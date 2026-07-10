@@ -5,7 +5,7 @@ import {basename,join} from "node:path";
 import {tmpdir} from "node:os";
 import {createHash} from "node:crypto";
 import {b as defineModuleInitializer} from "./runtime.ts";
-import {CHENG_DRIVER,CHENG_STAGE3_DRIVER,CHENG_TOOLCHAIN_ROOT,chengColdCsgDir,chengColdSummaryPath,chengDriverSpawnEnv,createChengTextTool,csgProjectRoot,jsonResult,readChengSummary,resolveProjectPath,assertInsideProject,runChengDriver,takeTrailingText,initChengToolkitModule,zodSchema} from "./cheng_toolkit_m9000.ts";
+import {CHENG_DRIVER,CHENG_STAGE3_DRIVER,CHENG_FUSION_VENDOR_COLD_DRIVER,CHENG_TOOLCHAIN_ROOT,chengColdCsgDir,chengColdSummaryPath,chengDriverSpawnEnv,createChengTextTool,csgProjectRoot,jsonResult,readChengSummary,resolveProjectPath,assertInsideProject,runChengDriver,takeTrailingText,initChengToolkitModule,zodSchema} from "./cheng_toolkit_m9000.ts";
 
 var chengCsgRoundtripInputSchema,ChengCsgRoundtripTool;
 
@@ -68,7 +68,12 @@ function compileCachedColdDriver(){
 }
 
 function resolveColdCsgDriver(){
-  const candidates=[process.env.CHENG_COLD_DRIVER,process.env.CHENG_CSG_DRIVER,CHENG_DRIVER,CHENG_STAGE3_DRIVER].filter(Boolean);
+  // Priority: explicit CHENG_COLD_DRIVER override > fusion-vendored cold
+  // driver (patched for CSG record kind=9 call-edge facts, see
+  // vendor/cold-driver/build.sh) > existing main-repo driver candidates.
+  // The vendor binary is preferred by default whenever it has been built,
+  // with no env var required.
+  const candidates=[process.env.CHENG_COLD_DRIVER,CHENG_FUSION_VENDOR_COLD_DRIVER,process.env.CHENG_CSG_DRIVER,CHENG_DRIVER,CHENG_STAGE3_DRIVER].filter(Boolean);
   for(const candidate of candidates)if(driverSupportsColdCsg(candidate))return{driver:candidate};
   const compiled=compileCachedColdDriver();
   if(compiled.driver&&driverSupportsColdCsg(compiled.driver))return compiled;

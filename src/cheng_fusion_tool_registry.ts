@@ -13,6 +13,8 @@ import {ChengLineMapReadTool, initChengLineMapReadModule} from "./cheng_line_map
 import {ChengLspQueryTool, initChengLspQueryModule} from "./cheng_lsp_query_m9006.ts";
 import {ChengProfileReportTool, initChengProfileReportModule} from "./cheng_profile_report_m9007.ts";
 import {ChengSymbolDiffTool, initChengSymbolDiffModule} from "./cheng_symbol_diff_m9008.ts";
+import {ChengExecDiffTool, initChengExecDiffModule} from "./cheng_exec_diff_m9012.ts";
+import {ChengTemplateLeakAuditTool, initChengTemplateLeakAuditModule} from "./cheng_template_leak_audit_m9013.ts";
 
 var chengFusionTools;
 
@@ -25,7 +27,9 @@ var initChengFusionToolRegistryModule = defineModuleInitializer(() => {
   initChengLspQueryModule();
   initChengProfileReportModule();
   initChengSymbolDiffModule();
-  chengFusionTools = [ChengCsgQueryTool, ChengEvidenceTool, ChengCsgRoundtripTool, ChengCrashTriageTool, ChengLineMapReadTool, ChengLspQueryTool, ChengProfileReportTool, ChengSymbolDiffTool];
+  initChengExecDiffModule();
+  initChengTemplateLeakAuditModule();
+  chengFusionTools = [ChengCsgQueryTool, ChengEvidenceTool, ChengCsgRoundtripTool, ChengCrashTriageTool, ChengLineMapReadTool, ChengLspQueryTool, ChengProfileReportTool, ChengSymbolDiffTool, ChengExecDiffTool, ChengTemplateLeakAuditTool];
 });
 
 function getChengFusionTools() {

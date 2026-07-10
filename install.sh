@@ -3,6 +3,11 @@
 # Uses node to read/modify/write JSON (never sed) so existing formatting/keys
 # of unrelated entries are preserved. Backs up the original file before any
 # real write. Pass --dry-run to only print the JSON that would be written.
+#
+# Separately, to get CSG kind=9 (call-edge) fact support in cheng_csg_query,
+# build the vendored cold driver once (not required for install, but
+# cheng_csg_roundtrip picks it up automatically once present):
+#   /Users/lbcheng/cheng-fusion/vendor/cold-driver/build.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

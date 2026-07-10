@@ -1,5 +1,5 @@
 // 加固项 1: RSS 帽 — 每个 Cheng driver 子进程都要带 CHENG_PROCESS_MAX_RSS_BYTES,
-// 默认 12884901888, 可被 CHENG_FUSION_RSS_CAP 覆盖。
+// 默认 1073741824 (1 GiB, 实测逐工具峰值 8-16x 裕度重定, 见 README), 可被 CHENG_FUSION_RSS_CAP 覆盖。
 //
 // 三层验证:
 //  A. 直接 import 生产模块的 chengDriverSpawnEnv(), 断言构造出的 env 含正确默认值/覆盖值。
@@ -18,7 +18,7 @@ async function testA_defaultAndOverride() {
   delete process.env.CHENG_FUSION_RSS_CAP;
   const mod = await import(TOOLKIT);
   const envDefault = mod.chengDriverSpawnEnv();
-  assertTrue(envDefault.CHENG_PROCESS_MAX_RSS_BYTES === "12884901888", `默认 RSS 帽 = 12884901888, 实得 ${envDefault.CHENG_PROCESS_MAX_RSS_BYTES}`);
+  assertTrue(envDefault.CHENG_PROCESS_MAX_RSS_BYTES === "1073741824", `默认 RSS 帽 = 1073741824, 实得 ${envDefault.CHENG_PROCESS_MAX_RSS_BYTES}`);
   process.env.CHENG_FUSION_RSS_CAP = "6000000000";
   const envOverridden = mod.chengDriverSpawnEnv();
   assertTrue(envOverridden.CHENG_PROCESS_MAX_RSS_BYTES === "6000000000", `CHENG_FUSION_RSS_CAP 覆盖生效, 实得 ${envOverridden.CHENG_PROCESS_MAX_RSS_BYTES}`);
@@ -30,7 +30,7 @@ async function testB_realSpawnReceivesEnv() {
   const mod = await import(TOOLKIT);
   const result = await mod.runChengDriver("/bin/sh", ["-c", "echo RSS=$CHENG_PROCESS_MAX_RSS_BYTES"], {cwd: CHENG_ROOT});
   assertTrue(result.exitCode === 0, `/bin/sh 子进程正常退出, exitCode=${result.exitCode}`);
-  assertTrue(result.stdout.includes("RSS=12884901888"), `子进程 stdout 含默认 RSS 帽, 实得: ${JSON.stringify(result.stdout)}`);
+  assertTrue(result.stdout.includes("RSS=1073741824"), `子进程 stdout 含默认 RSS 帽, 实得: ${JSON.stringify(result.stdout)}`);
 
   process.env.CHENG_FUSION_RSS_CAP = "7777777777";
   const result2 = await mod.runChengDriver("/bin/sh", ["-c", "echo RSS=$CHENG_PROCESS_MAX_RSS_BYTES"], {cwd: CHENG_ROOT});

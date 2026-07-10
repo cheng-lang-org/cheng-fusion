@@ -5,20 +5,26 @@ import {basename, dirname, isAbsolute, join, relative, resolve} from "node:path"
 import {fileURLToPath, pathToFileURL} from "node:url";
 import {createHash} from "node:crypto";
 import {b as defineModuleInitializer} from "./runtime.ts";
-import {z as zodSchema} from "zod";
-function initZodModule() {}
+import * as zodSchema from "zod";
+const initZodModule = () => {};
 import {withDefaultToolDefinitionBehavior as withDefaultToolDefinitionBehavior, initToolDefinitionLookupAndDefaultsModule as initToolDefinitionLookupAndDefaultsModule} from "./tool_definition_lookup_and_defaults_m2929.ts";
 
 const CHENG_TOOLCHAIN_ROOT = process.env.CHENG_TOOLCHAIN_ROOT || process.env.CHENG_ROOT || "/Users/lbcheng/cheng-lang";
 const CHENG_ROOT = CHENG_TOOLCHAIN_ROOT;
 const CHENG_DRIVER = process.env.CHENG_DRIVER || join(CHENG_TOOLCHAIN_ROOT, "artifacts/backend_driver/cheng");
 const CHENG_STAGE3_DRIVER = process.env.CHENG_STAGE3_DRIVER || join(CHENG_TOOLCHAIN_ROOT, "artifacts/bootstrap/cheng.stage3");
+// Fusion-vendored cold driver: bootstrap/cheng_cold.c from CHENG_TOOLCHAIN_ROOT
+// patched to understand CSG record kind=9 (call-edge facts) and compiled by
+// vendor/cold-driver/build.sh, without touching the main repo tree. See
+// resolveColdCsgDriver() in cheng_csg_roundtrip_m9003.ts for priority order.
+const CHENG_FUSION_PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const CHENG_FUSION_VENDOR_COLD_DRIVER = process.env.CHENG_FUSION_VENDOR_COLD_DRIVER || join(CHENG_FUSION_PACKAGE_ROOT, "vendor/cold-driver/cheng_cold_csg9");
 const CHENG_LSP_DEFAULT = join(CHENG_TOOLCHAIN_ROOT, "artifacts/cheng-lsp");
 const CSG_CORE_READER_ROOT = process.env.CSG_CORE_READER_ROOT || process.env.TS_CSG_ROOT || join(CHENG_TOOLCHAIN_ROOT, "ts-csg");
 const CSG_CORE_READER = join(CSG_CORE_READER_ROOT, "dist/csgc-reader.js");
 const CHENG_CANARY = "src/tests/ordinary_zero_exit_fixture.cheng";
 const CHENG_INVOCATION_CONTEXT_VERIFIED = Symbol.for("openclaude.cheng.invocationContextVerified");
-const CHENG_FUSION_RSS_CAP_BYTES_DEFAULT = "12884901888";
+const CHENG_FUSION_RSS_CAP_BYTES_DEFAULT = "1073741824";
 const CHENG_FUSION_LSP_TIMEOUT_MS_DEFAULT = 15000;
 const CHENG_FUSION_DRIVER_TIMEOUT_MS_DEFAULT = 120000;
 let chengProjectRootHints = [];
@@ -508,9 +514,9 @@ function parseChengColdFacts(root, factsPath, summary = {}) {
     if (payloadHex.length !== byteCount * 2) {
       throw new Error(`CHENG_CSG payload size mismatch at line ${index + 1}: kind=${kind} expected=${byteCount} actual=${payloadHex.length / 2}`);
     }
-    if (kind < 0 || kind > 8) throw new Error(`unknown CHENG_CSG record kind ${kind} at line ${index + 1}`);
+    if (kind < 0 || kind > 9) throw new Error(`unknown CHENG_CSG record kind ${kind} at line ${index + 1}`);
     recordCount++;
-    const payload = kind === 1 || kind === 2 || kind === 3 || kind === 4 || kind === 6 || kind === 7
+    const payload = kind === 1 || kind === 2 || kind === 3 || kind === 4 || kind === 6 || kind === 7 || kind === 9
       ? Buffer.from(payloadHex, "hex")
       : null;
     try {
@@ -563,6 +569,30 @@ function parseChengColdFacts(root, factsPath, summary = {}) {
           owner,
           sourceItemId,
           wordOffset,
+          calleeText: targetSymbol,
+          target: {name: targetName, fqName: targetSymbol},
+          loc: {file: summary.source ? normalizeToSubstratePath(summary.source, root) : normalizeToSubstratePath(factsPath, root), recordLine: index + 1},
+        };
+        appendToMapList(callsOut, owner, call);
+        appendToMapList(refsIn, targetName, call);
+        if (targetSymbol !== targetName) appendToMapList(refsIn, targetSymbol, call);
+      } else if (kind === 9) {
+        // Intra-object call/address-ref edge: the writer resolved this call to a
+        // function compiled into the same object and baked the branch/ADR
+        // immediate directly, so it needed no kind-6 relocation and would
+        // otherwise be invisible to the call graph. Informational only —
+        // wordOffset is not tracked (no relocation site to point at).
+        let offset = 0;
+        const sourceItemId = readU32LE(payload, offset); offset += 4;
+        const targetRead = readColdString(payload, offset);
+        const owner = `cold:function:${sourceItemId}`;
+        const targetSymbol = targetRead.value;
+        const targetName = coldLogicalSymbolName(targetSymbol);
+        const call = {
+          kind: "cheng_cold.call_edge",
+          owner,
+          sourceItemId,
+          wordOffset: null,
           calleeText: targetSymbol,
           target: {name: targetName, fqName: targetSymbol},
           loc: {file: summary.source ? normalizeToSubstratePath(summary.source, root) : normalizeToSubstratePath(factsPath, root), recordLine: index + 1},
@@ -893,6 +923,215 @@ function runChengDriver(driver, args, options = {}) {
     });
     child.on("exit", (code) => finish(code));
   });
+}
+
+const CHENG_FUSION_CRASH_TRIAGE_TIMEOUT_MS_DEFAULT = 60000;
+
+// lldb 的 `run` 一行命令自己做类 shell 的空白/引号切分, 实参含空格或引号时需要显式加引号转义,
+// 否则会被当成多个独立 argv 传给 debuggee.
+function lldbArgQuote(value) {
+  const text = String(value);
+  if (text.length > 0 && !/[\s"\\]/.test(text)) return text;
+  return `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+// 崩点批处理: -o 是无条件顺序执行的命令, -k(--one-line-on-crash) 只在 debuggee 因信号/异常停止时
+// 才触发 —— 干净退出时不会跑, 也不会挂起(lldb 自身在命令队列耗尽后退出). 用 spawn+detached+
+// 手动计时器给 lldb 自己也套上超时/RSS 加固, 和 runChengDriver 同一套孤儿防护.
+function runLldbBatch(binary, args, env, options = {}) {
+  const maxFrames = options.maxFrames || 64;
+  const runLine = ["run", ...args.map(lldbArgQuote)].join(" ");
+  const lldbArgs = ["-b", "-o", runLine, "-k", `bt ${maxFrames}`, "-k", "register read", "-k", "image list -o -f", "-k", "quit", binary];
+  const maxBuffer = options.maxBuffer || (1 << 26);
+  const timeoutMs = chengFusionTimeoutMs(options.timeoutMs || CHENG_FUSION_CRASH_TRIAGE_TIMEOUT_MS_DEFAULT);
+  return new Promise((resolvePromise) => {
+    let output = Buffer.alloc(0);
+    let settled = false;
+    let timedOut = false;
+    let overflow = false;
+    let child;
+    try {
+      child = spawn("lldb", lldbArgs, {
+        cwd: options.cwd || process.cwd(),
+        env: chengDriverSpawnEnv(env),
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+      });
+    } catch (error) {
+      resolvePromise({exitCode: null, output: "", error: error instanceof Error ? error.message : String(error)});
+      return;
+    }
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChengProcessGroup(child, "SIGKILL");
+    }, timeoutMs);
+    const append = (chunk) => {
+      if (overflow) return;
+      output = Buffer.concat([output, chunk]);
+      if (output.length > maxBuffer) {
+        overflow = true;
+        killChengProcessGroup(child, "SIGKILL");
+      }
+    };
+    child.stdout?.on("data", append);
+    child.stderr?.on("data", append);
+    const finish = (exitCode) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      let text = output.toString("utf8");
+      if (timedOut) text += `\n[cheng-fusion] lldb session timed out after ${timeoutMs}ms; process group killed (SIGKILL)`;
+      if (overflow) text += `\n[cheng-fusion] lldb output exceeded maxBuffer (${maxBuffer} bytes); process group killed (SIGKILL)`;
+      resolvePromise({exitCode, output: text, timedOut, overflow});
+    };
+    child.on("error", (error) => {
+      append(Buffer.from(`\n${error instanceof Error ? error.message : String(error)}`, "utf8"));
+      finish(null);
+    });
+    child.on("exit", (code) => finish(code));
+  });
+}
+
+function splitLldbSessions(text) {
+  const trimmed = text.replace(/^\(lldb\) /, "");
+  return trimmed.split(/\n\(lldb\) /).map((raw) => {
+    const nl = raw.indexOf("\n");
+    return nl < 0 ? {command: raw.trim(), output: ""} : {command: raw.slice(0, nl).trim(), output: raw.slice(nl + 1)};
+  });
+}
+
+function parseLldbRegisters(output) {
+  const registers = {};
+  const re = /^\s*(\w+)\s*=\s*(0x[0-9a-fA-F]+)/gm;
+  let match;
+  while ((match = re.exec(output)) !== null) registers[match[1]] = match[2];
+  return registers;
+}
+
+function parseLldbFrames(output) {
+  const frames = [];
+  const re = /frame #(\d+):\s+(0x[0-9a-fA-F]+)\s+([^`\n]+)`([^\n]*)/g;
+  let match;
+  while ((match = re.exec(output)) !== null) {
+    frames.push({index: Number(match[1]), pc: match[2], module: match[3].trim(), lldbSymbol: match[4].trim() || null});
+  }
+  return frames;
+}
+
+function parseLldbImageSlide(output) {
+  const match = output.match(/^\[\s*0\]\s+(0x[0-9a-fA-F]+)\s+(\S.*)$/m);
+  return match ? {slide: Number(match[1]), imagePath: match[2].trim()} : null;
+}
+
+// otool -l 的 __TEXT,__text section addr/size, 用来把运行时 pc 换算成 nm 符号表的坐标系.
+function parseOtoolTextSection(path) {
+  if (!existsSync(path)) return null;
+  const result = spawnSync("otool", ["-l", path], {encoding: "utf8", timeout: 15000, maxBuffer: 64 * 1024 * 1024});
+  if (result.status !== 0 || !result.stdout) return null;
+  const match = result.stdout.match(/sectname __text\s+segname __TEXT\s+addr (0x[0-9a-fA-F]+)\s+size (0x[0-9a-fA-F]+)/);
+  if (!match) return null;
+  return {addr: Number(match[1]), size: Number(match[2])};
+}
+
+function nmTextSymbols(path) {
+  if (!existsSync(path)) return [];
+  const result = spawnSync("nm", ["-n", path], {encoding: "utf8", timeout: 15000, maxBuffer: 64 * 1024 * 1024});
+  if (result.status !== 0 || !result.stdout) return [];
+  const symbols = [];
+  for (const line of result.stdout.split("\n")) {
+    const match = line.match(/^([0-9a-fA-F]{16})\s+T\s+(\S+)$/);
+    if (match) symbols.push({addr: Number(`0x${match[1]}`), name: match[2]});
+  }
+  symbols.sort((a, b) => a.addr - b.addr);
+  return symbols;
+}
+
+function nearestPrecedingSymbol(symbols, offset) {
+  let lo = 0, hi = symbols.length - 1, best = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (symbols[mid].addr <= offset) {
+      best = symbols[mid];
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return best;
+}
+
+// 纯发射 gen2 崩溃(0 行 stderr trace)的实战闭环: 自己起 lldb 跑 binary, 崩点批处理拿 bt/寄存器/
+// 崩点指令, 帧按 nm(primary.o) + otool(text section addr/size) + image-list slide 全部符号化;
+// 落在 primary.o 自身 __text 范围外的帧(provider/其它被链接 .o 的代码)如实标 provider-unresolved,
+// 不假装解析出一个误导性的符号.
+async function triageChengBinaryCrash(input) {
+  const binary = input.binary;
+  if (!existsSync(binary)) return {schema: "cheng_crash_triage_live.v1", error: `binary not found: ${binary}`};
+  const args = Array.isArray(input.args) ? input.args : [];
+  const primaryObject = input.primaryObject || `${binary}.primary.o`;
+  const maxFrames = input.maxFrames || 64;
+  const session = await runLldbBatch(binary, args, input.env || {}, {
+    maxFrames,
+    timeoutMs: input.timeoutSec ? Math.round(input.timeoutSec * 1000) : undefined,
+  });
+  const text = session.output;
+  const exitedMatch = text.match(/exited with status = (-?\d+)/);
+  if (exitedMatch && !/stop reason = /.test(text)) {
+    return {
+      schema: "cheng_crash_triage_live.v1",
+      binary, args, primaryObject,
+      exited: true,
+      exitCode: Number(exitedMatch[1]),
+      stopReason: null,
+      faultAddress: null,
+      crashInsn: null,
+      frames: [],
+      registers: {},
+      timedOut: Boolean(session.timedOut),
+      overflow: Boolean(session.overflow),
+    };
+  }
+  const sessions = splitLldbSessions(text);
+  const runSession = sessions.find((s) => /^run\b/.test(s.command)) || {output: text};
+  const btSession = sessions.find((s) => /^bt\b/.test(s.command));
+  const regSession = sessions.find((s) => s.command === "register read");
+  const imgSession = sessions.find((s) => /^image list/.test(s.command));
+  const stopReasonMatch = text.match(/stop reason = ([^\n]+)/);
+  const faultMatch = text.match(/EXC_BAD_ACCESS[^\n]*address=(0x[0-9a-fA-F]+)/);
+  const crashInsnMatch = runSession.output.match(/^->\s+(0x[0-9a-fA-F]+)(?:\s+<\+\d+>)?:\s+(.+)$/m);
+  const frames = btSession ? parseLldbFrames(btSession.output) : parseLldbFrames(runSession.output);
+  const registers = regSession ? parseLldbRegisters(regSession.output) : {};
+  const imageInfo = imgSession ? parseLldbImageSlide(imgSession.output) : null;
+  const slide = imageInfo ? imageInfo.slide : 0;
+  const binaryBase = basename(binary);
+  const primaryObjectExists = existsSync(primaryObject);
+  const exeText = parseOtoolTextSection(binary);
+  const primaryText = primaryObjectExists ? parseOtoolTextSection(primaryObject) : null;
+  const nmSymbols = primaryObjectExists ? nmTextSymbols(primaryObject) : [];
+  const symbolicated = frames.map((frame) => {
+    if (frame.lldbSymbol) return {...frame, symbol: frame.lldbSymbol, offset: null, providerUnresolved: false};
+    if (frame.module !== binaryBase) return {...frame, symbol: null, providerUnresolved: true, reason: "foreign-module"};
+    if (!primaryObjectExists) return {...frame, symbol: null, providerUnresolved: true, reason: "primary-object-not-found", primaryObject};
+    if (!exeText || !primaryText) return {...frame, symbol: null, providerUnresolved: true, reason: "text-section-not-found"};
+    const fileOffset = Number(frame.pc) - slide - exeText.addr;
+    if (fileOffset < 0 || fileOffset >= primaryText.size) return {...frame, symbol: null, providerUnresolved: true, reason: "provider-region", fileOffset};
+    const sym = nearestPrecedingSymbol(nmSymbols, fileOffset);
+    if (!sym) return {...frame, symbol: null, providerUnresolved: true, reason: "before-first-symbol", fileOffset};
+    return {...frame, symbol: sym.name, offset: fileOffset - sym.addr, providerUnresolved: false};
+  });
+  return {
+    schema: "cheng_crash_triage_live.v1",
+    binary, args, primaryObject,
+    exited: false,
+    stopReason: stopReasonMatch ? stopReasonMatch[1].trim() : null,
+    faultAddress: faultMatch ? faultMatch[1] : null,
+    crashInsn: crashInsnMatch ? {pc: crashInsnMatch[1], insn: crashInsnMatch[2].trim()} : null,
+    frames: symbolicated,
+    registers,
+    slide,
+    timedOut: Boolean(session.timedOut),
+    overflow: Boolean(session.overflow),
+  };
 }
 
 function chengLspResolveBinary() {
@@ -1388,6 +1627,213 @@ function profileResult(action, args, run, input = {}) {
   };
 }
 
+// 模板泄漏神谕: Cheng 泛型函数 fn Foo[T](...): T 编译期不按具体类型单态化, 而是共享同一个
+// mangled 符号(仅用定义处行号 __L<N> 消歧, 不编码具体 T), 见 PrimarySymbolNameForFunction
+// (primary_object_plan.cheng) 里 "lineScoped && signatureLineNumber > 0 -> raw + __L + line"
+// 这段真实 mangling 规则。命中 __L<N> 且回源确认签名里裸 T 出现在返回位/形参位的符号即"泄漏候选";
+// objdump -r 数其 BL(ARM64_RELOC_BRANCH26/X86_64_RELOC_BRANCH) 调用面, >0 才是被真实执行路径
+// 命中的 live_leak(单态化缺失且确有调用点跨类型共享同一份机器码), 否则只是死代码 dead_weight。
+const CHENG_TEMPLATE_LEAK_MANGLE_RE = /^(.*)__L([0-9]+)$/;
+const CHENG_TEMPLATE_LEAK_EXCLUDE_DIRS = ["artifacts", "node_modules", ".git", "conversion-reports", "scratchpad", "_coldrepro", "test_perf"];
+const CHENG_TEMPLATE_LEAK_DECL_RE = /^\s*fn\s+([A-Za-z_]\w*)/;
+const CHENG_TEMPLATE_LEAK_HEADER_RE = /^\s*fn\s+([A-Za-z_]\w*)\s*(?:\[([^\]]*)\])?\s*\(([\s\S]*)\)\s*:\s*([\s\S]*?)\s*=\s*$/;
+
+function runProbeTool(command, args, label) {
+  const result = spawnSync(command, args, {encoding: "utf8", maxBuffer: 1 << 29, timeout: 60000});
+  if (result.error) throw new Error(`${label} failed to start: ${result.error.message}`);
+  if (result.signal === "SIGTERM") throw new Error(`${label} timed out after 60000ms: ${command} ${args.join(" ")}`);
+  return result;
+}
+
+// nm -jUP: 一行一个已定义 symbol, 列 = name type addr size. 只取全局(大写) T(text/code) 且
+// 尾部带 __L<行号> mangling 的(即编译器判定为跨 "::" 作用域需要行号消歧的符号)。
+function nmDefinedTemplateMangledTextSymbols(objectPath) {
+  const result = runProbeTool("nm", ["-jUP", objectPath], "nm");
+  if (result.status !== 0) throw new Error(`nm -jUP exited ${result.status}: ${takeTrailingText(result.stderr, 2000)}`);
+  const out = [];
+  for (const rawLine of result.stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const cols = line.split(/\s+/);
+    if (cols.length < 2 || cols[1] !== "T") continue;
+    const match = cols[0].match(CHENG_TEMPLATE_LEAK_MANGLE_RE);
+    if (!match) continue;
+    out.push({symbol: cols[0], base: match[1], line: Number(match[2])});
+  }
+  return out;
+}
+
+// __L 之前的 base 形如 "<modulePath>__<FuncName>"(见 PrimarySanitizeSymbolPart: "::" 两个冒号各自
+// 被替换成 "_", 拼出双下划线作为模块路径/函数名分隔符); 取最后一个 "__" 之后的片段作为函数名,
+// 不去正向重建模块路径(避免模块目录命名规则的脆弱反推), 靠函数名+精确行号回源定位。
+function chengFunctionNameFromMangledBase(base) {
+  const stripped = base.startsWith("_") ? base.slice(1) : base;
+  const segments = stripped.split("__");
+  return segments[segments.length - 1];
+}
+
+// 项目内 "fn <Name>" 声明行的一次性全量索引(单次遍历, 供该次审计里所有候选符号复用查表,
+// 而不是每个候选各起一次子进程搜索 —— 后者在本仓 ~4400 个 .cheng 文件规模下经实测会
+// 因逐符号重复扫描而拖成分钟级; 一次索引后按 name+line 精确查表是 O(1))。
+function buildChengFunctionDeclIndex(root) {
+  const pruneArgs = [];
+  for (const dir of CHENG_TEMPLATE_LEAK_EXCLUDE_DIRS) {
+    if (pruneArgs.length > 0) pruneArgs.push("-o");
+    pruneArgs.push("-path", join(root, dir));
+  }
+  const findArgs = pruneArgs.length > 0
+    ? [root, "(", ...pruneArgs, ")", "-prune", "-o", "-name", "*.cheng", "-print"]
+    : [root, "-name", "*.cheng", "-print"];
+  const found = runProbeTool("find", findArgs, "find");
+  if (found.status !== 0) throw new Error(`find exited ${found.status}: ${takeTrailingText(found.stderr, 2000)}`);
+  const index = new Map();
+  for (const file of found.stdout.split("\n")) {
+    if (!file) continue;
+    let text;
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const match = lines[i].match(CHENG_TEMPLATE_LEAK_DECL_RE);
+      if (!match) continue;
+      const name = match[1];
+      if (!index.has(name)) index.set(name, []);
+      index.get(name).push({file, line: i + 1});
+    }
+  }
+  return index;
+}
+
+function splitChengTopLevel(text, separator) {
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of text) {
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}") depth--;
+    if (ch === separator && depth === 0) {
+      parts.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim() !== "" || parts.length > 0) parts.push(current);
+  return parts;
+}
+
+// 判定该函数头是否泛型(fn Name[T](...)), 且裸类型参数(如 T)是否原样出现在返回类型
+// 或某个形参的类型位置(而不仅仅是形参名恰好叫 T) —— 这才是"未绑定裸类型泄漏"的信号:
+// 泛型体本身直接以裸 T 出现在 ABI 相关位置, 说明该符号的机器码没有按具体类型特化。
+function parseChengGenericLeakSignature(header) {
+  const match = header.match(CHENG_TEMPLATE_LEAK_HEADER_RE);
+  if (!match) return null;
+  const [, , genericsRaw, paramsRaw, returnTypeRaw] = match;
+  if (!genericsRaw) return null;
+  const generics = genericsRaw.split(",").map((part) => part.trim().split(":")[0].trim()).filter(Boolean);
+  if (generics.length === 0) return null;
+  const params = splitChengTopLevel(paramsRaw, ",").map((part) => part.trim()).filter(Boolean);
+  const paramTypes = params.map((param) => {
+    const colon = param.indexOf(":");
+    return colon >= 0 ? param.slice(colon + 1).trim() : "";
+  });
+  const returnType = returnTypeRaw.trim();
+  const positions = [];
+  for (const generic of generics) {
+    const wordRe = new RegExp(`\\b${generic}\\b`);
+    if (wordRe.test(returnType)) positions.push({position: "return", param: generic});
+    paramTypes.forEach((paramType, index) => {
+      if (paramType && wordRe.test(paramType)) positions.push({position: "param", index, param: generic});
+    });
+  }
+  return {generics, returnType, positions};
+}
+
+// 多行函数头(签名跨行换行到 "=" 才收尾)兜底拼接, 封顶 8 行不做无限读, 与本仓已见的
+// 少量多行 fn 签名风格一致(见 primary_object_plan.cheng 里多形参逐行的 fn 声明)。
+function readChengFunctionHeader(filePath, startLine) {
+  const lines = readFileSync(filePath, "utf8").split(/\r?\n/);
+  let header = "";
+  for (let i = startLine - 1; i < lines.length && i < startLine - 1 + 8; i++) {
+    header += (header ? " " : "") + lines[i].trim();
+    if (/=\s*$/.test(lines[i])) break;
+  }
+  return header;
+}
+
+// objdump -r: 每行 "<offset> <RELOC_TYPE> <target symbol>"。只数分支/调用类重定位
+// (ARM64_RELOC_BRANCH26 或 x86_64 等价的 X86_64_RELOC_BRANCH, 用 /BRANCH/ 统一匹配两种目标架构),
+// 不数 PAGE21/PAGEOFF12/地址取值类, 这才是真实 BL 调用面(callEdges), 不是所有引用面。
+function objdumpBranchCallEdgeCounts(objectPath) {
+  const result = runProbeTool("objdump", ["-r", objectPath], "objdump");
+  if (result.status !== 0) throw new Error(`objdump -r exited ${result.status}: ${takeTrailingText(result.stderr, 2000)}`);
+  const counts = new Map();
+  for (const line of result.stdout.split("\n")) {
+    const match = line.match(/^\s*[0-9a-fA-F]+\s+\S*BRANCH\S*\s+(\S+)\s*$/);
+    if (!match) continue;
+    counts.set(match[1], (counts.get(match[1]) || 0) + 1);
+  }
+  return counts;
+}
+
+async function chengTemplateLeakAudit(input = {}) {
+  if (!input.objectPath) throw new Error("objectPath is required");
+  const root = resolveChengProjectRoot(input);
+  const objectPath = isAbsolute(normalizeMaybeFileUri(input.objectPath))
+    ? resolve(normalizeMaybeFileUri(input.objectPath))
+    : resolve(root, normalizeMaybeFileUri(input.objectPath));
+  if (!pathExistsFile(objectPath)) throw new Error(`object file not found: ${objectPath}`);
+  const candidates = nmDefinedTemplateMangledTextSymbols(objectPath);
+  const declIndex = buildChengFunctionDeclIndex(root);
+  let branchCounts = null;
+  const leaks = [];
+  let sourceNotFoundCount = 0;
+  let notGenericCount = 0;
+  for (const candidate of candidates) {
+    const funcName = chengFunctionNameFromMangledBase(candidate.base);
+    const declMatches = (declIndex.get(funcName) || []).filter((decl) => decl.line === candidate.line);
+    if (declMatches.length === 0) {
+      sourceNotFoundCount++;
+      continue;
+    }
+    const header = readChengFunctionHeader(declMatches[0].file, candidate.line);
+    const parsed = parseChengGenericLeakSignature(header);
+    if (!parsed || parsed.positions.length === 0) {
+      notGenericCount++;
+      continue;
+    }
+    if (!branchCounts) branchCounts = objdumpBranchCallEdgeCounts(objectPath);
+    const callEdges = branchCounts.get(candidate.symbol) || 0;
+    leaks.push({
+      symbol: candidate.symbol,
+      sourceFile: normalizeToSubstratePath(declMatches[0].file, root),
+      line: candidate.line,
+      signature: header,
+      genericParams: parsed.generics,
+      leakPositions: parsed.positions,
+      callEdges,
+      verdict: callEdges > 0 ? "live_leak" : "dead_weight",
+      ...(declMatches.length > 1 ? {ambiguousSourceMatches: declMatches.map((decl) => normalizeToSubstratePath(decl.file, root))} : {}),
+    });
+  }
+  const liveLeakCount = leaks.filter((leak) => leak.verdict === "live_leak").length;
+  return {
+    schema: "cheng_template_leak_audit.v1",
+    root,
+    objectPath,
+    scannedMangledSymbolCount: candidates.length,
+    sourceNotFoundCount,
+    notGenericCount,
+    leakCount: leaks.length,
+    liveLeakCount,
+    invariantHeld: liveLeakCount === 0,
+    leaks,
+  };
+}
+
 function zodToJsonSchema(schema) {
   return zodSchema.toJSONSchema(schema);
 }
@@ -1401,6 +1847,7 @@ export {
   CHENG_TOOLCHAIN_ROOT,
   CHENG_DRIVER,
   CHENG_STAGE3_DRIVER,
+  CHENG_FUSION_VENDOR_COLD_DRIVER,
   CHENG_CANARY,
   zodSchema,
   initChengToolkitModule,
@@ -1438,10 +1885,12 @@ export {
   chengLspSyncDoc,
   chengLspEnsureDocOpen,
   parseCrash,
+  triageChengBinaryCrash,
   readLineMap,
   snapshotChengSymbols,
   profileDriverForReport,
   profileDriverForRun,
   profileResult,
+  chengTemplateLeakAudit,
   zodToJsonSchema,
 };
