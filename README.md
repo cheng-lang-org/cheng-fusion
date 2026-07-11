@@ -50,8 +50,11 @@ claude mcp add cheng-fusion -- bun /Users/lbcheng/cheng-fusion/index.ts
 | `cheng_symbol_diff` | no | Snapshot `cheng print-symbols` counts; `primary_unsupported_count > 0` signals a compiler lowering regression. |
 | `cheng_exec_diff` | yes | Two-driver differential method: compile+run one or more fixtures under `driverA`/`driverB` and diff the result (`identical`/`semantic_divergence`/`compile_wall`/`both_fail`). |
 | `cheng_template_leak_audit` | no | Scan a `.primary.o` for `__L<line>`-mangled generic functions still carrying a bare unbound type parameter in return/param position (template monomorphization leak), and count real BL call edges via `objdump -r` to classify `live_leak` vs `dead_weight`. Golden invariant: `liveLeakCount` should be 0. |
+| `cheng_corrupt_hunt` | no | Two-stage lldb watchpoint write-point localization: stage 1 breakpoints a known detection site and reads a base-register+offset victim address `H` (and its current value); stage 2 (fresh process) sets a write watchpoint on `H` and replays from process start, recording pc/symbol/new-value/backtrace for each hit — the first hit in the real culprit function is the corrupting write. |
+| `cheng_shape_matrix` | yes | Runs the golden ignition fixture matrix (`fixtures/ignition/matrix.json`) under one Cheng driver: compiles+runs every non-planned entry and checks `expectRc` / `expectStdout` / `golden` (byte-exact) / `expectCompileBail` (a contracted honest `ZC_NOT_READY` rejection), reporting GREEN/RED/CFAIL per entry plus `coverageGaps` (`planned:true` entries with no fixture yet). Productizes the manual "30s ignition determinism loop". |
+| `cheng_claim_audit` | no | Diagnostic-only static text audit of `primary_object_plan.cheng`'s statement-claim sites (`PrimaryBodyIrNodeEvalOnlyOwn(` calls, `localInitialized = true` assignments, `continue` inside statement-dispatch loops found by indentation backtrack), classified `EMITS`/`POISONS`/`SILENT_RISK` by regex-scanning nearby context for emission/poison evidence. Candidates for human review, not verdicts — never a sufficient condition on its own to delete a text-path fallback. |
 
-All tools except `cheng_crash_triage` require an active Cheng project root (a directory containing `cheng-package.toml`), resolved from MCP workspace roots, an explicit `cwd`, or the tool's own `file`/`source`/`root` argument.
+All tools except `cheng_crash_triage`, `cheng_corrupt_hunt`, `cheng_shape_matrix` and `cheng_claim_audit` require an active Cheng project root (a directory containing `cheng-package.toml`), resolved from MCP workspace roots, an explicit `cwd`, or the tool's own `file`/`source`/`root` argument. `cheng_shape_matrix`/`cheng_claim_audit` take explicit absolute `driver`/`root`/`pobjPath` arguments instead (same rationale as `cheng_exec_diff`: fixtures and experimental drivers are often outside any Cheng project root).
 
 ## Environment knobs
 
@@ -141,9 +144,27 @@ cheng-fusion/
 │   ├── cheng_profile_report_m9007.ts
 │   ├── cheng_symbol_diff_m9008.ts
 │   ├── cheng_exec_diff_m9012.ts
-│   └── cheng_template_leak_audit_m9013.ts
+│   ├── cheng_template_leak_audit_m9013.ts
+│   ├── cheng_corrupt_hunt_m9015.ts
+│   ├── cheng_shape_matrix_m9016.ts              golden ignition fixture matrix runner
+│   └── cheng_claim_audit_m9017.ts               pobj dispatcher claim-site static audit
+├── fixtures/
+│   └── ignition/                                golden fixture library + matrix.json (see "Ignition fixture matrix" below)
 └── test/                                       hardening-item harness (RSS cap, timeout orphan-kill, stale-facts warning, line-map sidecar)
 ```
+
+## Ignition fixture matrix
+
+`fixtures/ignition/` is the productized, checked-in home for the "ignition determinism
+loop" fixtures (previously scattered across `/tmp/*` and lost on every reboot). `matrix.json`
+pins each fixture's contracted expectation (`expectRc` / `expectStdout` / `golden` byte-exact
+comparison / `expectCompileBail` for fixtures whose current honest contract is a diagnosed
+`ZC_NOT_READY` rejection) plus tags (`family:*`, `kind:*`) and five `planned:true` coverage-gap
+placeholders (ctor positional real-emit, global-init str field, assign/argpos/return-position
+constructor bugs `707`/`44`/`801`). Run it with `cheng_shape_matrix`.
+
+Known blocker: `g45.cheng` (from `/tmp/f23/repro42/`) does not exist anywhere on disk and could
+not be copied into the fixture library — recorded here rather than fabricated.
 
 ## Notes on what changed vs. the source repo
 

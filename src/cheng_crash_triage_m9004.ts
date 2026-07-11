@@ -22,7 +22,7 @@ var initChengCrashTriageModule=defineModuleInitializer(()=>{
     name:"cheng_crash_triage",
     searchHint:"parse Cheng crash stderr, or run a binary under lldb and symbolicate the crash",
     inputSchema:chengCrashTriageInputSchema,
-    description:"Parse Cheng compiler diagnostics/runtime stderr into source locations (stderr mode), or run a binary under lldb, capture backtrace/registers/fault instruction, and symbolicate frames against <name>.primary.o via nm+otool (binary mode). Frames outside the primary object's own text extent are reported as provider-unresolved rather than guessed.",
+    description:"Parse Cheng compiler diagnostics/runtime stderr into source locations (stderr mode), or run a binary under lldb, capture backtrace/registers/fault instruction, and symbolicate frames against <name>.primary.o plus any sibling <name>.provider.*.o via nm+otool (binary mode). Provider objects are located inside the linked binary by content-anchored byte search (no reliable link-order artifact exists), so frames landing in provider code resolve to real provider function names instead of a guess. Frames outside every located object are reported as provider-unresolved. Also classifies stopReason into stopClass (SIGSEGV/SIGBUS/SIGILL/SIGFPE/malloc-integrity-brk/panic-exit/breakpoint-trap).",
     prompt:"Use {stderr} for existing crash text. Use {binary,args,env,primaryObject} to reproduce and symbolicate a live crash of a pure-emission (0-stderr) Cheng driver or compiled program.",
     toAutoClassifierInput:(input)=>"stderr" in input?`crash:${String(input.stderr||"").length}`:`crash_live:${input.binary}`,
     async execute(input){

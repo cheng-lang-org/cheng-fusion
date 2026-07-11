@@ -1,5 +1,5 @@
 // @ts-nocheck
-import {existsSync, mkdirSync, readFileSync, statSync, writeFileSync} from "node:fs";
+import {existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync} from "node:fs";
 import {spawn, spawnSync} from "node:child_process";
 import {basename, dirname, isAbsolute, join, relative, resolve} from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
@@ -73,6 +73,33 @@ function jsonResult(value) {
 function takeTrailingText(value, limit = 4000) {
   const text = String(value || "");
   return text.length > limit ? text.slice(-limit) : text;
+}
+
+// ZC_NOT_READY idx=E/T function=NAME body_kind=KIND detail=... line=NUM fz_kind=... stmt_kind=... bail=NUM slot_diag=...
+// Shared between cheng_exec_diff (compile_wall detection: function/bodyKind/bail only,
+// loose match tolerant of field-order drift) and cheng_zc_census (needs every field when
+// zc_enumerate.sh falls back to printing this raw line shape instead of its structured
+// pipe rows) — one producer (backend_driver_dispatch_min.cheng), one parser per need.
+const ZC_NOT_READY_LINE = /^ZC_NOT_READY idx=(\d+)\/(\d+) function=(\S+) body_kind=(\S+) .*?\bbail=(-?\d+)\b/m;
+const ZC_NOT_READY_LINE_FULL = /^ZC_NOT_READY idx=(\d+)\/(\d+) function=(\S+) body_kind=(\S+) detail=(\S+) line=(\d+) fz_kind=(\S+) stmt_kind=(\S+) bail=(-?\d+) slot_diag=(\S+)/;
+const ZC_NOT_READY_TOTAL = /^ZC_NOT_READY_TOTAL count=(\d+)/m;
+
+function parseZcNotReady(text) {
+  const combined = String(text || "");
+  const entries = [];
+  const lineRe = new RegExp(ZC_NOT_READY_LINE.source, "gm");
+  let match;
+  while ((match = lineRe.exec(combined)) !== null) {
+    entries.push({function: match[3], bodyKind: match[4], bail: Number(match[5])});
+  }
+  const totalMatch = combined.match(ZC_NOT_READY_TOTAL);
+  return {entries, total: totalMatch ? Number(totalMatch[1]) : entries.length};
+}
+
+function parseZcNotReadyLineFull(line) {
+  const match = String(line || "").match(ZC_NOT_READY_LINE_FULL);
+  if (!match) return null;
+  return {function: match[3], bodyKind: match[4], detail: match[5], line: Number(match[6]), fzKind: match[7], stmtKind: match[8], bail: match[9], slotDiag: match[10]};
 }
 
 function stripUntrustedChengInvocationContextFields(input = {}) {
@@ -935,13 +962,11 @@ function lldbArgQuote(value) {
   return `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-// 崩点批处理: -o 是无条件顺序执行的命令, -k(--one-line-on-crash) 只在 debuggee 因信号/异常停止时
-// 才触发 —— 干净退出时不会跑, 也不会挂起(lldb 自身在命令队列耗尽后退出). 用 spawn+detached+
-// 手动计时器给 lldb 自己也套上超时/RSS 加固, 和 runChengDriver 同一套孤儿防护.
-function runLldbBatch(binary, args, env, options = {}) {
-  const maxFrames = options.maxFrames || 64;
-  const runLine = ["run", ...args.map(lldbArgQuote)].join(" ");
-  const lldbArgs = ["-b", "-o", runLine, "-k", `bt ${maxFrames}`, "-k", "register read", "-k", "image list -o -f", "-k", "quit", binary];
+// lldb 批处理子进程的共享 spawn 骨架: spawn+detached+手动计时器给 lldb 自己也套上超时/RSS
+// 加固(和 runChengDriver 同一套孤儿防护), 按 maxBuffer 截断防止失控输出. runLldbBatch(崩点
+// 探测, -k 触发) 和 runLldbOCommands(cheng_corrupt_hunt 的无条件顺序 -o 脚本) 共用这一段,
+// 只是各自拼装不同的 lldbArgs.
+function spawnLldbSession(lldbArgs, env, options = {}) {
   const maxBuffer = options.maxBuffer || (1 << 26);
   const timeoutMs = chengFusionTimeoutMs(options.timeoutMs || CHENG_FUSION_CRASH_TRIAGE_TIMEOUT_MS_DEFAULT);
   return new Promise((resolvePromise) => {
@@ -992,6 +1017,25 @@ function runLldbBatch(binary, args, env, options = {}) {
   });
 }
 
+// 崩点批处理: -o 是无条件顺序执行的命令, -k(--one-line-on-crash) 只在 debuggee 因信号/异常停止时
+// 才触发 —— 干净退出时不会跑, 也不会挂起(lldb 自身在命令队列耗尽后退出).
+function runLldbBatch(binary, args, env, options = {}) {
+  const maxFrames = options.maxFrames || 64;
+  const runLine = ["run", ...args.map(lldbArgQuote)].join(" ");
+  const lldbArgs = ["-b", "-o", runLine, "-k", `bt ${maxFrames}`, "-k", "register read", "-k", "image list -o -f", "-k", "quit", binary];
+  return spawnLldbSession(lldbArgs, env, options);
+}
+
+// cheng_corrupt_hunt 用: 一串无条件顺序执行的 -o 命令(不依赖 -k 崩溃触发), binary 仍按 lldb
+// 的隐式 target-create 位置参数传入(和 runLldbBatch 一致的约定, splitLldbSessions 已验证过
+// 这个隐式创建不会额外产生一段 "(lldb) " 输出块)。
+function runLldbOCommands(binary, commands, env, options = {}) {
+  const lldbArgs = ["-b"];
+  for (const command of commands) lldbArgs.push("-o", command);
+  lldbArgs.push(binary);
+  return spawnLldbSession(lldbArgs, env, options);
+}
+
 function splitLldbSessions(text) {
   const trimmed = text.replace(/^\(lldb\) /, "");
   return trimmed.split(/\n\(lldb\) /).map((raw) => {
@@ -1023,27 +1067,121 @@ function parseLldbImageSlide(output) {
   return match ? {slide: Number(match[1]), imagePath: match[2].trim()} : null;
 }
 
-// otool -l 的 __TEXT,__text section addr/size, 用来把运行时 pc 换算成 nm 符号表的坐标系.
+// otool -l 的 __TEXT,__text section addr/size/offset, 用来把运行时 pc 换算成 nm 符号表的
+// 坐标系(addr/size), 以及从磁盘文件里原样切出这段 __text 字节(offset, 文件里的字节起点,
+// 与 addr 的 vmaddr 坐标系无关 —— object 文件里 offset 是 mach header+load commands 之后
+// 的字节偏移, 链接产物里 offset 是页对齐后的字节偏移).
 function parseOtoolTextSection(path) {
   if (!existsSync(path)) return null;
   const result = spawnSync("otool", ["-l", path], {encoding: "utf8", timeout: 15000, maxBuffer: 64 * 1024 * 1024});
   if (result.status !== 0 || !result.stdout) return null;
-  const match = result.stdout.match(/sectname __text\s+segname __TEXT\s+addr (0x[0-9a-fA-F]+)\s+size (0x[0-9a-fA-F]+)/);
+  const match = result.stdout.match(/sectname __text\s+segname __TEXT\s+addr (0x[0-9a-fA-F]+)\s+size (0x[0-9a-fA-F]+)\s+offset (\d+)/);
   if (!match) return null;
-  return {addr: Number(match[1]), size: Number(match[2])};
+  return {addr: Number(match[1]), size: Number(match[2]), fileOff: Number(match[3])};
 }
 
+// nm -n 的 T(全局)/t(局部/static) 都要收: provider .o 里大量实际函数(如
+// cheng_core_runtime_program_support_backend__cheng_write_text_file__L6828)是 local
+// symbol, 只认 T 会把它们的地址晒漏成一段无符号区间, 让 nearestPrecedingSymbol 拿一个离得
+// 老远的全局符号硬凑一个荒谬的大 offset(实测: 5 万字节偏移量的假symbol命中).
 function nmTextSymbols(path) {
   if (!existsSync(path)) return [];
   const result = spawnSync("nm", ["-n", path], {encoding: "utf8", timeout: 15000, maxBuffer: 64 * 1024 * 1024});
   if (result.status !== 0 || !result.stdout) return [];
   const symbols = [];
   for (const line of result.stdout.split("\n")) {
-    const match = line.match(/^([0-9a-fA-F]{16})\s+T\s+(\S+)$/);
+    const match = line.match(/^([0-9a-fA-F]{16})\s+[Tt]\s+(\S+)$/);
     if (match) symbols.push({addr: Number(`0x${match[1]}`), name: match[2]});
   }
   symbols.sort((a, b) => a.addr - b.addr);
   return symbols;
+}
+
+// binary 同目录下 `<binary>.provider.<name>.o` 兄弟文件(BackendDriverDispatchMinCompileRuntimeProviderObjects
+// 的落盘约定). darwin_syscall provider 走内容寻址缓存(artifacts/backend_driver/provider_cache/<hash>.o),
+// 不落在这里, 因此这份清单不保证覆盖最终二进制 __text 里的每一段 provider 代码 —— 覆盖不到的区间
+// 如实留 provider-region 不猜.
+function findProviderObjects(binary) {
+  const dir = dirname(binary);
+  if (!existsSync(dir)) return [];
+  const prefix = `${basename(binary)}.provider.`;
+  return readdirSync(dir)
+    .filter((name) => name.startsWith(prefix) && name.endsWith(".o"))
+    .sort()
+    .map((name) => join(dir, name));
+}
+
+function providerModuleName(binary, providerPath) {
+  const prefix = `${basename(binary)}.provider.`;
+  const name = basename(providerPath);
+  return name.startsWith(prefix) && name.endsWith(".o") ? name.slice(prefix.length, -2) : name;
+}
+
+// Cheng 的内部 provider linker(macho_provider_linker.cheng)按 objPaths 顺序把每个 provider .o
+// 的 __text 原样拼接进最终 exe 的 __text, 但落盘产物里不存在任何记录拼接顺序/基址的边车文件:
+// native_link.log 只有 4 个摘要字段没有 object 列表, lldb `image list` 对这种静态拼接的单一
+// Mach-O 也只报一个 image(实测 2026-07-11 于 /tmp/f23/GEN2U 的真实崩溃复现, 两条线索都不成立,
+// 放弃按假设顺序累加 base 的方案 —— 那个方案曾把一段 provider 代码的 offset 算错整整 9288 字节,
+// 拿"最近符号"凑出一个看似合理实则驴唇不对马嘴的 symbol+offset, 逐字节比对才拆穿)。改用内容锚点
+// 搜索: provider 自己的 __text 里在多个位置取几种长度的候选窗口, 在最终二进制 __text 里查找
+// 该窗口的(可能不止一处的)出现位置反推 base, 再用整个 provider 长度做逐字节校验兜底确认 —— 真正
+// 的判据是这个全量校验, 不是"锚点唯一"(实测 core/support 这两个真实 provider 对象里, 128 字节
+// 长的窗口只要跨过一个 call/adrp 重定位字就整窗失配, 必须多试几个窗口才能找到没跨中继字的那个)。
+// 全量校验阈值定在 15%: 真实 provider 因 call/字面量重定位造成的逐字节差异实测 2.6%~4.9%, 而错误
+// 的 base 假设逐字节差异实测 86%+ —— 中间留了巨大安全余量, 不是拍脑袋的容差。全部候选都校验不过
+// 就返回 null, 该 provider 的帧照旧落 provider-region, 不瞎猜。
+function locateProviderBase(binaryTextBytes, providerTextBytes) {
+  if (!binaryTextBytes || !providerTextBytes || providerTextBytes.length === 0) return null;
+  const validate = (base) => {
+    if (base < 0 || base + providerTextBytes.length > binaryTextBytes.length) return false;
+    const candidate = binaryTextBytes.subarray(base, base + providerTextBytes.length);
+    const mismatchLimit = Math.max(128, Math.floor(providerTextBytes.length * 0.15));
+    let mismatches = 0;
+    for (let i = 0; i < candidate.length; i++) {
+      if (candidate[i] !== providerTextBytes[i]) {
+        mismatches++;
+        if (mismatches > mismatchLimit) return false;
+      }
+    }
+    return true;
+  };
+  const anchorLens = [128, 64, 32].filter((len) => len <= providerTextBytes.length);
+  const sampleCount = 8;
+  const maxOccurrencesPerAnchor = 50;
+  for (const anchorLen of anchorLens) {
+    for (let k = 0; k < sampleCount; k++) {
+      const span = providerTextBytes.length - anchorLen;
+      const anchorOffset = span <= 0 ? 0 : Math.floor((span * k) / (sampleCount - 1));
+      const anchor = providerTextBytes.subarray(anchorOffset, anchorOffset + anchorLen);
+      let searchFrom = 0;
+      for (let attempt = 0; attempt < maxOccurrencesPerAnchor; attempt++) {
+        const hit = binaryTextBytes.indexOf(anchor, searchFrom);
+        if (hit < 0) break;
+        if (validate(hit - anchorOffset)) return hit - anchorOffset;
+        searchFrom = hit + 1;
+      }
+    }
+  }
+  return null;
+}
+
+// stopReason 按 Darwin XNU 的 mach exception -> BSD signal 映射(bsd/uxkern/ux_exception.c)分类:
+// EXC_BAD_ACCESS code=1(KERN_INVALID_ADDRESS)->SIGSEGV, 其它 code(如 KERN_PROTECTION_FAILURE)
+// ->SIGBUS; EXC_BAD_INSTRUCTION->SIGILL; EXC_ARITHMETIC->SIGFPE; EXC_BREAKPOINT 且崩点模块是
+// libsystem_malloc.dylib -> malloc 自身堆完整性检查触发的故意陷阱(malloc-integrity-brk), 不是
+// 用户代码断点; abort()/panic() 走 SIGABRT -> panic-exit。
+function classifyStopClass(stopReason, frames) {
+  if (!stopReason) return null;
+  if (/SIGABRT/.test(stopReason)) return "panic-exit";
+  const badAccess = stopReason.match(/EXC_BAD_ACCESS\s*\(code=(-?\d+)/);
+  if (badAccess) return Number(badAccess[1]) === 1 ? "SIGSEGV" : "SIGBUS";
+  if (/EXC_BAD_INSTRUCTION/.test(stopReason)) return "SIGILL";
+  if (/EXC_ARITHMETIC/.test(stopReason)) return "SIGFPE";
+  if (/EXC_BREAKPOINT/.test(stopReason)) {
+    const topModule = frames && frames[0] ? frames[0].module || "" : "";
+    return /libsystem_malloc/.test(topModule) ? "malloc-integrity-brk" : "breakpoint-trap";
+  }
+  return "unknown";
 }
 
 function nearestPrecedingSymbol(symbols, offset) {
@@ -1058,6 +1196,65 @@ function nearestPrecedingSymbol(symbols, offset) {
     }
   }
   return best;
+}
+
+// binary __text 字节 + 各 provider 兄弟 .o 的内容锚点定位结果, 提取自 triageChengBinaryCrash,
+// cheng_corrupt_hunt 的 pc 符号化复用同一份(不重新扫一遍 provider 目录/重新做锚点搜索).
+function buildProviderCandidates(binary, binaryTextBytes) {
+  const providerCandidates = [];
+  if (!binaryTextBytes) return providerCandidates;
+  for (const providerPath of findProviderObjects(binary)) {
+    const providerText = parseOtoolTextSection(providerPath);
+    if (!providerText) continue;
+    let providerBytes;
+    try {
+      providerBytes = readFileSync(providerPath).subarray(providerText.fileOff, providerText.fileOff + providerText.size);
+    } catch {
+      continue;
+    }
+    const base = locateProviderBase(binaryTextBytes, providerBytes);
+    if (base === null) continue;
+    providerCandidates.push({
+      path: providerPath,
+      module: providerModuleName(binary, providerPath),
+      base,
+      size: providerText.size,
+      symbols: nmTextSymbols(providerPath),
+    });
+  }
+  return providerCandidates;
+}
+
+// 纯地址 -> 符号 的核心判定树(不含 bt 帧的 lldbSymbol/foreign-module 包装), 抽出来给
+// cheng_corrupt_hunt 的单点 pc(寄存器读出的崩点/写点)和 triageChengBinaryCrash 的每条 bt 帧共用。
+function symbolizeChengPc(pcNumber, ctx) {
+  if (!ctx.primaryObjectExists) return {symbol: null, providerUnresolved: true, reason: "primary-object-not-found", primaryObject: ctx.primaryObject};
+  if (!ctx.exeText || !ctx.primaryText) return {symbol: null, providerUnresolved: true, reason: "text-section-not-found"};
+  const fileOffset = pcNumber - (ctx.slide || 0) - ctx.exeText.addr;
+  if (fileOffset < 0 || fileOffset >= ctx.primaryText.size) {
+    const hit = ctx.providerCandidates.find((p) => fileOffset >= p.base && fileOffset < p.base + p.size);
+    if (hit) {
+      const localOffset = fileOffset - hit.base;
+      const sym = nearestPrecedingSymbol(hit.symbols, localOffset);
+      if (sym) {
+        return {symbol: sym.name, offset: localOffset - sym.addr, providerUnresolved: false, providerObject: hit.path, providerModule: hit.module};
+      }
+      return {symbol: null, providerUnresolved: true, reason: "provider-before-first-symbol", fileOffset, providerObject: hit.path, providerModule: hit.module};
+    }
+    return {symbol: null, providerUnresolved: true, reason: "provider-region", fileOffset};
+  }
+  const sym = nearestPrecedingSymbol(ctx.nmSymbols, fileOffset);
+  if (!sym) return {symbol: null, providerUnresolved: true, reason: "before-first-symbol", fileOffset};
+  return {symbol: sym.name, offset: fileOffset - sym.addr, providerUnresolved: false};
+}
+
+// bt 帧包装: 帧自带 lldb 已解析的符号(如落在系统 dylib)直接采用; 帧所属模块不是本 binary 的
+// 一律标 foreign-module; 否则委托 symbolizeChengPc 做地址判定。
+function symbolizeFrame(frame, ctx) {
+  if (frame.lldbSymbol) return {...frame, symbol: frame.lldbSymbol, offset: null, providerUnresolved: false};
+  if (frame.module !== ctx.binaryBase) return {...frame, symbol: null, providerUnresolved: true, reason: "foreign-module"};
+  const resolved = symbolizeChengPc(Number(frame.pc), ctx);
+  return {...frame, ...resolved};
 }
 
 // 纯发射 gen2 崩溃(0 行 stderr trace)的实战闭环: 自己起 lldb 跑 binary, 崩点批处理拿 bt/寄存器/
@@ -1083,6 +1280,7 @@ async function triageChengBinaryCrash(input) {
       exited: true,
       exitCode: Number(exitedMatch[1]),
       stopReason: null,
+      stopClass: null,
       faultAddress: null,
       crashInsn: null,
       frames: [],
@@ -1108,22 +1306,23 @@ async function triageChengBinaryCrash(input) {
   const exeText = parseOtoolTextSection(binary);
   const primaryText = primaryObjectExists ? parseOtoolTextSection(primaryObject) : null;
   const nmSymbols = primaryObjectExists ? nmTextSymbols(primaryObject) : [];
-  const symbolicated = frames.map((frame) => {
-    if (frame.lldbSymbol) return {...frame, symbol: frame.lldbSymbol, offset: null, providerUnresolved: false};
-    if (frame.module !== binaryBase) return {...frame, symbol: null, providerUnresolved: true, reason: "foreign-module"};
-    if (!primaryObjectExists) return {...frame, symbol: null, providerUnresolved: true, reason: "primary-object-not-found", primaryObject};
-    if (!exeText || !primaryText) return {...frame, symbol: null, providerUnresolved: true, reason: "text-section-not-found"};
-    const fileOffset = Number(frame.pc) - slide - exeText.addr;
-    if (fileOffset < 0 || fileOffset >= primaryText.size) return {...frame, symbol: null, providerUnresolved: true, reason: "provider-region", fileOffset};
-    const sym = nearestPrecedingSymbol(nmSymbols, fileOffset);
-    if (!sym) return {...frame, symbol: null, providerUnresolved: true, reason: "before-first-symbol", fileOffset};
-    return {...frame, symbol: sym.name, offset: fileOffset - sym.addr, providerUnresolved: false};
-  });
+  let binaryTextBytes = null;
+  if (exeText) {
+    try {
+      binaryTextBytes = readFileSync(binary).subarray(exeText.fileOff, exeText.fileOff + exeText.size);
+    } catch {
+      binaryTextBytes = null;
+    }
+  }
+  const providerCandidates = buildProviderCandidates(binary, binaryTextBytes);
+  const symbolizeCtx = {binaryBase, primaryObject, primaryObjectExists, exeText, primaryText, nmSymbols, providerCandidates, slide};
+  const symbolicated = frames.map((frame) => symbolizeFrame(frame, symbolizeCtx));
   return {
     schema: "cheng_crash_triage_live.v1",
     binary, args, primaryObject,
     exited: false,
     stopReason: stopReasonMatch ? stopReasonMatch[1].trim() : null,
+    stopClass: classifyStopClass(stopReasonMatch ? stopReasonMatch[1].trim() : null, frames),
     faultAddress: faultMatch ? faultMatch[1] : null,
     crashInsn: crashInsnMatch ? {pc: crashInsnMatch[1], insn: crashInsnMatch[2].trim()} : null,
     frames: symbolicated,
@@ -1131,6 +1330,255 @@ async function triageChengBinaryCrash(input) {
     slide,
     timedOut: Boolean(session.timedOut),
     overflow: Boolean(session.overflow),
+  };
+}
+
+const CHENG_FUSION_CORRUPT_HUNT_TIMEOUT_MS_DEFAULT = 60000;
+const CHENG_FUSION_CORRUPT_HUNT_MAXHITS_DEFAULT = 8;
+const CHENG_FUSION_CORRUPT_HUNT_BT_DEPTH = 8;
+
+function toHexAddr(n) {
+  return `0x${Math.trunc(n).toString(16)}`;
+}
+
+function parseCorruptHuntLiteralAddress(text) {
+  const match = String(text || "").trim().match(/^(?:0x)?([0-9a-fA-F]+)$/);
+  return match ? Number(`0x${match[1]}`) : null;
+}
+
+// lldb 地址表达式对寄存器算术是原生支持的(`$x1+16`), 在 -o 命令里直接写这种表达式让 lldb
+// 自己在命令执行的那一刻求值 —— 这是唯一能在单趟批处理里"读一个只有运行时才知道的地址"的
+// 办法(批处理命令是启动时就排好的静态列表, 没有分支/回读上一条命令输出再决定下一条参数的能力)。
+function corruptHuntRegisterOffsetExpr(register, offset) {
+  const n = Number(offset) || 0;
+  return n >= 0 ? `$${register}+${n}` : `$${register}-${Math.abs(n)}`;
+}
+
+function corruptHuntEnvVarsCommand(env) {
+  const merged = {CHENG_PROCESS_MAX_RSS_BYTES: chengFusionRssCapBytes(), ...(env || {})};
+  const tokens = Object.entries(merged).map(([key, value]) => lldbArgQuote(`${key}=${value}`));
+  return `settings set target.env-vars ${tokens.join(" ")}`;
+}
+
+function corruptHuntLaunchCommand(args) {
+  const quoted = (args || []).map(lldbArgQuote).join(" ");
+  return quoted ? `process launch --stop-at-entry -- ${quoted}` : "process launch --stop-at-entry";
+}
+
+// memory read 的一行输出形如 "0x16fdecbf0: 0x6fdeccf0"(地址: 十六进制值), 取冒号后那个值。
+function parseLldbMemoryReadValue(output) {
+  const match = String(output || "").match(/0x[0-9a-fA-F]+:\s*(0x[0-9a-fA-F]+)/);
+  return match ? match[1] : null;
+}
+
+// binary/primaryObject 的 otool/nm 静态上下文, stage1 的断点地址解析和 stage1/stage2 的 pc
+// 符号化共用同一份(不重复读文件/重复跑 nm)。provider 兄弟 .o 的内容锚点定位复用
+// buildProviderCandidates(cheng_crash_triage 同款)。
+function buildChengCorruptHuntContext(binary, primaryObject) {
+  const exeText = parseOtoolTextSection(binary);
+  const primaryObjectExists = Boolean(primaryObject) && existsSync(primaryObject);
+  const primaryText = primaryObjectExists ? parseOtoolTextSection(primaryObject) : null;
+  const nmSymbols = primaryObjectExists ? nmTextSymbols(primaryObject) : [];
+  let binaryTextBytes = null;
+  if (exeText) {
+    try {
+      binaryTextBytes = readFileSync(binary).subarray(exeText.fileOff, exeText.fileOff + exeText.size);
+    } catch {
+      binaryTextBytes = null;
+    }
+  }
+  const providerCandidates = buildProviderCandidates(binary, binaryTextBytes);
+  return {
+    binaryBase: basename(binary),
+    primaryObject,
+    primaryObjectExists,
+    exeText,
+    primaryText,
+    nmSymbols,
+    providerCandidates,
+    slide: 0,
+  };
+}
+
+// breakSymbol 模式: nm -n primaryObject 里找该符号的本地(相对 .o 自身 __text 起点)偏移, 按
+// system-link-exec 的 primary+provider 拼接约定(primary 对象的 __text 落在最终二进制 __text
+// 的文件偏移 0 处, 见 cheng_crash_triage 里 triageChengBinaryCrash 的同一假设)算出最终虚拟地址
+// = exeText.addr + 本地偏移。slide 按 0 处理(lldb 批处理默认 target.disable-aslr=true, 已用
+// `settings show target.disable-aslr` 实测确认;stage1 之后仍会校验断点是否真被命中,假设不成立
+// 会显式报错而不是静默给出一个从未命中的地址)。落在被链接 provider 对象里的符号、或函数体中间的
+// 任意 PC(非符号入口), 不在这个便捷路径覆盖范围内, 调用方应自行算出地址后走 breakAddr。
+function resolveCorruptHuntBreakAddress(input, ctx) {
+  if (input.breakAddr) {
+    const literal = parseCorruptHuntLiteralAddress(input.breakAddr);
+    if (literal === null) throw new Error(`cheng_corrupt_hunt: breakAddr 不是合法的十六进制地址: ${input.breakAddr}`);
+    return literal;
+  }
+  if (!ctx.primaryObjectExists) throw new Error(`cheng_corrupt_hunt: primaryObject 不存在: ${input.primaryObject}`);
+  if (!ctx.exeText) throw new Error(`cheng_corrupt_hunt: 无法用 otool -l 读出 binary 的 __text: ${input.binary}`);
+  const hit = ctx.nmSymbols.find((s) => s.name === input.breakSymbol);
+  if (!hit) throw new Error(`cheng_corrupt_hunt: breakSymbol '${input.breakSymbol}' 在 nm -n ${input.primaryObject} 里未找到`);
+  return ctx.exeText.addr + hit.addr;
+}
+
+// 阶段1: 固定地址断点必须在 --stop-at-entry 之后再下(案卷 docs/patches-form34-layerA-writer.md
+// 已实证的技巧)。整段是单趟批处理: 用寄存器算术表达式(见 corruptHuntRegisterOffsetExpr)在断点
+// 命中的那一刻直接读出 [H] 的初始值, 同时 `register read` 拿到基址寄存器的具体数值, 供 stage2
+// 组装字面量地址用(stage2 是全新进程, watchpoint 的目标地址必须是字面量, 不能再用寄存器表达式)。
+async function chengCorruptHuntStage1(input, ctx) {
+  const breakAddr = resolveCorruptHuntBreakAddress(input, ctx);
+  const breakAddrHex = toHexAddr(breakAddr);
+  const watchExpr = corruptHuntRegisterOffsetExpr(input.watchRegister, input.watchOffset);
+  const registerReadCmd = `register read ${input.watchRegister}`;
+  const memReadCmd = `memory read -fx -s${input.watchSize} -c1 -- ${watchExpr}`;
+  const commands = [
+    corruptHuntEnvVarsCommand(input.env),
+    corruptHuntLaunchCommand(input.args),
+    `breakpoint set -a ${breakAddrHex}`,
+    "continue",
+    registerReadCmd,
+    memReadCmd,
+    `bt ${CHENG_FUSION_CORRUPT_HUNT_BT_DEPTH}`,
+    "quit",
+  ];
+  const session = await runLldbOCommands(input.binary, commands, input.env || {}, {
+    timeoutMs: input.timeoutSec ? Math.round(input.timeoutSec * 1000) : undefined,
+  });
+  const text = session.output;
+  const sessions = splitLldbSessions(text);
+  const continueSession = sessions.find((s) => s.command === "continue");
+  const hitBreakpoint = Boolean(continueSession) && /stop reason = breakpoint/.test(continueSession.output);
+  if (!hitBreakpoint) {
+    return {
+      error: `cheng_corrupt_hunt stage1: 断点 ${breakAddrHex} 从未命中(进程提前退出或地址算错 —— 若走的是 breakSymbol, 检查 ASLR-disabled/base=0 假设是否对这个二进制成立), raw tail: ${takeTrailingText(text, 2000)}`,
+      breakAddrHex,
+      timedOut: Boolean(session.timedOut),
+    };
+  }
+  const registerSession = sessions.find((s) => s.command === registerReadCmd);
+  const registers = registerSession ? parseLldbRegisters(registerSession.output) : {};
+  const registerValueHex = registers[input.watchRegister];
+  if (!registerValueHex) {
+    return {
+      error: `cheng_corrupt_hunt stage1: 断点命中但读不到寄存器 ${input.watchRegister} 的值(寄存器名是否对这个架构合法?), raw tail: ${takeTrailingText(text, 2000)}`,
+      breakAddrHex,
+      timedOut: Boolean(session.timedOut),
+    };
+  }
+  const H = Number(registerValueHex) + (Number(input.watchOffset) || 0);
+  const memSession = sessions.find((s) => s.command === memReadCmd);
+  const initialValue = memSession ? parseLldbMemoryReadValue(memSession.output) : null;
+  const btSession = sessions.find((s) => s.command === `bt ${CHENG_FUSION_CORRUPT_HUNT_BT_DEPTH}`);
+  const bt = btSession ? parseLldbFrames(btSession.output).map((frame) => symbolizeFrame(frame, ctx)) : [];
+  return {
+    breakAddrHex,
+    registerValue: registerValueHex,
+    H,
+    Hhex: toHexAddr(H),
+    initialValue,
+    bt,
+    timedOut: Boolean(session.timedOut),
+    overflow: Boolean(session.overflow),
+  };
+}
+
+const CHENG_CORRUPT_HUNT_CAPABILITY_ERROR_RE = /(watchpoints? are not supported|hardware watchpoints? (are |is )?not supported|could not set variable|error: Watchpoint creation failed|unable to set (hardware )?watchpoint)/i;
+
+// 阶段2: 全新 lldb 进程, 在阶段1 算出的字面量地址 H 上挂 write watchpoint, 无条件顺序排
+// maxHits 组 (continue; memory read H; bt N) —— lldb 批处理没有"命中就停, 没命中就继续等"
+// 这种条件分支能力, 只能把命令预先排够 maxHits 组, 真实命中数不足时多余的 continue 会看到
+// 进程已退出, 照实止步不再往下解析。命中点的 pc/symbol 直接取 bt 第0帧(而不是另跑一次
+// register read pc 再套 symbolizeChengPc 自算) —— bt 帧自带 lldb 用二进制自身调试信息做的
+// 符号化(frame.lldbSymbol), 比 nm(primaryObject) 更准更全, symbolizeChengPc 只是它落在
+// foreign-module/没有 lldbSymbol 时的兜底(symbolizeFrame 已经封装了这个优先级)。
+async function chengCorruptHuntStage2(input, ctx, H) {
+  const Hhex = toHexAddr(H);
+  const maxHits = input.maxHits || CHENG_FUSION_CORRUPT_HUNT_MAXHITS_DEFAULT;
+  const memReadCmd = `memory read -fx -s${input.watchSize} -c1 -- ${Hhex}`;
+  const btCmd = `bt ${CHENG_FUSION_CORRUPT_HUNT_BT_DEPTH}`;
+  const commands = [
+    corruptHuntEnvVarsCommand(input.env),
+    corruptHuntLaunchCommand(input.args),
+    `watchpoint set expression -w write -s ${input.watchSize} -- ${Hhex}`,
+  ];
+  for (let i = 0; i < maxHits; i++) commands.push("continue", memReadCmd, btCmd);
+  commands.push("quit");
+  const session = await runLldbOCommands(input.binary, commands, input.env || {}, {
+    timeoutMs: input.timeoutSec ? Math.round(input.timeoutSec * 1000) : undefined,
+  });
+  const text = session.output;
+  const capabilityMatch = text.match(CHENG_CORRUPT_HUNT_CAPABILITY_ERROR_RE);
+  if (capabilityMatch) {
+    return {capabilityError: capabilityMatch[0], hits: [], Hhex, timedOut: Boolean(session.timedOut), raw: takeTrailingText(text, 4000)};
+  }
+  const sessions = splitLldbSessions(text);
+  const continues = sessions.filter((s) => s.command === "continue");
+  const memReads = sessions.filter((s) => s.command === memReadCmd);
+  const btReads = sessions.filter((s) => s.command === btCmd);
+  const hits = [];
+  for (let i = 0; i < maxHits; i++) {
+    const continueSession = continues[i];
+    if (!continueSession) break;
+    if (/exited with status/.test(continueSession.output) || /invalid process|process is not currently (running|being debugged)/i.test(continueSession.output)) break;
+    const frames = btReads[i] ? parseLldbFrames(btReads[i].output).map((frame) => symbolizeFrame(frame, ctx)) : [];
+    const top = frames[0];
+    if (!top) break;
+    const newValue = memReads[i] ? parseLldbMemoryReadValue(memReads[i].output) : null;
+    hits.push({
+      hit: i,
+      pc: top.pc,
+      symbol: top.symbol,
+      offset: top.offset,
+      providerUnresolved: top.providerUnresolved,
+      reason: top.reason,
+      providerObject: top.providerObject,
+      providerModule: top.providerModule,
+      newValue,
+      frames,
+    });
+  }
+  return {hits, Hhex, exhausted: hits.length >= maxHits, timedOut: Boolean(session.timedOut), overflow: Boolean(session.overflow)};
+}
+
+// cheng_corrupt_hunt: 两阶段 lldb watchpoint 写点定位(F23/F34 层A 案卷同款方法, 见
+// docs/patches-form34-layerA-writer.md)。阶段1 在检测点断点读出被害地址 H 的初始值; 阶段2 全新
+// 进程在 H 上挂写监视点, 顺着 maxHits 次命中把真正的写入指令(及其调用栈)钉出来 —— 这正是那份案卷
+// 里"stp x29,x30,[sp] 落在一个仍存活的祖先局部变量地址上"这类栈帧重叠/跨帧腐蚀问题的取证方法论,
+// 工具化成可重复调用的两段式流程。跨 run(阶段1 与阶段2 是两个独立 lldb 进程)的地址稳定性依赖
+// lldb 默认 target.disable-aslr=true(已用 `settings show target.disable-aslr` 实测确认), 是
+// 调用方前提而非本工具的兜底保证 —— binary/args/env 任一变化都可能改变地址, 调用方需自行保证
+// 两阶段用同一份 binary/args/env。
+async function chengCorruptHunt(input) {
+  if (!existsSync(input.binary)) throw new Error(`cheng_corrupt_hunt: binary not found: ${input.binary}`);
+  const hasBreakAddr = typeof input.breakAddr === "string" && input.breakAddr.length > 0;
+  const hasBreakSymbol = typeof input.breakSymbol === "string" && input.breakSymbol.length > 0;
+  if (hasBreakAddr === hasBreakSymbol) throw new Error("cheng_corrupt_hunt: provide exactly one of breakAddr, or breakSymbol (with primaryObject)");
+  if (hasBreakSymbol && !input.primaryObject) throw new Error("cheng_corrupt_hunt: breakSymbol requires primaryObject for nm resolution");
+  const primaryObject = input.primaryObject || null;
+  const ctx = buildChengCorruptHuntContext(input.binary, primaryObject);
+  const stage1 = await chengCorruptHuntStage1(input, ctx);
+  if (stage1.error) {
+    return {schema: "cheng_corrupt_hunt.v1", binary: input.binary, args: input.args || [], stage1, hits: [], error: stage1.error};
+  }
+  const stage2 = await chengCorruptHuntStage2(input, ctx, stage1.H);
+  return {
+    schema: "cheng_corrupt_hunt.v1",
+    binary: input.binary,
+    args: input.args || [],
+    watchRegister: input.watchRegister,
+    watchOffset: input.watchOffset,
+    watchSize: input.watchSize,
+    stage1: {
+      breakAddr: stage1.breakAddrHex,
+      H: stage1.Hhex,
+      initialValue: stage1.initialValue,
+      registerValue: stage1.registerValue,
+      bt: stage1.bt,
+    },
+    hits: stage2.hits,
+    hitCount: stage2.hits.length,
+    exhausted: stage2.exhausted,
+    capabilityError: stage2.capabilityError || null,
+    timedOut: Boolean(stage1.timedOut || stage2.timedOut),
   };
 }
 
@@ -1663,6 +2111,79 @@ function nmDefinedTemplateMangledTextSymbols(objectPath) {
   return out;
 }
 
+// nm -jUP: 一行一个已定义 symbol, 列 = name type addr size, 对 .o 和已链接可执行文件同样适用。
+// 只取全局(大写) T(text/code): 局部符号(小写 t, 如 cheng_cold 生成的 .L 标签)不是稳定的跨世代
+// 比对单位。
+function nmDefinedGlobalTextSymbolNames(objectPath) {
+  const result = runProbeTool("nm", ["-jUP", objectPath], "nm");
+  if (result.status !== 0) throw new Error(`nm -jUP exited ${result.status}: ${takeTrailingText(result.stderr, 2000)}`);
+  const out = [];
+  for (const rawLine of result.stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const cols = line.split(/\s+/);
+    if (cols.length < 2 || cols[1] !== "T") continue;
+    out.push(cols[0]);
+  }
+  return out;
+}
+
+// 符号名前缀聚类: 剥掉 mangling 前导下划线, 取 "std_" 这类小写 snake 前缀, 否则取首个
+// CamelCase 词(如 "PrimaryObjectPlan" -> "Primary", "TypedExprEval" -> "Typed"), 否则退化
+// 成截取前 10 字符。这不是精确的模块归属, 只用于世代比对里给差分集一个可读的分布摘要。
+function chengSymbolPrefixBucket(name) {
+  const clean = String(name || "").replace(/^_+/, "");
+  if (!clean) return "(empty)";
+  const snake = clean.match(/^([a-z][a-z0-9]*_)/);
+  if (snake) return snake[1];
+  const camel = clean.match(/^([A-Z][a-z0-9]*)/);
+  if (camel) return camel[1];
+  return clean.slice(0, 10);
+}
+
+function chengSymbolPrefixClusters(names) {
+  const counts = new Map();
+  for (const name of names) {
+    const bucket = chengSymbolPrefixBucket(name);
+    counts.set(bucket, (counts.get(bucket) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([prefix, count]) => ({prefix, count}));
+}
+
+// 双二进制(.o 或可执行文件, 世代 A/B 任意组合)已定义全局 T 符号集差分: onlyInA/onlyInB/common
+// 计数 + 各自的名字列表(供调用方精确定位) + 按前缀聚类的分布摘要, 免去手工 nm+sort+diff。
+// common 集合在两份世代相近的二进制间通常有数千项且信号价值低, 默认只报计数, 需要全量时传
+// includeCommon:true 显式要价。onlyInA/onlyInB 是真正的差分信号, 默认全量返回但受 limit 封顶。
+function compareChengBinarySymbols(objectAPath, objectBPath, options = {}) {
+  const namesA = nmDefinedGlobalTextSymbolNames(objectAPath);
+  const namesB = nmDefinedGlobalTextSymbolNames(objectBPath);
+  const setA = new Set(namesA);
+  const setB = new Set(namesB);
+  const onlyInA = namesA.filter((name) => !setB.has(name)).sort();
+  const onlyInB = namesB.filter((name) => !setA.has(name)).sort();
+  const commonCount = namesA.reduce((count, name) => count + (setB.has(name) ? 1 : 0), 0);
+  const limit = options.limit || 2000;
+  return {
+    schema: "cheng_symbol_diff_compare.v1",
+    objectA: objectAPath,
+    objectB: objectBPath,
+    countA: namesA.length,
+    countB: namesB.length,
+    countOnlyInA: onlyInA.length,
+    countOnlyInB: onlyInB.length,
+    countCommon: commonCount,
+    onlyInA: onlyInA.slice(0, limit),
+    onlyInB: onlyInB.slice(0, limit),
+    onlyInATruncated: onlyInA.length > limit,
+    onlyInBTruncated: onlyInB.length > limit,
+    common: options.includeCommon ? namesA.filter((name) => setB.has(name)).sort().slice(0, limit) : undefined,
+    clustersOnlyInA: chengSymbolPrefixClusters(onlyInA),
+    clustersOnlyInB: chengSymbolPrefixClusters(onlyInB),
+  };
+}
+
 // __L 之前的 base 形如 "<modulePath>__<FuncName>"(见 PrimarySanitizeSymbolPart: "::" 两个冒号各自
 // 被替换成 "_", 拼出双下划线作为模块路径/函数名分隔符); 取最后一个 "__" 之后的片段作为函数名,
 // 不去正向重建模块路径(避免模块目录命名规则的脆弱反推), 靠函数名+精确行号回源定位。
@@ -1854,6 +2375,8 @@ export {
   textResult,
   jsonResult,
   takeTrailingText,
+  parseZcNotReady,
+  parseZcNotReadyLineFull,
   createChengTextTool,
   resolveChengProjectRoot,
   withChengInvocationContext,
@@ -1886,8 +2409,10 @@ export {
   chengLspEnsureDocOpen,
   parseCrash,
   triageChengBinaryCrash,
+  chengCorruptHunt,
   readLineMap,
   snapshotChengSymbols,
+  compareChengBinarySymbols,
   profileDriverForReport,
   profileDriverForRun,
   profileResult,

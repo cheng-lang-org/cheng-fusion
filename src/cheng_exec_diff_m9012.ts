@@ -6,9 +6,9 @@
 import {createHash} from "node:crypto";
 import {mkdtempSync, rmSync, existsSync} from "node:fs";
 import {tmpdir} from "node:os";
-import {isAbsolute, join} from "node:path";
+import {isAbsolute, join, resolve} from "node:path";
 import {b as defineModuleInitializer} from "./runtime.ts";
-import {createChengTextTool,jsonResult,resolveChengProjectRoot,runChengDriver,takeTrailingText,initChengToolkitModule,zodSchema} from "./cheng_toolkit_m9000.ts";
+import {createChengTextTool,jsonResult,parseZcNotReady,resolveChengProjectRoot,runChengDriver,takeTrailingText,initChengToolkitModule,zodSchema} from "./cheng_toolkit_m9000.ts";
 
 var chengExecDiffInputSchema,ChengExecDiffTool;
 
@@ -21,38 +21,28 @@ function normalizeMaybeFileUri(value) {
 // driverA/driverB 常常不是同一份 "受信" driver(实验分支产物、/tmp 下的临时构建), 所以这里
 // 不复用 createChengTextTool 默认的 assertChengProjectInputPaths(那只认 file/source/... 键,
 // 且要求路径落在 root 内) —— fixture/driverA/driverB 就是刻意允许指向 root 之外的路径。
+//
+// 入口即绝对化: 相对路径若直接传给 spawn(driver,...,{cwd:root}), Node 对含路径分隔符的
+// command 是按父进程 process.cwd() 解析可执行文件本身, 但子进程的实际 cwd 是 root —— 两者
+// 不一致时, 若 driver 内部用 argv[0] 做自相对定位(找同目录 provider .o), 会在错误的 cwd 下
+// 解析出错误路径, 静默 "provider compile failed"。用 resolve() 把入口路径钉死成绝对路径,
+// 让 argv[0] 与实际 cwd 无关, 一次性堵死。
 function resolveArbitraryPath(value, label) {
   if (!value) throw new Error(`${label} is required`);
-  const path = normalizeMaybeFileUri(value);
+  const path = resolve(normalizeMaybeFileUri(value));
   if (!existsSync(path)) throw new Error(`${label} not found: ${path}`);
   return path;
 }
 
 function resolveFixturePath(value, root, label) {
   const text = normalizeMaybeFileUri(value);
-  const path = isAbsolute(text) ? text : join(root, text);
+  const path = resolve(isAbsolute(text) ? text : join(root, text));
   if (!existsSync(path)) throw new Error(`${label} not found: ${path}`);
   return path;
 }
 
 function sha256Digest(text) {
   return `sha256:${createHash("sha256").update(String(text || ""), "utf8").digest("hex")}`;
-}
-
-// ZC_NOT_READY idx=E/T function=NAME body_kind=KIND detail=... line=NUM fz_kind=... stmt_kind=... bail=NUM slot_diag=...
-const ZC_NOT_READY_LINE = /^ZC_NOT_READY idx=(\d+)\/(\d+) function=(\S+) body_kind=(\S+) .*?\bbail=(-?\d+)\b/m;
-const ZC_NOT_READY_TOTAL = /^ZC_NOT_READY_TOTAL count=(\d+)/m;
-
-function parseZcNotReady(text) {
-  const combined = String(text || "");
-  const entries = [];
-  const lineRe = new RegExp(ZC_NOT_READY_LINE.source, "gm");
-  let match;
-  while ((match = lineRe.exec(combined)) !== null) {
-    entries.push({function: match[3], bodyKind: match[4], bail: Number(match[5])});
-  }
-  const totalMatch = combined.match(ZC_NOT_READY_TOTAL);
-  return {entries, total: totalMatch ? Number(totalMatch[1]) : entries.length};
 }
 
 async function compileWithDriver(driver, fixturePath, root, outPath, timeoutMs) {

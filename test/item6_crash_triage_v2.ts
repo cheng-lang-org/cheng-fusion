@@ -91,8 +91,16 @@ async function testGen2mRealDriverCrashIfPresent() {
     assertTrue(/EXC_BAD_ACCESS/.test(parsed.stopReason || ""), `stopReason 含 EXC_BAD_ACCESS, 实得 ${parsed.stopReason}`);
     const resolvedNames = (parsed.frames || []).filter((f: any) => f.providerUnresolved === false).map((f: any) => f.symbol);
     assertTrue(resolvedNames.some((name: string) => /BackendDriverDispatchMin/.test(name || "")), `nm/otool 兜底路径解析出真实 Cheng 函数名, 实得: ${JSON.stringify(resolvedNames)}`);
+    // v3(crash_triage_m9004): 崩点自身落在 primary.o 声明的 __text size 之外, 但 GEN2M 同目录的
+    // <name>.provider.*.o 兄弟文件把它接住了(内容锚点定位 provider 基址 + nm 符号化), 不再是 v2
+    // 时代如实报 provider-unresolved 的终点 —— 这里改验证 v3 真符号化到了 provider 侧函数名,
+    // 任何仍未解析的帧必须仍如实标注可识别的 provider reason, 不允许静默瞎猜.
+    const allowedUnresolvedReasons = new Set(["provider-region", "provider-before-first-symbol"]);
     const providerFrames = (parsed.frames || []).filter((f: any) => f.providerUnresolved === true);
-    assertTrue(providerFrames.length > 0 && providerFrames.every((f: any) => f.reason === "provider-region"), `崩点自身落在 primary.o 声明的 __text size 之外, 如实标 provider-unresolved 而非瞎猜符号, 实得: ${JSON.stringify(providerFrames.map((f: any) => f.reason))}`);
+    assertTrue(providerFrames.every((f: any) => allowedUnresolvedReasons.has(f.reason)), `仍未解析的帧必须如实标注 provider reason, 实得: ${JSON.stringify(providerFrames.map((f: any) => f.reason))}`);
+    const providerResolvedFrames = (parsed.frames || []).filter((f: any) => f.providerUnresolved === false && f.providerModule);
+    assertTrue(providerResolvedFrames.length > 0, `v3 应把落在 provider 区间的帧符号化为真实 provider 函数名, 实得 frames: ${JSON.stringify(parsed.frames)}`);
+    assertTrue(parsed.stopClass === "SIGSEGV", `v3 stopClass 按 Darwin mach 异常映射分类, 实得 ${parsed.stopClass}`);
   } finally {
     mcp.kill();
     rmSync(dir, {recursive: true, force: true});
