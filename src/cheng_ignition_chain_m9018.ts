@@ -24,8 +24,8 @@ import {createChengTextTool, jsonResult, CHENG_STAGE3_DRIVER, initChengToolkitMo
 var chengIgnitionChainInputSchema, ChengIgnitionChainTool;
 
 const CHENG_FUSION_PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const DEFAULT_TREE_ROOT = "/tmp/f23/tree";
-const DEFAULT_WORK_DIR = "/tmp/f23/chain_runs";
+const DEFAULT_TREE_ROOT = "/Users/lbcheng/cheng-f24/tree_rebuilt_snap";
+const DEFAULT_WORK_DIR = "/Users/lbcheng/cheng-f24/chain_runs";
 const DEFAULT_MATRIX_PATH = join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/matrix.json");
 const MASKED_CMP_PATH = join(CHENG_FUSION_PACKAGE_ROOT, "tools/macho_masked_cmp.py");
 const DRIVER_SRC_RELATIVE = "src/core/tooling/backend_driver_dispatch_min.cheng";
@@ -414,9 +414,9 @@ var initChengIgnitionChainModule = defineModuleInitializer(() => {
   initChengToolkitModule();
   chengIgnitionChainInputSchema = zodSchema.strictObject({
     action: zodSchema.enum(["start", "status"]).describe("start = render+launch a detached ignition chain run; status = poll an existing run by runId."),
-    treeRoot: zodSchema.string().optional().describe("[start] Cheng project tree root passed to --root:. Defaults to /tmp/f23/tree."),
+    treeRoot: zodSchema.string().optional().describe("[start] Cheng project tree root passed to --root:. Defaults to /Users/lbcheng/cheng-f24/tree_rebuilt_snap."),
     seed: zodSchema.string().optional().describe("[start] Cold compiler binary used to bake the DRV stage. Defaults to the cheng.stage3 bootstrap seed."),
-    workDir: zodSchema.string().optional().describe("Base directory for run subdirectories (runId is appended). Defaults to /tmp/f23/chain_runs. Also read by action=status to locate the run."),
+    workDir: zodSchema.string().optional().describe("Base directory for run subdirectories (runId is appended). Defaults to /Users/lbcheng/cheng-f24/chain_runs. Also read by action=status to locate the run."),
     stages: zodSchema.strictObject({
       gen2: zodSchema.boolean().optional().describe("Self-recompile the backend driver with itself (~20+ min). Default true. Set false for a probes-only run."),
       terminal: zodSchema.boolean().optional().describe("Run the terminal fixture net (triv/g12/f8repro by default) with the GEN2 driver. Default true. No-op if gen2=false."),

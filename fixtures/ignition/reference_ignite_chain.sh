@@ -1,5 +1,5 @@
 #!/bin/zsh
-W=/tmp/f23
+W=/Users/lbcheng/cheng-f24
 S=/Users/lbcheng/cheng-lang/artifacts/bootstrap/cheng.stage3
 E() { echo "[ign52] $@"; }
 unset CHENG_NO_BACKEND_DRIVER_HANDOFF CHENG_REQUIRE_PURE_PROVIDERS 2>/dev/null
