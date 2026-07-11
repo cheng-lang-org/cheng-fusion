@@ -44,6 +44,6 @@ $W/GEN2AB system-link-exec --root:$W/tree --in:$W/tree/src/core/tooling/backend_
 D=$?
 [ $D -eq 0 ] && [ -x $W/GEN3W ] || { E "GEN3W_RED rc=$D"; exit 7; }
 E "GEN3W_GREEN size=$(stat -f %z $W/GEN3W)"
-MASK=$(python3 /tmp/integ/macho_masked_cmp.py $W/GEN2AB $W/GEN3W 2>&1 | tail -2 | tr '\n' ' ')
+MASK=$(python3 "$(dirname "$0")/../../tools/macho_masked_cmp.py" $W/GEN2AB $W/GEN3W 2>&1 | tail -2 | tr '\n' ' ')
 E "FIXPOINT masked: $MASK"
 E "★★★IGNITION_SEQUENCE_COMPLETE"
