@@ -53,7 +53,9 @@ function parseZcEnumerateStdout(stdout) {
       const match = line.match(ZC_HISTOGRAM_LINE);
       if (match) histogram.push({bail: match[1], count: Number(match[2])});
     } else if (section === "rows") {
-      if (line.trim()) rows.push(parseZcCensusRow(line));
+      // Row lines are pipe-separated (function|body_kind|...); tool-status lines
+      // like "zc_cache=miss key=..." or "KEEP zc_enumerate work=..." are not rows.
+      if (line.trim() && line.includes("|")) rows.push(parseZcCensusRow(line));
     }
   }
   return {fields, histogram, rows};

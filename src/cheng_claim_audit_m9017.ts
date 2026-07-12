@@ -30,7 +30,7 @@ import {createChengTextTool, jsonResult, initChengToolkitModule, zodSchema} from
 
 var chengClaimAuditInputSchema, ChengClaimAuditTool;
 
-const DEFAULT_POBJ_PATH = "/Users/lbcheng/cheng-f24/tree/src/core/backend/primary_object_plan.cheng";
+const DEFAULT_POBJ_PATH = "/Users/lbcheng/cheng-lang/src/core/backend/primary_object_plan.cheng";
 const DEFAULT_CONTEXT_LINES = 30;
 
 const NODE_EVAL_ONLY_OWN_CALL = /PrimaryBodyIrNodeEvalOnlyOwn\s*\(/;
