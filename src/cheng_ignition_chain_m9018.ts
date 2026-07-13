@@ -35,34 +35,34 @@ const DEFAULT_RSS_CAP_BYTES = "12884901888";
 
 // 与 reference_ignite_chain.sh 逐条一致(见该脚本的 11 探针 for 循环)。
 const DEFAULT_PROBES = [
-  {name: "triv", fixture: "/tmp/lenfix/triv.cheng", expect: 7},
-  {name: "rbytes", fixture: "/tmp/wipv11/rbytes.cheng", expect: 5},
-  {name: "s4dbg", fixture: "/tmp/bisect11/s4_debug_readwrite.cheng", expect: 5},
-  {name: "rerr", fixture: "/tmp/wipv11/rerr.cheng", expect: 0},
-  {name: "s4b", fixture: "/tmp/bisect11/s4b_strconcat_chain_isolated.cheng", expect: 0},
-  {name: "nsa", fixture: "/tmp/nsa/nsatest.cheng", expect: 0},
-  {name: "f8repro", fixture: "/tmp/f8b/f8repro.cheng", expect: 0},
-  {name: "g12", fixture: "/tmp/f11/g12.cheng", expect: 0},
-  {name: "iso13", fixture: "/tmp/f13/repro/isolate13.cheng", expect: 0},
-  {name: "iso7", fixture: "/tmp/f13/repro/isolate7.cheng", expect: 0},
-  {name: "iso9", fixture: "/tmp/f13/repro/isolate9.cheng", expect: 0},
+  {name: "triv", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/triv.cheng"), expect: 7},
+  {name: "rbytes", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/rbytes.cheng"), expect: 5},
+  {name: "s4dbg", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/s4_debug_readwrite.cheng"), expect: 5},
+  {name: "rerr", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/rerr.cheng"), expect: 0},
+  {name: "s4b", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/s4b_strconcat_chain_isolated.cheng"), expect: 0},
+  {name: "nsa", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/nsatest.cheng"), expect: 0},
+  {name: "f8repro", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/f8repro.cheng"), expect: 0},
+  {name: "g12", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/g12.cheng"), expect: 0},
+  {name: "iso13", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/isolate13.cheng"), expect: 0},
+  {name: "iso7", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/isolate7.cheng"), expect: 0},
+  {name: "iso9", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/isolate9.cheng"), expect: 0},
 ];
 
 // 与 reference_ignite_chain.sh 的终端三站一致。
 const DEFAULT_TERMINAL = [
-  {name: "triv", fixture: "/tmp/lenfix/triv.cheng", expect: 7},
-  {name: "g12", fixture: "/tmp/f11/g12.cheng", expect: 0},
-  {name: "f8repro", fixture: "/tmp/f8b/f8repro.cheng", expect: 0},
+  {name: "triv", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/triv.cheng"), expect: 7},
+  {name: "g12", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/g12.cheng"), expect: 0},
+  {name: "f8repro", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/f8repro.cheng"), expect: 0},
 ];
 
 // 与 reference_ignite_chain.sh 的 oracle 六件套一致(固定内置, 不走 matrix tag)。
 const DEFAULT_ORACLE = [
-  {name: "min", fixture: "/tmp/enum11/minimal/min.cheng", expect: 0},
-  {name: "s2", fixture: "/tmp/bisect11/s2_str_seq_clone.cheng", expect: 0},
-  {name: "orbytes", fixture: "/tmp/wipv11/rbytes.cheng", expect: 5},
-  {name: "onsa", fixture: "/tmp/nsa/nsatest.cheng", expect: 0},
-  {name: "os4b", fixture: "/tmp/bisect11/s4b_strconcat_chain_isolated.cheng", expect: 0},
-  {name: "oiso13", fixture: "/tmp/f13/repro/isolate13.cheng", expect: 0},
+  {name: "min", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/min.cheng"), expect: 0},
+  {name: "s2", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/s2_str_seq_clone.cheng"), expect: 0},
+  {name: "orbytes", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/rbytes.cheng"), expect: 5},
+  {name: "onsa", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/nsatest.cheng"), expect: 0},
+  {name: "os4b", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/s4b_strconcat_chain_isolated.cheng"), expect: 0},
+  {name: "oiso13", fixture: join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/isolate13.cheng"), expect: 0},
 ];
 
 function resolveAbsPath(value) {
