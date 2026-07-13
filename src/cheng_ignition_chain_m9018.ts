@@ -29,6 +29,9 @@ const DEFAULT_WORK_DIR = "/Users/lbcheng/cheng-f24/chain_runs";
 const DEFAULT_MATRIX_PATH = join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/matrix.json");
 const MASKED_CMP_PATH = join(CHENG_FUSION_PACKAGE_ROOT, "tools/macho_masked_cmp.py");
 const DRIVER_SRC_RELATIVE = "src/core/tooling/backend_driver_dispatch_min.cheng";
+// 12GiB: 历史硬编码值, 保留为默认不破坏现有调用方行为。实测 gen2 代际 driver 编全树峰值
+// 已到 ~14-16GB, gen3 阶段常年撞这个 cap —— 故 gen3 阶段可用 gen3RssCapBytes 单独覆盖。
+const DEFAULT_RSS_CAP_BYTES = "12884901888";
 
 // 与 reference_ignite_chain.sh 逐条一致(见该脚本的 11 探针 for 循环)。
 const DEFAULT_PROBES = [
@@ -107,6 +110,15 @@ function loadMatrixTagEntries(matrixPath, tag) {
   return out;
 }
 
+function normalizeRssCapBytes(value, fallback, label) {
+  if (value === undefined || value === null) return String(fallback);
+  const num = Number(value);
+  if (!Number.isInteger(num) || num <= 0) {
+    throw new Error(`${label} must be a positive integer byte count, got: ${value}`);
+  }
+  return String(num);
+}
+
 function generateRunId() {
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "");
   return `ignite_${stamp}_${randomBytes(3).toString("hex")}`;
@@ -127,7 +139,8 @@ W = CONFIG["workDir"]
 TREE = CONFIG["treeRoot"]
 JOURNAL = os.path.join(W, "journal.jsonl")
 PIDFILE = os.path.join(W, "chain.pid")
-RSS_CAP = "12884901888"
+RSS_CAP = str(CONFIG["rssCapBytes"])
+GEN3_RSS_CAP = str(CONFIG["gen3RssCapBytes"])
 
 def log(stage, **fields):
     rec = {"stage": stage, "ts": time.time()}
@@ -136,26 +149,26 @@ def log(stage, **fields):
         f.write(json.dumps(rec) + "\\n")
     print("[chain] stage=%s" % stage, flush=True)
 
-def cheng_env():
+def cheng_env(rss_cap=None):
     env = dict(os.environ)
-    env["CHENG_PROCESS_MAX_RSS_BYTES"] = RSS_CAP
+    env["CHENG_PROCESS_MAX_RSS_BYTES"] = rss_cap or RSS_CAP
     env.pop("CHENG_NO_BACKEND_DRIVER_HANDOFF", None)
     env.pop("CHENG_REQUIRE_PURE_PROVIDERS", None)
     return env
 
-def run_cmd(args, timeout):
+def run_cmd(args, timeout, rss_cap=None):
     t0 = time.time()
     try:
-        p = subprocess.run(args, timeout=timeout, capture_output=True, text=True, env=cheng_env(), cwd=TREE)
+        p = subprocess.run(args, timeout=timeout, capture_output=True, text=True, env=cheng_env(rss_cap), cwd=TREE)
         return {"rc": p.returncode, "stdout": p.stdout or "", "stderr": p.stderr or "", "wallMs": int((time.time() - t0) * 1000), "timedOut": False}
     except subprocess.TimeoutExpired as e:
         out = e.stdout if isinstance(e.stdout, str) else (e.stdout.decode("utf8", "replace") if e.stdout else "")
         err = e.stderr if isinstance(e.stderr, str) else (e.stderr.decode("utf8", "replace") if e.stderr else "")
         return {"rc": None, "stdout": out, "stderr": err + "\\n[chain] timed out after %dms" % int(timeout * 1000), "wallMs": int((time.time() - t0) * 1000), "timedOut": True}
 
-def compile_fixture(driver, src, out, timeout=300):
+def compile_fixture(driver, src, out, timeout=300, rss_cap=None):
     args = [driver, "system-link-exec", "--root:%s" % TREE, "--in:%s" % src, "--emit:exe", "--link-providers", "--target:arm64-apple-darwin", "--out:%s" % out]
-    return run_cmd(args, timeout)
+    return run_cmd(args, timeout, rss_cap=rss_cap)
 
 def run_bin(path, timeout=15):
     return run_cmd([path], timeout)
@@ -236,7 +249,7 @@ def main():
             log("gen3", bakeRc=None, maskedIdentical=None, note="tools/macho_masked_cmp.py not available; gen3 stage skipped")
         else:
             gen3_out = os.path.join(W, "GEN3")
-            r3 = compile_fixture(gen2_out, CONFIG["driverSrc"], gen3_out, timeout=1800)
+            r3 = compile_fixture(gen2_out, CONFIG["driverSrc"], gen3_out, timeout=1800, rss_cap=GEN3_RSS_CAP)
             gen3_ok = r3["rc"] == 0 and os.path.exists(gen3_out)
             if gen3_ok:
                 cmp_r = subprocess.run(["python3", CONFIG["maskedCmpPath"], gen2_out, gen3_out], capture_output=True, text=True, timeout=60)
@@ -323,6 +336,9 @@ async function startIgnitionChain(input) {
 
   const maskedCmpAvailable = existsSync(MASKED_CMP_PATH);
 
+  const rssCapBytes = normalizeRssCapBytes(input.rssCapBytes, DEFAULT_RSS_CAP_BYTES, "rssCapBytes");
+  const gen3RssCapBytes = normalizeRssCapBytes(input.gen3RssCapBytes, rssCapBytes, "gen3RssCapBytes");
+
   const config = {
     treeRoot,
     seed,
@@ -333,6 +349,8 @@ async function startIgnitionChain(input) {
     terminal,
     oracle,
     maskedCmpPath: maskedCmpAvailable ? MASKED_CMP_PATH : null,
+    rssCapBytes,
+    gen3RssCapBytes,
   };
 
   const scriptPath = join(runDir, "chain.py");
@@ -362,6 +380,8 @@ async function startIgnitionChain(input) {
     usedMatrixProbes: matrixProbes.length > 0,
     usedMatrixTerminal: matrixTerminal.length > 0,
     gen3MaskedCmpAvailable: maskedCmpAvailable,
+    rssCapBytes,
+    gen3RssCapBytes,
     note: "Chain started detached; poll with {action:'status', runId, workDir}. Stages gen2/terminal/oracle/gen3 self-recompile the whole backend driver (~20+ minutes each); probes-only (stages:{gen2:false}) completes in ~3 minutes.",
   });
 }
@@ -424,6 +444,8 @@ var initChengIgnitionChainModule = defineModuleInitializer(() => {
       gen3: zodSchema.boolean().optional().describe("Bake a GEN3 driver from GEN2 and masked-byte-compare it against GEN2 (fixed-point check). Default false (this is the slowest, most optional stage)."),
     }).optional().describe("[start] Which chain stages to run beyond drvBake+probes."),
     matrixPath: zodSchema.string().optional().describe("[start] fixtures/ignition/matrix.json-shaped file to source probe/terminal fixtures from tags 'probe'/'terminal'. Defaults to the fusion package's own matrix.json. Falls back to a built-in fixed list when no matching tagged entries exist."),
+    rssCapBytes: zodSchema.number().int().positive().optional().describe("[start] RSS cap in bytes, written as CHENG_PROCESS_MAX_RSS_BYTES for every stage's Cheng driver subprocess (drvBake/probes/gen2Bake/terminal/oracle), and also the gen3 stage's default (see gen3RssCapBytes to override just that one). Defaults to 12884901888 (12 GiB)."),
+    gen3RssCapBytes: zodSchema.number().int().positive().optional().describe("[start] RSS cap in bytes applied only to the gen3 stage's backend-driver self-recompile subprocess. Measured gen2-generation full-tree driver bakes peak ~14-16GB, routinely exceeding the shared 12GiB default cap and stalling gen3. Defaults to rssCapBytes's value (12884901888 / 12 GiB if that is also unset)."),
     runId: zodSchema.string().optional().describe("[status] The runId returned by a prior action=start call."),
   });
   ChengIgnitionChainTool = createChengTextTool({
