@@ -237,7 +237,7 @@ def main():
             outp = os.path.join(W, "o_%s.exe" % item["name"])
             cr = compile_fixture(gen2_out, item["fixture"], outp, timeout=300)
             if cr["rc"] != 0 or not os.path.exists(outp):
-                oracle_results.append({"name": item["name"], "rc": None, "expect": item["expect"], "pass": False, "note": "compile failed"})
+                oracle_results.append({"name": item["name"], "rc": None, "expect": item["expect"], "pass": False, "note": "compile failed", "compileStderrTail": cr["stderr"][-800:]})
                 continue
             rr = run_bin(outp, 10)
             oracle_results.append({"name": item["name"], "rc": rr["rc"], "expect": item["expect"], "pass": rr["rc"] == item["expect"]})
@@ -255,7 +255,7 @@ def main():
                 cmp_r = subprocess.run(["python3", CONFIG["maskedCmpPath"], gen2_out, gen3_out], capture_output=True, text=True, timeout=60)
                 log("gen3", bakeRc=r3["rc"], wallMs=r3["wallMs"], maskedIdentical=(cmp_r.returncode == 0), maskedOutput=(cmp_r.stdout + cmp_r.stderr).strip())
             else:
-                log("gen3", bakeRc=r3["rc"], wallMs=r3["wallMs"], maskedIdentical=None, note="gen3 bake failed", stderrTail=r3["stderr"][-1500:])
+                log("gen3", bakeRc=r3["rc"], wallMs=r3["wallMs"], maskedIdentical=None, note="gen3 bake failed", stderrTail=r3["stderr"][-1500:], stdoutTail=r3["stdout"][-1500:])
 
     gen2_gate = "GREEN" if zc_total == 0 else "ZC_NOT_READY_present"
     return "COMPLETE_gen2=%s_probes=%s_terminal=%s_oracle=%s" % (
