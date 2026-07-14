@@ -80,8 +80,14 @@ extract_rows() {
     ' "$1"
 }
 
+# Completion gate: newer zc_enumerate.sh prints zc_status=completed; older
+# tree-local copies (e.g. f24 campaign tree, discovered 2026-07-15 by the
+# T52-v5 reviewer) never print it but still emit the authoritative
+# zc_missing_function_count line. Accept either marker; only hard-fail when
+# NEITHER is present (true abort/false-green, per zc_enumerate honesty rules).
 for side in a b; do
-    if ! grep -q '^zc_status=completed$' "$WORK/$side.out"; then
+    if ! grep -q '^zc_status=completed$' "$WORK/$side.out" &&
+       ! grep -q '^zc_missing_function_count=' "$WORK/$side.out"; then
         echo "zc_census_diff_error=zc_enumerate_did_not_complete side=$side" >&2
         echo "--- raw output ($side) ---" >&2
         cat "$WORK/$side.out" >&2
