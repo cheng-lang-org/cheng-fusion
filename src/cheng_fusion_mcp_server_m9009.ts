@@ -9,7 +9,7 @@ import {setChengProjectRootHints,withChengInvocationContext,zodToJsonSchema} fro
 
 let mcpWorkspaceRootHints = [];
 let mcpClientCanListRoots = false;
-const chengToolsWithoutProjectRoot = new Set(["cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_claim_audit", "cheng_ignition_chain"]);
+const chengToolsWithoutProjectRoot = new Set(["cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_claim_audit", "cheng_ignition_chain", "cheng_orphan_slot_scan"]);
 const chengMutatingTools = new Set(["cheng_csg_roundtrip", "cheng_profile_report", "cheng_exec_diff", "cheng_zc_census", "cheng_shape_matrix", "cheng_ignition_chain", "cheng_residual_peel"]);
 
 function getChengFusionTools() {

@@ -21,6 +21,7 @@ import {ChengShapeMatrixTool, initChengShapeMatrixModule} from "./cheng_shape_ma
 import {ChengClaimAuditTool, initChengClaimAuditModule} from "./cheng_claim_audit_m9017.ts";
 import {ChengIgnitionChainTool, initChengIgnitionChainModule} from "./cheng_ignition_chain_m9018.ts";
 import {ChengResidualPeelTool, initChengResidualPeelModule} from "./cheng_residual_peel_m9019.ts";
+import {ChengOrphanSlotScanTool, initChengOrphanSlotScanModule} from "./cheng_orphan_slot_scan_m9020.ts";
 
 var chengFusionTools;
 
@@ -41,7 +42,8 @@ var initChengFusionToolRegistryModule = defineModuleInitializer(() => {
   initChengClaimAuditModule();
   initChengIgnitionChainModule();
   initChengResidualPeelModule();
-  chengFusionTools = [ChengCsgQueryTool, ChengEvidenceTool, ChengCsgRoundtripTool, ChengCrashTriageTool, ChengLineMapReadTool, ChengLspQueryTool, ChengProfileReportTool, ChengSymbolDiffTool, ChengExecDiffTool, ChengTemplateLeakAuditTool, ChengZcCensusTool, ChengCorruptHuntTool, ChengShapeMatrixTool, ChengClaimAuditTool, ChengIgnitionChainTool, ChengResidualPeelTool];
+  initChengOrphanSlotScanModule();
+  chengFusionTools = [ChengCsgQueryTool, ChengEvidenceTool, ChengCsgRoundtripTool, ChengCrashTriageTool, ChengLineMapReadTool, ChengLspQueryTool, ChengProfileReportTool, ChengSymbolDiffTool, ChengExecDiffTool, ChengTemplateLeakAuditTool, ChengZcCensusTool, ChengCorruptHuntTool, ChengShapeMatrixTool, ChengClaimAuditTool, ChengIgnitionChainTool, ChengResidualPeelTool, ChengOrphanSlotScanTool];
 });
 
 function getChengFusionTools() {

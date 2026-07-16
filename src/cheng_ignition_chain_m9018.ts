@@ -6,17 +6,18 @@
 // 每个阶段各自往 workDir/<runId>/journal.jsonl 追加一行结构化 JSON; action=status 读
 // journal + pid 存活判定, 供调用方轮询。
 //
-// 阶段字段(与 journal.jsonl 逐行对应): drvBake{rc,ok}, probes{probes:[{name,rc,expect,pass}]},
-// gen2Bake{rc,zcTotal,bails[],ok}, terminal{terminal:[{name,compileRc,runRc,expect,pass}]},
+// 阶段字段(与 journal.jsonl 逐行对应): provenance{seedSha256AtStart/AtRun+match,
+// treeSrcHashAtStart/AtRun+match}(见下方溯源块注释), drvBake{rc,ok,sha256}, probes{probes:[{name,rc,expect,pass}]},
+// gen2Bake{rc,zcTotal,bails[],ok,sha256}, terminal{terminal:[{name,compileRc,runRc,expect,pass}]},
 // oracle{oracle:[{name,rc,expect,pass}]}, gen3{bakeRc,maskedIdentical}, done{verdict}。
 //
 // 探针/终端网优先取 matrixPath 里 tags 含 "probe"/"terminal" 的条目(需同时有 fixture 和
 // expectRc); 当前 matrix.json 没有这两个 tag, 所以默认走内置清单(与
 // reference_ignite_chain.sh 逐条一致的 11 探针 / 3 终端 / 6 oracle, 都是绝对路径 fixture)。
 // oracle 六件套不走 matrix, 固定内置(reference 脚本里没给它任何 tag 挂钩点)。
-import {existsSync, mkdirSync, openSync, readFileSync, writeFileSync} from "node:fs";
-import {randomBytes} from "node:crypto";
-import {dirname, isAbsolute, join, resolve} from "node:path";
+import {existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync} from "node:fs";
+import {createHash, randomBytes} from "node:crypto";
+import {dirname, isAbsolute, join, relative, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {b as defineModuleInitializer} from "./runtime.ts";
 import {createChengTextTool, jsonResult, CHENG_STAGE3_DRIVER, initChengToolkitModule, zodSchema} from "./cheng_toolkit_m9000.ts";
@@ -124,6 +125,48 @@ function generateRunId() {
   return `ignite_${stamp}_${randomBytes(3).toString("hex")}`;
 }
 
+// 溯源(provenance): 今天的真实事故——两条链条只在共享 .bak 路径下的 seed 内容不同, 就产出了
+// 相反的 link 结论, 代价是 4 组 x 19 分钟的错误归因(把 seed 差异误判成了代码/流程差异)。
+// 若 journal 里当场就记了 seed sha256, 这个事故会被立刻看穿。sha256HexOfBuffer/sha256File 只在
+// JS 侧供 action=start 的即时 MCP 响应用; chain.py 里用 hashlib 独立重算同一套算法(而不是把
+// JS 算好的值透传进 CONFIG 直接搬运), 这样若 seed/tree 内容在"MCP 调度时刻"与"chain.py 真正
+// 起跑时刻"之间发生了漂移(正是今天这次事故的形状), AtStart 与 AtRun 两个值会当场对不上,
+// 而不是被悄悄合并成同一个数字掩盖掉。
+function sha256HexOfBuffer(buffer) {
+  return createHash("sha256").update(buffer).digest("hex");
+}
+
+function sha256File(path) {
+  return `sha256:${sha256HexOfBuffer(readFileSync(path))}`;
+}
+
+function walkChengSourceFiles(dir, out) {
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name);
+    let stat;
+    try {
+      stat = statSync(full);
+    } catch {
+      continue;
+    }
+    if (stat.isDirectory()) walkChengSourceFiles(full, out);
+    else if (name.endsWith(".cheng")) out.push(full);
+  }
+}
+
+// treeRoot src-content hash: sha256 over sorted "relpath:sha256hex" lines for every
+// <treeRoot>/src/**/*.cheng file — cheap (a few hundred ms over ~2800 files measured), fully
+// deterministic fingerprint of the whole frontend+backend source closure that actually feeds
+// the driver self-bake, independent of mtimes/renames on a shared .bak path.
+function computeTreeSrcHash(treeRoot) {
+  const srcDir = join(treeRoot, "src");
+  const files = [];
+  if (existsSync(srcDir)) walkChengSourceFiles(srcDir, files);
+  files.sort();
+  const lines = files.map((file) => `${relative(treeRoot, file)}:${sha256HexOfBuffer(readFileSync(file))}`);
+  return `sha256:${createHash("sha256").update(lines.join("\n")).digest("hex")}`;
+}
+
 // 整条链的实体跑在一个自包含 python3 脚本里(而不是 bash), 原因: 每阶段结果都要落成
 // 结构化 JSON 追加进 journal.jsonl —— python 有 json 模块能安全转义任意 stderr/路径文本,
 // bash 手工拼 JSON 字符串在引号/换行上必错。CONFIG 用 JSON 文本嵌入 + json.loads 解析,
@@ -131,7 +174,7 @@ function generateRunId() {
 function renderChainPythonScript(config) {
   const configJson = JSON.stringify(config);
   return `#!/usr/bin/env python3
-import json, os, re, subprocess, sys, time, traceback
+import hashlib, json, os, re, subprocess, sys, time, traceback
 
 CONFIG = json.loads(r'''${configJson}''')
 
@@ -173,6 +216,30 @@ def compile_fixture(driver, src, out, timeout=300, rss_cap=None):
 def run_bin(path, timeout=15):
     return run_cmd([path], timeout)
 
+# 溯源哈希: 与 JS 侧 sha256File/computeTreeSrcHash 同一套算法独立重算(见 cheng_ignition_chain_m9018.ts
+# 顶部注释), 不是把 JS 算好的值直接透传——好让"调度时刻"与"chain.py 真起跑时刻"之间的漂移当场可见。
+def sha256_hex(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def sha256_tag(path):
+    return "sha256:" + sha256_hex(path)
+
+def tree_src_hash(tree_root):
+    src_dir = os.path.join(tree_root, "src")
+    files = []
+    if os.path.isdir(src_dir):
+        for dirpath, _dirnames, filenames in os.walk(src_dir):
+            for name in filenames:
+                if name.endswith(".cheng"):
+                    files.append(os.path.join(dirpath, name))
+    files.sort()
+    lines = ["%s:%s" % (os.path.relpath(f, tree_root), sha256_hex(f)) for f in files]
+    return "sha256:" + hashlib.sha256("\\n".join(lines).encode("utf8")).hexdigest()
+
 ZC_TOTAL_RE = re.compile(r"^ZC_NOT_READY_TOTAL count=(\\d+)", re.M)
 ZC_LINE_RE = re.compile(r"^ZC_NOT_READY idx=\\d+/\\d+ function=(\\S+) body_kind=(\\S+) .*?\\bbail=(-?\\d+)\\b", re.M)
 
@@ -183,10 +250,19 @@ def parse_zc(text):
     return total, bails
 
 def main():
+    seed_sha_at_run = sha256_tag(CONFIG["seed"])
+    tree_hash_at_run = tree_src_hash(TREE)
+    log("provenance",
+        seed=CONFIG["seed"], seedSha256AtStart=CONFIG["seedSha256"], seedSha256AtRun=seed_sha_at_run,
+        seedShaMatch=(seed_sha_at_run == CONFIG["seedSha256"]),
+        treeRoot=TREE, treeSrcHashAtStart=CONFIG["treeSrcHash"], treeSrcHashAtRun=tree_hash_at_run,
+        treeSrcHashMatch=(tree_hash_at_run == CONFIG["treeSrcHash"]))
+
     drv_out = os.path.join(W, "DRV")
     r = compile_fixture(CONFIG["seed"], CONFIG["driverSrc"], drv_out, timeout=300)
     drv_ok = r["rc"] == 0 and os.path.exists(drv_out) and os.access(drv_out, os.X_OK)
-    log("drvBake", rc=r["rc"], wallMs=r["wallMs"], ok=drv_ok, timedOut=r["timedOut"], stderrTail=r["stderr"][-1500:])
+    log("drvBake", rc=r["rc"], wallMs=r["wallMs"], ok=drv_ok, timedOut=r["timedOut"], stderrTail=r["stderr"][-1500:],
+        sha256=(sha256_tag(drv_out) if drv_ok else None))
     if not drv_ok:
         return "ABORTED_DRV_BAKE_FAILED"
 
@@ -210,7 +286,8 @@ def main():
     r2 = compile_fixture(drv_out, CONFIG["driverSrc"], gen2_out, timeout=1800)
     zc_total, bails = parse_zc((r2["stdout"] or "") + "\\n" + (r2["stderr"] or ""))
     gen2_ok = r2["rc"] == 0 and os.path.exists(gen2_out) and os.access(gen2_out, os.X_OK)
-    log("gen2Bake", rc=r2["rc"], wallMs=r2["wallMs"], zcTotal=zc_total, bails=bails, ok=gen2_ok, timedOut=r2["timedOut"], stderrTail=r2["stderr"][-1500:])
+    log("gen2Bake", rc=r2["rc"], wallMs=r2["wallMs"], zcTotal=zc_total, bails=bails, ok=gen2_ok, timedOut=r2["timedOut"], stderrTail=r2["stderr"][-1500:],
+        sha256=(sha256_tag(gen2_out) if gen2_ok else None))
     if not gen2_ok:
         return "ABORTED_GEN2_BAKE_FAILED"
 
@@ -339,6 +416,12 @@ async function startIgnitionChain(input) {
   const rssCapBytes = normalizeRssCapBytes(input.rssCapBytes, DEFAULT_RSS_CAP_BYTES, "rssCapBytes");
   const gen3RssCapBytes = normalizeRssCapBytes(input.gen3RssCapBytes, rssCapBytes, "gen3RssCapBytes");
 
+  // 溯源快照: 在这个 MCP 调用当场算(不是等 detached chain.py 起跑才算), 好让 action=start 的
+  // 响应立刻就能报出来。chain.py 自己在真正起跑时会用 hashlib 独立重算一遍并跟这两个值比对
+  // (journal 的 "provenance" 阶段), 调度时刻与起跑时刻之间若有漂移会当场暴露, 不会被悄悄吞掉。
+  const seedSha256 = sha256File(seed);
+  const treeSrcHash = computeTreeSrcHash(treeRoot);
+
   const config = {
     treeRoot,
     seed,
@@ -351,6 +434,8 @@ async function startIgnitionChain(input) {
     maskedCmpPath: maskedCmpAvailable ? MASKED_CMP_PATH : null,
     rssCapBytes,
     gen3RssCapBytes,
+    seedSha256,
+    treeSrcHash,
   };
 
   const scriptPath = join(runDir, "chain.py");
@@ -372,6 +457,8 @@ async function startIgnitionChain(input) {
     pid: child.pid,
     treeRoot,
     seed,
+    seedSha256,
+    treeSrcHash,
     stages,
     probeCount: probes.length,
     terminalCount: terminal.length,
@@ -419,6 +506,7 @@ async function statusIgnitionChain(input) {
     journalPath,
     running,
     stagesDone,
+    provenance: byStage.get("provenance") || null,
     drvBake: byStage.get("drvBake") || null,
     probes: byStage.get("probes") || null,
     gen2Bake: byStage.get("gen2Bake") || null,
@@ -452,7 +540,7 @@ var initChengIgnitionChainModule = defineModuleInitializer(() => {
     name: "cheng_ignition_chain",
     searchHint: "start/poll a journaled background Cheng ignition chain (DRV bake -> probes -> GEN2 self-bake -> terminal/oracle nets -> optional GEN3+masked fixed-point compare)",
     inputSchema: chengIgnitionChainInputSchema,
-    description: "Productizes the manual ignition determinism chain (fixtures/ignition/reference_ignite_chain.sh) as a journaled background run, because the full chain (GEN2/GEN3 self-recompiles of the backend driver) takes 20+ minutes per stage and cannot block a single MCP tool call. action=start renders a self-contained python3 chain script into workDir/<runId>/, launches it detached (survives this MCP call returning), and returns {runId, journalPath}. Each stage (drvBake, probes, gen2Bake, terminal, oracle, gen3) appends exactly one structured JSON line to journal.jsonl as it completes. action=status reads that journal plus a pid file and returns {running, stagesDone, <perStageResult>, verdictSoFar} for polling. Set stages.gen2=false for a fast (~3 min) probes-only smoke run; leave gen3=false (the default) unless you specifically need the GEN2/GEN3 fixed-point byte comparison.",
+    description: "Productizes the manual ignition determinism chain (fixtures/ignition/reference_ignite_chain.sh) as a journaled background run, because the full chain (GEN2/GEN3 self-recompiles of the backend driver) takes 20+ minutes per stage and cannot block a single MCP tool call. action=start renders a self-contained python3 chain script into workDir/<runId>/, launches it detached (survives this MCP call returning), and returns {runId, journalPath, seedSha256, treeSrcHash}. Each stage appends exactly one structured JSON line to journal.jsonl as it completes: provenance (seed sha256 + <treeRoot>/src/**/*.cheng content hash, both recorded once at MCP-call time and independently re-hashed again at chain.py's actual run start, with a boolean match flag for each — a provenance drift between scheduling a run and it actually starting, e.g. a shared .bak seed path getting overwritten in between, shows up here instead of silently producing a misattributed verdict), drvBake/gen2Bake (each also carries the baked driver binary's own sha256), probes, terminal, oracle, gen3. action=status reads that journal plus a pid file and returns {running, stagesDone, <perStageResult>, verdictSoFar} for polling. Set stages.gen2=false for a fast (~3 min) probes-only smoke run; leave gen3=false (the default) unless you specifically need the GEN2/GEN3 fixed-point byte comparison.",
     prompt: "Use action=start to kick off a chain run (pass stages:{gen2:false,terminal:false,oracle:false,gen3:false} for a quick probes-only check), then poll with action=status + the returned runId until stagesDone includes 'done'. Never expect a single call to block until the chain finishes.",
     toAutoClassifierInput: (input) => `ignition_chain:${input.action}:${input.runId || "new"}`,
     async execute(input) {
