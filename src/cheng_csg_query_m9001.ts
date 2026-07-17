@@ -26,7 +26,7 @@ var initChengCsgQueryModule=defineModuleInitializer(()=>{
     async execute(input){
       const targetPath=input.file||input.source||null;
       const facts=await getChengFacts({root:input.root,file:targetPath});
-      if(!facts)return jsonResult({error:"CSG facts not available",hint:"run cheng_csg_roundtrip with root and source for this Cheng project"});
+      if(!facts)throw new Error("CSG facts not available; run cheng_csg_roundtrip with root and source for this Cheng project");
       const limit=input.limit||50;
       const staleWarning=factsStalenessWarning(facts,targetPath);
       const factsMeta={
@@ -35,21 +35,21 @@ var initChengCsgQueryModule=defineModuleInitializer(()=>{
         ...(staleWarning?{staleWarning}:{}),
       };
       if(input.kind==="symbol"){
-        if(!input.name)return jsonResult({error:"kind=symbol requires name"});
+        if(!input.name)throw new Error("kind=symbol requires name");
         return jsonResult({query:"symbol",root:facts.root,factsPath:facts.factsPath,factsRoot:facts.factsRoot,...factsMeta,name:input.name,matches:lookupByNameInFacts(facts,input.name)});
       }
       if(input.kind==="references"){
-        if(!input.name)return jsonResult({error:"kind=references requires name"});
+        if(!input.name)throw new Error("kind=references requires name");
         const calls=whoCallsInFacts(facts,input.name);
         return jsonResult({query:"references",root:facts.root,factsPath:facts.factsPath,factsRoot:facts.factsRoot,...factsMeta,callee:input.name,totalCallers:calls.length,callers:calls.slice(0,limit).map((call)=>{const caller=facts.funcById.get(call.owner);return{callerId:call.owner,caller:caller?.name,callerSymbol:caller?.symbol,callerLoc:caller?.loc,callLoc:call.loc,loc:call.loc,calleeText:call.calleeText,targetFqName:call.target?.fqName}})});
       }
       let functionId=input.id;
       if(!functionId&&input.name){
         const matches=lookupByNameInFacts(facts,input.name).filter((item)=>item.kind==="csg.function"||item.kind==="csg.async_function"||item.kind==="cheng_cold.function");
-        if(matches.length>1)return jsonResult({error:"function name is overloaded; pass id from kind=symbol",name:input.name,matches:matches.map((item)=>({id:item.id,symbol:item.symbol,loc:item.loc}))});
+        if(matches.length>1)throw new Error(`function name is overloaded; pass id from kind=symbol: ${JSON.stringify(matches.map((item)=>({id:item.id,symbol:item.symbol,loc:item.loc})))}`);
         functionId=matches[0]?.id;
       }
-      if(!functionId)return jsonResult({error:"kind=calls requires id or resolvable function name"});
+      if(!functionId)throw new Error("kind=calls requires id or resolvable function name");
       const calls=callsOfInFacts(facts,functionId);
       return jsonResult({query:"calls",root:facts.root,factsPath:facts.factsPath,factsRoot:facts.factsRoot,...factsMeta,function:functionId,totalCallees:calls.length,callees:calls.slice(0,limit).map((call)=>({callee:call.target?.name||call.calleeText,targetFqName:call.target?.fqName,loc:call.loc}))});
     }

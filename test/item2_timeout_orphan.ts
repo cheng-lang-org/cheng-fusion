@@ -12,7 +12,7 @@
 import {spawnSync} from "node:child_process";
 import {startMcp, assertTrue, sleep} from "./mcp_client.ts";
 
-const CHENG_ROOT = "/Users/lbcheng/cheng-lang";
+const CHENG_ROOT = process.env.CHENG_TOOLCHAIN_ROOT || process.env.CHENG_ROOT || "/Users/lbcheng/cheng-lang";
 
 function pgrepChengLsp(): Set<string> {
   const result = spawnSync("pgrep", ["-f", "artifacts/cheng-lsp"], {encoding: "utf8"});

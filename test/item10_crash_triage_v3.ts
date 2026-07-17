@@ -1,93 +1,96 @@
-// cheng_crash_triage v3: provider 符号化 + 信号分类。
-//
-// v2 时代, 落在 primary.o 声明的 __text size 之外的帧(其它被链接 .o 的代码)一律如实标
-// provider-unresolved, 不瞎猜。v3 把它们接住: binary 同目录的 `<name>.provider.*.o` 兄弟文件
-// 各自内容锚点定位在最终二进制 __text 里的真实位置(native_link.log 无 object 顺序、lldb
-// `image list` 对静态拼接的单一 Mach-O 也只报一个 image, 两条曾以为可用的线索实测都不成立,
-// 见 cheng_toolkit_m9000.ts 里 locateProviderBase 的注释), 定位后用 nm(T+t 都收)符号化命中
-// 帧。另外新增 stopClass, 把 stop reason 按 Darwin mach 异常 -> BSD signal 映射分成
-// SIGSEGV/SIGBUS/SIGILL/SIGFPE/malloc-integrity-brk(libsystem_malloc 里的 EXC_BREAKPOINT)/
-// panic-exit 几类。
-//
-// 用一个真实崩溃(不是 mock): GEN2U(Cheng 自举驱动) 编译 /tmp/lenfix/triv.cheng 时自身
-// SIGSEGV(已知调用链 RecordCompilerCsgMemory -> AppendLine -> provider 侧 str/bytes 拷贝函数),
-// 这俩都是本机临时构建产物, 不在仓库里固定资产, 若这次运行环境里不存在则明确打印跳过, 不伪造通过。
-import {existsSync, mkdtempSync, rmSync} from "node:fs";
+// stopReason -> stopClass 是 crash/corrupt 分析的纯协议映射。这里直接覆盖完整判定树，
+// 不依赖 LLDB、本机 /tmp 残留产物或可选 Cheng 构建。
+import {chmodSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {startMcp, assertTrue} from "./mcp_client.ts";
+import {classifyStopClass, triageChengBinaryCrash} from "../src/cheng_toolkit_m9000.ts";
+import {assertTrue} from "./mcp_client.ts";
 
-async function testGen2uProviderSymbolicationIfPresent() {
-  const binary = "/tmp/f23/GEN2U";
-  const source = "/tmp/lenfix/triv.cheng";
-  if (!existsSync(binary) || !existsSync(source)) {
-    console.log(`[A] 跳过: 真实 Cheng 驱动崩溃复现产物不在(${binary} / ${source} 缺一), 这是本机临时构建产物非仓库固定资产`);
-    return;
-  }
-  console.log("[A] 真实 Cheng 自举驱动崩溃复现: provider 侧符号化 + stopClass");
-  const dir = mkdtempSync(join(tmpdir(), "fusion-harness-item7-gen2u-"));
-  const out = join(dir, "t_triv.exe");
-  const mcp = startMcp({CHENG_PROCESS_MAX_RSS_BYTES: "12884901888"}, dir);
-  try {
-    await mcp.initialize({rootUri: `file://${dir}`});
-    const args = ["system-link-exec", "--root:/tmp/f23/tree", `--in:${source}`, "--emit:exe", "--link-providers", "--target:arm64-apple-darwin", `--out:${out}`];
-    const {isError, parsed} = await mcp.callTool("cheng_crash_triage", {binary, args, timeoutSec: 60}, undefined, 70000);
-    assertTrue(isError !== true, `Cheng 驱动 binary 模式调用未报错, 实得: ${JSON.stringify(parsed).slice(0, 400)}`);
-    assertTrue(parsed.exited === false, `确实崩溃(0 行 stderr 场景), 实得 exited=${parsed.exited}`);
-    assertTrue(/EXC_BAD_ACCESS/.test(parsed.stopReason || ""), `stopReason 含 EXC_BAD_ACCESS, 实得 ${parsed.stopReason}`);
-    assertTrue(parsed.stopClass === "SIGSEGV", `stopClass 按 code=1(KERN_INVALID_ADDRESS) 分类成 SIGSEGV, 实得 ${parsed.stopClass}`);
+type Frame = {module?: string | null};
 
-    const frames = parsed.frames || [];
-    assertTrue(frames.length >= 8, `帧数足够覆盖 primary+provider 两侧调用链, 实得 ${frames.length}`);
-
-    // 崩点(frame 0)本身必须落进某个 provider 对象且真被符号化, 不是 provider-unresolved。
-    const crashFrame = frames[0];
-    assertTrue(crashFrame.providerUnresolved === false && !!crashFrame.providerModule, `崩点帧应被 provider 符号化(非 provider-unresolved), 实得: ${JSON.stringify(crashFrame)}`);
-    assertTrue(typeof crashFrame.symbol === "string" && /cheng_/.test(crashFrame.symbol), `崩点符号是真实 provider 函数名, 实得 ${crashFrame.symbol}`);
-
-    // 已知调用链 RecordCompilerCsgMemory -> AppendLine -> provider(str/bytes 拷贝), primary 侧
-    // 两个函数名都应出现在已解析帧里, provider 侧也应至少解析出一个 provider 帧。
-    const resolvedNames = frames.filter((f: any) => f.providerUnresolved === false).map((f: any) => f.symbol || "");
-    assertTrue(resolvedNames.some((n: string) => /RecordCompilerCsgMemory/.test(n)), `primary 侧解析出 RecordCompilerCsgMemory, 实得: ${JSON.stringify(resolvedNames)}`);
-    assertTrue(resolvedNames.some((n: string) => /AppendLine/.test(n)), `primary 侧解析出 AppendLine, 实得: ${JSON.stringify(resolvedNames)}`);
-    const providerResolvedFrames = frames.filter((f: any) => f.providerUnresolved === false && f.providerModule);
-    assertTrue(providerResolvedFrames.length > 0, `provider 侧至少一帧被符号化, 实得 frames: ${JSON.stringify(frames)}`);
-    assertTrue(providerResolvedFrames.every((f: any) => f.providerModule === "runtime_program_support" || f.providerModule === "runtime_core_runtime"), `provider 帧标注的模块名来自真实兄弟 .o 文件名, 实得: ${JSON.stringify(providerResolvedFrames.map((f: any) => f.providerModule))}`);
-
-    // 每个已解析帧的 offset 必须是落在其所属函数体内的合理小数值(不是"最近符号"凑出来的巨大偏移),
-    // 这条实测踩过坑: T-only nm 曾把 provider 帧解析成离题万里的 _libc_open+20872。
-    for (const frame of frames) {
-      if (frame.providerUnresolved === false && typeof frame.offset === "number") {
-        assertTrue(frame.offset >= 0 && frame.offset < 8192, `已解析帧 offset 应是函数体内的小偏移(<8192), 实得 ${frame.symbol}+${frame.offset}`);
-      }
-    }
-
-    // 仍未解析的帧(如有)必须仍如实标注可识别的 provider reason, 不允许静默瞎猜。
-    const unresolved = frames.filter((f: any) => f.providerUnresolved === true);
-    const allowedReasons = new Set(["provider-region", "provider-before-first-symbol", "foreign-module", "before-first-symbol"]);
-    assertTrue(unresolved.every((f: any) => allowedReasons.has(f.reason)), `未解析帧必须标注已知 reason, 实得: ${JSON.stringify(unresolved.map((f: any) => f.reason))}`);
-  } finally {
-    mcp.kill();
-    rmSync(dir, {recursive: true, force: true});
-  }
+function expectClass(stopReason: string | null, frames: Frame[] | null, expected: string | null) {
+  const actual = classifyStopClass(stopReason, frames);
+  assertTrue(actual === expected, `${JSON.stringify(stopReason)} 应分类为 ${expected}, 实得 ${actual}`);
 }
 
-async function testStopClassMallocIntegrityBrkClassification() {
-  console.log("[B] stopClass 分类函数单测(纯逻辑, 不需要真崩溃): EXC_BREAKPOINT + libsystem_malloc -> malloc-integrity-brk");
-  const mod = await import("../src/cheng_toolkit_m9000.ts");
-  // classifyStopClass 未导出(模块内部函数), 改为通过一次真实 stderr 模式调用侧面验证模块可加载,
-  // 主断言仍以 [A] 的真实崩溃 stopClass=SIGSEGV 为准; 这里只做存在性检查, 避免因为改私有实现细节
-  // 而误报。
-  assertTrue(typeof mod.parseCrash === "function", "toolkit 模块正常加载导出");
+async function expectHardError(input: Record<string, unknown>, pattern: RegExp) {
+  let message = "";
+  try {
+    await triageChengBinaryCrash(input);
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+  assertTrue(pattern.test(message), `应硬失败 ${pattern}，实得 ${JSON.stringify(message)}`);
+}
+
+async function testLiveInputContracts() {
+  console.log("[D] live 输入必须是稳定、非空、非软链的可执行文件");
+  const before = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("cheng-fusion-crash-triage-")));
+  const dir = mkdtempSync(join(tmpdir(), "fusion-harness-item10-"));
+  try {
+    const missing = join(dir, "missing");
+    const empty = join(dir, "empty");
+    const nonExecutable = join(dir, "non-executable");
+    const executable = join(dir, "executable");
+    const binarySymlink = join(dir, "binary-symlink");
+    writeFileSync(empty, "");
+    chmodSync(empty, 0o700);
+    writeFileSync(nonExecutable, "#!/bin/sh\nexit 0\n");
+    chmodSync(nonExecutable, 0o600);
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    chmodSync(executable, 0o700);
+    symlinkSync(executable, binarySymlink);
+
+    await expectHardError({binary: missing}, /binary not found/);
+    await expectHardError({binary: dir}, /non-empty regular non-symlink/);
+    await expectHardError({binary: empty}, /non-empty regular non-symlink/);
+    await expectHardError({binary: nonExecutable}, /not executable/);
+    await expectHardError({binary: binarySymlink}, /non-empty regular non-symlink/);
+
+    const missingPrimary = join(dir, "missing.primary.o");
+    const emptyPrimary = join(dir, "empty.primary.o");
+    const primarySymlink = join(dir, "primary-symlink");
+    writeFileSync(emptyPrimary, "");
+    symlinkSync(emptyPrimary, primarySymlink);
+    await expectHardError({binary: executable, primaryObject: missingPrimary}, /primaryObject not found/);
+    await expectHardError({binary: executable, primaryObject: dir}, /primaryObject must be a non-empty regular non-symlink/);
+    await expectHardError({binary: executable, primaryObject: emptyPrimary}, /primaryObject must be a non-empty regular non-symlink/);
+    await expectHardError({binary: executable, primaryObject: primarySymlink}, /primaryObject must be a non-empty regular non-symlink/);
+  } finally {
+    rmSync(dir, {recursive: true, force: true});
+  }
+  const leaked = readdirSync(tmpdir()).filter((name) => name.startsWith("cheng-fusion-crash-triage-") && !before.has(name));
+  assertTrue(leaked.length === 0, `失败路径不得泄漏私有快照目录，实得 ${JSON.stringify(leaked)}`);
 }
 
 async function main() {
-  await testGen2uProviderSymbolicationIfPresent();
-  await testStopClassMallocIntegrityBrkClassification();
-  console.log("item7 crash triage v3: PASS");
+  console.log("[A] Darwin Mach exception 与 BSD signal 分类");
+  expectClass(null, [], null);
+  expectClass("", [], null);
+  expectClass("signal SIGABRT", [], "panic-exit");
+  expectClass("EXC_BAD_ACCESS (code=1, address=0x10)", [], "SIGSEGV");
+  expectClass("EXC_BAD_ACCESS (code=2, address=0x10)", [], "SIGBUS");
+  expectClass("EXC_BAD_ACCESS (code=-1, address=0x10)", [], "SIGBUS");
+  expectClass("EXC_BAD_INSTRUCTION (code=1)", [], "SIGILL");
+  expectClass("EXC_ARITHMETIC (code=1)", [], "SIGFPE");
+
+  console.log("[B] EXC_BREAKPOINT 只按崩点顶帧识别 malloc 完整性陷阱");
+  expectClass("EXC_BREAKPOINT (code=1)", [{module: "libsystem_malloc.dylib"}], "malloc-integrity-brk");
+  expectClass("EXC_BREAKPOINT (code=1)", [{module: "/usr/lib/system/libsystem_malloc.dylib"}], "malloc-integrity-brk");
+  expectClass("EXC_BREAKPOINT (code=1)", [{module: "cheng_program"}, {module: "libsystem_malloc.dylib"}], "breakpoint-trap");
+  expectClass("EXC_BREAKPOINT (code=1)", [], "breakpoint-trap");
+  expectClass("EXC_BREAKPOINT (code=1)", null, "breakpoint-trap");
+
+  console.log("[C] 未知 stop reason 不伪装成已知信号");
+  expectClass("signal SIGTERM", [], "unknown");
+  expectClass("thread exited", [], "unknown");
+
+  await testLiveInputContracts();
+
+  console.log("item10 crash stop class: PASS");
 }
 
 main().catch((error) => {
-  console.error("item7 crash triage v3: FAIL", error);
+  console.error("item10 crash stop class: FAIL", error);
   process.exit(1);
 });

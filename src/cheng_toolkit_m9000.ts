@@ -1,9 +1,11 @@
 // @ts-nocheck
-import {existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync} from "node:fs";
+import {accessSync, chmodSync, closeSync, constants, existsSync, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, writeSync} from "node:fs";
 import {spawn, spawnSync} from "node:child_process";
-import {basename, dirname, isAbsolute, join, relative, resolve} from "node:path";
+import {basename, dirname, isAbsolute, join, relative, resolve, sep} from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
 import {createHash} from "node:crypto";
+import {tmpdir} from "node:os";
+import {JsonRpcFrameDecoder} from "./json_rpc_frame_decoder.ts";
 import {b as defineModuleInitializer} from "./runtime.ts";
 import * as zodSchema from "zod";
 const initZodModule = () => {};
@@ -32,11 +34,21 @@ let chengProjectRootHints = [];
 // RSS 帽: 每个 Cheng driver 子进程都必须带 CHENG_PROCESS_MAX_RSS_BYTES, 可被 CHENG_FUSION_RSS_CAP 覆盖.
 function chengFusionRssCapBytes() {
   const override = String(process.env.CHENG_FUSION_RSS_CAP || "").trim();
-  return override || CHENG_FUSION_RSS_CAP_BYTES_DEFAULT;
+  const value = override || CHENG_FUSION_RSS_CAP_BYTES_DEFAULT;
+  if (!/^[1-9]\d*$/.test(value) || BigInt(value) > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`CHENG_FUSION_RSS_CAP must be a positive safe integer byte count, got: ${value}`);
+  }
+  return value;
 }
 
-function chengDriverSpawnEnv(extraEnv = {}) {
-  return {...process.env, CHENG_PROCESS_MAX_RSS_BYTES: chengFusionRssCapBytes(), ...extraEnv};
+function chengDriverSpawnEnv(extraEnv = {}, unsetEnv = []) {
+  const inherited = {...process.env};
+  for (const key of unsetEnv) {
+    if (typeof key === "string" && key.length > 0) delete inherited[key];
+  }
+  // The process RSS contract is not an ordinary caller override.  Keep it last so
+  // tool input can never silently remove the process-group memory guard.
+  return {...inherited, ...extraEnv, CHENG_PROCESS_MAX_RSS_BYTES: chengFusionRssCapBytes()};
 }
 
 // 超时孤儿: 单一 env 旋钮 CHENG_FUSION_TIMEOUT_MS, 存在时覆盖所有调用点(不论各自默认值多大).
@@ -193,9 +205,19 @@ function normalizeMaybeFileUri(value) {
 function findChengPackageRoot(startPath) {
   if (!startPath) return null;
   let current = resolve(normalizeMaybeFileUri(startPath));
+  try {
+    current = realpathSync.native(current);
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
   if (pathExistsFile(current)) current = dirname(current);
   for (;;) {
-    if (existsSync(join(current, "cheng-package.toml"))) return current;
+    const manifest = join(current, "cheng-package.toml");
+    try {
+      if (lstatSync(manifest).isFile()) return realpathSync.native(current);
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
     const parent = dirname(current);
     if (parent === current) return null;
     current = parent;
@@ -204,11 +226,22 @@ function findChengPackageRoot(startPath) {
 
 function normalizeChengProjectRoot(root, label = "Cheng project root") {
   const resolvedRoot = resolve(normalizeMaybeFileUri(root));
-  if (!pathExistsDirectory(resolvedRoot)) throw new Error(`${label} does not exist: ${resolvedRoot}`);
-  if (!existsSync(join(resolvedRoot, "cheng-package.toml"))) {
-    throw new Error(`${label} is not a Cheng project root (missing cheng-package.toml): ${resolvedRoot}`);
+  let canonicalRoot;
+  try {
+    canonicalRoot = realpathSync.native(resolvedRoot);
+  } catch {
+    throw new Error(`${label} does not exist: ${resolvedRoot}`);
   }
-  return resolvedRoot;
+  if (!pathExistsDirectory(canonicalRoot)) throw new Error(`${label} is not a directory: ${canonicalRoot}`);
+  const manifest = join(canonicalRoot, "cheng-package.toml");
+  let manifestStat = null;
+  try {
+    manifestStat = lstatSync(manifest);
+  } catch {}
+  if (!manifestStat?.isFile()) {
+    throw new Error(`${label} is not a Cheng project root (missing regular cheng-package.toml): ${canonicalRoot}`);
+  }
+  return canonicalRoot;
 }
 
 function uniqueProjectRoots(candidates) {
@@ -226,24 +259,88 @@ function uniqueProjectRoots(candidates) {
 
 function isInsideOrEqual(path, root) {
   const rel = relative(root, path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
-function assertChengProjectPathBelongsToRoot(value, root, label) {
-  if (!value) return null;
-  const text = normalizeMaybeFileUri(value);
-  const path = isAbsolute(text) ? resolve(text) : resolve(root, text);
+function canonicalExistingAncestor(path) {
+  let cursor = resolve(path);
+  for (;;) {
+    try {
+      lstatSync(cursor);
+      return realpathSync.native(cursor);
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    const parent = dirname(cursor);
+    if (parent === cursor) throw new Error(`no existing ancestor for path: ${path}`);
+    cursor = parent;
+  }
+}
+
+function assertCanonicalPathInsideProject(path, root) {
+  if (!isInsideOrEqual(path, root)) throw new Error(`path resolves outside Cheng project root: ${path}`);
+}
+
+function assertExistingProjectPath(path, root, label) {
+  let canonical;
+  try {
+    canonical = realpathSync.native(path);
+  } catch {
+    throw new Error(`${label} does not exist: ${path}`);
+  }
+  assertCanonicalPathInsideProject(canonical, root);
+  return canonical;
+}
+
+function assertProspectiveProjectPath(path, root, label) {
   assertInsideProject(path, root);
-  const ownerRoot = findChengPackageRoot(path);
-  if (ownerRoot && ownerRoot !== root) {
-    throw new Error(`${label} belongs to a different Cheng project root: ${path} (active=${root}, owner=${ownerRoot})`);
+  let cursor = resolve(path);
+  for (;;) {
+    let stat = null;
+    try {
+      stat = lstatSync(cursor);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`${label} traverses a symbolic link: ${cursor}`);
+      }
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    if (stat) {
+      const canonicalCursor = realpathSync.native(cursor);
+      assertCanonicalPathInsideProject(canonicalCursor, root);
+      if (canonicalCursor === root) return path;
+    }
+    const parent = dirname(cursor);
+    if (parent === cursor) {
+      throw new Error(`${label} is outside Cheng project root: ${path}`);
+    }
+    cursor = parent;
+  }
+}
+
+function assertChengProjectPathBelongsToRoot(value, root, label, mode = "existing") {
+  if (!value) return null;
+  const canonicalRoot = normalizeChengProjectRoot(root);
+  const text = normalizeMaybeFileUri(value);
+  const path = isAbsolute(text) ? resolve(text) : resolve(canonicalRoot, text);
+  assertInsideProject(path, canonicalRoot);
+  const checkedPath = mode === "output"
+    ? assertProspectiveProjectPath(path, canonicalRoot, label)
+    : assertExistingProjectPath(path, canonicalRoot, label);
+  const ownerSearchPath = mode === "output" ? canonicalExistingAncestor(checkedPath) : checkedPath;
+  const ownerRoot = findChengPackageRoot(ownerSearchPath);
+  if (ownerRoot && ownerRoot !== canonicalRoot) {
+    throw new Error(`${label} belongs to a different Cheng project root: ${path} (active=${canonicalRoot}, owner=${ownerRoot})`);
   }
   return path;
 }
 
 function assertChengProjectInputPaths(input = {}, root) {
-  for (const key of ["file", "source", "rawProfile", "facts", "outDir", "out", "reportOut"]) {
-    if (input[key]) assertChengProjectPathBelongsToRoot(input[key], root, key);
+  for (const key of ["file", "source", "rawProfile", "facts"]) {
+    if (input[key]) assertChengProjectPathBelongsToRoot(input[key], root, key, "existing");
+  }
+  for (const key of ["outDir", "out", "reportOut"]) {
+    if (input[key]) assertChengProjectPathBelongsToRoot(input[key], root, key, "output");
   }
 }
 
@@ -287,7 +384,10 @@ function shouldUseProcessCwdForProjectRoot(processCwdRoot, hintedRoots) {
 }
 
 function resolveActiveChengProjectRoot(input = {}) {
-  const hintedRoots = uniqueProjectRoots([...asArray(input.workspaceRoots), ...chengProjectRootHints]);
+  const invocationRoots = asArray(input.workspaceRoots).filter(Boolean);
+  const hintedRoots = invocationRoots.length > 0
+    ? uniqueProjectRoots(invocationRoots)
+    : uniqueProjectRoots(chengProjectRootHints);
   const processCwd = process.cwd();
   const processCwdRoot = findChengPackageRoot(processCwd);
   const explicitCwd = input.cwd ? normalizeMaybeFileUri(input.cwd) : null;
@@ -303,7 +403,8 @@ function resolveActiveChengProjectRoot(input = {}) {
     else {
       if (cwd) {
         const cwdRoot = findChengPackageRoot(cwd);
-        const candidate = resolve(cwd, file);
+        const cwdBase = cwdRoot ? realpathSync.native(cwd) : resolve(cwd);
+        const candidate = resolve(cwdBase, file);
         if (cwdRoot && !isInsideOrEqual(candidate, cwdRoot)) {
           throw new Error(`Cheng file is not inside the active Cheng project root: ${file}`);
         }
@@ -314,11 +415,29 @@ function resolveActiveChengProjectRoot(input = {}) {
         throw new Error(`Cheng file is not inside the active Cheng project roots: ${file}`);
       }
     }
-    if (fileRoot) return finalizeChengProjectRoot(fileRoot, input);
+    if (fileRoot) {
+      const contextualRoots = [...hintedRoots];
+      if (cwd) {
+        const cwdRoot = findChengPackageRoot(cwd);
+        if (cwdRoot && hintedRoots.length > 0 && !hintedRoots.includes(cwdRoot)) {
+          throw new Error(`cwd belongs to a project outside the active workspace roots: ${cwd} (owner=${cwdRoot})`);
+        }
+        if (cwdRoot && !contextualRoots.includes(cwdRoot)) contextualRoots.push(cwdRoot);
+      }
+      if (contextualRoots.length > 0 && !contextualRoots.includes(fileRoot)) {
+        throw new Error(`Cheng file belongs to a project outside the active workspace roots: ${file} (owner=${fileRoot})`);
+      }
+      return finalizeChengProjectRoot(fileRoot, input);
+    }
   }
   if (cwd) {
     const cwdRoot = findChengPackageRoot(cwd);
-    if (cwdRoot) return finalizeChengProjectRoot(cwdRoot, input);
+    if (cwdRoot) {
+      if (hintedRoots.length > 0 && !hintedRoots.includes(cwdRoot)) {
+        throw new Error(`cwd belongs to a project outside the active workspace roots: ${cwd} (owner=${cwdRoot})`);
+      }
+      return finalizeChengProjectRoot(cwdRoot, input);
+    }
   }
   if (hintedRoots.length === 1) return finalizeChengProjectRoot(hintedRoots[0], input);
   if (hintedRoots.length > 1) {
@@ -348,7 +467,7 @@ function resolveInvocationRelativePath(value, root, cwd, label) {
   if (!cwd) return value;
   const cwdRoot = findChengPackageRoot(cwd);
   if (cwdRoot !== root) return value;
-  const resolved = resolve(cwd, normalizeMaybeFileUri(value));
+  const resolved = resolve(realpathSync.native(cwd), normalizeMaybeFileUri(value));
   if (!isInsideOrEqual(resolved, root)) {
     throw new Error(`${label} is outside the selected Cheng project root: ${value}`);
   }
@@ -386,6 +505,13 @@ function withChengInvocationContext(input = {}, context = {}, options = {}) {
     ...asArray(context.workspaceRoots),
   ];
   const explicitCwd = input.cwd || context.cwd || null;
+  const authorizedRoots = uniqueProjectRoots([
+    ...asArray(context.workspaceRoots),
+    context.cwd,
+  ]);
+  if (options.requireActiveProjectContext && authorizedRoots.length === 0) {
+    throw new Error("No active Cheng workspace root authorizes this tool call");
+  }
   const projectHintFile = out.file || out.source || out.rawProfile;
   let contextRoot = null;
   let contextRootError = null;
@@ -398,6 +524,9 @@ function withChengInvocationContext(input = {}, context = {}, options = {}) {
   }
   if (out.root) {
     out.root = normalizeChengProjectRoot(out.root);
+    if (options.requireActiveProjectContext && !authorizedRoots.includes(out.root)) {
+      throw new Error(`Explicit Cheng project root is outside the active workspace roots: ${out.root} (active=${authorizedRoots.join(", ")})`);
+    }
   } else if (contextRoot) {
     out.root = contextRoot;
   } else {
@@ -412,6 +541,9 @@ function withChengInvocationContext(input = {}, context = {}, options = {}) {
   const processCwdRoot = findChengPackageRoot(processCwd);
   const cwd = explicitCwd || (out.root && processCwdRoot === out.root ? processCwd : null);
   if (out.root) {
+    if (options.requireActiveProjectContext && !authorizedRoots.includes(out.root)) {
+      throw new Error(`Selected Cheng project root is outside the active workspace roots: ${out.root} (active=${authorizedRoots.join(", ")})`);
+    }
     out = normalizeInvocationProjectPaths(out, out.root, cwd);
     assertChengProjectInputPaths(out, out.root);
   } else if (contextRootError && options.requireRoot) {
@@ -424,11 +556,16 @@ function withChengInvocationContext(input = {}, context = {}, options = {}) {
 function resolveProjectPath(value, root = resolveChengProjectRoot()) {
   if (!value) throw new Error("path is required");
   const path = normalizeMaybeFileUri(value);
-  return isAbsolute(path) ? resolve(path) : resolve(root, path);
+  const resolvedPath = isAbsolute(path) ? resolve(path) : resolve(root, path);
+  assertInsideProject(resolvedPath, normalizeChengProjectRoot(root));
+  return resolvedPath;
 }
 
 function assertInsideProject(path, root) {
-  if (!isInsideOrEqual(path, root)) throw new Error(`path is outside Cheng project root: ${path}`);
+  const canonicalRoot = normalizeChengProjectRoot(root);
+  const resolvedPath = resolve(path);
+  const canonicalPathOrAncestor = canonicalExistingAncestor(resolvedPath);
+  assertCanonicalPathInsideProject(canonicalPathOrAncestor, canonicalRoot);
 }
 
 function csgProjectRoot(input = {}) {
@@ -462,15 +599,467 @@ function resolveCsgFactsPath(input = {}, summary = null) {
     throw new Error(`Cheng CSG summary facts not found: ${declared}`);
   }
   const cold = chengColdFactsPath(root);
-  if (existsSync(cold)) return cold;
+  if (existsSync(cold)) {
+    throw new Error(`uncommitted Cheng CSG facts found without canonical summary: ${cold}; run cheng_csg_roundtrip to create a verified generation`);
+  }
   return null;
 }
 
 function readChengSummary(input = {}) {
   const root = csgProjectRoot(input);
   const cold = chengColdSummaryPath(root);
-  if (existsSync(cold)) return JSON.parse(readFileSync(cold, "utf8"));
-  return null;
+  let stat;
+  try {
+    stat = lstatSync(cold);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Cheng CSG summary must be a regular non-symlink file: ${cold}`);
+  if (stat.size <= 0) throw new Error(`Cheng CSG summary must be non-empty: ${cold}`);
+  return JSON.parse(readFileSync(cold, "utf8"));
+}
+
+// CSG 查询只接受 roundtrip 已提交的不可变 generation。canonical summary 是一个
+// 可替换的指针，不能把它或 current.facts 当作证据；以下读取路径在每次查询都重新
+// 验证，缓存只缓存已经验证过的解码结果。
+const CHENG_CSG_QUERY_MAX_SUMMARY_BYTES = 1024 * 1024;
+const CHENG_CSG_QUERY_MAX_FACTS_BYTES = 256 * 1024 * 1024;
+const CHENG_CSG_QUERY_MAX_REPORT_BYTES = 8 * 1024 * 1024;
+const CHENG_CSG_QUERY_MAX_OBJECT_BYTES = 512 * 1024 * 1024;
+const CHENG_CSG_QUERY_PRODUCER = "cheng-fusion/cheng_csg_roundtrip";
+const CHENG_CSG_QUERY_COMMIT_PROTOCOL = "content-addressed-generation+atomic-summary";
+const CHENG_CSG_QUERY_SCHEMA = "cheng-cold-csg.summary.v3";
+const CHENG_CSG_QUERY_SCHEMA_DESC = "header(0){schema_version:u32,abi_version:u32,pointer_width:u8,endian:u8,producer_version:u32,target_triple:bytes32,entry_symbol:bytes64,schema_hash:u64,plan_hash:u64};target(1){triple:str};object_format(2){format:str};entry(3){symbol:str};function(4){item_id:u32,word_offset:u32,word_count:u32,symbol:str,body_kind:str};word(5){word:u32};reloc(6){source_item_id:u32,word_offset:u32,target_symbol:str};data(7){item_id:u32,symbol:str,align:u32,byte_count:u32,bytes:raw};data_reloc(8){source_item_id:u32,word_offset:u32,reloc_kind:u32,addend:u32,target_symbol:str};call_edge(9){source_item_id:u32,target_symbol:str}";
+const CHENG_CSG_QUERY_FNV64_BASIS = 1469598103934665603n;
+const CHENG_CSG_QUERY_FNV64_PRIME = 1099511628211n;
+const CHENG_CSG_QUERY_SUMMARY_KEYS = ["artifactHashes", "byteSize", "commitProtocol", "current", "facts", "factsRoot", "generatedAt", "generationHash", "generationId", "objectOut", "producer", "readerExitCode", "readerReport", "root", "runtimeClosure", "schema", "source", "target", "totals", "writerExitCode", "writerReport"].sort();
+const CHENG_CSG_QUERY_HASH = /^sha256:[0-9a-f]{64}$/;
+const CHENG_CSG_QUERY_GENERATION_ID = /^sha256-[0-9a-f]{64}$/;
+
+function sameCsgStableFile(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+function csgFatalUtf8(raw, label, path) {
+  try {
+    return new TextDecoder("utf-8", {fatal: true}).decode(raw);
+  } catch (error) {
+    throw new Error(`${label} must be valid UTF-8: ${path} (${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
+function readStableCsgArtifact(path, label, maxBytes, allowMissing = false) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new Error(`invalid ${label} size limit: ${maxBytes}`);
+  let pathBefore;
+  try {
+    pathBefore = lstatSync(path, {bigint: true});
+  } catch (error) {
+    if (allowMissing && error?.code === "ENOENT") return null;
+    throw new Error(`${label} is unavailable: ${path} (${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (pathBefore.isSymbolicLink() || !pathBefore.isFile()) throw new Error(`${label} must be a regular non-symlink file: ${path}`);
+  if (pathBefore.size <= 0n) throw new Error(`${label} must be non-empty: ${path}`);
+  if (pathBefore.size > BigInt(maxBytes)) throw new Error(`${label} exceeds ${maxBytes} byte limit: ${path} (${pathBefore.size} bytes)`);
+  if (!Number.isInteger(constants.O_NOFOLLOW)) throw new Error("O_NOFOLLOW is required for Cheng CSG query verification");
+
+  let fd;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    throw new Error(`${label} could not be opened without following links: ${path} (${error instanceof Error ? error.message : String(error)})`);
+  }
+  try {
+    const descriptorBefore = fstatSync(fd, {bigint: true});
+    if (!descriptorBefore.isFile() || !sameCsgStableFile(pathBefore, descriptorBefore)) {
+      throw new Error(`${label} changed between path validation and open: ${path}`);
+    }
+    const expectedSize = Number(descriptorBefore.size);
+    const chunks = [];
+    const hash = createHash("sha256");
+    let offset = 0;
+    while (offset < expectedSize) {
+      const chunk = Buffer.allocUnsafe(Math.min(1024 * 1024, expectedSize - offset));
+      const bytesRead = readSync(fd, chunk, 0, chunk.length, offset);
+      if (bytesRead <= 0) throw new Error(`${label} became truncated while reading: ${path}`);
+      const bytes = bytesRead === chunk.length ? chunk : chunk.subarray(0, bytesRead);
+      chunks.push(bytes);
+      hash.update(bytes);
+      offset += bytesRead;
+    }
+    const descriptorAfter = fstatSync(fd, {bigint: true});
+    let pathAfter;
+    try {
+      pathAfter = lstatSync(path, {bigint: true});
+    } catch (error) {
+      throw new Error(`${label} path disappeared while reading: ${path} (${error instanceof Error ? error.message : String(error)})`);
+    }
+    if (pathAfter.isSymbolicLink() || !pathAfter.isFile() || !sameCsgStableFile(descriptorBefore, descriptorAfter) || !sameCsgStableFile(descriptorAfter, pathAfter)) {
+      throw new Error(`${label} changed while reading: ${path}`);
+    }
+    return {raw: Buffer.concat(chunks, expectedSize), hash: `sha256:${hash.digest("hex")}`, stat: pathAfter};
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function requireCanonicalCsgDirectory(path, root, label) {
+  const absolute = resolve(path);
+  assertInsideProject(absolute, root);
+  const relativePath = relative(root, absolute);
+  const components = relativePath === "" ? [] : relativePath.split(/[\\/]+/).filter(Boolean);
+  let cursor = root;
+  const assertDirectory = (directory) => {
+    let stat;
+    try {
+      stat = lstatSync(directory);
+    } catch (error) {
+      throw new Error(`${label} directory is unavailable: ${directory} (${error instanceof Error ? error.message : String(error)})`);
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory() || realpathSync.native(directory) !== directory) {
+      throw new Error(`${label} traverses a symbolic link or non-directory: ${directory}`);
+    }
+  };
+  assertDirectory(cursor);
+  for (const component of components) {
+    cursor = join(cursor, component);
+    assertDirectory(cursor);
+  }
+  return absolute;
+}
+
+function requireCanonicalCsgArtifactParent(path, root, label) {
+  const absolute = resolve(path);
+  assertInsideProject(absolute, root);
+  requireCanonicalCsgDirectory(dirname(absolute), root, label);
+  return absolute;
+}
+
+function csgFNV1a64(raw) {
+  let hash = CHENG_CSG_QUERY_FNV64_BASIS;
+  for (const byte of raw) hash = BigInt.asUintN(64, (hash ^ BigInt(byte)) * CHENG_CSG_QUERY_FNV64_PRIME);
+  return hash;
+}
+
+function readStrictCsgStringForQuery(payload, offset, path, line) {
+  if (offset < 0 || offset + 4 > payload.length) throw new Error(`CHENG_CSG string length is out of bounds at line ${line}: ${path}`);
+  const length = payload.readUInt32LE(offset);
+  const start = offset + 4;
+  const end = start + length;
+  if (end > payload.length) throw new Error(`CHENG_CSG string payload is out of bounds at line ${line}: ${path}`);
+  const value = csgFatalUtf8(payload.subarray(start, end), "CHENG_CSG string", path);
+  if (value.length === 0) throw new Error(`CHENG_CSG string must be non-empty at line ${line}: ${path}`);
+  return {value, end};
+}
+
+function readFixedCsgStringForQuery(payload, start, length, label, path) {
+  const bytes = payload.subarray(start, start + length);
+  const nul = bytes.indexOf(0);
+  const end = nul < 0 ? bytes.length : nul;
+  if (nul >= 0 && bytes.subarray(nul).some((byte) => byte !== 0)) throw new Error(`CHENG_CSG header ${label} has non-zero bytes after NUL: ${path}`);
+  const value = csgFatalUtf8(bytes.subarray(0, end), `CHENG_CSG header ${label}`, path);
+  if (value.length === 0) throw new Error(`CHENG_CSG header ${label} must be non-empty: ${path}`);
+  return value;
+}
+
+function validateCommittedColdFacts(raw, factsPath, expectedTarget) {
+  if (typeof expectedTarget !== "string" || !/^[A-Za-z0-9_.+-]{1,128}$/.test(expectedTarget)) {
+    throw new Error(`CSG target triple must be 1..128 canonical ASCII target characters: ${expectedTarget}`);
+  }
+  const text = csgFatalUtf8(raw, "CSG facts", factsPath);
+  if (!text.startsWith("CHENG_CSG\n") || !text.endsWith("\n")) throw new Error(`CSG facts must use exact CHENG_CSG LF line format: ${factsPath}`);
+  const lines = text.slice(0, -1).split("\n");
+  if (lines[0] !== "CHENG_CSG") throw new Error(`CSG facts header must be exactly CHENG_CSG: ${factsPath}`);
+  const records = [];
+  const counts = {records: 0, functions: 0, words: 0, relocs: 0, data: 0, dataRelocs: 0, callEdges: 0};
+  for (let index = 1; index < lines.length; index++) {
+    const match = lines[index].match(/^R([0-9a-f]{4})([0-9a-f]{8})([0-9a-f]*)$/);
+    if (!match) throw new Error(`invalid CHENG_CSG record line ${index + 1}: ${factsPath}`);
+    const kind = Number.parseInt(match[1], 16);
+    const byteCount = Number.parseInt(match[2], 16);
+    if (kind < 0 || kind > 9 || match[3].length !== byteCount * 2) throw new Error(`invalid CHENG_CSG record payload at line ${index + 1}: ${factsPath}`);
+    records.push({kind, payload: Buffer.from(match[3], "hex"), line: index + 1, text: lines[index]});
+    counts.records++;
+    if (kind === 4) counts.functions++;
+    else if (kind === 5) counts.words++;
+    else if (kind === 6) counts.relocs++;
+    else if (kind === 7) counts.data++;
+    else if (kind === 8) counts.dataRelocs++;
+    else if (kind === 9) counts.callEdges++;
+  }
+  if (records.length === 0 || records[0].kind !== 0) throw new Error(`CHENG_CSG facts must begin with the canonical header record: ${factsPath}`);
+  const header = records[0].payload;
+  if (header.length !== 126 || header.readUInt32LE(0) !== 1 || header.readUInt32LE(4) !== 1 || header[8] !== 8 || header[9] !== 1 || header.readUInt32LE(10) <= 0) {
+    throw new Error(`CHENG_CSG header schema/ABI/pointer-width/endian mismatch: ${factsPath}`);
+  }
+  const headerTarget = readFixedCsgStringForQuery(header, 14, 32, "target", factsPath);
+  if (headerTarget !== expectedTarget.slice(0, 32)) throw new Error(`CHENG_CSG header target mismatch: expected=${expectedTarget.slice(0, 32)} actual=${headerTarget}`);
+  if (header.readBigUInt64LE(110) !== csgFNV1a64(Buffer.from(CHENG_CSG_QUERY_SCHEMA_DESC, "utf8"))) throw new Error(`CHENG_CSG schema_hash mismatch: ${factsPath}`);
+  const payloadStart = Buffer.byteLength(`CHENG_CSG\n${records[0].text}\n`, "utf8");
+  if (header.readBigUInt64LE(118) !== csgFNV1a64(raw.subarray(payloadStart))) throw new Error(`CHENG_CSG plan_hash mismatch: ${factsPath}`);
+
+  const singletonKinds = new Set();
+  const singletonValues = new Map();
+  const functionItems = new Map();
+  const dataItems = new Map();
+  const functionSymbols = new Map();
+  const dataSymbols = new Map();
+  const relocations = [];
+  const dataRelocations = [];
+  const callEdges = [];
+  for (let index = 0; index < records.length; index++) {
+    const {kind, payload, line} = records[index];
+    if (kind === 0) {
+      if (index !== 0) throw new Error(`duplicate CHENG_CSG header record at line ${line}: ${factsPath}`);
+      continue;
+    }
+    let offset = 0;
+    const readU32 = (field) => {
+      if (offset + 4 > payload.length) throw new Error(`CHENG_CSG ${field} is truncated at line ${line}: ${factsPath}`);
+      const value = payload.readUInt32LE(offset);
+      offset += 4;
+      return value;
+    };
+    const readString = () => {
+      const value = readStrictCsgStringForQuery(payload, offset, factsPath, line);
+      offset = value.end;
+      return value.value;
+    };
+    if (kind === 1 || kind === 2 || kind === 3) {
+      if (singletonKinds.has(kind)) throw new Error(`duplicate CHENG_CSG singleton record kind ${kind} at line ${line}: ${factsPath}`);
+      singletonKinds.add(kind);
+      singletonValues.set(kind, readString());
+    } else if (kind === 4) {
+      const itemId = readU32("function item_id");
+      const wordOffset = readU32("function word_offset");
+      const wordCount = readU32("function word_count");
+      const symbol = readString();
+      readString();
+      if (functionItems.has(itemId)) throw new Error(`duplicate CHENG_CSG function item_id ${itemId} at line ${line}: ${factsPath}`);
+      if (functionSymbols.has(symbol) || dataSymbols.has(symbol)) throw new Error(`duplicate CHENG_CSG function symbol ${symbol} at line ${line}: ${factsPath}`);
+      const entry = {itemId, wordOffset, wordCount, symbol, line};
+      functionItems.set(itemId, entry);
+      functionSymbols.set(symbol, entry);
+    } else if (kind === 5) {
+      readU32("word");
+    } else if (kind === 6) {
+      relocations.push({sourceItemId: readU32("reloc source_item_id"), wordOffset: readU32("reloc word_offset"), targetSymbol: readString(), line});
+    } else if (kind === 7) {
+      const itemId = readU32("data item_id");
+      const symbol = readString();
+      const align = readU32("data align");
+      const byteCount = readU32("data byte_count");
+      if (offset + byteCount > payload.length || byteCount === 0 || ![1, 2, 4, 8, 16].includes(align)) throw new Error(`invalid CHENG_CSG data record at line ${line}: ${factsPath}`);
+      if (dataItems.has(itemId)) throw new Error(`duplicate CHENG_CSG data item_id ${itemId} at line ${line}: ${factsPath}`);
+      if (dataSymbols.has(symbol) || functionSymbols.has(symbol)) throw new Error(`duplicate CHENG_CSG data symbol ${symbol} at line ${line}: ${factsPath}`);
+      const entry = {itemId, symbol, line};
+      dataItems.set(itemId, entry);
+      dataSymbols.set(symbol, entry);
+      offset += byteCount;
+    } else if (kind === 8) {
+      const sourceItemId = readU32("data_reloc source_item_id");
+      const wordOffset = readU32("data_reloc word_offset");
+      const relocKind = readU32("data_reloc reloc_kind");
+      const addend = readU32("data_reloc addend");
+      const targetSymbol = readString();
+      if (relocKind !== 1 || addend !== 0) throw new Error(`invalid CHENG_CSG data_reloc at line ${line}: ${factsPath}`);
+      dataRelocations.push({sourceItemId, wordOffset, targetSymbol, line});
+    } else if (kind === 9) {
+      callEdges.push({sourceItemId: readU32("call_edge source_item_id"), targetSymbol: readString(), line});
+    }
+    if (offset !== payload.length) throw new Error(`CHENG_CSG record has trailing or malformed payload at line ${line}: ${factsPath}`);
+  }
+  for (const kind of [1, 2, 3]) if (!singletonKinds.has(kind)) throw new Error(`CHENG_CSG required singleton record kind ${kind} is missing: ${factsPath}`);
+  if (singletonValues.get(1) !== expectedTarget) throw new Error(`CHENG_CSG target record mismatch: expected=${expectedTarget} actual=${singletonValues.get(1)}`);
+  const expectedEntry = Buffer.alloc(64);
+  Buffer.from(singletonValues.get(3), "utf8").copy(expectedEntry, 0, 0, 64);
+  if (!header.subarray(46, 110).equals(expectedEntry)) throw new Error(`CHENG_CSG entry record/header identification bytes mismatch: ${factsPath}`);
+  if (counts.functions <= 0 || !functionSymbols.has(singletonValues.get(3))) throw new Error(`CHENG_CSG entry symbol does not identify a function: ${singletonValues.get(3)} (${factsPath})`);
+  for (const fn of functionItems.values()) {
+    if (fn.wordOffset > counts.words || fn.wordCount > counts.words - fn.wordOffset) throw new Error(`CHENG_CSG function item_id ${fn.itemId} word range exceeds word records at line ${fn.line}: ${factsPath}`);
+  }
+  const requireFunctionSource = (reference, kind) => {
+    const source = functionItems.get(reference.sourceItemId);
+    if (!source) throw new Error(`CHENG_CSG ${kind} has dangling source_item_id ${reference.sourceItemId} at line ${reference.line}: ${factsPath}`);
+    return source;
+  };
+  for (const reloc of relocations) {
+    const source = requireFunctionSource(reloc, "reloc");
+    if (reloc.wordOffset < source.wordOffset || reloc.wordOffset >= source.wordOffset + source.wordCount) throw new Error(`CHENG_CSG reloc word_offset is outside source function item_id ${source.itemId} at line ${reloc.line}: ${factsPath}`);
+  }
+  for (const reloc of dataRelocations) {
+    const source = requireFunctionSource(reloc, "data_reloc");
+    if (reloc.wordOffset < source.wordOffset || reloc.wordOffset + 1 >= source.wordOffset + source.wordCount) throw new Error(`CHENG_CSG data_reloc word_offset pair is outside source function item_id ${source.itemId} at line ${reloc.line}: ${factsPath}`);
+    if (!functionSymbols.has(reloc.targetSymbol) && !dataSymbols.has(reloc.targetSymbol)) throw new Error(`CHENG_CSG data_reloc target_symbol does not identify a defined symbol at line ${reloc.line}: ${factsPath}`);
+  }
+  for (const edge of callEdges) {
+    requireFunctionSource(edge, "call_edge");
+    if (!functionSymbols.has(edge.targetSymbol)) throw new Error(`CHENG_CSG call_edge target_symbol does not identify a function at line ${edge.line}: ${factsPath}`);
+  }
+  return {counts, target: singletonValues.get(1), objectFormat: singletonValues.get(2), entry: singletonValues.get(3)};
+}
+
+function validateCsgReportForQuery(raw, path, label, factsCounts) {
+  const text = csgFatalUtf8(raw, label, path);
+  if (text.includes("\r") || !text.endsWith("\n")) throw new Error(`${label} must use canonical LF-terminated key=value lines: ${path}`);
+  const values = {};
+  for (const [index, line] of text.slice(0, -1).split("\n").entries()) {
+    const match = line.match(/^([A-Za-z][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) throw new Error(`${label} has malformed key=value line ${index + 1}: ${path}`);
+    if (Object.hasOwn(values, match[1])) throw new Error(`${label} has duplicate key ${match[1]}: ${path}`);
+    values[match[1]] = match[2];
+  }
+  for (const [field, count] of [["facts_record_count", "records"], ["facts_function_count", "functions"], ["facts_word_count", "words"], ["facts_reloc_count", "relocs"], ["facts_data_count", "data"], ["facts_data_reloc_count", "dataRelocs"]]) {
+    const value = values[field];
+    if (!/^(0|[1-9][0-9]*)$/.test(value || "")) throw new Error(`${label} ${field} must be a canonical non-negative integer: ${path}`);
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed) || parsed !== factsCounts[count]) throw new Error(`${label} ${field} mismatch: ${path}`);
+  }
+  return values;
+}
+
+function csgGenerationHashForQuery(root, source, target, artifactHashes) {
+  return sha256Hex(Buffer.from(JSON.stringify({root, source, target, artifactHashes}), "utf8"));
+}
+
+function sameCsgArtifactHashes(left, right) {
+  return ["facts", "writerReport", "readerReport", "object"].every((key) => left?.[key] === right?.[key] && CHENG_CSG_QUERY_HASH.test(String(left?.[key] || "")));
+}
+
+function exactCsgGenerationObjectName(source) {
+  return `${basename(source).replace(/[^A-Za-z0-9_.-]/g, "_")}.o`;
+}
+
+function assertExactCsgKeys(value, keys, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(keys.slice().sort())) {
+    throw new Error(`${label} fields are not canonical`);
+  }
+}
+
+function parseVerifiedCsgSummary(root) {
+  const summaryPath = chengColdSummaryPath(root);
+  const evidence = readStableCsgArtifact(summaryPath, "canonical CSG summary", CHENG_CSG_QUERY_MAX_SUMMARY_BYTES, true);
+  if (!evidence) return null;
+  requireCanonicalCsgArtifactParent(summaryPath, root, "canonical CSG summary");
+  const text = csgFatalUtf8(evidence.raw, "canonical CSG summary", summaryPath);
+  if (!text.endsWith("\n")) throw new Error(`canonical CSG summary must end with LF: ${summaryPath}`);
+  let summary;
+  try {
+    summary = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`canonical CSG summary is invalid JSON: ${summaryPath} (${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (JSON.stringify(summary, null, 2) + "\n" !== text) throw new Error(`canonical CSG summary is not canonical JSON: ${summaryPath}`);
+  assertExactCsgKeys(summary, CHENG_CSG_QUERY_SUMMARY_KEYS, `canonical CSG summary ${summaryPath}`);
+  if (summary.schema !== CHENG_CSG_QUERY_SCHEMA || summary.producer !== CHENG_CSG_QUERY_PRODUCER || summary.commitProtocol !== CHENG_CSG_QUERY_COMMIT_PROTOCOL) {
+    throw new Error(`canonical CSG summary has an untrusted schema, producer, or commit protocol: ${summaryPath}`);
+  }
+  if (summary.root !== root || typeof summary.source !== "string" || typeof summary.target !== "string" || !/^[A-Za-z0-9_.+-]{1,128}$/.test(summary.target)) {
+    throw new Error(`canonical CSG summary root/source/target is invalid: ${summaryPath}`);
+  }
+  const source = resolve(summary.source);
+  if (source !== summary.source || !source.endsWith(".cheng")) throw new Error(`canonical CSG summary source must be an absolute .cheng path: ${summaryPath}`);
+  assertInsideProject(source, root);
+  const sourceStat = lstatSync(source);
+  if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) throw new Error(`canonical CSG summary source must remain a regular non-symlink file: ${source}`);
+  if (!CHENG_CSG_QUERY_GENERATION_ID.test(summary.generationId) || !CHENG_CSG_QUERY_HASH.test(summary.generationHash)) {
+    throw new Error(`canonical CSG summary generation identifiers or artifact hashes are invalid: ${summaryPath}`);
+  }
+  assertExactCsgKeys(summary.artifactHashes, ["facts", "writerReport", "readerReport", "object"], `canonical CSG summary artifact hashes ${summaryPath}`);
+  if (!sameCsgArtifactHashes(summary.artifactHashes, summary.artifactHashes)) throw new Error(`canonical CSG summary artifact hashes are invalid: ${summaryPath}`);
+  if (summary.generationId !== `sha256-${summary.generationHash.slice("sha256:".length)}` || summary.generationHash !== csgGenerationHashForQuery(root, source, summary.target, summary.artifactHashes)) {
+    throw new Error(`canonical CSG summary generation hash mismatch: ${summaryPath}`);
+  }
+  if (summary.factsRoot !== summary.artifactHashes.facts || !Number.isSafeInteger(summary.byteSize) || summary.byteSize <= 0 || summary.runtimeClosure !== null || summary.writerExitCode !== 0 || summary.readerExitCode !== 0) {
+    throw new Error(`canonical CSG summary process or facts metadata is invalid: ${summaryPath}`);
+  }
+  if (typeof summary.generatedAt !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(summary.generatedAt) || !Number.isFinite(Date.parse(summary.generatedAt))) {
+    throw new Error(`canonical CSG summary generatedAt is invalid: ${summaryPath}`);
+  }
+  return {summary, evidence, summaryPath, source};
+}
+
+function verifyCommittedCsgGeneration(root) {
+  const canonical = parseVerifiedCsgSummary(root);
+  if (!canonical) return null;
+  const {summary, evidence: canonicalEvidence, summaryPath, source} = canonical;
+  const factsPath = requireCanonicalCsgArtifactParent(summary.facts, root, "CSG generation facts");
+  if (factsPath !== summary.facts || basename(factsPath) !== "current.facts") throw new Error(`canonical CSG summary facts path is not canonical: ${summaryPath}`);
+  const generationDir = dirname(factsPath);
+  const generationRoot = dirname(generationDir);
+  const outDir = dirname(generationRoot);
+  if (basename(generationDir) !== summary.generationId || basename(generationRoot) !== ".cheng-csg-generations") throw new Error(`canonical CSG summary generation path is invalid: ${summaryPath}`);
+  requireCanonicalCsgDirectory(generationDir, root, "CSG immutable generation");
+  const objectName = exactCsgGenerationObjectName(source);
+  const paths = {
+    facts: factsPath,
+    writerReport: join(generationDir, "current.writer.report.txt"),
+    readerReport: join(generationDir, "current.reader.report.txt"),
+    objectOut: join(generationDir, objectName),
+    summary: join(generationDir, "summary.json"),
+  };
+  if (summary.writerReport !== paths.writerReport || summary.readerReport !== paths.readerReport || summary.objectOut !== paths.objectOut) {
+    throw new Error(`canonical CSG summary declares artifact paths outside its generation: ${summaryPath}`);
+  }
+  const expectedCurrent = {
+    facts: join(outDir, "current.facts"),
+    writerReport: join(outDir, "current.writer.report.txt"),
+    readerReport: join(outDir, "current.reader.report.txt"),
+    objectOut: join(outDir, objectName),
+  };
+  assertExactCsgKeys(summary.current, ["facts", "writerReport", "readerReport", "objectOut"], `canonical CSG summary current ${summaryPath}`);
+  if (JSON.stringify(summary.current) !== JSON.stringify(expectedCurrent)) throw new Error(`canonical CSG summary current projection paths are invalid: ${summaryPath}`);
+  const names = readdirSync(generationDir).sort();
+  const expectedNames = ["current.facts", "current.reader.report.txt", "current.writer.report.txt", objectName, "summary.json"].sort();
+  if (JSON.stringify(names) !== JSON.stringify(expectedNames)) throw new Error(`CSG immutable generation has unexpected directory entries: ${generationDir}`);
+  const generationSummary = readStableCsgArtifact(paths.summary, "CSG immutable generation summary", CHENG_CSG_QUERY_MAX_SUMMARY_BYTES);
+  if (!generationSummary.raw.equals(canonicalEvidence.raw)) throw new Error(`canonical CSG summary does not exactly identify the immutable generation: ${summaryPath}`);
+  const artifacts = {
+    facts: readStableCsgArtifact(paths.facts, "CSG facts", CHENG_CSG_QUERY_MAX_FACTS_BYTES),
+    writerReport: readStableCsgArtifact(paths.writerReport, "CSG writer report", CHENG_CSG_QUERY_MAX_REPORT_BYTES),
+    readerReport: readStableCsgArtifact(paths.readerReport, "CSG reader report", CHENG_CSG_QUERY_MAX_REPORT_BYTES),
+    object: readStableCsgArtifact(paths.objectOut, "CSG reader object", CHENG_CSG_QUERY_MAX_OBJECT_BYTES),
+  };
+  const actualHashes = {facts: artifacts.facts.hash, writerReport: artifacts.writerReport.hash, readerReport: artifacts.readerReport.hash, object: artifacts.object.hash};
+  for (const key of ["facts", "writerReport", "readerReport", "object"]) {
+    if (actualHashes[key] !== summary.artifactHashes[key]) {
+      throw new Error(`CSG ${key === "facts" ? "facts" : key} hash mismatch: declared=${summary.artifactHashes[key]} actual=${actualHashes[key]} path=${paths[key === "object" ? "objectOut" : key]}`);
+    }
+  }
+  const factsEvidence = validateCommittedColdFacts(artifacts.facts.raw, paths.facts, summary.target);
+  const writerReport = validateCsgReportForQuery(artifacts.writerReport.raw, paths.writerReport, "CSG writer report", factsEvidence.counts);
+  validateCsgReportForQuery(artifacts.readerReport.raw, paths.readerReport, "CSG reader report", factsEvidence.counts);
+  const expectedTotals = {
+    sourceFiles: 1,
+    functions: factsEvidence.counts.functions,
+    words: factsEvidence.counts.words,
+    relocs: factsEvidence.counts.relocs,
+    data: factsEvidence.counts.data,
+    dataRelocs: factsEvidence.counts.dataRelocs,
+    callEdges: factsEvidence.counts.callEdges,
+    symbols: factsEvidence.counts.functions + factsEvidence.counts.data,
+    calls: factsEvidence.counts.relocs + factsEvidence.counts.dataRelocs + factsEvidence.counts.callEdges,
+    records: factsEvidence.counts.records,
+    bytes: artifacts.facts.raw.length,
+  };
+  assertExactCsgKeys(summary.totals, Object.keys(expectedTotals), `canonical CSG summary totals ${summaryPath}`);
+  if (JSON.stringify(summary.totals) !== JSON.stringify(expectedTotals) || summary.byteSize !== artifacts.facts.raw.length) throw new Error(`canonical CSG summary totals mismatch: ${summaryPath}`);
+  for (const [label, artifact] of [["facts", artifacts.facts], ["writer report", artifacts.writerReport], ["reader report", artifacts.readerReport], ["object", artifacts.object], ["summary", generationSummary]]) {
+    if ((artifact.stat.mode & 0o222n) !== 0n) throw new Error(`CSG immutable generation ${label} is writable: ${generationDir}`);
+  }
+  // Re-read the pointer and every artifact after validation.  A cache entry is only
+  // produced from one stable generation, never from a path that changed mid-query.
+  const finalCanonical = readStableCsgArtifact(chengColdSummaryPath(root), "canonical CSG summary", CHENG_CSG_QUERY_MAX_SUMMARY_BYTES);
+  if (finalCanonical.hash !== canonicalEvidence.hash || !finalCanonical.raw.equals(canonicalEvidence.raw)) throw new Error(`canonical CSG summary changed during verification: ${summaryPath}`);
+  const finalGenerationSummary = readStableCsgArtifact(paths.summary, "CSG immutable generation summary final verification", CHENG_CSG_QUERY_MAX_SUMMARY_BYTES);
+  if (finalGenerationSummary.hash !== generationSummary.hash || (finalGenerationSummary.stat.mode & 0o222n) !== 0n) throw new Error(`CSG immutable generation summary changed during verification: ${paths.summary}`);
+  if (JSON.stringify(readdirSync(generationDir).sort()) !== JSON.stringify(expectedNames)) throw new Error(`CSG immutable generation directory changed during verification: ${generationDir}`);
+  for (const [key, path] of Object.entries({facts: paths.facts, writerReport: paths.writerReport, readerReport: paths.readerReport, object: paths.objectOut})) {
+    const maxBytes = key === "facts" ? CHENG_CSG_QUERY_MAX_FACTS_BYTES : key === "object" ? CHENG_CSG_QUERY_MAX_OBJECT_BYTES : CHENG_CSG_QUERY_MAX_REPORT_BYTES;
+    const finalArtifact = readStableCsgArtifact(path, `CSG ${key} final verification`, maxBytes);
+    if (finalArtifact.hash !== artifacts[key].hash || (finalArtifact.stat.mode & 0o222n) !== 0n) throw new Error(`CSG generation ${key} changed during verification: ${path}`);
+  }
+  return {summary, summaryHash: canonicalEvidence.hash, paths, factsRaw: artifacts.facts.raw, writerReport};
 }
 
 function appendToMapList(map, key, value) {
@@ -514,8 +1103,8 @@ function coldLogicalSymbolName(symbol) {
   return String(symbol || "").replace(/\$o[0-9a-f]{16}\$[0-9]+$/i, "");
 }
 
-function parseChengColdFacts(root, factsPath, summary = {}) {
-  const raw = readFileSync(factsPath);
+function parseChengColdFacts(root, factsPath, summary = {}, rawOverride = null, verifiedReport = null) {
+  const raw = rawOverride || readFileSync(factsPath);
   const text = raw.toString("utf8");
   if (!text.startsWith("CHENG_CSG\n")) throw new Error(`not a CHENG_CSG facts file: ${factsPath}`);
   const symById = new Map();
@@ -650,7 +1239,7 @@ function parseChengColdFacts(root, factsPath, summary = {}) {
   if (target || objectFormat || entry) {
     modules.set("cheng-cold", {path: "cheng-cold", target, objectFormat, entry});
   }
-  const report = parseColdReport(summary.writerReport || summary.readerReport);
+  const report = verifiedReport || parseColdReport(summary.writerReport || summary.readerReport);
   return {
     schema: "cheng-cold-csg.facts.v1",
     root,
@@ -684,10 +1273,10 @@ function parseChengColdFacts(root, factsPath, summary = {}) {
   };
 }
 
-async function parseCsgCoreFacts(root, factsPath, summary = {}) {
+async function parseCsgCoreFacts(root, factsPath, summary = {}, rawOverride = null) {
   if (!existsSync(CSG_CORE_READER)) throw new Error(`CSG-Core reader not found: ${CSG_CORE_READER}`);
   const {csgcReadFacts} = await import(pathToFileURL(CSG_CORE_READER).href);
-  const decoded = csgcReadFacts(readFileSync(factsPath));
+  const decoded = csgcReadFacts(rawOverride || readFileSync(factsPath));
   const facts = decoded.facts || [];
   const symById = new Map();
   const funcById = new Map();
@@ -760,18 +1349,24 @@ async function parseCsgCoreFacts(root, factsPath, summary = {}) {
 
 async function getChengFacts(input = {}) {
   const root = csgProjectRoot(input);
-  const summary = readChengSummary({root, cwd: root}) || {};
-  const factsPath = resolveCsgFactsPath({...input, root}, summary);
-  if (!factsPath) return null;
-  if (!existsSync(factsPath)) return null;
-  assertInsideProject(factsPath, root);
-  const stat = statSync(factsPath);
-  const cacheKey = `${factsPath}:${stat.mtimeMs}:${stat.size}`;
+  if (input.facts) throw new Error(`facts path override is disabled; Cheng CSG is fixed to ${chengColdFactsPath(root)}`);
+  const verified = verifyCommittedCsgGeneration(root);
+  if (!verified) {
+    const current = chengColdFactsPath(root);
+    let currentStat = null;
+    try {
+      currentStat = lstatSync(current);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    if (currentStat) throw new Error(`uncommitted Cheng CSG facts found without canonical summary: ${current}; run cheng_csg_roundtrip to create a verified generation`);
+    return null;
+  }
+  const {summary, paths, factsRaw, summaryHash, writerReport} = verified;
+  const actualFactsRoot = sha256Hex(factsRaw);
+  const cacheKey = `${summaryHash}:${summary.generationHash}:${paths.facts}:${actualFactsRoot}`;
   if (csgFactsCache.has(cacheKey)) return csgFactsCache.get(cacheKey);
-  const raw = readFileSync(factsPath);
-  const parsed = raw.toString("utf8", 0, Math.min(raw.length, 16)).startsWith("CHENG_CSG\n")
-    ? parseChengColdFacts(root, factsPath, summary)
-    : await parseCsgCoreFacts(root, factsPath, summary);
+  const parsed = parseChengColdFacts(root, paths.facts, summary, factsRaw, writerReport);
   csgFactsCache.clear();
   csgFactsCache.set(cacheKey, parsed);
   return parsed;
@@ -895,16 +1490,33 @@ function resolveChengPath(input, defaultPath, root = resolveChengProjectRoot()) 
 // detached grandchild 在 spawnSync timeout 触发后仍存活). Cheng driver 的多进程后端
 // (BACKEND_JOBS fork-join) 可能 fork 出这类孙进程, 所以这里改用 spawn + detached:true +
 // 手动计时器, 超时/输出溢出时对整个进程组 kill(-pid, SIGKILL), 不留孤儿.
+function withChengDriverRawOutput(result, stdoutBuffer, stderrBuffer) {
+  // Text remains the stable public surface for existing callers. Non-enumerable buffers preserve
+  // exact process bytes for golden contracts without inflating spread/serialized tool results.
+  Object.defineProperties(result, {
+    stdoutBuffer: {value: stdoutBuffer, enumerable: false},
+    stderrBuffer: {value: stderrBuffer, enumerable: false},
+  });
+  return result;
+}
+
 function runChengDriver(driver, args, options = {}) {
   if (!existsSync(driver)) {
-    return Promise.resolve({missingDriver: true, driver, exitCode: null, stdout: "", stderr: `cheng driver not found: ${driver}`});
+    const stderr = Buffer.from(`cheng driver not found: ${driver}`, "utf8");
+    return Promise.resolve(withChengDriverRawOutput(
+      {missingDriver: true, driver, exitCode: null, stdout: "", stderr: stderr.toString("utf8"), timedOut: false, overflow: false},
+      Buffer.alloc(0),
+      stderr,
+    ));
   }
   const cwd = options.cwd || resolveChengProjectRoot(options);
   const maxBuffer = options.maxBuffer || (1 << 30);
   const timeoutMs = chengFusionTimeoutMs(options.timeoutMs || CHENG_FUSION_DRIVER_TIMEOUT_MS_DEFAULT);
   return new Promise((resolvePromise) => {
-    let stdout = Buffer.alloc(0);
-    let stderr = Buffer.alloc(0);
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutLength = 0;
+    let stderrLength = 0;
     let settled = false;
     let timedOut = false;
     let overflow = false;
@@ -912,12 +1524,17 @@ function runChengDriver(driver, args, options = {}) {
     try {
       child = spawn(driver, args, {
         cwd,
-        env: chengDriverSpawnEnv(options.env),
+        env: chengDriverSpawnEnv(options.env, options.unsetEnv),
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       });
     } catch (error) {
-      resolvePromise({missingDriver: false, driver, exitCode: null, stdout: "", stderr: error instanceof Error ? error.message : String(error)});
+      const stderr = Buffer.from(error instanceof Error ? error.message : String(error), "utf8");
+      resolvePromise(withChengDriverRawOutput(
+        {missingDriver: false, driver, exitCode: null, stdout: "", stderr: stderr.toString("utf8"), timedOut: false, overflow: false},
+        Buffer.alloc(0),
+        stderr,
+      ));
       return;
     }
     const timer = setTimeout(() => {
@@ -926,11 +1543,18 @@ function runChengDriver(driver, args, options = {}) {
     }, timeoutMs);
     const append = (which, chunk) => {
       if (overflow) return;
-      if (which === "stdout") stdout = Buffer.concat([stdout, chunk]);
-      else stderr = Buffer.concat([stderr, chunk]);
-      if (stdout.length + stderr.length > maxBuffer) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (stdoutLength + stderrLength + bytes.length > maxBuffer) {
         overflow = true;
         killChengProcessGroup(child, "SIGKILL");
+        return;
+      }
+      if (which === "stdout") {
+        stdoutChunks.push(bytes);
+        stdoutLength += bytes.length;
+      } else {
+        stderrChunks.push(bytes);
+        stderrLength += bytes.length;
       }
     };
     child.stdout?.on("data", (chunk) => append("stdout", chunk));
@@ -939,16 +1563,21 @@ function runChengDriver(driver, args, options = {}) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      const stdout = Buffer.concat(stdoutChunks, stdoutLength);
+      let stderr = Buffer.concat(stderrChunks, stderrLength);
       let stderrText = stderr.toString("utf8");
       if (timedOut) stderrText += `\n[cheng-fusion] timed out after ${timeoutMs}ms; process group killed (SIGKILL)`;
       if (overflow) stderrText += `\n[cheng-fusion] output exceeded maxBuffer (${maxBuffer} bytes); process group killed (SIGKILL)`;
-      resolvePromise({missingDriver: false, driver, exitCode, stdout: stdout.toString("utf8"), stderr: stderrText, timedOut});
+      resolvePromise(withChengDriverRawOutput(
+        {missingDriver: false, driver, exitCode: timedOut || overflow ? null : exitCode, stdout: stdout.toString("utf8"), stderr: stderrText, timedOut, overflow},
+        stdout,
+        stderr,
+      ));
     };
     child.on("error", (error) => {
-      stderr = Buffer.concat([stderr, Buffer.from(`\n${error instanceof Error ? error.message : String(error)}`, "utf8")]);
-      finish(null);
+      append("stderr", Buffer.from(`\n${error instanceof Error ? error.message : String(error)}`, "utf8"));
     });
-    child.on("exit", (code) => finish(code));
+    child.on("close", (code) => finish(code));
   });
 }
 
@@ -958,19 +1587,51 @@ const CHENG_FUSION_CRASH_TRIAGE_TIMEOUT_MS_DEFAULT = 60000;
 // 否则会被当成多个独立 argv 传给 debuggee.
 function lldbArgQuote(value) {
   const text = String(value);
+  if (/[\0\r\n]/.test(text)) throw new Error("lldb argument contains a forbidden NUL/line break");
   if (text.length > 0 && !/[\s"\\]/.test(text)) return text;
   return `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+const CHENG_FUSION_RESERVED_DEBUGGEE_ENV = new Set(["CHENG_PROCESS_MAX_RSS_BYTES"]);
+
+function validateLldbDebuggeeEnv(env) {
+  if (env === undefined) return [];
+  if (!env || typeof env !== "object" || Array.isArray(env)) throw new Error("LLDB debuggee env must be an object of string pairs");
+  const entries = Object.entries(env);
+  for (const [key, value] of entries) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`LLDB debuggee env has an invalid variable name: ${key}`);
+    if (typeof value !== "string" || /[\0\r\n]/.test(value)) throw new Error(`LLDB debuggee env ${key} must be a string without NUL or line breaks`);
+    if (CHENG_FUSION_RESERVED_DEBUGGEE_ENV.has(key)) throw new Error(`LLDB debuggee env may not override reserved ${key}`);
+  }
+  return entries.sort(([left], [right]) => left.localeCompare(right));
+}
+
+// The controller keeps its own inherited environment. User input is translated only into
+// LLDB's target environment, and the process RSS cap is appended last as a non-overridable
+// debuggee invariant.
+function lldbTargetEnvVarsCommand(env) {
+  const entries = validateLldbDebuggeeEnv(env);
+  const tokens = [...entries, ["CHENG_PROCESS_MAX_RSS_BYTES", chengFusionRssCapBytes()]]
+    .map(([key, value]) => lldbArgQuote(`${key}=${value}`));
+  return `settings set target.env-vars ${tokens.join(" ")}`;
+}
+
+function assertLldbAslrDisabled(output, stage) {
+  if (!/target\.disable-aslr[^\r\n]*=\s*true\b/i.test(String(output || ""))) {
+    throw new Error(`${stage}: LLDB did not prove target.disable-aslr=true: ${takeTrailingText(output, 2000)}`);
+  }
 }
 
 // lldb 批处理子进程的共享 spawn 骨架: spawn+detached+手动计时器给 lldb 自己也套上超时/RSS
 // 加固(和 runChengDriver 同一套孤儿防护), 按 maxBuffer 截断防止失控输出. runLldbBatch(崩点
 // 探测, -k 触发) 和 runLldbOCommands(cheng_corrupt_hunt 的无条件顺序 -o 脚本) 共用这一段,
 // 只是各自拼装不同的 lldbArgs.
-function spawnLldbSession(lldbArgs, env, options = {}) {
+function spawnLldbSession(lldbArgs, options = {}) {
   const maxBuffer = options.maxBuffer || (1 << 26);
   const timeoutMs = chengFusionTimeoutMs(options.timeoutMs || CHENG_FUSION_CRASH_TRIAGE_TIMEOUT_MS_DEFAULT);
   return new Promise((resolvePromise) => {
-    let output = Buffer.alloc(0);
+    const outputChunks = [];
+    let outputLength = 0;
     let settled = false;
     let timedOut = false;
     let overflow = false;
@@ -978,7 +1639,7 @@ function spawnLldbSession(lldbArgs, env, options = {}) {
     try {
       child = spawn("lldb", lldbArgs, {
         cwd: options.cwd || process.cwd(),
-        env: chengDriverSpawnEnv(env),
+        env: chengDriverSpawnEnv(),
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       });
@@ -992,11 +1653,14 @@ function spawnLldbSession(lldbArgs, env, options = {}) {
     }, timeoutMs);
     const append = (chunk) => {
       if (overflow) return;
-      output = Buffer.concat([output, chunk]);
-      if (output.length > maxBuffer) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (outputLength + bytes.length > maxBuffer) {
         overflow = true;
         killChengProcessGroup(child, "SIGKILL");
+        return;
       }
+      outputChunks.push(bytes);
+      outputLength += bytes.length;
     };
     child.stdout?.on("data", append);
     child.stderr?.on("data", append);
@@ -1004,16 +1668,16 @@ function spawnLldbSession(lldbArgs, env, options = {}) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      const output = Buffer.concat(outputChunks, outputLength);
       let text = output.toString("utf8");
       if (timedOut) text += `\n[cheng-fusion] lldb session timed out after ${timeoutMs}ms; process group killed (SIGKILL)`;
       if (overflow) text += `\n[cheng-fusion] lldb output exceeded maxBuffer (${maxBuffer} bytes); process group killed (SIGKILL)`;
-      resolvePromise({exitCode, output: text, timedOut, overflow});
+      resolvePromise({exitCode: timedOut || overflow ? null : exitCode, output: text, timedOut, overflow});
     };
     child.on("error", (error) => {
       append(Buffer.from(`\n${error instanceof Error ? error.message : String(error)}`, "utf8"));
-      finish(null);
     });
-    child.on("exit", (code) => finish(code));
+    child.on("close", (code) => finish(code));
   });
 }
 
@@ -1022,18 +1686,212 @@ function spawnLldbSession(lldbArgs, env, options = {}) {
 function runLldbBatch(binary, args, env, options = {}) {
   const maxFrames = options.maxFrames || 64;
   const runLine = ["run", ...args.map(lldbArgQuote)].join(" ");
-  const lldbArgs = ["-b", "-o", runLine, "-k", `bt ${maxFrames}`, "-k", "register read", "-k", "image list -o -f", "-k", "quit", binary];
-  return spawnLldbSession(lldbArgs, env, options);
+  const lldbArgs = [
+    "--no-lldbinit", "--no-use-colors", "-b",
+    "-o", "settings set target.disable-aslr true",
+    "-o", "settings show target.disable-aslr",
+    "-o", lldbTargetEnvVarsCommand(env),
+    "-o", runLine,
+    "-k", `bt ${maxFrames}`, "-k", "register read", "-k", "image list -o -f", "-k", "quit", binary,
+  ];
+  return spawnLldbSession(lldbArgs, options);
 }
 
 // cheng_corrupt_hunt 用: 一串无条件顺序执行的 -o 命令(不依赖 -k 崩溃触发), binary 仍按 lldb
 // 的隐式 target-create 位置参数传入(和 runLldbBatch 一致的约定, splitLldbSessions 已验证过
 // 这个隐式创建不会额外产生一段 "(lldb) " 输出块)。
 function runLldbOCommands(binary, commands, env, options = {}) {
-  const lldbArgs = ["-b"];
+  // `env` is intentionally not passed to the LLDB controller process. Stage commands
+  // must use lldbTargetEnvVarsCommand before launch.
+  validateLldbDebuggeeEnv(env);
+  const lldbArgs = ["--no-lldbinit", "--no-use-colors", "-b"];
   for (const command of commands) lldbArgs.push("-o", command);
   lldbArgs.push(binary);
-  return spawnLldbSession(lldbArgs, env, options);
+  return spawnLldbSession(lldbArgs, options);
+}
+
+// corrupt-hunt stage2 cannot pre-schedule a fixed number of `continue/memory/bt`
+// commands: once the debuggee exits, every remaining command is an LLDB error and
+// stale stop text can be mistaken for a new event. Commands executed while the
+// target is stopped use a private Python-print delimiter. `continue` is different:
+// writing its delimiter in the same stdin payload lets LLDB forward those bytes to
+// the running debuggee. It therefore sends only `continue\n`, then waits for the
+// complete process stop/exit event before sending anything else. In synchronous
+// non-TTY mode LLDB does not emit a fresh prompt after `continue`; the final
+// `Target N: (...) stopped.` line is the stop-event completion boundary.
+function createInteractiveLldbSession(binary, options = {}) {
+  const maxBuffer = options.maxBuffer || (1 << 26);
+  const timeoutMs = chengFusionTimeoutMs(options.timeoutMs || CHENG_FUSION_CRASH_TRIAGE_TIMEOUT_MS_DEFAULT);
+  let child;
+  try {
+    child = spawn("lldb", ["--no-lldbinit", "--no-use-colors", binary], {
+      cwd: options.cwd || process.cwd(),
+      env: chengDriverSpawnEnv(),
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+    });
+  } catch (error) {
+    throw new Error(`failed to spawn lldb: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const outputChunks = [];
+  let outputLength = 0;
+  let idleBuffer = Buffer.alloc(0);
+  let waiter = null;
+  let commandSequence = 0;
+  let timedOut = false;
+  let overflow = false;
+  let spawnError = null;
+  let closed = false;
+  let closeCode = null;
+  let resolveClose;
+  const closePromise = new Promise((resolvePromise) => { resolveClose = resolvePromise; });
+
+  const rejectWaiter = (error) => {
+    if (!waiter) return;
+    const current = waiter;
+    waiter = null;
+    current.reject(error);
+  };
+  const inspectWaiter = () => {
+    if (!waiter) return;
+    const text = waiter.buffer.toString("utf8");
+    let match;
+    if (waiter.kind === "command") {
+      const markerPattern = new RegExp(`(?:^|\\r?\\n)${waiter.marker}\\r?\\n`);
+      match = markerPattern.exec(text);
+      if (!match) return;
+    } else {
+      const stopReason = /stop reason = [^\r\n]+\r?\n/i.exec(text);
+      let stopComplete = null;
+      if (stopReason) {
+        const afterReason = stopReason.index + stopReason[0].length;
+        const targetStopped = /^Target\s+\d+:\s+.*\bstopped\.\r?\n/gmi.exec(text.slice(afterReason));
+        if (targetStopped) {
+          const end = afterReason + targetStopped.index + targetStopped[0].length;
+          stopComplete = {start: stopReason.index, end};
+        }
+      }
+      const terminalMatches = [
+        stopComplete,
+        /^Process\s+[1-9]\d*\s+exited with[^\r\n]*\r?\n/gmi.exec(text),
+        /(?:^|\r?\n)error:\s*[^\r\n]*\r?\n/i.exec(text),
+      ].filter(Boolean).map((candidate) => candidate.start === undefined
+        ? {start: candidate.index, end: candidate.index + candidate[0].length}
+        : candidate).sort((left, right) => left.start - right.start);
+      if (terminalMatches.length === 0) return;
+      match = {index: terminalMatches[0].end, 0: ""};
+    }
+    const current = waiter;
+    waiter = null;
+    idleBuffer = Buffer.from(text.slice(match.index + match[0].length), "utf8");
+    current.resolve(text.slice(0, match.index));
+  };
+  const append = (chunk) => {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    if (overflow) return;
+    if (outputLength + bytes.length > maxBuffer) {
+      overflow = true;
+      killChengProcessGroup(child, "SIGKILL");
+      rejectWaiter(new Error(`lldb output exceeded maxBuffer (${maxBuffer} bytes)`));
+      return;
+    }
+    outputChunks.push(bytes);
+    outputLength += bytes.length;
+    if (waiter) {
+      waiter.buffer = Buffer.concat([waiter.buffer, bytes]);
+      inspectWaiter();
+    } else {
+      idleBuffer = Buffer.concat([idleBuffer, bytes]);
+    }
+  };
+  child.stdout?.on("data", append);
+  child.stderr?.on("data", append);
+  child.on("error", (error) => {
+    spawnError = error instanceof Error ? error.message : String(error);
+    append(Buffer.from(`\n${spawnError}`, "utf8"));
+    rejectWaiter(new Error(`lldb process error: ${spawnError}`));
+  });
+  child.on("close", (code) => {
+    if (closed) return;
+    closed = true;
+    closeCode = code;
+    clearTimeout(timer);
+    rejectWaiter(new Error(`lldb exited before completing command (exitCode=${code})`));
+    resolveClose();
+  });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    killChengProcessGroup(child, "SIGKILL");
+    rejectWaiter(new Error(`lldb session timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+
+  async function execute(command) {
+    if (closed) throw new Error(`lldb already exited (exitCode=${closeCode})`);
+    if (waiter) throw new Error("lldb command protocol violation: concurrent commands");
+    const marker = `__CHENG_FUSION_LLDB_COMMAND_${commandSequence++}__`;
+    return new Promise((resolvePromise, rejectPromise) => {
+      waiter = {kind: "command", marker, buffer: idleBuffer, resolve: resolvePromise, reject: rejectPromise};
+      idleBuffer = Buffer.alloc(0);
+      const payload = `${command}\nscript print(${JSON.stringify(marker)})\n`;
+      child.stdin.write(payload, (error) => {
+        if (!error) return;
+        rejectWaiter(new Error(`failed to write lldb command: ${error.message}`));
+        killChengProcessGroup(child, "SIGKILL");
+      });
+      inspectWaiter();
+    });
+  }
+
+  async function continueUntilStop() {
+    if (closed) throw new Error(`lldb already exited (exitCode=${closeCode})`);
+    if (waiter) throw new Error("lldb command protocol violation: concurrent commands");
+    return new Promise((resolvePromise, rejectPromise) => {
+      waiter = {kind: "process-event", buffer: idleBuffer, resolve: resolvePromise, reject: rejectPromise};
+      idleBuffer = Buffer.alloc(0);
+      child.stdin.write("continue\n", (error) => {
+        if (!error) return;
+        rejectWaiter(new Error(`failed to write lldb continue command: ${error.message}`));
+        killChengProcessGroup(child, "SIGKILL");
+      });
+      inspectWaiter();
+    });
+  }
+
+  async function close() {
+    if (!closed) {
+      try {
+        child.stdin.write("quit\n");
+        child.stdin.end();
+      } catch {
+        killChengProcessGroup(child, "SIGKILL");
+      }
+    }
+    await closePromise;
+    const output = Buffer.concat(outputChunks, outputLength).toString("utf8");
+    return {
+      exitCode: timedOut || overflow || spawnError ? null : closeCode,
+      output,
+      timedOut,
+      overflow,
+      error: spawnError,
+    };
+  }
+
+  return {execute, continueUntilStop, close};
+}
+
+function assertCorruptHuntLldbSuccess(session, stage) {
+  const tail = takeTrailingText(session.output || session.error || "", 2000);
+  if (session.timedOut) throw new Error(`cheng_corrupt_hunt ${stage}: lldb timed out; session state is unknown: ${tail}`);
+  if (session.overflow) throw new Error(`cheng_corrupt_hunt ${stage}: lldb output overflow; session is incomplete: ${tail}`);
+  if (!Number.isInteger(session.exitCode)) throw new Error(`cheng_corrupt_hunt ${stage}: lldb produced no integer exitCode: ${tail}`);
+  if (session.exitCode !== 0) throw new Error(`cheng_corrupt_hunt ${stage}: lldb exited ${session.exitCode}: ${tail}`);
+}
+
+function assertNoLldbCommandError(output, stage, command) {
+  const errorMatch = String(output || "").match(/(?:^|\n)error:\s*([^\r\n]*)/i);
+  if (errorMatch) throw new Error(`cheng_corrupt_hunt ${stage}: LLDB command '${command}' failed: ${errorMatch[1]}`);
 }
 
 function splitLldbSessions(text) {
@@ -1080,89 +1938,19 @@ function parseOtoolTextSection(path) {
   return {addr: Number(match[1]), size: Number(match[2]), fileOff: Number(match[3])};
 }
 
-// nm -n 的 T(全局)/t(局部/static) 都要收: provider .o 里大量实际函数(如
-// cheng_core_runtime_program_support_backend__cheng_write_text_file__L6828)是 local
-// symbol, 只认 T 会把它们的地址晒漏成一段无符号区间, 让 nearestPrecedingSymbol 拿一个离得
-// 老远的全局符号硬凑一个荒谬的大 offset(实测: 5 万字节偏移量的假symbol命中).
+// T/t 都作为精确区间边界收集；所有权只允许同址唯一全局 T。局部 t 可能只是函数内标签，
+// 不能靠 nm 行序把它冒充函数 owner。
 function nmTextSymbols(path) {
   if (!existsSync(path)) return [];
   const result = spawnSync("nm", ["-n", path], {encoding: "utf8", timeout: 15000, maxBuffer: 64 * 1024 * 1024});
   if (result.status !== 0 || !result.stdout) return [];
   const symbols = [];
   for (const line of result.stdout.split("\n")) {
-    const match = line.match(/^([0-9a-fA-F]{16})\s+[Tt]\s+(\S+)$/);
-    if (match) symbols.push({addr: Number(`0x${match[1]}`), name: match[2]});
+    const match = line.match(/^([0-9a-fA-F]{16})\s+([Tt])\s+(\S+)$/);
+    if (match) symbols.push({addr: Number(`0x${match[1]}`), kind: match[2], name: match[3]});
   }
   symbols.sort((a, b) => a.addr - b.addr);
   return symbols;
-}
-
-// binary 同目录下 `<binary>.provider.<name>.o` 兄弟文件(BackendDriverDispatchMinCompileRuntimeProviderObjects
-// 的落盘约定). darwin_syscall provider 走内容寻址缓存(artifacts/backend_driver/provider_cache/<hash>.o),
-// 不落在这里, 因此这份清单不保证覆盖最终二进制 __text 里的每一段 provider 代码 —— 覆盖不到的区间
-// 如实留 provider-region 不猜.
-function findProviderObjects(binary) {
-  const dir = dirname(binary);
-  if (!existsSync(dir)) return [];
-  const prefix = `${basename(binary)}.provider.`;
-  return readdirSync(dir)
-    .filter((name) => name.startsWith(prefix) && name.endsWith(".o"))
-    .sort()
-    .map((name) => join(dir, name));
-}
-
-function providerModuleName(binary, providerPath) {
-  const prefix = `${basename(binary)}.provider.`;
-  const name = basename(providerPath);
-  return name.startsWith(prefix) && name.endsWith(".o") ? name.slice(prefix.length, -2) : name;
-}
-
-// Cheng 的内部 provider linker(macho_provider_linker.cheng)按 objPaths 顺序把每个 provider .o
-// 的 __text 原样拼接进最终 exe 的 __text, 但落盘产物里不存在任何记录拼接顺序/基址的边车文件:
-// native_link.log 只有 4 个摘要字段没有 object 列表, lldb `image list` 对这种静态拼接的单一
-// Mach-O 也只报一个 image(实测 2026-07-11 于 /tmp/f23/GEN2U 的真实崩溃复现, 两条线索都不成立,
-// 放弃按假设顺序累加 base 的方案 —— 那个方案曾把一段 provider 代码的 offset 算错整整 9288 字节,
-// 拿"最近符号"凑出一个看似合理实则驴唇不对马嘴的 symbol+offset, 逐字节比对才拆穿)。改用内容锚点
-// 搜索: provider 自己的 __text 里在多个位置取几种长度的候选窗口, 在最终二进制 __text 里查找
-// 该窗口的(可能不止一处的)出现位置反推 base, 再用整个 provider 长度做逐字节校验兜底确认 —— 真正
-// 的判据是这个全量校验, 不是"锚点唯一"(实测 core/support 这两个真实 provider 对象里, 128 字节
-// 长的窗口只要跨过一个 call/adrp 重定位字就整窗失配, 必须多试几个窗口才能找到没跨中继字的那个)。
-// 全量校验阈值定在 15%: 真实 provider 因 call/字面量重定位造成的逐字节差异实测 2.6%~4.9%, 而错误
-// 的 base 假设逐字节差异实测 86%+ —— 中间留了巨大安全余量, 不是拍脑袋的容差。全部候选都校验不过
-// 就返回 null, 该 provider 的帧照旧落 provider-region, 不瞎猜。
-function locateProviderBase(binaryTextBytes, providerTextBytes) {
-  if (!binaryTextBytes || !providerTextBytes || providerTextBytes.length === 0) return null;
-  const validate = (base) => {
-    if (base < 0 || base + providerTextBytes.length > binaryTextBytes.length) return false;
-    const candidate = binaryTextBytes.subarray(base, base + providerTextBytes.length);
-    const mismatchLimit = Math.max(128, Math.floor(providerTextBytes.length * 0.15));
-    let mismatches = 0;
-    for (let i = 0; i < candidate.length; i++) {
-      if (candidate[i] !== providerTextBytes[i]) {
-        mismatches++;
-        if (mismatches > mismatchLimit) return false;
-      }
-    }
-    return true;
-  };
-  const anchorLens = [128, 64, 32].filter((len) => len <= providerTextBytes.length);
-  const sampleCount = 8;
-  const maxOccurrencesPerAnchor = 50;
-  for (const anchorLen of anchorLens) {
-    for (let k = 0; k < sampleCount; k++) {
-      const span = providerTextBytes.length - anchorLen;
-      const anchorOffset = span <= 0 ? 0 : Math.floor((span * k) / (sampleCount - 1));
-      const anchor = providerTextBytes.subarray(anchorOffset, anchorOffset + anchorLen);
-      let searchFrom = 0;
-      for (let attempt = 0; attempt < maxOccurrencesPerAnchor; attempt++) {
-        const hit = binaryTextBytes.indexOf(anchor, searchFrom);
-        if (hit < 0) break;
-        if (validate(hit - anchorOffset)) return hit - anchorOffset;
-        searchFrom = hit + 1;
-      }
-    }
-  }
-  return null;
 }
 
 // stopReason 按 Darwin XNU 的 mach exception -> BSD signal 映射(bsd/uxkern/ux_exception.c)分类:
@@ -1184,45 +1972,18 @@ function classifyStopClass(stopReason, frames) {
   return "unknown";
 }
 
-function nearestPrecedingSymbol(symbols, offset) {
-  let lo = 0, hi = symbols.length - 1, best = null;
+function nearestPrecedingSymbolGroup(symbols, offset) {
+  let lo = 0, hi = symbols.length - 1, bestAddress = null;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     if (symbols[mid].addr <= offset) {
-      best = symbols[mid];
+      bestAddress = symbols[mid].addr;
       lo = mid + 1;
     } else {
       hi = mid - 1;
     }
   }
-  return best;
-}
-
-// binary __text 字节 + 各 provider 兄弟 .o 的内容锚点定位结果, 提取自 triageChengBinaryCrash,
-// cheng_corrupt_hunt 的 pc 符号化复用同一份(不重新扫一遍 provider 目录/重新做锚点搜索).
-function buildProviderCandidates(binary, binaryTextBytes) {
-  const providerCandidates = [];
-  if (!binaryTextBytes) return providerCandidates;
-  for (const providerPath of findProviderObjects(binary)) {
-    const providerText = parseOtoolTextSection(providerPath);
-    if (!providerText) continue;
-    let providerBytes;
-    try {
-      providerBytes = readFileSync(providerPath).subarray(providerText.fileOff, providerText.fileOff + providerText.size);
-    } catch {
-      continue;
-    }
-    const base = locateProviderBase(binaryTextBytes, providerBytes);
-    if (base === null) continue;
-    providerCandidates.push({
-      path: providerPath,
-      module: providerModuleName(binary, providerPath),
-      base,
-      size: providerText.size,
-      symbols: nmTextSymbols(providerPath),
-    });
-  }
-  return providerCandidates;
+  return bestAddress === null ? [] : symbols.filter((symbol) => symbol.addr === bestAddress);
 }
 
 // 纯地址 -> 符号 的核心判定树(不含 bt 帧的 lldbSymbol/foreign-module 包装), 抽出来给
@@ -1232,20 +1993,24 @@ function symbolizeChengPc(pcNumber, ctx) {
   if (!ctx.exeText || !ctx.primaryText) return {symbol: null, providerUnresolved: true, reason: "text-section-not-found"};
   const fileOffset = pcNumber - (ctx.slide || 0) - ctx.exeText.addr;
   if (fileOffset < 0 || fileOffset >= ctx.primaryText.size) {
-    const hit = ctx.providerCandidates.find((p) => fileOffset >= p.base && fileOffset < p.base + p.size);
-    if (hit) {
-      const localOffset = fileOffset - hit.base;
-      const sym = nearestPrecedingSymbol(hit.symbols, localOffset);
-      if (sym) {
-        return {symbol: sym.name, offset: localOffset - sym.addr, providerUnresolved: false, providerObject: hit.path, providerModule: hit.module};
-      }
-      return {symbol: null, providerUnresolved: true, reason: "provider-before-first-symbol", fileOffset, providerObject: hit.path, providerModule: hit.module};
-    }
     return {symbol: null, providerUnresolved: true, reason: "provider-region", fileOffset};
   }
-  const sym = nearestPrecedingSymbol(ctx.nmSymbols, fileOffset);
-  if (!sym) return {symbol: null, providerUnresolved: true, reason: "before-first-symbol", fileOffset};
-  return {symbol: sym.name, offset: fileOffset - sym.addr, providerUnresolved: false};
+  const objectAddress = ctx.primaryText.addr + fileOffset;
+  const symbolGroup = nearestPrecedingSymbolGroup(ctx.nmSymbols, objectAddress);
+  if (symbolGroup.length === 0) return {symbol: null, providerUnresolved: true, reason: "before-first-symbol", fileOffset};
+  const symbolAddress = symbolGroup[0].addr;
+  if (symbolAddress < ctx.primaryText.addr || symbolAddress >= ctx.primaryText.addr + ctx.primaryText.size) {
+    return {symbol: null, providerUnresolved: true, reason: "symbol-outside-primary-text", fileOffset};
+  }
+  const globalNames = [...new Set(symbolGroup.filter((symbol) => symbol.kind === "T").map((symbol) => symbol.name))].sort();
+  if (globalNames.length > 1) {
+    return {symbol: null, providerUnresolved: true, reason: "ambiguous-primary-symbol", fileOffset, candidates: globalNames};
+  }
+  if (globalNames.length === 0) {
+    const localNames = [...new Set(symbolGroup.map((symbol) => symbol.name))].sort();
+    return {symbol: null, providerUnresolved: true, reason: "local-primary-symbol-boundary", fileOffset, candidates: localNames};
+  }
+  return {symbol: globalNames[0], offset: objectAddress - symbolAddress, providerUnresolved: false};
 }
 
 // bt 帧包装: 帧自带 lldb 已解析的符号(如落在系统 dylib)直接采用; 帧所属模块不是本 binary 的
@@ -1257,80 +2022,302 @@ function symbolizeFrame(frame, ctx) {
   return {...frame, ...resolved};
 }
 
-// 纯发射 gen2 崩溃(0 行 stderr trace)的实战闭环: 自己起 lldb 跑 binary, 崩点批处理拿 bt/寄存器/
-// 崩点指令, 帧按 nm(primary.o) + otool(text section addr/size) + image-list slide 全部符号化;
-// 落在 primary.o 自身 __text 范围外的帧(provider/其它被链接 .o 的代码)如实标 provider-unresolved,
-// 不假装解析出一个误导性的符号.
+const CHENG_FUSION_CRASH_TRIAGE_INPUT_FILE_MAX_BYTES = 1024 * 1024 * 1024;
+const CHENG_FUSION_CRASH_TRIAGE_INPUT_TOTAL_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const CHENG_FUSION_CRASH_TRIAGE_SNAPSHOT_PREFIX = "cheng-fusion-crash-triage-";
+
+function crashTriageStableStatKey(stat) {
+  return [stat.dev, stat.ino, stat.size, stat.mode, stat.uid, stat.gid, stat.nlink, stat.mtimeNs, stat.ctimeNs]
+    .map((value) => String(value)).join(":");
+}
+
+function stableFileStatKey(stat) {
+  return [stat.dev, stat.ino, stat.size, stat.mode, stat.mtimeNs, stat.ctimeNs].map((value) => String(value)).join(":");
+}
+
+function createCrashTriageSnapshotRoot() {
+  const root = mkdtempSync(join(tmpdir(), CHENG_FUSION_CRASH_TRIAGE_SNAPSHOT_PREFIX));
+  chmodSync(root, 0o700);
+  const rootStat = lstatSync(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || (rootStat.mode & 0o777) !== 0o700) {
+    throw new Error(`cheng_crash_triage failed to create a private snapshot directory: ${root}`);
+  }
+  return root;
+}
+
+// Open the caller-owned input once with O_NOFOLLOW, stream exactly that generation into
+// a private O_EXCL file, and reject any metadata/path-generation change observed across
+// the copy. All downstream processes receive only destinationPath.
+function snapshotCrashTriageInput(sourcePath, reportedPath, destinationPath, label, mode, total) {
+  let pathBefore;
+  try {
+    pathBefore = lstatSync(sourcePath, {bigint: true});
+  } catch (error) {
+    throw new Error(`${label} not found: ${reportedPath} (${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (pathBefore.isSymbolicLink() || !pathBefore.isFile() || pathBefore.size <= 0n) {
+    throw new Error(`${label} must be a non-empty regular non-symlink file: ${reportedPath}`);
+  }
+  const size = Number(pathBefore.size);
+  if (!Number.isSafeInteger(size) || size > CHENG_FUSION_CRASH_TRIAGE_INPUT_FILE_MAX_BYTES) {
+    throw new Error(`${label} exceeds the ${CHENG_FUSION_CRASH_TRIAGE_INPUT_FILE_MAX_BYTES}-byte input limit: ${reportedPath} (${pathBefore.size} bytes)`);
+  }
+  if (total.bytes + size > CHENG_FUSION_CRASH_TRIAGE_INPUT_TOTAL_MAX_BYTES) {
+    throw new Error(`cheng_crash_triage inputs exceed the ${CHENG_FUSION_CRASH_TRIAGE_INPUT_TOTAL_MAX_BYTES}-byte total limit`);
+  }
+  if (mode === 0o700) {
+    try {
+      accessSync(sourcePath, constants.X_OK);
+    } catch {
+      throw new Error(`${label} is not executable: ${reportedPath}`);
+    }
+  }
+  if (typeof constants.O_NOFOLLOW !== "number") {
+    throw new Error("cheng_crash_triage requires O_NOFOLLOW support for live input snapshots");
+  }
+
+  const cloexec = typeof constants.O_CLOEXEC === "number" ? constants.O_CLOEXEC : 0;
+  let sourceFd = null;
+  let destinationFd = null;
+  let sourceBefore;
+  let sourceAfter;
+  let pathAfter;
+  let copied = 0;
+  const hash = createHash("sha256");
+  try {
+    sourceFd = openSync(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW | cloexec);
+    sourceBefore = fstatSync(sourceFd, {bigint: true});
+    if (!sourceBefore.isFile() || sourceBefore.size <= 0n
+        || sourceBefore.dev !== pathBefore.dev || sourceBefore.ino !== pathBefore.ino
+        || crashTriageStableStatKey(sourceBefore) !== crashTriageStableStatKey(pathBefore)) {
+      throw new Error(`${label} changed while being opened: ${reportedPath}`);
+    }
+
+    destinationFd = openSync(destinationPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | cloexec,
+      mode);
+    fchmodSync(destinationFd, mode);
+    const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, size));
+    while (copied < size) {
+      const count = readSync(sourceFd, buffer, 0, Math.min(buffer.length, size - copied), copied);
+      if (count <= 0) throw new Error(`${label} ended before its declared size while being copied: ${reportedPath}`);
+      hash.update(buffer.subarray(0, count));
+      let written = 0;
+      while (written < count) {
+        const n = writeSync(destinationFd, buffer, written, count - written);
+        if (n <= 0) throw new Error(`${label} snapshot write made no progress: ${reportedPath}`);
+        written += n;
+      }
+      copied += count;
+    }
+    sourceAfter = fstatSync(sourceFd, {bigint: true});
+    try {
+      pathAfter = lstatSync(sourcePath, {bigint: true});
+    } catch (error) {
+      throw new Error(`${label} path changed while being copied: ${reportedPath} (${error instanceof Error ? error.message : String(error)})`);
+    }
+    if (copied !== size
+        || crashTriageStableStatKey(sourceBefore) !== crashTriageStableStatKey(sourceAfter)
+        || crashTriageStableStatKey(sourceAfter) !== crashTriageStableStatKey(pathAfter)) {
+      throw new Error(`${label} changed while being copied: ${reportedPath}`);
+    }
+    fsyncSync(destinationFd);
+    const destinationStat = fstatSync(destinationFd, {bigint: true});
+    if (!destinationStat.isFile() || destinationStat.size !== sourceAfter.size
+        || (destinationStat.mode & 0o777n) !== BigInt(mode)) {
+      throw new Error(`${label} snapshot verification failed: ${reportedPath}`);
+    }
+  } finally {
+    if (destinationFd !== null) closeSync(destinationFd);
+    if (sourceFd !== null) closeSync(sourceFd);
+  }
+  total.bytes += copied;
+  return {
+    sourcePath: reportedPath,
+    destinationPath,
+    mode,
+    size: copied,
+    sha256: `sha256:${hash.digest("hex")}`,
+  };
+}
+
+function verifyCrashTriageSnapshot(snapshot, label) {
+  const pathBefore = lstatSync(snapshot.destinationPath, {bigint: true});
+  if (pathBefore.isSymbolicLink() || !pathBefore.isFile() || pathBefore.size !== BigInt(snapshot.size)
+      || (pathBefore.mode & 0o777n) !== BigInt(snapshot.mode)) {
+    throw new Error(`${label} private snapshot metadata changed after publication`);
+  }
+  const cloexec = typeof constants.O_CLOEXEC === "number" ? constants.O_CLOEXEC : 0;
+  const fd = openSync(snapshot.destinationPath, constants.O_RDONLY | constants.O_NOFOLLOW | cloexec);
+  const hash = createHash("sha256");
+  let copied = 0;
+  let fdBefore;
+  let fdAfter;
+  try {
+    fdBefore = fstatSync(fd, {bigint: true});
+    if (crashTriageStableStatKey(fdBefore) !== crashTriageStableStatKey(pathBefore)) {
+      throw new Error(`${label} private snapshot generation changed while being opened`);
+    }
+    const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, snapshot.size));
+    while (copied < snapshot.size) {
+      const count = readSync(fd, buffer, 0, Math.min(buffer.length, snapshot.size - copied), copied);
+      if (count <= 0) throw new Error(`${label} private snapshot ended before its declared size`);
+      hash.update(buffer.subarray(0, count));
+      copied += count;
+    }
+    fdAfter = fstatSync(fd, {bigint: true});
+  } finally {
+    closeSync(fd);
+  }
+  const pathAfter = lstatSync(snapshot.destinationPath, {bigint: true});
+  const actualHash = `sha256:${hash.digest("hex")}`;
+  if (copied !== snapshot.size
+      || crashTriageStableStatKey(fdBefore) !== crashTriageStableStatKey(fdAfter)
+      || crashTriageStableStatKey(fdAfter) !== crashTriageStableStatKey(pathAfter)
+      || actualHash !== snapshot.sha256) {
+    throw new Error(`${label} private snapshot bytes changed after publication: expected ${snapshot.sha256}, got ${actualHash}`);
+  }
+}
+
+function publicCrashTriageInputEvidence(snapshot) {
+  return snapshot ? {path: snapshot.sourcePath, size: snapshot.size, sha256: snapshot.sha256} : null;
+}
+
+// 纯发射 gen2 崩溃(0 行 stderr trace)的实战闭环: 先冻结 binary/primary.o 的稳定字节,
+// 再让 lldb/otool/nm 只消费私有快照。对外始终报告调用者的原路径和内容证据。
 async function triageChengBinaryCrash(input) {
-  const binary = input.binary;
-  if (!existsSync(binary)) return {schema: "cheng_crash_triage_live.v1", error: `binary not found: ${binary}`};
+  const binary = String(input.binary || "");
+  if (!isAbsolute(binary)) throw new Error(`cheng_crash_triage binary must be an absolute path: ${binary}`);
+  const binarySource = resolve(binary);
+  const primaryWasExplicit = Object.prototype.hasOwnProperty.call(input, "primaryObject");
+  const primaryObject = primaryWasExplicit ? String(input.primaryObject || "") : `${binary}.primary.o`;
+  if (!isAbsolute(primaryObject)) throw new Error(`cheng_crash_triage primaryObject must be an absolute path: ${primaryObject}`);
+  const primarySource = resolve(primaryObject);
   const args = Array.isArray(input.args) ? input.args : [];
-  const primaryObject = input.primaryObject || `${binary}.primary.o`;
   const maxFrames = input.maxFrames || 64;
-  const session = await runLldbBatch(binary, args, input.env || {}, {
-    maxFrames,
-    timeoutMs: input.timeoutSec ? Math.round(input.timeoutSec * 1000) : undefined,
-  });
-  const text = session.output;
-  const exitedMatch = text.match(/exited with status = (-?\d+)/);
-  if (exitedMatch && !/stop reason = /.test(text)) {
+  let snapshotRoot = null;
+  try {
+    snapshotRoot = createCrashTriageSnapshotRoot();
+    const binaryDir = join(snapshotRoot, "binary");
+    const primaryDir = join(snapshotRoot, "primary");
+    mkdirSync(binaryDir, {mode: 0o700});
+    mkdirSync(primaryDir, {mode: 0o700});
+    chmodSync(binaryDir, 0o700);
+    chmodSync(primaryDir, 0o700);
+    const total = {bytes: 0};
+    const binarySnapshot = snapshotCrashTriageInput(
+      binarySource, binary, join(binaryDir, basename(binarySource)),
+      "cheng_crash_triage binary", 0o700, total,
+    );
+    let primarySnapshot = null;
+    if (primaryWasExplicit) {
+      primarySnapshot = snapshotCrashTriageInput(
+        primarySource, primaryObject, join(primaryDir, basename(primarySource)),
+        "cheng_crash_triage primaryObject", 0o600, total,
+      );
+    } else {
+      let defaultPrimaryExists = false;
+      try {
+        lstatSync(primarySource);
+        defaultPrimaryExists = true;
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") {
+          throw new Error(`cheng_crash_triage cannot inspect default primaryObject ${primaryObject}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (defaultPrimaryExists) {
+        primarySnapshot = snapshotCrashTriageInput(
+          primarySource, primaryObject, join(primaryDir, basename(primarySource)),
+          "cheng_crash_triage primaryObject", 0o600, total,
+        );
+      }
+    }
+    const inputEvidence = {
+      binary: publicCrashTriageInputEvidence(binarySnapshot),
+      primaryObject: publicCrashTriageInputEvidence(primarySnapshot),
+    };
+
+    const session = await runLldbBatch(binarySnapshot.destinationPath, args, input.env || {}, {
+      maxFrames,
+      timeoutMs: input.timeoutSec ? Math.round(input.timeoutSec * 1000) : undefined,
+      maxBuffer: input.maxOutputBytes,
+    });
+    const text = session.output;
+    assertLldbAslrDisabled(text, "cheng_crash_triage live lldb");
+    if (session.timedOut) {
+      throw new Error(`cheng_crash_triage live lldb timed out; crash state is unknown: ${takeTrailingText(text, 2000)}`);
+    }
+    if (session.overflow) {
+      throw new Error(`cheng_crash_triage live lldb output overflow; crash state is incomplete: ${takeTrailingText(text, 2000)}`);
+    }
+    if (!Number.isInteger(session.exitCode)) {
+      throw new Error(`cheng_crash_triage live lldb produced no exit code: ${takeTrailingText(text, 2000)}`);
+    }
+    if (session.exitCode !== 0) {
+      throw new Error(`cheng_crash_triage live lldb exited ${session.exitCode}: ${takeTrailingText(text, 2000)}`);
+    }
+    verifyCrashTriageSnapshot(binarySnapshot, "cheng_crash_triage binary");
+    if (primarySnapshot) verifyCrashTriageSnapshot(primarySnapshot, "cheng_crash_triage primaryObject");
+    const exitedMatch = text.match(/exited with status = (-?\d+)/);
+    const hasStopReason = /stop reason = /.test(text);
+    if (!exitedMatch && !hasStopReason) {
+      throw new Error(`cheng_crash_triage live lldb completed without a debuggee exit or stop reason: ${takeTrailingText(text, 2000)}`);
+    }
+    if (exitedMatch && !hasStopReason) {
+      return {
+        schema: "cheng_crash_triage_live.v1",
+        binary, args, primaryObject, inputEvidence,
+        exited: true,
+        exitCode: Number(exitedMatch[1]),
+        stopReason: null,
+        stopClass: null,
+        faultAddress: null,
+        crashInsn: null,
+        frames: [],
+        registers: {},
+        lldbExitCode: session.exitCode,
+        timedOut: Boolean(session.timedOut),
+        overflow: Boolean(session.overflow),
+      };
+    }
+    const sessions = splitLldbSessions(text);
+    const runSession = sessions.find((s) => /^run\b/.test(s.command)) || {output: text};
+    const btSession = sessions.find((s) => /^bt\b/.test(s.command));
+    const regSession = sessions.find((s) => s.command === "register read");
+    const imgSession = sessions.find((s) => /^image list/.test(s.command));
+    const stopReasonMatch = text.match(/stop reason = ([^\n]+)/);
+    const faultMatch = text.match(/EXC_BAD_ACCESS[^\n]*address=(0x[0-9a-fA-F]+)/);
+    const crashInsnMatch = runSession.output.match(/^->\s+(0x[0-9a-fA-F]+)(?:\s+<\+\d+>)?:\s+(.+)$/m);
+    const frames = btSession ? parseLldbFrames(btSession.output) : parseLldbFrames(runSession.output);
+    const registers = regSession ? parseLldbRegisters(regSession.output) : {};
+    const imageInfo = imgSession ? parseLldbImageSlide(imgSession.output) : null;
+    const slide = imageInfo ? imageInfo.slide : 0;
+    const primaryObjectExists = Boolean(primarySnapshot);
+    const exeText = parseOtoolTextSection(binarySnapshot.destinationPath);
+    const primaryText = primarySnapshot ? parseOtoolTextSection(primarySnapshot.destinationPath) : null;
+    const nmSymbols = primarySnapshot ? nmTextSymbols(primarySnapshot.destinationPath) : [];
+    verifyCrashTriageSnapshot(binarySnapshot, "cheng_crash_triage binary");
+    if (primarySnapshot) verifyCrashTriageSnapshot(primarySnapshot, "cheng_crash_triage primaryObject");
+    const symbolizeCtx = {binaryBase: basename(binary), primaryObject, primaryObjectExists, exeText, primaryText, nmSymbols, slide};
+    const symbolicated = frames.map((frame) => symbolizeFrame(frame, symbolizeCtx));
     return {
       schema: "cheng_crash_triage_live.v1",
-      binary, args, primaryObject,
-      exited: true,
-      exitCode: Number(exitedMatch[1]),
-      stopReason: null,
-      stopClass: null,
-      faultAddress: null,
-      crashInsn: null,
-      frames: [],
-      registers: {},
+      binary, args, primaryObject, inputEvidence,
+      exited: false,
+      stopReason: stopReasonMatch ? stopReasonMatch[1].trim() : null,
+      stopClass: classifyStopClass(stopReasonMatch ? stopReasonMatch[1].trim() : null, frames),
+      faultAddress: faultMatch ? faultMatch[1] : null,
+      crashInsn: crashInsnMatch ? {pc: crashInsnMatch[1], insn: crashInsnMatch[2].trim()} : null,
+      frames: symbolicated,
+      registers,
+      slide,
+      lldbExitCode: session.exitCode,
       timedOut: Boolean(session.timedOut),
       overflow: Boolean(session.overflow),
     };
+  } finally {
+    if (snapshotRoot) rmSync(snapshotRoot, {recursive: true, force: true});
   }
-  const sessions = splitLldbSessions(text);
-  const runSession = sessions.find((s) => /^run\b/.test(s.command)) || {output: text};
-  const btSession = sessions.find((s) => /^bt\b/.test(s.command));
-  const regSession = sessions.find((s) => s.command === "register read");
-  const imgSession = sessions.find((s) => /^image list/.test(s.command));
-  const stopReasonMatch = text.match(/stop reason = ([^\n]+)/);
-  const faultMatch = text.match(/EXC_BAD_ACCESS[^\n]*address=(0x[0-9a-fA-F]+)/);
-  const crashInsnMatch = runSession.output.match(/^->\s+(0x[0-9a-fA-F]+)(?:\s+<\+\d+>)?:\s+(.+)$/m);
-  const frames = btSession ? parseLldbFrames(btSession.output) : parseLldbFrames(runSession.output);
-  const registers = regSession ? parseLldbRegisters(regSession.output) : {};
-  const imageInfo = imgSession ? parseLldbImageSlide(imgSession.output) : null;
-  const slide = imageInfo ? imageInfo.slide : 0;
-  const binaryBase = basename(binary);
-  const primaryObjectExists = existsSync(primaryObject);
-  const exeText = parseOtoolTextSection(binary);
-  const primaryText = primaryObjectExists ? parseOtoolTextSection(primaryObject) : null;
-  const nmSymbols = primaryObjectExists ? nmTextSymbols(primaryObject) : [];
-  let binaryTextBytes = null;
-  if (exeText) {
-    try {
-      binaryTextBytes = readFileSync(binary).subarray(exeText.fileOff, exeText.fileOff + exeText.size);
-    } catch {
-      binaryTextBytes = null;
-    }
-  }
-  const providerCandidates = buildProviderCandidates(binary, binaryTextBytes);
-  const symbolizeCtx = {binaryBase, primaryObject, primaryObjectExists, exeText, primaryText, nmSymbols, providerCandidates, slide};
-  const symbolicated = frames.map((frame) => symbolizeFrame(frame, symbolizeCtx));
-  return {
-    schema: "cheng_crash_triage_live.v1",
-    binary, args, primaryObject,
-    exited: false,
-    stopReason: stopReasonMatch ? stopReasonMatch[1].trim() : null,
-    stopClass: classifyStopClass(stopReasonMatch ? stopReasonMatch[1].trim() : null, frames),
-    faultAddress: faultMatch ? faultMatch[1] : null,
-    crashInsn: crashInsnMatch ? {pc: crashInsnMatch[1], insn: crashInsnMatch[2].trim()} : null,
-    frames: symbolicated,
-    registers,
-    slide,
-    timedOut: Boolean(session.timedOut),
-    overflow: Boolean(session.overflow),
-  };
 }
 
 const CHENG_FUSION_CORRUPT_HUNT_TIMEOUT_MS_DEFAULT = 60000;
@@ -1338,12 +2325,12 @@ const CHENG_FUSION_CORRUPT_HUNT_MAXHITS_DEFAULT = 8;
 const CHENG_FUSION_CORRUPT_HUNT_BT_DEPTH = 8;
 
 function toHexAddr(n) {
-  return `0x${Math.trunc(n).toString(16)}`;
+  return `0x${(typeof n === "bigint" ? n : BigInt(Math.trunc(n))).toString(16)}`;
 }
 
 function parseCorruptHuntLiteralAddress(text) {
   const match = String(text || "").trim().match(/^(?:0x)?([0-9a-fA-F]+)$/);
-  return match ? Number(`0x${match[1]}`) : null;
+  return match ? BigInt(`0x${match[1]}`) : null;
 }
 
 // lldb 地址表达式对寄存器算术是原生支持的(`$x1+16`), 在 -o 命令里直接写这种表达式让 lldb
@@ -1355,39 +2342,32 @@ function corruptHuntRegisterOffsetExpr(register, offset) {
 }
 
 function corruptHuntEnvVarsCommand(env) {
-  const merged = {CHENG_PROCESS_MAX_RSS_BYTES: chengFusionRssCapBytes(), ...(env || {})};
-  const tokens = Object.entries(merged).map(([key, value]) => lldbArgQuote(`${key}=${value}`));
-  return `settings set target.env-vars ${tokens.join(" ")}`;
+  return lldbTargetEnvVarsCommand(env);
 }
 
 function corruptHuntLaunchCommand(args) {
   const quoted = (args || []).map(lldbArgQuote).join(" ");
-  return quoted ? `process launch --stop-at-entry -- ${quoted}` : "process launch --stop-at-entry";
+  return quoted
+    ? `process launch --stop-at-entry --no-stdio -- ${quoted}`
+    : "process launch --stop-at-entry --no-stdio";
 }
 
-// memory read 的一行输出形如 "0x16fdecbf0: 0x6fdeccf0"(地址: 十六进制值), 取冒号后那个值。
-function parseLldbMemoryReadValue(output) {
-  const match = String(output || "").match(/0x[0-9a-fA-F]+:\s*(0x[0-9a-fA-F]+)/);
-  return match ? match[1] : null;
+// memory read 的一行输出形如 "0x16fdecbf0: 0x6fdeccf0"。地址和值必须作为一个不可拆的
+// 记录解析，调用方再验证地址就是本轮 H；不能只抽 value 后与另一轮 stop 拼接。
+function parseLldbMemoryReadRecord(output) {
+  const matches = [...String(output || "").matchAll(/^\s*(0x[0-9a-fA-F]+):\s*(0x[0-9a-fA-F]+)\s*$/gm)];
+  if (matches.length !== 1) return null;
+  return {address: toHexAddr(BigInt(matches[0][1])), value: matches[0][2]};
 }
 
 // binary/primaryObject 的 otool/nm 静态上下文, stage1 的断点地址解析和 stage1/stage2 的 pc
-// 符号化共用同一份(不重复读文件/重复跑 nm)。provider 兄弟 .o 的内容锚点定位复用
-// buildProviderCandidates(cheng_crash_triage 同款)。
+// 符号化共用同一份(不重复读文件/重复跑 nm)。没有 linker 产出的精确 provider 映射时，
+// primary 之外的地址保持 providerUnresolved，绝不靠内容相似度猜测对象基址。
 function buildChengCorruptHuntContext(binary, primaryObject) {
   const exeText = parseOtoolTextSection(binary);
   const primaryObjectExists = Boolean(primaryObject) && existsSync(primaryObject);
   const primaryText = primaryObjectExists ? parseOtoolTextSection(primaryObject) : null;
   const nmSymbols = primaryObjectExists ? nmTextSymbols(primaryObject) : [];
-  let binaryTextBytes = null;
-  if (exeText) {
-    try {
-      binaryTextBytes = readFileSync(binary).subarray(exeText.fileOff, exeText.fileOff + exeText.size);
-    } catch {
-      binaryTextBytes = null;
-    }
-  }
-  const providerCandidates = buildProviderCandidates(binary, binaryTextBytes);
   return {
     binaryBase: basename(binary),
     primaryObject,
@@ -1395,15 +2375,14 @@ function buildChengCorruptHuntContext(binary, primaryObject) {
     exeText,
     primaryText,
     nmSymbols,
-    providerCandidates,
     slide: 0,
   };
 }
 
-// breakSymbol 模式: nm -n primaryObject 里找该符号的本地(相对 .o 自身 __text 起点)偏移, 按
-// system-link-exec 的 primary+provider 拼接约定(primary 对象的 __text 落在最终二进制 __text
-// 的文件偏移 0 处, 见 cheng_crash_triage 里 triageChengBinaryCrash 的同一假设)算出最终虚拟地址
-// = exeText.addr + 本地偏移。slide 按 0 处理(lldb 批处理默认 target.disable-aslr=true, 已用
+// breakSymbol 模式: nm -n primaryObject 里的符号值与该对象 __text.addr 同属 section 地址坐标，
+// 必须先相减得到对象内偏移，再按 primary+provider 拼接约定映射到最终二进制 __text 起点：
+// exeText.addr + (symbol.addr - primaryText.addr)。slide 按 0 处理(lldb 批处理默认
+// target.disable-aslr=true, 已用
 // `settings show target.disable-aslr` 实测确认;stage1 之后仍会校验断点是否真被命中,假设不成立
 // 会显式报错而不是静默给出一个从未命中的地址)。落在被链接 provider 对象里的符号、或函数体中间的
 // 任意 PC(非符号入口), 不在这个便捷路径覆盖范围内, 调用方应自行算出地址后走 breakAddr。
@@ -1415,9 +2394,15 @@ function resolveCorruptHuntBreakAddress(input, ctx) {
   }
   if (!ctx.primaryObjectExists) throw new Error(`cheng_corrupt_hunt: primaryObject 不存在: ${input.primaryObject}`);
   if (!ctx.exeText) throw new Error(`cheng_corrupt_hunt: 无法用 otool -l 读出 binary 的 __text: ${input.binary}`);
-  const hit = ctx.nmSymbols.find((s) => s.name === input.breakSymbol);
-  if (!hit) throw new Error(`cheng_corrupt_hunt: breakSymbol '${input.breakSymbol}' 在 nm -n ${input.primaryObject} 里未找到`);
-  return ctx.exeText.addr + hit.addr;
+  if (!ctx.primaryText) throw new Error(`cheng_corrupt_hunt: 无法用 otool -l 读出 primaryObject 的 __text: ${input.primaryObject}`);
+  const symbolHits = ctx.nmSymbols.filter((symbol) => symbol.name === input.breakSymbol);
+  if (symbolHits.length === 0) throw new Error(`cheng_corrupt_hunt: breakSymbol '${input.breakSymbol}' 在 nm -n ${input.primaryObject} 里未找到`);
+  if (symbolHits.length !== 1) throw new Error(`cheng_corrupt_hunt: breakSymbol '${input.breakSymbol}' 在 nm -n ${input.primaryObject} 里不唯一`);
+  const hit = symbolHits[0];
+  if (hit.addr < ctx.primaryText.addr || hit.addr >= ctx.primaryText.addr + ctx.primaryText.size) {
+    throw new Error(`cheng_corrupt_hunt: breakSymbol '${input.breakSymbol}' 不在 primaryObject __TEXT,__text 区间内`);
+  }
+  return ctx.exeText.addr + (hit.addr - ctx.primaryText.addr);
 }
 
 // 阶段1: 固定地址断点必须在 --stop-at-entry 之后再下(案卷 docs/patches-form34-layerA-writer.md
@@ -1427,31 +2412,86 @@ function resolveCorruptHuntBreakAddress(input, ctx) {
 async function chengCorruptHuntStage1(input, ctx) {
   const breakAddr = resolveCorruptHuntBreakAddress(input, ctx);
   const breakAddrHex = toHexAddr(breakAddr);
+  const breakpointSkip = input.breakpointSkip ?? 0;
   const watchExpr = corruptHuntRegisterOffsetExpr(input.watchRegister, input.watchOffset);
   const registerReadCmd = `register read ${input.watchRegister}`;
   const memReadCmd = `memory read -fx -s${input.watchSize} -c1 -- ${watchExpr}`;
+  const breakpointModifyCmd = `breakpoint modify -i ${breakpointSkip}`;
+  const breakpointListCmd = "breakpoint list";
+  const aslrSetCommand = "settings set target.disable-aslr true";
+  const aslrShowCommand = "settings show target.disable-aslr";
   const commands = [
+    "settings set interpreter.prompt-on-quit false",
+    aslrSetCommand,
+    aslrShowCommand,
     corruptHuntEnvVarsCommand(input.env),
     corruptHuntLaunchCommand(input.args),
     `breakpoint set -a ${breakAddrHex}`,
+    breakpointModifyCmd,
     "continue",
+    breakpointListCmd,
     registerReadCmd,
     memReadCmd,
     `bt ${CHENG_FUSION_CORRUPT_HUNT_BT_DEPTH}`,
     "quit",
   ];
-  const session = await runLldbOCommands(input.binary, commands, input.env || {}, {
+  const session = await runLldbOCommands(input.binary, commands, input.env, {
     timeoutMs: input.timeoutSec ? Math.round(input.timeoutSec * 1000) : undefined,
+    maxBuffer: input.maxOutputBytes,
   });
   const text = session.output;
   const sessions = splitLldbSessions(text);
-  const continueSession = sessions.find((s) => s.command === "continue");
-  const hitBreakpoint = Boolean(continueSession) && /stop reason = breakpoint/.test(continueSession.output);
-  if (!hitBreakpoint) {
+  assertCorruptHuntLldbSuccess(session, "stage1");
+  const aslrShowSession = sessions.find((s) => s.command === aslrShowCommand);
+  assertLldbAslrDisabled(aslrShowSession?.output, "cheng_corrupt_hunt stage1");
+  const breakpointCommand = `breakpoint set -a ${breakAddrHex}`;
+  const breakpointSession = sessions.find((s) => s.command === breakpointCommand);
+  const breakpointIdMatch = breakpointSession?.output.match(/\bBreakpoint\s+(\d+)\s*:/);
+  if (!breakpointIdMatch) {
     return {
-      error: `cheng_corrupt_hunt stage1: 断点 ${breakAddrHex} 从未命中(进程提前退出或地址算错 —— 若走的是 breakSymbol, 检查 ASLR-disabled/base=0 假设是否对这个二进制成立), raw tail: ${takeTrailingText(text, 2000)}`,
+      error: `cheng_corrupt_hunt stage1: 无法从 lldb 输出确认目标断点编号，拒绝按 continue 序号猜测命中: ${takeTrailingText(text, 2000)}`,
       breakAddrHex,
+      breakpointSkip,
+      observedBreakpointHits: 0,
       timedOut: Boolean(session.timedOut),
+    };
+  }
+  const breakpointId = Number(breakpointIdMatch[1]);
+  const modifySession = sessions.find((s) => s.command === breakpointModifyCmd);
+  if (!modifySession || /(^|\n)error:/i.test(modifySession.output)) {
+    return {
+      error: `cheng_corrupt_hunt stage1: 无法给目标断点 ${breakpointId} 设置 ignore-count=${breakpointSkip}: ${takeTrailingText(modifySession?.output || text, 2000)}`,
+      breakAddrHex,
+      breakpointId,
+      breakpointSkip,
+      timedOut: false,
+    };
+  }
+  const breakpointListSession = sessions.find((s) => s.command === breakpointListCmd);
+  const hitCountMatch = breakpointListSession?.output.match(new RegExp(`^${breakpointId}:.*?hit count = (\\d+)`, "m"));
+  const observedBreakpointHits = hitCountMatch ? Number(hitCountMatch[1]) : null;
+  const continueSession = sessions.find((s) => s.command === "continue");
+  const targetBreakpointPattern = new RegExp(`stop reason = breakpoint ${breakpointId}(?:\\.|\\b)`, "i");
+  const hitBreakpoint = Boolean(continueSession) && targetBreakpointPattern.test(continueSession.output);
+  if (!hitBreakpoint) {
+    const stopReason = continueSession?.output.match(/stop reason = ([^\n]+)/i)?.[1]?.trim() || "目标进程未停住";
+    return {
+      error: `cheng_corrupt_hunt stage1: 只接受目标断点 ${breakpointId}(${breakAddrHex}) 在 ignore-count=${breakpointSkip} 后的命中，实得 stop reason=${stopReason}${observedBreakpointHits === null ? "" : `，目标断点实际命中 ${observedBreakpointHits} 次`}(进程提前退出、命中不足、信号或其他断点均不能冒充目标命中), raw tail: ${takeTrailingText(text, 2000)}`,
+      breakAddrHex,
+      breakpointId,
+      breakpointSkip,
+      observedBreakpointHits,
+      timedOut: Boolean(session.timedOut),
+    };
+  }
+  if (observedBreakpointHits === null || observedBreakpointHits !== breakpointSkip + 1) {
+    return {
+      error: `cheng_corrupt_hunt stage1: 目标断点 ${breakpointId} 已停住，但无法证明它是第 ${breakpointSkip + 1} 次命中(hit count=${observedBreakpointHits === null ? "unavailable" : observedBreakpointHits})，拒绝继续取证`,
+      breakAddrHex,
+      breakpointId,
+      breakpointSkip,
+      observedBreakpointHits,
+      timedOut: false,
     };
   }
   const registerSession = sessions.find((s) => s.command === registerReadCmd);
@@ -1461,21 +2501,50 @@ async function chengCorruptHuntStage1(input, ctx) {
     return {
       error: `cheng_corrupt_hunt stage1: 断点命中但读不到寄存器 ${input.watchRegister} 的值(寄存器名是否对这个架构合法?), raw tail: ${takeTrailingText(text, 2000)}`,
       breakAddrHex,
+      breakpointId,
+      breakpointSkip,
+      observedBreakpointHits,
       timedOut: Boolean(session.timedOut),
     };
   }
-  const H = Number(registerValueHex) + (Number(input.watchOffset) || 0);
+  const H = BigInt(registerValueHex) + BigInt(input.watchOffset);
+  if (H < 0n) {
+    return {
+      error: `cheng_corrupt_hunt stage1: ${input.watchRegister}+watchOffset 得到负地址 ${H.toString()}，拒绝读取`,
+      breakAddrHex,
+      breakpointId,
+      breakpointSkip,
+      observedBreakpointHits,
+      timedOut: false,
+    };
+  }
   const memSession = sessions.find((s) => s.command === memReadCmd);
-  const initialValue = memSession ? parseLldbMemoryReadValue(memSession.output) : null;
+  const initialRead = memSession ? parseLldbMemoryReadRecord(memSession.output) : null;
+  if (!initialRead || initialRead.address !== toHexAddr(H)) {
+    return {
+      error: `cheng_corrupt_hunt stage1: 目标断点 ${breakpointId} 命中，但 memory read ${toHexAddr(H)} ${initialRead ? `返回了其他地址 ${initialRead.address}` : "失败"}，不能把未配对值带入 stage2: ${takeTrailingText(memSession?.output || text, 2000)}`,
+      breakAddrHex,
+      breakpointId,
+      breakpointSkip,
+      observedBreakpointHits,
+      registerValue: registerValueHex,
+      Hhex: toHexAddr(H),
+      timedOut: false,
+    };
+  }
   const btSession = sessions.find((s) => s.command === `bt ${CHENG_FUSION_CORRUPT_HUNT_BT_DEPTH}`);
   const bt = btSession ? parseLldbFrames(btSession.output).map((frame) => symbolizeFrame(frame, ctx)) : [];
   return {
     breakAddrHex,
+    breakpointId,
+    breakpointSkip,
+    observedBreakpointHits,
     registerValue: registerValueHex,
     H,
     Hhex: toHexAddr(H),
-    initialValue,
+    initialValue: initialRead.value,
     bt,
+    lldbExitCode: session.exitCode,
     timedOut: Boolean(session.timedOut),
     overflow: Boolean(session.overflow),
   };
@@ -1483,103 +2552,220 @@ async function chengCorruptHuntStage1(input, ctx) {
 
 const CHENG_CORRUPT_HUNT_CAPABILITY_ERROR_RE = /(watchpoints? are not supported|hardware watchpoints? (are |is )?not supported|could not set variable|error: Watchpoint creation failed|unable to set (hardware )?watchpoint)/i;
 
-// 阶段2: 全新 lldb 进程, 在阶段1 算出的字面量地址 H 上挂 write watchpoint, 无条件顺序排
-// maxHits 组 (continue; memory read H; bt N) —— lldb 批处理没有"命中就停, 没命中就继续等"
-// 这种条件分支能力, 只能把命令预先排够 maxHits 组, 真实命中数不足时多余的 continue 会看到
-// 进程已退出, 照实止步不再往下解析。命中点的 pc/symbol 直接取 bt 第0帧(而不是另跑一次
-// register read pc 再套 symbolizeChengPc 自算) —— bt 帧自带 lldb 用二进制自身调试信息做的
-// 符号化(frame.lldbSymbol), 比 nm(primaryObject) 更准更全, symbolizeChengPc 只是它落在
-// foreign-module/没有 lldbSymbol 时的兜底(symbolizeFrame 已经封装了这个优先级)。
+// 阶段2: 全新 lldb 进程, 在阶段1 算出的字面量地址 H 上挂 write watchpoint。每一组
+// (continue; memory read H; bt N) 必须严格对应同一个目标 watchpoint stop: 先从创建输出解析
+// watchpoint id，再按原始命令顺序配对三段 session。信号、其他断点和读内存失败全部终止取证，
+// 不能通过分别过滤 continue/memory/bt 后按数组下标拼接来伪造一次命中。
 async function chengCorruptHuntStage2(input, ctx, H) {
   const Hhex = toHexAddr(H);
   const maxHits = input.maxHits || CHENG_FUSION_CORRUPT_HUNT_MAXHITS_DEFAULT;
   const memReadCmd = `memory read -fx -s${input.watchSize} -c1 -- ${Hhex}`;
   const btCmd = `bt ${CHENG_FUSION_CORRUPT_HUNT_BT_DEPTH}`;
-  const commands = [
-    corruptHuntEnvVarsCommand(input.env),
-    corruptHuntLaunchCommand(input.args),
-    `watchpoint set expression -w write -s ${input.watchSize} -- ${Hhex}`,
-  ];
-  for (let i = 0; i < maxHits; i++) commands.push("continue", memReadCmd, btCmd);
-  commands.push("quit");
-  const session = await runLldbOCommands(input.binary, commands, input.env || {}, {
+  const watchpointCommand = `watchpoint set expression -w write -s ${input.watchSize} -- ${Hhex}`;
+  const controller = createInteractiveLldbSession(input.binary, {
     timeoutMs: input.timeoutSec ? Math.round(input.timeoutSec * 1000) : undefined,
+    maxBuffer: input.maxOutputBytes,
   });
-  const text = session.output;
-  const capabilityMatch = text.match(CHENG_CORRUPT_HUNT_CAPABILITY_ERROR_RE);
-  if (capabilityMatch) {
-    return {capabilityError: capabilityMatch[0], hits: [], Hhex, timedOut: Boolean(session.timedOut), raw: takeTrailingText(text, 4000)};
-  }
-  const sessions = splitLldbSessions(text);
-  const continues = sessions.filter((s) => s.command === "continue");
-  const memReads = sessions.filter((s) => s.command === memReadCmd);
-  const btReads = sessions.filter((s) => s.command === btCmd);
   const hits = [];
-  for (let i = 0; i < maxHits; i++) {
-    const continueSession = continues[i];
-    if (!continueSession) break;
-    if (/exited with status/.test(continueSession.output) || /invalid process|process is not currently (running|being debugged)/i.test(continueSession.output)) break;
-    const frames = btReads[i] ? parseLldbFrames(btReads[i].output).map((frame) => symbolizeFrame(frame, ctx)) : [];
-    const top = frames[0];
-    if (!top) break;
-    const newValue = memReads[i] ? parseLldbMemoryReadValue(memReads[i].output) : null;
-    hits.push({
-      hit: i,
-      pc: top.pc,
-      symbol: top.symbol,
-      offset: top.offset,
-      providerUnresolved: top.providerUnresolved,
-      reason: top.reason,
-      providerObject: top.providerObject,
-      providerModule: top.providerModule,
-      newValue,
-      frames,
-    });
+  let watchpointId = null;
+  let launchedPid = null;
+  let processExit = null;
+  let stageError = null;
+  try {
+    const promptOutput = await controller.execute("settings set interpreter.prompt-on-quit false");
+    assertNoLldbCommandError(promptOutput, "stage2", "settings set interpreter.prompt-on-quit false");
+
+    const inputPathCommand = "settings set target.input-path /dev/null";
+    const inputPathOutput = await controller.execute(inputPathCommand);
+    assertNoLldbCommandError(inputPathOutput, "stage2", inputPathCommand);
+
+    const syncCommand = "script lldb.debugger.SetAsync(False); print('__CHENG_FUSION_LLDB_ASYNC__=' + str(lldb.debugger.GetAsync()))";
+    const syncOutput = await controller.execute(syncCommand);
+    assertNoLldbCommandError(syncOutput, "stage2", syncCommand);
+    const syncProof = [...syncOutput.matchAll(/^__CHENG_FUSION_LLDB_ASYNC__=False\s*\r?$/gm)];
+    if (syncProof.length !== 1) {
+      throw new Error(`cheng_corrupt_hunt stage2: 无法证明 LLDB synchronous mode 已启用: ${takeTrailingText(syncOutput, 2000)}`);
+    }
+
+    const aslrSetCommand = "settings set target.disable-aslr true";
+    const aslrSetOutput = await controller.execute(aslrSetCommand);
+    assertNoLldbCommandError(aslrSetOutput, "stage2", aslrSetCommand);
+    const aslrShowCommand = "settings show target.disable-aslr";
+    const aslrShowOutput = await controller.execute(aslrShowCommand);
+    assertNoLldbCommandError(aslrShowOutput, "stage2", aslrShowCommand);
+    assertLldbAslrDisabled(aslrShowOutput, "cheng_corrupt_hunt stage2");
+
+    const envCommand = corruptHuntEnvVarsCommand(input.env);
+    const envOutput = await controller.execute(envCommand);
+    assertNoLldbCommandError(envOutput, "stage2", envCommand);
+
+    const launchCommand = corruptHuntLaunchCommand(input.args);
+    const launchOutput = await controller.execute(launchCommand);
+    assertNoLldbCommandError(launchOutput, "stage2", launchCommand);
+    const launchMatches = [...launchOutput.matchAll(/^Process\s+([1-9]\d*)\s+launched:\s+.+$/gm)];
+    if (launchMatches.length !== 1) {
+      throw new Error(`cheng_corrupt_hunt stage2: 无法确认唯一 debuggee launch: ${takeTrailingText(launchOutput, 2000)}`);
+    }
+    launchedPid = Number(launchMatches[0][1]);
+
+    const watchpointOutput = await controller.execute(watchpointCommand);
+    const capabilityMatch = watchpointOutput.match(CHENG_CORRUPT_HUNT_CAPABILITY_ERROR_RE);
+    if (capabilityMatch) throw new Error(`cheng_corrupt_hunt stage2: 无法创建硬件 watchpoint: ${capabilityMatch[0]}`);
+    assertNoLldbCommandError(watchpointOutput, "stage2", watchpointCommand);
+    const watchpointMatches = [...watchpointOutput.matchAll(/\bWatchpoint\s+(\d+)\s*:/gi)];
+    if (watchpointMatches.length !== 1) {
+      throw new Error(`cheng_corrupt_hunt stage2: 无法确认唯一目标 watchpoint 编号: ${takeTrailingText(watchpointOutput, 2000)}`);
+    }
+    watchpointId = Number(watchpointMatches[0][1]);
+    const targetWatchpointReason = new RegExp(`^watchpoint ${watchpointId}(?:\\.|$)`, "i");
+
+    for (let i = 0; i < maxHits; i++) {
+      const continueOutput = await controller.continueUntilStop();
+      assertNoLldbCommandError(continueOutput, "stage2", "continue");
+      const exitMatches = [...continueOutput.matchAll(/^Process\s+([1-9]\d*)\s+exited with\s+(?:status\s*=\s*|code\s*=?\s*)(-?\d+)(?:\s+\(0x[0-9a-fA-F]+\))?\s*\r?$/gm)];
+      const stopReasons = [...continueOutput.matchAll(/stop reason = ([^\r\n]+)/gi)].map((match) => match[1].trim());
+      if (exitMatches.length === 1 && stopReasons.length === 0) {
+        const exitPid = Number(exitMatches[0][1]);
+        if (exitPid !== launchedPid) {
+          throw new Error(`cheng_corrupt_hunt stage2: exit pid ${exitPid} 与 launch pid ${launchedPid} 不一致`);
+        }
+        processExit = {pid: exitPid, status: Number(exitMatches[0][2])};
+        break;
+      }
+      if (exitMatches.length !== 0 || stopReasons.length !== 1 || !targetWatchpointReason.test(stopReasons[0])) {
+        throw new Error(`cheng_corrupt_hunt stage2: 第 ${i + 1} 轮只接受目标 watchpoint ${watchpointId} 或精确的 Process ${launchedPid} exited with status/code，实得 stop=${stopReasons.join(" | ") || "none"}: ${takeTrailingText(continueOutput, 2000)}`);
+      }
+
+      const memoryOutput = await controller.execute(memReadCmd);
+      assertNoLldbCommandError(memoryOutput, "stage2", memReadCmd);
+      const memoryRead = parseLldbMemoryReadRecord(memoryOutput);
+      if (!memoryRead || memoryRead.address !== Hhex) {
+        throw new Error(`cheng_corrupt_hunt stage2: watchpoint ${watchpointId} 第 ${i + 1} 次命中后的 memory read 未唯一返回 ${Hhex}: ${takeTrailingText(memoryOutput, 2000)}`);
+      }
+
+      const btOutput = await controller.execute(btCmd);
+      assertNoLldbCommandError(btOutput, "stage2", btCmd);
+      const frames = parseLldbFrames(btOutput).map((frame) => symbolizeFrame(frame, ctx));
+      const top = frames[0];
+      if (!top) throw new Error(`cheng_corrupt_hunt stage2: watchpoint ${watchpointId} 第 ${i + 1} 次命中后 backtrace 为空`);
+      hits.push({
+        hit: hits.length,
+        pc: top.pc,
+        symbol: top.symbol,
+        offset: top.offset,
+        providerUnresolved: top.providerUnresolved,
+        reason: top.reason,
+        providerObject: top.providerObject,
+        providerModule: top.providerModule,
+        address: memoryRead.address,
+        newValue: memoryRead.value,
+        frames,
+      });
+    }
+    if (hits.length === 0) {
+      throw new Error(`cheng_corrupt_hunt stage2: 进程退出前未观察到目标 watchpoint ${watchpointId} 的任何命中`);
+    }
+  } catch (error) {
+    stageError = error instanceof Error ? error : new Error(String(error));
   }
-  return {hits, Hhex, exhausted: hits.length >= maxHits, timedOut: Boolean(session.timedOut), overflow: Boolean(session.overflow)};
+
+  const session = await controller.close();
+  assertCorruptHuntLldbSuccess(session, "stage2");
+  if (stageError) throw stageError;
+  return {
+    watchpointId,
+    hits,
+    Hhex,
+    processExit,
+    exhausted: hits.length >= maxHits,
+    lldbExitCode: session.exitCode,
+    timedOut: false,
+    overflow: false,
+  };
 }
 
-// cheng_corrupt_hunt: 两阶段 lldb watchpoint 写点定位(F23/F34 层A 案卷同款方法, 见
-// docs/patches-form34-layerA-writer.md)。阶段1 在检测点断点读出被害地址 H 的初始值; 阶段2 全新
-// 进程在 H 上挂写监视点, 顺着 maxHits 次命中把真正的写入指令(及其调用栈)钉出来 —— 这正是那份案卷
-// 里"stp x29,x30,[sp] 落在一个仍存活的祖先局部变量地址上"这类栈帧重叠/跨帧腐蚀问题的取证方法论,
-// 工具化成可重复调用的两段式流程。跨 run(阶段1 与阶段2 是两个独立 lldb 进程)的地址稳定性依赖
-// lldb 默认 target.disable-aslr=true(已用 `settings show target.disable-aslr` 实测确认), 是
-// 调用方前提而非本工具的兜底保证 —— binary/args/env 任一变化都可能改变地址, 调用方需自行保证
-// 两阶段用同一份 binary/args/env。
+// cheng_corrupt_hunt: 两阶段 lldb watchpoint 写点定位。调用者输入在启动第一个
+// debugger 前一次性复制到私有目录；后续的 lldb/otool/nm 只接触冻结副本。原路径在
+// 运行中可以变化，但不能反过来改写本次取证的二进制证据。
 async function chengCorruptHunt(input) {
-  if (!existsSync(input.binary)) throw new Error(`cheng_corrupt_hunt: binary not found: ${input.binary}`);
+  validateLldbDebuggeeEnv(input.env);
+  const originalBinary = String(input.binary || "");
+  const originalPrimaryObject = input.primaryObject === undefined ? null : String(input.primaryObject || "");
+  if (!isAbsolute(originalBinary)) throw new Error(`cheng_corrupt_hunt binary must be an absolute path: ${originalBinary}`);
+  if (originalPrimaryObject !== null && !isAbsolute(originalPrimaryObject)) {
+    throw new Error(`cheng_corrupt_hunt primaryObject must be an absolute path: ${originalPrimaryObject}`);
+  }
   const hasBreakAddr = typeof input.breakAddr === "string" && input.breakAddr.length > 0;
   const hasBreakSymbol = typeof input.breakSymbol === "string" && input.breakSymbol.length > 0;
   if (hasBreakAddr === hasBreakSymbol) throw new Error("cheng_corrupt_hunt: provide exactly one of breakAddr, or breakSymbol (with primaryObject)");
-  if (hasBreakSymbol && !input.primaryObject) throw new Error("cheng_corrupt_hunt: breakSymbol requires primaryObject for nm resolution");
-  const primaryObject = input.primaryObject || null;
-  const ctx = buildChengCorruptHuntContext(input.binary, primaryObject);
-  const stage1 = await chengCorruptHuntStage1(input, ctx);
-  if (stage1.error) {
-    return {schema: "cheng_corrupt_hunt.v1", binary: input.binary, args: input.args || [], stage1, hits: [], error: stage1.error};
+  if (hasBreakSymbol && !originalPrimaryObject) throw new Error("cheng_corrupt_hunt: breakSymbol requires primaryObject for nm resolution");
+  let snapshotRoot = null;
+  try {
+    snapshotRoot = createCrashTriageSnapshotRoot();
+    const binaryDir = join(snapshotRoot, "binary");
+    const primaryDir = join(snapshotRoot, "primary");
+    mkdirSync(binaryDir, {mode: 0o700});
+    mkdirSync(primaryDir, {mode: 0o700});
+    chmodSync(binaryDir, 0o700);
+    chmodSync(primaryDir, 0o700);
+    const total = {bytes: 0};
+    const binarySource = resolve(originalBinary);
+    const binarySnapshot = snapshotCrashTriageInput(
+      binarySource, binarySource, join(binaryDir, basename(binarySource)),
+      "cheng_corrupt_hunt binary", 0o700, total,
+    );
+    const primarySnapshot = originalPrimaryObject === null ? null : snapshotCrashTriageInput(
+      resolve(originalPrimaryObject), resolve(originalPrimaryObject), join(primaryDir, basename(resolve(originalPrimaryObject))),
+      "cheng_corrupt_hunt primaryObject", 0o600, total,
+    );
+    const frozenInput = {
+      ...input,
+      binary: binarySnapshot.destinationPath,
+      ...(primarySnapshot ? {primaryObject: primarySnapshot.destinationPath} : {}),
+    };
+    const ctx = buildChengCorruptHuntContext(frozenInput.binary, frozenInput.primaryObject || null);
+    const stage1 = await chengCorruptHuntStage1(frozenInput, ctx);
+    if (stage1.error) throw new Error(stage1.error);
+    verifyCrashTriageSnapshot(binarySnapshot, "cheng_corrupt_hunt binary");
+    if (primarySnapshot) verifyCrashTriageSnapshot(primarySnapshot, "cheng_corrupt_hunt primaryObject");
+    let stage2;
+    try {
+      stage2 = await chengCorruptHuntStage2(frozenInput, ctx, stage1.H);
+    } finally {
+      verifyCrashTriageSnapshot(binarySnapshot, "cheng_corrupt_hunt binary");
+      if (primarySnapshot) verifyCrashTriageSnapshot(primarySnapshot, "cheng_corrupt_hunt primaryObject");
+    }
+    return {
+      schema: "cheng_corrupt_hunt.v1",
+      binary: binarySource,
+      args: input.args || [],
+      inputEvidence: {binary: publicCrashTriageInputEvidence(binarySnapshot), primaryObject: publicCrashTriageInputEvidence(primarySnapshot)},
+      watchRegister: input.watchRegister,
+      watchOffset: input.watchOffset,
+      watchSize: input.watchSize,
+      breakpointSkip: input.breakpointSkip ?? 0,
+      stage1: {
+        breakAddr: stage1.breakAddrHex,
+        breakpointId: stage1.breakpointId,
+        breakpointSkip: stage1.breakpointSkip,
+        observedBreakpointHits: stage1.observedBreakpointHits,
+        H: stage1.Hhex,
+        initialValue: stage1.initialValue,
+        registerValue: stage1.registerValue,
+        bt: stage1.bt,
+        lldbExitCode: stage1.lldbExitCode,
+      },
+      watchpointId: stage2.watchpointId ?? null,
+      hits: stage2.hits,
+      hitCount: stage2.hits.length,
+      exhausted: stage2.exhausted,
+      processExit: stage2.processExit,
+      lldbExitCode: stage2.lldbExitCode,
+      timedOut: Boolean(stage1.timedOut || stage2.timedOut),
+    };
+  } finally {
+    if (snapshotRoot) rmSync(snapshotRoot, {recursive: true, force: true});
   }
-  const stage2 = await chengCorruptHuntStage2(input, ctx, stage1.H);
-  return {
-    schema: "cheng_corrupt_hunt.v1",
-    binary: input.binary,
-    args: input.args || [],
-    watchRegister: input.watchRegister,
-    watchOffset: input.watchOffset,
-    watchSize: input.watchSize,
-    stage1: {
-      breakAddr: stage1.breakAddrHex,
-      H: stage1.Hhex,
-      initialValue: stage1.initialValue,
-      registerValue: stage1.registerValue,
-      bt: stage1.bt,
-    },
-    hits: stage2.hits,
-    hitCount: stage2.hits.length,
-    exhausted: stage2.exhausted,
-    capabilityError: stage2.capabilityError || null,
-    timedOut: Boolean(stage1.timedOut || stage2.timedOut),
-  };
 }
 
 function chengLspResolveBinary() {
@@ -1601,9 +2787,11 @@ class JsonRpcProcessClient {
     this.options = options;
     this.nextId = 1;
     this.pending = new Map();
-    this.buffer = Buffer.alloc(0);
+    this.decoder = new JsonRpcFrameDecoder({framing: "content-length", label: `cheng-lsp ${command}`});
     this.publishedDiagnostics = new Map();
     this.dead = false;
+    this.generation = 0;
+    this.rootPath = null;
   }
 
   start() {
@@ -1621,54 +2809,50 @@ class JsonRpcProcessClient {
     process.once("exit", this.cleanup);
     this.stderr = "";
     this.child.stderr.on("data", (chunk) => {
-      this.stderr += chunk.toString("utf8");
+      this.stderr = takeTrailingText(this.stderr + chunk.toString("utf8"), 64 * 1024);
     });
     this.child.stdout.on("data", (chunk) => {
-      this.buffer = Buffer.concat([this.buffer, chunk]);
-      this.processBuffer();
-    });
-    this.child.on("exit", (code, signal) => {
-      this.dead = true;
-      const error = new Error(`JSON-RPC process exited: code=${code} signal=${signal} stderr=${takeTrailingText(this.stderr, 1000)}`);
-      for (const pending of this.pending.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(error);
+      if (this.dead) return;
+      try {
+        this.decoder.push(chunk, (message) => this.handleMessage(message));
+      } catch (error) {
+        this.fail(error, "SIGKILL");
       }
-      this.pending.clear();
     });
+    this.child.on("error", (error) => this.fail(error));
+    this.child.stdin.on("error", (error) => this.fail(error, "SIGKILL"));
+    this.child.on("exit", (code, signal) => {
+      const error = new Error(`JSON-RPC process exited: code=${code} signal=${signal} stderr=${takeTrailingText(this.stderr, 1000)}`);
+      this.fail(error);
+    });
+  }
+
+  rejectPending(error) {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
+  }
+
+  fail(error, killSignal = null) {
+    if (this.cleanup) {
+      process.off("exit", this.cleanup);
+      this.cleanup = null;
+    }
+    if (this.dead) return;
+    const failure = error instanceof Error ? error : new Error(String(error));
+    this.dead = true;
+    this.decoder.clear();
+    if (killSignal) killChengProcessGroup(this.child, killSignal);
+    this.rejectPending(failure);
+    this.onDead?.(this, failure);
   }
 
   // 超时孤儿修复: kill 整个进程组(detached 时 child.pid 即 pgid), 不只是杀直接子进程,
   // 覆盖 driver 在 LSP 内部再 fork 出的孙进程情况.
   killTree(signal = "SIGKILL") {
-    this.dead = true;
-    killChengProcessGroup(this.child, signal);
-  }
-
-  processBuffer() {
-    for (;;) {
-      if (this.buffer.length === 0) return;
-      const preview = this.buffer.toString("utf8", 0, Math.min(this.buffer.length, 32));
-      if (/^Content-Length:/i.test(preview)) {
-        const split = this.buffer.indexOf("\r\n\r\n");
-        if (split < 0) return;
-        const header = this.buffer.toString("utf8", 0, split);
-        const match = header.match(/Content-Length:\s*(\d+)/i);
-        if (!match) throw new Error(`Bad JSON-RPC header: ${header}`);
-        const length = Number(match[1]);
-        const start = split + 4;
-        if (this.buffer.length < start + length) return;
-        const body = this.buffer.toString("utf8", start, start + length);
-        this.buffer = this.buffer.subarray(start + length);
-        this.handleMessage(JSON.parse(body));
-        continue;
-      }
-      const lineEnd = this.buffer.indexOf("\n");
-      if (lineEnd < 0) return;
-      const line = this.buffer.toString("utf8", 0, lineEnd).replace(/\r$/, "").trim();
-      this.buffer = this.buffer.subarray(lineEnd + 1);
-      if (line) this.handleMessage(JSON.parse(line));
-    }
+    this.fail(new Error(`JSON-RPC process tree killed with ${signal}`), signal);
   }
 
   handleMessage(message) {
@@ -1687,24 +2871,28 @@ class JsonRpcProcessClient {
   }
 
   sendEnvelope(message) {
+    if (this.dead || !this.child?.stdin?.writable) throw new Error(`cannot write to dead JSON-RPC process: ${this.command}`);
     const body = JSON.stringify(message);
     this.child.stdin.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
   }
 
   request(method, params, timeoutMs) {
+    if (this.dead) return Promise.reject(new Error(`cannot request from dead JSON-RPC process: ${this.command}`));
     const id = this.nextId++;
     const message = {jsonrpc: "2.0", id, method, params};
     const effectiveTimeoutMs = chengFusionTimeoutMs(timeoutMs === undefined ? CHENG_FUSION_LSP_TIMEOUT_MS_DEFAULT : timeoutMs);
     return new Promise((resolvePromise, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
         // 超时孤儿修复: 不再只是 reject 掉 promise 留一个卡死的 cheng-lsp 子进程常驻;
         // 立即 kill 整个进程组并把 client 标记为 dead, 让 chengLspEnsureClient 下次换新进程.
-        this.killTree("SIGKILL");
-        reject(new Error(`${method} timed out after ${effectiveTimeoutMs}ms; killed cheng-lsp process tree`));
+        this.fail(new Error(`${method} timed out after ${effectiveTimeoutMs}ms; killed cheng-lsp process tree`), "SIGKILL");
       }, effectiveTimeoutMs);
       this.pending.set(id, {resolve: resolvePromise, reject, timer});
-      this.sendEnvelope(message);
+      try {
+        this.sendEnvelope(message);
+      } catch (error) {
+        this.fail(error, "SIGKILL");
+      }
     });
   }
 
@@ -1713,24 +2901,21 @@ class JsonRpcProcessClient {
   }
 
   close() {
-    try {
-      if (this.cleanup) process.off("exit", this.cleanup);
-      this.killTree("SIGTERM");
-    } catch {}
+    // JsonRpcProcessClient has no asynchronous close contract. Use an immediate group SIGKILL so
+    // initialize failures, protocol failures and service shutdown cannot leave a resistant child
+    // or grandchild behind after close() returns.
+    this.fail(new Error(`JSON-RPC client closed: ${this.command}`), "SIGKILL");
   }
 }
 
 let chengLspClients = new Map();
-let chengLspOpenDocs = new Map();
+let chengLspClientFlights = new Map();
+let chengLspNextGeneration = 1;
+let chengLspOpenDocs = new WeakMap();
 
-// chengLspOpenDocs 按 uri 全局共享(不分 client). 换新 client 前必须清掉该 root 下的
-// open-doc 记录, 否则新进程会收到 didChange(它从没收过 didOpen)而不是 didOpen.
-function purgeChengLspOpenDocsUnderRoot(rootPath) {
-  for (const uri of [...chengLspOpenDocs.keys()]) {
-    try {
-      if (isInsideOrEqual(fileURLToPath(uri), rootPath)) chengLspOpenDocs.delete(uri);
-    } catch {}
-  }
+function forgetChengLspClient(rootPath, client) {
+  if (chengLspClients.get(rootPath) === client) chengLspClients.delete(rootPath);
+  chengLspOpenDocs.delete(client);
 }
 
 async function chengLspEnsureClient(rootPath = resolveChengProjectRoot()) {
@@ -1738,37 +2923,66 @@ async function chengLspEnsureClient(rootPath = resolveChengProjectRoot()) {
   const existing = chengLspClients.get(rootPath);
   if (existing) {
     if (!existing.dead) return existing;
-    chengLspClients.delete(rootPath);
-    purgeChengLspOpenDocsUnderRoot(rootPath);
+    forgetChengLspClient(rootPath, existing);
   }
-  const binary = chengLspResolveBinary();
-  if (!existsSync(binary)) throw new Error(`cheng-lsp binary not found: ${binary}`);
-  const client = new JsonRpcProcessClient(binary, [], {cwd: rootPath});
-  client.start();
-  const rootUri = pathToUri(rootPath);
-  await client.request("initialize", {
-    capabilities: {},
-    processId: process.pid,
-    rootUri,
-    workspaceFolders: [{uri: rootUri, name: dirname(rootPath).split("/").pop() || "cheng"}],
-  }, 20000);
-  client.notify("initialized", {});
-  chengLspClients.set(rootPath, client);
-  return client;
+  const inFlight = chengLspClientFlights.get(rootPath);
+  if (inFlight) return inFlight;
+
+  const flight = (async () => {
+    const binary = chengLspResolveBinary();
+    if (!existsSync(binary)) throw new Error(`cheng-lsp binary not found: ${binary}`);
+    if (!Number.isSafeInteger(chengLspNextGeneration)) throw new Error("cheng-lsp client generation counter exhausted");
+    const generation = chengLspNextGeneration++;
+    const client = new JsonRpcProcessClient(binary, [], {cwd: rootPath});
+    client.rootPath = rootPath;
+    client.generation = generation;
+    client.onDead = () => forgetChengLspClient(rootPath, client);
+    try {
+      client.start();
+      const rootUri = pathToUri(rootPath);
+      await client.request("initialize", {
+        capabilities: {},
+        processId: process.pid,
+        rootUri,
+        workspaceFolders: [{uri: rootUri, name: basename(rootPath) || "cheng"}],
+      }, 20000);
+      client.notify("initialized", {});
+      if (client.dead) throw new Error(`cheng-lsp exited during initialize: ${binary}`);
+      chengLspClients.set(rootPath, client);
+      return client;
+    } catch (error) {
+      client.close();
+      throw error;
+    }
+  })();
+  chengLspClientFlights.set(rootPath, flight);
+  try {
+    return await flight;
+  } finally {
+    if (chengLspClientFlights.get(rootPath) === flight) chengLspClientFlights.delete(rootPath);
+  }
 }
 
 async function chengLspSyncDoc(client, filePath, text) {
+  if (!client || client.dead || !Number.isSafeInteger(client.generation) || client.generation <= 0) {
+    throw new Error("chengLspSyncDoc requires a live initialized cheng-lsp client generation");
+  }
   const uri = pathToUri(filePath);
-  const tracked = chengLspOpenDocs.get(uri);
-  if (!tracked) {
+  let openDocs = chengLspOpenDocs.get(client);
+  if (!openDocs) {
+    openDocs = new Map();
+    chengLspOpenDocs.set(client, openDocs);
+  }
+  const tracked = openDocs.get(uri);
+  if (!tracked || tracked.generation !== client.generation) {
     client.notify("textDocument/didOpen", {textDocument: {uri, languageId: "cheng", version: 1, text}});
-    chengLspOpenDocs.set(uri, {version: 1, text});
+    openDocs.set(uri, {generation: client.generation, version: 1, text});
     return uri;
   }
   if (tracked.text === text) return uri;
   const version = tracked.version + 1;
   client.notify("textDocument/didChange", {textDocument: {uri, version}, contentChanges: [{text}]});
-  chengLspOpenDocs.set(uri, {version, text});
+  openDocs.set(uri, {generation: client.generation, version, text});
   return uri;
 }
 
@@ -2007,33 +3221,139 @@ async function readLineMap(file, input = {}) {
   };
 }
 
+const CHENG_SYMBOLS_TARGET = "arm64-apple-darwin";
+const CHENG_SYMBOLS_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+function parseCanonicalUnsignedInteger(value, field) {
+  if (!/^(?:0|[1-9][0-9]*)$/.test(value)) {
+    throw new Error(`cheng_symbols_v1 ${field} must be a canonical unsigned integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`cheng_symbols_v1 ${field} exceeds Number.MAX_SAFE_INTEGER`);
+  }
+  return parsed;
+}
+
+function validateCountedSymbolList(value, count, field) {
+  if (count === 0) {
+    if (value !== "-") throw new Error(`cheng_symbols_v1 ${field} must be '-' when its count is zero`);
+    return;
+  }
+  if (value === "-" || value.length === 0) {
+    throw new Error(`cheng_symbols_v1 ${field} must contain ${count} symbols`);
+  }
+  const symbols = value.split(",");
+  if (symbols.some((symbol) => symbol.length === 0) || symbols.length !== count) {
+    throw new Error(`cheng_symbols_v1 ${field} count mismatch: expected ${count}, got ${symbols.length}`);
+  }
+}
+
+function parseChengSymbolsReport(buffer, expected = {}) {
+  if (!Buffer.isBuffer(buffer)) throw new Error("cheng_symbols_v1 stdout bytes are unavailable");
+  let text;
+  try {
+    text = new TextDecoder("utf-8", {fatal: true}).decode(buffer);
+  } catch {
+    throw new Error("cheng_symbols_v1 output is not valid UTF-8");
+  }
+  if (!text.endsWith("\n")) throw new Error("cheng_symbols_v1 output must end with exactly one complete line");
+  const lines = text.split("\n");
+  lines.pop();
+  if (lines[0] !== "cheng_symbols_v1") throw new Error("cheng_symbols_v1 exact header is missing");
+
+  // The backend driver currently emits one separator line while stage3/cold emit none. These are
+  // the two formal producer layouts; multiple separators and every other extra line are rejected.
+  let offset = 1;
+  if (lines[offset] === "") offset++;
+  const fields = [
+    "entry",
+    "target",
+    "source_path",
+    "lowering_symbol_count",
+    "lowering_symbols",
+    "primary_symbol_count",
+    "primary_symbols",
+    "primary_unsupported_count",
+  ];
+  if (lines.length - offset !== fields.length) {
+    throw new Error(`cheng_symbols_v1 must contain exactly ${fields.length} ordered fields`);
+  }
+  const values = {};
+  for (let index = 0; index < fields.length; index++) {
+    const field = fields[index];
+    const prefix = `${field}=`;
+    const line = lines[offset + index];
+    if (!line.startsWith(prefix)) {
+      throw new Error(`cheng_symbols_v1 expected ordered field ${field}`);
+    }
+    values[field] = line.slice(prefix.length);
+  }
+
+  if (values.entry !== expected.source || values.source_path !== expected.source) {
+    throw new Error("cheng_symbols_v1 entry/source_path does not match the requested source");
+  }
+  if (values.target !== expected.target) {
+    throw new Error(`cheng_symbols_v1 target mismatch: expected ${expected.target}`);
+  }
+  const loweringSymbolCount = parseCanonicalUnsignedInteger(values.lowering_symbol_count, "lowering_symbol_count");
+  const primarySymbolCount = parseCanonicalUnsignedInteger(values.primary_symbol_count, "primary_symbol_count");
+  const primaryUnsupportCount = parseCanonicalUnsignedInteger(values.primary_unsupported_count, "primary_unsupported_count");
+  validateCountedSymbolList(values.lowering_symbols, loweringSymbolCount, "lowering_symbols");
+  validateCountedSymbolList(values.primary_symbols, primarySymbolCount, "primary_symbols");
+  if (primaryUnsupportCount > loweringSymbolCount) {
+    throw new Error("cheng_symbols_v1 primary_unsupported_count exceeds lowering_symbol_count");
+  }
+  return {
+    schema: "cheng_symbols_v1",
+    primaryUnsupportCount,
+    primarySymbolCount,
+    loweringSymbolCount,
+    primarySymbols: values.primary_symbols,
+    loweringSymbols: values.lowering_symbols,
+    byteLength: buffer.length,
+    regression: primaryUnsupportCount > 0,
+  };
+}
+
 async function snapshotChengSymbols(sourceRel, input = {}) {
   const root = resolveChengProjectRoot({root: input.root, file: sourceRel});
-  if (!existsSync(CHENG_DRIVER)) return null;
   const source = resolveChengPath(sourceRel, CHENG_CANARY, root);
-  if (!existsSync(source)) return {error: `source not found: ${source}`, stderr: "", outTail: ""};
-  const run = await runChengDriver(CHENG_DRIVER, ["print-symbols", `--root:${root}`, `--in:${source}`, "--target:arm64-apple-darwin", "--emit:obj"], {root, cwd: root});
-  const stdout = run.stdout || "";
-  if (run.exitCode !== 0) return {error: `exit ${run.exitCode}`, stderr: takeTrailingText(run.stderr, 600), outTail: takeTrailingText(stdout, 600)};
-  const pick = (key) => {
-    const match = stdout.match(new RegExp(`^${key}=([0-9]+)`, "m"));
-    return match ? Number(match[1]) : null;
-  };
-  const primarySymbols = stdout.match(/^primary_symbols=(.*)$/m);
-  const loweringSymbols = stdout.match(/^lowering_symbols=(.*)$/m);
-  const primaryUnsupportCount = pick("primary_unsupported_count");
-  const hasHeader = stdout.includes("cheng_symbols_v1");
+  if (/[\r\n]/.test(source)) throw new Error("symbol snapshot source path cannot contain a line break");
+  let sourceBefore;
+  try {
+    sourceBefore = lstatSync(source, {bigint: true});
+  } catch (error) {
+    throw new Error(`symbol snapshot source not found: ${source} (${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (sourceBefore.isSymbolicLink() || !sourceBefore.isFile()) {
+    throw new Error(`symbol snapshot source must be a regular non-symlink file: ${source}`);
+  }
+  const run = await runChengDriver(
+    CHENG_DRIVER,
+    ["print-symbols", `--root:${root}`, `--in:${source}`, `--target:${CHENG_SYMBOLS_TARGET}`, "--emit:obj"],
+    {root, cwd: root, maxBuffer: CHENG_SYMBOLS_MAX_OUTPUT_BYTES},
+  );
+  if (run.missingDriver) throw new Error(`cheng driver not found: ${CHENG_DRIVER}`);
+  if (run.timedOut) throw new Error("cheng print-symbols timed out");
+  if (run.overflow) throw new Error(`cheng print-symbols output exceeded ${CHENG_SYMBOLS_MAX_OUTPUT_BYTES} bytes`);
+  if (!Number.isInteger(run.exitCode)) throw new Error("cheng print-symbols produced no exit code");
+  if (run.exitCode !== 0) {
+    throw new Error(`cheng print-symbols exited ${run.exitCode}: ${takeTrailingText(run.stderr, 600)}`);
+  }
+  let sourceAfter;
+  try {
+    sourceAfter = lstatSync(source, {bigint: true});
+  } catch {
+    throw new Error(`symbol snapshot source disappeared while print-symbols was running: ${source}`);
+  }
+  if (sourceAfter.isSymbolicLink() || !sourceAfter.isFile() || stableFileStatKey(sourceBefore) !== stableFileStatKey(sourceAfter)) {
+    throw new Error(`symbol snapshot source changed while print-symbols was running: ${source}`);
+  }
   return {
-    schema: hasHeader ? "cheng_symbols_v1" : "unknown",
+    ...parseChengSymbolsReport(run.stdoutBuffer, {source, target: CHENG_SYMBOLS_TARGET}),
     root,
     source,
-    primaryUnsupportCount,
-    primarySymbolCount: pick("primary_symbol_count"),
-    loweringSymbolCount: pick("lowering_symbol_count"),
-    primarySymbols: primarySymbols ? primarySymbols[1].trim() : null,
-    loweringSymbols: loweringSymbols ? loweringSymbols[1].trim() : null,
-    byteLength: stdout.length,
-    regression: hasHeader && primaryUnsupportCount != null ? primaryUnsupportCount > 0 : null,
   };
 }
 
@@ -2057,8 +3377,59 @@ function profileDriverForRun() {
   return existsSync(CHENG_DRIVER) ? CHENG_DRIVER : CHENG_STAGE3_DRIVER;
 }
 
+const PROFILE_PROTOCOL_UTF8_DECODER = new TextDecoder("utf-8", {fatal: true});
+class ProfileProtocolUtf8Error extends Error {}
+
+function profileSchemaFromOutputs(...values) {
+  let found = false;
+  for (const value of values) {
+    if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) {
+      throw new Error("profile protocol evidence must be raw process/file bytes");
+    }
+    let text;
+    try {
+      text = PROFILE_PROTOCOL_UTF8_DECODER.decode(value);
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+      throw new ProfileProtocolUtf8Error("profile protocol evidence is not valid UTF-8");
+    }
+    const lines = text.split(/\r?\n/);
+    if (lines.some((line) => line === "cheng_profile_v1")) found = true;
+  }
+  return found ? "cheng_profile_v1" : null;
+}
+
 function profileResult(action, args, run, input = {}) {
-  const reason = profileUnsupportedReason(run) || (run.missingDriver ? `cheng driver not found: ${run.driver || ""}` : run.exitCode !== 0 ? `exit ${run.exitCode}` : null);
+  const outputInvalidUtf8 = Boolean(input.profileOutputInvalidUtf8);
+  let processInvalidUtf8 = false;
+  let profileSchema = null;
+  try {
+    profileSchema = profileSchemaFromOutputs(run.stdoutBuffer, run.stderrBuffer);
+    if (!outputInvalidUtf8 && input.profileOutputBuffer !== undefined) {
+      profileSchema ||= profileSchemaFromOutputs(input.profileOutputBuffer);
+    }
+    if (outputInvalidUtf8) profileSchema = null;
+  } catch (error) {
+    if (!(error instanceof ProfileProtocolUtf8Error)) throw error;
+    processInvalidUtf8 = true;
+    profileSchema = null;
+  }
+  const processOk = !run.missingDriver && !run.timedOut && !run.overflow && Number.isInteger(run.exitCode);
+  const outputRequired = Boolean(input.profileOutputPath);
+  const outputMaterialized = outputRequired ? input.profileOutputMaterialized === true : null;
+  const outputOverflow = outputRequired && input.profileOutputOverflow === true;
+  const reason = profileUnsupportedReason(run)
+    || (run.missingDriver ? `cheng driver not found: ${run.driver || ""}`
+      : run.timedOut ? "profile process timed out"
+        : run.overflow ? "profile process output overflow"
+          : !Number.isInteger(run.exitCode) ? "profile process produced no exit code"
+            : run.exitCode !== 0 ? `exit ${run.exitCode}`
+              : processInvalidUtf8 ? "profile process output is not valid UTF-8"
+                : outputRequired && !outputMaterialized ? "profile-report returned rc=0 without a fresh non-empty regular output"
+                  : outputOverflow ? "profile-report output exceeds maxOutputBytes"
+                    : outputInvalidUtf8 ? "profile-report output is not valid UTF-8"
+                      : !profileSchema ? "profile output missing exact cheng_profile_v1 schema marker line"
+                        : null);
   const root = input.root || null;
   return {
     schema: "cheng_profile_report_tool.v1",
@@ -2067,9 +3438,20 @@ function profileResult(action, args, run, input = {}) {
     root,
     command: ["cheng", ...args].join(" "),
     exitCode: run.exitCode,
-    supported: !run.missingDriver && run.exitCode === 0 && !reason,
+    status: processOk && run.exitCode === 0 && !reason ? "completed" : "CFAIL",
+    supported: processOk && run.exitCode === 0 && !reason,
     unsupportedReason: reason,
-    profileSchema: String(run.stdout || "").includes("cheng_profile_v1") ? "cheng_profile_v1" : null,
+    profileSchema,
+    timedOut: Boolean(run.timedOut),
+    overflow: Boolean(run.overflow),
+    output: outputRequired ? {
+      path: input.profileOutputPath,
+      materialized: outputMaterialized,
+      bytes: Number.isInteger(input.profileOutputBytes) ? input.profileOutputBytes : null,
+      overflow: outputOverflow,
+      validUtf8: outputMaterialized && !outputOverflow ? !outputInvalidUtf8 : null,
+      published: input.profileOutputPublished === true,
+    } : null,
     stdout: takeTrailingText(run.stdout),
     stderr: takeTrailingText(run.stderr),
   };
@@ -2093,6 +3475,65 @@ function runProbeTool(command, args, label) {
   return result;
 }
 
+const MACHO_FILE_TYPE_NAMES = new Map([
+  [1, "MH_OBJECT"],
+  [2, "MH_EXECUTE"],
+  [3, "MH_FVMLIB"],
+  [4, "MH_CORE"],
+  [5, "MH_PRELOAD"],
+  [6, "MH_DYLIB"],
+  [7, "MH_DYLINKER"],
+  [8, "MH_BUNDLE"],
+  [9, "MH_DYLIB_STUB"],
+  [10, "MH_DSYM"],
+  [11, "MH_KEXT_BUNDLE"],
+  [12, "MH_FILESET"],
+  [13, "MH_GPU_EXECUTE"],
+]);
+
+const MACHO_FAT_MAGICS = new Set([
+  0xcafebabe,
+  0xbebafeca,
+  0xcafebabf,
+  0xbfbafeca,
+]);
+
+// Caller relocation addresses are section-relative only in a thin MH_OBJECT. Reading the Mach-O
+// header directly makes this invariant independent of otool's presentation and rejects universal
+// binaries before nm can silently merge per-architecture symbol tables.
+function requireThinMachOObject(objectPath) {
+  const fd = openSync(objectPath, "r");
+  const header = Buffer.alloc(16);
+  let bytesRead;
+  try {
+    bytesRead = readSync(fd, header, 0, header.length, 0);
+  } finally {
+    closeSync(fd);
+  }
+  if (bytesRead < header.length) {
+    throw new Error(`cheng_symbol_diff caller attribution requires a thin MH_OBJECT; file is too short for a Mach-O header: ${objectPath}`);
+  }
+
+  const magic = header.readUInt32BE(0);
+  if (MACHO_FAT_MAGICS.has(magic)) {
+    throw new Error(`cheng_symbol_diff caller attribution requires a thin MH_OBJECT; fat Mach-O is not supported: ${objectPath}`);
+  }
+
+  let fileType;
+  if (magic === 0xfeedface || magic === 0xfeedfacf) {
+    fileType = header.readUInt32BE(12);
+  } else if (magic === 0xcefaedfe || magic === 0xcffaedfe) {
+    fileType = header.readUInt32LE(12);
+  } else {
+    throw new Error(`cheng_symbol_diff caller attribution requires a thin MH_OBJECT; not a Mach-O file: ${objectPath}`);
+  }
+  if (fileType !== 1) {
+    const name = MACHO_FILE_TYPE_NAMES.get(fileType) || `unknown filetype ${fileType}`;
+    throw new Error(`cheng_symbol_diff caller attribution requires a thin MH_OBJECT; found ${name}: ${objectPath}`);
+  }
+  return {fileType: "MH_OBJECT"};
+}
+
 // nm -jUP: 一行一个已定义 symbol, 列 = name type addr size. 只取全局(大写) T(text/code) 且
 // 尾部带 __L<行号> mangling 的(即编译器判定为跨 "::" 作用域需要行号消歧的符号)。
 function nmDefinedTemplateMangledTextSymbols(objectPath) {
@@ -2111,21 +3552,186 @@ function nmDefinedTemplateMangledTextSymbols(objectPath) {
   return out;
 }
 
-// nm -jUP: 一行一个已定义 symbol, 列 = name type addr size, 对 .o 和已链接可执行文件同样适用。
-// 只取全局(大写) T(text/code): 局部符号(小写 t, 如 cheng_cold 生成的 .L 标签)不是稳定的跨世代
-// 比对单位。
-function nmDefinedGlobalTextSymbolNames(objectPath) {
-  const result = runProbeTool("nm", ["-jUP", objectPath], "nm");
-  if (result.status !== 0) throw new Error(`nm -jUP exited ${result.status}: ${takeTrailingText(result.stderr, 2000)}`);
-  const out = [];
+// Darwin nm -nP gives one stable, machine-readable row per symbol:
+//   name type value size
+// LLVM nm reports Mach-O sizes as zero, so text function ranges must be derived from sorted text
+// symbol starts and the exact __TEXT,__text section end rather than from the unusable size column.
+function nmMachOSymbolFacts(objectPath) {
+  const result = runProbeTool("nm", ["-nP", objectPath], "nm");
+  if (result.status !== 0) throw new Error(`nm -nP exited ${result.status}: ${takeTrailingText(result.stderr, 2000)}`);
+  const undefinedNames = new Set();
+  const definedGlobalTextNames = [];
+  const textSymbols = [];
   for (const rawLine of result.stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
     const cols = line.split(/\s+/);
-    if (cols.length < 2 || cols[1] !== "T") continue;
-    out.push(cols[0]);
+    if (cols.length < 2) continue;
+    const [name, type] = cols;
+    if (type === "U") {
+      undefinedNames.add(name);
+      continue;
+    }
+    if (type !== "T" && type !== "t") continue;
+    if (cols.length < 3 || !/^[0-9a-fA-F]+$/.test(cols[2])) continue;
+    if (type === "T") definedGlobalTextNames.push(name);
+    textSymbols.push({name, type, address: BigInt(`0x${cols[2]}`)});
   }
-  return out;
+  textSymbols.sort((a, b) => a.address < b.address ? -1 : a.address > b.address ? 1 : a.name.localeCompare(b.name));
+  return {definedGlobalTextNames, undefinedNames: [...undefinedNames].sort(), textSymbols};
+}
+
+function machOTextSection(objectPath) {
+  const result = runProbeTool("otool", ["-l", objectPath], "otool -l");
+  if (result.status !== 0) throw new Error(`otool -l exited ${result.status}: ${takeTrailingText(result.stderr, 2000)}`);
+  let inSection = false;
+  let sectname = null;
+  let segname = null;
+  let address = null;
+  let size = null;
+  for (const rawLine of result.stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (line === "Section") {
+      inSection = true;
+      sectname = null;
+      segname = null;
+      address = null;
+      size = null;
+      continue;
+    }
+    if (!inSection) continue;
+    let match = line.match(/^sectname\s+(\S+)$/);
+    if (match) {
+      sectname = match[1];
+      continue;
+    }
+    match = line.match(/^segname\s+(\S+)$/);
+    if (match) {
+      segname = match[1];
+      continue;
+    }
+    match = line.match(/^addr\s+0x([0-9a-fA-F]+)$/);
+    if (match) {
+      address = BigInt(`0x${match[1]}`);
+      continue;
+    }
+    match = line.match(/^size\s+0x([0-9a-fA-F]+)$/);
+    if (!match) continue;
+    size = BigInt(`0x${match[1]}`);
+    if (sectname === "__text" && segname === "__TEXT" && address !== null) {
+      return {segment: segname, section: sectname, address, size, end: address + size};
+    }
+  }
+  throw new Error(`otool -l did not report a __TEXT,__text section: ${objectPath}`);
+}
+
+const MACHO_DIRECT_CALL_RELOCATION_TYPES = new Set([
+  "BR26",
+  "BRANCH",
+  "ARM64_RELOC_BRANCH26",
+  "X86_64_RELOC_BRANCH",
+]);
+
+// otool -rv prints both Darwin spellings used by the supported architectures:
+// arm64 uses BR26, x86_64 uses BRANCH. The relocation address is section-relative in MH_OBJECT,
+// so retain it verbatim and also compute the section-address-adjusted site used for range lookup.
+function machODirectUndefinedCallRelocations(objectPath, undefinedNames, textSection) {
+  const result = runProbeTool("otool", ["-rv", objectPath], "otool -rv");
+  if (result.status !== 0) throw new Error(`otool -rv exited ${result.status}: ${takeTrailingText(result.stderr, 2000)}`);
+  const undefinedSet = new Set(undefinedNames);
+  const calls = [];
+  let segment = null;
+  let section = null;
+  for (const rawLine of result.stdout.split("\n")) {
+    const line = rawLine.trim();
+    const header = line.match(/^Relocation information \(([^,]+),([^\)]+)\)\s+\d+ entries$/);
+    if (header) {
+      segment = header[1];
+      section = header[2];
+      continue;
+    }
+    if (segment !== textSection.segment || section !== textSection.section) continue;
+    const cols = line.split(/\s+/);
+    if (cols.length < 7 || !/^[0-9a-fA-F]+$/.test(cols[0])) continue;
+    const relocationType = cols[4];
+    if (cols[3] !== "True" || !MACHO_DIRECT_CALL_RELOCATION_TYPES.has(relocationType)) continue;
+    const symbol = cols.slice(6).join(" ");
+    if (!undefinedSet.has(symbol)) continue;
+    const relocationAddress = BigInt(`0x${cols[0]}`);
+    calls.push({
+      symbol,
+      segment,
+      section,
+      relocationAddress,
+      siteAddress: textSection.address + relocationAddress,
+      relocationType,
+    });
+  }
+  return calls;
+}
+
+// Every global T and local t start is a real range boundary. Ownership is stricter: only one global
+// T at that exact start may own the range. A local/static t can terminate the preceding function's
+// range, but can never become an owner or inherit ownership from the preceding global function.
+function machOTextFunctionRanges(textSymbols, textSection) {
+  const groups = [];
+  for (const symbol of textSymbols) {
+    if (symbol.address < textSection.address || symbol.address >= textSection.end) continue;
+    const last = groups[groups.length - 1];
+    if (last && last.start === symbol.address) last.symbols.push(symbol);
+    else groups.push({start: symbol.address, symbols: [symbol]});
+  }
+  return groups.map((group, index) => {
+    const candidates = group.symbols.filter((symbol) => symbol.type === "T");
+    const end = index + 1 < groups.length ? groups[index + 1].start : textSection.end;
+    return {
+      start: group.start,
+      end,
+      owner: candidates.length === 1 ? candidates[0].name : "unresolved-owner",
+    };
+  });
+}
+
+function formatMachOAddress(value) {
+  return `0x${value.toString(16).padStart(16, "0")}`;
+}
+
+function findMachOTextFunctionRange(ranges, address) {
+  let low = 0;
+  let high = ranges.length - 1;
+  let preceding = null;
+  while (low <= high) {
+    const middle = low + Math.floor((high - low) / 2);
+    const candidate = ranges[middle];
+    if (candidate.start <= address) {
+      preceding = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return preceding && address < preceding.end ? preceding : null;
+}
+
+function attributeUndefinedCallRelocations(objectPath, nmFacts) {
+  const textSection = machOTextSection(objectPath);
+  const ranges = machOTextFunctionRanges(nmFacts.textSymbols, textSection);
+  const calls = machODirectUndefinedCallRelocations(objectPath, nmFacts.undefinedNames, textSection);
+  return calls.map((call) => {
+    const range = findMachOTextFunctionRange(ranges, call.siteAddress);
+    const resolved = Boolean(range && range.owner !== "unresolved-owner");
+    return {
+      symbol: call.symbol,
+      owner: resolved ? range.owner : "unresolved-owner",
+      ownerResolved: resolved,
+      section: `${call.segment},${call.section}`,
+      relocationAddress: formatMachOAddress(call.relocationAddress),
+      siteAddress: formatMachOAddress(call.siteAddress),
+      relocationType: call.relocationType,
+      functionStart: resolved ? formatMachOAddress(range.start) : null,
+      functionEndExclusive: resolved ? formatMachOAddress(range.end) : null,
+    };
+  }).sort((a, b) => a.symbol.localeCompare(b.symbol) || a.siteAddress.localeCompare(b.siteAddress));
 }
 
 // 符号名前缀聚类: 剥掉 mangling 前导下划线, 取 "std_" 这类小写 snake 前缀, 否则取首个
@@ -2152,18 +3758,28 @@ function chengSymbolPrefixClusters(names) {
     .map(([prefix, count]) => ({prefix, count}));
 }
 
-// 双二进制(.o 或可执行文件, 世代 A/B 任意组合)已定义全局 T 符号集差分: onlyInA/onlyInB/common
-// 计数 + 各自的名字列表(供调用方精确定位) + 按前缀聚类的分布摘要, 免去手工 nm+sort+diff。
-// common 集合在两份世代相近的二进制间通常有数千项且信号价值低, 默认只报计数, 需要全量时传
-// includeCommon:true 显式要价。onlyInA/onlyInB 是真正的差分信号, 默认全量返回但受 limit 封顶。
+// 两个 thin Mach-O MH_OBJECT(.o, 世代 A/B 任意组合)的符号集差分:
+// - 原有已定义全局 T: onlyInA/onlyInB/common + 前缀聚类保持不变;
+// - 未定义 U: undefinedOnlyInA/undefinedOnlyInB/undefinedCommon;
+// - 每个真实直接调用 relocation: 用 section-relative relocation 地址落进 nm text 符号的半开区间。
+// common 集合默认只报计数, includeCommon:true 才返回名字。所有 onlyIn 名字列表受 limit 封顶。
 function compareChengBinarySymbols(objectAPath, objectBPath, options = {}) {
-  const namesA = nmDefinedGlobalTextSymbolNames(objectAPath);
-  const namesB = nmDefinedGlobalTextSymbolNames(objectBPath);
+  requireThinMachOObject(objectAPath);
+  requireThinMachOObject(objectBPath);
+  const nmFactsA = nmMachOSymbolFacts(objectAPath);
+  const nmFactsB = nmMachOSymbolFacts(objectBPath);
+  const namesA = nmFactsA.definedGlobalTextNames;
+  const namesB = nmFactsB.definedGlobalTextNames;
   const setA = new Set(namesA);
   const setB = new Set(namesB);
   const onlyInA = namesA.filter((name) => !setB.has(name)).sort();
   const onlyInB = namesB.filter((name) => !setA.has(name)).sort();
   const commonCount = namesA.reduce((count, name) => count + (setB.has(name) ? 1 : 0), 0);
+  const undefinedSetA = new Set(nmFactsA.undefinedNames);
+  const undefinedSetB = new Set(nmFactsB.undefinedNames);
+  const undefinedOnlyInA = nmFactsA.undefinedNames.filter((name) => !undefinedSetB.has(name));
+  const undefinedOnlyInB = nmFactsB.undefinedNames.filter((name) => !undefinedSetA.has(name));
+  const undefinedCommon = nmFactsA.undefinedNames.filter((name) => undefinedSetB.has(name));
   const limit = options.limit || 2000;
   return {
     schema: "cheng_symbol_diff_compare.v1",
@@ -2181,6 +3797,22 @@ function compareChengBinarySymbols(objectAPath, objectBPath, options = {}) {
     common: options.includeCommon ? namesA.filter((name) => setB.has(name)).sort().slice(0, limit) : undefined,
     clustersOnlyInA: chengSymbolPrefixClusters(onlyInA),
     clustersOnlyInB: chengSymbolPrefixClusters(onlyInB),
+    countUndefinedA: nmFactsA.undefinedNames.length,
+    countUndefinedB: nmFactsB.undefinedNames.length,
+    countUndefinedOnlyInA: undefinedOnlyInA.length,
+    countUndefinedOnlyInB: undefinedOnlyInB.length,
+    countUndefinedCommon: undefinedCommon.length,
+    undefinedA: nmFactsA.undefinedNames.slice(0, limit),
+    undefinedB: nmFactsB.undefinedNames.slice(0, limit),
+    undefinedATruncated: nmFactsA.undefinedNames.length > limit,
+    undefinedBTruncated: nmFactsB.undefinedNames.length > limit,
+    undefinedOnlyInA: undefinedOnlyInA.slice(0, limit),
+    undefinedOnlyInB: undefinedOnlyInB.slice(0, limit),
+    undefinedOnlyInATruncated: undefinedOnlyInA.length > limit,
+    undefinedOnlyInBTruncated: undefinedOnlyInB.length > limit,
+    undefinedCommon: options.includeCommon ? undefinedCommon.slice(0, limit) : undefined,
+    undefinedCallersA: attributeUndefinedCallRelocations(objectAPath, nmFactsA),
+    undefinedCallersB: attributeUndefinedCallRelocations(objectBPath, nmFactsB),
   };
 }
 
@@ -2404,10 +4036,12 @@ export {
   chengFusionRssCapBytes,
   resolveChengPath,
   chengLspQuery,
+  JsonRpcProcessClient,
   chengLspEnsureClient,
   chengLspSyncDoc,
   chengLspEnsureDocOpen,
   parseCrash,
+  classifyStopClass,
   triageChengBinaryCrash,
   chengCorruptHunt,
   readLineMap,
@@ -2415,6 +4049,7 @@ export {
   compareChengBinarySymbols,
   profileDriverForReport,
   profileDriverForRun,
+  profileSchemaFromOutputs,
   profileResult,
   chengTemplateLeakAudit,
   zodToJsonSchema,

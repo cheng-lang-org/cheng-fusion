@@ -58,8 +58,8 @@ async function main() {
       console.log("[C] compile_wall: 固定文本 stub driver 模拟 ZC_NOT_READY, 单列不算分歧");
       {
         const notReadyDriver = makeStubDriver(scratch, "stub_notready.sh", [
-          'echo "ZC_NOT_READY idx=0/1 function=FakeTargetFn body_kind=return detail=none line=5 fz_kind=3 stmt_kind=2 bail=801 slot_diag=none"',
-          'echo "ZC_NOT_READY_TOTAL count=1"',
+          'echo "ZC_NOT_READY idx=0/1 function=FakeTargetFn body_kind=return detail=none line=5 fz_kind=3 stmt_kind=2 bail=801 slot_diag=none" >&2',
+          'echo "ZC_NOT_READY_TOTAL count=1" >&2',
           "exit 2",
         ].join("\n"));
         const {isError, parsed} = await mcp.callTool("cheng_exec_diff", {fixture: CANARY, driverA: notReadyDriver, driverB: STAGE3, root: CHENG_ROOT}, undefined, 30000);

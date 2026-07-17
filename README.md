@@ -1,6 +1,6 @@
 # cheng-fusion-mcp
 
-Standalone MCP server exposing deterministic Cheng compiler fusion tools — CSG facts, cheng-lsp, crash triage, line maps, profiling, and symbol-regression checks — for the active Cheng project. Speaks MCP over stdio JSON-RPC (hand-rolled transport, no MCP SDK dependency). Runs on [bun](https://bun.sh).
+Standalone Cheng compiler diagnostic toolkit with 18 deterministic tools. The same registry, schemas, validation and execution path are exposed through MCP stdio JSON-RPC and a headless CLI. Runs on [bun](https://bun.sh).
 
 Extracted as a standalone package from the claude-code reverse-engineered repo's `claude/tool/cheng_*.ts` modules; the session-integration hooks (`cheng_fusion_hooks_m9011.ts`, which wire into claude-code's own Bash tool / session registry) are intentionally **not** included — a standalone MCP server doesn't need them.
 
@@ -34,7 +34,26 @@ claude mcp add cheng-fusion -- bun /Users/lbcheng/cheng-fusion/index.ts
 ```sh
 /Users/lbcheng/cheng-fusion/install.sh            # applies the change
 /Users/lbcheng/cheng-fusion/install.sh --dry-run  # prints the JSON without writing anything
+/Users/lbcheng/cheng-fusion/install.sh --doctor   # registers, then runs all health checks
 ```
+
+Real installs take a cooperative exclusive transaction lock, preserve the prior mode and unrelated keys, hard-link an exact backup, then fsync and atomically rename the new config. A concurrent install or non-object configuration fails without changing the file. The config path itself must be a regular file; symlinks are rejected so an atomic rename cannot silently replace a dotfiles link instead of its target.
+
+## Headless CLI
+
+The CLI is the reliable entry point for automation, subagents and isolated clones that do not inherit an MCP connection:
+
+```sh
+bun /Users/lbcheng/cheng-fusion/cli.ts list
+bun /Users/lbcheng/cheng-fusion/cli.ts run cheng_crash_triage --input '{"stderr":"panic at sample.cheng:12"}'
+bun /Users/lbcheng/cheng-fusion/cli.ts run cheng_csg_query --root /absolute/cheng-project --cwd /absolute/cheng-project --input @request.json
+printf '%s\n' '{"stderr":"panic"}' | bun /Users/lbcheng/cheng-fusion/cli.ts run cheng_crash_triage --input -
+bun /Users/lbcheng/cheng-fusion/cli.ts doctor
+```
+
+`list` and `run` invoke the same `handleMcpRequest` path as MCP. `--root` and `--cwd` are request-local and canonicalized; existing project inputs are checked by real target, and prospective outputs reject escaping/symlink ancestors. Each root-dependent MCP call consumes its own `roots/list` snapshot, while empty/error responses clear stale state. `doctor` starts the real `index.ts`, performs `initialize → tools/list`, verifies every top-level input schema is an object, checks the backend/stage3/LSP executables and macOS signatures, and completes a real minimal LSP initialize handshake. Failures are structured JSON and return nonzero.
+
+The repeatable production-path integration entry is `bun run test`; it uses checked-in or runtime-created fixtures, includes the real LLDB watchpoint test, and requires the configured real Cheng toolchain. Each child has a process-group timeout (`CHENG_FUSION_SUITE_TEST_TIMEOUT_MS`, default 180000 ms). Historical `/tmp`-dependent observational tests are excluded from this gate. `bun run test:item11` remains available for running the LLDB gate alone.
 
 ## Tools
 
@@ -43,34 +62,36 @@ claude mcp add cheng-fusion -- bun /Users/lbcheng/cheng-fusion/index.ts
 | `cheng_csg_query` | no | Query CSG facts: symbol declarations, inbound references, outbound calls. |
 | `cheng_evidence` | no | Cross-module refactor blast-radius evidence (impact radius, cross-module callers) from CSG facts. |
 | `cheng_csg_roundtrip` | yes | Emit Cheng cold CSG facts for a source file and verify the cold reader consumes them; refreshes `conversion-reports/cheng-csg/current.facts`. |
-| `cheng_crash_triage` | no | Parse Cheng compiler/runtime stderr into structured `file:line` frames. |
+| `cheng_crash_triage` | yes* | Parse Cheng compiler/runtime stderr, or execute an explicitly supplied binary under LLDB for live triage. The conservative MCP annotation is mutating because the debuggee may have side effects. |
 | `cheng_line_map_read` | no | Canonical function sig/body line spans for a `.cheng` source (sidecar-cached; falls back to cheng-lsp). |
 | `cheng_lsp_query` | no | Direct pass-through to the real `cheng-lsp` language server: hover, definition, references, diagnostics, rename, codeAction, etc. |
-| `cheng_profile_report` | yes | Probe/run/convert real Cheng profiling reports (`profile-report` / `system-link-exec` + executable timing). |
-| `cheng_symbol_diff` | no | Snapshot `cheng print-symbols` counts; `primary_unsupported_count > 0` signals a compiler lowering regression. |
-| `cheng_exec_diff` | yes | Two-driver differential method: compile+run one or more fixtures under `driverA`/`driverB` and diff the result (`identical`/`semantic_divergence`/`compile_wall`/`both_fail`). |
+| `cheng_profile_report` | yes | Convert profile reports with fresh bounded artifacts, or collect link/run timing observations. Only `profile-report` may prove an exact `cheng_profile_v1`; `run` remains `CFAIL` until formal profiler instrumentation is wired and never trusts user-program stdout. |
+| `cheng_symbol_diff` | no | Compare defined and undefined symbol sets. For thin Mach-O objects, Darwin branch relocations are mapped to a unique global-`T` owner interval; local `t`, aliases and out-of-range sites remain explicit `unresolved-owner`. Executables/fat objects are rejected for caller attribution. |
+| `cheng_exec_diff` | yes | Two-driver differential method using raw stdout bytes. Completed runs report `identical`/`semantic_divergence`/`both_fail`; `compile_wall` additionally requires the complete rc=2 `ZC_NOT_READY` protocol. Timeout, output overflow, invalid executable materialization, or missing raw bytes report `CFAIL`. |
 | `cheng_template_leak_audit` | no | Scan a `.primary.o` for `__L<line>`-mangled generic functions still carrying a bare unbound type parameter in return/param position (template monomorphization leak), and count real BL call edges via `objdump -r` to classify `live_leak` vs `dead_weight`. Golden invariant: `liveLeakCount` should be 0. |
-| `cheng_corrupt_hunt` | no | Two-stage lldb watchpoint write-point localization: stage 1 breakpoints a known detection site and reads a base-register+offset victim address `H` (and its current value); stage 2 (fresh process) sets a write watchpoint on `H` and replays from process start, recording pc/symbol/new-value/backtrace for each hit — the first hit in the real culprit function is the corrupting write. |
-| `cheng_shape_matrix` | yes | Runs the golden ignition fixture matrix (`fixtures/ignition/matrix.json`) under one Cheng driver: compiles+runs every non-planned entry and checks `expectRc` / `expectStdout` / `golden` (byte-exact) / `expectCompileBail` (a contracted honest `ZC_NOT_READY` rejection), reporting GREEN/RED/CFAIL per entry plus `coverageGaps` (`planned:true` entries with no fixture yet). Productizes the manual "30s ignition determinism loop". |
+| `cheng_zc_census` | yes | Run the canonical whole-tree `ZC_NOT_READY` census and return exact missing-function/bail records instead of parsing logs by hand. |
+| `cheng_corrupt_hunt` | yes* | Execute a binary twice under LLDB for two-stage watchpoint localization. Stage 1 uses the target breakpoint's ignore count for `breakpointSkip`; stage 2 accepts only the exact created watchpoint ID. Signals/other stops and failed memory reads are hard errors. |
+| `cheng_shape_matrix` | yes | Run all 111 checked-in ignition contracts under one driver, including exact runtime/stdout/golden, `expectCompileRc`, and honest compile-bail contracts. Contract groups are preflight-exclusive; timeout/materialization contradictions cannot be GREEN. |
+| `cheng_fixture_matrix` | yes | Run the full explicit `drivers[] × fixtures[]` compile/run product. Preflight requires a real Cheng root and unique canonical driver/`.cheng` paths plus bidirectional/`*_true` mirror contracts; every cell and pair receives a GREEN/RED verdict. |
 | `cheng_claim_audit` | no | Diagnostic-only static text audit of `primary_object_plan.cheng`'s statement-claim sites (`PrimaryBodyIrNodeEvalOnlyOwn(` calls, `localInitialized = true` assignments, `continue` inside statement-dispatch loops found by indentation backtrack), classified `EMITS`/`POISONS`/`SILENT_RISK` by regex-scanning nearby context for emission/poison evidence. Candidates for human review, not verdicts — never a sufficient condition on its own to delete a text-path fallback. |
+| `cheng_ignition_chain` | yes | Start/poll the journaled DRV→probes→GEN2→terminal/oracle→optional GEN3 chain. `baseTree+revertCommits` runs exact reverse patches in a realpath-isolated clone. OS lock state proves liveness; provenance drift and GEN3 failures abort explicitly; the permanent claim, sole journal `done` and atomic non-overwriting `done.json` must match. |
 | `cheng_residual_peel` | yes* | One-shot residual peel board for ZC/Pass B: `mode=static` (default) runs second-scale shape rules (`freeSeq` multi-overload, multi-stmt `;…; break`, V2FastBuild same-name) from `fixtures/residual_rules.json`; `mode=full` adds canonical `tools/zc_enumerate.sh` census. Returns `static.hits`, optional `census`, phase-ordered `attackOrder`, and `maskedRisk` (deeper-phase static hits likely hidden until call-resolve clears). Static = leads not verdicts; only census may claim `zc_missing_function_count`. \*Mutating flag set because `mode=full` spawns a heavy driver; prefer `static` under load. |
-| `cheng_orphan_slot_scan` | no | Disassembles `objPath` via `otool -tv`, selects the function matching `fnFilter` (most-specific/exact-suffix wins on ambiguity, never "last defined wins"), and reports `[sp,#offset]` stack slots read by `ldr`/`ldur`/`ldp` but never written by any `str`/`stur`/`stp` in that function — a stale-stack-read signal. Handles the `stp`/`ldp` implicit-zero-offset form (`stp x0, x1, [sp]`, no `#imm`) that a naive regex misses. `wOnly` (default true) gates the `BAD` verdict to 32-bit w-register orphans only; wider orphans are still listed but informational (often ABI struct-return slots a callee writes through a pointer). |
+| `cheng_orphan_slot_scan` | no | Disassembles `objPath` via `otool -tv`, selects the function matching `fnFilter`, and reports explicit `[sp,#offset]` loads whose full byte range has no explicit `str`/`stur`/`stp` coverage in that function. Pair stride follows register width (`w/s=4`, `x/d=8`, `q=16`) and implicit-zero-offset `stp`/`ldp` is supported. Computed-pointer/callee writes and control flow are outside this scan, so results are candidates, never a GOOD/BAD correctness verdict; `wOnly` only selects 32-bit priority candidates. |
 
-All tools except `cheng_crash_triage`, `cheng_corrupt_hunt`, `cheng_shape_matrix`, `cheng_claim_audit`, `cheng_ignition_chain` and `cheng_orphan_slot_scan` require an active Cheng project root (a directory containing `cheng-package.toml`), resolved from MCP workspace roots, an explicit `cwd`, or the tool's own `file`/`source`/`root` argument. `cheng_shape_matrix`/`cheng_claim_audit` take explicit absolute `driver`/`root`/`pobjPath` arguments instead (same rationale as `cheng_exec_diff`: fixtures and experimental drivers are often outside any Cheng project root); `cheng_ignition_chain` and `cheng_orphan_slot_scan` likewise take explicit absolute `treeRoot`/`seed`/`objPath` arguments.
+All tools except `cheng_crash_triage`, `cheng_corrupt_hunt`, `cheng_shape_matrix`, `cheng_fixture_matrix`, `cheng_claim_audit`, `cheng_ignition_chain` and `cheng_orphan_slot_scan` require an active Cheng project root (a directory containing `cheng-package.toml`). MCP workspace roots and CLI `--root`/`--cwd` are invocation-local context. Rootless tools instead require their own explicit absolute driver/tree/object paths.
 
 ## Environment knobs
 
 | Variable | Default | Effect |
 |---|---|---|
-| `CHENG_FUSION_RSS_CAP` | `1073741824` (1 GiB) | Overrides `CHENG_PROCESS_MAX_RSS_BYTES` injected into every spawned Cheng driver/cheng-lsp subprocess. This is a **circuit-breaker ceiling, not an expected footprint** — real measured peaks are two orders of magnitude smaller (see below); the compiler self-aborts once a compile/link process crosses it (checked in `compiler_main.cheng` / `system_link_exec.cheng` via `HostOpsConfiguredMaxRssBytes`/`HostOpsCurrentRssBytes`). Note: `cheng-lsp` does **not** check this env var at all (no call site in `lsp_server.cheng`/`lsp_entry.cheng`/`lsp_protocol.cheng`), so for `cheng_lsp_query`/`cheng_line_map_read` this cap is inert — the only backstop there is `CHENG_FUSION_TIMEOUT_MS` + process-group `SIGKILL`. |
-| `CHENG_FUSION_TIMEOUT_MS` | tool-specific (15s for LSP requests, 120s for driver runs) | Overrides every timeout in the process, uniformly. On timeout the whole subprocess **group** is `SIGKILL`ed (not just the direct child), so `BACKEND_JOBS` fork-join grandchildren don't survive as orphans. |
+| `CHENG_FUSION_RSS_CAP` | `1073741824` (1 GiB) | Overrides `CHENG_PROCESS_MAX_RSS_BYTES` for toolkit-spawned Cheng processes. `cheng_ignition_chain` is intentionally separate and uses its explicit `rssCapBytes`/`gen3RssCapBytes` contract (default 12 GiB). `cheng-lsp` does not consume the RSS variable; timeout/group-kill is its bound. |
+| `CHENG_FUSION_TIMEOUT_MS` | tool-specific (15s for LSP requests, 120s for driver runs) | Overrides toolkit process timeouts. On timeout the whole subprocess group is `SIGKILL`ed. The background ignition chain owns explicit per-stage timeouts in its generated journaled runner. |
 | `CHENG_TOOLCHAIN_ROOT` / `CHENG_ROOT` | `/Users/lbcheng/cheng-lang` | Default Cheng toolchain root used to locate the backend driver, stage3 driver, and cheng-lsp fallback path. |
 | `CHENG_DRIVER` | `$CHENG_TOOLCHAIN_ROOT/artifacts/backend_driver/cheng` | Explicit override for the backend driver binary. |
 | `CHENG_STAGE3_DRIVER` | `$CHENG_TOOLCHAIN_ROOT/artifacts/bootstrap/cheng.stage3` | Explicit override for the stage3 self-hosted driver. |
 | `CHENG_LSP_PATH` | resolved via `which cheng-lsp`, else `$CHENG_TOOLCHAIN_ROOT/artifacts/cheng-lsp` | Explicit override for the `cheng-lsp` binary. |
 | `CHENG_COLD_DRIVER` | — | Highest-priority driver override for `cheng_csg_roundtrip`'s cold-CSG emission. |
-| `CHENG_FUSION_VENDOR_COLD_DRIVER` | `vendor/cold-driver/cheng_cold_csg9` (this package) | Second priority, ahead of `CHENG_CSG_DRIVER`/`CHENG_DRIVER`/`CHENG_STAGE3_DRIVER`. Used automatically whenever the vendor binary exists — see "Vendor cold driver" below. |
-| `CHENG_CSG_DRIVER` | — | Third-priority driver candidate, tried before `CHENG_DRIVER`/`CHENG_STAGE3_DRIVER`. |
+| `CHENG_FUSION_VENDOR_COLD_DRIVER` | `vendor/cold-driver/cheng_cold_csg9` (this package) | Default compatible CSG driver. It is the only implicit fallback, so an unpatched main-repo driver cannot silently emit the pre-kind-9 schema. |
 | `CSG_CORE_READER_ROOT` / `TS_CSG_ROOT` | `$CHENG_TOOLCHAIN_ROOT/ts-csg` | Root used to locate the CSG-Core facts reader (`dist/csgc-reader.js`) for non-cold CSG facts. |
 
 ### RSS cap sizing (measured 2026-07-10)
@@ -102,7 +123,8 @@ only sees cross-object calls (kind=6 relocs); intra-file calls (the common
 case) are invisible.
 
 `vendor/cold-driver/` builds a fusion-local cold driver binary that *does*
-understand kind=9, by applying `vendor/cold-driver/patches/csg-writer-call-edges.patch`
+understand kind=9 and reports the exact total `facts_record_count` from both
+writer and reader paths, by applying `vendor/cold-driver/patches/csg-writer-call-edges.patch`
 to a **copy** of `$CHENG_TOOLCHAIN_ROOT/bootstrap/cheng_cold.c` (plus its
 `#include`d siblings) and compiling that copy. This never touches the main
 repo's source tree, artifacts, or seeds.
@@ -115,15 +137,16 @@ Rebuild whenever the main repo's `bootstrap/cheng_cold.c` changes upstream, or
 the vendored patch is updated. Output: `vendor/cold-driver/cheng_cold_csg9`
 (gitignored; rebuilt on demand, not committed). `cheng_csg_roundtrip` picks it
 up automatically once built — no env var required (see the driver-priority
-table above); set `CHENG_COLD_DRIVER` to override with a different binary, or
-delete the vendor binary to fall back to the main repo's stage3/backend
-driver.
+table above); set `CHENG_COLD_DRIVER` to override with a separately built
+compatible binary. If neither exists, `cheng_csg_roundtrip` hard-fails rather
+than falling back to a main-repo driver that emits the pre-kind-9 schema.
 
 ## Layout
 
 ```
 cheng-fusion/
 ├── index.ts                                  entry point (equivalent to the source repo's 3-line shim)
+├── cli.ts                                    headless list/run/doctor entry point
 ├── package.json                               name=cheng-fusion-mcp, bun, zod dependency
 ├── install.sh                                  idempotent ~/.claude.json registration
 ├── vendor/
@@ -135,7 +158,7 @@ cheng-fusion/
 │   ├── runtime.ts                              tiny lazy-module-init helper (copied verbatim)
 │   ├── tool_definition_lookup_and_defaults_m2929.ts
 │   ├── cheng_toolkit_m9000.ts                  shared toolkit: project-root resolution, CSG facts parsing, driver spawning, cheng-lsp client
-│   ├── cheng_fusion_tool_registry.ts           local static registry of the 8 cheng_* tools (replaces the claude-code builtin tool registry)
+│   ├── cheng_fusion_tool_registry.ts           local static registry of all 18 cheng_* tools
 │   ├── cheng_fusion_mcp_server_m9009.ts        MCP stdio JSON-RPC server
 │   ├── cheng_csg_query_m9001.ts
 │   ├── cheng_evidence_m9002.ts
@@ -147,23 +170,33 @@ cheng-fusion/
 │   ├── cheng_symbol_diff_m9008.ts
 │   ├── cheng_exec_diff_m9012.ts
 │   ├── cheng_template_leak_audit_m9013.ts
+│   ├── cheng_zc_census_m9014.ts
 │   ├── cheng_corrupt_hunt_m9015.ts
 │   ├── cheng_shape_matrix_m9016.ts              golden ignition fixture matrix runner
-│   └── cheng_claim_audit_m9017.ts               pobj dispatcher claim-site static audit
+│   ├── cheng_claim_audit_m9017.ts               pobj dispatcher claim-site static audit
+│   ├── cheng_ignition_chain_m9018.ts            detached journaled generation chain + ablation
+│   ├── cheng_residual_peel_m9019.ts
+│   ├── cheng_orphan_slot_scan_m9020.ts
+│   └── cheng_fixture_matrix_m9021.ts             multi-driver × fixture contract matrix
 ├── fixtures/
 │   └── ignition/                                golden fixture library + matrix.json (see "Ignition fixture matrix" below)
-└── test/                                       hardening-item harness (RSS cap, timeout orphan-kill, stale-facts warning, line-map sidecar)
+└── test/                                       production-path integration and end-to-end harnesses
 ```
 
 ## Ignition fixture matrix
 
 `fixtures/ignition/` is the productized, checked-in home for the "ignition determinism
 loop" fixtures (previously scattered across `/tmp/*` and lost on every reboot). `matrix.json`
-pins each fixture's contracted expectation (`expectRc` / `expectStdout` / `golden` byte-exact
-comparison / `expectCompileBail` for fixtures whose current honest contract is a diagnosed
-`ZC_NOT_READY` rejection) plus tags (`family:*`, `kind:*`) and five `planned:true` coverage-gap
-placeholders (ctor positional real-emit, global-init str field, assign/argpos/return-position
-constructor bugs `707`/`44`/`801`). Run it with `cheng_shape_matrix`.
+pins 111 unique, runnable contracts: `expectRc` / `expectStdout` / byte-exact `golden` /
+`expectCompileRc` / diagnosed `expectCompileBail`, plus `family:*` and `kind:*` tags.
+There are no `planned:true` placeholders or split staging manifests. Run the canonical library
+with `cheng_shape_matrix`; use `cheng_fixture_matrix` for an explicit multi-driver subset.
+
+`expectStdout` is the exact UTF-8 byte sequence encoded by the JSON string; trailing spaces and
+newlines are significant, exactly as they are for `golden`. `expectCompileBail` is GREEN only for
+the evidenced rejection protocol: exit code 2, exact `ZC_NOT_READY` records, one final
+`ZC_NOT_READY_TOTAL`, matching count/denominators, unique continuous zero-based indices, and the
+contracted bail on every record. The whole matrix is preflighted before `filterTag` is applied.
 
 Known blocker: `g45.cheng` (from `/tmp/f23/repro42/`) does not exist anywhere on disk and could
 not be copied into the fixture library — recorded here rather than fabricated.
@@ -171,6 +204,6 @@ not be copied into the fixture library — recorded here rather than fabricated.
 ## Notes on what changed vs. the source repo
 
 - **zod**: the source repo vendors a bundled/renamed copy of zod 4's internals (`vendor/m222.ts` re-exporting `m219`/`m211`/etc.). This package uses the real `zod` npm package (`^4.4.3`) instead — verified to expose an identical top-level API for everything actually used (`strictObject`, `enum`, `string`, `number().int().positive()`, `.optional()`, `.describe()`, `.safeParse()`, `.toJSONSchema()`).
-- **Tool registry**: the source repo's server filtered `cheng_*` tools out of claude-code's full builtin tool registry (1000+ lines, dozens of unrelated tools). This package registers the 8 `cheng_*` tools directly in `cheng_fusion_tool_registry.ts`, in the same order and with the same init-call sequence as the original registry.
+- **Tool registry**: the source repo's server filtered `cheng_*` tools out of claude-code's full builtin tool registry. This package registers its 18 tools directly in `cheng_fusion_tool_registry.ts`; MCP and CLI consume this one registry.
 - **`withDefaultToolDefinitionBehavior`**: copied verbatim (12 lines, `tool_definition_lookup_and_defaults_m2929.ts`) — small enough that a minimal reimplementation wasn't warranted.
 - **Excluded**: `cheng_fusion_hooks_m9011.ts` (claude-code session/BashTool integration hooks) is not part of this package; it only makes sense inside claude-code's own process, not a standalone MCP server.

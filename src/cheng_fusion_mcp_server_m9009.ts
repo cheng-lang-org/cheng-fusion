@@ -6,11 +6,12 @@
 // prefix "cheng_". Behavior (tool list, order, schemas, dispatch) is unchanged.
 import {getChengFusionTools as getAllChengFusionTools, initChengFusionToolRegistryModule} from "./cheng_fusion_tool_registry.ts";
 import {setChengProjectRootHints,withChengInvocationContext,zodToJsonSchema} from "./cheng_toolkit_m9000.ts";
+import {JSON_RPC_MAX_FRAME_BYTES,JsonRpcFrameDecoder} from "./json_rpc_frame_decoder.ts";
 
 let mcpWorkspaceRootHints = [];
 let mcpClientCanListRoots = false;
 const chengToolsWithoutProjectRoot = new Set(["cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_claim_audit", "cheng_ignition_chain", "cheng_orphan_slot_scan", "cheng_fixture_matrix"]);
-const chengMutatingTools = new Set(["cheng_csg_roundtrip", "cheng_profile_report", "cheng_exec_diff", "cheng_zc_census", "cheng_shape_matrix", "cheng_ignition_chain", "cheng_residual_peel", "cheng_fixture_matrix"]);
+const chengMutatingTools = new Set(["cheng_csg_roundtrip", "cheng_profile_report", "cheng_exec_diff", "cheng_zc_census", "cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_ignition_chain", "cheng_residual_peel", "cheng_fixture_matrix"]);
 
 function getChengFusionTools() {
   initChengFusionToolRegistryModule();
@@ -24,8 +25,9 @@ async function describeTool(tool) {
 }
 
 function validateInput(tool, input) {
-  if (!tool.inputSchema?.safeParse) return {ok: true, value: input || {}};
-  const parsed = tool.inputSchema.safeParse(input || {});
+  const value = input === undefined ? {} : input;
+  if (!tool.inputSchema?.safeParse) return {ok: true, value};
+  const parsed = tool.inputSchema.safeParse(value);
   if (parsed.success) return {ok: true, value: parsed.data};
   return {ok: false, error: parsed.error?.message || String(parsed.error)};
 }
@@ -60,8 +62,6 @@ function collectWorkspaceRoots(params = {}) {
     push(value.workspace_root);
     push(value.projectRoot);
     push(value.project_root);
-    push(value.cwd);
-    push(value.currentWorkingDirectory);
     for (const root of value.workspaceRoots || []) push(root);
     for (const root of value.workspace_roots || []) push(root);
     for (const folder of value.workspaceFolders || []) push(folder);
@@ -70,9 +70,7 @@ function collectWorkspaceRoots(params = {}) {
     for (const root of value.clientInfo?.workspaceFolders || []) push(root);
   };
   visit(params);
-  visit(params.arguments);
   visit(params._meta);
-  visit(params._meta?.arguments);
   visit(params.meta);
   visit(params.context);
   visit(params.clientContext);
@@ -94,9 +92,7 @@ function collectWorkingDirectories(params = {}) {
     push(value.working_directory);
   };
   visit(params);
-  visit(params.arguments);
   visit(params._meta);
-  visit(params._meta?.arguments);
   visit(params.meta);
   visit(params.context);
   visit(params.clientContext);
@@ -169,13 +165,21 @@ async function handleMcpRequest(message, transportContext = {}) {
     const name = message.params?.name;
     const tool = getChengFusionTools().find((candidate) => candidate.name === name);
     if (!tool) throw Object.assign(new Error(`Cheng fusion tool not found: ${name}`), {code: -32602});
-    const directRoots = collectWorkspaceRoots(message.params);
-    if (!chengToolsWithoutProjectRoot.has(tool.name) && directRoots.length === 0 && typeof transportContext.refreshWorkspaceRoots === "function") {
-      await transportContext.refreshWorkspaceRoots();
+    const rawArguments = message.params?.arguments === undefined ? {} : message.params.arguments;
+    if (rawArguments === null || typeof rawArguments !== "object" || Array.isArray(rawArguments)) {
+      return {
+        isError: true,
+        content: [{type: "text", text: `Invalid input for ${tool.name}: arguments must be a JSON object`}],
+      };
     }
-    const context = buildMcpInvocationContext(message.params, {existingWorkspaceRoots: mcpWorkspaceRootHints});
-    const validation = validateInput(tool, stripMcpContextFields(message.params?.arguments || {}));
+    const validation = validateInput(tool, stripMcpContextFields(rawArguments));
     if (!validation.ok) return {isError: true, content: [{type: "text", text: `Invalid input for ${tool.name}: ${validation.error}`}]};
+    const directRoots = collectWorkspaceRoots(message.params);
+    let invocationRootSnapshot = [...mcpWorkspaceRootHints];
+    if (!chengToolsWithoutProjectRoot.has(tool.name) && directRoots.length === 0 && typeof transportContext.refreshWorkspaceRoots === "function") {
+      invocationRootSnapshot = [...await transportContext.refreshWorkspaceRoots()];
+    }
+    const context = buildMcpInvocationContext(message.params, {existingWorkspaceRoots: invocationRootSnapshot});
     try {
       const input = chengToolsWithoutProjectRoot.has(tool.name)
         ? validation.value
@@ -198,66 +202,85 @@ function encodeError(message, error) {
 }
 
 function createMessageReader(onMessage, onError) {
-  let buffer = Buffer.alloc(0);
-  // Robustness: onMessage is async and called fire-and-forget from the stdin
-  // 'data' listener. A synchronous throw or a rejected promise escaping here
-  // becomes an uncaught exception / unhandled rejection that kills the process
-  // (= client disconnect). Route both to onError (stderr) and keep reading.
-  const dispatch = (parsed) => {
+  const decoder = new JsonRpcFrameDecoder({framing: "auto", label: "MCP input"});
+  let failed = false;
+  const fail = (error) => {
+    if (failed) return;
+    failed = true;
+    decoder.clear();
+    const fatal = error instanceof Error ? error : new Error(String(error));
+    onError(fatal);
+    throw fatal;
+  };
+  const dispatch = (parsed, frame) => {
+    const returned = onMessage(parsed, frame);
+    if (returned && typeof returned.then === "function") {
+      returned.catch((error) => {
+        setTimeout(() => fail(error), 0);
+      });
+    }
+  };
+  const reader = (chunk) => {
+    if (failed) return;
     try {
-      const returned = onMessage(parsed);
-      if (returned && typeof returned.then === "function") returned.catch((err) => onError(err));
-    } catch (err) {
-      onError(err);
+      decoder.push(chunk, dispatch);
+    } catch (error) {
+      fail(error);
     }
   };
-  // Robustness: a partial/corrupt frame must not throw out of the 'data'
-  // listener. Parse in isolation; on failure record the bad frame on stderr and
-  // skip it (the buffer has already been advanced past this frame), continuing
-  // to read subsequent well-formed frames. Valid frames are unaffected.
-  const parseFrame = (text) => {
-    try {
-      return {ok: true, value: JSON.parse(text)};
-    } catch (err) {
-      onError(new Error(`failed to parse MCP frame (${text.length} bytes), skipping: ${err instanceof Error ? err.message : String(err)}`));
-      return {ok: false};
+  reader.end = () => {
+    if (failed) return;
+    const bufferedBytes = decoder.queue?.length || 0;
+    if (bufferedBytes > 0 || decoder.expectedBodyBytes !== null) {
+      fail(new Error(`MCP input: truncated JSON frame at EOF (${bufferedBytes} buffered bytes)`));
     }
   };
-  return (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    for (;;) {
-      if (buffer.length === 0) return;
-      const preview = buffer.toString("utf8", 0, Math.min(buffer.length, 32));
-      if (/^Content-Length:/i.test(preview)) {
-        const split = buffer.indexOf("\r\n\r\n");
-        if (split < 0) return;
-        const header = buffer.toString("utf8", 0, split);
-        const match = header.match(/Content-Length:\s*(\d+)/i);
-        if (!match) return onError(new Error(`bad MCP header: ${header}`));
-        const length = Number(match[1]);
-        const start = split + 4;
-        if (buffer.length < start + length) return;
-        const body = buffer.toString("utf8", start, start + length);
-        buffer = buffer.subarray(start + length);
-        const parsed = parseFrame(body);
-        if (parsed.ok) dispatch(parsed.value);
-        continue;
-      }
-      const newline = buffer.indexOf("\n");
-      if (newline < 0) return;
-      const line = buffer.toString("utf8", 0, newline).replace(/\r$/, "").trim();
-      buffer = buffer.subarray(newline + 1);
-      if (line) {
-        const parsed = parseFrame(line);
-        if (parsed.ok) dispatch(parsed.value);
-      }
-    }
-  };
+  return reader;
+}
+
+function writeToStreamWithBackpressure(stream, text) {
+  let accepted;
+  try {
+    accepted = stream.write(text);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  if (accepted !== false) return Promise.resolve();
+  if (typeof stream.once !== "function") {
+    return Promise.reject(new Error("output stream rejected a write but cannot signal drain"));
+  }
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      stream.removeListener?.("drain", onDrain);
+      stream.removeListener?.("error", onError);
+      stream.removeListener?.("close", onClose);
+    };
+    const onDrain = () => { cleanup(); resolve(); };
+    const onError = (error) => { cleanup(); reject(error instanceof Error ? error : new Error(String(error))); };
+    const onClose = () => { cleanup(); reject(Object.assign(new Error("output stream closed before drain"), {code: "EOF"})); };
+    stream.once("drain", onDrain);
+    stream.once("error", onError);
+    stream.once("close", onClose);
+  });
 }
 
 async function startChengFusionMcpServer(stdin = process.stdin, stdout = process.stdout, stderr = process.stderr) {
+  const maxQueuedClientMessages = 32;
+  const maxQueuedClientBytes = JSON_RPC_MAX_FRAME_BYTES;
+  const highWaterMessages = 8;
+  const lowWaterMessages = 4;
+  const highWaterBytes = 8 * 1024 * 1024;
+  const lowWaterBytes = 4 * 1024 * 1024;
   let nextServerRequestId = 1;
   const pendingServerRequests = new Map();
+  const queuedClientMessages = [];
+  let queuedClientBytes = 0;
+  let processingClientMessage = false;
+  let inputPaused = false;
+  let inputEnded = false;
+  let inputEndReason = "stdin ended";
+  let gracefulDrainInFlight = false;
+  let outputTail = Promise.resolve();
   let shuttingDown = false;
   function logStderr(text) {
     try {
@@ -266,41 +289,109 @@ async function startChengFusionMcpServer(stdin = process.stdin, stdout = process
       // stderr itself is gone; nothing left to do but stay alive silently.
     }
   }
-  function gracefulExit(reason) {
+  function shutdown(reason, exitCode, immediate = true) {
     if (shuttingDown) return;
     shuttingDown = true;
-    logStderr(`cheng-fusion: ${reason}; exiting cleanly`);
-    process.exit(0);
+    queuedClientMessages.length = 0;
+    queuedClientBytes = 0;
+    const disconnectError = new Error(`MCP client disconnected: ${reason}`);
+    for (const pending of pendingServerRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(disconnectError);
+    }
+    pendingServerRequests.clear();
+    logStderr(`cheng-fusion: ${reason}; exiting ${exitCode === 0 ? "cleanly" : "with failure"}`);
+    if (immediate) process.exit(exitCode);
+    process.exitCode = exitCode;
+  }
+  function gracefulExit(reason) {
+    shutdown(reason, 0);
+  }
+  function fatalExit(error) {
+    const message = error instanceof Error ? error.stack || error.message : String(error);
+    shutdown(message, 1);
   }
   function isBrokenPipe(error) {
     const code = error && (error.code || error.errno);
     return code === "EPIPE" || code === "EOF" || code === "ERR_STREAM_DESTROYED" || code === "ERR_STREAM_WRITE_AFTER_END";
   }
-  // Robustness: the client's read end can vanish mid-write (EPIPE) or the stream
-  // can already be destroyed. Never let a stdout write throw out of a handler and
-  // kill the process. A broken pipe means the client is gone -> exit cleanly; any
-  // other write error is recorded on stderr without crashing. Bytes for the happy
-  // path are unchanged: on success this is exactly `stdout.write(text)`.
-  function safeWrite(text) {
-    try {
-      stdout.write(text);
-    } catch (error) {
-      if (isBrokenPipe(error)) return gracefulExit(`stdout broken pipe (${error.code || error.errno})`);
-      logStderr(`cheng-fusion: stdout write error: ${error instanceof Error ? error.stack || error.message : String(error)}`);
+  function updateInputFlow() {
+    if (shuttingDown) return;
+    if (inputEnded) {
+      if (!inputPaused) stdin.pause?.();
+      inputPaused = true;
+      return;
+    }
+    // A server-initiated roots/list response must always be allowed through the
+    // same duplex stream, otherwise pausing at high water could deadlock the
+    // active request. Excess requests are still bounded below and fail hard.
+    const mustReceiveServerResponse = pendingServerRequests.size > 0;
+    const aboveHighWater = queuedClientMessages.length >= highWaterMessages || queuedClientBytes >= highWaterBytes;
+    const belowLowWater = queuedClientMessages.length <= lowWaterMessages && queuedClientBytes <= lowWaterBytes;
+    if (!inputPaused && aboveHighWater && !mustReceiveServerResponse) {
+      stdin.pause?.();
+      inputPaused = true;
+    } else if (inputPaused && (mustReceiveServerResponse || belowLowWater)) {
+      stdin.resume?.();
+      inputPaused = false;
     }
   }
+
+  function safeWrite(text) {
+    const operation = outputTail.then(() => writeToStreamWithBackpressure(stdout, text));
+    outputTail = operation.catch(() => {});
+    return operation.catch((error) => {
+      if (isBrokenPipe(error)) return gracefulExit(`stdout broken pipe (${error.code || error.errno})`);
+      throw error;
+    });
+  }
+
+  function maybeFinishAfterInputEnd() {
+    if (!inputEnded || shuttingDown || gracefulDrainInFlight) return;
+    if (processingClientMessage || queuedClientMessages.length > 0 || pendingServerRequests.size > 0) return;
+    gracefulDrainInFlight = true;
+    const observedOutputTail = outputTail;
+    observedOutputTail.then(() => {
+      gracefulDrainInFlight = false;
+      if (shuttingDown) return;
+      if (
+        processingClientMessage
+        || queuedClientMessages.length > 0
+        || pendingServerRequests.size > 0
+        || outputTail !== observedOutputTail
+      ) {
+        maybeFinishAfterInputEnd();
+        return;
+      }
+      // Do not call process.exit here: even a write that returned true may still
+      // be buffered by the runtime. With stdin exhausted, setting exitCode lets
+      // the event loop flush the transport before exiting naturally.
+      shutdown(`${inputEndReason}; all requests and output drained`, 0, false);
+    }).catch((error) => fatalExit(error));
+  }
   function writeJson(message) {
-    safeWrite(JSON.stringify(message) + "\n");
+    return safeWrite(JSON.stringify(message) + "\n");
   }
   function requestClient(method, params = {}, timeoutMs = 1000) {
     const id = `cheng-fusion-${nextServerRequestId++}`;
-    writeJson({jsonrpc: "2.0", id, method, params});
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pendingServerRequests.delete(id);
+        updateInputFlow();
+        maybeFinishAfterInputEnd();
         reject(new Error(`${method} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       pendingServerRequests.set(id, {resolve, reject, timer});
+      updateInputFlow();
+      writeJson({jsonrpc: "2.0", id, method, params}).catch((error) => {
+        const pending = pendingServerRequests.get(id);
+        if (!pending) return;
+        pendingServerRequests.delete(id);
+        clearTimeout(pending.timer);
+        updateInputFlow();
+        maybeFinishAfterInputEnd();
+        reject(error);
+      });
     });
   }
   async function refreshWorkspaceRoots() {
@@ -308,72 +399,114 @@ async function startChengFusionMcpServer(stdin = process.stdin, stdout = process
     // Clear the cache before asking the client. A timeout/error must never leave a stale
     // previous-project root available to a later tool call.
     updateMcpWorkspaceRoots({roots: []});
-    const result = await requestClient("roots/list", {}, 1000);
-    return updateMcpWorkspaceRoots(result);
+    try {
+      const result = await requestClient("roots/list", {}, 1000);
+      return [...updateMcpWorkspaceRoots(result)];
+    } catch (error) {
+      updateMcpWorkspaceRoots({roots: []});
+      throw error;
+    }
   }
-  const onData = createMessageReader(async (message) => {
+
+  function settleServerResponse(message) {
     if (message.id !== undefined && message.method === undefined && pendingServerRequests.has(message.id)) {
       const pending = pendingServerRequests.get(message.id);
       pendingServerRequests.delete(message.id);
       clearTimeout(pending.timer);
       if (message.error) pending.reject(new Error(message.error.message || JSON.stringify(message.error)));
       else pending.resolve(message.result || {});
-      return;
+      updateInputFlow();
+      maybeFinishAfterInputEnd();
+      return true;
     }
+    return false;
+  }
+
+  async function processClientMessage(message) {
     if (message.id === undefined) {
       if (message.method === "notifications/initialized" || message.method === "notifications/roots/list_changed") {
-        refreshWorkspaceRoots().catch((error) => {
-          stderr.write(`roots/list refresh failed: ${error instanceof Error ? error.message : String(error)}\n`);
-        });
+        try {
+          await refreshWorkspaceRoots();
+        } catch (error) {
+          logStderr(`roots/list refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       return;
     }
     try {
       const result = await handleMcpRequest(message, {refreshWorkspaceRoots});
-      writeJson({jsonrpc: "2.0", id: message.id, result});
+      await writeJson({jsonrpc: "2.0", id: message.id, result});
     } catch (error) {
-      safeWrite(encodeError(message, error));
+      await safeWrite(encodeError(message, error));
     }
-  }, (error) => {
-    logStderr((error instanceof Error ? error.stack || error.message : String(error)));
+  }
+
+  async function pumpClientMessages() {
+    if (processingClientMessage || shuttingDown) return;
+    processingClientMessage = true;
+    try {
+      while (!shuttingDown && queuedClientMessages.length > 0) {
+        const next = queuedClientMessages.shift();
+        queuedClientBytes -= next.frameBytes;
+        updateInputFlow();
+        await processClientMessage(next.message);
+      }
+    } finally {
+      processingClientMessage = false;
+      updateInputFlow();
+      maybeFinishAfterInputEnd();
+    }
+  }
+
+  function enqueueClientMessage(message, frame = {}) {
+    if (shuttingDown) return;
+    if (settleServerResponse(message)) return;
+    const frameBytes = Number.isSafeInteger(frame.frameBytes) && frame.frameBytes >= 0
+      ? frame.frameBytes
+      : Buffer.byteLength(JSON.stringify(message), "utf8");
+    if (queuedClientMessages.length >= maxQueuedClientMessages || queuedClientBytes + frameBytes > maxQueuedClientBytes) {
+      throw new Error(`MCP input request queue exceeded its bound (${maxQueuedClientMessages} messages / ${maxQueuedClientBytes} bytes)`);
+    }
+    queuedClientMessages.push({message, frameBytes});
+    queuedClientBytes += frameBytes;
+    updateInputFlow();
+    pumpClientMessages().catch((error) => {
+      fatalExit(error);
+    });
+  }
+
+  const onData = createMessageReader(enqueueClientMessage, (error) => {
+    fatalExit(error);
   });
+  function finishInput(reason) {
+    if (inputEnded || shuttingDown) return;
+    inputEnded = true;
+    inputEndReason = reason;
+    stdin.removeListener?.("data", onData);
+    stdin.pause?.();
+    inputPaused = true;
+    onData.end?.();
+    maybeFinishAfterInputEnd();
+  }
   // Robustness: an async EPIPE on stdout surfaces as an 'error' event (not a
   // throw). Without a handler it becomes an uncaughtException that kills the
   // process. A broken pipe here means the client is gone -> exit cleanly.
   stdout.on?.("error", (error) => {
     if (isBrokenPipe(error)) return gracefulExit(`stdout error (${error.code || error.errno})`);
-    logStderr(`cheng-fusion: stdout error: ${error instanceof Error ? error.stack || error.message : String(error)}`);
+    fatalExit(error);
   });
-  // Robustness: the client closing its write end (stdin EOF) is the normal
-  // disconnect signal -> exit cleanly so we don't linger. A stdin error that is
-  // a reset/broken pipe is also a disconnect; anything else is recorded but not
-  // fatal.
-  stdin.on?.("end", () => gracefulExit("stdin ended"));
-  stdin.on?.("close", () => gracefulExit("stdin closed"));
+  // EOF closes only the client's write half. Finish every frame already
+  // accepted, every server-initiated request, and every backpressured response
+  // before allowing the process to exit.
+  stdin.on?.("end", () => finishInput("stdin ended"));
+  stdin.on?.("close", () => finishInput("stdin closed"));
   stdin.on?.("error", (error) => {
     const code = error && (error.code || error.errno);
     if (code === "ECONNRESET" || isBrokenPipe(error)) return gracefulExit(`stdin error (${code})`);
-    logStderr(`cheng-fusion: stdin error: ${error instanceof Error ? error.stack || error.message : String(error)}`);
-  });
-  // Robustness: process-level last line of defense for the running server (the
-  // index.ts .catch only guards startup). A broken pipe / reset escaping any
-  // path is a real disconnect -> exit cleanly. Any other uncaught error or
-  // unhandled rejection is a bug we must surface on stderr, but crashing drops
-  // the whole MCP session, so we log and keep the process alive.
-  process.on("uncaughtException", (error) => {
-    if (isBrokenPipe(error) || (error && (error.code || error.errno) === "ECONNRESET")) {
-      return gracefulExit(`uncaught stream disconnect (${error.code || error.errno})`);
-    }
-    logStderr(`cheng-fusion: uncaughtException (kept alive): ${error instanceof Error ? error.stack || error.message : String(error)}`);
-  });
-  process.on("unhandledRejection", (reason) => {
-    if (isBrokenPipe(reason) || (reason && (reason.code || reason.errno) === "ECONNRESET")) {
-      return gracefulExit(`unhandled stream disconnect (${reason.code || reason.errno})`);
-    }
-    logStderr(`cheng-fusion: unhandledRejection (kept alive): ${reason instanceof Error ? reason.stack || reason.message : String(reason)}`);
+    fatalExit(error);
   });
   stdin.on("data", onData);
   stdin.resume?.();
 }
 
-export {getChengFusionTools,handleMcpRequest,startChengFusionMcpServer};
+export {createMessageReader,getChengFusionTools,handleMcpRequest,startChengFusionMcpServer,writeToStreamWithBackpressure};

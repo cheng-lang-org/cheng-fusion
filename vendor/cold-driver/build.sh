@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds a fusion-local cold driver binary that understands CSG record kind=9
-# (call-edge facts), by applying patches/csg-writer-call-edges.patch to a
-# *copy* of the main repo's bootstrap/cheng_cold.c and compiling that copy.
+# (call-edge facts) and reports the exact total record count from both writer
+# and reader paths, by applying patches/csg-writer-call-edges.patch to a *copy*
+# of the main repo's bootstrap/cheng_cold.c and compiling that copy.
 #
 # Never touches the main repo (cheng-lang) source tree, artifacts, or seeds.
 # Safe to re-run any time the patch or the upstream cheng_cold.c changes;

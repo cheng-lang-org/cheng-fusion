@@ -106,3 +106,60 @@ lldb -o "command script import /path/to/lldb_syscall_probe.py" ...
 See the module docstring for the full batch-mode invocation. Not run live
 as part of this sedimentation pass (no live lldb session in scope); syntax
 self-checked with `python3 -c "import ast; ast.parse(open(...).read())"`.
+
+## cold_regression_ab.sh
+
+Runs the upstream cold regression suite concurrently against baseline and patched compilers built from the same clean clone, then compares noise-masked results.
+
+```
+cold_regression_ab.sh <clone_root> <patch_file> [--heavy] [--jobs N] [--out DIR]
+```
+
+The clone must be either clean or contain exactly the supplied patch; the script verifies and restores that original state.
+
+## gen2_symbolize.sh
+
+Resolves one or more Cheng text offsets through a `primary.o` symbol table or an offset-bearing cold `.map`, without a new bake.
+
+```
+gen2_symbolize.sh <primary.o|cold.map> <text_offset> [more_offsets...]
+```
+
+For Mach-O objects, the script reads the single real `__TEXT,__text` section and builds
+half-open intervals from every `T`/`t` boundary to the next boundary or section end. Only
+one global `T` at an interval start may own it: a local `t` returns `NO_MATCH` with exit 2,
+and same-address aliases return `ERROR AMBIGUOUS` with exit 3. Section-external offsets
+also return exit 2, so the final symbol is never unbounded. A `.map` lookup first validates
+the complete `cheng_line_map_v1` stream: exact marker, matching `entry_count`, decimal source
+lines, unique required `function_name`/`module_path`/`offset`/`size` fields, and positive sizes.
+It then requires exactly one interval: zero matches return 2 and overlaps return 3. Target offsets
+accept strict unsigned decimal (including `08`) or hexadecimal syntax and are parsed as
+unbounded Python integers. Provider-region PCs must be resolved against the actual owner.
+
+## seed_lint_check.sh
+
+Rejects newly added function-local integer declarations with redundant explicit `= 0`, a source shape accepted by stage3 but rejected by the self-hosted driver.
+
+```
+seed_lint_check.sh <file.cheng|patch.diff> [...]
+```
+
+## cov_trace.py / cov_diff.sh
+
+`cov_trace.py` records exact first-hit function coverage using LLDB-managed arm64 traps after byte-verifying the `primary.o → executable` text mapping. `cov_diff.sh` runs the same workload on two binaries and reports newly covered and lost functions.
+
+```
+cov_diff.sh <binA> <binB> <outdir> [--timeout SEC] [--objA a.primary.o] [--objB b.primary.o] -- <argv...>
+```
+
+Mapping failure, launch failure and unknown traps are hard errors; they never produce guessed coverage.
+
+## macho_masked_cmp.py
+
+Checks GEN3≡GEN2 byte identity after masking only Mach-O `LC_UUID` and `LC_CODE_SIGNATURE` payloads.
+
+```
+macho_masked_cmp.py <gen2> <gen3>
+```
+
+Every other byte must match.

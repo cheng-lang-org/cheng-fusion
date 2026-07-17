@@ -71,8 +71,8 @@ trap cleanup EXIT
 # a2_strimmvalue_offdesync,b3_global_str_regress,
 # formB_ok_hoist_struct_misread,g4_bareptr_or_store,f4_str_nested_call_arg,
 # triv_station,vardecl5_station -> 7/7/7/7/0/0/46/0/0/7/5 ; plus the 5
-# T52-family fixtures landed in the same batch as this tool (oracle-measured
-# rc, see fixtures/ignition/matrix_planned_additions.json).
+# T52-family fixtures landed in the same batch as this tool; their
+# oracle-measured rc contracts now live in fixtures/ignition/matrix.json.
 BUILTIN_MANIFEST="
 adv6_int32_boundary|adversarial/adv6_int32_boundary.cheng|7
 enumadd_probe|enumadd_probe.cheng|7

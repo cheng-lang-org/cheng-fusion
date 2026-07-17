@@ -10,14 +10,14 @@
 //
 // 诚实边界: 不能单靠本工具预言 stream-emit 全部未来洞; static 是 lead 不是 verdict。
 // 规则表: fixtures/residual_rules.json (可扩展)。
-import {existsSync, readFileSync, readdirSync, statSync} from "node:fs";
-import {dirname, isAbsolute, join, relative, resolve} from "node:path";
+import {closeSync, constants, existsSync, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync} from "node:fs";
+import {tmpdir} from "node:os";
+import {dirname, isAbsolute, join, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {b as defineModuleInitializer} from "./runtime.ts";
 import {
   createChengTextTool,
   jsonResult,
-  parseZcNotReadyLineFull,
   resolveChengPath,
   resolveChengProjectRoot,
   runChengDriver,
@@ -25,6 +25,7 @@ import {
   initChengToolkitModule,
   zodSchema,
 } from "./cheng_toolkit_m9000.ts";
+import {ZC_PROCESS_MAX_OUTPUT_BYTES,ZC_TARGET,clusterZcCensusRows,parseZcCensusRun} from "./zc_census_protocol.ts";
 
 var chengResidualPeelInputSchema, ChengResidualPeelTool;
 
@@ -32,18 +33,127 @@ const FUSION_PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_RULES_PATH = join(FUSION_PKG_ROOT, "fixtures", "residual_rules.json");
 const DEFAULT_DISPATCH_MIN = "src/core/tooling/backend_driver_dispatch_min.cheng";
 
-const ZC_KV_LINE = /^([a-z][a-z0-9_]*)=(.*)$/;
-const ZC_BAIL_HISTOGRAM_HEADER = "zc_bail_histogram (bail号 -> count):";
-const ZC_ROWS_HEADER = "zc_rows (function|body_kind|detail|line|fz_kind|stmt_kind|bail):";
-const ZC_HISTOGRAM_LINE = /^\s*bail=(\S+)\s+count=(\d+)\s*$/;
 const FN_DEF = /^\s*fn\s+([A-Za-z_][\w]*)\s*[\(\[]/;
 
-function loadRules(rulesPath) {
+const MAX_RULES_BYTES = 1024 * 1024;
+const RULE_KINDS = new Set(["multi_fn_same_name", "multi_stmt_line"]);
+const SEVERITIES = new Set(["high", "medium", "low"]);
+
+function isPathInside(path, parent) {
+  const relative = resolve(path).slice(resolve(parent).length);
+  return relative === "" || (relative.startsWith("/") && !relative.startsWith("/../"));
+}
+
+function assertExactKeys(value, keys, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
+  for (const key of Object.keys(value)) {
+    if (!keys.has(key)) throw new Error(`${label} has unsupported field: ${key}`);
+  }
+}
+
+function stableRegularText(path, label, maxBytes = MAX_RULES_BYTES) {
+  let fd = null;
+  try {
+    const before = lstatSync(path);
+    if (!before.isFile() || before.isSymbolicLink()) throw new Error(`${label} must be a regular non-symlink file: ${path}`);
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.size > maxBytes) throw new Error(`${label} is not a bounded regular file: ${path}`);
+    if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
+      throw new Error(`${label} changed while opening: ${path}`);
+    }
+    const bytes = readFileSync(fd);
+    const after = lstatSync(path);
+    if (!after.isFile() || after.isSymbolicLink() || after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size) {
+      throw new Error(`${label} changed while reading: ${path}`);
+    }
+    return new TextDecoder("utf-8", {fatal: true}).decode(bytes);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith(label)) throw error;
+    throw new Error(`${label} cannot be read safely: ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function validateRelativeRulePath(root, value, label) {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`${label} must be a non-empty relative path`);
+  if (isAbsolute(value) || value.split(/[\\/]/).some((part) => part === ".." || part === "")) {
+    throw new Error(`${label} must be a normalized non-escaping relative path: ${value}`);
+  }
+  const candidate = resolve(root, value);
+  const rootReal = realpathSync.native(root);
+  const candidateReal = realpathSync.native(candidate);
+  if (!isPathInside(candidateReal, rootReal)) throw new Error(`${label} escapes root: ${value}`);
+  const stat = lstatSync(candidate);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} must reference a regular non-symlink source file: ${candidate}`);
+  return {relativePath: value, absolutePath: candidate};
+}
+
+function loadRules(rulesPath, root) {
   const path = rulesPath || DEFAULT_RULES_PATH;
-  if (!existsSync(path)) throw new Error(`residual rules not found: ${path}`);
-  const raw = JSON.parse(readFileSync(path, "utf8"));
-  if (!raw || !Array.isArray(raw.rules)) throw new Error(`invalid residual rules (need rules[]): ${path}`);
-  return {path, phases: raw.phases || [], rules: raw.rules};
+  const text = stableRegularText(path, "residual rules");
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`invalid residual rules JSON: ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  assertExactKeys(raw, new Set(["schema", "description", "phases", "rules"]), "residual rules");
+  if (raw.schema !== "cheng_residual_rules.v1") throw new Error(`unsupported residual rules schema: ${raw.schema}`);
+  if (typeof raw.description !== "string" || !Array.isArray(raw.phases) || !Array.isArray(raw.rules)) {
+    throw new Error(`invalid residual rules structure: ${path}`);
+  }
+
+  const phaseIds = new Set();
+  const phases = raw.phases.map((phase, index) => {
+    const label = `residual rules phases[${index}]`;
+    assertExactKeys(phase, new Set(["id", "depth", "bodyKinds", "note"]), label);
+    if (typeof phase.id !== "string" || phase.id.length === 0 || phaseIds.has(phase.id)) throw new Error(`${label}.id must be unique and non-empty`);
+    if (!Number.isSafeInteger(phase.depth) || phase.depth < 0) throw new Error(`${label}.depth must be a non-negative safe integer`);
+    if (!Array.isArray(phase.bodyKinds) || phase.bodyKinds.some((kind) => typeof kind !== "string" || kind.length === 0)) throw new Error(`${label}.bodyKinds must be non-empty strings`);
+    if (typeof phase.note !== "string") throw new Error(`${label}.note must be a string`);
+    phaseIds.add(phase.id);
+    return {id: phase.id, depth: phase.depth, bodyKinds: [...phase.bodyKinds], note: phase.note};
+  });
+  if (phases.length === 0) throw new Error("residual rules must declare at least one phase");
+
+  const ruleIds = new Set();
+  const rules = raw.rules.map((rule, index) => {
+    const label = `residual rules rules[${index}]`;
+    const commonKeys = new Set(["id", "phase", "family", "familyRef", "severityRef", "severity", "paths", "kind", "fixHint", "note", "fnName", "pattern", "requireBreak"]);
+    assertExactKeys(rule, commonKeys, label);
+    if (typeof rule.id !== "string" || rule.id.length === 0 || ruleIds.has(rule.id)) throw new Error(`${label}.id must be unique and non-empty`);
+    if (typeof rule.phase !== "string" || !phaseIds.has(rule.phase)) throw new Error(`${label}.phase references an unknown phase: ${rule.phase}`);
+    if (typeof rule.family !== "string" || rule.family.length === 0) throw new Error(`${label}.family must be non-empty`);
+    if (!SEVERITIES.has(rule.severity)) throw new Error(`${label}.severity must be high, medium, or low`);
+    if (!RULE_KINDS.has(rule.kind)) throw new Error(`${label}.kind is unsupported: ${rule.kind}`);
+    for (const optionalText of ["familyRef", "severityRef", "fixHint", "note"]) {
+      if (rule[optionalText] !== undefined && typeof rule[optionalText] !== "string") throw new Error(`${label}.${optionalText} must be a string`);
+    }
+    if (!Array.isArray(rule.paths) || rule.paths.length === 0) throw new Error(`${label}.paths must be non-empty`);
+    const seenPaths = new Set();
+    const paths = rule.paths.map((item, pathIndex) => {
+      const verified = validateRelativeRulePath(root, item, `${label}.paths[${pathIndex}]`);
+      if (seenPaths.has(verified.relativePath)) throw new Error(`${label}.paths duplicates ${verified.relativePath}`);
+      seenPaths.add(verified.relativePath);
+      return verified;
+    });
+    if (rule.kind === "multi_fn_same_name") {
+      if (typeof rule.fnName !== "string" || rule.fnName.length === 0 || rule.pattern !== undefined || rule.requireBreak !== undefined) {
+        throw new Error(`${label} multi_fn_same_name requires fnName only`);
+      }
+    } else {
+      if (typeof rule.pattern !== "string" || rule.pattern.length === 0 || (rule.requireBreak !== undefined && typeof rule.requireBreak !== "boolean") || rule.fnName !== undefined) {
+        throw new Error(`${label} multi_stmt_line requires pattern and optional requireBreak only`);
+      }
+      try { new RegExp(rule.pattern); } catch (error) { throw new Error(`${label}.pattern is invalid: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+    ruleIds.add(rule.id);
+    return {...rule, paths};
+  });
+  if (rules.length === 0) throw new Error("residual rules must declare at least one rule");
+  return {path, phases, rules};
 }
 
 function phaseDepth(phases, phaseId) {
@@ -51,70 +161,17 @@ function phaseDepth(phases, phaseId) {
   return p && typeof p.depth === "number" ? p.depth : 99;
 }
 
-function parseZcCensusRow(rawLine) {
-  const text = rawLine.trim();
-  const notReady = parseZcNotReadyLineFull(text);
-  if (notReady) return {...notReady, raw: text};
-  const fields = text.split("|");
-  if (!fields[0]) {
-    return {function: null, bodyKind: null, detail: null, line: null, fzKind: null, stmtKind: null, bail: "none", raw: text};
-  }
-  const bail = fields.length >= 7 && fields[6] !== "" ? fields[6] : "none";
-  return {
-    function: fields[0],
-    bodyKind: fields[1] || null,
-    detail: fields[2] || null,
-    line: fields[3] ? Number(fields[3]) : null,
-    fzKind: fields[4] || null,
-    stmtKind: fields[5] || null,
-    bail,
-    raw: text,
-  };
-}
+function compareText(left,right){return String(left)<String(right)?-1:String(left)>String(right)?1:0}
 
-function parseZcEnumerateStdout(stdout) {
-  const fields = {};
-  const histogram = [];
-  const rows = [];
-  let section = "fields";
-  for (const line of String(stdout || "").split(/\r?\n/)) {
-    if (line === ZC_BAIL_HISTOGRAM_HEADER) {
-      section = "histogram";
-      continue;
-    }
-    if (line === ZC_ROWS_HEADER) {
-      section = "rows";
-      continue;
-    }
-    if (section === "fields") {
-      const match = line.match(ZC_KV_LINE);
-      if (match) fields[match[1]] = match[2];
-    } else if (section === "histogram") {
-      const match = line.match(ZC_HISTOGRAM_LINE);
-      if (match) histogram.push({bail: match[1], count: Number(match[2])});
-    } else if (section === "rows") {
-      if (line.trim() && line.includes("|")) rows.push(parseZcCensusRow(line));
-    }
-  }
-  return {fields, histogram, rows};
-}
-
-function parseIntOrNull(value) {
-  if (value === undefined || value === null || !/^-?\d+$/.test(String(value))) return null;
-  return Number(value);
-}
-
-function readLines(absPath) {
-  return readFileSync(absPath, "utf8").split(/\r?\n/);
+function readLines(rulePath) {
+  return stableRegularText(rulePath.absolutePath, `residual source ${rulePath.relativePath}`, 64 * 1024 * 1024).split(/\r?\n/);
 }
 
 function scanMultiFnSameName(root, rule) {
   const hits = [];
-  const paths = rule.paths || [];
-  for (const rel of paths) {
-    const abs = join(root, rel);
-    if (!existsSync(abs)) continue;
-    const lines = readLines(abs);
+  for (const rulePath of rule.paths) {
+    const rel = rulePath.relativePath;
+    const lines = readLines(rulePath);
     const defs = [];
     for (let i = 0; i < lines.length; i++) {
       const m = lines[i].match(FN_DEF);
@@ -144,11 +201,9 @@ function scanMultiStmtLine(root, rule) {
   const hits = [];
   const re = new RegExp(rule.pattern || "=\\s*[^;\\n]+;\\s*[A-Za-z_][\\w.]*\\s*=");
   const requireBreak = rule.requireBreak !== false;
-  const paths = rule.paths || [];
-  for (const rel of paths) {
-    const abs = join(root, rel);
-    if (!existsSync(abs)) continue;
-    const lines = readLines(abs);
+  for (const rulePath of rule.paths) {
+    const rel = rulePath.relativePath;
+    const lines = readLines(rulePath);
     const sites = [];
     for (let i = 0; i < lines.length; i++) {
       const text = lines[i];
@@ -184,35 +239,9 @@ function runStaticScan(root, rules) {
       hits.push(...scanMultiFnSameName(root, rule));
     } else if (rule.kind === "multi_stmt_line") {
       hits.push(...scanMultiStmtLine(root, rule));
-    }
+    } else throw new Error(`unsupported residual rule kind: ${rule.kind}`);
   }
   return hits;
-}
-
-function clusterCensusRows(rows) {
-  const byBodyKind = new Map();
-  const byBail = new Map();
-  for (const row of rows) {
-    const bk = row.bodyKind || "unknown";
-    if (!byBodyKind.has(bk)) byBodyKind.set(bk, []);
-    byBodyKind.get(bk).push(row);
-    const bail = row.bail == null || row.bail === "" ? "none" : String(row.bail);
-    if (!byBail.has(bail)) byBail.set(bail, []);
-    byBail.get(bail).push(row.function);
-  }
-  return {
-    byBodyKind: [...byBodyKind.entries()]
-      .map(([bodyKind, list]) => ({
-        bodyKind,
-        count: list.length,
-        functions: list.map((r) => r.function),
-        details: list.map((r) => r.detail).filter(Boolean),
-      }))
-      .sort((a, b) => b.count - a.count || a.bodyKind.localeCompare(b.bodyKind)),
-    byBail: [...byBail.entries()]
-      .map(([bail, functions]) => ({bail, count: functions.length, functions}))
-      .sort((a, b) => b.count - a.count || a.bail.localeCompare(b.bail)),
-  };
 }
 
 function phaseForBodyKind(phases, bodyKind) {
@@ -258,7 +287,16 @@ function buildAttackOrder(phases, staticHits, censusClusters) {
       });
     }
   }
-  items.sort((a, b) => a.depth - b.depth || (a.severity === "high" ? -1 : 1) || String(a.family).localeCompare(String(b.family)));
+  const severityRank={high:0,medium:1,low:2};
+  const sourceRank={static:0,census:1};
+  items.sort((a,b)=>
+    a.depth-b.depth ||
+    (severityRank[a.severity]??3)-(severityRank[b.severity]??3) ||
+    (sourceRank[a.source]??2)-(sourceRank[b.source]??2) ||
+    compareText(a.family,b.family) ||
+    compareText(a.ruleId??"",b.ruleId??"") ||
+    compareText(a.path??"",b.path??""),
+  );
   return items;
 }
 
@@ -332,6 +370,7 @@ var initChengResidualPeelModule = defineModuleInitializer(() => {
         input.rulesPath
           ? resolve(isAbsolute(String(input.rulesPath)) ? String(input.rulesPath) : join(root, String(input.rulesPath)))
           : DEFAULT_RULES_PATH,
+        root,
       );
 
       const staticHits = runStaticScan(root, rules);
@@ -344,42 +383,48 @@ var initChengResidualPeelModule = defineModuleInitializer(() => {
         }
         const sourcePath = resolveChengPath(input.source || DEFAULT_DISPATCH_MIN, DEFAULT_DISPATCH_MIN, root);
         if (!existsSync(sourcePath)) throw new Error(`source not found: ${sourcePath}`);
-        let driver = null;
-        if (input.driver) {
-          driver = resolve(isAbsolute(String(input.driver)) ? String(input.driver) : join(root, String(input.driver)));
-          if (!existsSync(driver)) throw new Error(`driver not found: ${driver}`);
-        }
+        const driver = input.driver
+          ? resolve(isAbsolute(String(input.driver)) ? String(input.driver) : join(root, String(input.driver)))
+          : join(root,"artifacts","backend_driver","cheng");
+        if (!existsSync(driver)) throw new Error(`driver not found: ${driver}`);
         const timeoutMs = input.timeoutSec ? Math.round(input.timeoutSec * 1000) : undefined;
-        const run = await runChengDriver(scriptPath, [sourcePath], {
-          root,
-          cwd: root,
-          timeoutMs,
-          env: driver ? {ZC_DRIVER: driver} : {},
-        });
-        if (run.missingDriver) throw new Error(`tools/zc_enumerate.sh not found: ${scriptPath}`);
-        const {fields, histogram, rows} = parseZcEnumerateStdout(run.stdout);
-        const totalRaw = fields.zc_missing_function_count ?? null;
-        const total = parseIntOrNull(totalRaw);
-        const status = run.exitCode === 0 && total !== null ? "completed" : "aborted";
-        const clusters = clusterCensusRows(rows);
-        census = {
-          status,
-          total,
-          totalRaw,
-          threeWayMatch: fields.zc_count_three_way_match || null,
-          driver: fields.zc_driver || driver || null,
-          source: fields.zc_file || sourcePath,
-          exitCode: run.exitCode,
-          timedOut: Boolean(run.timedOut),
-          rowCount: rows.length,
-          rows: rows.slice(0, 100),
-          rowsTruncated: rows.length > 100,
-          byBail: clusters.byBail,
-          byBodyKind: clusters.byBodyKind,
-          histogram,
-          stdoutTail: takeTrailingText(run.stdout, 3000),
-          stderrTail: takeTrailingText(run.stderr, 2000),
-        };
+        const diagDir=realpathSync(mkdtempSync(join(tmpdir(),"cheng-fusion-zc-residual-")));
+        const diagPrefix="residual";
+        const unsetEnv=[...Object.keys(process.env).filter((key)=>key.startsWith("ZC_")),"CHENG_CENSUS_MAX_RSS","CHENG_PROCESS_MAX_RSS_BYTES"];
+        try{
+          const run = await runChengDriver(scriptPath, [sourcePath], {
+            root,cwd:root,timeoutMs,maxBuffer:ZC_PROCESS_MAX_OUTPUT_BYTES,unsetEnv,
+            env:{
+              ZC_DRIVER:driver,ZC_TARGET,ZC_DIAG_DIR:diagDir,ZC_DIAG_PREFIX:diagPrefix,ZC_NO_CACHE:"1",
+              ZC_ENUMERATE_KEEP_WORK:"0",ZC_COMPILER_CSG_STDERR:"0",ZC_PROGRESS:"0",CHENG_PROCESS_MAX_RSS_BYTES:"1073741824",
+            },
+          });
+          if (run.missingDriver) throw new Error(`tools/zc_enumerate.sh not found: ${scriptPath}`);
+          const protocol = parseZcCensusRun(run,{root,script:scriptPath,source:sourcePath,driver,target:ZC_TARGET,diagDir,diagPrefix});
+          const clusters = protocol.status === "completed" ? clusterZcCensusRows(protocol.rows) : {byBail:[],byBodyKind:[]};
+          census = {
+            status:protocol.status,
+            total:protocol.total,
+            totalRaw:protocol.totalRaw,
+            threeWayMatch:protocol.threeWayMatch,
+            zeroProof:protocol.zeroProof,
+            protocolError:protocol.protocolError,
+            processOk:protocol.processOk,
+            driver:protocol.status === "completed" ? protocol.fields.zc_driver : driver,
+            source:protocol.status === "completed" ? protocol.fields.zc_file : sourcePath,
+            exitCode: run.exitCode,
+            timedOut: Boolean(run.timedOut),
+            overflow: Boolean(run.overflow),
+            rowCount: protocol.rowCount,
+            rows: protocol.rows.slice(0, 100),
+            rowsTruncated: protocol.rows.length > 100,
+            byBail: clusters.byBail,
+            byBodyKind: clusters.byBodyKind,
+            histogram:protocol.histogram,
+            stdoutTail: takeTrailingText(run.stdout, 3000),
+            stderrTail: takeTrailingText(run.stderr, 2000),
+          };
+        }finally{rmSync(diagDir,{recursive:true,force:true})}
       }
 
       const attackOrder = buildAttackOrder(phases, staticHits, census);
@@ -419,6 +464,8 @@ var initChengResidualPeelModule = defineModuleInitializer(() => {
                   .filter((h) => h.phase === "call_resolve")
                   .map((h) => h.ruleId)
                   .join(", ") || staticHits[0].ruleId}; then re-run mode=full when load free.`
+              : census && census.status === "aborted"
+                ? `Census aborted without usable groups: ${census.protocolError || "zc_enumerate process failure"}`
               : census && census.total === 0
                 ? "Static clean and census total=0 — candidate A-gate (still require three-way match + frozen clone policy)."
                 : census
@@ -430,4 +477,4 @@ var initChengResidualPeelModule = defineModuleInitializer(() => {
   });
 });
 
-export {ChengResidualPeelTool, initChengResidualPeelModule};
+export {ChengResidualPeelTool,buildAttackOrder,initChengResidualPeelModule};

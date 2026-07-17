@@ -16,13 +16,14 @@ var initChengCrashTriageModule=defineModuleInitializer(()=>{
     env:zodSchema.record(zodSchema.string(),zodSchema.string()).optional().describe("Binary mode: extra environment variables for the debuggee."),
     primaryObject:zodSchema.string().optional().describe("Binary mode: path to the driver's own .primary.o for symbolication. Defaults to <binary>.primary.o next to binary."),
     maxFrames:zodSchema.number().int().positive().max(256).optional().describe("Binary mode: max backtrace frames. Default 64."),
-    timeoutSec:zodSchema.number().positive().optional().describe("Binary mode: lldb session timeout in seconds. Default 60.")
+    timeoutSec:zodSchema.number().positive().max(600).optional().describe("Binary mode: lldb session timeout in seconds, maximum 600. Default 60."),
+    maxOutputBytes:zodSchema.number().int().positive().max(1024*1024*1024).optional().describe("Binary mode: maximum combined LLDB stdout/stderr bytes, maximum 1 GiB. Overflow kills the process group and is a hard error. Default 64 MiB.")
   });
   ChengCrashTriageTool=createChengTextTool({
     name:"cheng_crash_triage",
     searchHint:"parse Cheng crash stderr, or run a binary under lldb and symbolicate the crash",
     inputSchema:chengCrashTriageInputSchema,
-    description:"Parse Cheng compiler diagnostics/runtime stderr into source locations (stderr mode), or run a binary under lldb, capture backtrace/registers/fault instruction, and symbolicate frames against <name>.primary.o plus any sibling <name>.provider.*.o via nm+otool (binary mode). Provider objects are located inside the linked binary by content-anchored byte search (no reliable link-order artifact exists), so frames landing in provider code resolve to real provider function names instead of a guess. Frames outside every located object are reported as provider-unresolved. Also classifies stopReason into stopClass (SIGSEGV/SIGBUS/SIGILL/SIGFPE/malloc-integrity-brk/panic-exit/breakpoint-trap).",
+    description:"Parse Cheng compiler diagnostics/runtime stderr into source locations (stderr mode), or run a binary under lldb, capture backtrace/registers/fault instruction, and symbolicate frames (binary mode). Live mode hard-fails on LLDB nonzero/missing exit, timeout, output overflow, or completion without a debuggee exit/stop reason. LLDB-resolved symbols are preserved; otherwise only <name>.primary.o is mapped via its __TEXT,__text range and exact nm T/t boundaries, with a unique global T symbol required for ownership. Aliases, local-only boundaries, and addresses outside primary are reported explicitly as unresolved—provider objects are never guessed. Also classifies stopReason into stopClass (SIGSEGV/SIGBUS/SIGILL/SIGFPE/malloc-integrity-brk/panic-exit/breakpoint-trap).",
     prompt:"Use {stderr} for existing crash text. Use {binary,args,env,primaryObject} to reproduce and symbolicate a live crash of a pure-emission (0-stderr) Cheng driver or compiled program.",
     toAutoClassifierInput:(input)=>"stderr" in input?`crash:${String(input.stderr||"").length}`:`crash_live:${input.binary}`,
     async execute(input){

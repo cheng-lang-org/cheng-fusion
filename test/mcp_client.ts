@@ -1,9 +1,11 @@
 // 共享 MCP stdio JSON-RPC 客户端: 起 cheng-fusion-mcp.ts 子进程, 发 initialize + tools/call, 收行分隔 JSON。
 // 不依赖交互会话, 纯 bun 脚本可独立跑。
 import {spawn} from "node:child_process";
+import {dirname, join} from "node:path";
+import {fileURLToPath} from "node:url";
 
-const PROJECT = "/Users/lbcheng/cheng-fusion";
-const ENTRY = `${PROJECT}/index.ts`;
+const PROJECT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const ENTRY = join(PROJECT, "index.ts");
 
 export function startMcp(env: Record<string, string> = {}, cwd: string = PROJECT) {
   const child = spawn("bun", [ENTRY], {

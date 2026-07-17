@@ -4,99 +4,14 @@
 // stderr 造成的伪信号)。这里绝不自创测量口径 —— 只调用该脚本 + 解析它自己的结构化 stdout
 // (key=value 字段区 + zc_bail_histogram 区 + zc_rows 区), 按 bail 号/body_kind 聚类。
 // 脚本不存在/不适配当前 root 时明确报错, 不静默降级。
-import {existsSync} from "node:fs";
+import {existsSync,mkdtempSync,realpathSync,rmSync} from "node:fs";
+import {tmpdir} from "node:os";
 import {isAbsolute, join, resolve} from "node:path";
 import {b as defineModuleInitializer} from "./runtime.ts";
-import {CHENG_CANARY,createChengTextTool,jsonResult,parseZcNotReadyLineFull,resolveChengPath,resolveChengProjectRoot,runChengDriver,takeTrailingText,initChengToolkitModule,zodSchema} from "./cheng_toolkit_m9000.ts";
+import {CHENG_CANARY,createChengTextTool,jsonResult,resolveChengPath,resolveChengProjectRoot,runChengDriver,takeTrailingText,initChengToolkitModule,zodSchema} from "./cheng_toolkit_m9000.ts";
+import {ZC_PROCESS_MAX_OUTPUT_BYTES,ZC_TARGET,clusterZcCensusRows,parseZcCensusRun} from "./zc_census_protocol.ts";
 
 var chengZcCensusInputSchema,ChengZcCensusTool;
-
-const ZC_KV_LINE = /^([a-z][a-z0-9_]*)=(.*)$/;
-const ZC_BAIL_HISTOGRAM_HEADER = "zc_bail_histogram (bail号 -> count):";
-const ZC_ROWS_HEADER = "zc_rows (function|body_kind|detail|line|fz_kind|stmt_kind|bail):";
-const ZC_HISTOGRAM_LINE = /^\s*bail=(\S+)\s+count=(\d+)\s*$/;
-
-function parseZcCensusRow(rawLine) {
-  const text = rawLine.trim();
-  // zc_enumerate.sh 的 zc_rows 区两种形态: 有结构化报告时是 pipe 行(见脚本里的
-  // echo header), 报告缺失时回退成原始 ZC_NOT_READY 文本行(与 cheng_exec_diff 共用
-  // 同一份 parseZcNotReadyLineFull 解析器, 同一个产出源 backend_driver_dispatch_min.cheng)。
-  const notReady = parseZcNotReadyLineFull(text);
-  if (notReady) return {...notReady, raw: text};
-  const fields = text.split("|");
-  if (!fields[0]) return {function: null, bodyKind: null, detail: null, line: null, fzKind: null, stmtKind: null, bail: "none", raw: text};
-  const bail = fields.length >= 7 && fields[6] !== "" ? fields[6] : "none";
-  return {
-    function: fields[0],
-    bodyKind: fields[1] || null,
-    detail: fields[2] || null,
-    line: fields[3] ? Number(fields[3]) : null,
-    fzKind: fields[4] || null,
-    stmtKind: fields[5] || null,
-    bail,
-    raw: text,
-  };
-}
-
-function parseZcEnumerateStdout(stdout) {
-  const fields = {};
-  const histogram = [];
-  const rows = [];
-  let section = "fields";
-  for (const line of String(stdout || "").split(/\r?\n/)) {
-    if (line === ZC_BAIL_HISTOGRAM_HEADER) { section = "histogram"; continue; }
-    if (line === ZC_ROWS_HEADER) { section = "rows"; continue; }
-    if (section === "fields") {
-      const match = line.match(ZC_KV_LINE);
-      if (match) fields[match[1]] = match[2];
-    } else if (section === "histogram") {
-      const match = line.match(ZC_HISTOGRAM_LINE);
-      if (match) histogram.push({bail: match[1], count: Number(match[2])});
-    } else if (section === "rows") {
-      // Row lines are pipe-separated (function|body_kind|...); tool-status lines
-      // like "zc_cache=miss key=..." or "KEEP zc_enumerate work=..." are not rows.
-      if (line.trim() && line.includes("|")) rows.push(parseZcCensusRow(line));
-    }
-  }
-  return {fields, histogram, rows};
-}
-
-function pushGrouped(map, key, value) {
-  if (!map.has(key)) map.set(key, []);
-  map.get(key).push(value);
-}
-
-function buildByBail(rows, histogram) {
-  const byBailMap = new Map();
-  for (const row of rows) pushGrouped(byBailMap, row.bail == null || row.bail === "" ? "none" : String(row.bail), row.function);
-  const histogramByBail = new Map(histogram.map((entry) => [String(entry.bail), entry.count]));
-  const bails = new Set([...byBailMap.keys(), ...histogramByBail.keys()]);
-  const out = [];
-  for (const bail of bails) {
-    const functions = byBailMap.get(bail) || [];
-    const entry = {bail, count: functions.length, functions};
-    if (histogramByBail.has(bail) && histogramByBail.get(bail) !== functions.length) {
-      entry.histogramCount = histogramByBail.get(bail);
-      entry.countMismatch = true;
-    }
-    out.push(entry);
-  }
-  out.sort((a, b) => b.count - a.count || (a.bail < b.bail ? -1 : a.bail > b.bail ? 1 : 0));
-  return out;
-}
-
-function buildByBodyKind(rows) {
-  const map = new Map();
-  for (const row of rows) pushGrouped(map, row.bodyKind || "unknown", row.function);
-  return [...map.entries()]
-    .map(([bodyKind, functions]) => ({bodyKind, count: functions.length, functions}))
-    .sort((a, b) => b.count - a.count || (a.bodyKind < b.bodyKind ? -1 : a.bodyKind > b.bodyKind ? 1 : 0));
-}
-
-function parseIntOrNull(value) {
-  if (value === undefined || value === null || !/^-?\d+$/.test(value)) return null;
-  return Number(value);
-}
 
 var initChengZcCensusModule = defineModuleInitializer(() => {
   initChengToolkitModule();
@@ -122,36 +37,50 @@ var initChengZcCensusModule = defineModuleInitializer(() => {
       }
       const sourcePath = resolveChengPath(input.source, CHENG_CANARY, root);
       if (!existsSync(sourcePath)) throw new Error(`source not found: ${sourcePath}`);
-      let driver = null;
-      if (input.driver) {
-        driver = resolve(isAbsolute(String(input.driver)) ? String(input.driver) : join(root, String(input.driver)));
-        if (!existsSync(driver)) throw new Error(`driver not found: ${driver}`);
-      }
+      const driver = input.driver
+        ? resolve(isAbsolute(String(input.driver)) ? String(input.driver) : join(root, String(input.driver)))
+        : join(root,"artifacts","backend_driver","cheng");
+      if (!existsSync(driver)) throw new Error(`driver not found: ${driver}`);
       const timeoutMs = input.timeoutSec ? Math.round(input.timeoutSec * 1000) : undefined;
-      const run = await runChengDriver(scriptPath, [sourcePath], {root, cwd: root, timeoutMs, env: driver ? {ZC_DRIVER: driver} : {}});
-      if (run.missingDriver) throw new Error(`tools/zc_enumerate.sh not found under this root: ${scriptPath}`);
-      const {fields, histogram, rows} = parseZcEnumerateStdout(run.stdout);
-      const totalRaw = fields.zc_missing_function_count ?? null;
-      const total = parseIntOrNull(totalRaw);
-      const status = run.exitCode === 0 && total !== null ? "completed" : "aborted";
-      return jsonResult({
-        schema: "cheng_zc_census.v1",
-        root,
-        script: scriptPath,
-        driver: fields.zc_driver || driver || null,
-        source: fields.zc_file || sourcePath,
-        exitCode: run.exitCode,
-        status,
-        total,
-        totalRaw,
-        byBail: buildByBail(rows, histogram),
-        byBodyKind: buildByBodyKind(rows),
-        rowCount: rows.length,
-        raw: fields,
-        stdoutTail: takeTrailingText(run.stdout, 4000),
-        stderrTail: takeTrailingText(run.stderr, 4000),
-        timedOut: Boolean(run.timedOut),
-      });
+      const diagDir=realpathSync(mkdtempSync(join(tmpdir(),"cheng-fusion-zc-census-")));
+      const diagPrefix="census";
+      const unsetEnv=[...Object.keys(process.env).filter((key)=>key.startsWith("ZC_")),"CHENG_CENSUS_MAX_RSS","CHENG_PROCESS_MAX_RSS_BYTES"];
+      try{
+        const run = await runChengDriver(scriptPath, [sourcePath], {
+          root,cwd:root,timeoutMs,maxBuffer:ZC_PROCESS_MAX_OUTPUT_BYTES,unsetEnv,
+          env:{
+            ZC_DRIVER:driver,ZC_TARGET,ZC_DIAG_DIR:diagDir,ZC_DIAG_PREFIX:diagPrefix,ZC_NO_CACHE:"1",
+            ZC_ENUMERATE_KEEP_WORK:"0",ZC_COMPILER_CSG_STDERR:"0",ZC_PROGRESS:"0",CHENG_PROCESS_MAX_RSS_BYTES:"1073741824",
+          },
+        });
+        if (run.missingDriver) throw new Error(`tools/zc_enumerate.sh not found under this root: ${scriptPath}`);
+        const protocol = parseZcCensusRun(run,{root,script:scriptPath,source:sourcePath,driver,target:ZC_TARGET,diagDir,diagPrefix});
+        const clusters = protocol.status === "completed" ? clusterZcCensusRows(protocol.rows) : {byBail:[],byBodyKind:[]};
+        return jsonResult({
+          schema: "cheng_zc_census.v1",
+          root,
+          script: scriptPath,
+          driver: protocol.status === "completed" ? protocol.fields.zc_driver : driver,
+          source: protocol.status === "completed" ? protocol.fields.zc_file : sourcePath,
+          exitCode: run.exitCode,
+          status: protocol.status,
+          total: protocol.total,
+          totalRaw: protocol.totalRaw,
+          byBail: clusters.byBail,
+          byBodyKind: clusters.byBodyKind,
+          rowCount: protocol.rowCount,
+          raw: protocol.fields,
+          histogram: protocol.histogram,
+          threeWayMatch: protocol.threeWayMatch,
+          zeroProof: protocol.zeroProof,
+          protocolError: protocol.protocolError,
+          processOk: protocol.processOk,
+          stdoutTail: takeTrailingText(run.stdout, 4000),
+          stderrTail: takeTrailingText(run.stderr, 4000),
+          timedOut: Boolean(run.timedOut),
+          overflow: Boolean(run.overflow),
+        });
+      }finally{rmSync(diagDir,{recursive:true,force:true})}
     },
   });
 });
