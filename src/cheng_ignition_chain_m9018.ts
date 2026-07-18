@@ -7,9 +7,20 @@
 // journal + pid 存活判定, 供调用方轮询。
 //
 // 阶段字段(与 journal.jsonl 逐行对应): provenance{seedSha256AtStart/AtRun+match,
-// treeSrcHashAtStart/AtRun+match}(见下方溯源块注释), drvBake{rc,ok,sha256}, probes{probes:[{name,rc,expect,pass}]},
-// gen2Bake{rc,zcTotal,bails[],ok,sha256}, terminal{terminal:[{name,compileRc,runRc,expect,pass}]},
-// oracle{oracle:[{name,rc,expect,pass}]}, gen3{bakeRc,maskedIdentical}, done{verdict}。
+// treeSrcHashAtStart/AtRun+match}(见下方溯源块注释), drvBake{rc,ok,sha256,peakRssBytes,peakRssError,signal},
+// probes{probes:[{name,rc,expect,pass,compilePeakRssBytes,compilePeakRssError,compileSignal,runPeakRssBytes,runPeakRssError,runSignal}]},
+// gen2Bake{rc,zcTotal,bails[],ok,sha256,peakRssBytes,peakRssError,signal},
+// terminal{terminal:[{name,compileRc,runRc,expect,pass,compilePeakRssBytes,runPeakRssBytes,compileSignal,runSignal}]},
+// oracle{oracle:[{name,rc,expect,pass,compilePeakRssBytes,runPeakRssBytes,compileSignal,runSignal}]},
+// gen3{bakeRc,maskedIdentical,peakRssBytes,peakRssError,signal}, done{verdict}。
+//
+// 逐站 RSS 峰值(刀A): 每个子进程收尾后用 darwin `/usr/bin/time -l` 记录的 maximum resident
+// set size(字节)写进该站 journal 行, 取不到就 null + peakRssError 原因, 不估算不补 0。
+// 信号死亡取证(刀B): compile/run 的 rc<0 或 >=128 时记 signal 名; 若信号是
+// SIGSEGV/SIGBUS/SIGILL 且崩的是 chain 自产二进制(DRV/GEN2 自己, 不是它编译产物运行时崩)
+// 自动起 lldb one-shot(60s: run->bt 12->disassemble -c 8 --pc->quit), 存
+// <runDir>/forensics/<stage>_<fixture>.lldb.txt, 该条目 journal 记 <prefix>Forensics{ok,path};
+// lldb 失败(如二进制不可执行)不阻断链, 原因记 forensics.reason。
 //
 // 探针/终端网严格取 matrixPath 里 tags 含 "probe"/"terminal" 的可运行条目；缺文件、
 // 非法 JSON、无对应标签或条目契约不完整都在启动后台进程前 hard-fail。oracle 六件套
@@ -369,7 +380,7 @@ function snapshotTreeInputs(sourceTree, snapshotTree) {
 function renderChainPythonScript(config) {
   const configBase64 = Buffer.from(JSON.stringify(config), "utf8").toString("base64");
   return `#!/usr/bin/env python3
-import base64, fcntl, hashlib, json, os, re, selectors, signal, stat, subprocess, sys, time, traceback
+import base64, fcntl, hashlib, json, os, re, selectors, shlex, signal, stat, subprocess, sys, tempfile, time, traceback
 
 CONFIG = json.loads(base64.b64decode("${configBase64}").decode("utf8"))
 
@@ -388,6 +399,8 @@ CURRENT_CHILD_PGID = None
 OUTPUT_TAIL_BYTES = 65536
 OUTPUT_MAX_BYTES = int(CONFIG["outputMaxBytes"])
 ZC_CAPTURE_BYTES = 4 * 1024 * 1024
+FORENSICS_DIR = os.path.join(W, "forensics")
+TIME_ABNORMAL_SUFFIX = "time: command terminated abnormally\\n"
 
 class SnapshotDriftError(RuntimeError):
     pass
@@ -462,6 +475,92 @@ def cheng_env(rss_cap=None):
     env.pop("CHENG_NO_BACKEND_DRIVER_HANDOFF", None)
     env.pop("CHENG_REQUIRE_PURE_PROVIDERS", None)
     return env
+
+# 逐站 RSS 峰值(刀A): darwin \`/usr/bin/time -l -o <file>\` 把 rusage(含 maximum resident set
+# size, 字节)写进独立文件(不混进被计时命令自身的 stdout/stderr), 一次子进程一份用完即删。
+# 取不到(文件空/无该行/进程被 timeout 强杀导致 time 自己也没来得及写)如实 null+原因, 不补 0 不估算。
+def parse_peak_rss(path):
+    try:
+        text = open(path).read()
+    except OSError as e:
+        return None, "rss probe file unreadable: %s" % e
+    match = re.search(r"^\\s*(\\d+)\\s+maximum resident set size", text, re.M)
+    if not match:
+        return None, "no 'maximum resident set size' line in /usr/bin/time -l output (%s)" % ("file empty" if not text.strip() else "unexpected format")
+    return int(match.group(1)), None
+
+# rc<0(Python exec 的信号约定)或 rc>=128(部分 shell/wrapper 的 128+signum 约定, 两种都防,
+# 见 feedback_exit_code_signal_trap 教训)时把信号号解成名字; 非信号退出返回 None。
+def classify_signal(rc):
+    if rc is None:
+        return None
+    n = None
+    if rc < 0:
+        n = -rc
+    elif rc >= 128:
+        n = rc - 128
+    if not n:
+        return None
+    try:
+        return signal.Signals(n).name
+    except ValueError:
+        return "SIG_UNKNOWN_%d" % n
+
+# 信号死亡自动取证(刀B): 只在 (a) 信号是 SIGSEGV/SIGBUS/SIGILL 且 (b) 崩的是 chain 自产二进制
+# (DRV/GEN2 本身, 即这次调用的 driver 自己崩了, 不是它编译产物运行时崩)才自动起 lldb one-shot
+# 复现(60s 超时, run -> bt 12 -> disassemble -c 8 --pc -> quit); lldb 失败不阻断链, 原因记 journal。
+def run_lldb_one_shot(binary, run_args, out_path, env, timeout_sec=60):
+    run_line = ("run " + " ".join(shlex.quote(a) for a in run_args)) if run_args else "run"
+    # -o 是无条件顺序命令, 但 debuggee 在 run 里崩溃后 lldb 不会继续处理后面排队的 -o 命令
+    # (实测: -o 版本 bt/disassemble/quit 全部静默丢失); -k(--one-line-on-crash) 才会在崩溃停住后
+    # 触发, 与 cheng_toolkit_m9000.ts 的 runLldbBatch 同一手法。
+    lldb_args = ["lldb", "-b", "-o", run_line, "-k", "bt 12", "-k", "disassemble -c 8 --pc", "-k", "quit", binary]
+    p = subprocess.Popen(lldb_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=TREE, start_new_session=True)
+    timed_out = False
+    try:
+        out, err = p.communicate(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        out, err = p.communicate()
+    try:
+        os.makedirs(FORENSICS_DIR, exist_ok=True)
+        with open(out_path, "w") as f:
+            f.write(out)
+            f.write(err)
+            if timed_out:
+                f.write("\\n[chain] lldb one-shot timed out after %ds\\n" % timeout_sec)
+    except OSError as e:
+        return {"ok": False, "path": None, "reason": "failed to write forensics file: %s" % e}
+    return {"ok": True, "path": out_path, "timedOut": timed_out}
+
+def maybe_capture_forensics(stage, fixture_label, driver, run_args, signal_name, env):
+    if signal_name not in ("SIGSEGV", "SIGBUS", "SIGILL"):
+        return None
+    if os.path.basename(driver) not in ("DRV", "GEN2"):
+        return None
+    out_path = os.path.join(FORENSICS_DIR, "%s_%s.lldb.txt" % (stage, fixture_label))
+    try:
+        return run_lldb_one_shot(driver, run_args, out_path, env, timeout_sec=60)
+    except Exception as e:
+        return {"ok": False, "path": None, "reason": "lldb invocation raised: %s" % e}
+
+# probe/terminal/oracle 各站 journal 行里 compile/run 两段各自的 peakRssBytes/peakRssError/signal
+# 字段拼装(前缀区分 compile 段与 run 段), forensics 只在真触发时才带上(不给每条正常记录添 null 噪音)。
+def rss_signal_fields(result, prefix):
+    def key(name):
+        return (prefix + name[0].upper() + name[1:]) if prefix else name
+    fields = {
+        key("peakRssBytes"): result.get("peakRssBytes"),
+        key("peakRssError"): result.get("peakRssError"),
+        key("signal"): result.get("signal"),
+    }
+    if result.get("forensics") is not None:
+        fields[key("forensics")] = result["forensics"]
+    return fields
 
 def materialized_executable(path):
     try:
@@ -549,6 +648,8 @@ def run_cmd(args, timeout, rss_cap=None):
     RUN_COMMAND_INDEX += 1
     stdout_path = os.path.join(W, "command_%03d.stdout.log" % command_index)
     stderr_path = os.path.join(W, "command_%03d.stderr.log" % command_index)
+    rss_fd, rss_path = tempfile.mkstemp(prefix="rss_", dir=W)
+    os.close(rss_fd)
     t0 = time.time()
     p = None
     timed_out = False
@@ -556,7 +657,7 @@ def run_cmd(args, timeout, rss_cap=None):
     selector = None
     try:
         with open(stdout_path, "xb") as stdout_file, open(stderr_path, "xb") as stderr_file:
-            p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            p = subprocess.Popen(["/usr/bin/time", "-l", "-o", rss_path] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  env=cheng_env(rss_cap), cwd=TREE, start_new_session=True)
             CURRENT_CHILD_PGID = p.pid
             selector = selectors.DefaultSelector()
@@ -630,17 +731,28 @@ def run_cmd(args, timeout, rss_cap=None):
             os.fsync(stderr_file.fileno())
         stdout_tail, stdout_truncated = read_output_tail(stdout_path)
         stderr_tail, stderr_truncated = read_output_tail(stderr_path)
+        peak_rss, rss_err = parse_peak_rss(rss_path)
+        try:
+            os.remove(rss_path)
+        except OSError:
+            pass
+        if stderr_tail.endswith(TIME_ABNORMAL_SUFFIX):
+            stderr_tail = stderr_tail[:-len(TIME_ABNORMAL_SUFFIX)]
         if timed_out:
             stderr_tail += "\\n[chain] timed out after %dms" % int(timeout * 1000)
         if output_overflow:
             stderr_tail += "\\n[chain] combined output exceeded %d bytes; process group killed" % OUTPUT_MAX_BYTES
-        result = {"rc": None if (timed_out or output_overflow) else p.returncode,
+        rc = None if (timed_out or output_overflow) else p.returncode
+        result = {"rc": rc,
                   "stdout": stdout_tail, "stderr": stderr_tail,
                   "stdoutLog": stdout_path, "stderrLog": stderr_path,
                   "stdoutTruncated": stdout_truncated, "stderrTruncated": stderr_truncated,
                   "zcText": collect_zc_text([stdout_path, stderr_path]),
                   "wallMs": int((time.time() - t0) * 1000),
-                  "timedOut": timed_out, "outputOverflow": output_overflow}
+                  "timedOut": timed_out, "outputOverflow": output_overflow,
+                  "peakRssBytes": peak_rss,
+                  "peakRssError": rss_err if (timed_out or output_overflow) else (rss_err or None),
+                  "signal": classify_signal(rc)}
         assert_snapshot_provenance()
         return result
     except BaseException:
@@ -656,13 +768,23 @@ def run_cmd(args, timeout, rss_cap=None):
                 p.wait(timeout=5)
             except BaseException:
                 pass
+        try:
+            os.remove(rss_path)
+        except OSError:
+            pass
         raise
 
-def compile_fixture(driver, src, out, timeout=300, rss_cap=None):
+def compile_fixture(driver, src, out, timeout=300, rss_cap=None, stage="compile", fixture_label=None):
     if os.path.lexists(out):
         raise RuntimeError("refusing to reuse pre-existing compiler output: %s" % out)
     args = [driver, "system-link-exec", "--root:%s" % TREE, "--in:%s" % src, "--emit:exe", "--link-providers", "--target:arm64-apple-darwin", "--out:%s" % out]
-    return run_cmd(args, timeout, rss_cap=rss_cap)
+    result = run_cmd(args, timeout, rss_cap=rss_cap)
+    if result.get("signal"):
+        label = fixture_label or os.path.basename(src)
+        forensics = maybe_capture_forensics(stage, label, driver, args[1:], result["signal"], cheng_env(rss_cap))
+        if forensics is not None:
+            result["forensics"] = forensics
+    return result
 
 def run_bin(path, timeout=15):
     if not materialized_executable(path):
@@ -807,11 +929,11 @@ def main():
         return "ABORTED_PROVENANCE_MISMATCH"
 
     drv_out = os.path.join(W, "DRV")
-    r = compile_fixture(CONFIG["seed"], CONFIG["driverSrc"], drv_out, timeout=300)
+    r = compile_fixture(CONFIG["seed"], CONFIG["driverSrc"], drv_out, timeout=300, stage="drvBake", fixture_label=os.path.basename(CONFIG["driverSrc"]))
     drv_ok = r["rc"] == 0 and materialized_executable(drv_out)
     log("drvBake", rc=r["rc"], wallMs=r["wallMs"], ok=drv_ok, timedOut=r["timedOut"], outputOverflow=r["outputOverflow"],
         stdoutLog=r["stdoutLog"], stderrLog=r["stderrLog"], stderrTail=r["stderr"][-1500:],
-        sha256=(sha256_tag(drv_out) if drv_ok else None))
+        sha256=(sha256_tag(drv_out) if drv_ok else None), **rss_signal_fields(r, ""))
     if not drv_ok:
         return "ABORTED_DRV_BAKE_FAILED"
 
@@ -819,16 +941,18 @@ def main():
     probe_results = []
     for item_index, item in enumerate(CONFIG["probes"]):
         outp = os.path.join(W, "p_%03d.exe" % item_index)
-        cr = compile_fixture(drv_out, item["fixture"], outp, timeout=300)
+        cr = compile_fixture(drv_out, item["fixture"], outp, timeout=300, stage="probes", fixture_label=item["name"])
         if cr["rc"] != 0 or not materialized_executable(outp):
             probe_results.append({"name": item["name"], "rc": None, "expect": item["expect"], "pass": False, "note": "compile failed",
                                   "compileTimedOut": cr["timedOut"], "compileOutputOverflow": cr["outputOverflow"],
-                                  "compileStdoutLog": cr["stdoutLog"], "compileStderrLog": cr["stderrLog"], "compileStderrTail": cr["stderr"][-800:]})
+                                  "compileStdoutLog": cr["stdoutLog"], "compileStderrLog": cr["stderrLog"], "compileStderrTail": cr["stderr"][-800:],
+                                  **rss_signal_fields(cr, "compile")})
             continue
         rr = run_bin(outp, 10)
         probe_results.append({"name": item["name"], "rc": rr["rc"], "expect": item["expect"], "pass": rr["rc"] == item["expect"],
                               "timedOut": rr["timedOut"], "outputOverflow": rr["outputOverflow"],
-                              "stdoutLog": rr["stdoutLog"], "stderrLog": rr["stderrLog"]})
+                              "stdoutLog": rr["stdoutLog"], "stderrLog": rr["stderrLog"],
+                              **rss_signal_fields(cr, "compile"), **rss_signal_fields(rr, "run")})
     pass_count = sum(1 for x in probe_results if x["pass"])
     log("probes", wallMs=int((time.time() - t0) * 1000), passCount=pass_count, total=len(probe_results), probes=probe_results)
 
@@ -838,13 +962,13 @@ def main():
         return "%s_gen2=SKIPPED_probes=%s_terminal=SKIPPED_oracle=SKIPPED_gen3=SKIPPED" % (prefix, probes_gate)
 
     gen2_out = os.path.join(W, "GEN2")
-    r2 = compile_fixture(drv_out, CONFIG["driverSrc"], gen2_out, timeout=1800)
+    r2 = compile_fixture(drv_out, CONFIG["driverSrc"], gen2_out, timeout=1800, stage="gen2Bake", fixture_label=os.path.basename(CONFIG["driverSrc"]))
     zc_total, bails = parse_zc(r2["zcText"])
     gen2_ok = r2["rc"] == 0 and materialized_executable(gen2_out)
     log("gen2Bake", rc=r2["rc"], wallMs=r2["wallMs"], zcTotal=zc_total, bails=bails, ok=gen2_ok,
         timedOut=r2["timedOut"], outputOverflow=r2["outputOverflow"], stdoutLog=r2["stdoutLog"], stderrLog=r2["stderrLog"],
         stderrTail=r2["stderr"][-1500:],
-        sha256=(sha256_tag(gen2_out) if gen2_ok else None))
+        sha256=(sha256_tag(gen2_out) if gen2_ok else None), **rss_signal_fields(r2, ""))
     if not gen2_ok:
         return "ABORTED_GEN2_BAKE_FAILED"
 
@@ -854,16 +978,18 @@ def main():
         term_results = []
         for item_index, item in enumerate(CONFIG["terminal"]):
             outp = os.path.join(W, "t_%03d.exe" % item_index)
-            cr = compile_fixture(gen2_out, item["fixture"], outp, timeout=300)
+            cr = compile_fixture(gen2_out, item["fixture"], outp, timeout=300, stage="terminal", fixture_label=item["name"])
             if cr["rc"] != 0 or not materialized_executable(outp):
                 term_results.append({"name": item["name"], "compileRc": cr["rc"], "runRc": None, "expect": item["expect"], "pass": False,
                                      "compileTimedOut": cr["timedOut"], "compileOutputOverflow": cr["outputOverflow"],
-                                     "compileStdoutLog": cr["stdoutLog"], "compileStderrLog": cr["stderrLog"], "stderrTail": cr["stderr"][-800:]})
+                                     "compileStdoutLog": cr["stdoutLog"], "compileStderrLog": cr["stderrLog"], "stderrTail": cr["stderr"][-800:],
+                                     **rss_signal_fields(cr, "compile")})
                 continue
             rr = run_bin(outp, 15)
             term_results.append({"name": item["name"], "compileRc": cr["rc"], "runRc": rr["rc"], "expect": item["expect"], "pass": rr["rc"] == item["expect"],
                                  "timedOut": rr["timedOut"], "outputOverflow": rr["outputOverflow"],
-                                 "stdoutLog": rr["stdoutLog"], "stderrLog": rr["stderrLog"], "stderrTail": rr["stderr"][-800:]})
+                                 "stdoutLog": rr["stdoutLog"], "stderrLog": rr["stderrLog"], "stderrTail": rr["stderr"][-800:],
+                                 **rss_signal_fields(cr, "compile"), **rss_signal_fields(rr, "run")})
         terminal_gate = "PASS" if all(x["pass"] for x in term_results) else "FAIL"
         log("terminal", wallMs=int((time.time() - t0) * 1000), passCount=sum(1 for x in term_results if x["pass"]), total=len(term_results), terminal=term_results)
 
@@ -873,16 +999,18 @@ def main():
         oracle_results = []
         for item_index, item in enumerate(CONFIG["oracle"]):
             outp = os.path.join(W, "o_%03d.exe" % item_index)
-            cr = compile_fixture(gen2_out, item["fixture"], outp, timeout=300)
+            cr = compile_fixture(gen2_out, item["fixture"], outp, timeout=300, stage="oracle", fixture_label=item["name"])
             if cr["rc"] != 0 or not materialized_executable(outp):
                 oracle_results.append({"name": item["name"], "rc": None, "expect": item["expect"], "pass": False, "note": "compile failed",
                                        "compileTimedOut": cr["timedOut"], "compileOutputOverflow": cr["outputOverflow"],
-                                       "compileStdoutLog": cr["stdoutLog"], "compileStderrLog": cr["stderrLog"], "compileStderrTail": cr["stderr"][-800:]})
+                                       "compileStdoutLog": cr["stdoutLog"], "compileStderrLog": cr["stderrLog"], "compileStderrTail": cr["stderr"][-800:],
+                                       **rss_signal_fields(cr, "compile")})
                 continue
             rr = run_bin(outp, 10)
             oracle_results.append({"name": item["name"], "rc": rr["rc"], "expect": item["expect"], "pass": rr["rc"] == item["expect"],
                                    "timedOut": rr["timedOut"], "outputOverflow": rr["outputOverflow"],
-                                   "stdoutLog": rr["stdoutLog"], "stderrLog": rr["stderrLog"]})
+                                   "stdoutLog": rr["stdoutLog"], "stderrLog": rr["stderrLog"],
+                                   **rss_signal_fields(cr, "compile"), **rss_signal_fields(rr, "run")})
         oracle_gate = "PASS" if all(x["pass"] for x in oracle_results) else "FAIL"
         log("oracle", wallMs=int((time.time() - t0) * 1000), passCount=sum(1 for x in oracle_results if x["pass"]), total=len(oracle_results), oracle=oracle_results)
 
@@ -892,7 +1020,7 @@ def main():
             raise RuntimeError("gen3 requested but tools/macho_masked_cmp.py is unavailable")
         else:
             gen3_out = os.path.join(W, "GEN3")
-            r3 = compile_fixture(gen2_out, CONFIG["driverSrc"], gen3_out, timeout=1800, rss_cap=GEN3_RSS_CAP)
+            r3 = compile_fixture(gen2_out, CONFIG["driverSrc"], gen3_out, timeout=1800, rss_cap=GEN3_RSS_CAP, stage="gen3", fixture_label=os.path.basename(CONFIG["driverSrc"]))
             gen3_ok = r3["rc"] == 0 and materialized_executable(gen3_out)
             if gen3_ok:
                 cmp_r = run_cmd(["python3", CONFIG["maskedCmpPath"], gen2_out, gen3_out], timeout=60)
@@ -907,7 +1035,7 @@ def main():
                     bakeStdoutLog=r3["stdoutLog"], bakeStderrLog=r3["stderrLog"],
                     compareRc=cmp_r["rc"], compareTimedOut=cmp_r["timedOut"], compareOutputOverflow=cmp_r["outputOverflow"],
                     compareStdoutLog=cmp_r["stdoutLog"], compareStderrLog=cmp_r["stderrLog"],
-                    ok=masked_identical, maskedIdentical=masked_identical, maskedOutput=(cmp_r["stdout"] + cmp_r["stderr"]).strip())
+                    ok=masked_identical, maskedIdentical=masked_identical, maskedOutput=(cmp_r["stdout"] + cmp_r["stderr"]).strip(), **rss_signal_fields(r3, ""))
                 if compare_failed:
                     return "ABORTED_GEN3_COMPARE_FAILED"
                 if not masked_identical:
@@ -916,7 +1044,7 @@ def main():
                 log("gen3", bakeRc=r3["rc"], wallMs=r3["wallMs"], ok=False, maskedIdentical=None,
                     timedOut=r3["timedOut"], outputOverflow=r3["outputOverflow"],
                     stdoutLog=r3["stdoutLog"], stderrLog=r3["stderrLog"],
-                    note="gen3 bake failed", stderrTail=r3["stderr"][-1500:], stdoutTail=r3["stdout"][-1500:])
+                    note="gen3 bake failed", stderrTail=r3["stderr"][-1500:], stdoutTail=r3["stdout"][-1500:], **rss_signal_fields(r3, ""))
                 return "ABORTED_GEN3_BAKE_FAILED"
 
     gen2_gate = "GREEN" if zc_total == 0 else "ZC_NOT_READY_present"
@@ -1017,6 +1145,20 @@ function assertExactKeys(value, expectedKeys, label) {
   const expected = [...expectedKeys].sort();
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     invalidJournal(label, `fields ${JSON.stringify(actual)} do not equal ${JSON.stringify(expected)}`);
+  }
+}
+
+function assertKeys(value, requiredKeys, optionalKeys, label) {
+  assertPlainObject(value, label);
+  const required = new Set(requiredKeys);
+  const optional = new Set(optionalKeys);
+  for (const key of Object.keys(value)) {
+    if (!required.has(key) && !optional.has(key)) {
+      invalidJournal(label, `unexpected field ${JSON.stringify(key)}`);
+    }
+  }
+  for (const key of required) {
+    if (!Object.hasOwn(value, key)) invalidJournal(label, `missing required field ${JSON.stringify(key)}`);
   }
 }
 
@@ -1128,9 +1270,10 @@ function validateProvenanceRecord(record, label) {
 }
 
 function validateBakeRecord(record, label, {gen2 = false} = {}) {
-  const fields = ["stage", "ts", "rc", "wallMs", "ok", "timedOut", "outputOverflow", "stdoutLog", "stderrLog", "stderrTail", "sha256"];
-  if (gen2) fields.push("zcTotal", "bails");
-  assertExactKeys(record, fields, label);
+  const required = ["stage", "ts", "rc", "wallMs", "ok", "timedOut", "outputOverflow", "stdoutLog", "stderrLog", "stderrTail", "sha256"];
+  if (gen2) required.push("zcTotal", "bails");
+  const optional = ["peakRssBytes", "peakRssError", "signal", "forensics"];
+  assertKeys(record, required, optional, label);
   assertInteger(record.wallMs, `${label}.wallMs`, {nonnegative: true});
   assertProcessResult(record.rc, record.timedOut, record.outputOverflow, label);
   assertBoolean(record.ok, `${label}.ok`);
@@ -1154,7 +1297,10 @@ function validateBakeRecord(record, label, {gen2 = false} = {}) {
 }
 
 function validateRuntimeResult(item, label) {
-  assertExactKeys(item, ["name", "rc", "expect", "pass", "timedOut", "outputOverflow", "stdoutLog", "stderrLog"], label);
+  const required = ["name", "rc", "expect", "pass", "timedOut", "outputOverflow", "stdoutLog", "stderrLog"];
+  const optional = ["compilePeakRssBytes", "compilePeakRssError", "compileSignal", "compileForensics",
+                    "runPeakRssBytes", "runPeakRssError", "runSignal", "runForensics"];
+  assertKeys(item, required, optional, label);
   assertString(item.name, `${label}.name`);
   assertInteger(item.expect, `${label}.expect`);
   assertProcessResult(item.rc, item.timedOut, item.outputOverflow, label);
@@ -1175,7 +1321,9 @@ function validateProbeLikeRecord(record, label, arrayKey) {
     const item = items[index];
     const itemLabel = `${label}.${arrayKey}[${index}]`;
     if (Object.hasOwn(item, "note")) {
-      assertExactKeys(item, ["name", "rc", "expect", "pass", "note", "compileTimedOut", "compileOutputOverflow", "compileStdoutLog", "compileStderrLog", "compileStderrTail"], itemLabel);
+      const required = ["name", "rc", "expect", "pass", "note", "compileTimedOut", "compileOutputOverflow", "compileStdoutLog", "compileStderrLog", "compileStderrTail"];
+      const optional = ["compilePeakRssBytes", "compilePeakRssError", "compileSignal", "compileForensics"];
+      assertKeys(item, required, optional, itemLabel);
       assertString(item.name, `${itemLabel}.name`);
       assertInteger(item.expect, `${itemLabel}.expect`);
       if (item.rc !== null || item.pass !== false || item.note !== "compile failed") invalidJournal(itemLabel, "compile failure summary is contradictory");
@@ -1203,7 +1351,9 @@ function validateTerminalRecord(record, label) {
     const item = record.terminal[index];
     const itemLabel = `${label}.terminal[${index}]`;
     if (Object.hasOwn(item, "compileTimedOut")) {
-      assertExactKeys(item, ["name", "compileRc", "runRc", "expect", "pass", "compileTimedOut", "compileOutputOverflow", "compileStdoutLog", "compileStderrLog", "stderrTail"], itemLabel);
+      const required = ["name", "compileRc", "runRc", "expect", "pass", "compileTimedOut", "compileOutputOverflow", "compileStdoutLog", "compileStderrLog", "stderrTail"];
+      const optional = ["compilePeakRssBytes", "compilePeakRssError", "compileSignal", "compileForensics"];
+      assertKeys(item, required, optional, itemLabel);
       assertString(item.name, `${itemLabel}.name`);
       assertInteger(item.expect, `${itemLabel}.expect`);
       assertProcessResult(item.compileRc, item.compileTimedOut, item.compileOutputOverflow, `${itemLabel}.compile`);
@@ -1211,7 +1361,10 @@ function validateTerminalRecord(record, label) {
       for (const key of ["compileStdoutLog", "compileStderrLog"]) assertString(item[key], `${itemLabel}.${key}`);
       assertString(item.stderrTail, `${itemLabel}.stderrTail`, {allowEmpty: true});
     } else {
-      assertExactKeys(item, ["name", "compileRc", "runRc", "expect", "pass", "timedOut", "outputOverflow", "stdoutLog", "stderrLog", "stderrTail"], itemLabel);
+      const required = ["name", "compileRc", "runRc", "expect", "pass", "timedOut", "outputOverflow", "stdoutLog", "stderrLog", "stderrTail"];
+      const optional = ["compilePeakRssBytes", "compilePeakRssError", "compileSignal", "compileForensics",
+                        "runPeakRssBytes", "runPeakRssError", "runSignal", "runForensics"];
+      assertKeys(item, required, optional, itemLabel);
       assertString(item.name, `${itemLabel}.name`);
       if (item.compileRc !== 0) invalidJournal(itemLabel, "runtime row requires compileRc=0");
       assertInteger(item.expect, `${itemLabel}.expect`);
@@ -1230,7 +1383,9 @@ function validateTerminalRecord(record, label) {
 function validateGen3Record(record, label) {
   const bakeFailure = Object.hasOwn(record, "note");
   if (bakeFailure) {
-    assertExactKeys(record, ["stage", "ts", "bakeRc", "wallMs", "ok", "maskedIdentical", "timedOut", "outputOverflow", "stdoutLog", "stderrLog", "note", "stderrTail", "stdoutTail"], label);
+    const required = ["stage", "ts", "bakeRc", "wallMs", "ok", "maskedIdentical", "timedOut", "outputOverflow", "stdoutLog", "stderrLog", "note", "stderrTail", "stdoutTail"];
+    const optional = ["peakRssBytes", "peakRssError", "signal", "forensics"];
+    assertKeys(record, required, optional, label);
     assertInteger(record.wallMs, `${label}.wallMs`, {nonnegative: true});
     assertProcessResult(record.bakeRc, record.timedOut, record.outputOverflow, `${label}.bake`);
     if (record.ok !== false || record.maskedIdentical !== null || record.note !== "gen3 bake failed") invalidJournal(label, "invalid gen3 bake-failure summary");
@@ -1238,7 +1393,9 @@ function validateGen3Record(record, label) {
     for (const key of ["stderrTail", "stdoutTail"]) assertString(record[key], `${label}.${key}`, {allowEmpty: true});
     return;
   }
-  assertExactKeys(record, ["stage", "ts", "bakeRc", "wallMs", "bakeOutputOverflow", "bakeStdoutLog", "bakeStderrLog", "compareRc", "compareTimedOut", "compareOutputOverflow", "compareStdoutLog", "compareStderrLog", "ok", "maskedIdentical", "maskedOutput"], label);
+  const required = ["stage", "ts", "bakeRc", "wallMs", "bakeOutputOverflow", "bakeStdoutLog", "bakeStderrLog", "compareRc", "compareTimedOut", "compareOutputOverflow", "compareStdoutLog", "compareStderrLog", "ok", "maskedIdentical", "maskedOutput"];
+  const optional = ["peakRssBytes", "peakRssError", "signal", "forensics"];
+  assertKeys(record, required, optional, label);
   if (record.bakeRc !== 0 || record.bakeOutputOverflow !== false) invalidJournal(label, "comparison row requires a successful gen3 bake");
   assertInteger(record.wallMs, `${label}.wallMs`, {nonnegative: true});
   assertProcessResult(record.compareRc, record.compareTimedOut, record.compareOutputOverflow, `${label}.compare`);
