@@ -963,8 +963,18 @@ def main():
 
     gen2_out = os.path.join(W, "GEN2")
     r2 = compile_fixture(drv_out, CONFIG["driverSrc"], gen2_out, timeout=1800, stage="gen2Bake", fixture_label=os.path.basename(CONFIG["driverSrc"]))
-    zc_total, bails = parse_zc(r2["zcText"])
     gen2_ok = r2["rc"] == 0 and materialized_executable(gen2_out)
+    if gen2_ok:
+        zc_total, bails = parse_zc(r2["zcText"])
+    else:
+        # bake died before/without the ZC enumeration section (e.g. object writer
+        # failure): verdict must be the honest ABORTED_GEN2_BAKE_FAILED with raw
+        # stderr, not a harness RuntimeError crash. Strict protocol stays enforced
+        # on the rc==0 path.
+        try:
+            zc_total, bails = parse_zc(r2["zcText"])
+        except RuntimeError:
+            zc_total, bails = None, []
     log("gen2Bake", rc=r2["rc"], wallMs=r2["wallMs"], zcTotal=zc_total, bails=bails, ok=gen2_ok,
         timedOut=r2["timedOut"], outputOverflow=r2["outputOverflow"], stdoutLog=r2["stdoutLog"], stderrLog=r2["stderrLog"],
         stderrTail=r2["stderr"][-1500:],
