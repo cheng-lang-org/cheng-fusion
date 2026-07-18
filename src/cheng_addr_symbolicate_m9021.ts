@@ -147,6 +147,12 @@ function symbolicateAddress(binaryPath, objectPath, address, requestedWindowSize
   if (!objText) throw new Error(`objectPath has no __TEXT,__text section: ${objectPath}`);
 
   const addressHex = `0x${address.toString(16)}`;
+  // AArch64 instructions are always 4-byte aligned; a misaligned crash address cannot be a real
+  // instruction PC. Reject up front, before any window search, rather than let an unaligned
+  // address flow into byte-matching and produce a misleadingly "confident" result.
+  if (address % 4 !== 0) {
+    throw new Error(`address must be 4-byte aligned (AArch64 instruction alignment), got: ${addressHex} (address % 4 = ${address % 4})`);
+  }
   const relative = address - exeText.addr;
   if (relative < 0 || relative >= exeText.size) {
     return {
