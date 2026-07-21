@@ -163,3 +163,87 @@ macho_masked_cmp.py <gen2> <gen3>
 ```
 
 Every other byte must match.
+
+## semantic_gen.py
+
+Bounded semantic-combination fixture generator. Emits
+`fixtures/semantic/<family>/s<seed>.cheng` plus an ignition-matrix-isomorphic
+`fixtures/semantic/matrix.json` (one contract group per entry: runtime
+`expectRc`, or `expectCompileRc` for diagnosed-rejection families), directly
+runnable by `cheng_shape_matrix` via its `matrixPath` parameter.
+
+```
+semantic_gen.py --root /abs/cheng/tree [--out fixtures/semantic] [--seeds 3]
+                [--families all|name,name] [--check]
+```
+
+Deterministic: own xorshift64* PRNG keyed by (family, seed); same arguments
+always reproduce the same bytes (`--check` byte-verifies without writing).
+Oracle values are computed by the generator from the constants it emits, never
+hand-recorded. `--root` is mandatory and only lands in `matrix.json
+defaultRoot` — regenerating with a different root changes nothing else, which
+is the parameterization answer to the ignition matrix's pinned defaultRoot.
+
+**Lesson**: the 2026-07-19 inventory (`diag_fusion_inventory/REPORT.md`) found
+every ignition fixture was hand-curated from /tmp battle repros and the repo
+had zero generators; the first generator covers the 2026-07-19 campaign forms
+(str global call-RHS, slot-dominance dedup, narrow deref, ref-seq field,
+aggregate-field str RHS, AddrOf scalar root, int32-shell shift) so the next
+battle's repro variants are produced, not retyped. Calibration evidence and the
+known pre-fix-driver divergences it reproduces: `diag_c1_semantic_gen/REPORT.md`.
+
+## evidence_deposit.py
+
+**Purpose**: deposit one finished ignition-chain run's release evidence out of
+its ephemeral run workDir into the checked-in `evidence/<runId>/`, before the
+workDir is cleaned and the evidence evaporates.
+
+**Usage**:
+```
+evidence_deposit.py <runId> <runDir> [--evidence-dir DIR] [--force]
+```
+Copies `journal.jsonl`, the `done.json`/`completion.claim.json` sentinel pair
+and the provenance record verbatim, projects per-stage verdict summaries into
+`stages.json`, binds source-tree/seed/driver/GEN2/GEN3/fixture-manifest/
+comparator/chain-tool/deposit-tool hashes plus the GEN3 masked-compare result
+into `receipt.json`, re-hashes every deposited file into `manifest.json`, and
+appends one entry to `evidence/index.json` (append-only: runId -> verdict +
+hashes + ts). Everything is staged in a tmp sibling and committed by rename;
+a runId already deposited is refused with exit 2 unless `--force`. Hard errors
+(exit 1): runId mismatch, missing done/claim, done/claim byte mismatch, broken
+journal structure, or a DRV/GEN2 binary whose current bytes no longer match
+the hash the journal recorded at bake time. Exit 0 = deposited.
+
+**Lesson**: the chain's provenance mechanism (inputManifestSha256, per-file
+sha256 snapshots, atomic O_EXCL done sentinel) was already strict, but every
+bit of it lived only in the run workDir -- three 2026-07-19/20 chains
+(T045700/T210408/T004807, all ABORTED_GEN3_BAKE_FAILED) had their verdicts
+recorded in session notes with no in-repo receipt to point at. Deposit right
+after a chain finishes; the receipt is what the 2026-07-17 contract's
+"completion manifest" audit can actually check in.
+
+## evidence_verify.py
+
+**Purpose**: post-deposit verifier for the checked-in evidence store (mutation-net
+GAP-1 hardening). `evidence_deposit.py` validates a run workDir at deposit time;
+nothing re-checked the deposited `evidence/<runId>/` payloads afterwards.
+
+**Usage**:
+```
+evidence_verify.py [--evidence-dir DIR] [runId ...]
+```
+For every deposited run it re-checks, from the checked-in bytes alone: every
+manifest.json file re-hashes (sha256+size) and the on-disk set is exactly
+`manifest.files + manifest.json`; done.json == completion.claim.json byte-identical;
+journal.jsonl starts with provenance and its final done verdict equals done.json's;
+receipt.json shape (exact schema, runId == directory, enum-shaped verdict);
+index.json entries consistent with each receipt hash block (verdict/lastStage/ts/
+seed/tree/input-manifest/driver/gen2/gen3/masked-identical); provenance/input_manifest/
+stages cross-checks; store-level two-way orphan scan (every index run has a directory,
+every directory is indexed). Any mismatch exits 1; usage errors exit 2; with no
+runId the whole store is verified.
+
+**Lesson**: verified by a 7-case perturbation matrix (verdict flips on receipt and
+index, file delete/add, done flip, orphan dir, ghost index entry) -- every tamper
+is caught with an exact FAIL reason. item27 wires the two former GAP-1 mutants
+(M-EVIDENCE-SEED-SWAP, M-EVIDENCE-VERDICT-DROP) onto this gate; kill rate 26/26.

@@ -10,8 +10,8 @@ import {JSON_RPC_MAX_FRAME_BYTES,JsonRpcFrameDecoder} from "./json_rpc_frame_dec
 
 let mcpWorkspaceRootHints = [];
 let mcpClientCanListRoots = false;
-const chengToolsWithoutProjectRoot = new Set(["cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_claim_audit", "cheng_ignition_chain", "cheng_orphan_slot_scan", "cheng_fixture_matrix", "cheng_addr_symbolicate"]);
-const chengMutatingTools = new Set(["cheng_csg_roundtrip", "cheng_profile_report", "cheng_exec_diff", "cheng_zc_census", "cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_ignition_chain", "cheng_residual_peel", "cheng_fixture_matrix"]);
+const chengToolsWithoutProjectRoot = new Set(["cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_claim_audit", "cheng_ignition_chain", "cheng_orphan_slot_scan", "cheng_fixture_matrix", "cheng_addr_symbolicate", "cheng_regalloc_preflight"]);
+const chengMutatingTools = new Set(["cheng_csg_roundtrip", "cheng_profile_report", "cheng_exec_diff", "cheng_zc_census", "cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_ignition_chain", "cheng_residual_peel", "cheng_fixture_matrix", "cheng_regalloc_preflight"]);
 
 function getChengFusionTools() {
   initChengFusionToolRegistryModule();

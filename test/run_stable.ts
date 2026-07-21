@@ -6,7 +6,7 @@ import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const perTestTimeoutMs = Number(process.env.CHENG_FUSION_SUITE_TEST_TIMEOUT_MS || 180_000);
+const perTestTimeoutMs = Number(process.env.CHENG_FUSION_SUITE_TEST_TIMEOUT_MS || 300_000);
 if (!Number.isInteger(perTestTimeoutMs) || perTestTimeoutMs <= 0) {
   throw new Error(`CHENG_FUSION_SUITE_TEST_TIMEOUT_MS must be a positive integer, got ${process.env.CHENG_FUSION_SUITE_TEST_TIMEOUT_MS}`);
 }
@@ -29,6 +29,9 @@ const tests = [
   "test/item19_lsp_protocol_singleflight.ts",
   "test/item20_profile_report_invariants.ts",
   "test/item21_zc_protocol_strict.ts",
+  "test/item22_regalloc_preflight.ts",
+  "test/item23_semantic_matrix.ts",
+  "test/item24_semantic_pipeline_matrix.ts",
 ];
 
 function runTest(test: string) {

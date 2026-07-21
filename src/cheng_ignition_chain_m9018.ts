@@ -1933,6 +1933,33 @@ async function statusIgnitionChain(input) {
   else if (stagesDone.length > 0) verdictSoFar = "STALLED_NO_DONE_RECORD";
   else verdictSoFar = "STARTING_OR_CRASHED_BEFORE_FIRST_STAGE";
 
+  let evidenceDeposit = null;
+  if (input.depositEvidence === true) {
+    if (!completionConsistent || done === null) {
+      throw new Error("depositEvidence requires a consistently completed run");
+    }
+    const evidenceDir = join(CHENG_FUSION_PACKAGE_ROOT, "evidence");
+    const deposit = spawnSync("python3", [
+      join(CHENG_FUSION_PACKAGE_ROOT, "tools/evidence_deposit.py"), input.runId, runDir, "--evidence-dir", evidenceDir,
+    ], {encoding: "utf8", maxBuffer: 16 * 1024 * 1024});
+    // rc=2 = 已入库(幂等), 不算失败
+    if (deposit.status !== 0 && deposit.status !== 2) {
+      throw new Error(`evidence_deposit failed rc=${deposit.status}: ${(deposit.stderr || "").slice(-2000)}`);
+    }
+    const verify = spawnSync("python3", [
+      join(CHENG_FUSION_PACKAGE_ROOT, "tools/evidence_verify.py"), "--evidence-dir", evidenceDir, input.runId,
+    ], {encoding: "utf8", maxBuffer: 16 * 1024 * 1024});
+    if (verify.status !== 0) {
+      throw new Error(`evidence_verify failed rc=${verify.status}: ${(verify.stderr || "").slice(-2000)}`);
+    }
+    evidenceDeposit = {
+      deposited: deposit.status === 0,
+      alreadyDeposited: deposit.status === 2,
+      depositOutput: (deposit.stdout || "").trim(),
+      verifyOutput: (verify.stdout || "").trim(),
+    };
+  }
+
   return jsonResult({
     schema: "cheng_ignition_chain.status.v1",
     runId: input.runId,
@@ -1965,6 +1992,7 @@ async function statusIgnitionChain(input) {
     completionConsistent,
     done,
     verdictSoFar,
+    evidenceDeposit,
   });
 }
 
@@ -1988,6 +2016,7 @@ var initChengIgnitionChainModule = defineModuleInitializer(() => {
     gen3RssCapBytes: zodSchema.number().int().positive().optional().describe("[start] RSS cap in bytes applied only to the gen3 stage's backend-driver self-recompile subprocess. Measured gen2-generation full-tree driver bakes peak ~14-16GB, routinely exceeding the shared 12GiB default cap and stalling gen3. Defaults to rssCapBytes's value (12884901888 / 12 GiB if that is also unset)."),
     outputMaxBytes: zodSchema.number().int().min(65536).max(1073741824).optional().describe("[start] Hard combined stdout+stderr byte cap for each subprocess, including fixture executions and GEN3 comparison. Defaults to 268435456 (256 MiB). Overflow kills the whole subprocess group and can never pass a gate."),
     runId: zodSchema.string().optional().describe("[status] The exact ignite_YYYYMMDDTHHMMSS_xxxxxx runId returned by action=start; traversal and symlink aliases are rejected."),
+    depositEvidence: zodSchema.boolean().optional().describe("[status] When true and the run is consistently complete, deposit the run's evidence into the checked-in package evidence store (evidence_deposit.py, idempotent) and immediately re-verify it with evidence_verify.py; either failure is a hard error."),
   });
   ChengIgnitionChainTool = createChengTextTool({
     name: "cheng_ignition_chain",

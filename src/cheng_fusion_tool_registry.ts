@@ -1,8 +1,9 @@
 // @ts-nocheck
 // Local static registry replacing the source repo's ../artifact/builtin_tool_registry_m4623.ts
 // (that module was a 1000+ line registry of ALL claude-code builtin tools; cheng-fusion only
-// ever consumed getAllBuiltinTools().filter(name.startsWith("cheng_"))). This registers exactly
-// all 18 Cheng tools directly. MCP and the headless CLI consume this one registry.
+// ever consumed getAllBuiltinTools().filter(name.startsWith("cheng_"))). MCP and the headless CLI
+// consume this one validated registry; its count and identity are derived from the actual entries.
+import {createHash} from "node:crypto";
 import {b as defineModuleInitializer} from "./runtime.ts";
 import {ChengCsgQueryTool, initChengCsgQueryModule} from "./cheng_csg_query_m9001.ts";
 import {ChengEvidenceTool, initChengEvidenceModule} from "./cheng_evidence_m9002.ts";
@@ -23,8 +24,22 @@ import {ChengResidualPeelTool, initChengResidualPeelModule} from "./cheng_residu
 import {ChengOrphanSlotScanTool, initChengOrphanSlotScanModule} from "./cheng_orphan_slot_scan_m9020.ts";
 import {ChengFixtureMatrixTool, initChengFixtureMatrixModule} from "./cheng_fixture_matrix_m9021.ts";
 import {ChengAddrSymbolicateTool, initChengAddrSymbolicateModule} from "./cheng_addr_symbolicate_m9021.ts";
+import {ChengRegallocPreflightTool, initChengRegallocPreflightModule} from "./cheng_regalloc_preflight_m9022.ts";
 
-var chengFusionTools;
+var chengFusionTools, chengFusionToolManifest;
+
+function buildChengFusionToolManifest(tools) {
+  if (!Array.isArray(tools) || tools.length === 0) throw new Error("Cheng Fusion tool registry must not be empty");
+  const names = tools.map((tool, index) => {
+    const name = tool?.name;
+    if (typeof name !== "string" || !/^cheng_[a-z0-9_]+$/.test(name)) throw new Error(`Cheng Fusion tool ${index} has an invalid name`);
+    return name;
+  });
+  const sortedNames = [...names].sort();
+  if (new Set(sortedNames).size !== sortedNames.length) throw new Error("Cheng Fusion tool registry contains duplicate names");
+  const sha256 = createHash("sha256").update(sortedNames.map((name) => `${name}\n`).join(""), "utf8").digest("hex");
+  return Object.freeze({schema: "cheng_fusion_tool_registry.v1", count: sortedNames.length, names: Object.freeze(sortedNames), sha256});
+}
 
 var initChengFusionToolRegistryModule = defineModuleInitializer(() => {
   initChengCsgQueryModule();
@@ -46,11 +61,17 @@ var initChengFusionToolRegistryModule = defineModuleInitializer(() => {
   initChengOrphanSlotScanModule();
   initChengFixtureMatrixModule();
   initChengAddrSymbolicateModule();
-  chengFusionTools = [ChengCsgQueryTool, ChengEvidenceTool, ChengCsgRoundtripTool, ChengCrashTriageTool, ChengLineMapReadTool, ChengLspQueryTool, ChengProfileReportTool, ChengSymbolDiffTool, ChengExecDiffTool, ChengTemplateLeakAuditTool, ChengZcCensusTool, ChengCorruptHuntTool, ChengShapeMatrixTool, ChengClaimAuditTool, ChengIgnitionChainTool, ChengResidualPeelTool, ChengOrphanSlotScanTool, ChengFixtureMatrixTool, ChengAddrSymbolicateTool];
+  initChengRegallocPreflightModule();
+  chengFusionTools = [ChengCsgQueryTool, ChengEvidenceTool, ChengCsgRoundtripTool, ChengCrashTriageTool, ChengLineMapReadTool, ChengLspQueryTool, ChengProfileReportTool, ChengSymbolDiffTool, ChengExecDiffTool, ChengTemplateLeakAuditTool, ChengZcCensusTool, ChengCorruptHuntTool, ChengShapeMatrixTool, ChengClaimAuditTool, ChengIgnitionChainTool, ChengResidualPeelTool, ChengOrphanSlotScanTool, ChengFixtureMatrixTool, ChengAddrSymbolicateTool, ChengRegallocPreflightTool];
+  chengFusionToolManifest = buildChengFusionToolManifest(chengFusionTools);
 });
 
 function getChengFusionTools() {
   return chengFusionTools;
 }
 
-export {getChengFusionTools, initChengFusionToolRegistryModule};
+function getChengFusionToolManifest() {
+  return chengFusionToolManifest;
+}
+
+export {getChengFusionToolManifest, getChengFusionTools, initChengFusionToolRegistryModule};

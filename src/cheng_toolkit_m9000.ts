@@ -41,14 +41,23 @@ function chengFusionRssCapBytes() {
   return value;
 }
 
-function chengDriverSpawnEnv(extraEnv = {}, unsetEnv = []) {
+function hardPositiveSafeInteger(value, label) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number <= 0) throw new Error(`${label} must be a positive safe integer`);
+  return number;
+}
+
+function chengDriverSpawnEnv(extraEnv = {}, unsetEnv = [], hardRssCapBytes) {
   const inherited = {...process.env};
   for (const key of unsetEnv) {
     if (typeof key === "string" && key.length > 0) delete inherited[key];
   }
   // The process RSS contract is not an ordinary caller override.  Keep it last so
   // tool input can never silently remove the process-group memory guard.
-  return {...inherited, ...extraEnv, CHENG_PROCESS_MAX_RSS_BYTES: chengFusionRssCapBytes()};
+  const rssCap = hardRssCapBytes === undefined
+    ? chengFusionRssCapBytes()
+    : String(hardPositiveSafeInteger(hardRssCapBytes, "hardRssCapBytes"));
+  return {...inherited, ...extraEnv, CHENG_PROCESS_MAX_RSS_BYTES: rssCap};
 }
 
 // 超时孤儿: 单一 env 旋钮 CHENG_FUSION_TIMEOUT_MS, 存在时覆盖所有调用点(不论各自默认值多大).
@@ -1511,7 +1520,13 @@ function runChengDriver(driver, args, options = {}) {
   }
   const cwd = options.cwd || resolveChengProjectRoot(options);
   const maxBuffer = options.maxBuffer || (1 << 30);
-  const timeoutMs = chengFusionTimeoutMs(options.timeoutMs || CHENG_FUSION_DRIVER_TIMEOUT_MS_DEFAULT);
+  const exactGuardOwnsTimeoutAndCleanup = options.exactGuardOwnsTimeoutAndCleanup === true;
+  if (exactGuardOwnsTimeoutAndCleanup && options.hardTimeoutMs !== undefined) {
+    throw new Error("exact guard ownership forbids a competing outer hardTimeoutMs");
+  }
+  const timeoutMs = exactGuardOwnsTimeoutAndCleanup ? null : options.hardTimeoutMs === undefined
+    ? chengFusionTimeoutMs(options.timeoutMs || CHENG_FUSION_DRIVER_TIMEOUT_MS_DEFAULT)
+    : hardPositiveSafeInteger(options.hardTimeoutMs, "hardTimeoutMs");
   return new Promise((resolvePromise) => {
     const stdoutChunks = [];
     const stderrChunks = [];
@@ -1524,7 +1539,7 @@ function runChengDriver(driver, args, options = {}) {
     try {
       child = spawn(driver, args, {
         cwd,
-        env: chengDriverSpawnEnv(options.env, options.unsetEnv),
+        env: chengDriverSpawnEnv(options.env, options.unsetEnv, options.hardRssCapBytes),
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       });
@@ -1537,7 +1552,7 @@ function runChengDriver(driver, args, options = {}) {
       ));
       return;
     }
-    const timer = setTimeout(() => {
+    const timer = exactGuardOwnsTimeoutAndCleanup ? null : setTimeout(() => {
       timedOut = true;
       killChengProcessGroup(child, "SIGKILL");
     }, timeoutMs);
@@ -1546,7 +1561,7 @@ function runChengDriver(driver, args, options = {}) {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (stdoutLength + stderrLength + bytes.length > maxBuffer) {
         overflow = true;
-        killChengProcessGroup(child, "SIGKILL");
+        if (!exactGuardOwnsTimeoutAndCleanup) killChengProcessGroup(child, "SIGKILL");
         return;
       }
       if (which === "stdout") {
@@ -1562,7 +1577,7 @@ function runChengDriver(driver, args, options = {}) {
     const finish = (exitCode) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
       const stdout = Buffer.concat(stdoutChunks, stdoutLength);
       let stderr = Buffer.concat(stderrChunks, stderrLength);
       let stderrText = stderr.toString("utf8");

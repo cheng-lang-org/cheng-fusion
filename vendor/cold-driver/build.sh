@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # Builds a fusion-local cold driver binary that understands CSG record kind=9
 # (call-edge facts) and reports the exact total record count from both writer
-# and reader paths, by applying patches/csg-writer-call-edges.patch to a *copy*
+# and reader paths, by applying patches/*.patch (in glob order) to a *copy*
 # of the main repo's bootstrap/cheng_cold.c and compiling that copy.
 #
+# Current patches:
+#   csg-writer-call-edges.patch   CSG kind=9 call-edge writer/reader counts
+#   print-symbols-symbol-list.patch  lowering_symbols/primary_symbols emit the
+#                                  exact comma-separated function-name list
+#                                  (fusion cheng_symbols_v1 contract), not a
+#                                  "N functions scanned" summary
+#
 # Never touches the main repo (cheng-lang) source tree, artifacts, or seeds.
-# Safe to re-run any time the patch or the upstream cheng_cold.c changes;
+# Safe to re-run any time a patch or the upstream cheng_cold.c changes;
 # output is content-addressed so a no-op source means a no-op rebuild.
 set -euo pipefail
 
@@ -49,7 +56,7 @@ for name in "${UPSTREAM_SIBLINGS[@]}"; do
   cp "$CHENG_ROOT/bootstrap/$name" "$BUILD_DIR/bootstrap/$name"
 done
 
-(cd "$BUILD_DIR" && patch -p1 < "$PATCH_FILE")
+(cd "$BUILD_DIR" && for p in "$SCRIPT_DIR"/patches/*.patch; do patch -p1 < "$p"; done)
 
 TMP_BINARY="$OUT_BINARY.tmp-$$"
 "$CC" -std=c11 -O2 -o "$TMP_BINARY" "$BUILD_DIR/bootstrap/cheng_cold.c"

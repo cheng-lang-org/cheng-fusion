@@ -1,0 +1,31 @@
+# Cheng semantic matrix v1
+
+`src/cheng_semantic_matrix_m9023.ts` defines a bounded, constraint-pruned semantic model for the high-risk compiler path:
+
+`TypedExpr -> CSG -> lowering -> primary/backend2 -> regalloc`
+
+It deliberately does not claim to enumerate Cheng's infinite grammar. The declared type families include `i32/i64/f64/bool`, `str`, `int32[]`, `str[]`, managed-object sequences, managed fixed arrays, inline/nested managed objects, and managed `Result` payloads. Their scalar kind, shape, managed depth, element ownership, and ownership-descriptor kind are independent declarative metadata; no physical ABI size or offset is guessed.
+
+Critical ownership-descriptor, field/ref-boundary, exact-call/result-transport, and control-flow families are exhaustively covered inside the bounded legal model. `str` local transport has its own `managed_value_slot` class so it cannot disappear between scalar and aggregate dispatch. All axes additionally receive exact pairwise coverage. The deterministic weighted set-cover pass only chooses a smaller witness suite; it does not prove completeness and does not claim a minimum suite. The separate validator has its own allocation-free constraint bitmask classifier, full-domain DFS, and projection encoder; it does not consume generator tokens, selected cases, manifests, or receipts. All bounded assignments compare the generator and proof violation masks exactly, and the fixed axis-ordinal/mask stream is SHA-256 bound. Tests mutate a classifier dimension and delete a critical projection while retaining the old receipt; both must be RED. Every semantic constraint also has a unique isolated rejection witness.
+
+Every case has a content-derived ID, a bounded-model ordinal, a deterministic seed manifest, and deterministic hash shards. The ordinal is only a model-enumeration coordinate; it is never presented as a compiler node or declaration index. Exact compiler identities must come from future compiler-owned observed receipts and must use `int32` node/declaration indices only; neither source text nor `name+arity` is an identity key. The public surface model contains ordinary values and implicit `var T` borrowing only. `ref_boundary_field` is an internal structured hop requirement, not public `ref` or pointer syntax.
+
+The legal universe is also materialization-total. Scalar, string, sequence, and fixed-array literals have explicit public-literal recipes; object, nested-object, and `Result` construction is represented as an exact call recipe rather than a fake literal. `self_alias` is limited to non-Owned global ident/field/index sources, and `may_alias` is limited to Borrowed views. Every legal case deterministically produces a type/origin/destination/call-fixture/field-hop/control-flow/alias/public-surface recipe and hash. The recipe is still not Cheng source and makes no compile-success claim.
+
+For legal cases, the independent oracle fixes ownership actions, symbolic field-hop shape, exact-identity requirements, result transport, control-flow joins, and alias rules. It never manufactures a compiler node ID, declaration ID, field offset, type-layout index, or executed result. The contract ledger requires TypedExpr, CSG, lowering, both backends, and both regalloc paths. Mutation tests swap ownership/overload target, drop the exact-offset proof requirement, omit a stage, and require every mutation to fail. An actual numeric field-offset mutation remains a real-runner mutation and cannot honestly run before the structured receipt interface exists.
+
+`deltaReduceFailingSemanticCases` uses deterministic delta debugging over legal cases. It revalidates semantic legality before each predicate call and verifies the failure predicate again at the end.
+
+## Real pipeline boundary
+
+No current installed command emits exact structured receipts for all seven required stages, and `artifacts/backend_driver/cheng` is not currently installed in the main tree. Therefore v1 does not infer success from compilation return codes, textual diagnostics, or primary/backend2 agreement alone.
+
+`executeSemanticMatrixShard` always raises `REAL_PIPELINE_RUNNER_REQUIRED` in v1, even if a caller supplies an object that claims to be a runner. This prevents self-reported hashes or an echoed oracle from becoming a false execution proof.
+
+The future `cheng-real-structured-pipeline.v1` integration must bind raw generated source bytes, the case-materialization manifest, materializer bytes, semantic case hash, driver bytes, every compiler/tool source identity, and the toolchain manifest. Every observed stage receipt must bind that same execution identity. TypedExpr's real `int32` node/declaration identities and compiler type-layout receipt/field offsets must be preserved and cross-checked through CSG, lowering, both backends, and both regalloc paths. Primary/backend2 differential agreement remains only one required test; each observed receipt must also satisfy the independent symbolic ownership oracle. Illegal cases must return exact structured violation codes and the rejecting stage.
+
+The missing production interface is a compiler-owned structured receipt command that exposes exact TypedExpr node identity and `exprClass`, CSG/lowering preservation, primary/backend2 emission facts, and regalloc facts under the same frozen source/compiler identity. Until that interface exists, this module is a complete planning/oracle/mutation/reduction gate, not a claim that the real pipeline executed.
+
+## Verification
+
+The package entry is `bun run test:item23`, and the default stable suite also runs `test/item23_semantic_matrix.ts`. In the formal repository, the exact-1-GiB process-tree guard completed item23 with rc=0, empty stderr, 212 samples and a 225,607,680-byte enforced peak. The run exhaustively classified 1,244,160 bounded assignments, retained 1,584 legal cases plus ten isolated negative witnesses, selected 202 deterministic coverage cases, and passed sections A–G: schema/no-infinite-grammar, independent full-domain classifier/projection proof, pointer-free materialization, stale-receipt/classifier/coverage attacks, shard binding, oracle/ledger mutations, legality-preserving reduction, and hard failure when real seven-stage receipts are absent.

@@ -7,6 +7,7 @@
 //   E. doctor really spawns index.ts, validates object schemas, executable/code-sign state, and
 //      a cheng-lsp initialize handshake; a missing driver yields a concrete structured code.
 import assert from "node:assert/strict";
+import {createHash} from "node:crypto";
 import {spawn} from "node:child_process";
 import {EventEmitter} from "node:events";
 import {accessSync, chmodSync, constants, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync} from "node:fs";
@@ -15,6 +16,7 @@ import {dirname, join} from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
 import {validateToolSchemas} from "../cli.ts";
 import {handleMcpRequest, writeToStreamWithBackpressure} from "../src/cheng_fusion_mcp_server_m9009.ts";
+import {getChengFusionToolManifest, getChengFusionTools, initChengFusionToolRegistryModule} from "../src/cheng_fusion_tool_registry.ts";
 import {JSON_RPC_MAX_FRAME_BYTES, JsonRpcFrameDecoder} from "../src/json_rpc_frame_decoder.ts";
 import {resolveChengProjectRoot} from "../src/cheng_toolkit_m9000.ts";
 
@@ -203,6 +205,16 @@ async function testMcpCliParity(tempRoot: string) {
     const cliList = parseJson(cliListRun.stdout, "CLI list");
     assert.deepEqual(cliList, mcpList.result);
     assertTrue(cliList.tools.length > 0, `CLI list exactly matches MCP tools/list (${cliList.tools.length} tools)`);
+    initChengFusionToolRegistryModule();
+    const registryTools = getChengFusionTools();
+    const registryManifest = getChengFusionToolManifest();
+    const registryNames = registryTools.map((tool: any) => tool.name).sort();
+    assert.equal(registryManifest.count, registryTools.length);
+    assert.deepEqual(registryManifest.names, registryNames);
+    assert.equal(new Set(registryNames).size, registryNames.length);
+    assert.equal(registryManifest.sha256, createHash("sha256").update(registryNames.map((name: string) => `${name}\n`).join(""), "utf8").digest("hex"));
+    assert.deepEqual(cliList.tools.map((tool: any) => tool.name).sort(), registryNames);
+    assertTrue(true, "registry count and identity are derived from the unique actual tool names");
     assertTrue(cliList.tools.every((tool: any) => tool.inputSchema?.type === "object"), "every listed schema has top-level type=object");
     for (const executingTool of ["cheng_crash_triage", "cheng_corrupt_hunt"]) {
       assert.equal(cliList.tools.find((tool: any) => tool.name === executingTool)?.annotations?.readOnlyHint, false);
