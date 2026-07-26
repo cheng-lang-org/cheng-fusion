@@ -4,14 +4,17 @@
 // (./cheng_fusion_tool_registry.ts) instead of filtering the full claude-code
 // builtin tool registry (../artifact/builtin_tool_registry_m4623.ts) by name
 // prefix "cheng_". Behavior (tool list, order, schemas, dispatch) is unchanged.
-import {getChengFusionTools as getAllChengFusionTools, initChengFusionToolRegistryModule} from "./cheng_fusion_tool_registry.ts";
+import {getChengFusionToolManifest, getChengFusionTools as getAllChengFusionTools, initChengFusionToolRegistryModule} from "./cheng_fusion_tool_registry.ts";
 import {setChengProjectRootHints,withChengInvocationContext,zodToJsonSchema} from "./cheng_toolkit_m9000.ts";
 import {JSON_RPC_MAX_FRAME_BYTES,JsonRpcFrameDecoder} from "./json_rpc_frame_decoder.ts";
+import {randomBytes} from "node:crypto";
+import {createChengFusionMcpRuntimeIdentity} from "./cheng_fusion_mcp_runtime_identity.ts";
+import {chengFusionSourceDriftReport} from "./cheng_fusion_source_guard.ts";
 
 let mcpWorkspaceRootHints = [];
 let mcpClientCanListRoots = false;
-const chengToolsWithoutProjectRoot = new Set(["cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_claim_audit", "cheng_ignition_chain", "cheng_orphan_slot_scan", "cheng_fixture_matrix", "cheng_addr_symbolicate", "cheng_regalloc_preflight"]);
-const chengMutatingTools = new Set(["cheng_csg_roundtrip", "cheng_profile_report", "cheng_exec_diff", "cheng_zc_census", "cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_ignition_chain", "cheng_residual_peel", "cheng_fixture_matrix", "cheng_regalloc_preflight"]);
+let mcpRuntimeSessionIdentity = null;
+const chengMutatingTools = new Set(["cheng_csg_roundtrip", "cheng_profile_report", "cheng_exec_diff", "cheng_zc_census", "cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_ignition_chain", "cheng_residual_peel", "cheng_fixture_matrix", "cheng_regalloc_preflight", "cheng_semantic_snapshot_audit", "cheng_driver_frontier_probe"]);
 
 function getChengFusionTools() {
   initChengFusionToolRegistryModule();
@@ -140,14 +143,41 @@ function updateMcpClientCapabilities(params = {}) {
   mcpClientCanListRoots = Boolean(params.capabilities?.roots);
 }
 
+function bindToolResponseToMcpRuntime(result) {
+  if (mcpRuntimeSessionIdentity === null) return result;
+  return {
+    ...result,
+    _meta: {
+      chengFusionRuntimeIdentity: mcpRuntimeSessionIdentity,
+    },
+  };
+}
+
 async function handleMcpRequest(message, transportContext = {}) {
   if (message.method === "initialize") {
+    if (mcpRuntimeSessionIdentity !== null) {
+      throw new Error("cheng_fusion_mcp_runtime_already_initialized");
+    }
     updateMcpClientCapabilities(message.params);
     updateMcpWorkspaceRoots(message.params);
+    initChengFusionToolRegistryModule();
+    const requestedNonce = message.params?._meta?.chengFusionRuntimeNonce;
+    const initializationNonce =
+      typeof requestedNonce === "string" && /^[0-9a-f]{64}$/.test(requestedNonce)
+        ? requestedNonce
+        : randomBytes(32).toString("hex");
+    mcpRuntimeSessionIdentity = createChengFusionMcpRuntimeIdentity(
+      getChengFusionToolManifest(),
+      initializationNonce,
+    );
     return {
       protocolVersion: message.params?.protocolVersion || "2025-11-25",
       capabilities: {tools: {}},
-      serverInfo: {name: "cheng-fusion", version: "2.1.205"},
+      serverInfo: {
+        name: "cheng-fusion",
+        version: "current",
+        runtimeIdentity: mcpRuntimeSessionIdentity,
+      },
       instructions: "Deterministic Cheng fusion tools for the active Cheng project: CSG, LSP, crash triage, line maps, profiling, and symbol regression checks."
     };
   }
@@ -163,31 +193,37 @@ async function handleMcpRequest(message, transportContext = {}) {
   }
   if (message.method === "tools/call") {
     const name = message.params?.name;
+    // 陈旧源守卫: 本进程的模块图是 import 那一刻的 src/ 快照。src/ 一旦被编辑, 后续任何结论都来自
+    // 编辑前的代码, 必须硬失败而不是返回一个会被误判的旧结论(见 cheng_fusion_source_guard.ts)。
+    const sourceDrift = chengFusionSourceDriftReport(typeof name === "string" ? name : null);
+    if (sourceDrift) {
+      return bindToolResponseToMcpRuntime({isError: true, content: [{type: "text", text: JSON.stringify(sourceDrift, null, 2)}]});
+    }
     const tool = getChengFusionTools().find((candidate) => candidate.name === name);
     if (!tool) throw Object.assign(new Error(`Cheng fusion tool not found: ${name}`), {code: -32602});
     const rawArguments = message.params?.arguments === undefined ? {} : message.params.arguments;
     if (rawArguments === null || typeof rawArguments !== "object" || Array.isArray(rawArguments)) {
-      return {
+      return bindToolResponseToMcpRuntime({
         isError: true,
         content: [{type: "text", text: `Invalid input for ${tool.name}: arguments must be a JSON object`}],
-      };
+      });
     }
     const validation = validateInput(tool, stripMcpContextFields(rawArguments));
-    if (!validation.ok) return {isError: true, content: [{type: "text", text: `Invalid input for ${tool.name}: ${validation.error}`}]};
+    if (!validation.ok) return bindToolResponseToMcpRuntime({isError: true, content: [{type: "text", text: `Invalid input for ${tool.name}: ${validation.error}`}]});
     const directRoots = collectWorkspaceRoots(message.params);
     let invocationRootSnapshot = [...mcpWorkspaceRootHints];
-    if (!chengToolsWithoutProjectRoot.has(tool.name) && directRoots.length === 0 && typeof transportContext.refreshWorkspaceRoots === "function") {
+    if (tool.requiresChengProjectRoot && directRoots.length === 0 && typeof transportContext.refreshWorkspaceRoots === "function") {
       invocationRootSnapshot = [...await transportContext.refreshWorkspaceRoots()];
     }
     const context = buildMcpInvocationContext(message.params, {existingWorkspaceRoots: invocationRootSnapshot});
     try {
-      const input = chengToolsWithoutProjectRoot.has(tool.name)
-        ? validation.value
-        : withChengInvocationContext(validation.value, context, {requireRoot: true, requireActiveProjectContext: true});
+      const input = tool.requiresChengProjectRoot
+        ? withChengInvocationContext(validation.value, context, {requireRoot: true, requireActiveProjectContext: true})
+        : validation.value;
       const result = await tool.execute(input);
-      return {content: toolContent(result)};
+      return bindToolResponseToMcpRuntime({content: toolContent(result)});
     } catch (error) {
-      return {isError: true, content: [{type: "text", text: error instanceof Error ? error.message : String(error)}]};
+      return bindToolResponseToMcpRuntime({isError: true, content: [{type: "text", text: error instanceof Error ? error.message : String(error)}]});
     }
   }
   throw Object.assign(new Error(`Method not found: ${message.method}`), {code: -32601});

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// grammar_corpus_gen.ts — 966 parser receipt 消费半套之有界语料生成器。
+// grammar_corpus_gen.ts — 正式 EBNF obligation 的有界 source-witness 语料生成器。
 //
 // 框架沿袭 tools/semantic_gen.py 的 family×seed 形态(确定性生成、每条目带合同、
 // 矩阵式 manifest、--check 自检); 此处 family=production shape, seed=variant。
@@ -7,32 +7,75 @@
 //
 // 输入(只读):
 //   TREE/docs/cheng-formal-spec.md  → buildChengGrammarObligationContract(m9024)
-//   fixtures/semantic/ebnf_parser_node_map.json → covered 集(MAPPED+PARTIAL 85)与 mapStatus
+//   fixtures/semantic/ebnf_parser_node_map.json → current mapStatus/receipt_ready/
+//     required-witnessed-missing 计数(只读，不得由 corpus 反向升级)
 // 输出(确定性, 无时间戳/无 RNG):
-//   fixtures/semantic/grammar_corpus/<shape>.cheng  最小真实 Cheng 源(过 lintChengPublicSource)
-//   fixtures/semantic/grammar_corpus/corpus.json    manifest: 每条 source 的 claims
-//     (obligationId/production/kind/structuralPath/variant/bound/mapStatus) + blocked 清单
+//   fixtures/semantic/grammar_corpus/current 单标量 content-addressed generation 指针
+//   fixtures/semantic/grammar_corpus/.cheng-grammar-corpus-generations/
+//     sha256-*/<shape>.cheng  最小真实 Cheng 源(过 lintChengPublicSource)
+//     sha256-*/corpus.json   manifest: 每条 source 的 claims
+//     (obligationId/production/kind/structuralPath/variant/bound/
+//      mapStatus/receiptReady)
 //     + 按 obligation 类(production/choice/optional/repetition/recursion)的命中 production 集
-// 完备性硬门: covered 85 production 的全部 required obligation 必须各有一条 claim,
-//   否则除非在 BLOCKED 表(带仲裁 disposition: no-pointer 门禁排除 / 表面不可写); 不满足即非零退出。
+// 完备性硬门: PLAN 声明的 source-witness production 的全部 required
+//   obligation 必须各有且仅有一条 claim；不存在人工 BLOCKED/排除清单。
+//   Source claim 不等于 parser receipt；manifest 原样保留 map 的
+//   witnessedRequiredCount/missingRequiredCount，receiptReady 全由真实 map 决定。
 //
 // 用法: bun tools/grammar_corpus_gen.ts [--check]
 //   默认写出文件; --check 只在内存重建并与磁盘逐字节比对。
-import {readFileSync, writeFileSync, mkdirSync, existsSync} from "node:fs";
-import {dirname, resolve} from "node:path";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdtempSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import {basename, dirname, join, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {
   buildChengGrammarObligationContract,
   lintChengPublicSource,
   type ChengGrammarObligation,
 } from "../src/cheng_semantic_pipeline_matrix_m9024.ts";
-import {sha256} from "../src/cheng_semantic_matrix_m9023.ts";
+import {
+  canonicalJson,
+  sha256,
+} from "../src/cheng_semantic_matrix_m9023.ts";
+import {
+  buildEbnfParserNodeMap,
+  rebuildSerializedEbnfParserNodeMapFromReceiptArtifacts,
+  validateCurrentUnwitnessedEbnfParserNodeMap,
+} from "../src/cheng_ebnf_parser_node_map.ts";
+import {parseUniqueCurrentJson} from "../src/current_schema_json.ts";
+import {
+  CHENG_GRAMMAR_CORPUS_CURRENT,
+  CHENG_GRAMMAR_CORPUS_GENERATIONS,
+  chengGrammarCorpusFileIdentityEqual,
+  chengGrammarCorpusGenerationId,
+  readCurrentChengGrammarCorpus,
+} from "../src/cheng_grammar_corpus_store.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SPEC_PATH = process.env.CHENG_FORMAL_SPEC_PATH ?? "/Users/lbcheng/cheng-lang/docs/cheng-formal-spec.md";
-const MAP_PATH = resolve(HERE, "../fixtures/semantic/ebnf_parser_node_map.json");
+const MAP_PATH = process.env.CHENG_EBNF_MAP_PATH ??
+  resolve(HERE, "../fixtures/semantic/ebnf_parser_node_map.json");
+const PARSER_PATH = process.env.CHENG_PARSER_PATH ??
+  "/Users/lbcheng/cheng-lang/src/core/lang/parser.cheng";
+const PRODUCER_CLAIMS_PATH = resolve(
+  HERE,
+  "../fixtures/semantic/ebnf_parser_producer_claims.json",
+);
 const OUT_DIR = resolve(HERE, "../fixtures/semantic/grammar_corpus");
-const CORPUS_SCHEMA = "cheng_grammar_witness_corpus.v1";
+const CORPUS_SCHEMA = "cheng_grammar_witness_corpus";
 
 // ---------------------------------------------------------------- EBNF walk
 // 与 m9024 tokenizeEbnf/parseEbnfExpression/walk 同逻辑(逐 obligation fragmentSha256
@@ -122,21 +165,45 @@ interface StructuralNode {
   readonly structuralPath: string;
   readonly fragment: string;
   readonly armFragments: readonly string[];
+  readonly insideIndentEnvelope: boolean;
 }
 
 function enumerateStructuralNodes(rhs: string): StructuralNode[] {
   const ast = parseEbnfExpression(rhs);
   const out: StructuralNode[] = [];
-  function walk(node: GNode, path: string): void {
+  function walk(
+    node: GNode,
+    path: string,
+    insideIndentEnvelope: boolean,
+  ): void {
     if (node.kind === "choice") {
       out.push({kind: "choice", structuralPath: path, fragment: normalizedFragment(node),
-        armFragments: node.children.map(normalizedFragment)});
+        armFragments: node.children.map(normalizedFragment),
+        insideIndentEnvelope});
     } else if (node.kind === "optional" || node.kind === "repetition") {
-      out.push({kind: node.kind, structuralPath: path, fragment: normalizedFragment(node), armFragments: []});
+      out.push({
+        kind: node.kind,
+        structuralPath: path,
+        fragment: normalizedFragment(node),
+        armFragments: [],
+        insideIndentEnvelope,
+      });
     }
-    node.children.forEach((child, index) => walk(child, `${path}.${node.kind}${index}`));
+    node.children.forEach((child, index) => {
+      const directlyInsideIndentEnvelope =
+        node.kind === "sequence" &&
+        node.children.slice(0, index).some((sibling) =>
+          sibling.kind === "atom" && sibling.text === "INDENT") &&
+        node.children.slice(index + 1).some((sibling) =>
+          sibling.kind === "atom" && sibling.text === "DEDENT");
+      walk(
+        child,
+        `${path}.${node.kind}${index}`,
+        insideIndentEnvelope || directlyInsideIndentEnvelope,
+      );
+    });
   }
-  walk(ast, "root");
+  walk(ast, "root", false);
   return out;
 }
 
@@ -166,6 +233,17 @@ function extractEbnfBlock(spec: string): string {
 const L = (...lines: string[]) => lines.join("\n") + "\n";
 
 const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Record<string, number>; lacks?: string[]}}> = {
+  mod_empty: {
+    note: "仅 module header，零 import、零 top-level declaration",
+    code: L("module corpus_empty"),
+    evidence: {
+      has: {"module": 1, "corpus_empty": 1},
+      lacks: [
+        "import", "fn", "type", "let", "var", "const", "iterator",
+        "macro", "template", "concept", "trait",
+      ],
+    },
+  },
   mod_min: {
     note: "最小模块: 1 个 fn decl, 无 header/import/空行",
     code: L(
@@ -262,28 +340,76 @@ const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Rec
     evidence: {has: {"let": 2, "var": 3, "const": 2}},
   },
   anno: {
-    note: "annotations 重复 0/1/8 + annotation 参数 absent/present",
+    note: "已注册 annotation 重复 0/1/8 + 参数 absent/present",
     code: L(
-      "@inline",
+      "@profile",
       "fn f1(): int32 =",
       "    return 1",
-      "@a",
-      "@b",
-      "@c",
-      "@d",
-      "@e",
-      "@f",
-      "@g",
-      "@h",
+      "@profile",
+      "@profile",
+      "@profile",
+      "@profile",
+      "@profile",
+      "@profile",
+      "@profile",
+      "@profile",
       "fn f2(): int32 =",
       "    return 2",
-      "@deprecated(\"x\")",
+      "@profile(\"x\")",
       "fn f3(): int32 =",
       "    return 3",
       "fn main(): int32 =",
       "    return 0",
     ),
-    evidence: {has: {"@inline": 1, "@deprecated": 1, "@a": 1, "@h": 1}},
+    evidence: {has: {"@profile": 10}},
+  },
+  anno_args: {
+    note: "Annotation/AnnotationArg SoA 全形：标量、顶层键值、递归 list/dict、两种 separator、空值、尾逗号、8+1 有界组合",
+    code: L(
+      "@profile",
+      "@profile",
+      "@profile",
+      "@profile",
+      "@profile",
+      "@profile",
+      "@profile",
+      "@profile",
+      "let annotationRun = 1",
+      "@profile()",
+      "let annotationEmpty = 1",
+      "@profile(id)",
+      "let annotationScalar = 1",
+      "@profile(left: id; right = true)",
+      "let annotationSeparators = 1",
+      "@profile(id, 1, 2.5, \"s\", 'c', false, key = id, [id, 1, \"s\", 'c', true, [id], {nested: id}, tail, last, extra,], {id: id, \"s\" = 1, 2: true, false: id, a: [id], b: {c = id}, d: id, e: id, f: id, g: id,}, extra)",
+      "let annotationAll = 1",
+      "@profile([], {})",
+      "let annotationEmpties = 1",
+      "@profile([a], {a: a})",
+      "let annotationOne = 1",
+      "@profile([a, b], {a: a, b = b})",
+      "let annotationTwo = 1",
+      "@profile([a,], {a: a,})",
+      "let annotationTrailing = 1",
+      "@profile([[[[id]]]])",
+      "let annotationDeepList = 1",
+      "@profile({a: {b = {c: {d = id}}}})",
+      "let annotationDeepDict = 1",
+      "@profile(a = b: c = d: e)",
+      "let annotationDeepEntry = 1",
+      "fn annotated(a: int32, b: int32): int32 =",
+      "    return a + b",
+    ),
+    evidence: {
+      has: {
+        "@profile": 19,
+        "[": 10,
+        "{": 10,
+        ":": 10,
+        "=": 10,
+        ";": 1,
+      },
+    },
   },
   fn: {
     note: "fnDecl 单行形 + routineHead/paramList/param 全 variant",
@@ -299,6 +425,9 @@ const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Rec
       "fn f8(a: int32 = 1): int32 = a",
       "fn v(): int32 =",
       "    return",
+      "fn suite2(): int32 =",
+      "    let x = 1",
+      "    return x",
       "fn main(): int32 =",
       "    return 0",
     ),
@@ -369,12 +498,17 @@ const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Rec
     evidence: {has: {"yield": 3, "macro": 2, "template": 4, "iterator": 2, "concept": 2, "trait": 2, "where": 2}},
   },
   types: {
-    note: "typeDecl/typeEntry/fieldDecl/tupleElem/enumField 全 variant + 语句位 typeDecl",
+    note: "typeDecl/typeEntry/objectType/of inheritance/fieldDecl/tupleElem/enumField 全 variant；typeArg 覆盖复杂类型、整数、单标识符及逗号/分号",
     code: L(
       "type A = int32",
       "type B[T] = T",
       "type W where 1 > 0 = int32",
       "type C = tuple[int32, str]",
+      "type TypeArgEmpty = Vector[]",
+      "type TypeArgNumber = Vector[4]",
+      "type TypeArgIdent[T] = Vector[T]",
+      "type TypeArgNested = Vector[tuple[int32, str]]",
+      "type TypeArgSemi = Generic2[int32; str]",
       "type Tup = tuple[a: int32, b: str = \"t\"]",
       "type E1 = enum:",
       "    Red",
@@ -382,6 +516,11 @@ const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Rec
       "type Obj =",
       "    x: int32",
       "    y: str = \"d\"",
+      "type BaseObj =",
+      "    baseValue: int32",
+      "type DerivedObj = of BaseObj:",
+      "    derivedValue: int32",
+      "type EmptyDerivedObj = of BaseObj",
       "type",
       "    D = int32",
       "    E = str",
@@ -408,6 +547,206 @@ const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Rec
       "    return 0",
     ),
     evidence: {has: {"type": 12, "where": 2, "enum": 1, "tuple": 2}},
+  },
+  algebraic_types: {
+    note: "algebraicType/variantType parser-owned TypeSyntax 全形：联合 0/1/8、payload absent/empty/present、field 0/1/8、逗号/分号、默认值、递归深度 3",
+    code: L(
+      "type Single = Only(value: int32)",
+      "type Pair = Left | Right",
+      "type Nine = K0 | K1 | K2 | K3 | K4 | K5 | K6 | K7 | K8",
+      "type Payloads = None | Empty() | Comma(a: int32, b: str) | Semi(a: int32; b: str) | Many(a0: int32, a1: int32, a2: int32, a3: int32, a4: int32, a5: int32, a6: int32, a7: int32, a8: int32) | Defaulted(value: int32 = 1)",
+      "type Deep = A(value: B(value: C(value: D())))",
+      "fn main(): int32 =",
+      "    return 0",
+    ),
+    evidence: {
+      has: {
+        "type": 5,
+        "|": 14,
+        "(": 9,
+        ")": 9,
+        ",": 9,
+        ";": 1,
+        "=": 7,
+      },
+    },
+  },
+  type_shapes: {
+    note: "剩余结构类型正式表面：object inheritance、托管 ref object、泛型约束/default、fn/tuple/set/enum/var、qualified/bracket/optional postfix 与 8 上界",
+    code: L(
+      "type BaseObject =",
+      "    f0: int32",
+      "    f1: str",
+      "    f2: bool",
+      "    f3: char",
+      "    f4: int64",
+      "    f5: uint8",
+      "    f6: float32",
+      "    f7: float64",
+      "    f8: int32",
+      "type DerivedWithColon = of BaseObject:",
+      "    local: int32",
+      "type DerivedNoColon = of BaseObject",
+      "type EmptyImplicit =",
+      "type ExplicitInherited = object of BaseObject",
+      "type ExplicitNoColon = object",
+      "    local: int32",
+      "type ManagedEmpty = ref object",
+      "type ManagedInherited = ref object of BaseObject:",
+      "    local: int32",
+      "type ManagedRef = ref object:",
+      "    value: int32",
+      "    child: ref object:",
+      "        next: ref object:",
+      "            leaf: ref object",
+      "type Generic[A, B; C, D, E, F, G, H, I] = A",
+      "type ParamForms[A, B: int32, C = int32, D: int32 = int32] = A",
+      "type DeepParam[T: tuple[tuple[tuple[int32]]] = tuple[tuple[tuple[int32]]]] = T",
+      "type Proc0 = fn()",
+      "type Proc1 = fn(): int32",
+      "type ProcDeep = fn(): fn(): fn(): fn(): int32",
+      "type TupleOne = tuple[int32]",
+      "type TupleComma = tuple[int32, str]",
+      "type TupleSemi = tuple[int32; str]",
+      "type TupleNine = tuple[int32, int32, int32, int32, int32, int32, int32, int32, int32]",
+      "type TupleDeep = tuple[tuple[tuple[tuple[int32]]]]",
+      "type SetOne = set[int32]",
+      "type SetDeep = set[set[set[set[int32]]]]",
+      "type EnumEmpty = enum",
+      "type EnumFlat = enum: Red",
+      "type EnumBlock = enum",
+      "    E0",
+      "    E1",
+      "    E2",
+      "    E3",
+      "    E4",
+      "    E5",
+      "    E6",
+      "    E7",
+      "    E8",
+      "type Qualified = A.B.C.D.E.F.G.H.I",
+      "type BracketEmpty = Vector[]",
+      "type BracketOne = Vector[int32]",
+      "type BracketMixed = Vector[tuple[int32], 4, T]",
+      "type BracketSemi = Vector[int32; str]",
+      "type BracketNine = Vector[int32, int32, int32, int32, int32, int32, int32, int32, int32]",
+      "type OptionalOne = int32?",
+      "type Parenthesized = (((int32)))",
+      "type VarOne = var int32",
+      "type VarDeep = var var var var int32",
+      "fn main(): int32 =",
+      "    return 0",
+    ),
+    evidence: {
+      has: {
+        "type": 35,
+        "of": 4,
+        "ref": 6,
+        "object": 8,
+        "fn": 5,
+        "tuple": 10,
+        "set": 5,
+        "enum": 3,
+        "var": 5,
+        ".": 8,
+        "?": 1,
+        ";": 3,
+      },
+      lacks: ["*"],
+    },
+  },
+  pattern_shapes: {
+    note: "Pattern SoA 正式表面：binding/wildcard/literal/tuple/sequence/set/range/object/variant、typed projection 与 8 上界；caseArm/lvalue 另由精确结构证据门禁",
+    code: L(
+      "fn patternSource(value: int32): int32 =",
+      "    match value:",
+      "        bind => return 1",
+      "        typed: int32 => return 2",
+      "        _ => return 3",
+      "        _: int32 => return 4",
+      "        1 => return 5",
+      "        \"s\" => return 6",
+      "        true => return 7",
+      "        'c' => return 8",
+      "        (a) => return 9",
+      "        (a, b) => return 10",
+      "        (a, b, c, d, e, f, g, h, i) => return 11",
+      "        [] => return 12",
+      "        [a] => return 13",
+      "        [a, b, c, d, e, f, g, h, i] => return 14",
+      "        {a} => return 15",
+      "        {a, b} => return 16",
+      "        {a, b, c, d, e, f, g, h, i} => return 17",
+      "        a..b => return 18",
+      "        a..<b => return 19",
+      "        Point(a) => return 20",
+      "        Point(x: a) => return 21",
+      "        Object9(a0: a, a1: b, a2: c, a3: d, a4: e, a5: f, a6: g, a7: h, a8: i) => return 22",
+      "        None => return 23",
+      "        Empty() => return 24",
+      "        Some(a) => return 25",
+      "        Many(a, b, c, d, e, f, g, h, i) => return 26",
+      "        (((deep))) => return 27",
+      "        Outer(value: Inner(value: Deep(value: leaf))) => return 28",
+      "    case value:",
+      "        of 1: value = 1",
+      "        of 1, 2: value = 2",
+      "        of 1, 2, 3, 4, 5, 6, 7, 8, 9: value = 3",
+      "        of Some(1): value = 4",
+      "        of Outer(value: Inner(value: Deep(value: leaf))): value = 5",
+      "    var root = value",
+      "    root.a = value",
+      "    root.a[0].b = value",
+      "    return value",
+      "fn main(): int32 =",
+      "    return patternSource(1)",
+    ),
+    evidence: {
+      has: {
+        "match": 1,
+        ">": 28,
+        "_": 2,
+        "..": 1,
+        "..<": 1,
+        "Point": 2,
+        "Many": 1,
+        "case": 1,
+        "of": 5,
+        ".": 3,
+      },
+    },
+  },
+  concept_trait_shapes: {
+    note: "concept/trait 声明与 statement 递归、typeParamList absent/present 的正式表面",
+    code: L(
+      "concept PlainConcept:",
+      "    x = 1",
+      "concept GenericConcept[T]:",
+      "    y = 2",
+      "concept C0:",
+      "    concept C1:",
+      "        concept C2:",
+      "            concept C3:",
+      "                z = 3",
+      "trait PlainTrait:",
+      "    a = 1",
+      "trait GenericTrait[T]:",
+      "    b = 2",
+      "trait R0:",
+      "    trait R1:",
+      "        trait R2:",
+      "            trait R3:",
+      "                c = 3",
+      "fn main(): int32 =",
+      "    concept LocalConcept[T]:",
+      "        p = 1",
+      "    trait LocalTrait[T]:",
+      "        q = 2",
+      "    return 0",
+    ),
+    evidence: {
+      has: {"concept": 7, "trait": 7, "[": 4, "]": 4},
+    },
   },
   stmt: {
     note: "控制语句全族 + statementCore 多数臂 + suite 重复 one/max",
@@ -543,10 +882,9 @@ const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Rec
       "    of 7: r = 7",
       "    of 8: r = 8",
       "    else: r = 9",
-      "    case r",
       "    return r",
     ),
-    evidence: {has: {"elif": 16, "match": 3, "case": 7, "of": 19, "for": 2, "else": 4}},
+    evidence: {has: {"elif": 16, "match": 3, "case": 6, "of": 19, "for": 2, "else": 4}},
   },
   expr_ops: {
     note: "全部二元层 one/zero + 三元 + 一元前缀 + await",
@@ -648,13 +986,13 @@ const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Rec
       "    let g = f [1, 2]",
       "    let h = f {1, 2}",
       "    let i = f (1)",
-      "    let j = f 1.abs",
+      "    let j = f (1).abs",
       "    let k = f 1[0]",
       "    let l = f 1[0..1]",
       "    let m = f 1[0..<1]",
       "    let n = f 1?",
       "    let o = f 1(2)",
-      "    let p = f 1.a.b.c.d.e.f.g.h",
+      "    let p = f (1).a.b.c.d.e.f.g.h",
       "    let q = f {}",
       "    let r = f {1, 2, 3, 4, 5, 6, 7, 8, 9}",
       "    let s = f {1,}",
@@ -672,6 +1010,10 @@ const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Rec
       "    let i = 42",
       "    let f = 4.2",
       "    let s = \"str\"",
+      "    let multiline = \"\"\"",
+      "        alpha",
+      "        beta",
+      "    \"\"\"",
       "    let c = 'x'",
       "    let bt = true",
       "    let bf = false",
@@ -682,7 +1024,8 @@ const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Rec
       "    let t5 = (1, 2, 3, 4, 5, 6, 7, 8, 9)",
       "    let l1 = [1]",
       "    let l2 = [1, 2]",
-      "    let l3: int32[] = []",
+      "    var l3: int32[]",
+      "    l3 = []",
       "    let l4 = [1, 2,]",
       "    let l5 = [1, 2, 3, 4, 5, 6, 7, 8, 9]",
       "    let p = (i)",
@@ -787,9 +1130,9 @@ const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Rec
       "            else: 3",
       "        else: 4",
       "    case a",
-      "    of fn(): int32 =",
+      "    of (fn(): int32 = 1):",
       "        case a",
-      "        of fn(): int32 =",
+      "        of (fn(): int32 = 2):",
       "            case a",
       "            of 1: 1",
       "            else: 2",
@@ -951,68 +1294,8 @@ const SOURCES: Record<string, {note: string; code: string; evidence?: {has?: Rec
   },
 };
 
-// ---------------------------------------------------------------- BLOCKED
-// 无法由过 lint 的真实表面见证的 obligation(如实, 每条绑机械理由 + 仲裁 disposition + spec 证据)。
-// disposition 取值:
-//   excluded_no_pointer_public_gate — 语法合法(spec §1.2)但 §0.2 no-pointer 生产门禁禁用的
-//     指针操作(解引用 `*`/`->`、取址 `&`); lintChengPublicSource 是该门禁的公开表面镜像,
-//     公开语料永无 lint-clean witness, 属合同级排除而非 lint bug。
-//   excluded_surface_unwritable — repetition zero 要求空 INDENT 块; §1.1 无 pass/空语句,
-//     statementCore 无空臂, INDENT 由缩进行触发(空块不产生 INDENT), 表面不可写。
-// kind 取值同合同; key 精确匹配节点 fragment(见 dump_obligations)。
-const BLOCKED: {
-  production: string; kind: "choice" | "optional" | "repetition"; key: string; variant: string;
-  disposition: "excluded_no_pointer_public_gate" | "excluded_surface_unwritable";
-  reason: string; evidence: readonly string[];
-}[] = [
-  {production: "unary", kind: "choice", key: "sequence(\"*\",unary)", variant: "alternative_3",
-    disposition: "excluded_no_pointer_public_gate",
-    reason: "解引用 `*` unary 属 no-pointer 生产门禁禁用指针操作; lint M9024_L04 为其公开表面镜像(前缀位 `*` 仍禁, 二元乘法门禁不管)",
-    evidence: ["docs/cheng-formal-spec.md §0.2 no-pointer 生产门禁: 禁用指针操作(解引用 `*`/`->`、取址 `&`)",
-      "docs/cheng-formal-spec.md §1.2 unary ::= \"*\" unary(语法合法, 公开口径除外)"]},
-  {production: "unary", kind: "choice", key: "sequence(\"&\",unary)", variant: "alternative_4",
-    disposition: "excluded_no_pointer_public_gate",
-    reason: "取址 `&` unary 属 no-pointer 生产门禁禁用指针操作; lint M9024_L03 前缀位 `&` 仍禁(二元按位与已放行)",
-    evidence: ["docs/cheng-formal-spec.md §0.2 no-pointer 生产门禁: 禁用指针操作(取址 `&`)",
-      "docs/cheng-formal-spec.md §1.2 unary ::= \"&\" unary(语法合法, 公开口径除外)"]},
-  {production: "postfix", kind: "choice", key: "sequence(\"->\",ident)", variant: "alternative_1",
-    disposition: "excluded_no_pointer_public_gate",
-    reason: "`->` 唯一语法角色是 `T*` 指针成员访问(等价 `(*p).field`), 属 no-pointer 生产门禁禁用解引用; lint M9024_L03 恒禁",
-    evidence: ["docs/cheng-formal-spec.md §0.2 指针成员访问: `T*` 的成员访问统一使用 `->`",
-      "docs/cheng-formal-spec.md §0.2 no-pointer 生产门禁: 禁用指针操作(解引用 `*`/`->`)",
-      "docs/cheng-formal-spec.md §1.2 postfix ::= unary { ... \"->\" ident ... }(语法合法, 公开口径除外)"]},
-  {production: "suite", kind: "repetition", key: "repetition(sequence(statement))", variant: "zero",
-    disposition: "excluded_surface_unwritable",
-    reason: "repetition zero = NEWLINE INDENT DEDENT 空块; 无 pass/空语句, 空块不产生 INDENT, 表面不可写",
-    evidence: ["docs/cheng-formal-spec.md §1.2 suite ::= NEWLINE INDENT { statement } DEDENT | statement(重复仅在 INDENT 臂内)",
-      "docs/cheng-formal-spec.md §1.1 关键字表无 pass; statementCore 22 臂无空语句",
-      "docs/cheng-formal-spec.md §1.1 INDENT/DEDENT 由行首缩进触发(空块无缩进行)"]},
-  {production: "caseStmt", kind: "repetition", key: "@root.sequence3.group0.choice1.sequence1.optional0.choice0.sequence1", variant: "zero",
-    disposition: "excluded_surface_unwritable",
-    reason: "INDENT 形 0 个 caseBranch = `case r:` 后空 INDENT 块, 同 suite 空块不可写",
-    evidence: ["docs/cheng-formal-spec.md §1.2 caseStmt ::= ... NEWLINE [ INDENT { caseBranch } DEDENT | { caseBranch } ]",
-      "docs/cheng-formal-spec.md §1.1 无 pass/空语句; 空块不产生 INDENT"]},
-  {production: "caseStmt", kind: "repetition", key: "@root.sequence3.group0.choice1.sequence1.optional0.choice1.sequence0", variant: "zero",
-    disposition: "excluded_surface_unwritable",
-    reason: "flat 形 0 个 caseBranch = `case r` 换行后无任何分支, 表面不可写(同空块)",
-    evidence: ["docs/cheng-formal-spec.md §1.2 caseStmt ::= ... NEWLINE [ INDENT { caseBranch } DEDENT | { caseBranch } ]"]},
-  {production: "module", kind: "repetition", key: "repetition(sequence(topLevelDecl,repetition(sequence(NEWLINE))))", variant: "zero",
-    disposition: "excluded_surface_unwritable",
-    reason: "0 个 topLevelDecl = 空模块(0 个公开 token), witness 模型要求非空 token span, 无法表达",
-    evidence: ["src/cheng_semantic_pipeline_matrix_m9024.ts buildGrammarSourceCoverageReceipt: tokenEnd <= tokenStart 即 invalid grammar source witness span"]},
-  {production: "caseExpr", kind: "repetition", key: "repetition(sequence(caseExprBranch))", variant: "zero",
-    disposition: "excluded_surface_unwritable",
-    reason: "0 个 caseExprBranch = `case a:` 后空 INDENT 块(caseExpr 无 flat 臂), 表面不可写",
-    evidence: ["docs/cheng-formal-spec.md §1.2 caseExpr ::= \"case\" expression [\":\"] ( expression | NEWLINE INDENT { caseExprBranch } DEDENT ) [...]",
-      "docs/cheng-formal-spec.md §1.1 无 pass/空语句; 空块不产生 INDENT"]},
-  {production: "stringLiteral", kind: "choice", key: "sequence(MULTILINE_STRING)", variant: "alternative_1",
-    disposition: "excluded_surface_unwritable",
-    reason: "多行字符串字面量在语料 token 模型中被 chengCodeWithoutCommentsAndLiterals 逐字符抹空格(保偏移), 无 token 锚点可写 claim span; 短串臂已 claim",
-    evidence: ["tools/grammar_span_receipt.ts chengCodeWithoutCommentsAndLiterals: 字符串/字符字面量逐字符抹空格(换行保留), 多行串内部无可见 token"]},
-];
-
 // ---------------------------------------------------------------- PLAN
-// 每个 covered production 的 claim 计划。key 解析规则:
+// 每个 source-witness production 的 claim 计划。key 解析规则:
 //   "@<path>"     → structuralPath 精确匹配
 //   其他           → 节点 fragment 精确匹配(choice 时匹配臂 fragment)
 // variant 映射: choice → 臂序; optional → absent/present 各自 src;
@@ -1026,7 +1309,6 @@ interface ProdPlan {
 }
 
 const OPT = (absent: string, present: string) => ({absent, present});
-// zero/one/max 任一可 undefined → 该 variant 无 claim(落入 missing, 由 BLOCKED 承接)
 const REP = (zero?: string, one?: string, max?: string): {zero: string | undefined; one: string | undefined; max: string | undefined} => ({zero, one, max});
 
 const PLAN: Record<string, ProdPlan> = {
@@ -1038,7 +1320,7 @@ const PLAN: Record<string, ProdPlan> = {
       "@root.sequence1.optional0.sequence1": REP("mod_hdr0", "mod_mid", "mod_full"),
       "repetition(sequence(importDecl,repetition(sequence(NEWLINE))))": REP("mod_min", "mod_hdr0", "mod_full"),
       "@root.sequence2.repetition0.sequence1": REP("mod_hdr0", "mod_mid", "mod_full"),
-      "repetition(sequence(topLevelDecl,repetition(sequence(NEWLINE))))": REP(undefined, "mod_min", "mod_full"),
+      "repetition(sequence(topLevelDecl,repetition(sequence(NEWLINE))))": REP("mod_empty", "mod_min", "mod_full"),
       "@root.sequence3.repetition0.sequence1": REP("mod_min", "mod_mid", "mod_full"),
     },
   },
@@ -1080,8 +1362,78 @@ const PLAN: Record<string, ProdPlan> = {
     recursion: "rec_stmt",
   },
   storage: {root: "bind", choice: {"sequence(\"let\")": "bind", "sequence(\"var\")": "bind", "sequence(\"const\")": "bind"}},
-  annotations: {root: "anno", repetition: {"repetition(sequence(annotation))": REP("anno", "anno", "anno")}},
-  annotation: {root: "anno", optional: {"optional(sequence(annotationArgs))": OPT("anno", "anno")}},
+  annotations: {root: "anno", repetition: {"repetition(sequence(annotation))": REP("anno", "anno", "anno_args")}},
+  annotation: {root: "anno", optional: {"optional(sequence(annotationArgs))": OPT("anno", "anno_args")}},
+  annotationArgs: {
+    root: "anno_args",
+    choice: {
+      "sequence(\",\")": "anno_args",
+      "sequence(\";\")": "anno_args",
+    },
+    optional: {
+      "optional(sequence(annotationArg,repetition(sequence(group(choice(sequence(\",\"),sequence(\";\"))),annotationArg))))":
+        OPT("anno_args", "anno_args"),
+    },
+    repetition: {
+      "repetition(sequence(group(choice(sequence(\",\"),sequence(\";\"))),annotationArg))":
+        REP("anno_args", "anno_args", "anno_args"),
+    },
+  },
+  annotationArg: {
+    root: "anno_args",
+    choice: {
+      "sequence(ident)": "anno_args",
+      "sequence(numberLiteral)": "anno_args",
+      "sequence(stringLiteral)": "anno_args",
+      "sequence(charLiteral)": "anno_args",
+      "sequence(boolLiteral)": "anno_args",
+      "sequence(annotationEntry)": "anno_args",
+      "sequence(annotationList)": "anno_args",
+      "sequence(annotationDict)": "anno_args",
+    },
+    recursion: "anno_args",
+  },
+  annotationList: {
+    root: "anno_args",
+    optional: {
+      "@root.sequence1": OPT("anno_args", "anno_args"),
+      "@root.sequence1.optional0.sequence2": OPT("anno_args", "anno_args"),
+    },
+    repetition: {
+      "repetition(sequence(\",\",annotationArg))":
+        REP("anno_args", "anno_args", "anno_args"),
+    },
+    recursion: "anno_args",
+  },
+  annotationDict: {
+    root: "anno_args",
+    optional: {
+      "@root.sequence1": OPT("anno_args", "anno_args"),
+      "@root.sequence1.optional0.sequence2": OPT("anno_args", "anno_args"),
+    },
+    repetition: {
+      "repetition(sequence(\",\",annotationEntry))":
+        REP("anno_args", "anno_args", "anno_args"),
+    },
+    recursion: "anno_args",
+  },
+  annotationEntry: {
+    root: "anno_args",
+    choice: {
+      "sequence(\":\")": "anno_args",
+      "sequence(\"=\")": "anno_args",
+    },
+    recursion: "anno_args",
+  },
+  annotationKey: {
+    root: "anno_args",
+    choice: {
+      "sequence(ident)": "anno_args",
+      "sequence(stringLiteral)": "anno_args",
+      "sequence(numberLiteral)": "anno_args",
+      "sequence(boolLiteral)": "anno_args",
+    },
+  },
   routineHead: {
     root: "fn",
     optional: {
@@ -1153,11 +1505,39 @@ const PLAN: Record<string, ProdPlan> = {
     },
     choice: {
       "sequence(typeExpr)": "types",
-      "sequence(objectType)": "types",
+      "sequence(implicitObjectType)": "types",
     },
     recursion: "rec_decl",
   },
   fieldDecl: {root: "types", optional: {"optional(sequence(\"=\",expression))": OPT("types", "types")}, recursion: "rec_decl"},
+  algebraicType: {
+    root: "algebraic_types",
+    repetition: {
+      "repetition(sequence(\"|\",variantType))":
+        REP("algebraic_types", "algebraic_types", "algebraic_types"),
+    },
+    recursion: "algebraic_types",
+  },
+  variantType: {
+    root: "algebraic_types",
+    optional: {
+      "@root.sequence1":
+        OPT("algebraic_types", "algebraic_types"),
+      "@root.sequence1.optional0.sequence1":
+        OPT("algebraic_types", "algebraic_types"),
+    },
+    choice: {
+      "@root.sequence1.optional0.sequence1.optional0.sequence1.repetition0.sequence0.group0:0":
+        "algebraic_types",
+      "@root.sequence1.optional0.sequence1.optional0.sequence1.repetition0.sequence0.group0:1":
+        "algebraic_types",
+    },
+    repetition: {
+      "@root.sequence1.optional0.sequence1.optional0.sequence1":
+        REP("algebraic_types", "algebraic_types", "algebraic_types"),
+    },
+    recursion: "algebraic_types",
+  },
   paramList: {
     root: "fn",
     optional: {"optional(sequence(param,repetition(sequence(group(choice(sequence(\",\"),sequence(\";\"))),param))))": OPT("fn", "fn")},
@@ -1185,10 +1565,10 @@ const PLAN: Record<string, ProdPlan> = {
   suite: {
     root: "mod_min",
     choice: {
-      "sequence(NEWLINE,INDENT,repetition(sequence(statement)),DEDENT)": "mod_min",
+      "sequence(NEWLINE,INDENT,statement,repetition(sequence(statement)),DEDENT)": "mod_min",
       "sequence(statement)": "fn",
     },
-    repetition: {"repetition(sequence(statement))": REP(undefined, "mod_min", "stmt")},
+    repetition: {"repetition(sequence(statement))": REP("mod_min", "fn", "stmt")},
     recursion: "rec_stmt",
   },
   statement: {root: "mod_min", recursion: "rec_stmt"},
@@ -1238,17 +1618,18 @@ const PLAN: Record<string, ProdPlan> = {
     root: "stmt",
     optional: {
       "optional(sequence(\":\"))": OPT("stmt_rep", "stmt"),
-      "optional(choice(sequence(INDENT,repetition(sequence(caseBranch)),DEDENT),sequence(repetition(sequence(caseBranch)))))": OPT("stmt_rep", "stmt"),
     },
     choice: {
-      "sequence(suite)": "stmt_rep",
-      "sequence(NEWLINE,optional(choice(sequence(INDENT,repetition(sequence(caseBranch)),DEDENT),sequence(repetition(sequence(caseBranch))))))": "stmt",
-      "sequence(INDENT,repetition(sequence(caseBranch)),DEDENT)": "stmt",
-      "sequence(repetition(sequence(caseBranch)))": "stmt_rep",
+      "@root.sequence3.group0:0": "stmt_rep",
+      "@root.sequence3.group0:1": "stmt",
+      "@root.sequence3.group0.choice1.sequence1.group0:0": "stmt",
+      "@root.sequence3.group0.choice1.sequence1.group0:1": "stmt_rep",
     },
     repetition: {
-      "@root.sequence3.group0.choice1.sequence1.optional0.choice0.sequence1": REP(undefined, "stmt_rep", "stmt_rep"),
-      "@root.sequence3.group0.choice1.sequence1.optional0.choice1.sequence0": REP(undefined, "stmt_rep", "stmt_rep"),
+      "@root.sequence3.group0.choice1.sequence1.group0.choice0.sequence2":
+        REP("stmt_rep", "stmt_rep", "stmt_rep"),
+      "@root.sequence3.group0.choice1.sequence1.group0.choice1.sequence1":
+        REP("stmt_rep", "stmt_rep", "stmt_rep"),
     },
     recursion: "rec_stmt",
   },
@@ -1453,9 +1834,9 @@ const PLAN: Record<string, ProdPlan> = {
     },
     choice: {
       "sequence(expression)": "expr_ifcase",
-      "sequence(NEWLINE,INDENT,repetition(sequence(caseExprBranch)),DEDENT)": "expr_ifcase",
+      "sequence(NEWLINE,INDENT,caseExprBranch,repetition(sequence(caseExprBranch)),DEDENT)": "expr_ifcase",
     },
-    repetition: {"repetition(sequence(caseExprBranch))": REP(undefined, "expr_ifcase", "expr_ifcase")},
+    repetition: {"repetition(sequence(caseExprBranch))": REP("expr_ifcase", "expr_ifcase", "expr_ifcase")},
     recursion: "rec_expr",
   },
   caseExprBranch: {root: "expr_ifcase", optional: {"optional(sequence(\"if\",expression))": OPT("expr_ifcase", "expr_ifcase")}, recursion: "rec_expr"},
@@ -1481,9 +1862,267 @@ const PLAN: Record<string, ProdPlan> = {
   },
   boolLiteral: {root: "expr_primary", choice: {"sequence(\"true\")": "expr_primary", "sequence(\"false\")": "expr_primary"}},
   charLiteral: {root: "expr_primary"},
+  moduleHeader: {
+    root: "mod_hdr0",
+  },
+  conceptDecl: {
+    root: "concept_trait_shapes",
+    optional: {
+      "@root.sequence2": OPT("concept_trait_shapes", "concept_trait_shapes"),
+    },
+    recursion: "concept_trait_shapes",
+  },
+  traitDecl: {
+    root: "concept_trait_shapes",
+    optional: {
+      "@root.sequence2": OPT("concept_trait_shapes", "concept_trait_shapes"),
+    },
+    recursion: "concept_trait_shapes",
+  },
+  conceptStmt: {
+    root: "concept_trait_shapes",
+    recursion: "concept_trait_shapes",
+  },
+  traitStmt: {
+    root: "concept_trait_shapes",
+    recursion: "concept_trait_shapes",
+  },
+  typeParamList: {
+    root: "type_shapes",
+    choice: {
+      "@root.sequence2.repetition0.sequence0.group0:0": "type_shapes",
+      "@root.sequence2.repetition0.sequence0.group0:1": "type_shapes",
+    },
+    repetition: {
+      "@root.sequence2": REP("type_shapes", "type_shapes", "type_shapes"),
+    },
+    recursion: "type_shapes",
+  },
+  typeParam: {
+    root: "type_shapes",
+    optional: {
+      "@root.sequence1": OPT("type_shapes", "type_shapes"),
+      "@root.sequence2": OPT("type_shapes", "type_shapes"),
+    },
+    recursion: "type_shapes",
+  },
+  implicitObjectType: {
+    root: "type_shapes",
+    choice: {
+      "@root:0": "type_shapes",
+      "@root:1": "type_shapes",
+    },
+    optional: {
+      "@root.choice0.sequence0": OPT("type_shapes", "type_shapes"),
+      "@root.choice0.sequence1": OPT("type_shapes", "type_shapes"),
+      "@root.choice1.sequence0": OPT("type_shapes", "type_shapes"),
+    },
+    recursion: "type_shapes",
+  },
+  objectType: {
+    root: "type_shapes",
+    choice: {
+      "@root:0": "type_shapes",
+      "@root:1": "type_shapes",
+    },
+    optional: {
+      "@root.choice0.sequence1": OPT("type_shapes", "type_shapes"),
+      "@root.choice0.sequence2": OPT("type_shapes", "type_shapes"),
+      "@root.choice1.sequence1": OPT("type_shapes", "type_shapes"),
+    },
+    recursion: "type_shapes",
+  },
+  objectFields: {
+    root: "type_shapes",
+    repetition: {
+      "@root.sequence3": REP("type_shapes", "type_shapes", "type_shapes"),
+    },
+    recursion: "type_shapes",
+  },
+  typeExpr: {
+    root: "type_shapes",
+    choice: {
+      "@root:0": "type_shapes",
+      "@root:1": "type_shapes",
+      "@root:2": "type_shapes",
+      "@root:3": "type_shapes",
+      "@root:4": "type_shapes",
+      "@root:5": "type_shapes",
+      "@root:6": "type_shapes",
+      "@root:7": "type_shapes",
+    },
+    recursion: "type_shapes",
+  },
+  refType: {
+    root: "type_shapes",
+    recursion: "type_shapes",
+  },
+  procType: {
+    root: "type_shapes",
+    optional: {
+      "@root.sequence2": OPT("type_shapes", "type_shapes"),
+    },
+    recursion: "type_shapes",
+  },
+  tupleType: {
+    root: "type_shapes",
+    choice: {
+      "@root.sequence3.repetition0.sequence0.group0:0": "type_shapes",
+      "@root.sequence3.repetition0.sequence0.group0:1": "type_shapes",
+    },
+    repetition: {
+      "@root.sequence3": REP("type_shapes", "type_shapes", "type_shapes"),
+    },
+    recursion: "type_shapes",
+  },
+  setType: {
+    root: "type_shapes",
+    recursion: "type_shapes",
+  },
+  enumType: {
+    root: "type_shapes",
+    choice: {
+      "@root.sequence1.optional0:0": "type_shapes",
+      "@root.sequence1.optional0:1": "type_shapes",
+    },
+    optional: {
+      "@root.sequence1": OPT("type_shapes", "type_shapes"),
+    },
+    recursion: "type_shapes",
+  },
+  enumFields: {
+    root: "type_shapes",
+    repetition: {
+      "@root.sequence1": REP("type_shapes", "type_shapes", "type_shapes"),
+    },
+    recursion: "type_shapes",
+  },
+  varType: {
+    root: "type_shapes",
+    recursion: "type_shapes",
+  },
+  typePostfix: {
+    root: "type_shapes",
+    choice: {
+      "@root.sequence1.repetition0:0": "type_shapes",
+      "@root.sequence1.repetition0:1": "type_shapes",
+      "@root.sequence1.repetition0:2": "type_shapes",
+      "@root.sequence1.repetition0.choice1.sequence1.optional0.sequence1.repetition0.sequence0.group0:0": "type_shapes",
+      "@root.sequence1.repetition0.choice1.sequence1.optional0.sequence1.repetition0.sequence0.group0:1": "type_shapes",
+    },
+    optional: {
+      "@root.sequence1.repetition0.choice1.sequence1": OPT("type_shapes", "type_shapes"),
+    },
+    repetition: {
+      "@root.sequence1": REP("type_shapes", "type_shapes", "type_shapes"),
+      "@root.sequence1.repetition0.choice1.sequence1.optional0.sequence1": REP("type_shapes", "type_shapes", "type_shapes"),
+    },
+    recursion: "type_shapes",
+  },
+  typePrimary: {
+    root: "type_shapes",
+    choice: {
+      "@root:0": "type_shapes",
+      "@root:1": "type_shapes",
+    },
+    recursion: "type_shapes",
+  },
+  typeArg: {
+    root: "type_shapes",
+    choice: {
+      "@root:0": "type_shapes",
+      "@root:1": "type_shapes",
+      "@root:2": "type_shapes",
+    },
+    recursion: "type_shapes",
+  },
+  pattern: {
+    root: "pattern_shapes",
+    choice: {
+      "@root:0": "pattern_shapes",
+      "@root:1": "pattern_shapes",
+      "@root:2": "pattern_shapes",
+      "@root:3": "pattern_shapes",
+      "@root:4": "pattern_shapes",
+      "@root:5": "pattern_shapes",
+      "@root:6": "pattern_shapes",
+      "@root:7": "pattern_shapes",
+      "@root:8": "pattern_shapes",
+    },
+    optional: {
+      "@root.choice0.sequence1": OPT("pattern_shapes", "pattern_shapes"),
+      "@root.choice1.sequence1": OPT("pattern_shapes", "pattern_shapes"),
+      "@root.choice4.sequence1": OPT("pattern_shapes", "pattern_shapes"),
+    },
+    repetition: {
+      "@root.choice3.sequence2": REP("pattern_shapes", "pattern_shapes", "pattern_shapes"),
+      "@root.choice4.sequence1.optional0.sequence1": REP("pattern_shapes", "pattern_shapes", "pattern_shapes"),
+      "@root.choice5.sequence2": REP("pattern_shapes", "pattern_shapes", "pattern_shapes"),
+    },
+    recursion: "pattern_shapes",
+  },
+  variantPattern: {
+    root: "pattern_shapes",
+    optional: {
+      "@root.sequence1": OPT("pattern_shapes", "pattern_shapes"),
+      "@root.sequence1.optional0.sequence1": OPT("pattern_shapes", "pattern_shapes"),
+    },
+    repetition: {
+      "@root.sequence1.optional0.sequence1.optional0.sequence1": REP("pattern_shapes", "pattern_shapes", "pattern_shapes"),
+    },
+  },
+  rangePattern: {
+    root: "pattern_shapes",
+    choice: {
+      "@root.sequence1.group0:0": "pattern_shapes",
+      "@root.sequence1.group0:1": "pattern_shapes",
+    },
+    recursion: "pattern_shapes",
+  },
+  objectPattern: {
+    root: "pattern_shapes",
+    repetition: {
+      "@root.sequence3": REP("pattern_shapes", "pattern_shapes", "pattern_shapes"),
+    },
+    recursion: "pattern_shapes",
+  },
+  patternArg: {
+    root: "pattern_shapes",
+    choice: {
+      "@root:0": "pattern_shapes",
+      "@root:1": "pattern_shapes",
+    },
+    recursion: "pattern_shapes",
+  },
+  literalPattern: {
+    root: "pattern_shapes",
+    choice: {
+      "@root:0": "pattern_shapes",
+      "@root:1": "pattern_shapes",
+      "@root:2": "pattern_shapes",
+      "@root:3": "pattern_shapes",
+    },
+  },
+  caseArm: {
+    root: "pattern_shapes",
+    repetition: {
+      "@root.sequence1": REP("pattern_shapes", "pattern_shapes", "pattern_shapes"),
+    },
+    recursion: "pattern_shapes",
+  },
+  lvalue: {
+    root: "pattern_shapes",
+    recursion: "pattern_shapes",
+  },
   ident: {root: "expr_primary"},
   numberLiteral: {root: "expr_primary", choice: {"sequence(INTEGER)": "expr_primary", "sequence(FLOAT)": "expr_primary"}},
-  stringLiteral: {root: "expr_primary", choice: {"sequence(SHORT_STRING)": "expr_primary", "sequence(MULTILINE_STRING)": undefined}},
+  stringLiteral: {
+    root: "expr_primary",
+    choice: {
+      "sequence(SHORT_STRING)": "expr_primary",
+      "sequence(MULTILINE_STRING)": "expr_primary",
+    },
+  },
 };
 
 // typeDecl 的两个 choice 节点(root 与 group 内)臂 fragment 相同(sequence(typeExpr)/sequence(objectType)),
@@ -1500,6 +2139,7 @@ interface Claim {
   readonly variant: string;
   readonly bound: number | null;
   readonly mapStatus: "MAPPED" | "PARTIAL";
+  readonly receiptReady: boolean;
 }
 
 interface CorpusEntry {
@@ -1510,18 +2150,6 @@ interface CorpusEntry {
   readonly sourceSha256: string;
   readonly lintTokenCount: number;
   readonly claims: readonly Claim[];
-}
-
-interface BlockedEntry {
-  readonly obligationId: string;
-  readonly production: string;
-  readonly kind: ObligationKindName;
-  readonly structuralPath: string;
-  readonly variant: string;
-  readonly bound: number | null;
-  readonly disposition: "excluded_no_pointer_public_gate" | "excluded_surface_unwritable";
-  readonly reason: string;
-  readonly evidence: readonly string[];
 }
 
 function resolveKey(nodes: readonly StructuralNode[], kind: "choice" | "optional" | "repetition", key: string): StructuralNode {
@@ -1541,36 +2169,99 @@ function resolveKey(nodes: readonly StructuralNode[], kind: "choice" | "optional
   throw new Error(`key ${key}: ${kind} 节点命中 ${exact.length}+${contains.length}(必须唯一); 候选=${sameKind.map((n) => n.structuralPath).join(",")}`);
 }
 
-function choiceArmIndex(node: StructuralNode, key: string): number {
-  if (key.startsWith("@")) {
-    const armPart = key.slice(key.lastIndexOf(":") + 1);
-    const idx = Number(armPart);
-    if (Number.isInteger(idx) && idx >= 0 && idx < node.armFragments.length) return idx;
-    throw new Error(`key ${key}: 臂序号越界(共 ${node.armFragments.length} 臂)`);
-  }
-  const hits = node.armFragments.map((a, i) => a === key ? i : -1).filter((i) => i >= 0);
-  if (hits.length !== 1) throw new Error(`choice key ${key} 命中 ${hits.length} 臂 @ ${node.structuralPath}`);
-  return hits[0]!;
-}
-
-export function buildCorpus() {
+export function buildCorpus(
+  mapBytes: Buffer = readFileSync(MAP_PATH),
+) {
   const specBytes = readFileSync(SPEC_PATH);
+  const parserBytes = readFileSync(PARSER_PATH);
+  const producerClaimsBytes = readFileSync(PRODUCER_CLAIMS_PATH);
   const specText = specBytes.toString("utf8");
   const grammar = buildChengGrammarObligationContract(specBytes);
   const ebnf = extractEbnfBlock(specText);
   const productions = parseProductions(ebnf);
   const nodesByProd = new Map(productions.map((p) => [p.name, enumerateStructuralNodes(p.rhs)]));
-  const mapDoc = JSON.parse(readFileSync(MAP_PATH, "utf8")) as {
+  const suppliedMap = parseUniqueCurrentJson(
+    mapBytes.toString("utf8"),
+    "ebnf_parser_node_map",
+  ) as {
+    schema: string;
+    receiptEvidence: {inputCount: number; rows: unknown[]};
     spec: {formalSpecSha256: string; ebnfSha256: string};
-    rows: {name: string; status: "MAPPED" | "PARTIAL" | "UNMAPPED"}[];
+    counts: {
+      requiredObligationCount: number;
+      witnessedRequiredCount: number;
+      missingRequiredCount: number;
+    };
+    rows: {
+      name: string;
+      status: "MAPPED" | "PARTIAL" | "UNMAPPED";
+      receipt_ready: boolean;
+      required_obligation_count: number;
+      witnessed_required_count: number;
+      missing_required_count: number;
+    }[];
   };
+  const mapDoc = suppliedMap.receiptEvidence?.inputCount === 0
+    ? validateCurrentUnwitnessedEbnfParserNodeMap(
+        mapBytes,
+        specBytes,
+        parserBytes,
+        producerClaimsBytes,
+      )
+    : rebuildSerializedEbnfParserNodeMapFromReceiptArtifacts(
+        mapBytes,
+        specBytes,
+        parserBytes,
+        producerClaimsBytes,
+      );
   if (mapDoc.spec.formalSpecSha256 !== grammar.formalSpecSha256) {
-    throw new Error("ebnf_parser_node_map.json 与当前 spec 不一致(先重跑 diag_ebnf_map/gen_map.py)");
+    throw new Error(
+      "ebnf_parser_node_map.json 与当前 spec 不一致(先跑 bun tools/ebnf_parser_node_map_gen.ts)",
+    );
   }
   const statusByProd = new Map(mapDoc.rows.map((r) => [r.name, r.status]));
-  const covered = mapDoc.rows.filter((r) => r.status !== "UNMAPPED").map((r) => r.name);
+  const mapRowByProd = new Map(mapDoc.rows.map((r) => [r.name, r]));
+  if (mapRowByProd.size !== mapDoc.rows.length) {
+    throw new Error("EBNF map 存在重复 production row");
+  }
+  let rowRequiredCount = 0;
+  let rowWitnessedCount = 0;
+  let rowMissingCount = 0;
+  for (const row of mapDoc.rows) {
+    if (row.required_obligation_count !==
+        row.witnessed_required_count + row.missing_required_count) {
+      throw new Error(`EBNF map row obligation 计数不守恒: ${row.name}`);
+    }
+    if (row.receipt_ready !== (row.missing_required_count === 0)) {
+      throw new Error(`EBNF map row receipt_ready 与 missing_required_count 冲突: ${row.name}`);
+    }
+    rowRequiredCount += row.required_obligation_count;
+    rowWitnessedCount += row.witnessed_required_count;
+    rowMissingCount += row.missing_required_count;
+  }
+  // Corpus claims are source-witness plans, not parser receipts.  A truthful
+  // current map may have receipt_ready=false for every production while the
+  // formal obligation→source plan remains useful for generating parser input.
+  // Therefore PLAN selects claimable productions; the generated claim carries
+  // the map's real receiptReady bit and never upgrades PARTIAL to MAPPED.
+  const claimProductions = Object.keys(PLAN).sort();
+  for (const name of claimProductions) {
+    const row = mapRowByProd.get(name);
+    if (row === undefined) throw new Error(`PLAN 引用正式 EBNF 外 production: ${name}`);
+    if (row.status === "UNMAPPED") {
+      throw new Error(`PLAN 不得为 UNMAPPED production 生成 source claim: ${name}`);
+    }
+  }
+  if (mapDoc.counts.requiredObligationCount !== grammar.requiredCount ||
+      mapDoc.counts.witnessedRequiredCount +
+        mapDoc.counts.missingRequiredCount !== grammar.requiredCount ||
+      rowRequiredCount !== mapDoc.counts.requiredObligationCount ||
+      rowWitnessedCount !== mapDoc.counts.witnessedRequiredCount ||
+      rowMissingCount !== mapDoc.counts.missingRequiredCount) {
+    throw new Error("EBNF map obligation 计数与正式合同不一致");
+  }
 
-  // 每个 covered production 的 required obligations
+  // 每个 source-witness production 的 required obligations
   const obsByProd = new Map<string, ChengGrammarObligation[]>();
   for (const o of grammar.obligations) {
     if (o.disposition !== "required") continue;
@@ -1587,14 +2278,19 @@ export function buildCorpus() {
     }
     const mapStatus = statusByProd.get(o.production);
     if (mapStatus !== "MAPPED" && mapStatus !== "PARTIAL") throw new Error(`claim 落到 UNMAPPED production: ${o.production}`);
+    const receiptReady = mapRowByProd.get(o.production)?.receipt_ready;
+    if (receiptReady === undefined) {
+      throw new Error(`claim production 缺 EBNF map row: ${o.production}`);
+    }
     claimByObligation.set(o.obligationId, {src, claim: {
       obligationId: o.obligationId, production: o.production, kind: o.kind,
-      structuralPath: o.structuralPath, variant: o.variant, bound: o.bound, mapStatus,
+      structuralPath: o.structuralPath, variant: o.variant, bound: o.bound,
+      mapStatus, receiptReady,
     }});
   };
 
   const missing = new Map<string, string>(); // obligationId → 描述
-  for (const name of covered) {
+  for (const name of claimProductions) {
     const plan = PLAN[name];
     const obligations = obsByProd.get(name) ?? [];
     if (plan === undefined) {
@@ -1642,48 +2338,12 @@ export function buildCorpus() {
     }
   }
 
-  // BLOCKED 解析
-  const blockedEntries: BlockedEntry[] = [];
-  const blockedIds = new Set<string>();
-  for (const b of BLOCKED) {
-    const nodes = nodesByProd.get(b.production);
-    if (nodes === undefined) throw new Error(`BLOCKED 引用未知 production: ${b.production}`);
-    const node = resolveKey(nodes, b.kind, b.key);
-    const candidates = (obsByProd.get(b.production) ?? []).filter((o) =>
-      o.kind === b.kind && o.structuralPath === node.structuralPath && o.variant === b.variant);
-    if (candidates.length !== 1) throw new Error(`BLOCKED ${b.production}/${b.kind}/${b.variant} 命中 ${candidates.length} 条 obligation`);
-    const o = candidates[0]!;
-    blockedIds.add(o.obligationId);
-    blockedEntries.push({
-      obligationId: o.obligationId, production: o.production, kind: o.kind,
-      structuralPath: o.structuralPath, variant: o.variant, bound: o.bound,
-      disposition: b.disposition, reason: b.reason, evidence: b.evidence,
-    });
-  }
-  // BLOCKED 机械佐证: disposition 与节点形态必须相符
-  for (const b of BLOCKED) {
-    if (b.evidence.length === 0) throw new Error(`BLOCKED 缺 spec 证据: ${b.production} ${b.key}`);
-    if (b.disposition === "excluded_no_pointer_public_gate" &&
-        !b.key.includes("\"->\"") && !b.key.includes("\"&\"") && !b.key.includes("\"*\"")) {
-      throw new Error(`BLOCKED no-pointer disposition 与 fragment 不符: ${b.production} ${b.key}`);
-    }
-    if (b.disposition === "excluded_surface_unwritable" &&
-        !(b.kind === "repetition" && b.variant === "zero") &&
-        !(b.kind === "choice" && b.key.includes("_STRING"))) {
-      throw new Error(`BLOCKED surface-unwritable disposition 仅适用 repetition zero 或字面量 strip 后无 token 锚的 choice 臂: ${b.production} ${b.kind} ${b.variant}`);
-    }
-  }
-
-  // BLOCKED 与 claim 互斥: 被 blocked 的 obligation 不得同时存在 claim
-  for (const id of blockedIds) {
-    if (claimByObligation.has(id)) {
-      const hit = claimByObligation.get(id)!;
-      throw new Error(`BLOCKED 与 claim 冲突: ${id} 同时被 source ${hit.src} claim`);
-    }
-  }
-  const uncovered = [...missing.entries()].filter(([id]) => !blockedIds.has(id)).map(([, desc]) => desc);
+  const uncovered = [...missing.values()];
   if (uncovered.length > 0) {
-    throw new Error(`covered production 存在未 claim 且未 blocked 的 obligation(${uncovered.length}):\n  ${uncovered.join("\n  ")}`);
+    throw new Error(
+      `source-witness production 存在未 claim 的 required obligation(` +
+      `${uncovered.length}):\n  ${uncovered.join("\n  ")}`,
+    );
   }
 
   // 逐 source 装配 entries
@@ -1695,7 +2355,9 @@ export function buildCorpus() {
     const claims = [...claimByObligation.values()]
       .filter((c) => c.src === shape)
       .map((c) => c.claim)
-      .sort((a, b2) => a.obligationId.localeCompare(b2.obligationId));
+      .sort((a, b2) =>
+        a.obligationId < b2.obligationId ? -1 :
+          a.obligationId > b2.obligationId ? 1 : 0);
     entries.push({
       relativePath, shape, note: def.note,
       evidence: {has: def.evidence?.has ?? {}, lacks: def.evidence?.lacks ?? []},
@@ -1719,26 +2381,40 @@ export function buildCorpus() {
   }
   for (const list of Object.values(hitSets)) list.sort();
 
+  const coveredRequiredObligations = [...obsByProd.entries()]
+    .filter(([name]) => claimProductions.includes(name))
+    .reduce((acc, [, list]) => acc + list.length, 0);
+  if (claimByObligation.size !== coveredRequiredObligations) {
+    throw new Error(
+      `source-plan obligation 不守恒: claims=${claimByObligation.size} ` +
+      `!= covered=${coveredRequiredObligations}`,
+    );
+  }
+  if (coveredRequiredObligations !== mapDoc.counts.requiredObligationCount) {
+    throw new Error(
+      `source-plan 未覆盖全部 required obligation: covered=${coveredRequiredObligations} required=${mapDoc.counts.requiredObligationCount}`,
+    );
+  }
+
   const manifest = {
     schema: CORPUS_SCHEMA,
     generated: "deterministic(无时间戳/无 RNG, 同 semantic_gen 纪律)",
     spec: {
       formalSpecSha256: grammar.formalSpecSha256,
       ebnfSha256: grammar.ebnfSha256,
-      mapSha256: sha256(readFileSync(MAP_PATH)),
+      mapSha256: sha256(Buffer.from(canonicalJson(mapDoc), "utf8")),
       productionCount: grammar.productionCount,
     },
     counts: {
-      coveredProductions: covered.length,
+      coveredProductions: claimProductions.length,
       sources: entries.length,
       claims: claimByObligation.size,
-      blocked: blockedEntries.length,
-      coveredRequiredObligations: [...obsByProd.entries()]
-        .filter(([name]) => covered.includes(name))
-        .reduce((acc, [, list]) => acc + list.length, 0),
+      coveredRequiredObligations,
+      requiredObligationCount: mapDoc.counts.requiredObligationCount,
+      witnessedRequiredCount: mapDoc.counts.witnessedRequiredCount,
+      missingRequiredCount: mapDoc.counts.missingRequiredCount,
     },
     hitProductionsByKind: hitSets,
-    blocked: blockedEntries.sort((a, b2) => a.obligationId.localeCompare(b2.obligationId)),
     entries,
   };
   const files = new Map<string, string>();
@@ -1747,30 +2423,389 @@ export function buildCorpus() {
   return {manifest, files};
 }
 
+export function buildCurrentSourcePlan(
+  inputs: {
+    readonly specBytes: Buffer;
+    readonly parserBytes: Buffer;
+    readonly producerClaimsBytes: Buffer;
+  } = {
+    specBytes: readFileSync(SPEC_PATH),
+    parserBytes: readFileSync(PARSER_PATH),
+    producerClaimsBytes: readFileSync(PRODUCER_CLAIMS_PATH),
+  },
+) {
+  const producerOnlyMap = buildEbnfParserNodeMap(
+    inputs.specBytes,
+    inputs.parserBytes,
+    inputs.producerClaimsBytes,
+  );
+  return buildCorpus(Buffer.from(JSON.stringify(producerOnlyMap)));
+}
+
+export function currentSourcePlanMismatches(
+  files: ReadonlyMap<string, string>,
+  outputDirectory: string = OUT_DIR,
+): readonly string[] {
+  const canonicalNames = new Set([
+    "corpus.json",
+    ...Object.keys(SOURCES).map((name) => `${name}.cheng`),
+  ]);
+  const mismatches: string[] = [];
+  for (const name of [...canonicalNames].sort()) {
+    if (!files.has(name)) {
+      mismatches.push(`${name}: source-plan 输入缺失`);
+    }
+  }
+  for (const name of [...files.keys()].sort()) {
+    if (!canonicalNames.has(name)) {
+      mismatches.push(`${name}: 非当前 source-plan 输入`);
+    }
+  }
+  let snapshot;
+  try {
+    snapshot = readCurrentChengGrammarCorpus(outputDirectory);
+  } catch (error) {
+    mismatches.push(
+      "grammar_corpus: " +
+      (error instanceof Error ? error.message : String(error)),
+    );
+    return mismatches;
+  }
+  if (snapshot.files.size !== canonicalNames.size) {
+    mismatches.push("grammar_corpus: current generation 文件数漂移");
+  }
+  for (const [name, content] of files) {
+    if (!canonicalNames.has(name)) continue;
+    const disk = snapshot.files.get(name);
+    if (disk === undefined) {
+      mismatches.push(`${name}: current generation 缺失`);
+    } else if (!disk.equals(Buffer.from(content, "utf8"))) {
+      mismatches.push(`${name}: 内容漂移`);
+    }
+  }
+  return mismatches;
+}
+
+export interface GrammarCorpusPublishHooks {
+  readonly afterStagedFile?: (
+    stagedCount: number,
+    name: string,
+  ) => void;
+  readonly beforeCurrentPointerRename?: (generationId: string) => void;
+}
+
+function grammarCorpusPublishNameValid(name: string): boolean {
+  return name === "corpus.json" ||
+    /^[a-z][a-z0-9_]*\.cheng$/.test(name);
+}
+
+function grammarCorpusRegularFile(path: string, label: string) {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`${label} must be a regular non-symlink file: ${path}`);
+  }
+  return stat;
+}
+
+function grammarCorpusBytesEqual(left: Buffer, right: Buffer): boolean {
+  return left.length === right.length && left.equals(right);
+}
+
+function grammarCorpusFsync(path: string): void {
+  const descriptor = openSync(path, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function grammarCorpusGenerationMatches(
+  generationDirectory: string,
+  files: ReadonlyMap<string, string>,
+): boolean {
+  const stat = lstatSync(generationDirectory);
+  if (stat.isSymbolicLink() || !stat.isDirectory() ||
+      canonicalJson(readdirSync(generationDirectory).sort()) !==
+        canonicalJson([...files.keys()].sort())) {
+    return false;
+  }
+  for (const [name, content] of files) {
+    const path = join(generationDirectory, name);
+    if (!existsSync(path)) return false;
+    const fileStat = lstatSync(path);
+    if (fileStat.isSymbolicLink() || !fileStat.isFile() ||
+        !grammarCorpusBytesEqual(
+          readFileSync(path),
+          Buffer.from(content, "utf8"),
+        )) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function grammarCorpusSnapshotIdentityEqual(
+  left: ReturnType<typeof readCurrentChengGrammarCorpus>,
+  right: ReturnType<typeof readCurrentChengGrammarCorpus>,
+): boolean {
+  if (left.generationId !== right.generationId ||
+      !chengGrammarCorpusFileIdentityEqual(
+        left.pointerIdentity,
+        right.pointerIdentity,
+      ) ||
+      left.fileIdentities.size !== right.fileIdentities.size) {
+    return false;
+  }
+  for (const [name, identity] of left.fileIdentities) {
+    const current = right.fileIdentities.get(name);
+    if (current === undefined ||
+        !chengGrammarCorpusFileIdentityEqual(identity, current)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function publishGrammarCorpusFiles(
+  outputDirectory: string,
+  files: ReadonlyMap<string, string>,
+  hooks: GrammarCorpusPublishHooks = {},
+): void {
+  const names = [...files.keys()].sort();
+  const canonicalNames = [
+    "corpus.json",
+    ...Object.keys(SOURCES).map((name) => `${name}.cheng`),
+  ].sort();
+  if (canonicalJson(names) !== canonicalJson(canonicalNames) ||
+      names.some((name) => !grammarCorpusPublishNameValid(name))) {
+    throw new Error("grammar corpus publish file set invalid");
+  }
+  const canonicalOutput = resolve(outputDirectory);
+  const outputParent = dirname(canonicalOutput);
+  mkdirSync(outputParent, {recursive: true});
+  const lockDirectory = join(
+    outputParent,
+    `.grammar-corpus-publish-${basename(canonicalOutput)}.lock`,
+  );
+  mkdirSync(lockDirectory);
+  let stageRoot = "";
+  let createdOutputStore = false;
+  let currentPointerCommitted = false;
+  try {
+    let currentGenerationId = "";
+    let currentSnapshot:
+      ReturnType<typeof readCurrentChengGrammarCorpus> | undefined;
+    if (existsSync(canonicalOutput)) {
+      const outputStat = lstatSync(canonicalOutput);
+      if (outputStat.isSymbolicLink() || !outputStat.isDirectory()) {
+        throw new Error(
+          `grammar corpus output must be a regular directory: ` +
+          canonicalOutput,
+        );
+      }
+      const rootNames = readdirSync(canonicalOutput).sort();
+      const expectedRootNames = [
+        CHENG_GRAMMAR_CORPUS_CURRENT,
+        CHENG_GRAMMAR_CORPUS_GENERATIONS,
+      ].sort();
+      if (canonicalJson(rootNames) !== canonicalJson(expectedRootNames)) {
+        throw new Error(
+          "grammar corpus output is not the unique current generation store",
+        );
+      }
+      currentSnapshot =
+        readCurrentChengGrammarCorpus(canonicalOutput);
+      currentGenerationId = currentSnapshot.generationId;
+    } else {
+      mkdirSync(canonicalOutput);
+      createdOutputStore = true;
+      mkdirSync(join(canonicalOutput, CHENG_GRAMMAR_CORPUS_GENERATIONS));
+    }
+    const generationsRoot =
+      join(canonicalOutput, CHENG_GRAMMAR_CORPUS_GENERATIONS);
+    const generationsStat = lstatSync(generationsRoot);
+    if (generationsStat.isSymbolicLink() ||
+        !generationsStat.isDirectory()) {
+      throw new Error("grammar corpus generations root invalid");
+    }
+    const generationId = chengGrammarCorpusGenerationId(files);
+    const generationDirectory = join(generationsRoot, generationId);
+    const currentPath = join(
+      canonicalOutput,
+      CHENG_GRAMMAR_CORPUS_CURRENT,
+    );
+    const pointerBytes = Buffer.from(`${generationId}\n`, "utf8");
+    if (existsSync(currentPath)) {
+      grammarCorpusRegularFile(currentPath, "grammar corpus current pointer");
+      const currentBytes = readFileSync(currentPath);
+      if (grammarCorpusBytesEqual(currentBytes, pointerBytes)) {
+        if (currentGenerationId !== generationId) {
+          throw new Error("grammar corpus current pointer identity drifted");
+        }
+        if (!existsSync(generationDirectory) ||
+            !grammarCorpusGenerationMatches(generationDirectory, files)) {
+          throw new Error(
+            "grammar corpus current generation content drifted",
+          );
+        }
+        readCurrentChengGrammarCorpus(canonicalOutput);
+        return;
+      }
+    }
+    stageRoot = mkdtempSync(
+      join(outputParent, ".grammar-corpus-generation-staging-"),
+    );
+    const stagedGenerationsRoot =
+      join(stageRoot, CHENG_GRAMMAR_CORPUS_GENERATIONS);
+    mkdirSync(stagedGenerationsRoot);
+    const stagedGeneration =
+      join(stagedGenerationsRoot, generationId);
+    mkdirSync(stagedGeneration);
+    let stagedCount = 0;
+    for (const name of names) {
+      const expectedBytes = Buffer.from(files.get(name)!, "utf8");
+      const stagedPath = join(stagedGeneration, name);
+      writeFileSync(stagedPath, expectedBytes, {flag: "wx"});
+      grammarCorpusRegularFile(
+        stagedPath,
+        "grammar corpus staged generation file",
+      );
+      if (!grammarCorpusBytesEqual(readFileSync(stagedPath), expectedBytes)) {
+        throw new Error(`grammar corpus staged bytes drifted: ${name}`);
+      }
+      grammarCorpusFsync(stagedPath);
+      chmodSync(stagedPath, 0o444);
+      stagedCount += 1;
+      hooks.afterStagedFile?.(stagedCount, name);
+    }
+    grammarCorpusFsync(stagedGeneration);
+    grammarCorpusFsync(stagedGenerationsRoot);
+    const stagedPointer =
+      join(stageRoot, CHENG_GRAMMAR_CORPUS_CURRENT);
+    writeFileSync(stagedPointer, pointerBytes, {flag: "wx"});
+    grammarCorpusFsync(stagedPointer);
+    chmodSync(stagedPointer, 0o444);
+    grammarCorpusFsync(stageRoot);
+    const stagedSnapshot =
+      readCurrentChengGrammarCorpus(stageRoot);
+    if (stagedSnapshot.generationId !== generationId) {
+      throw new Error(
+        "grammar corpus staged generation identity invalid",
+      );
+    }
+    if (existsSync(generationDirectory)) {
+      if (!grammarCorpusGenerationMatches(generationDirectory, files)) {
+        throw new Error(
+          "grammar corpus content-addressed generation collision",
+        );
+      }
+    } else {
+      renameSync(stagedGeneration, generationDirectory);
+      chmodSync(generationDirectory, 0o555);
+      grammarCorpusFsync(generationsRoot);
+    }
+    hooks.beforeCurrentPointerRename?.(generationId);
+    if (currentGenerationId === "") {
+      if (existsSync(currentPath)) {
+        throw new Error(
+          "grammar corpus current pointer appeared before commit",
+        );
+      }
+    } else {
+      const beforeCommit =
+        readCurrentChengGrammarCorpus(canonicalOutput);
+      if (currentSnapshot === undefined ||
+          !grammarCorpusSnapshotIdentityEqual(
+            currentSnapshot,
+            beforeCommit,
+          )) {
+        throw new Error(
+          "grammar corpus current snapshot changed before commit",
+        );
+      }
+    }
+    renameSync(stagedPointer, currentPath);
+    currentPointerCommitted = true;
+    grammarCorpusFsync(canonicalOutput);
+  } finally {
+    try {
+      if (stageRoot !== "" && existsSync(stageRoot)) {
+        for (const name of readdirSync(stageRoot)) {
+          const path = join(stageRoot, name);
+          const stat = lstatSync(path);
+          if (!stat.isSymbolicLink() && stat.isDirectory()) {
+            chmodSync(path, 0o755);
+          }
+        }
+        rmSync(stageRoot, {recursive: true, force: true});
+      }
+      if (createdOutputStore && !currentPointerCommitted &&
+          existsSync(canonicalOutput)) {
+        const generationsRoot =
+          join(canonicalOutput, CHENG_GRAMMAR_CORPUS_GENERATIONS);
+        if (existsSync(generationsRoot)) {
+          for (const generationId of readdirSync(generationsRoot)) {
+            const generationDirectory =
+              join(generationsRoot, generationId);
+            const stat = lstatSync(generationDirectory);
+            if (!stat.isSymbolicLink() && stat.isDirectory()) {
+              chmodSync(generationDirectory, 0o755);
+            }
+          }
+        }
+        rmSync(canonicalOutput, {recursive: true, force: true});
+      }
+    } finally {
+      rmSync(lockDirectory, {recursive: true, force: true});
+    }
+  }
+}
+
 function main() {
   const check = process.argv.includes("--check");
+  const checkSources = process.argv.includes("--check-sources");
+  const prepareSources = process.argv.includes("--prepare-sources");
+  if (checkSources || prepareSources) {
+    const {manifest, files} = buildCurrentSourcePlan();
+    if (manifest.counts.claims !==
+          manifest.counts.requiredObligationCount) {
+      throw new Error("current source-plan 未覆盖全部 required obligation");
+    }
+    if (checkSources) {
+      const mismatches = currentSourcePlanMismatches(files);
+      if (mismatches.length > 0) {
+        throw new Error(
+          `current source-plan 漂移:\n  ${mismatches.join("\n  ")}`,
+        );
+      }
+      console.log(
+        `[grammar_corpus_gen] --check-sources 通过: ` +
+        `sources=${manifest.counts.sources} ` +
+        `claims=${manifest.counts.claims}`,
+      );
+      return;
+    }
+    publishGrammarCorpusFiles(OUT_DIR, files);
+    console.log(
+      `[grammar_corpus_gen] prepared current source-plan: ` +
+      `sources=${manifest.counts.sources} claims=${manifest.counts.claims}`,
+    );
+    return;
+  }
   const {manifest, files} = buildCorpus();
   if (check) {
-    const mismatches: string[] = [];
-    for (const [name, content] of files) {
-      const path = resolve(OUT_DIR, name);
-      if (!existsSync(path)) {mismatches.push(`${name}: 磁盘缺失`); continue;}
-      if (readFileSync(path, "utf8") !== content) mismatches.push(`${name}: 内容漂移`);
-    }
-    for (const name of ["corpus.json", ...Object.keys(SOURCES).map((s) => `${s}.cheng`)]) {
-      if (!files.has(name)) mismatches.push(`${name}: 生成侧缺失`);
-    }
+    const mismatches = currentSourcePlanMismatches(files);
     if (mismatches.length > 0) {
       console.error(`--check 失败:\n  ${mismatches.join("\n  ")}`);
       process.exit(1);
     }
-    console.log(`[grammar_corpus_gen] --check 通过: ${files.size} 文件逐字节一致, claims=${manifest.counts.claims}, blocked=${manifest.counts.blocked}`);
+    console.log(`[grammar_corpus_gen] --check 通过: ${files.size} 文件逐字节一致, claims=${manifest.counts.claims}`);
     return;
   }
-  mkdirSync(OUT_DIR, {recursive: true});
-  for (const [name, content] of files) writeFileSync(resolve(OUT_DIR, name), content);
+  publishGrammarCorpusFiles(OUT_DIR, files);
   console.log(`[grammar_corpus_gen] wrote ${files.size} files → ${OUT_DIR}`);
-  console.log(`[grammar_corpus_gen] sources=${manifest.counts.sources} claims=${manifest.counts.claims}/${manifest.counts.coveredRequiredObligations} blocked=${manifest.counts.blocked}`);
+  console.log(`[grammar_corpus_gen] sources=${manifest.counts.sources} claims=${manifest.counts.claims}/${manifest.counts.coveredRequiredObligations}`);
 }
 
 if (process.argv[1]?.endsWith("grammar_corpus_gen.ts")) main();

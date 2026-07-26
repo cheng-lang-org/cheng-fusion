@@ -41,7 +41,18 @@ async function main() {
 
   console.log("[A] formal EBNF is mechanically decomposed and unbounded grammar remains explicitly RED");
   const grammar = buildChengGrammarObligationContract(formalSpec);
-  validateChengGrammarObligationContract(formalSpec, grammar);
+  const generatedGrammarCounts = validateChengGrammarObligationContract(formalSpec, grammar);
+  assert.deepEqual(generatedGrammarCounts, {
+    obligationCount: grammar.obligations.length,
+    requiredCount: grammar.obligations.filter(
+      (entry) => entry.disposition === "required",
+    ).length,
+    obligationRootSha256: grammar.obligationRootSha256,
+  });
+  assert.throws(
+    () => validateChengGrammarObligationContract(formalSpec, {...grammar, schema: "cheng_formal_grammar_obligations.v1"} as any),
+    /contract mismatch/,
+  );
   assert.ok(grammar.productionCount > 50);
   assert.ok(grammar.requiredCount > 0 && grammar.excludedCount > 0);
   for (const kind of ["production", "choice", "optional", "repetition", "recursion"] as const) {
@@ -96,6 +107,10 @@ async function main() {
   assert.equal(matrix.manifest.seed, "item24-phase2-seed");
   assert.match(matrix.manifest.manifestSha256, /^[0-9a-f]{64}$/);
   validatePipelineMatrix(matrix);
+  assert.throws(
+    () => validatePipelineMatrix({...matrix, schema: "cheng_semantic_pipeline_matrix.v1"} as any),
+    /invalid pipeline matrix schema/,
+  );
   assert.equal(matrix.manifest.rejectCount, coverage.negative.length);
   assert.ok(matrix.cases.filter((entry) => entry.expected === "reject").every((entry) => entry.violationCodes.length === 1));
   assert.deepEqual(
@@ -146,6 +161,16 @@ async function main() {
   assert.throws(() => validateBaseSemanticSourceBundle(firstBase, grammar, mutateSourceBundle(firstBaseBundle, "materializer_binding_swap")), /bundle identity/);
   assert.throws(() => validateBaseSemanticSourceBundle(firstBase, grammar, mutateSourceBundle(firstBaseBundle, "grammar_root_swap")), /bundle identity/);
   assert.equal(lintChengPublicSource("fn ok(value: var int32) =\n    value = 1\n").passed, true);
+  assert.equal(
+    lintChengPublicSource(
+      "type Managed = ref object:\n    value: int32\n",
+    ).passed,
+    true,
+  );
+  assert.equal(
+    lintChengPublicSource("type Raw = ref int32\n").passed,
+    false,
+  );
   assert.equal(lintChengPublicSource("@importc(\"bad\")\nfn bad(value: ptr) =\n    value = value\n").passed, false);
 
   console.log("[D] every selected critical/pairwise/higher-order witness has source-changing profile templates and verified token spans");
@@ -196,7 +221,20 @@ async function main() {
   assert.equal(reduced.reducedCases.length, 1);
   assert.equal(reduced.reducedCases[0]?.profileCaseId, target.profileCaseId);
   assert.equal(CHENG_REAL_PIPELINE_RECEIPT_PROTOCOL.implemented, false);
+  assert.equal(CHENG_REAL_PIPELINE_RECEIPT_PROTOCOL.schema, "cheng_real_source_bound_seven_stage_protocol");
+  assert.equal(CHENG_REAL_PIPELINE_RECEIPT_PROTOCOL.receiptSchema, "cheng.compiler.execution_stage_bundle");
   assert.deepEqual(CHENG_REAL_PIPELINE_RECEIPT_PROTOCOL.requiredStages, ["typed_expr", "csg", "lowering", "primary", "primary_regalloc", "backend2", "backend2_regalloc"]);
+  assert.deepEqual(CHENG_REAL_PIPELINE_RECEIPT_PROTOCOL.sourceBindings, [
+    "case_id",
+    "source_bundle_raw32",
+    "materializer_bytes_raw32",
+    "grammar_obligation_root_raw32",
+    "compiler_source_closure_raw32",
+    "driver_bytes_raw32",
+    "toolchain_manifest_raw32",
+    "command_manifest_raw32",
+    "target_triple",
+  ]);
   await assert.rejects(
     () => executeSourceBoundSevenStageRunner(matrix, {oracleEcho: true}),
     (error: unknown) => error instanceof RealPipelineReceiptUnavailableError && error.code === "REAL_PIPELINE_RUNNER_REQUIRED",

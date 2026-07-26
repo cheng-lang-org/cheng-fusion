@@ -20,7 +20,7 @@
 #   <driver>        compiler binary (backend_driver or any cheng.stageN)
 #   <root>          --root: tree passed to system-link-exec (the compiler's
 #                   own source tree, providing runtime/backend providers --
-#                   e.g. /Users/lbcheng/cheng-f24/tree). NOT the fixtures dir.
+#                   e.g. /Users/lbcheng/cheng-lang). NOT the fixtures dir.
 #   [manifest.json] optional override: JSON array of
 #                   {"name":..., "path":... (relative to FIXTURES_DIR),
 #                    "expectRc": N}. If omitted, uses the 11 built-in probes

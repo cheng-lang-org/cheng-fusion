@@ -1,10 +1,12 @@
 // cheng_shape_matrix 真实 stage3 端到端回归。生产判定不被替换；仅契约预检
 // 用一个会写哨兵文件的脚本，证明非法矩阵在第一个 spawn 前 hard-fail。
 import {chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync} from "node:fs";
+import assert from "node:assert/strict";
 import {tmpdir} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {assertTrue, startMcp} from "./mcp_client.ts";
+import {assertShapeMatrixReportSchema} from "../src/cheng_shape_matrix_m9016.ts";
 
 const FUSION_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CHENG_ROOT = process.env.CHENG_TOOLCHAIN_ROOT || process.env.CHENG_ROOT || "/Users/lbcheng/cheng-lang";
@@ -182,6 +184,12 @@ async function main() {
         timeoutSec: 30,
       }, undefined, 60000);
       assertTrue(isError !== true, `checked-in matrix 真实调用成功，实得 ${JSON.stringify(parsed).slice(0, 500)}`);
+      assertTrue(parsed.schema === "cheng_shape_matrix", `shape_matrix 使用唯一 canonical schema，实得 ${parsed.schema}`);
+      assert.throws(
+        () => assertShapeMatrixReportSchema({...parsed, schema: "cheng_shape_matrix.v1"}),
+        /unsupported shape matrix report schema/,
+        "legacy shape-matrix report schema must be rejected",
+      );
       assertTrue(parsed.results.length === 1 && parsed.results[0].name === "f47_probe_seq_fnvalue", `精确选中 checked-in f47 entry`);
       const result = parsed.results[0];
       assertTrue(result.status === "GREEN" && result.rc === 0, `当前真实 stage3 rc=0 命中 checked-in 契约`);

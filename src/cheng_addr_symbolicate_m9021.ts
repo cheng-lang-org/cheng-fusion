@@ -1,6 +1,6 @@
 // @ts-nocheck
 // cheng_addr_symbolicate: 从 exe 崩溃地址反查 .o 符号+偏移。链产的 GEN2/DRV 被内部 linker
-// 剥符号(nm 只剩几十个动态符号), *.map 是 cheng_line_map_v1 行映射(无地址字段), 唯一还留着
+// 剥符号(nm 只剩几十个动态符号), *.map 是 cheng_line_map 行映射(无地址字段), 唯一还留着
 // 完整符号表的是链前的 <name>.primary.o(nm -n 几千到上万条 T/t 符号)。
 //
 // 与既有 symbolizeChengPc(cheng_toolkit_m9000.ts, 供 cheng_crash_triage/cheng_corrupt_hunt 用)的
@@ -27,9 +27,17 @@ import {createChengTextTool, jsonResult, initChengToolkitModule, zodSchema} from
 
 var chengAddrSymbolicateInputSchema, ChengAddrSymbolicateTool;
 
+const ADDR_SYMBOLICATE_SCHEMA = "cheng_addr_symbolicate";
 const MH_MAGIC_64 = 0xfeedfacf;
 const LC_SEGMENT_64 = 0x19;
 const WINDOW_LADDER = [64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024];
+
+function assertAddrSymbolicateReportSchema(report) {
+  if (!report || typeof report !== "object" || report.schema !== ADDR_SYMBOLICATE_SCHEMA) {
+    throw new Error(`unsupported address symbolicate report schema: ${report?.schema}`);
+  }
+  return report;
+}
 
 // 路径白名单: 只认已存在的绝对路径普通文件(不接受相对路径/目录/符号解析猜测)。
 function resolveExistingAbsoluteFile(value, label) {
@@ -156,7 +164,7 @@ function symbolicateAddress(binaryPath, objectPath, address, requestedWindowSize
   const relative = address - exeText.addr;
   if (relative < 0 || relative >= exeText.size) {
     return {
-      schema: "cheng_addr_symbolicate.v1", binaryPath, objectPath, address: addressHex,
+      schema: ADDR_SYMBOLICATE_SCHEMA, binaryPath, objectPath, address: addressHex,
       symbol: null, symbolOffset: null, matchCount: 0, confidence: "none",
       reason: "address_outside_text_section",
       exeText: {addr: `0x${exeText.addr.toString(16)}`, size: exeText.size, end: `0x${(exeText.addr + exeText.size).toString(16)}`},
@@ -190,7 +198,7 @@ function symbolicateAddress(binaryPath, objectPath, address, requestedWindowSize
   if (!resolved) {
     const matchCount = lastNonEmpty ? lastNonEmpty.hits.length : 0;
     return {
-      schema: "cheng_addr_symbolicate.v1", binaryPath, objectPath, address: addressHex,
+      schema: ADDR_SYMBOLICATE_SCHEMA, binaryPath, objectPath, address: addressHex,
       symbol: null, symbolOffset: null, matchCount, confidence: matchCount > 1 ? "ambiguous" : "none",
       reason: matchCount > 1 ? "multiple_candidate_offsets_in_object" : "no_matching_byte_sequence_in_object",
       windowAttempts: attempts,
@@ -203,14 +211,14 @@ function symbolicateAddress(binaryPath, objectPath, address, requestedWindowSize
   const sym = nearestPrecedingSymbol(symbols, localAddr);
   if (!sym) {
     return {
-      schema: "cheng_addr_symbolicate.v1", binaryPath, objectPath, address: addressHex,
+      schema: ADDR_SYMBOLICATE_SCHEMA, binaryPath, objectPath, address: addressHex,
       symbol: null, symbolOffset: null, matchCount: 1, confidence: "none",
       reason: "unique_byte_match_but_no_preceding_symbol_in_object_symtab",
       windowAttempts: attempts,
     };
   }
   return {
-    schema: "cheng_addr_symbolicate.v1", binaryPath, objectPath, address: addressHex,
+    schema: ADDR_SYMBOLICATE_SCHEMA, binaryPath, objectPath, address: addressHex,
     symbol: sym.name, symbolOffset: localAddr - sym.addr, matchCount: 1, confidence: "high",
     windowSize: resolved.windowSize, windowAttempts: attempts,
   };
@@ -235,9 +243,9 @@ var initChengAddrSymbolicateModule = defineModuleInitializer(() => {
       const binaryPath = resolveExistingAbsoluteFile(input.binaryPath, "binaryPath");
       const objectPath = resolveExistingAbsoluteFile(input.objectPath, "objectPath");
       const address = parseAddressInput(input.address);
-      return jsonResult(symbolicateAddress(binaryPath, objectPath, address, input.windowSize));
+      return jsonResult(assertAddrSymbolicateReportSchema(symbolicateAddress(binaryPath, objectPath, address, input.windowSize)));
     },
   });
 });
 
-export {ChengAddrSymbolicateTool, initChengAddrSymbolicateModule};
+export {ChengAddrSymbolicateTool, assertAddrSymbolicateReportSchema, initChengAddrSymbolicateModule};

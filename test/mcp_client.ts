@@ -3,15 +3,33 @@
 import {spawn} from "node:child_process";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
+import {verifyInheritedParentGuardForChild} from "../src/cheng_toolkit_m9000.ts";
 
 const PROJECT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = join(PROJECT, "index.ts");
 
 export function startMcp(env: Record<string, string> = {}, cwd: string = PROJECT) {
+  const inheritedProof = verifyInheritedParentGuardForChild();
+  const childEnv = {...process.env, ...env} as Record<string, string>;
+  if (inheritedProof) {
+    for (const key of [
+      "BEAT_C_GUARD_PARENT_CAPABILITY",
+      "BEAT_C_GUARD_PARENT_MONITOR_PID",
+      "BEAT_C_GUARD_PARENT_LIMIT_BYTES",
+      "BEAT_C_GUARD_PARENT_PROOF_FD",
+    ]) {
+      if (Object.hasOwn(env, key) && env[key] !== process.env[key]) {
+        throw new Error(`startMcp cannot replace verified parent-guard field: ${key}`);
+      }
+      childEnv[key] = String(process.env[key]);
+    }
+  }
   const child = spawn("bun", [ENTRY], {
     cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-    env: {...process.env, ...env} as any,
+    stdio: inheritedProof
+      ? ["pipe", "pipe", "pipe", inheritedProof.proofFd]
+      : ["pipe", "pipe", "pipe"],
+    env: childEnv as any,
   });
   let stdout = "";
   let stderr = "";

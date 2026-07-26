@@ -38,9 +38,11 @@ FAMILIES = [
     "str_global_call_rhs",
     "slot_dedup_chain",
     "narrow_deref",
+    "narrow_deref_fixed",
     "ref_seq_field",
     "agg_field_str_rhs",
     "addrof_scalar_root",
+    "addrof_scalar_root_fixed",
     "int32_shell_shift",
     "borrowed_seq_bitcopy",
     "str_empty_eq",
@@ -53,9 +55,11 @@ FORM_TAG = {
     "str_global_call_rhs": "str-global-call-rhs",
     "slot_dedup_chain": "slot-dominance-dedup-chain",
     "narrow_deref": "narrow-deref",
+    "narrow_deref_fixed": "narrow-deref-fixed-leg",
     "ref_seq_field": "ref-seq-field",
     "agg_field_str_rhs": "agg-field-str-rhs",
     "addrof_scalar_root": "addrof-scalar-root",
+    "addrof_scalar_root_fixed": "addrof-scalar-root-fixed-leg",
     "int32_shell_shift": "int32-shell-shift",
     "borrowed_seq_bitcopy": "borrowed-seq-bitcopy",
     "str_empty_eq": "str-empty-eq",
@@ -199,6 +203,44 @@ def gen_narrow_deref(seed):
     return BANNER + "\n".join(lines) + "\n", {"expectRc": value}, note
 
 
+def gen_narrow_deref_fixed(seed):
+    """legal-surface variant of narrow_deref: uint8 seq element read must emit a
+    1-byte load (ldrb). 原族裸指针/解引用公开面已被 ZRPC 闸禁, 窄读判别形改经
+    字节容器(uint8 序列)表达 — 元素读宽度看错即 4B 误读形态。"""
+    rng = rng_for("narrow_deref_fixed", seed)
+    a = rng.span(1, 120)
+    b = rng.span(1, 120)
+    via_helper = rng.below(2) == 1
+    lines = []
+    if via_helper:
+        lines += [
+            "fn byteAt(buf: uint8[], i: int32): uint8 =",
+            "    return buf[i]",
+            "",
+        ]
+    lines += [
+        "fn main(): int32 =",
+        "    var buf: uint8[]",
+        "    add(buf, uint8(%d))" % a,
+        "    add(buf, uint8(%d))" % b,
+    ]
+    if via_helper:
+        lines.append("    let v0: uint8 = byteAt(buf, 0)")
+    else:
+        lines.append("    let v0: uint8 = buf[0]")
+    lines += [
+        "    if v0 != uint8(%d):" % a,
+        "        return 71",
+        "    if buf[1] != uint8(%d):" % b,
+        "        return 72",
+        "    return int32(v0) + int32(buf[1])",
+    ]
+    expect = a + b
+    note = ("窄 deref 合法面变体(fixed-leg): uint8 序列元素读必须发 1B 读(ldrb), 期望 rc=%d (a+b); "
+            "原族裸指针面已被 ZRPC 禁, 判别形改经字节容器; variant=%s" % (expect, "helper" if via_helper else "direct"))
+    return BANNER + "\n".join(lines) + "\n", {"expectRc": expect}, note
+
+
 def gen_ref_seq_field(seed):
     """struct carrying a T[] field between two scalars: field offsets must treat
     the seq as a 16B inline header, not an 8B ref pointer (W2D form)."""
@@ -303,6 +345,34 @@ def gen_addrof_scalar_root(seed):
     lines.append("    return x")
     note = ("AddrOf 标量根: `ptr(&x)` 物化真指针后 `*p = %s` + 读回, 期望 rc=%d; "
             "形态源=R1/D2 AddrOfPlaceRootInfo 标量根 + G4 bareptr deref-store" % ("局部变量" if via_var else "常量", value))
+    return BANNER + "\n".join(lines) + "\n", {"expectRc": value}, note
+
+
+def gen_addrof_scalar_root_fixed(seed):
+    """legal-surface variant of addrof_scalar_root: `&place`(标量根/字段取址实参)
+    必须物化真地址 — 经 std.atomic 的 `&c.value` 形写/RMW 后, 根字段直读回
+    (写未落地即原族同款红码 81)。原族 ptr() 裸指针面已被 ZRPC 闸禁,
+    `&Identifier/&Field` 为收窄后合法面(parser &place 闸)。"""
+    rng = rng_for("addrof_scalar_root_fixed", seed)
+    value = rng.span(1, 250)
+    via_rmw = rng.below(2) == 1
+    lines = [
+        "import std/atomic",
+        "",
+        "fn main(): int32 =",
+        "    var c = atomic.NewI32(0)",
+    ]
+    if via_rmw:
+        lines.append("    let prev: int32 = atomic.FetchAddI32(c, %d)" % value)
+        lines.append("    if prev != 0:")
+        lines.append("        return 80")
+    else:
+        lines.append("    atomic.StoreI32(c, %d)" % value)
+    lines.append("    if c.value != %d:" % value)
+    lines.append("        return 81")
+    lines.append("    return c.value")
+    note = ("AddrOf 标量根合法面变体(fixed-leg): `&c.value` 物化真地址后经原子%s写, 根字段直读回, "
+            "期望 rc=%d; 形态源=R1/D2 AddrOfPlaceRootInfo 标量根(收窄后 `&place` 合法面)" % ("RMW " if via_rmw else "", value))
     return BANNER + "\n".join(lines) + "\n", {"expectRc": value}, note
 
 
@@ -442,9 +512,11 @@ GENS = {
     "str_global_call_rhs": gen_str_global_call_rhs,
     "slot_dedup_chain": gen_slot_dedup_chain,
     "narrow_deref": gen_narrow_deref,
+    "narrow_deref_fixed": gen_narrow_deref_fixed,
     "ref_seq_field": gen_ref_seq_field,
     "agg_field_str_rhs": gen_agg_field_str_rhs,
     "addrof_scalar_root": gen_addrof_scalar_root,
+    "addrof_scalar_root_fixed": gen_addrof_scalar_root_fixed,
     "int32_shell_shift": gen_int32_shell_shift,
     "borrowed_seq_bitcopy": gen_borrowed_seq_bitcopy,
     "str_empty_eq": gen_str_empty_eq,

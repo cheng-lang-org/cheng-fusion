@@ -1,11 +1,13 @@
 #!/usr/bin/env bun
 import {createHash} from "node:crypto";
+import assert from "node:assert/strict";
 import {spawnSync} from "node:child_process";
 import {chmodSync,copyFileSync,existsSync,mkdtempSync,mkdirSync,readFileSync,realpathSync,rmSync,symlinkSync,truncateSync,unlinkSync,writeFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {dirname,join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {buildAttackOrder} from "../src/cheng_residual_peel_m9019.ts";
+import {assertZcCensusReportSchema} from "../src/cheng_zc_census_m9014.ts";
 import {ZC_CENSUS_FIELD_ORDER,ZC_PROCESS_MAX_OUTPUT_BYTES,ZC_TARGET,parseZcCensusRun} from "../src/zc_census_protocol.ts";
 import {assertTrue,startMcp} from "./mcp_client.ts";
 
@@ -74,7 +76,7 @@ function materializeEvidence(paths:any,options:any={}){
   writeFileSync(evidence.phase,options.phaseText===undefined?"2\t2\tZC phase\n":options.phaseText);
   const driverRc=total===0?"0":"2";
   writeFileSync(evidence.guard,[
-    "tool=tools/beat_c_process_group_guard.sh","schema=beat_c_process_memory_guard.v4","platform=darwin","status=completed",`rc=${driverRc}`,"abort_reason=",
+    "tool=tools/beat_c_process_group_guard.sh","schema=beat_c_process_memory_guard","platform=darwin","status=completed",`rc=${driverRc}`,"abort_reason=",
     "memory_guard_mode=process_tree","memory_guard_scope=identity_history_union_group_and_descendants","process_tree_membership_metric=darwin_libproc_identity_history_group_and_descendants",
     "enforcement_kind=darwin_cooperative_process_tree_poll","observed_sample_limit_status=proved","hard_memory_limit_proof_status=not_provable_userspace_poll",
     "sampling_blind_spot=inter_sample_transient_peaks_not_provable_by_userspace_polling","memory_limit_bytes=1073741824",
@@ -89,10 +91,10 @@ function materializeEvidence(paths:any,options:any={}){
   const resourceStats=bytesAndLines(evidence.resource),phaseStats=bytesAndLines(evidence.phase);
   const driverHash=sha256(paths.driver),enumeratorHash=sha256(paths.script),guardHash=sha256(paths.guard),sourceHash=sha256(paths.source),gitHash=sha256Bytes("real worktree state");
   const manifestRows=[
-    "schema=zc_evidence_manifest.v1","status=completed",`zc_enumerator=${paths.script}`,`zc_enumerator_sha256_before=${enumeratorHash}`,`zc_enumerator_sha256_after=${enumeratorHash}`,
-    `source=${paths.source}`,`source_sha256=${sourceHash}`,`source_sha256_after=${sourceHash}`,"git_worktree_state_schema=git_worktree_state.v1",
+    "schema=zc_evidence_manifest","status=completed",`zc_enumerator=${paths.script}`,`zc_enumerator_sha256_before=${enumeratorHash}`,`zc_enumerator_sha256_after=${enumeratorHash}`,
+    `source=${paths.source}`,`source_sha256=${sourceHash}`,`source_sha256_after=${sourceHash}`,"git_worktree_state_schema=git_worktree_state",
     `git_worktree_state_sha256_before=${gitHash}`,`git_worktree_state_sha256_after=${gitHash}`,`driver=${paths.driver}`,`driver_sha256=${driverHash}`,
-    `driver_sha256_before=${driverHash}`,`driver_sha256_after=${driverHash}`,`rss_guard=${paths.guard}`,"rss_guard_schema=beat_c_process_memory_guard.v4",
+    `driver_sha256_before=${driverHash}`,`driver_sha256_after=${driverHash}`,`rss_guard=${paths.guard}`,"rss_guard_schema=beat_c_process_memory_guard",
     `rss_guard_sha256_before=${guardHash}`,`rss_guard_sha256_after=${guardHash}`,`rss_guard_report=${evidence.guard}`,`rss_guard_report_sha256=${sha256(evidence.guard)}`,
     "rss_guard_limit_bytes=1073741824","rss_guard_enforcement_metric=max_process_tree_resident_and_phys_footprint","rss_guard_enforcement_kind=darwin_cooperative_process_tree_poll",
     "rss_guard_observed_sample_limit_status=proved","rss_guard_hard_memory_limit_proof_status=not_provable_userspace_poll","rss_guard_poll_seconds=0.01",
@@ -111,7 +113,7 @@ function materializeEvidence(paths:any,options:any={}){
     zc_shared_rss_guard_sha256:guardHash,zc_shared_rss_guard_sha256_after:guardHash,zc_rss_guard_report_sha256:sha256(evidence.guard),
     zc_target:ZC_TARGET,zc_file:paths.source,zc_source_sha256:sourceHash,zc_source_sha256_after:sourceHash,
     zc_git_worktree_state_sha256_before:gitHash,zc_git_worktree_state_sha256_after:gitHash,zc_driver_rc:driverRc,zc_compiler_csg_stderr:"0",zc_progress:"0",
-    zc_rss_guard_schema:"beat_c_process_memory_guard.v4",zc_rss_guard_status:"completed",zc_rss_guard_rc:driverRc,zc_rss_guard_abort_reason:"",
+    zc_rss_guard_schema:"beat_c_process_memory_guard",zc_rss_guard_status:"completed",zc_rss_guard_rc:driverRc,zc_rss_guard_abort_reason:"",
     zc_rss_guard_mode:"process_tree",zc_rss_guard_scope:"identity_history_union_group_and_descendants",zc_rss_requested_limit_bytes:"1073741824",zc_rss_limit_bytes:"1073741824",
     zc_rss_enforcement_metric:"max_process_tree_resident_and_phys_footprint",zc_rss_enforcement_kind:"darwin_cooperative_process_tree_poll",
     zc_rss_observed_sample_limit_status:"proved",zc_rss_hard_memory_limit_proof_status:"not_provable_userspace_poll",zc_rss_poll_seconds:"0.01",zc_rss_measurement_status:"available",
@@ -200,6 +202,18 @@ async function main(){
     assertTrue(parse(paths,four).status==="completed","4-field 正式结构行与 raw stderr 独立证据一致");
     const zero=createDirect(paths,{rows:[],resourceText:"",phaseText:""});directDirs.push(dirname(zero.evidence.manifest));
     const zeroResult=parse(paths,zero);assertTrue(zeroResult.status==="completed"&&zeroResult.total===0&&zeroResult.zeroProof==="proved","零计数要求 full-backend provenance，trace bytes/lines 允许 canonical 0");
+    const oldManifest=createDirect(paths);directDirs.push(dirname(oldManifest.evidence.manifest));
+    setManifestField(oldManifest,"schema","zc_evidence_manifest.v1");
+    assertAborted(parse(paths,oldManifest),"旧 manifest schema","manifest");
+    const oldWorktree=createDirect(paths);directDirs.push(dirname(oldWorktree.evidence.manifest));
+    setManifestField(oldWorktree,"git_worktree_state_schema","git_worktree_state.v1");
+    assertAborted(parse(paths,oldWorktree),"旧 worktree schema","manifest");
+    const oldGuard=createDirect(paths);directDirs.push(dirname(oldGuard.evidence.manifest));
+    assertAborted(
+      parse(paths,oldGuard,render(oldGuard,{zc_rss_guard_schema:"beat_c_process_memory_guard.v4"})),
+      "旧 guard schema",
+      "guard",
+    );
 
     console.log("[B] 删除、替换、hash 与独立 count 冲突全部 aborted");
     const deleted=createDirect(paths);directDirs.push(dirname(deleted.evidence.manifest));unlinkSync(deleted.evidence.report);
@@ -269,6 +283,8 @@ async function main(){
       await mcp.initialize({rootUri:`file://${paths.root}`,workspaceFolders:[{uri:`file://${paths.root}`,name:"zc-protocol"}]});
       const census=await mcp.callTool("cheng_zc_census",{root:paths.root,source:paths.source,driver:paths.driver},undefined,20000);
       assertTrue(census.isError!==true&&census.parsed.status==="completed"&&census.parsed.total===2,"zc_census 严格 evidence verdict");
+      assertTrue(census.parsed.schema==="cheng_zc_census","zc_census 使用唯一 canonical schema");
+      assert.throws(()=>assertZcCensusReportSchema({...census.parsed,schema:"cheng_zc_census.v1"}),/unsupported ZC census report schema/);
       const censusEnv=JSON.parse(readFileSync(join(paths.root,"env-log.json"),"utf8"));
       assertTrue(censusEnv.zc.ZC_DRIVER===paths.driver&&censusEnv.zc.ZC_TARGET===ZC_TARGET&&censusEnv.zc.ZC_DIAG_PREFIX==="census"&&censusEnv.zc.ZC_NO_CACHE==="1","census 受控 env 固定");
       assertTrue(censusEnv.zc.ZC_AMBIENT_POISON===undefined&&!existsSync(censusEnv.diagDir),"census ambient ZC 清空且私有 diag 已清理");

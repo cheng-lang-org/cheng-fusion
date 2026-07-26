@@ -5,8 +5,35 @@ import {basename, dirname, isAbsolute, join, relative, resolve, sep} from "node:
 import {fileURLToPath, pathToFileURL} from "node:url";
 import {createHash} from "node:crypto";
 import {tmpdir} from "node:os";
+import {dlopen, FFIType, ptr} from "bun:ffi";
 import {JsonRpcFrameDecoder} from "./json_rpc_frame_decoder.ts";
 import {b as defineModuleInitializer} from "./runtime.ts";
+import {
+  chengLspArtifactCacheKey,
+  chengLspAssertArtifactIdentityStable,
+  chengLspCaptureArtifactIdentity,
+} from "./cheng_lsp_artifact_receipt.ts";
+import {
+  CHENG_CSG_ARTIFACT_HASH_KEY_ORDER as CHENG_CSG_QUERY_ARTIFACT_HASH_KEYS,
+  CHENG_CSG_COMMIT_PROTOCOL as CHENG_CSG_QUERY_COMMIT_PROTOCOL,
+  CHENG_CSG_CURRENT_KEY_ORDER as CHENG_CSG_QUERY_CURRENT_KEYS,
+  CHENG_CSG_CURRENT_CONTRACT_SOURCE_PATH,
+  CHENG_CSG_DRIVER_IDENTITY_KEY_ORDER as CHENG_CSG_QUERY_DRIVER_IDENTITY_KEYS,
+  CHENG_CSG_GENERATION_CONTRACT_SHA256 as CHENG_CSG_QUERY_GENERATION_CONTRACT_SHA256,
+  CHENG_CSG_GENERATION_ID_PATTERN as CHENG_CSG_QUERY_GENERATION_ID,
+  CHENG_CSG_HASH_PATTERN as CHENG_CSG_QUERY_HASH,
+  CHENG_CSG_SCHEMA_DESC as CHENG_CSG_QUERY_SCHEMA_DESC,
+  CHENG_CSG_SCHEMA_DESC_SHA256 as CHENG_CSG_QUERY_SCHEMA_DESC_SHA256,
+  CHENG_CSG_SUMMARY_KEY_ORDER as CHENG_CSG_QUERY_SUMMARY_KEYS,
+  CHENG_CSG_SUMMARY_PRODUCER as CHENG_CSG_QUERY_PRODUCER,
+  CHENG_CSG_SUMMARY_SCHEMA as CHENG_CSG_QUERY_SCHEMA,
+  CHENG_CSG_TOTAL_KEY_ORDER as CHENG_CSG_QUERY_TOTAL_KEYS,
+  CHENG_CSG_TOOL_IDENTITY_KEY_ORDER as CHENG_CSG_QUERY_TOOL_IDENTITY_KEYS,
+  CHENG_CSG_ROUNDTRIP_SOURCE_PATH,
+  CHENG_CSG_TOOLKIT_SOURCE_PATH,
+  chengCsgGenerationHash,
+  chengCsgGenerationObjectName as exactCsgGenerationObjectName,
+} from "./cheng_csg_current_contract.ts";
 import * as zodSchema from "zod";
 const initZodModule = () => {};
 import {withDefaultToolDefinitionBehavior as withDefaultToolDefinitionBehavior, initToolDefinitionLookupAndDefaultsModule as initToolDefinitionLookupAndDefaultsModule} from "./tool_definition_lookup_and_defaults_m2929.ts";
@@ -18,7 +45,9 @@ const CHENG_STAGE3_DRIVER = process.env.CHENG_STAGE3_DRIVER || join(CHENG_TOOLCH
 // Fusion-vendored cold driver: bootstrap/cheng_cold.c from CHENG_TOOLCHAIN_ROOT
 // patched to understand CSG record kind=9 (call-edge facts) and compiled by
 // vendor/cold-driver/build.sh, without touching the main repo tree. See
-// resolveColdCsgDriver() in cheng_csg_roundtrip_m9003.ts for priority order.
+// resolveColdCsgDriver() in cheng_csg_roundtrip_m9003.ts binds the one selected
+// driver to its current build receipt; invalid explicit selection never falls
+// back to another driver.
 const CHENG_FUSION_PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CHENG_FUSION_VENDOR_COLD_DRIVER = process.env.CHENG_FUSION_VENDOR_COLD_DRIVER || join(CHENG_FUSION_PACKAGE_ROOT, "vendor/cold-driver/cheng_cold_csg9");
 const CHENG_LSP_DEFAULT = join(CHENG_TOOLCHAIN_ROOT, "artifacts/cheng-lsp");
@@ -29,7 +58,24 @@ const CHENG_INVOCATION_CONTEXT_VERIFIED = Symbol.for("openclaude.cheng.invocatio
 const CHENG_FUSION_RSS_CAP_BYTES_DEFAULT = "1073741824";
 const CHENG_FUSION_LSP_TIMEOUT_MS_DEFAULT = 15000;
 const CHENG_FUSION_DRIVER_TIMEOUT_MS_DEFAULT = 120000;
+const CHENG_PROCESS_TOPOLOGY_ABI = [
+  "darwin-process-topology",
+  "libproc=/usr/lib/libproc.dylib",
+  "proc_pidinfo=PROC_PIDTBSDINFO(3)",
+  "proc_bsdinfo_size=136",
+  "proc_bsdinfo_offsets=pid:12,ppid:16,pgid:100,start_tvsec:120,start_tvusec:128",
+  "libsystem=/usr/lib/libSystem.B.dylib",
+  "getsid=i32(i32)",
+  "getpgid=i32(i32)",
+  "getsockopt=LOCAL_PEERPID(0,2)",
+  "parent_proof=cheng.guard.parent_proof:length-prefixed-canonical-json",
+  "poll=i32(pollfd*,u32,i32)",
+  "recv=isize(i32,ptr,usize,i32)",
+].join("\n");
+const CHENG_PROCESS_TOPOLOGY_ABI_SHA256 = createHash("sha256").update(CHENG_PROCESS_TOPOLOGY_ABI).digest("hex");
 let chengProjectRootHints = [];
+let chengDarwinProcessApi = null;
+let inheritedParentGuardProof = null;
 
 // RSS 帽: 每个 Cheng driver 子进程都必须带 CHENG_PROCESS_MAX_RSS_BYTES, 可被 CHENG_FUSION_RSS_CAP 覆盖.
 function chengFusionRssCapBytes() {
@@ -76,6 +122,341 @@ function killChengProcessGroup(child, signal = "SIGKILL") {
       try { child.kill(signal); } catch {}
     }
   }
+}
+
+function darwinProcessApi() {
+  if (process.platform !== "darwin") {
+    throw new Error("inherited parent-guard topology requires Darwin libproc");
+  }
+  if (chengDarwinProcessApi) return chengDarwinProcessApi;
+  const libproc = dlopen("/usr/lib/libproc.dylib", {
+    proc_pidinfo: {
+      args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32],
+      returns: FFIType.i32,
+    },
+  });
+  const libsystem = dlopen("/usr/lib/libSystem.B.dylib", {
+    getsid: {args: [FFIType.i32], returns: FFIType.i32},
+    getpgid: {args: [FFIType.i32], returns: FFIType.i32},
+    getsockopt: {
+      args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr, FFIType.ptr],
+      returns: FFIType.i32,
+    },
+    poll: {
+      args: [FFIType.ptr, FFIType.u32, FFIType.i32],
+      returns: FFIType.i32,
+    },
+    recv: {
+      args: [FFIType.i32, FFIType.ptr, FFIType.u64, FFIType.i32],
+      returns: FFIType.i64,
+    },
+  });
+  chengDarwinProcessApi = Object.freeze({
+    procPidInfo: libproc.symbols.proc_pidinfo,
+    getSid: libsystem.symbols.getsid,
+    getPgid: libsystem.symbols.getpgid,
+    getSockOpt: libsystem.symbols.getsockopt,
+    poll: libsystem.symbols.poll,
+    recv: libsystem.symbols.recv,
+  });
+  return chengDarwinProcessApi;
+}
+
+function readDarwinProcessBsdInfo(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0x7fffffff) {
+    throw new Error(`process identity pid is invalid: ${pid}`);
+  }
+  const raw = Buffer.alloc(136);
+  const bytes = darwinProcessApi().procPidInfo(pid, 3, 0, ptr(raw), raw.length);
+  if (bytes === 0) return null;
+  if (bytes !== raw.length) {
+    throw new Error(`proc_pidinfo returned non-canonical proc_bsdinfo size for pid ${pid}: ${bytes}`);
+  }
+  const identity = {
+    pid: raw.readUInt32LE(12),
+    ppid: raw.readUInt32LE(16),
+    pgid: raw.readUInt32LE(100),
+    startTvsec: raw.readBigUInt64LE(120).toString(10),
+    startTvusec: raw.readBigUInt64LE(128).toString(10),
+  };
+  if (identity.pid !== pid ||
+      !Number.isSafeInteger(identity.ppid) ||
+      !Number.isSafeInteger(identity.pgid) ||
+      !/^(0|[1-9]\d*)$/.test(identity.startTvsec) ||
+      !/^(0|[1-9]\d*)$/.test(identity.startTvusec)) {
+    throw new Error(`proc_pidinfo returned invalid identity for pid ${pid}`);
+  }
+  return identity;
+}
+
+function sameDarwinProcessIdentity(left, right) {
+  return Boolean(left && right) &&
+    left.pid === right.pid &&
+    left.ppid === right.ppid &&
+    left.pgid === right.pgid &&
+    left.startTvsec === right.startTvsec &&
+    left.startTvusec === right.startTvusec;
+}
+
+function chengProcessIdentitySnapshot(pid) {
+  const before = readDarwinProcessBsdInfo(pid);
+  if (!before) return null;
+  const api = darwinProcessApi();
+  const sid = api.getSid(pid);
+  const pgid = api.getPgid(pid);
+  const after = readDarwinProcessBsdInfo(pid);
+  if (sid <= 0 || pgid <= 0 || !sameDarwinProcessIdentity(before, after) || after.pgid !== pgid) {
+    throw new Error(`process identity changed during stable topology read: pid=${pid}`);
+  }
+  return Object.freeze({
+    ...after,
+    sid,
+    abiSha256: CHENG_PROCESS_TOPOLOGY_ABI_SHA256,
+  });
+}
+
+function assertSameProcessSnapshot(before, after, label) {
+  if (!before || !after ||
+      before.pid !== after.pid ||
+      before.ppid !== after.ppid ||
+      before.sid !== after.sid ||
+      before.pgid !== after.pgid ||
+      before.startTvsec !== after.startTvsec ||
+      before.startTvusec !== after.startTvusec ||
+      before.abiSha256 !== after.abiSha256) {
+    throw new Error(`${label} changed during topology verification`);
+  }
+}
+
+const CHENG_PARENT_GUARD_PROOF_KEYS = [
+  "schema",
+  "capability",
+  "monitorPid",
+  "monitorStartTvsec",
+  "monitorStartTvusec",
+  "limitBytes",
+  "rootPid",
+  "rootStartTvsec",
+  "rootStartTvusec",
+  "rootPpid",
+  "rootSid",
+  "rootPgid",
+];
+const CHENG_PARENT_GUARD_ENV_KEYS = [
+  "BEAT_C_GUARD_PARENT_CAPABILITY",
+  "BEAT_C_GUARD_PARENT_MONITOR_PID",
+  "BEAT_C_GUARD_PARENT_LIMIT_BYTES",
+  "BEAT_C_GUARD_PARENT_PROOF_FD",
+];
+
+function peekParentGuardFrame(fd) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new Error("inherited parent-guard proof record timed out");
+    const pollfd = Buffer.alloc(8);
+    pollfd.writeInt32LE(fd, 0);
+    pollfd.writeInt16LE(1, 4);
+    const pollRc = darwinProcessApi().poll(ptr(pollfd), 1, remainingMs);
+    const revents = pollfd.readUInt16LE(6);
+    if (pollRc !== 1 || (revents & (0x08 | 0x10 | 0x20)) !== 0 || (revents & 1) === 0) {
+      throw new Error("inherited parent-guard proof socket closed or failed during record read");
+    }
+    const frame = Buffer.alloc(4101);
+    const bytes = Number(darwinProcessApi().recv(fd, ptr(frame), frame.length, 0x82));
+    if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > frame.length) {
+      throw new Error("inherited parent-guard proof socket returned an invalid record fragment");
+    }
+    if (bytes < 4) continue;
+    const size = frame.readUInt32BE(0);
+    if (size <= 0 || size > 4096) throw new Error("inherited parent-guard proof record size is invalid");
+    const expected = 4 + size;
+    if (bytes < expected) continue;
+    if (bytes !== expected) throw new Error("inherited parent-guard proof socket contains extra bytes");
+    return frame.subarray(4, expected);
+  }
+}
+
+function parseParentGuardProofRecord(fd) {
+  const raw = peekParentGuardFrame(fd);
+  let text;
+  let record;
+  try {
+    text = new TextDecoder("utf-8", {fatal: true}).decode(raw);
+    record = JSON.parse(text);
+  } catch {
+    throw new Error("inherited parent-guard proof record is invalid JSON");
+  }
+  if (!record || typeof record !== "object" || Array.isArray(record) ||
+      JSON.stringify(Object.keys(record)) !== JSON.stringify(CHENG_PARENT_GUARD_PROOF_KEYS) ||
+      !text.endsWith("\n") || text.includes("\r") || JSON.stringify(record) + "\n" !== text) {
+    throw new Error("inherited parent-guard proof record is not canonical");
+  }
+  if (record.schema !== "cheng.guard.parent_proof" ||
+      typeof record.capability !== "string" || !/^[0-9a-f]{64}$/.test(record.capability)) {
+    throw new Error("inherited parent-guard proof record schema is invalid");
+  }
+  for (const key of CHENG_PARENT_GUARD_PROOF_KEYS.slice(2)) {
+    if (!Number.isSafeInteger(record[key]) || record[key] <= 0) {
+      throw new Error(`inherited parent-guard proof record ${key} is invalid`);
+    }
+  }
+  return Object.freeze({
+    record: Object.freeze(record),
+    sha256: createHash("sha256").update(raw).digest("hex"),
+  });
+}
+
+function requireParentGuardProofSocket(fd, monitorPid) {
+  if (!Number.isSafeInteger(fd) || fd !== 3) {
+    throw new Error("inherited parent-guard proof fd is invalid");
+  }
+  let before;
+  try {
+    before = fstatSync(fd);
+  } catch {
+    throw new Error("inherited parent-guard proof fd is not open");
+  }
+  if (!before.isSocket()) {
+    throw new Error("inherited parent-guard proof fd is not a Unix socket");
+  }
+  const peerRaw = Buffer.alloc(4);
+  const lengthRaw = Buffer.alloc(4);
+  lengthRaw.writeUInt32LE(peerRaw.length, 0);
+  const rc = darwinProcessApi().getSockOpt(fd, 0, 2, ptr(peerRaw), ptr(lengthRaw));
+  if (rc !== 0 || lengthRaw.readUInt32LE(0) !== peerRaw.length) {
+    throw new Error("inherited parent-guard proof socket has no stable LOCAL_PEERPID");
+  }
+  const peerPid = peerRaw.readInt32LE(0);
+  if (peerPid !== monitorPid) {
+    throw new Error(`inherited parent-guard proof peer pid differs from monitor: peer=${peerPid} monitor=${monitorPid}`);
+  }
+  const after = fstatSync(fd);
+  if (!after.isSocket() ||
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.mode !== after.mode) {
+    throw new Error("inherited parent-guard proof fd changed during verification");
+  }
+  const declaration = [
+    process.pid,
+    fd,
+    String(process.env.BEAT_C_GUARD_PARENT_CAPABILITY || ""),
+    String(process.env.BEAT_C_GUARD_PARENT_MONITOR_PID || ""),
+    String(process.env.BEAT_C_GUARD_PARENT_LIMIT_BYTES || ""),
+  ].join(":");
+  if (!inheritedParentGuardProof) {
+    inheritedParentGuardProof = Object.freeze({
+      declaration,
+      ...parseParentGuardProofRecord(fd),
+    });
+  } else if (inheritedParentGuardProof.declaration !== declaration) {
+    throw new Error("inherited parent-guard declaration changed after proof verification");
+  }
+  const peerAfterRaw = Buffer.alloc(4);
+  const peerAfterLength = Buffer.alloc(4);
+  peerAfterLength.writeUInt32LE(peerAfterRaw.length, 0);
+  const peerAfterRc = darwinProcessApi().getSockOpt(
+    fd, 0, 2, ptr(peerAfterRaw), ptr(peerAfterLength));
+  if (peerAfterRc !== 0 ||
+      peerAfterLength.readUInt32LE(0) !== peerAfterRaw.length ||
+      peerAfterRaw.readInt32LE(0) !== monitorPid) {
+    throw new Error("inherited parent-guard proof peer changed after record verification");
+  }
+  return inheritedParentGuardProof;
+}
+
+function inheritedParentGuardOwnsProcessTree() {
+  const capability = String(process.env.BEAT_C_GUARD_PARENT_CAPABILITY || "");
+  const monitorText = String(process.env.BEAT_C_GUARD_PARENT_MONITOR_PID || "");
+  const limitText = String(process.env.BEAT_C_GUARD_PARENT_LIMIT_BYTES || "");
+  const proofFdText = String(process.env.BEAT_C_GUARD_PARENT_PROOF_FD || "");
+  const present = capability.length > 0 || monitorText.length > 0 || limitText.length > 0 || proofFdText.length > 0;
+  if (!present) return false;
+  if (!/^[0-9a-f]{64}$/.test(capability) ||
+      !/^[1-9]\d*$/.test(monitorText) ||
+      !/^[1-9]\d*$/.test(limitText) ||
+      !/^[1-9]\d*$/.test(proofFdText)) {
+    throw new Error("invalid inherited parent-guard capability");
+  }
+  const monitorPid = Number(monitorText);
+  const limitBytes = Number(limitText);
+  const proofFd = Number(proofFdText);
+  if (!Number.isSafeInteger(monitorPid) || monitorPid <= 1 ||
+      !Number.isSafeInteger(limitBytes) || limitBytes <= 0 ||
+      !Number.isSafeInteger(proofFd)) {
+    throw new Error("inherited parent-guard identity is outside safe integer range");
+  }
+  const proof = requireParentGuardProofSocket(proofFd, monitorPid);
+  const self = chengProcessIdentitySnapshot(process.pid);
+  if (!self || self.ppid !== process.ppid) {
+    throw new Error("inherited parent-guard self identity changed during topology snapshot");
+  }
+  const monitorIdentity = chengProcessIdentitySnapshot(monitorPid);
+  const record = proof.record;
+  if (!monitorIdentity ||
+      record.capability !== capability ||
+      record.monitorPid !== monitorPid ||
+      record.monitorStartTvsec !== Number(monitorIdentity.startTvsec) ||
+      record.monitorStartTvusec !== Number(monitorIdentity.startTvusec) ||
+      record.limitBytes !== limitBytes) {
+    throw new Error("inherited parent-guard proof record does not match capability, monitor, or limit");
+  }
+  let cursor = self.ppid;
+  const seen = new Set();
+  const ancestors = [];
+  for (let depth = 0; depth < 128 && cursor > 0; depth++) {
+    if (seen.has(cursor)) throw new Error("inherited parent-guard ancestry contains a cycle");
+    seen.add(cursor);
+    const current = chengProcessIdentitySnapshot(cursor);
+    if (!current)throw new Error(`inherited parent-guard ancestor vanished at pid ${cursor}`);
+    ancestors.push(current);
+    if (cursor === monitorPid)break;
+    cursor = current.ppid;
+  }
+  const monitorIndex = ancestors.findIndex((entry) => entry.pid === monitorPid);
+  if (monitorIndex < 0)throw new Error("inherited parent-guard monitor is not an ancestor");
+  const rootIndex = ancestors.findIndex((entry) => entry.pid === record.rootPid);
+  const rootIdentity = record.rootPid === self.pid ? self : ancestors[rootIndex];
+  if (!rootIdentity ||
+      (record.rootPid !== self.pid && (rootIndex < 0 || rootIndex >= monitorIndex)) ||
+      record.rootStartTvsec !== Number(rootIdentity.startTvsec) ||
+      record.rootStartTvusec !== Number(rootIdentity.startTvusec) ||
+      record.rootPpid !== rootIdentity.ppid ||
+      record.rootSid !== rootIdentity.sid ||
+      record.rootPgid !== rootIdentity.pgid ||
+      self.sid !== rootIdentity.sid ||
+      self.pgid !== rootIdentity.pgid) {
+    throw new Error("inherited parent-guard proof record does not bind an exact same-session/group ancestor root");
+  }
+  const sessionLeaderPid = self.sid;
+  const sessionLeaderIndex = ancestors.findIndex((entry) => entry.pid === sessionLeaderPid);
+  if (sessionLeaderPid !== process.pid &&
+      (sessionLeaderIndex < 0 || sessionLeaderIndex >= monitorIndex)) {
+    throw new Error("inherited parent-guard capability is not bound to a session below the monitor");
+  }
+  const sessionLeader = sessionLeaderPid === process.pid ? self : ancestors[sessionLeaderIndex];
+  if (!sessionLeader || sessionLeader.sid !== sessionLeaderPid || sessionLeader.pgid !== sessionLeaderPid) {
+    throw new Error("inherited parent-guard session leader identity is invalid");
+  }
+  assertSameProcessSnapshot(self, chengProcessIdentitySnapshot(self.pid), "inherited parent-guard self identity");
+  for (const ancestor of ancestors) {
+    assertSameProcessSnapshot(
+      ancestor,
+      chengProcessIdentitySnapshot(ancestor.pid),
+      `inherited parent-guard ancestor pid ${ancestor.pid}`,
+    );
+  }
+  return true;
+}
+
+function verifyInheritedParentGuardForChild() {
+  if (!inheritedParentGuardOwnsProcessTree()) return null;
+  return Object.freeze({
+    proofFd: 3,
+    monitorPid: Number(process.env.BEAT_C_GUARD_PARENT_MONITOR_PID),
+    limitBytes: Number(process.env.BEAT_C_GUARD_PARENT_LIMIT_BYTES),
+  });
 }
 
 function initChengToolkit() {
@@ -147,6 +528,7 @@ function stripUntrustedChengInvocationContextFields(input = {}) {
 function createChengTextTool(config) {
   return withDefaultToolDefinitionBehavior({
     name: config.name,
+    requiresChengProjectRoot: config.requiresChengProjectRoot === true,
     searchHint: config.searchHint,
     maxResultSizeChars: config.maxResultSizeChars || 1e5,
     shouldDefer: true,
@@ -518,8 +900,18 @@ function withChengInvocationContext(input = {}, context = {}, options = {}) {
     ...asArray(context.workspaceRoots),
     context.cwd,
   ]);
-  if (options.requireActiveProjectContext && authorizedRoots.length === 0) {
-    throw new Error("No active Cheng workspace root authorizes this tool call");
+  // 授权边界: 客户端声明了 workspaceRoots(authorizedRoots 非空)时, root 必须在其中(防越权);
+  // 本地无声明(authorizedRoots 空, 如 stdio 客户端未提供工作区)时, 显式 root 过了
+  // normalizeChengProjectRoot 的 cheng-package.toml 验证即视为合法授权(用户显式声明项目)。
+  // 启动上下文回退: stdio 服务端由客户端从工作区目录拉起时, process.cwd() 即
+  // 客户端工作区(逐调用不可被客户端注入伪造, 未经 stripUntrusted 通道), 解析出
+  // cheng-package.toml 即视为与显式 root 同级的本地授权; 解析不到维持原拒绝。
+  if (options.requireActiveProjectContext && authorizedRoots.length === 0 && !out.root) {
+    const launchRoot = findChengPackageRoot(process.cwd());
+    if (!launchRoot) {
+      throw new Error("No active Cheng workspace root authorizes this tool call");
+    }
+    out.root = launchRoot;
   }
   const projectHintFile = out.file || out.source || out.rawProfile;
   let contextRoot = null;
@@ -533,7 +925,7 @@ function withChengInvocationContext(input = {}, context = {}, options = {}) {
   }
   if (out.root) {
     out.root = normalizeChengProjectRoot(out.root);
-    if (options.requireActiveProjectContext && !authorizedRoots.includes(out.root)) {
+    if (options.requireActiveProjectContext && authorizedRoots.length > 0 && !authorizedRoots.includes(out.root)) {
       throw new Error(`Explicit Cheng project root is outside the active workspace roots: ${out.root} (active=${authorizedRoots.join(", ")})`);
     }
   } else if (contextRoot) {
@@ -550,7 +942,7 @@ function withChengInvocationContext(input = {}, context = {}, options = {}) {
   const processCwdRoot = findChengPackageRoot(processCwd);
   const cwd = explicitCwd || (out.root && processCwdRoot === out.root ? processCwd : null);
   if (out.root) {
-    if (options.requireActiveProjectContext && !authorizedRoots.includes(out.root)) {
+    if (options.requireActiveProjectContext && authorizedRoots.length > 0 && !authorizedRoots.includes(out.root)) {
       throw new Error(`Selected Cheng project root is outside the active workspace roots: ${out.root} (active=${authorizedRoots.join(", ")})`);
     }
     out = normalizeInvocationProjectPaths(out, out.root, cwd);
@@ -614,37 +1006,20 @@ function resolveCsgFactsPath(input = {}, summary = null) {
   return null;
 }
 
-function readChengSummary(input = {}) {
-  const root = csgProjectRoot(input);
-  const cold = chengColdSummaryPath(root);
-  let stat;
-  try {
-    stat = lstatSync(cold);
-  } catch (error) {
-    if (error?.code === "ENOENT") return null;
-    throw error;
-  }
-  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Cheng CSG summary must be a regular non-symlink file: ${cold}`);
-  if (stat.size <= 0) throw new Error(`Cheng CSG summary must be non-empty: ${cold}`);
-  return JSON.parse(readFileSync(cold, "utf8"));
-}
-
 // CSG 查询只接受 roundtrip 已提交的不可变 generation。canonical summary 是一个
 // 可替换的指针，不能把它或 current.facts 当作证据；以下读取路径在每次查询都重新
 // 验证，缓存只缓存已经验证过的解码结果。
 const CHENG_CSG_QUERY_MAX_SUMMARY_BYTES = 1024 * 1024;
-const CHENG_CSG_QUERY_MAX_FACTS_BYTES = 256 * 1024 * 1024;
+/* Full-compiler-closure facts are legitimately ~330MB today (122 files,
+   11k functions) and grow with the tree; the 256MiB fixture-era bound would
+   reject the real generation. The hash/shape verification above is the
+   integrity guard, this is only a runaway-size sanity bound. */
+const CHENG_CSG_QUERY_MAX_FACTS_BYTES = 1024 * 1024 * 1024;
 const CHENG_CSG_QUERY_MAX_REPORT_BYTES = 8 * 1024 * 1024;
 const CHENG_CSG_QUERY_MAX_OBJECT_BYTES = 512 * 1024 * 1024;
-const CHENG_CSG_QUERY_PRODUCER = "cheng-fusion/cheng_csg_roundtrip";
-const CHENG_CSG_QUERY_COMMIT_PROTOCOL = "content-addressed-generation+atomic-summary";
-const CHENG_CSG_QUERY_SCHEMA = "cheng-cold-csg.summary.v3";
-const CHENG_CSG_QUERY_SCHEMA_DESC = "header(0){schema_version:u32,abi_version:u32,pointer_width:u8,endian:u8,producer_version:u32,target_triple:bytes32,entry_symbol:bytes64,schema_hash:u64,plan_hash:u64};target(1){triple:str};object_format(2){format:str};entry(3){symbol:str};function(4){item_id:u32,word_offset:u32,word_count:u32,symbol:str,body_kind:str};word(5){word:u32};reloc(6){source_item_id:u32,word_offset:u32,target_symbol:str};data(7){item_id:u32,symbol:str,align:u32,byte_count:u32,bytes:raw};data_reloc(8){source_item_id:u32,word_offset:u32,reloc_kind:u32,addend:u32,target_symbol:str};call_edge(9){source_item_id:u32,target_symbol:str}";
 const CHENG_CSG_QUERY_FNV64_BASIS = 1469598103934665603n;
 const CHENG_CSG_QUERY_FNV64_PRIME = 1099511628211n;
-const CHENG_CSG_QUERY_SUMMARY_KEYS = ["artifactHashes", "byteSize", "commitProtocol", "current", "facts", "factsRoot", "generatedAt", "generationHash", "generationId", "objectOut", "producer", "readerExitCode", "readerReport", "root", "runtimeClosure", "schema", "source", "target", "totals", "writerExitCode", "writerReport"].sort();
-const CHENG_CSG_QUERY_HASH = /^sha256:[0-9a-f]{64}$/;
-const CHENG_CSG_QUERY_GENERATION_ID = /^sha256-[0-9a-f]{64}$/;
+const CHENG_CSG_QUERY_LOADED_TOOL_IDENTITY = captureCsgToolIdentityForQuery();
 
 function sameCsgStableFile(left, right) {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
@@ -790,7 +1165,6 @@ function validateCommittedColdFacts(raw, factsPath, expectedTarget) {
     records.push({kind, payload: Buffer.from(match[3], "hex"), line: index + 1, text: lines[index]});
     counts.records++;
     if (kind === 4) counts.functions++;
-    else if (kind === 5) counts.words++;
     else if (kind === 6) counts.relocs++;
     else if (kind === 7) counts.data++;
     else if (kind === 8) counts.dataRelocs++;
@@ -798,7 +1172,7 @@ function validateCommittedColdFacts(raw, factsPath, expectedTarget) {
   }
   if (records.length === 0 || records[0].kind !== 0) throw new Error(`CHENG_CSG facts must begin with the canonical header record: ${factsPath}`);
   const header = records[0].payload;
-  if (header.length !== 126 || header.readUInt32LE(0) !== 1 || header.readUInt32LE(4) !== 1 || header[8] !== 8 || header[9] !== 1 || header.readUInt32LE(10) <= 0) {
+  if (header.length !== 126 || header.readUInt32LE(0) !== 2 || header.readUInt32LE(4) !== 1 || header[8] !== 8 || header[9] !== 1 || header.readUInt32LE(10) <= 0) {
     throw new Error(`CHENG_CSG header schema/ABI/pointer-width/endian mismatch: ${factsPath}`);
   }
   const headerTarget = readFixedCsgStringForQuery(header, 14, 32, "target", factsPath);
@@ -850,7 +1224,15 @@ function validateCommittedColdFacts(raw, factsPath, expectedTarget) {
       functionItems.set(itemId, entry);
       functionSymbols.set(symbol, entry);
     } else if (kind === 5) {
-      readU32("word");
+      const wordOffset = readU32("word_chunk word_offset");
+      const wordCount = readU32("word_chunk word_count");
+      if (wordOffset !== counts.words || wordCount <= 0 || wordCount > 4096 ||
+          wordCount > Math.floor((payload.length - offset) / 4) ||
+          payload.length - offset !== wordCount * 4) {
+        throw new Error(`CHENG_CSG word_chunk count/offset/payload mismatch at line ${line}: ${factsPath}`);
+      }
+      offset += wordCount * 4;
+      counts.words += wordCount;
     } else if (kind === 6) {
       relocations.push({sourceItemId: readU32("reloc source_item_id"), wordOffset: readU32("reloc word_offset"), targetSymbol: readString(), line});
     } else if (kind === 7) {
@@ -927,21 +1309,116 @@ function validateCsgReportForQuery(raw, path, label, factsCounts) {
   return values;
 }
 
-function csgGenerationHashForQuery(root, source, target, artifactHashes) {
-  return sha256Hex(Buffer.from(JSON.stringify({root, source, target, artifactHashes}), "utf8"));
+function csgGenerationHashForQuery(root, source, entrySource, target, driverIdentity, toolIdentity, artifactHashes) {
+  return chengCsgGenerationHash(root, source, entrySource, target, driverIdentity, toolIdentity, artifactHashes);
+}
+
+function validateCsgDriverIdentityForQuery(identity, summaryPath) {
+  assertExactCsgKeyOrder(identity, CHENG_CSG_QUERY_DRIVER_IDENTITY_KEYS, `canonical CSG summary driverIdentity ${summaryPath}`);
+  if (identity.driverRole !== "official" || identity.csgSchemaVersion !== 2 || identity.csgAbiVersion !== 1 || identity.csgPointerWidth !== 8 || identity.csgEndian !== 1 || identity.csgSchemaDescSha256 !== CHENG_CSG_QUERY_SCHEMA_DESC_SHA256) {
+    throw new Error(`canonical CSG summary driverIdentity is not the unique current descriptor: ${summaryPath}`);
+  }
+  for (const field of ["driverSha256", "receiptSha256", "sourceClosureSha256", "patchSha256", "buildScriptSha256", "contractSha256", "compilerSha256", "compilerVersionSha256", "csgSchemaDescSha256"]) {
+    if (!CHENG_CSG_QUERY_HASH.test(String(identity[field] || ""))) throw new Error(`canonical CSG summary driverIdentity ${field} is invalid: ${summaryPath}`);
+  }
+  for (const field of ["driverPath", "receiptPath", "sourceManifestPath", "patchPath", "buildScriptPath", "contractPath", "compilerPath"]) {
+    if (typeof identity[field] !== "string" || resolve(identity[field]) !== identity[field]) throw new Error(`canonical CSG summary driverIdentity ${field} must be absolute: ${summaryPath}`);
+  }
+  const selectedDriver = process.env.CHENG_COLD_DRIVER || CHENG_FUSION_VENDOR_COLD_DRIVER;
+  if (process.env.CHENG_COLD_DRIVER && !process.env.CHENG_COLD_DRIVER_RECEIPT) throw new Error("CHENG_COLD_DRIVER requires the exact CHENG_COLD_DRIVER_RECEIPT; implicit fallback is forbidden");
+  const selectedReceipt = process.env.CHENG_COLD_DRIVER_RECEIPT || `${selectedDriver}.receipt`;
+  if (identity.driverPath !== selectedDriver || identity.receiptPath !== selectedReceipt) throw new Error(`canonical CSG summary driverIdentity is stale for the selected official driver: ${summaryPath}`);
+  if (identity.contractPath !== CHENG_CSG_CURRENT_CONTRACT_SOURCE_PATH) throw new Error(`canonical CSG summary contract path is not the unique current contract: ${summaryPath}`);
+  for (const [path, field, label, maxBytes] of [
+    [identity.driverPath, "driverSha256", "canonical CSG driver", CHENG_CSG_QUERY_MAX_OBJECT_BYTES],
+    [identity.receiptPath, "receiptSha256", "canonical CSG driver receipt", CHENG_CSG_QUERY_MAX_SUMMARY_BYTES],
+    [identity.sourceManifestPath, "sourceClosureSha256", "canonical CSG source manifest", CHENG_CSG_QUERY_MAX_REPORT_BYTES],
+    [identity.patchPath, "patchSha256", "canonical CSG driver patch", CHENG_CSG_QUERY_MAX_REPORT_BYTES],
+    [identity.buildScriptPath, "buildScriptSha256", "canonical CSG driver build script", CHENG_CSG_QUERY_MAX_REPORT_BYTES],
+    [identity.contractPath, "contractSha256", "canonical CSG current contract", CHENG_CSG_QUERY_MAX_REPORT_BYTES],
+    [identity.compilerPath, "compilerSha256", "canonical CSG compiler", CHENG_CSG_QUERY_MAX_OBJECT_BYTES],
+  ]) {
+    const artifact = readStableCsgArtifact(path, label, maxBytes);
+    if (artifact.hash !== identity[field]) throw new Error(`${label} identity hash mismatch: declared=${identity[field]} actual=${artifact.hash} path=${path}`);
+  }
+  const manifest = readStableCsgArtifact(identity.sourceManifestPath, "canonical CSG source manifest", CHENG_CSG_QUERY_MAX_REPORT_BYTES);
+  const manifestText = csgFatalUtf8(manifest.raw, "canonical CSG source manifest", identity.sourceManifestPath);
+  if (!manifestText.endsWith("\n") || manifestText.includes("\r")) throw new Error(`canonical CSG source manifest must use LF-terminated lines: ${identity.sourceManifestPath}`);
+  const seen = new Set();
+  for (const line of manifestText.slice(0, -1).split("\n")) {
+    const match = /^([0-9a-f]{64})  (\/.+)$/.exec(line);
+    if (!match || resolve(match[2]) !== match[2] || seen.has(match[2])) throw new Error(`canonical CSG source manifest line is invalid: ${identity.sourceManifestPath}`);
+    seen.add(match[2]);
+    const member = readStableCsgArtifact(match[2], "canonical CSG source closure member", CHENG_CSG_QUERY_MAX_FACTS_BYTES);
+    if (member.hash !== `sha256:${match[1]}`) throw new Error(`canonical CSG source closure member hash mismatch: ${match[2]}`);
+  }
+  if (seen.size === 0) throw new Error(`canonical CSG source manifest is empty: ${identity.sourceManifestPath}`);
+  const compilerProbe = spawnSync(identity.compilerPath, ["--version"], {encoding: null, timeout: 5000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024, env: chengDriverSpawnEnv()});
+  if (compilerProbe.error || compilerProbe.signal || compilerProbe.status !== 0) throw new Error(`canonical CSG compiler identity probe failed: ${identity.compilerPath}`);
+  const compilerVersionHash = `sha256:${createHash("sha256").update(compilerProbe.stdout || Buffer.alloc(0)).digest("hex")}`;
+  if (compilerVersionHash !== identity.compilerVersionSha256) throw new Error(`canonical CSG compiler version identity mismatch: ${identity.compilerPath}`);
+}
+
+function validateCsgToolIdentityForQuery(identity, summaryPath) {
+  assertExactCsgKeyOrder(identity, CHENG_CSG_QUERY_TOOL_IDENTITY_KEYS, `canonical CSG summary toolIdentity ${summaryPath}`);
+  const expectedPaths = {
+    producerPath: CHENG_CSG_ROUNDTRIP_SOURCE_PATH,
+    consumerPath: CHENG_CSG_TOOLKIT_SOURCE_PATH,
+    contractPath: CHENG_CSG_CURRENT_CONTRACT_SOURCE_PATH,
+  };
+  for (const [pathField, hashField, label] of [
+    ["producerPath", "producerSha256", "canonical CSG roundtrip producer source"],
+    ["consumerPath", "consumerSha256", "canonical CSG toolkit consumer source"],
+    ["contractPath", "contractSha256", "canonical CSG current contract source"],
+  ]) {
+    if (identity[pathField] !== expectedPaths[pathField]) throw new Error(`canonical CSG summary toolIdentity ${pathField} is not the unique current source: ${summaryPath}`);
+    if (!CHENG_CSG_QUERY_HASH.test(String(identity[hashField] || ""))) throw new Error(`canonical CSG summary toolIdentity ${hashField} is invalid: ${summaryPath}`);
+    const artifact = readStableCsgArtifact(identity[pathField], label, CHENG_CSG_QUERY_MAX_REPORT_BYTES);
+    if (artifact.hash !== identity[hashField]) throw new Error(`canonical CSG summary toolIdentity ${hashField} is stale: declared=${identity[hashField]} actual=${artifact.hash}`);
+  }
+  if (JSON.stringify(identity) !== JSON.stringify(CHENG_CSG_QUERY_LOADED_TOOL_IDENTITY)) {
+    throw new Error(`canonical CSG summary toolIdentity does not match the implementation loaded by this process: ${summaryPath}`);
+  }
+  return identity;
+}
+
+function captureCsgToolIdentityForQuery() {
+  const producer = readStableCsgArtifact(CHENG_CSG_ROUNDTRIP_SOURCE_PATH, "loaded CSG roundtrip producer source", CHENG_CSG_QUERY_MAX_REPORT_BYTES);
+  const consumer = readStableCsgArtifact(CHENG_CSG_TOOLKIT_SOURCE_PATH, "loaded CSG toolkit consumer source", CHENG_CSG_QUERY_MAX_REPORT_BYTES);
+  const contract = readStableCsgArtifact(CHENG_CSG_CURRENT_CONTRACT_SOURCE_PATH, "loaded CSG current contract source", CHENG_CSG_QUERY_MAX_REPORT_BYTES);
+  return {
+    producerPath: CHENG_CSG_ROUNDTRIP_SOURCE_PATH,
+    producerSha256: producer.hash,
+    consumerPath: CHENG_CSG_TOOLKIT_SOURCE_PATH,
+    consumerSha256: consumer.hash,
+    contractPath: CHENG_CSG_CURRENT_CONTRACT_SOURCE_PATH,
+    contractSha256: contract.hash,
+  };
 }
 
 function sameCsgArtifactHashes(left, right) {
   return ["facts", "writerReport", "readerReport", "object"].every((key) => left?.[key] === right?.[key] && CHENG_CSG_QUERY_HASH.test(String(left?.[key] || "")));
 }
 
-function exactCsgGenerationObjectName(source) {
-  return `${basename(source).replace(/[^A-Za-z0-9_.-]/g, "_")}.o`;
+function sameCsgArtifactHashesWithMaps(left, right) {
+  return sameCsgArtifactHashes(left, right) && ["factsLinemap", "objectMap"].every((key) => left?.[key] === right?.[key] && CHENG_CSG_QUERY_HASH.test(String(left?.[key] || "")));
+}
+
+function csgArtifactHashKeysAreCanonical(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return JSON.stringify(Object.keys(value)) ===
+    JSON.stringify(CHENG_CSG_QUERY_ARTIFACT_HASH_KEYS);
 }
 
 function assertExactCsgKeys(value, keys, label) {
   if (!value || typeof value !== "object" || Array.isArray(value) || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(keys.slice().sort())) {
     throw new Error(`${label} fields are not canonical`);
+  }
+}
+
+function assertExactCsgKeyOrder(value, keys, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || JSON.stringify(Object.keys(value)) !== JSON.stringify(keys)) {
+    throw new Error(`${label} fields or field order are not canonical`);
   }
 }
 
@@ -959,39 +1436,47 @@ function parseVerifiedCsgSummary(root) {
     throw new Error(`canonical CSG summary is invalid JSON: ${summaryPath} (${error instanceof Error ? error.message : String(error)})`);
   }
   if (JSON.stringify(summary, null, 2) + "\n" !== text) throw new Error(`canonical CSG summary is not canonical JSON: ${summaryPath}`);
-  assertExactCsgKeys(summary, CHENG_CSG_QUERY_SUMMARY_KEYS, `canonical CSG summary ${summaryPath}`);
-  if (summary.schema !== CHENG_CSG_QUERY_SCHEMA || summary.producer !== CHENG_CSG_QUERY_PRODUCER || summary.commitProtocol !== CHENG_CSG_QUERY_COMMIT_PROTOCOL) {
+  assertExactCsgKeyOrder(summary, CHENG_CSG_QUERY_SUMMARY_KEYS, `canonical CSG summary ${summaryPath}`);
+  if (summary.schema !== CHENG_CSG_QUERY_SCHEMA ||
+      summary.producer !== CHENG_CSG_QUERY_PRODUCER ||
+      summary.commitProtocol !== CHENG_CSG_QUERY_COMMIT_PROTOCOL ||
+      summary.generationContractSha256 !==
+        CHENG_CSG_QUERY_GENERATION_CONTRACT_SHA256) {
     throw new Error(`canonical CSG summary has an untrusted schema, producer, or commit protocol: ${summaryPath}`);
   }
-  if (summary.root !== root || typeof summary.source !== "string" || typeof summary.target !== "string" || !/^[A-Za-z0-9_.+-]{1,128}$/.test(summary.target)) {
-    throw new Error(`canonical CSG summary root/source/target is invalid: ${summaryPath}`);
+  if (summary.root !== root || typeof summary.source !== "string" || typeof summary.entrySource !== "string" || typeof summary.target !== "string" || !/^[A-Za-z0-9_.+-]{1,128}$/.test(summary.target)) {
+    throw new Error(`canonical CSG summary root/source/entrySource/target is invalid: ${summaryPath}`);
   }
   const source = resolve(summary.source);
   if (source !== summary.source || !source.endsWith(".cheng")) throw new Error(`canonical CSG summary source must be an absolute .cheng path: ${summaryPath}`);
   assertInsideProject(source, root);
   const sourceStat = lstatSync(source);
   if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) throw new Error(`canonical CSG summary source must remain a regular non-symlink file: ${source}`);
+  const entrySource = resolve(summary.entrySource);
+  if (entrySource !== summary.entrySource || !entrySource.endsWith(".cheng")) throw new Error(`canonical CSG summary entrySource must be an absolute .cheng path: ${summaryPath}`);
+  assertInsideProject(entrySource, root);
+  const entrySourceStat = lstatSync(entrySource);
+  if (entrySourceStat.isSymbolicLink() || !entrySourceStat.isFile()) throw new Error(`canonical CSG summary entrySource must remain a regular non-symlink file: ${entrySource}`);
   if (!CHENG_CSG_QUERY_GENERATION_ID.test(summary.generationId) || !CHENG_CSG_QUERY_HASH.test(summary.generationHash)) {
     throw new Error(`canonical CSG summary generation identifiers or artifact hashes are invalid: ${summaryPath}`);
   }
-  assertExactCsgKeys(summary.artifactHashes, ["facts", "writerReport", "readerReport", "object"], `canonical CSG summary artifact hashes ${summaryPath}`);
-  if (!sameCsgArtifactHashes(summary.artifactHashes, summary.artifactHashes)) throw new Error(`canonical CSG summary artifact hashes are invalid: ${summaryPath}`);
-  if (summary.generationId !== `sha256-${summary.generationHash.slice("sha256:".length)}` || summary.generationHash !== csgGenerationHashForQuery(root, source, summary.target, summary.artifactHashes)) {
+  validateCsgDriverIdentityForQuery(summary.driverIdentity, summaryPath);
+  validateCsgToolIdentityForQuery(summary.toolIdentity, summaryPath);
+  if (!csgArtifactHashKeysAreCanonical(summary.artifactHashes)) throw new Error(`canonical CSG summary artifact hashes ${summaryPath} fields are not canonical`);
+  if (!sameCsgArtifactHashesWithMaps(summary.artifactHashes, summary.artifactHashes)) throw new Error(`canonical CSG summary artifact hashes are invalid: ${summaryPath}`);
+  if (summary.generationId !== `sha256-${summary.generationHash.slice("sha256:".length)}` || summary.generationHash !== csgGenerationHashForQuery(root, source, entrySource, summary.target, summary.driverIdentity, summary.toolIdentity, summary.artifactHashes)) {
     throw new Error(`canonical CSG summary generation hash mismatch: ${summaryPath}`);
   }
   if (summary.factsRoot !== summary.artifactHashes.facts || !Number.isSafeInteger(summary.byteSize) || summary.byteSize <= 0 || summary.runtimeClosure !== null || summary.writerExitCode !== 0 || summary.readerExitCode !== 0) {
     throw new Error(`canonical CSG summary process or facts metadata is invalid: ${summaryPath}`);
   }
-  if (typeof summary.generatedAt !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(summary.generatedAt) || !Number.isFinite(Date.parse(summary.generatedAt))) {
-    throw new Error(`canonical CSG summary generatedAt is invalid: ${summaryPath}`);
-  }
-  return {summary, evidence, summaryPath, source};
+  return {summary, evidence, summaryPath, source, entrySource};
 }
 
 function verifyCommittedCsgGeneration(root) {
   const canonical = parseVerifiedCsgSummary(root);
   if (!canonical) return null;
-  const {summary, evidence: canonicalEvidence, summaryPath, source} = canonical;
+  const {summary, evidence: canonicalEvidence, summaryPath, source, entrySource} = canonical;
   const factsPath = requireCanonicalCsgArtifactParent(summary.facts, root, "CSG generation facts");
   if (factsPath !== summary.facts || basename(factsPath) !== "current.facts") throw new Error(`canonical CSG summary facts path is not canonical: ${summaryPath}`);
   const generationDir = dirname(factsPath);
@@ -999,12 +1484,14 @@ function verifyCommittedCsgGeneration(root) {
   const outDir = dirname(generationRoot);
   if (basename(generationDir) !== summary.generationId || basename(generationRoot) !== ".cheng-csg-generations") throw new Error(`canonical CSG summary generation path is invalid: ${summaryPath}`);
   requireCanonicalCsgDirectory(generationDir, root, "CSG immutable generation");
-  const objectName = exactCsgGenerationObjectName(source);
+  const objectName = exactCsgGenerationObjectName(entrySource);
   const paths = {
     facts: factsPath,
+    factsLinemap: join(generationDir, "current.facts.linemap"),
     writerReport: join(generationDir, "current.writer.report.txt"),
     readerReport: join(generationDir, "current.reader.report.txt"),
     objectOut: join(generationDir, objectName),
+    objectMap: join(generationDir, `${objectName}.map`),
     summary: join(generationDir, "summary.json"),
   };
   if (summary.writerReport !== paths.writerReport || summary.readerReport !== paths.readerReport || summary.objectOut !== paths.objectOut) {
@@ -1016,10 +1503,10 @@ function verifyCommittedCsgGeneration(root) {
     readerReport: join(outDir, "current.reader.report.txt"),
     objectOut: join(outDir, objectName),
   };
-  assertExactCsgKeys(summary.current, ["facts", "writerReport", "readerReport", "objectOut"], `canonical CSG summary current ${summaryPath}`);
+  assertExactCsgKeyOrder(summary.current, CHENG_CSG_QUERY_CURRENT_KEYS, `canonical CSG summary current ${summaryPath}`);
   if (JSON.stringify(summary.current) !== JSON.stringify(expectedCurrent)) throw new Error(`canonical CSG summary current projection paths are invalid: ${summaryPath}`);
   const names = readdirSync(generationDir).sort();
-  const expectedNames = ["current.facts", "current.reader.report.txt", "current.writer.report.txt", objectName, "summary.json"].sort();
+  const expectedNames = ["current.facts", "current.facts.linemap", "current.reader.report.txt", "current.writer.report.txt", objectName, `${objectName}.map`, "summary.json"].sort();
   if (JSON.stringify(names) !== JSON.stringify(expectedNames)) throw new Error(`CSG immutable generation has unexpected directory entries: ${generationDir}`);
   const generationSummary = readStableCsgArtifact(paths.summary, "CSG immutable generation summary", CHENG_CSG_QUERY_MAX_SUMMARY_BYTES);
   if (!generationSummary.raw.equals(canonicalEvidence.raw)) throw new Error(`canonical CSG summary does not exactly identify the immutable generation: ${summaryPath}`);
@@ -1035,11 +1522,28 @@ function verifyCommittedCsgGeneration(root) {
       throw new Error(`CSG ${key === "facts" ? "facts" : key} hash mismatch: declared=${summary.artifactHashes[key]} actual=${actualHashes[key]} path=${paths[key === "object" ? "objectOut" : key]}`);
     }
   }
+  const factsLinemap = readStableCsgArtifact(paths.factsLinemap, "CSG facts line-map", CHENG_CSG_QUERY_MAX_REPORT_BYTES);
+  const objectMap = readStableCsgArtifact(paths.objectMap, "CSG object line-map", CHENG_CSG_QUERY_MAX_REPORT_BYTES);
+  if (factsLinemap.hash !== summary.artifactHashes.factsLinemap) throw new Error(`CSG factsLinemap hash mismatch: declared=${summary.artifactHashes.factsLinemap} actual=${factsLinemap.hash}`);
+  if (objectMap.hash !== summary.artifactHashes.objectMap) throw new Error(`CSG objectMap hash mismatch: declared=${summary.artifactHashes.objectMap} actual=${objectMap.hash}`);
+  if (factsLinemap.hash !== objectMap.hash) throw new Error(`CSG line-map diverges between facts sidecar and object map: ${generationDir}`);
+  for (const [mapEvidence, mapLabel] of [[factsLinemap, "CSG facts line-map"], [objectMap, "CSG object line-map"]]) {
+    try {
+      parseLineMapReport(mapEvidence.raw, generationDir);
+    } catch (error) {
+      throw new Error(`${mapLabel} is not a valid cheng_line_map artifact: ${generationDir} (${error instanceof Error ? error.message : String(error)})`);
+    }
+  }
   const factsEvidence = validateCommittedColdFacts(artifacts.facts.raw, paths.facts, summary.target);
   const writerReport = validateCsgReportForQuery(artifacts.writerReport.raw, paths.writerReport, "CSG writer report", factsEvidence.counts);
   validateCsgReportForQuery(artifacts.readerReport.raw, paths.readerReport, "CSG reader report", factsEvidence.counts);
+  if (writerReport.source !== entrySource) throw new Error(`CSG writer report entry source mismatch: expected=${entrySource} actual=${writerReport.source || ""}`);
+  if (!/^[1-9][0-9]*$/.test(writerReport.compile_input_source_file_count || "") || !Number.isSafeInteger(Number(writerReport.compile_input_source_file_count))) {
+    throw new Error(`CSG writer report compile_input_source_file_count must be a canonical positive integer: ${paths.writerReport}`);
+  }
+  const sourceFileCount = Number(writerReport.compile_input_source_file_count);
   const expectedTotals = {
-    sourceFiles: 1,
+    sourceFiles: sourceFileCount,
     functions: factsEvidence.counts.functions,
     words: factsEvidence.counts.words,
     relocs: factsEvidence.counts.relocs,
@@ -1051,7 +1555,7 @@ function verifyCommittedCsgGeneration(root) {
     records: factsEvidence.counts.records,
     bytes: artifacts.facts.raw.length,
   };
-  assertExactCsgKeys(summary.totals, Object.keys(expectedTotals), `canonical CSG summary totals ${summaryPath}`);
+  assertExactCsgKeyOrder(summary.totals, CHENG_CSG_QUERY_TOTAL_KEYS, `canonical CSG summary totals ${summaryPath}`);
   if (JSON.stringify(summary.totals) !== JSON.stringify(expectedTotals) || summary.byteSize !== artifacts.facts.raw.length) throw new Error(`canonical CSG summary totals mismatch: ${summaryPath}`);
   for (const [label, artifact] of [["facts", artifacts.facts], ["writer report", artifacts.writerReport], ["reader report", artifacts.readerReport], ["object", artifacts.object], ["summary", generationSummary]]) {
     if ((artifact.stat.mode & 0o222n) !== 0n) throw new Error(`CSG immutable generation ${label} is writable: ${generationDir}`);
@@ -1060,13 +1564,16 @@ function verifyCommittedCsgGeneration(root) {
   // produced from one stable generation, never from a path that changed mid-query.
   const finalCanonical = readStableCsgArtifact(chengColdSummaryPath(root), "canonical CSG summary", CHENG_CSG_QUERY_MAX_SUMMARY_BYTES);
   if (finalCanonical.hash !== canonicalEvidence.hash || !finalCanonical.raw.equals(canonicalEvidence.raw)) throw new Error(`canonical CSG summary changed during verification: ${summaryPath}`);
+  validateCsgToolIdentityForQuery(summary.toolIdentity, `${summaryPath} final verification`);
   const finalGenerationSummary = readStableCsgArtifact(paths.summary, "CSG immutable generation summary final verification", CHENG_CSG_QUERY_MAX_SUMMARY_BYTES);
   if (finalGenerationSummary.hash !== generationSummary.hash || (finalGenerationSummary.stat.mode & 0o222n) !== 0n) throw new Error(`CSG immutable generation summary changed during verification: ${paths.summary}`);
   if (JSON.stringify(readdirSync(generationDir).sort()) !== JSON.stringify(expectedNames)) throw new Error(`CSG immutable generation directory changed during verification: ${generationDir}`);
-  for (const [key, path] of Object.entries({facts: paths.facts, writerReport: paths.writerReport, readerReport: paths.readerReport, object: paths.objectOut})) {
+  const finalArtifacts = {facts: paths.facts, factsLinemap: paths.factsLinemap, writerReport: paths.writerReport, readerReport: paths.readerReport, object: paths.objectOut, objectMap: paths.objectMap};
+  for (const [key, path] of Object.entries(finalArtifacts)) {
     const maxBytes = key === "facts" ? CHENG_CSG_QUERY_MAX_FACTS_BYTES : key === "object" ? CHENG_CSG_QUERY_MAX_OBJECT_BYTES : CHENG_CSG_QUERY_MAX_REPORT_BYTES;
     const finalArtifact = readStableCsgArtifact(path, `CSG ${key} final verification`, maxBytes);
-    if (finalArtifact.hash !== artifacts[key].hash || (finalArtifact.stat.mode & 0o222n) !== 0n) throw new Error(`CSG generation ${key} changed during verification: ${path}`);
+    const baselineHash = artifacts[key] ? artifacts[key].hash : (key === "factsLinemap" ? summary.artifactHashes.factsLinemap : summary.artifactHashes.objectMap);
+    if (finalArtifact.hash !== baselineHash || (finalArtifact.stat.mode & 0o222n) !== 0n) throw new Error(`CSG generation ${key} changed during verification: ${path}`);
   }
   return {summary, summaryHash: canonicalEvidence.hash, paths, factsRaw: artifacts.facts.raw, writerReport};
 }
@@ -1125,6 +1632,7 @@ function parseChengColdFacts(root, factsPath, summary = {}, rawOverride = null, 
   const unsupportedByCode = new Map();
   const modules = new Map();
   let recordCount = 0;
+  let decodedWordCount = 0;
   let target = summary.target || null;
   let entry = null;
   let objectFormat = null;
@@ -1141,7 +1649,7 @@ function parseChengColdFacts(root, factsPath, summary = {}, rawOverride = null, 
     }
     if (kind < 0 || kind > 9) throw new Error(`unknown CHENG_CSG record kind ${kind} at line ${index + 1}`);
     recordCount++;
-    const payload = kind === 1 || kind === 2 || kind === 3 || kind === 4 || kind === 6 || kind === 7 || kind === 9
+    const payload = kind === 0 || kind === 1 || kind === 2 || kind === 3 || kind === 4 || kind === 5 || kind === 6 || kind === 7 || kind === 9
       ? Buffer.from(payloadHex, "hex")
       : null;
     try {
@@ -1181,6 +1689,15 @@ function parseChengColdFacts(root, factsPath, summary = {}, rawOverride = null, 
         appendToMapList(funcByName, fn.name, id);
         appendToMapList(nameToIds, fn.name, id);
         if (fn.symbol !== fn.name) appendToMapList(nameToIds, fn.symbol, id);
+      } else if (kind === 5) {
+        if (payload.length < 8) throw new Error("word_chunk header is truncated");
+        const wordOffset = readU32LE(payload, 0);
+        const wordCount = readU32LE(payload, 4);
+        if (wordOffset !== decodedWordCount || wordCount <= 0 ||
+            wordCount > 4096 || payload.length !== 8 + wordCount * 4) {
+          throw new Error("word_chunk count/offset/payload mismatch");
+        }
+        decodedWordCount += wordCount;
       } else if (kind === 6) {
         let offset = 0;
         const sourceItemId = readU32LE(payload, offset); offset += 4;
@@ -1250,15 +1767,15 @@ function parseChengColdFacts(root, factsPath, summary = {}, rawOverride = null, 
   }
   const report = verifiedReport || parseColdReport(summary.writerReport || summary.readerReport);
   return {
-    schema: "cheng-cold-csg.facts.v1",
+    schema: "cheng-cold-csg.facts",
     root,
     factsPath,
     source: summary.source || null,
-    generatedAt: summary.generatedAt || null,
+    entrySource: summary.entrySource || null,
     factCount: recordCount,
     factsRoot: summary.factsRoot || sha256Hex(raw),
-    totals: {
-      sourceFiles: summary.source ? 1 : 0,
+    totals: summary.totals || {
+      sourceFiles: 0,
       functions: funcById.size,
       symbols: symById.size,
       calls: [...callsOut.values()].reduce((sum, list) => sum + list.length, 0),
@@ -1335,11 +1852,11 @@ async function parseCsgCoreFacts(root, factsPath, summary = {}, rawOverride = nu
     }
   }
   return {
-    schema: "csg-core.facts.v1",
+    schema: "csg-core.facts",
     root,
     factsPath,
     source: summary.source || null,
-    generatedAt: summary.generatedAt || null,
+    entrySource: summary.entrySource || null,
     factCount: facts.length,
     factsRoot: summary.factsRoot || summary.facts_root,
     totals: summary.totals || summary.counts,
@@ -1436,8 +1953,7 @@ function factsStalenessWarning(facts, targetPathRaw) {
     return null;
   }
   if (targetAbs === factsSourceAbs) return null;
-  const generatedAtText = facts.generatedAt ? ` at ${facts.generatedAt}` : "";
-  return `CSG facts were generated from ${normalizeToSubstratePath(factsSourceAbs, root)}${generatedAtText}, not ${normalizeToSubstratePath(targetAbs, root)}; results and file:line locations may not reflect the queried file. Run cheng_csg_roundtrip with source=${normalizeToSubstratePath(targetAbs, root)} to refresh facts.`;
+  return `CSG facts target ${normalizeToSubstratePath(factsSourceAbs, root)}, not ${normalizeToSubstratePath(targetAbs, root)}; results and file:line locations may not reflect the queried file. Run cheng_csg_roundtrip with source=${normalizeToSubstratePath(targetAbs, root)} and the exact package entrySource to refresh facts.`;
 }
 
 function evidenceForSymbolInFacts(facts, name) {
@@ -1520,7 +2036,21 @@ function runChengDriver(driver, args, options = {}) {
   }
   const cwd = options.cwd || resolveChengProjectRoot(options);
   const maxBuffer = options.maxBuffer || (1 << 30);
-  const exactGuardOwnsTimeoutAndCleanup = options.exactGuardOwnsTimeoutAndCleanup === true;
+  const inheritedParentGuardProof = verifyInheritedParentGuardForChild();
+  const inheritedParentGuard = inheritedParentGuardProof !== null;
+  const childEnv = chengDriverSpawnEnv(options.env, options.unsetEnv, options.hardRssCapBytes);
+  if (inheritedParentGuard) {
+    for (const key of CHENG_PARENT_GUARD_ENV_KEYS) {
+      if ((options.unsetEnv || []).includes(key) ||
+          (Object.hasOwn(options.env || {}, key) && String(options.env[key]) !== String(process.env[key]))) {
+        throw new Error(`runChengDriver cannot replace verified parent-guard field: ${key}`);
+      }
+      childEnv[key] = String(process.env[key]);
+    }
+  }
+  const exactGuardOwnsTimeoutAndCleanup =
+    options.exactGuardOwnsTimeoutAndCleanup === true ||
+    inheritedParentGuard;
   if (exactGuardOwnsTimeoutAndCleanup && options.hardTimeoutMs !== undefined) {
     throw new Error("exact guard ownership forbids a competing outer hardTimeoutMs");
   }
@@ -1539,9 +2069,11 @@ function runChengDriver(driver, args, options = {}) {
     try {
       child = spawn(driver, args, {
         cwd,
-        env: chengDriverSpawnEnv(options.env, options.unsetEnv, options.hardRssCapBytes),
-        stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
+        env: childEnv,
+        stdio: inheritedParentGuard
+          ? ["ignore", "pipe", "pipe", inheritedParentGuardProof.proofFd]
+          : ["ignore", "pipe", "pipe"],
+        detached: !inheritedParentGuard,
       });
     } catch (error) {
       const stderr = Buffer.from(error instanceof Error ? error.message : String(error), "utf8");
@@ -2280,7 +2812,7 @@ async function triageChengBinaryCrash(input) {
     }
     if (exitedMatch && !hasStopReason) {
       return {
-        schema: "cheng_crash_triage_live.v1",
+        schema: "cheng_crash_triage_live",
         binary, args, primaryObject, inputEvidence,
         exited: true,
         exitCode: Number(exitedMatch[1]),
@@ -2316,7 +2848,7 @@ async function triageChengBinaryCrash(input) {
     const symbolizeCtx = {binaryBase: basename(binary), primaryObject, primaryObjectExists, exeText, primaryText, nmSymbols, slide};
     const symbolicated = frames.map((frame) => symbolizeFrame(frame, symbolizeCtx));
     return {
-      schema: "cheng_crash_triage_live.v1",
+      schema: "cheng_crash_triage_live",
       binary, args, primaryObject, inputEvidence,
       exited: false,
       stopReason: stopReasonMatch ? stopReasonMatch[1].trim() : null,
@@ -2751,7 +3283,7 @@ async function chengCorruptHunt(input) {
       if (primarySnapshot) verifyCrashTriageSnapshot(primarySnapshot, "cheng_corrupt_hunt primaryObject");
     }
     return {
-      schema: "cheng_corrupt_hunt.v1",
+      schema: "cheng_corrupt_hunt",
       binary: binarySource,
       args: input.args || [],
       inputEvidence: {binary: publicCrashTriageInputEvidence(binarySnapshot), primaryObject: publicCrashTriageInputEvidence(primarySnapshot)},
@@ -2783,12 +3315,37 @@ async function chengCorruptHunt(input) {
   }
 }
 
-function chengLspResolveBinary() {
-  if (process.env.CHENG_LSP_PATH) return process.env.CHENG_LSP_PATH;
-  const found = spawnSync("which", ["cheng-lsp"], {encoding: "utf8"});
-  const resolvedPath = found.stdout?.trim();
-  if (resolvedPath) return resolvedPath;
-  return CHENG_LSP_DEFAULT;
+function chengLspResolveBinary(environment = process.env, defaultPath = CHENG_LSP_DEFAULT) {
+  const explicitlyConfigured = String(environment.CHENG_LSP_PATH || "").trim();
+  const candidate = explicitlyConfigured || defaultPath;
+  const origin = explicitlyConfigured ? "CHENG_LSP_PATH" : "current Cheng artifact";
+  if (!isAbsolute(candidate)) throw new Error(`${origin} must be an absolute cheng-lsp path: ${candidate}`);
+  let stat;
+  try {
+    stat = lstatSync(candidate);
+  } catch (error) {
+    throw new Error(`${origin} cheng-lsp binary not found at ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.size <= 0) {
+    throw new Error(`${origin} cheng-lsp must be a non-empty regular non-symlink file: ${candidate}`);
+  }
+  try {
+    accessSync(candidate, constants.X_OK);
+  } catch (error) {
+    throw new Error(`${origin} cheng-lsp is not executable at ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (realpathSync.native(candidate) !== candidate) {
+    throw new Error(`${origin} cheng-lsp path must be canonical: ${candidate}`);
+  }
+  return candidate;
+}
+
+function chengLspResolveArtifactIdentity(
+    environment = process.env,
+    defaultPath = CHENG_LSP_DEFAULT,
+    toolchainRoot = CHENG_TOOLCHAIN_ROOT) {
+  const binary = chengLspResolveBinary(environment, defaultPath);
+  return chengLspCaptureArtifactIdentity(binary, toolchainRoot);
 }
 
 function pathToUri(filePath) {
@@ -2804,6 +3361,8 @@ class JsonRpcProcessClient {
     this.pending = new Map();
     this.decoder = new JsonRpcFrameDecoder({framing: "content-length", label: `cheng-lsp ${command}`});
     this.publishedDiagnostics = new Map();
+    this.diagnosticPublishSequences = new Map();
+    this.diagnosticPublishWaiters = new Map();
     this.dead = false;
     this.generation = 0;
     this.rootPath = null;
@@ -2848,6 +3407,13 @@ class JsonRpcProcessClient {
       pending.reject(error);
     }
     this.pending.clear();
+    for (const waiters of this.diagnosticPublishWaiters.values()) {
+      for (const waiter of waiters) {
+        clearTimeout(waiter.timer);
+        waiter.reject(error);
+      }
+    }
+    this.diagnosticPublishWaiters.clear();
   }
 
   fail(error, killSignal = null) {
@@ -2873,7 +3439,28 @@ class JsonRpcProcessClient {
   handleMessage(message) {
     if (message.method === "textDocument/publishDiagnostics") {
       const uri = message.params?.uri;
-      if (uri) this.publishedDiagnostics.set(uri, message.params?.diagnostics || []);
+      if (uri) {
+        const diagnostics = message.params?.diagnostics || [];
+        const sequence = (this.diagnosticPublishSequences.get(uri) || 0) + 1;
+        this.publishedDiagnostics.set(uri, diagnostics);
+        this.diagnosticPublishSequences.set(uri, sequence);
+        const waiters = this.diagnosticPublishWaiters.get(uri) || [];
+        const pending = [];
+        for (const waiter of waiters) {
+          if (sequence > waiter.afterSequence) {
+            clearTimeout(waiter.timer);
+            waiter.resolve({
+              diagnostics,
+              sequence,
+              version: message.params?.version,
+            });
+          } else {
+            pending.push(waiter);
+          }
+        }
+        if (pending.length > 0) this.diagnosticPublishWaiters.set(uri, pending);
+        else this.diagnosticPublishWaiters.delete(uri);
+      }
       return;
     }
     if (message.id !== undefined && this.pending.has(message.id)) {
@@ -2915,6 +3502,46 @@ class JsonRpcProcessClient {
     this.sendEnvelope({jsonrpc: "2.0", method, params});
   }
 
+  diagnosticPublishSequence(uri) {
+    return this.diagnosticPublishSequences.get(uri) || 0;
+  }
+
+  waitForPublishedDiagnostics(uri, afterSequence, timeoutMs) {
+    if (this.dead) return Promise.reject(new Error(`cannot wait on dead JSON-RPC process: ${this.command}`));
+    const currentSequence = this.diagnosticPublishSequence(uri);
+    if (currentSequence > afterSequence) {
+      return Promise.resolve({
+        diagnostics: this.publishedDiagnostics.get(uri) || [],
+        sequence: currentSequence,
+        version: undefined,
+      });
+    }
+    const effectiveTimeoutMs = chengFusionTimeoutMs(
+      timeoutMs === undefined ? CHENG_FUSION_LSP_TIMEOUT_MS_DEFAULT : timeoutMs,
+    );
+    return new Promise((resolvePromise, reject) => {
+      const waiter = {
+        afterSequence,
+        resolve: resolvePromise,
+        reject,
+        timer: null,
+      };
+      waiter.timer = setTimeout(() => {
+        const waiters = this.diagnosticPublishWaiters.get(uri) || [];
+        const remaining = waiters.filter((candidate) => candidate !== waiter);
+        if (remaining.length > 0) this.diagnosticPublishWaiters.set(uri, remaining);
+        else this.diagnosticPublishWaiters.delete(uri);
+        reject(new Error(
+          `textDocument/publishDiagnostics timed out after ${effectiveTimeoutMs}ms ` +
+          `for ${uri} after sequence ${afterSequence}; refusing to treat unfinished analysis as zero diagnostics`,
+        ));
+      }, effectiveTimeoutMs);
+      const waiters = this.diagnosticPublishWaiters.get(uri) || [];
+      waiters.push(waiter);
+      this.diagnosticPublishWaiters.set(uri, waiters);
+    });
+  }
+
   close() {
     // JsonRpcProcessClient has no asynchronous close contract. Use an immediate group SIGKILL so
     // initialize failures, protocol failures and service shutdown cannot leave a resistant child
@@ -2928,30 +3555,49 @@ let chengLspClientFlights = new Map();
 let chengLspNextGeneration = 1;
 let chengLspOpenDocs = new WeakMap();
 
-function forgetChengLspClient(rootPath, client) {
-  if (chengLspClients.get(rootPath) === client) chengLspClients.delete(rootPath);
+function forgetChengLspClient(cacheKey, client) {
+  if (chengLspClients.get(cacheKey) === client) chengLspClients.delete(cacheKey);
   chengLspOpenDocs.delete(client);
 }
 
-async function chengLspEnsureClient(rootPath = resolveChengProjectRoot()) {
+async function chengLspEnsureClient(
+    rootPath = resolveChengProjectRoot()) {
   rootPath = normalizeChengProjectRoot(rootPath);
-  const existing = chengLspClients.get(rootPath);
+  const environment = process.env;
+  const defaultPath = CHENG_LSP_DEFAULT;
+  const toolchainRoot = CHENG_TOOLCHAIN_ROOT;
+  const artifactIdentity = chengLspResolveArtifactIdentity(
+    environment,
+    defaultPath,
+    toolchainRoot);
+  const cacheKey = chengLspArtifactCacheKey(rootPath, artifactIdentity);
+  const existing = chengLspClients.get(cacheKey);
   if (existing) {
-    if (!existing.dead) return existing;
-    forgetChengLspClient(rootPath, existing);
+    if (!existing.dead) {
+      chengLspAssertArtifactIdentityStable(
+        existing.artifactIdentity,
+        artifactIdentity,
+        "cached cheng-lsp");
+      return existing;
+    }
+    forgetChengLspClient(cacheKey, existing);
   }
-  const inFlight = chengLspClientFlights.get(rootPath);
+  const inFlight = chengLspClientFlights.get(cacheKey);
   if (inFlight) return inFlight;
 
   const flight = (async () => {
-    const binary = chengLspResolveBinary();
-    if (!existsSync(binary)) throw new Error(`cheng-lsp binary not found: ${binary}`);
+    const binary = artifactIdentity.output.path;
     if (!Number.isSafeInteger(chengLspNextGeneration)) throw new Error("cheng-lsp client generation counter exhausted");
     const generation = chengLspNextGeneration++;
-    const client = new JsonRpcProcessClient(binary, [], {cwd: rootPath});
+    const client = new JsonRpcProcessClient(binary, [], {
+      cwd: rootPath,
+      env: environment,
+    });
     client.rootPath = rootPath;
     client.generation = generation;
-    client.onDead = () => forgetChengLspClient(rootPath, client);
+    client.cacheKey = cacheKey;
+    client.artifactIdentity = artifactIdentity;
+    client.onDead = () => forgetChengLspClient(cacheKey, client);
     try {
       client.start();
       const rootUri = pathToUri(rootPath);
@@ -2961,20 +3607,29 @@ async function chengLspEnsureClient(rootPath = resolveChengProjectRoot()) {
         rootUri,
         workspaceFolders: [{uri: rootUri, name: basename(rootPath) || "cheng"}],
       }, 20000);
-      client.notify("initialized", {});
       if (client.dead) throw new Error(`cheng-lsp exited during initialize: ${binary}`);
-      chengLspClients.set(rootPath, client);
+      const initializedArtifactIdentity = chengLspResolveArtifactIdentity(
+        environment,
+        defaultPath,
+        toolchainRoot);
+      chengLspAssertArtifactIdentityStable(
+        artifactIdentity,
+        initializedArtifactIdentity,
+        "cheng-lsp initialize");
+      client.artifactIdentity = initializedArtifactIdentity;
+      client.notify("initialized", {});
+      chengLspClients.set(cacheKey, client);
       return client;
     } catch (error) {
       client.close();
       throw error;
     }
   })();
-  chengLspClientFlights.set(rootPath, flight);
+  chengLspClientFlights.set(cacheKey, flight);
   try {
     return await flight;
   } finally {
-    if (chengLspClientFlights.get(rootPath) === flight) chengLspClientFlights.delete(rootPath);
+    if (chengLspClientFlights.get(cacheKey) === flight) chengLspClientFlights.delete(cacheKey);
   }
 }
 
@@ -2990,14 +3645,26 @@ async function chengLspSyncDoc(client, filePath, text) {
   }
   const tracked = openDocs.get(uri);
   if (!tracked || tracked.generation !== client.generation) {
+    const diagnosticPublishBaseline = client.diagnosticPublishSequence(uri);
     client.notify("textDocument/didOpen", {textDocument: {uri, languageId: "cheng", version: 1, text}});
-    openDocs.set(uri, {generation: client.generation, version: 1, text});
+    openDocs.set(uri, {
+      generation: client.generation,
+      version: 1,
+      text,
+      diagnosticPublishBaseline,
+    });
     return uri;
   }
   if (tracked.text === text) return uri;
   const version = tracked.version + 1;
+  const diagnosticPublishBaseline = client.diagnosticPublishSequence(uri);
   client.notify("textDocument/didChange", {textDocument: {uri, version}, contentChanges: [{text}]});
-  openDocs.set(uri, {generation: client.generation, version, text});
+  openDocs.set(uri, {
+    generation: client.generation,
+    version,
+    text,
+    diagnosticPublishBaseline,
+  });
   return uri;
 }
 
@@ -3005,12 +3672,18 @@ async function chengLspEnsureDocOpen(client, filePath) {
   return chengLspSyncDoc(client, filePath, readFileSync(filePath, "utf8"));
 }
 
-function extractDiagnostics(result) {
-  if (!result) return [];
-  if (Array.isArray(result)) return result;
-  if (Array.isArray(result.items)) return result.items;
-  if (Array.isArray(result.diagnostics)) return result.diagnostics;
-  return [];
+async function chengLspDiagnosticsForSyncedDoc(client, uri, timeoutMs = 10000) {
+  const openDocs = chengLspOpenDocs.get(client);
+  const tracked = openDocs?.get(uri);
+  if (!tracked || tracked.generation !== client.generation) {
+    throw new Error(`diagnostics requested for unsynchronized Cheng document: ${uri}`);
+  }
+  const published = await client.waitForPublishedDiagnostics(
+    uri,
+    tracked.diagnosticPublishBaseline,
+    timeoutMs,
+  );
+  return published.diagnostics;
 }
 
 function lineRange(input, text) {
@@ -3068,22 +3741,12 @@ async function chengLspQuery(input) {
     return client.request("workspace/symbol", {query: input.query});
   }
   if (input.kind === "diagnostics") {
-    try {
-      return extractDiagnostics(await client.request("textDocument/diagnostic", {textDocument}, 10000));
-    } catch {
-      await new Promise((resolveWait) => setTimeout(resolveWait, 250));
-      return client.publishedDiagnostics.get(uri) || [];
-    }
+    return chengLspDiagnosticsForSyncedDoc(client, uri, 10000);
   }
   if (input.kind === "codeAction") {
     if (input.line === undefined || input.character === undefined) throw new Error("codeAction requires line and character");
     const range = lineRange(input, text);
-    let diagnostics = [];
-    try {
-      diagnostics = extractDiagnostics(await client.request("textDocument/diagnostic", {textDocument}, 10000));
-    } catch {
-      diagnostics = client.publishedDiagnostics.get(uri) || [];
-    }
+    const diagnostics = await chengLspDiagnosticsForSyncedDoc(client, uri, 10000);
     return client.request("textDocument/codeAction", {textDocument, range, context: {diagnostics}});
   }
   throw new Error(`unknown LSP query kind: ${input.kind}`);
@@ -3155,7 +3818,7 @@ function parseCrash(stderr) {
   const formatCounts = {};
   for (const frame of frames) formatCounts[frame.source] = (formatCounts[frame.source] || 0) + 1;
   return {
-    schema: "cheng_crash_triage.v1",
+    schema: "cheng_crash_triage",
     frameCount: frames.length,
     frames,
     formatCounts,
@@ -3165,51 +3828,572 @@ function parseCrash(stderr) {
   };
 }
 
-function parseLineMapReport(text, source) {
-  const marker = text.indexOf("cheng_line_map_v1");
-  if (marker < 0) throw new Error(`no cheng_line_map_v1 marker in line-map (${text.length} bytes)`);
-  const report = text.slice(marker);
-  const lines = report.split(/\r?\n/).filter(Boolean);
-  const countLine = lines.find((line) => line.startsWith("entry_count="));
+const CHENG_LINE_MAP_SCHEMA = "cheng_line_map";
+const CHENG_SYMBOLS_SCHEMA = "cheng_symbols";
+const LINE_MAP_UTF8_DECODER = new TextDecoder("utf-8", {fatal: true});
+
+function parseCanonicalLineMapUnsigned(value, field, allowZero = true) {
+  if (!/^(?:0|[1-9][0-9]*)$/.test(value) || (!allowZero && value === "0")) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} ${field} must be a canonical ${allowZero ? "unsigned" : "positive"} integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${CHENG_LINE_MAP_SCHEMA} ${field} exceeds Number.MAX_SAFE_INTEGER`);
+  return parsed;
+}
+
+function parseCanonicalLineMapOffset(value, field) {
+  if (!/^(?:0|[1-9][0-9]*|0x[0-9a-f]+)$/.test(value)) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} ${field} must be a canonical decimal or lowercase hexadecimal integer`);
+  }
+  const parsed = value.startsWith("0x") ? Number.parseInt(value.slice(2), 16) : Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${CHENG_LINE_MAP_SCHEMA} ${field} exceeds Number.MAX_SAFE_INTEGER`);
+  return parsed;
+}
+
+function parseExactLineMapFields(line, kind, orderedKeys, lineNumber) {
+  const columns = line.split("\t");
+  if (columns.length !== orderedKeys.length + 1 || columns[0] !== kind) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} line ${lineNumber} must be a complete ${kind} record`);
+  }
+  const values = {};
+  for (let index = 0; index < orderedKeys.length; index++) {
+    const key = orderedKeys[index];
+    const prefix = `${key}=`;
+    const field = columns[index + 1];
+    if (!field.startsWith(prefix) || field.length === prefix.length) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} line ${lineNumber} expected non-empty field ${key}`);
+    }
+    values[key] = field.slice(prefix.length);
+  }
+  return values;
+}
+
+function assertLowerHexLineMapCid(value, field) {
+  if (!/^[0-9a-f]{64}$/.test(value)) throw new Error(`${CHENG_LINE_MAP_SCHEMA} ${field} must be a lowercase 32-byte CID`);
+}
+
+function parseSimpleLineMap(lines, source, expectedModulePath) {
+  if (lines.length < 2 || !lines[1].startsWith("entry_count=")) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} must declare entry_count immediately after the schema header`);
+  }
+  const entryCount = parseCanonicalLineMapUnsigned(lines[1].slice("entry_count=".length), "entry_count");
+  if (lines.length !== entryCount + 2) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} entry_count=${entryCount} but found ${lines.length - 2} records`);
+  }
   const functions = [];
-  for (const line of lines) {
-    if (!line.startsWith("entry\t")) continue;
-    const columns = line.split("\t");
-    const value = (item) => {
-      const index = String(item || "").indexOf("=");
-      return index >= 0 ? String(item).slice(index + 1) : item || null;
-    };
+  for (let index = 0; index < entryCount; index++) {
+    const lineNumber = index + 3;
+    const columns = lines[index + 2].split("\t");
+    if (columns.length < 9 || columns[0] !== "entry" || columns.slice(1, 7).some((value) => value.length === 0)) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} line ${lineNumber} must be a complete positional entry`);
+    }
+    const sigLine = parseCanonicalLineMapUnsigned(columns[4], `line ${lineNumber} signature line`, false);
+    const bodyLine = parseCanonicalLineMapUnsigned(columns[5], `line ${lineNumber} body line`, false);
+    parseCanonicalLineMapUnsigned(columns[6], `line ${lineNumber} end line`, false);
+    const keyed = columns.slice(7);
+    const keys = keyed.map((field) => field.slice(0, field.indexOf("=")));
+    const allowedLayouts = [
+      ["function_name", "module_path"],
+      ["offset", "size", "function_name", "module_path"],
+      ["function_name", "module_path", "offset", "size"],
+    ];
+    if (keyed.some((field) => !/^[a-z_]+=.*/.test(field)) ||
+        !allowedLayouts.some((layout) => JSON.stringify(layout) === JSON.stringify(keys))) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} line ${lineNumber} has unsupported or incomplete keyed fields`);
+    }
+    const values = Object.fromEntries(keyed.map((field) => {
+      const separator = field.indexOf("=");
+      return [field.slice(0, separator), field.slice(separator + 1)];
+    }));
+    if (!values.function_name || !values.module_path ||
+        values.function_name !== columns[2] || values.module_path !== columns[3]) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} line ${lineNumber} positional/keyed function identity mismatch`);
+    }
+    if (expectedModulePath !== null && values.module_path !== expectedModulePath) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} line ${lineNumber} module_path does not match the requested source`);
+    }
+    if (values.offset !== undefined) {
+      parseCanonicalLineMapOffset(values.offset, `line ${lineNumber} offset`);
+      if (parseCanonicalLineMapOffset(values.size, `line ${lineNumber} size`) <= 0) {
+        throw new Error(`${CHENG_LINE_MAP_SCHEMA} line ${lineNumber} size must be positive`);
+      }
+    }
     functions.push({
-      primarySymbol: columns[1] || null,
-      funcName: columns[2] || null,
-      file: columns[3] || null,
-      sigLine: columns[4] != null ? Number(columns[4]) : null,
-      bodyLine: columns[5] != null ? Number(columns[5]) : null,
-      functionName: columns[7] ? value(columns[7]) : columns[2] || null,
-      modulePath: columns[8] ? value(columns[8]) : columns[3] || null,
+      primarySymbol: columns[1],
+      funcName: columns[2],
+      file: columns[3],
+      sigLine,
+      bodyLine,
+      functionName: values.function_name,
+      modulePath: values.module_path,
+    });
+  }
+  return {schema: CHENG_LINE_MAP_SCHEMA, source, entryCount, functionCount: functions.length, functions};
+}
+
+function parseSemanticLineMap(lines, source, expectedModulePath) {
+  const headers = [
+    "source_version", "semantic_snapshot_cid", "binding_receipt_cid", "world_head_cid",
+    "compiler_cid", "source_bundle_cid", "csg_root_cid", "validation_receipt_cid",
+    "debug_projection_cid", "declaration_table_cid", "declaration_identity_cid", "object_cid",
+    "object_structure_cid", "debug_map_cid", "text_section_index", "text_section_file_offset",
+    "text_section_byte_length", "entry_count", "location_count",
+  ];
+  if (lines.length < headers.length + 1) throw new Error(`${CHENG_LINE_MAP_SCHEMA} semantic header is incomplete`);
+  const headerValues = {};
+  for (let index = 0; index < headers.length; index++) {
+    const key = headers[index];
+    const prefix = `${key}=`;
+    const line = lines[index + 1];
+    if (!line.startsWith(prefix) || line.length === prefix.length) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} expected ordered header ${key}`);
+    }
+    headerValues[key] = line.slice(prefix.length);
+  }
+  for (const key of headers.slice(1, 14)) assertLowerHexLineMapCid(headerValues[key], key);
+  parseCanonicalLineMapUnsigned(headerValues.source_version, "source_version", false);
+  parseCanonicalLineMapUnsigned(headerValues.text_section_index, "text_section_index");
+  parseCanonicalLineMapUnsigned(headerValues.text_section_file_offset, "text_section_file_offset", false);
+  parseCanonicalLineMapUnsigned(headerValues.text_section_byte_length, "text_section_byte_length", false);
+  const entryCount = parseCanonicalLineMapUnsigned(headerValues.entry_count, "entry_count", false);
+  const locationCount = parseCanonicalLineMapUnsigned(headerValues.location_count, "location_count", false);
+  const records = lines.slice(headers.length + 1);
+  if (records.length !== entryCount + locationCount) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} declared ${entryCount + locationCount} records but found ${records.length}`);
+  }
+  const entryKeys = [
+    "function_id", "function_symbol_id", "function_decl_id", "function_decl_key_cid",
+    "function_symbol_cid", "object_section_index", "pc_start", "pc_end_exclusive",
+    "object_file_byte_start", "object_file_byte_end_exclusive", "symbol_bytes_cid", "source_id",
+    "document_cid", "declaration_span_id", "body_span_id", "body_start_line", "body_start_column",
+    "body_end_line", "body_end_column", "function_name", "module_path",
+  ];
+  const locationKeys = [
+    "debug_op_id", "function_id", "function_symbol_id", "function_decl_id", "function_decl_key_cid",
+    "function_symbol_cid", "pc_start", "pc_end_exclusive", "object_file_byte_start",
+    "object_file_byte_end_exclusive", "bytes_cid", "typed_node_id", "typed_ir_node_index",
+    "source_id", "span_id", "document_cid", "start_line", "start_column", "end_line",
+    "end_column", "module_path",
+  ];
+  const syntheticKeys = [
+    "synthetic_kind", "function_id", "function_symbol_id", "function_decl_id",
+    "function_decl_key_cid", "function_symbol_cid", "pc_start", "pc_end_exclusive",
+    "object_file_byte_start", "object_file_byte_end_exclusive", "bytes_cid",
+  ];
+  const functions = [];
+  let observedLocations = 0;
+  for (let index = 0; index < records.length; index++) {
+    const lineNumber = headers.length + index + 2;
+    const kind = records[index].split("\t", 1)[0];
+    if (kind === "entry") {
+      if (functions.length >= entryCount) throw new Error(`${CHENG_LINE_MAP_SCHEMA} entry records must precede location records`);
+      const values = parseExactLineMapFields(records[index], "entry", entryKeys, lineNumber);
+      for (const key of ["function_decl_key_cid", "function_symbol_cid", "symbol_bytes_cid", "document_cid"]) {
+        assertLowerHexLineMapCid(values[key], `line ${lineNumber} ${key}`);
+      }
+      for (const key of entryKeys.filter((key) => !key.endsWith("_cid") && key !== "function_name" && key !== "module_path")) {
+        parseCanonicalLineMapUnsigned(values[key], `line ${lineNumber} ${key}`);
+      }
+      if (expectedModulePath !== null && values.module_path !== expectedModulePath) {
+        throw new Error(`${CHENG_LINE_MAP_SCHEMA} line ${lineNumber} module_path does not match the requested source`);
+      }
+      const bodyLine = parseCanonicalLineMapUnsigned(values.body_start_line, `line ${lineNumber} body_start_line`);
+      functions.push({
+        primarySymbol: null,
+        funcName: values.function_name,
+        file: values.module_path,
+        sigLine: null,
+        bodyLine,
+        endLine: parseCanonicalLineMapUnsigned(values.body_end_line, `line ${lineNumber} body_end_line`),
+        functionName: values.function_name,
+        modulePath: values.module_path,
+      });
+      continue;
+    }
+    const keys = kind === "location" ? locationKeys : kind === "synthetic" ? syntheticKeys : null;
+    if (!keys || functions.length !== entryCount) throw new Error(`${CHENG_LINE_MAP_SCHEMA} line ${lineNumber} has invalid record ordering or kind`);
+    const values = parseExactLineMapFields(records[index], kind, keys, lineNumber);
+    for (const key of keys.filter((key) => key.endsWith("_cid"))) assertLowerHexLineMapCid(values[key], `line ${lineNumber} ${key}`);
+    for (const key of keys.filter((key) => !key.endsWith("_cid") && key !== "module_path")) {
+      parseCanonicalLineMapUnsigned(values[key], `line ${lineNumber} ${key}`);
+    }
+    if (kind === "location" && expectedModulePath !== null && values.module_path !== expectedModulePath) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} line ${lineNumber} module_path does not match the requested source`);
+    }
+    observedLocations++;
+  }
+  if (functions.length !== entryCount || observedLocations !== locationCount) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} entry/location record counts do not match their headers`);
+  }
+  return {schema: CHENG_LINE_MAP_SCHEMA, source, entryCount, functionCount: functions.length, functions};
+}
+
+function parseLineMapReport(input, source, options = {}) {
+  let text;
+  if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
+    try {
+      text = LINE_MAP_UTF8_DECODER.decode(input);
+    } catch {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} input is not valid UTF-8`);
+    }
+  } else if (typeof input === "string") {
+    text = input;
+  } else {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} input bytes are unavailable`);
+  }
+  if (!text.endsWith("\n") || text.includes("\r")) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} must use complete LF-terminated lines`);
+  }
+  const lines = text.slice(0, -1).split("\n");
+  if (lines[0] !== CHENG_LINE_MAP_SCHEMA) throw new Error(`unsupported line-map schema: ${lines[0] || "<empty>"}`);
+  if (lines.some((line) => line.length === 0)) throw new Error(`${CHENG_LINE_MAP_SCHEMA} contains an unexpected empty line`);
+  const expectedModulePath = options.expectedModulePath ?? null;
+  if (expectedModulePath !== null && (typeof expectedModulePath !== "string" || expectedModulePath.length === 0 || /[\r\n\t]/.test(expectedModulePath))) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} expectedModulePath must be one non-empty protocol field`);
+  }
+  return lines[1]?.startsWith("entry_count=")
+    ? parseSimpleLineMap(lines, source, expectedModulePath)
+    : parseSemanticLineMap(lines, source, expectedModulePath);
+}
+
+function assertExactLineMapObjectKeys(value, expected, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} ${label} must be an object`);
+  }
+  const actual = Object.keys(value).sort();
+  const keys = [...expected].sort();
+  if (actual.length !== keys.length || actual.some((key, index) => key !== keys[index])) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} ${label} has an unsupported or incomplete field set`);
+  }
+}
+
+function assertLineMapJsonInteger(value, label, minimum = 0) {
+  if (!Number.isSafeInteger(value) || value < minimum) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} ${label} must be a safe integer >= ${minimum}`);
+  }
+}
+
+function assertLineMapJsonCid(value, label, allowZero = false) {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value) ||
+      (!allowZero && value === "0".repeat(64))) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} ${label} must be a${allowZero ? "" : " nonzero"} lowercase CID`);
+  }
+}
+
+function assertLineMapReportSchema(report, options = {}) {
+  const receiptFields = [
+    "chengSourceVersion", "chengSemanticSnapshotCid", "chengBindingReceiptCid",
+    "chengCsgRootCid", "chengQueryProjectionCid", "chengQueryIndexCid",
+    "chengDeclarationTableCid", "chengCompilerFactProjectionCid",
+    "chengSnapshotRejected", "chengFailureDiagnosticRootCid", "chengFailureCargoCid",
+    "chengFailureAdmissionReceiptCid",
+  ];
+  const topFields = [
+    "schema", "source", "sourceVersion", "semanticSnapshotCid", "bindingReceiptCid",
+    "csgRootCid", "declarationTableCid", "debugProjectionCid", "documentCid",
+    "entryCount", "functionCount", "locationCount", "syntheticCount", "functions",
+    "locations", "syntheticLocations", ...receiptFields,
+  ];
+  assertExactLineMapObjectKeys(report, topFields, "LSP result");
+  if (report.schema !== CHENG_LINE_MAP_SCHEMA ||
+      typeof report.source !== "string" || report.source.length === 0 ||
+      (options.expectedSource !== undefined && report.source !== options.expectedSource) ||
+      report.chengSnapshotRejected !== false) {
+    throw new Error(`unsupported or incomplete line-map report schema: ${report?.schema}`);
+  }
+  for (const field of ["sourceVersion", "entryCount", "functionCount", "locationCount", "syntheticCount", "chengSourceVersion"]) {
+    assertLineMapJsonInteger(report[field], field, field.includes("Version") ? 1 : 0);
+  }
+  if (report.sourceVersion !== report.chengSourceVersion ||
+      report.entryCount !== report.functionCount ||
+      !Array.isArray(report.functions) || !Array.isArray(report.locations) ||
+      !Array.isArray(report.syntheticLocations) ||
+      report.functionCount !== report.functions.length ||
+      report.locationCount !== report.locations.length ||
+      report.syntheticCount !== report.syntheticLocations.length ||
+      report.functionCount <= 0 ||
+      report.locationCount + report.syntheticCount <= 0) {
+    throw new Error(`${CHENG_LINE_MAP_SCHEMA} LSP result counts are incomplete or inconsistent`);
+  }
+  for (const [field, mirror] of [
+    ["semanticSnapshotCid", "chengSemanticSnapshotCid"],
+    ["bindingReceiptCid", "chengBindingReceiptCid"],
+    ["csgRootCid", "chengCsgRootCid"],
+    ["declarationTableCid", "chengDeclarationTableCid"],
+  ]) {
+    assertLineMapJsonCid(report[field], field);
+    assertLineMapJsonCid(report[mirror], mirror);
+    if (report[field] !== report[mirror]) throw new Error(`${CHENG_LINE_MAP_SCHEMA} ${field} receipt mismatch`);
+  }
+  for (const field of [
+    "debugProjectionCid", "documentCid", "chengQueryProjectionCid", "chengQueryIndexCid",
+    "chengCompilerFactProjectionCid",
+  ]) assertLineMapJsonCid(report[field], field);
+  for (const field of [
+    "chengFailureDiagnosticRootCid", "chengFailureCargoCid", "chengFailureAdmissionReceiptCid",
+  ]) {
+    assertLineMapJsonCid(report[field], field, true);
+    if (report[field] !== "0".repeat(64)) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} published result carries a failure receipt`);
+    }
+  }
+
+  const functionFields = [
+    "functionId", "typedFunctionIndex", "functionDeclId", "functionSymbolId",
+    "sourceId", "declarationSpanId", "bodySpanId", "documentCid",
+    "functionDeclKeyCid", "functionSymbolCid", "interfaceCid", "fragmentCid",
+    "modulePath", "functionName", "qualifiedName", "bodyStartByte", "bodyEndByte",
+    "bodyStartLine", "bodyStartColumn", "bodyEndLine", "bodyEndColumn", "threadBoundary",
+  ];
+  const functionsById = new Map();
+  let reportSourceId = null;
+  let reportModulePath = null;
+  for (const entry of report.functions) {
+    assertExactLineMapObjectKeys(entry, functionFields, "function record");
+    for (const field of [
+      "functionId", "typedFunctionIndex", "functionDeclId", "functionSymbolId", "sourceId",
+      "declarationSpanId", "bodySpanId", "bodyStartByte", "bodyEndByte", "bodyStartLine",
+      "bodyStartColumn", "bodyEndLine", "bodyEndColumn",
+    ]) assertLineMapJsonInteger(entry[field], `function.${field}`);
+    for (const field of ["documentCid", "functionDeclKeyCid", "functionSymbolCid", "interfaceCid", "fragmentCid"]) {
+      assertLineMapJsonCid(entry[field], `function.${field}`);
+    }
+    if (entry.documentCid !== report.documentCid ||
+        typeof entry.modulePath !== "string" || entry.modulePath.length === 0 ||
+        typeof entry.functionName !== "string" || entry.functionName.length === 0 ||
+        typeof entry.qualifiedName !== "string" || entry.qualifiedName.length === 0 ||
+        typeof entry.threadBoundary !== "boolean" ||
+        entry.bodyEndByte < entry.bodyStartByte || entry.bodyEndLine < entry.bodyStartLine ||
+        (reportSourceId !== null && entry.sourceId !== reportSourceId) ||
+        (reportModulePath !== null && entry.modulePath !== reportModulePath) ||
+        functionsById.has(entry.functionId)) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} function record identity is inconsistent`);
+    }
+    reportSourceId = entry.sourceId;
+    reportModulePath = entry.modulePath;
+    functionsById.set(entry.functionId, entry);
+  }
+
+  const operationFields = [
+    "debugOpId", "typedNodeId", "typedIrNodeIndex", "originParserNodeId",
+    "syntheticOriginKind", "spanAuthorityKind", "functionId", "functionDeclId",
+    "functionSymbolId", "symbolDeclId", "symbolId", "sourceId", "spanId", "opKind",
+    "typedOpKind", "typeId", "ownershipKind", "documentCid", "functionDeclKeyCid",
+    "functionSymbolCid", "symbolDeclKeyCid", "symbolCid", "modulePath", "startByte",
+    "endByte", "startLine", "startColumn", "endLine", "endColumn",
+  ];
+  const debugOpIds = new Set();
+  const validateOperation = (operation, synthetic) => {
+    assertExactLineMapObjectKeys(operation, operationFields, synthetic ? "synthetic record" : "location record");
+    for (const field of [
+      "debugOpId", "typedNodeId", "typedIrNodeIndex", "functionId", "functionDeclId",
+      "functionSymbolId", "sourceId", "syntheticOriginKind", "spanAuthorityKind",
+      "opKind", "typedOpKind", "ownershipKind",
+    ]) assertLineMapJsonInteger(operation[field], `operation.${field}`);
+    for (const field of ["originParserNodeId", "symbolDeclId", "symbolId", "spanId", "typeId", "startByte", "endByte", "startLine", "startColumn", "endLine", "endColumn"]) {
+      assertLineMapJsonInteger(operation[field], `operation.${field}`, -1);
+    }
+    for (const field of ["documentCid", "functionDeclKeyCid", "functionSymbolCid"]) {
+      assertLineMapJsonCid(operation[field], `operation.${field}`);
+    }
+    for (const field of ["symbolDeclKeyCid", "symbolCid"]) {
+      assertLineMapJsonCid(operation[field], `operation.${field}`, operation.symbolId === -1);
+    }
+    if ((operation.symbolId === -1 &&
+         (operation.symbolDeclId !== -1 ||
+          operation.symbolDeclKeyCid !== "0".repeat(64) ||
+          operation.symbolCid !== "0".repeat(64))) ||
+        (operation.symbolId >= 0 &&
+         (operation.symbolDeclId < 0 ||
+          operation.symbolDeclKeyCid === "0".repeat(64) ||
+          operation.symbolCid === "0".repeat(64)))) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} operation symbol identity is inconsistent`);
+    }
+    const owner = functionsById.get(operation.functionId);
+    if (!owner || debugOpIds.has(operation.debugOpId) ||
+        operation.documentCid !== report.documentCid ||
+        operation.sourceId !== owner.sourceId ||
+        operation.functionDeclId !== owner.functionDeclId ||
+        operation.functionSymbolId !== owner.functionSymbolId ||
+        operation.functionDeclKeyCid !== owner.functionDeclKeyCid ||
+        operation.functionSymbolCid !== owner.functionSymbolCid ||
+        operation.modulePath !== owner.modulePath) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} operation/function identity join failed`);
+    }
+    debugOpIds.add(operation.debugOpId);
+    if (synthetic) {
+      if (operation.syntheticOriginKind <= 0 || operation.syntheticOriginKind > 5 ||
+          operation.originParserNodeId !== -1 || operation.spanAuthorityKind !== 2 ||
+          operation.spanId !== -1 || operation.startByte !== -1 || operation.endByte !== -1 ||
+          operation.startLine !== -1 || operation.startColumn !== -1 ||
+          operation.endLine !== -1 || operation.endColumn !== -1) {
+        throw new Error(`${CHENG_LINE_MAP_SCHEMA} synthetic record identity is invalid`);
+      }
+    } else if (operation.syntheticOriginKind !== 0 || operation.originParserNodeId < 0 ||
+               operation.spanAuthorityKind !== 1 || operation.spanId < 0 ||
+               operation.startByte < 0 || operation.endByte < operation.startByte ||
+               operation.startLine < 0 || operation.endLine < operation.startLine) {
+      throw new Error(`${CHENG_LINE_MAP_SCHEMA} location record span identity is invalid`);
+    }
+  };
+  for (const operation of report.locations) validateOperation(operation, false);
+  for (const operation of report.syntheticLocations) validateOperation(operation, true);
+  return report;
+}
+
+function maskChengSourceLine(raw, state, lineNumber) {
+  const masked = raw.split("");
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < raw.length; index++) {
+    if (state.tripleQuoted) {
+      masked[index] = " ";
+      if (raw.startsWith('"""', index)) {
+        masked[index + 1] = " ";
+        masked[index + 2] = " ";
+        state.tripleQuoted = false;
+        index += 2;
+      }
+      continue;
+    }
+    const char = raw[index];
+    if (quote !== null) {
+      masked[index] = " ";
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (raw.startsWith('"""', index)) {
+      masked[index] = " ";
+      masked[index + 1] = " ";
+      masked[index + 2] = " ";
+      state.tripleQuoted = true;
+      index += 2;
+      continue;
+    }
+    if (char === "#") {
+      for (let rest = index; rest < raw.length; rest++) masked[rest] = " ";
+      break;
+    }
+    if (char === '"' || char === "'") {
+      masked[index] = " ";
+      quote = char;
+    }
+  }
+  if (quote !== null) throw new Error(`Cheng source has an unterminated short literal at line ${lineNumber}`);
+  return masked.join("");
+}
+
+function parseChengSourceFunctionSpans(input, source) {
+  let text;
+  try {
+    text = new TextDecoder("utf-8", {fatal: true}).decode(input);
+  } catch {
+    throw new Error(`Cheng source is not valid UTF-8: ${source}`);
+  }
+  if (text.includes("\r")) throw new Error(`Cheng source must use LF line endings: ${source}`);
+  const lines = text.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  const lexerState = {tripleQuoted: false};
+  const codeLines = lines.map((line, index) => maskChengSourceLine(line, lexerState, index + 1));
+  if (lexerState.tripleQuoted) throw new Error(`Cheng source has an unterminated multiline string: ${source}`);
+  const declarations = [];
+  for (let index = 0; index < codeLines.length; index++) {
+    const code = codeLines[index];
+    const match = code.match(/^(?:(?:async)\s+)?(?:fn|iterator)\s+([A-Za-z_][A-Za-z0-9_]*)\b/);
+    if (match) declarations.push({lineIndex: index, name: match[1], sigColumn: code.indexOf(match[0])});
+  }
+  const functions = [];
+  for (const declaration of declarations) {
+    let roundDepth = 0;
+    let squareDepth = 0;
+    let braceDepth = 0;
+    let assignment = null;
+    let signatureEndIndex = declaration.lineIndex;
+    for (let lineIndex = declaration.lineIndex; lineIndex < codeLines.length; lineIndex++) {
+      const code = codeLines[lineIndex];
+      if (lineIndex > declaration.lineIndex && code.trim() !== "" && /^\S/.test(code) &&
+          roundDepth === 0 && squareDepth === 0 && braceDepth === 0) {
+        break;
+      }
+      for (let column = lineIndex === declaration.lineIndex ? declaration.sigColumn : 0; column < code.length; column++) {
+        const char = code[column];
+        if (char === "(") roundDepth++;
+        else if (char === ")") roundDepth--;
+        else if (char === "[") squareDepth++;
+        else if (char === "]") squareDepth--;
+        else if (char === "{") braceDepth++;
+        else if (char === "}") braceDepth--;
+        else if (char === "=" && roundDepth === 0 && squareDepth === 0 && braceDepth === 0) {
+          assignment = {lineIndex, column};
+          signatureEndIndex = lineIndex;
+          break;
+        }
+        if (roundDepth < 0 || squareDepth < 0 || braceDepth < 0) {
+          throw new Error(`Cheng function ${declaration.name} has an unmatched signature delimiter at line ${lineIndex + 1}`);
+        }
+      }
+      if (assignment) break;
+      signatureEndIndex = lineIndex;
+    }
+    if (roundDepth !== 0 || squareDepth !== 0 || braceDepth !== 0) {
+      throw new Error(`Cheng function ${declaration.name} has an unterminated signature starting at line ${declaration.lineIndex + 1}`);
+    }
+
+    let bodyLineIndex = signatureEndIndex;
+    let bodyColumn = Math.max(0, lines[signatureEndIndex]?.length || 0);
+    let endLineIndex = signatureEndIndex;
+    if (assignment) {
+      const sameLineBody = codeLines[assignment.lineIndex].slice(assignment.column + 1);
+      const sameLineOffset = sameLineBody.search(/\S/);
+      if (sameLineOffset >= 0) {
+        bodyLineIndex = assignment.lineIndex;
+        bodyColumn = assignment.column + 1 + sameLineOffset;
+      } else {
+        let foundBody = false;
+        for (let lineIndex = assignment.lineIndex + 1; lineIndex < codeLines.length; lineIndex++) {
+          const code = codeLines[lineIndex];
+          if (code.trim() === "") continue;
+          if (/^\S/.test(code)) break;
+          bodyLineIndex = lineIndex;
+          bodyColumn = code.search(/\S/);
+          foundBody = true;
+          break;
+        }
+        if (!foundBody) {
+          throw new Error(`Cheng function ${declaration.name} has '=' but no suite at line ${assignment.lineIndex + 1}`);
+        }
+      }
+      endLineIndex = bodyLineIndex;
+      for (let lineIndex = bodyLineIndex; lineIndex < codeLines.length; lineIndex++) {
+        const code = codeLines[lineIndex];
+        if (lineIndex > bodyLineIndex && code.trim() !== "" && /^\S/.test(code)) break;
+        if (lines[lineIndex].trim() !== "") endLineIndex = lineIndex;
+      }
+    }
+    functions.push({
+      primarySymbol: null,
+      funcName: declaration.name,
+      file: source,
+      sigLine: declaration.lineIndex + 1,
+      sigColumn: declaration.sigColumn,
+      signatureEndLine: signatureEndIndex + 1,
+      bodyLine: bodyLineIndex + 1,
+      bodyColumn,
+      endLine: endLineIndex + 1,
+      endColumn: lines[endLineIndex]?.length || 0,
+      functionName: declaration.name,
+      modulePath: source,
     });
   }
   return {
-    schema: "cheng_line_map_v1",
+    schema: CHENG_LINE_MAP_SCHEMA,
     source,
-    entryCount: countLine ? Number(countLine.slice("entry_count=".length)) : null,
+    entryCount: functions.length,
     functionCount: functions.length,
     functions,
   };
-}
-
-// 巨文件策略: 源文件旁的 `<source>.map` 边车(与编译器自身的 debug line-map 产物同名
-// 约定)若存在且比源文件新, 直接读边车解析, 不重新过 LSP 全量解析(那是巨文件慢的根因)。
-// 只读不写: 这个工具是 readOnlyHint 的查询工具, 不该往用户项目树里落新文件当副作用。
-function readChengLineMapSidecar(source) {
-  const sidecar = `${source}.map`;
-  if (!existsSync(sidecar)) return null;
-  const sourceStat = statSync(source);
-  const sidecarStat = statSync(sidecar);
-  if (sidecarStat.mtimeMs <= sourceStat.mtimeMs) return null;
-  const text = readFileSync(sidecar, "utf8");
-  if (!text.includes("cheng_line_map_v1")) return null;
-  return {...parseLineMapReport(text, source), source, cacheHit: true, cachePath: sidecar};
 }
 
 async function readLineMap(file, input = {}) {
@@ -3218,21 +4402,18 @@ async function readLineMap(file, input = {}) {
   const source = resolveProjectPath(file, root);
   assertInsideProject(source, root);
   if (existsSync(source)) {
-    const candidate = readFileSync(source, "utf8");
-    if (candidate.includes("cheng_line_map_v1")) return parseLineMapReport(candidate, source);
+    const candidate = readFileSync(source);
+    const firstLine = candidate.subarray(0, Math.max(0, candidate.indexOf(0x0a))).toString("utf8");
+    if (source.endsWith(".map") || firstLine.startsWith("cheng_line_map")) return parseLineMapReport(candidate, source);
   }
   if (!existsSync(source)) throw new Error(`source not found: ${source}`);
-  const sidecar = readChengLineMapSidecar(source);
-  if (sidecar) return sidecar;
-  const report = await chengLspQuery({kind: "lineMap", file: source, root});
-  if (report?.schema !== "cheng_line_map_v1" || !Array.isArray(report.functions)) {
-    throw new Error("cheng-lsp returned an invalid line-map response");
-  }
+  const sourceBytes = readFileSync(source);
+  const report = parseChengSourceFunctionSpans(sourceBytes, source);
+  if (report.functionCount <= 0) throw new Error(`Cheng source declares no top-level fn or iterator: ${source}`);
   return {
     ...report,
     source,
     cacheHit: false,
-    functions: report.functions.map((entry) => ({...entry, file: source, modulePath: source})),
   };
 }
 
@@ -3241,41 +4422,41 @@ const CHENG_SYMBOLS_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 function parseCanonicalUnsignedInteger(value, field) {
   if (!/^(?:0|[1-9][0-9]*)$/.test(value)) {
-    throw new Error(`cheng_symbols_v1 ${field} must be a canonical unsigned integer`);
+    throw new Error(`${CHENG_SYMBOLS_SCHEMA} ${field} must be a canonical unsigned integer`);
   }
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed)) {
-    throw new Error(`cheng_symbols_v1 ${field} exceeds Number.MAX_SAFE_INTEGER`);
+    throw new Error(`${CHENG_SYMBOLS_SCHEMA} ${field} exceeds Number.MAX_SAFE_INTEGER`);
   }
   return parsed;
 }
 
 function validateCountedSymbolList(value, count, field) {
   if (count === 0) {
-    if (value !== "-") throw new Error(`cheng_symbols_v1 ${field} must be '-' when its count is zero`);
+    if (value !== "-") throw new Error(`${CHENG_SYMBOLS_SCHEMA} ${field} must be '-' when its count is zero`);
     return;
   }
   if (value === "-" || value.length === 0) {
-    throw new Error(`cheng_symbols_v1 ${field} must contain ${count} symbols`);
+    throw new Error(`${CHENG_SYMBOLS_SCHEMA} ${field} must contain ${count} symbols`);
   }
   const symbols = value.split(",");
   if (symbols.some((symbol) => symbol.length === 0) || symbols.length !== count) {
-    throw new Error(`cheng_symbols_v1 ${field} count mismatch: expected ${count}, got ${symbols.length}`);
+    throw new Error(`${CHENG_SYMBOLS_SCHEMA} ${field} count mismatch: expected ${count}, got ${symbols.length}`);
   }
 }
 
 function parseChengSymbolsReport(buffer, expected = {}) {
-  if (!Buffer.isBuffer(buffer)) throw new Error("cheng_symbols_v1 stdout bytes are unavailable");
+  if (!Buffer.isBuffer(buffer)) throw new Error(`${CHENG_SYMBOLS_SCHEMA} stdout bytes are unavailable`);
   let text;
   try {
     text = new TextDecoder("utf-8", {fatal: true}).decode(buffer);
   } catch {
-    throw new Error("cheng_symbols_v1 output is not valid UTF-8");
+    throw new Error(`${CHENG_SYMBOLS_SCHEMA} output is not valid UTF-8`);
   }
-  if (!text.endsWith("\n")) throw new Error("cheng_symbols_v1 output must end with exactly one complete line");
+  if (!text.endsWith("\n") || text.includes("\r")) throw new Error(`${CHENG_SYMBOLS_SCHEMA} output must use complete LF-terminated lines`);
   const lines = text.split("\n");
   lines.pop();
-  if (lines[0] !== "cheng_symbols_v1") throw new Error("cheng_symbols_v1 exact header is missing");
+  if (lines[0] !== CHENG_SYMBOLS_SCHEMA) throw new Error(`unsupported symbols schema: ${lines[0] || "<empty>"}`);
 
   // The backend driver currently emits one separator line while stage3/cold emit none. These are
   // the two formal producer layouts; multiple separators and every other extra line are rejected.
@@ -3292,7 +4473,7 @@ function parseChengSymbolsReport(buffer, expected = {}) {
     "primary_unsupported_count",
   ];
   if (lines.length - offset !== fields.length) {
-    throw new Error(`cheng_symbols_v1 must contain exactly ${fields.length} ordered fields`);
+    throw new Error(`${CHENG_SYMBOLS_SCHEMA} must contain exactly ${fields.length} ordered fields`);
   }
   const values = {};
   for (let index = 0; index < fields.length; index++) {
@@ -3300,16 +4481,16 @@ function parseChengSymbolsReport(buffer, expected = {}) {
     const prefix = `${field}=`;
     const line = lines[offset + index];
     if (!line.startsWith(prefix)) {
-      throw new Error(`cheng_symbols_v1 expected ordered field ${field}`);
+      throw new Error(`${CHENG_SYMBOLS_SCHEMA} expected ordered field ${field}`);
     }
     values[field] = line.slice(prefix.length);
   }
 
   if (values.entry !== expected.source || values.source_path !== expected.source) {
-    throw new Error("cheng_symbols_v1 entry/source_path does not match the requested source");
+    throw new Error(`${CHENG_SYMBOLS_SCHEMA} entry/source_path does not match the requested source`);
   }
   if (values.target !== expected.target) {
-    throw new Error(`cheng_symbols_v1 target mismatch: expected ${expected.target}`);
+    throw new Error(`${CHENG_SYMBOLS_SCHEMA} target mismatch: expected ${expected.target}`);
   }
   const loweringSymbolCount = parseCanonicalUnsignedInteger(values.lowering_symbol_count, "lowering_symbol_count");
   const primarySymbolCount = parseCanonicalUnsignedInteger(values.primary_symbol_count, "primary_symbol_count");
@@ -3317,10 +4498,10 @@ function parseChengSymbolsReport(buffer, expected = {}) {
   validateCountedSymbolList(values.lowering_symbols, loweringSymbolCount, "lowering_symbols");
   validateCountedSymbolList(values.primary_symbols, primarySymbolCount, "primary_symbols");
   if (primaryUnsupportCount > loweringSymbolCount) {
-    throw new Error("cheng_symbols_v1 primary_unsupported_count exceeds lowering_symbol_count");
+    throw new Error(`${CHENG_SYMBOLS_SCHEMA} primary_unsupported_count exceeds lowering_symbol_count`);
   }
   return {
-    schema: "cheng_symbols_v1",
+    schema: CHENG_SYMBOLS_SCHEMA,
     primaryUnsupportCount,
     primarySymbolCount,
     loweringSymbolCount,
@@ -3385,15 +4566,24 @@ function profileUnsupportedReason(run) {
 }
 
 function profileDriverForReport() {
-  return existsSync(CHENG_STAGE3_DRIVER) ? CHENG_STAGE3_DRIVER : CHENG_DRIVER;
+  return CHENG_DRIVER;
 }
 
 function profileDriverForRun() {
-  return existsSync(CHENG_DRIVER) ? CHENG_DRIVER : CHENG_STAGE3_DRIVER;
+  return CHENG_DRIVER;
 }
 
 const PROFILE_PROTOCOL_UTF8_DECODER = new TextDecoder("utf-8", {fatal: true});
+const CHENG_PROFILE_SCHEMA = "cheng_profile";
+const CHENG_PROFILE_REPORT_TOOL_SCHEMA = "cheng_profile_report_tool";
 class ProfileProtocolUtf8Error extends Error {}
+
+function assertProfileReportToolSchema(report) {
+  if (!report || typeof report !== "object" || report.schema !== CHENG_PROFILE_REPORT_TOOL_SCHEMA) {
+    throw new Error(`unsupported profile report tool schema: ${report?.schema}`);
+  }
+  return report;
+}
 
 function profileSchemaFromOutputs(...values) {
   let found = false;
@@ -3409,9 +4599,9 @@ function profileSchemaFromOutputs(...values) {
       throw new ProfileProtocolUtf8Error("profile protocol evidence is not valid UTF-8");
     }
     const lines = text.split(/\r?\n/);
-    if (lines.some((line) => line === "cheng_profile_v1")) found = true;
+    if (lines.some((line) => line === CHENG_PROFILE_SCHEMA)) found = true;
   }
-  return found ? "cheng_profile_v1" : null;
+  return found ? CHENG_PROFILE_SCHEMA : null;
 }
 
 function profileResult(action, args, run, input = {}) {
@@ -3443,11 +4633,11 @@ function profileResult(action, args, run, input = {}) {
                 : outputRequired && !outputMaterialized ? "profile-report returned rc=0 without a fresh non-empty regular output"
                   : outputOverflow ? "profile-report output exceeds maxOutputBytes"
                     : outputInvalidUtf8 ? "profile-report output is not valid UTF-8"
-                      : !profileSchema ? "profile output missing exact cheng_profile_v1 schema marker line"
+                      : !profileSchema ? `profile output missing exact ${CHENG_PROFILE_SCHEMA} schema marker line`
                         : null);
   const root = input.root || null;
-  return {
-    schema: "cheng_profile_report_tool.v1",
+  return assertProfileReportToolSchema({
+    schema: CHENG_PROFILE_REPORT_TOOL_SCHEMA,
     action,
     driver: run.driver || "",
     root,
@@ -3469,7 +4659,7 @@ function profileResult(action, args, run, input = {}) {
     } : null,
     stdout: takeTrailingText(run.stdout),
     stderr: takeTrailingText(run.stderr),
-  };
+  });
 }
 
 // 模板泄漏神谕: Cheng 泛型函数 fn Foo[T](...): T 编译期不按具体类型单态化, 而是共享同一个
@@ -3797,7 +4987,7 @@ function compareChengBinarySymbols(objectAPath, objectBPath, options = {}) {
   const undefinedCommon = nmFactsA.undefinedNames.filter((name) => undefinedSetB.has(name));
   const limit = options.limit || 2000;
   return {
-    schema: "cheng_symbol_diff_compare.v1",
+    schema: "cheng_symbol_diff_compare",
     objectA: objectAPath,
     objectB: objectBPath,
     countA: namesA.length,
@@ -3989,7 +5179,7 @@ async function chengTemplateLeakAudit(input = {}) {
   }
   const liveLeakCount = leaks.filter((leak) => leak.verdict === "live_leak").length;
   return {
-    schema: "cheng_template_leak_audit.v1",
+    schema: "cheng_template_leak_audit",
     root,
     objectPath,
     scannedMangledSymbolCount: candidates.length,
@@ -4017,6 +5207,7 @@ export {
   CHENG_STAGE3_DRIVER,
   CHENG_FUSION_VENDOR_COLD_DRIVER,
   CHENG_CANARY,
+  CHENG_PROCESS_TOPOLOGY_ABI_SHA256,
   zodSchema,
   initChengToolkitModule,
   textResult,
@@ -4036,7 +5227,6 @@ export {
   chengColdSummaryPath,
   chengColdFactsPath,
   resolveCsgFactsPath,
-  readChengSummary,
   getChengFacts,
   lookupByNameInFacts,
   callsOfInFacts,
@@ -4046,25 +5236,34 @@ export {
   evidenceForFileInFacts,
   normalizeToSubstratePath,
   factsStalenessWarning,
+  chengProcessIdentitySnapshot,
+  verifyInheritedParentGuardForChild,
   runChengDriver,
   chengDriverSpawnEnv,
   chengFusionRssCapBytes,
   resolveChengPath,
   chengLspQuery,
+  chengLspResolveBinary,
+  chengLspResolveArtifactIdentity,
   JsonRpcProcessClient,
   chengLspEnsureClient,
   chengLspSyncDoc,
+  chengLspDiagnosticsForSyncedDoc,
   chengLspEnsureDocOpen,
   parseCrash,
   classifyStopClass,
   triageChengBinaryCrash,
   chengCorruptHunt,
+  parseLineMapReport,
+  assertLineMapReportSchema,
+  parseChengSourceFunctionSpans,
   readLineMap,
   snapshotChengSymbols,
   compareChengBinarySymbols,
   profileDriverForReport,
   profileDriverForRun,
   profileSchemaFromOutputs,
+  assertProfileReportToolSchema,
   profileResult,
   chengTemplateLeakAudit,
   zodToJsonSchema,

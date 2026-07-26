@@ -36,7 +36,7 @@ import {createChengTextTool, jsonResult, CHENG_STAGE3_DRIVER, initChengToolkitMo
 var chengIgnitionChainInputSchema, ChengIgnitionChainTool;
 
 const CHENG_FUSION_PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const DEFAULT_TREE_ROOT = "/Users/lbcheng/cheng-f24/tree_rebuilt_snap";
+const DEFAULT_TREE_ROOT = "/Users/lbcheng/cheng-lang";
 const DEFAULT_WORK_DIR = "/Users/lbcheng/cheng-f24/chain_runs";
 const DEFAULT_MATRIX_PATH = join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/matrix.json");
 const MASKED_CMP_PATH = join(CHENG_FUSION_PACKAGE_ROOT, "tools/macho_masked_cmp.py");
@@ -1824,7 +1824,7 @@ async function startIgnitionChain(input) {
     child.unref();
 
     return jsonResult({
-      schema: "cheng_ignition_chain.start.v1",
+      schema: "cheng_ignition_chain.start",
       runId,
       runDir,
       journalPath,
@@ -1961,7 +1961,7 @@ async function statusIgnitionChain(input) {
   }
 
   return jsonResult({
-    schema: "cheng_ignition_chain.status.v1",
+    schema: "cheng_ignition_chain.status",
     runId: input.runId,
     runDir,
     journalPath,
@@ -2000,7 +2000,7 @@ var initChengIgnitionChainModule = defineModuleInitializer(() => {
   initChengToolkitModule();
   chengIgnitionChainInputSchema = zodSchema.strictObject({
     action: zodSchema.enum(["start", "status"]).describe("start = render+launch a detached ignition chain run; status = poll an existing run by runId."),
-    treeRoot: zodSchema.string().optional().describe("[start] Cheng project tree root passed to --root:. Defaults to /Users/lbcheng/cheng-f24/tree_rebuilt_snap. Mutually exclusive with baseTree/revertCommits."),
+    treeRoot: zodSchema.string().optional().describe("[start] Cheng project tree root passed to --root:. Defaults to /Users/lbcheng/cheng-lang. Mutually exclusive with baseTree/revertCommits."),
     baseTree: zodSchema.string().optional().describe("[start ablation] Clean Git Cheng tree to clone without hardlinks. Requires revertCommits and is never modified."),
     revertCommits: zodSchema.array(zodSchema.string().min(1)).min(1).max(64).optional().describe("[start ablation] Exact caller-ordered commits to reverse inside the isolated baseTree clone. Each must be a single-parent ancestor of baseTree HEAD; every reverse patch must pass git apply --reverse --check. Requires baseTree."),
     seed: zodSchema.string().optional().describe("[start] Cold compiler binary used to bake the DRV stage. Defaults to the cheng.stage3 bootstrap seed."),

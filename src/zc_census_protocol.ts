@@ -306,10 +306,10 @@ function validateEvidence(fields,rows,total,expected){
   if(manifest.hash!==requireSha(fields.zc_manifest_sha256,"zc_manifest_sha256"))throw new Error("ZC manifest SHA-256 mismatch");
   const manifestKv=parseKvText(manifest,"ZC manifest",{exactKeys:ZC_MANIFEST_FIELD_ORDER});
   const manifestExpected={
-    schema:"zc_evidence_manifest.v1",status:"completed",zc_enumerator:resolve(expected.script),
+    schema:"zc_evidence_manifest",status:"completed",zc_enumerator:resolve(expected.script),
     zc_enumerator_sha256_before:enumeratorHash,zc_enumerator_sha256_after:enumeratorHash,
     source:resolve(expected.source),source_sha256:sourceHash,source_sha256_after:sourceHash,
-    git_worktree_state_schema:"git_worktree_state.v1",
+    git_worktree_state_schema:"git_worktree_state",
     git_worktree_state_sha256_before:fields.zc_git_worktree_state_sha256_before,
     git_worktree_state_sha256_after:fields.zc_git_worktree_state_sha256_after,
     driver:resolve(expected.driver),driver_sha256:driverHash,driver_sha256_before:driverHash,driver_sha256_after:driverHash,
@@ -488,7 +488,7 @@ function parseCompletedProtocol(run,expected={}){
   const driverRc=uint(fields.zc_driver_rc,"zc_driver_rc");
   if(uint(fields.zc_rss_guard_rc,"zc_rss_guard_rc")!==driverRc)throw new Error("RSS guard rc must equal driver rc");
   if(fields.zc_compiler_csg_stderr!=="0"||fields.zc_progress!=="0")throw new Error("controlled ZC diagnostics/progress contract mismatch");
-  if(fields.zc_rss_guard_schema!=="beat_c_process_memory_guard.v4"||fields.zc_rss_guard_status!=="completed"||fields.zc_rss_guard_abort_reason!=="")throw new Error("RSS guard completed schema/status/abort contract mismatch");
+  if(fields.zc_rss_guard_schema!=="beat_c_process_memory_guard"||fields.zc_rss_guard_status!=="completed"||fields.zc_rss_guard_abort_reason!=="")throw new Error("RSS guard completed schema/status/abort contract mismatch");
   if(fields.zc_rss_guard_mode!=="process_tree"||fields.zc_rss_guard_scope!=="identity_history_union_group_and_descendants")throw new Error("RSS guard mode/scope contract mismatch");
   const requestedLimit=uint(fields.zc_rss_requested_limit_bytes,"zc_rss_requested_limit_bytes",{positive:true});
   const effectiveLimit=uint(fields.zc_rss_limit_bytes,"zc_rss_limit_bytes",{positive:true});

@@ -7,9 +7,11 @@
 //   [D] driver 不存在: 明确报错。
 //   [E] schema 校验: 未知字段被 strictObject 拒绝。
 import {mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, chmodSync} from "node:fs";
+import assert from "node:assert/strict";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {startMcp, assertTrue} from "./mcp_client.ts";
+import {assertZcCensusReportSchema} from "../src/cheng_zc_census_m9014.ts";
 
 const CHENG_ROOT = "/Users/lbcheng/cheng-lang";
 const CANARY = `${CHENG_ROOT}/src/tests/ordinary_zero_exit_fixture.cheng`;
@@ -56,7 +58,12 @@ async function main() {
         const stubDriver = makeStubBackendDriver(scratch);
         const {isError, parsed} = await mcp.callTool("cheng_zc_census", {root: CHENG_ROOT, driver: stubDriver, source: CANARY}, undefined, 30000);
         assertTrue(isError !== true, `调用未报错, 实得: ${JSON.stringify(parsed).slice(0, 400)}`);
-        assertTrue(parsed.schema === "cheng_zc_census.v1", `schema 正确, 实得 ${parsed.schema}`);
+        assertTrue(parsed.schema === "cheng_zc_census", `schema 正确, 实得 ${parsed.schema}`);
+        assert.throws(
+          () => assertZcCensusReportSchema({...parsed, schema: "cheng_zc_census.v1"}),
+          /unsupported ZC census report schema/,
+          "legacy ZC census report schema must be rejected",
+        );
         assertTrue(parsed.status === "completed", `status=completed, 实得 ${parsed.status} (raw=${JSON.stringify(parsed.raw).slice(0,300)})`);
         assertTrue(parsed.total === 2, `total=2, 实得 ${parsed.total}`);
         assertTrue(parsed.rowCount === 2, `rowCount=2, 实得 ${parsed.rowCount}`);
@@ -76,7 +83,7 @@ async function main() {
       {
         const {isError, parsed} = await mcp.callTool("cheng_zc_census", {root: F23_TREE, driver: F23_DRV42}, undefined, 120000);
         assertTrue(isError !== true, `调用未报错, 实得: ${JSON.stringify(parsed).slice(0, 400)}`);
-        assertTrue(parsed.schema === "cheng_zc_census.v1", `schema 正确`);
+        assertTrue(parsed.schema === "cheng_zc_census", `schema 正确`);
         assertTrue(parsed.root === F23_TREE, `root 回显正确, 实得 ${parsed.root}`);
         assertTrue(parsed.status === "completed" || parsed.status === "aborted", `status ∈ {completed,aborted}, 实得 ${parsed.status}`);
         assertTrue(Array.isArray(parsed.byBail) && Array.isArray(parsed.byBodyKind), `byBail/byBodyKind 都是数组`);

@@ -15,7 +15,7 @@
 #     text_offset: PC - __TEXT.__text addr (lldb: `image lookup -a` gives
 #     __TEXT.__text+N directly; pass N). Decimal or 0x hex.
 #   - *.o        -> nm -n symtab interval lookup (self-hosted backend output)
-#   - *.map      -> cheng_line_map_v1 with offset=/size= fields (cold C output)
+#   - *.map      -> cheng_line_map with offset=/size= fields (cold C output)
 # Caveat: offsets beyond primary.o __text size live in provider .o regions;
 # resolve those against the matching provider object instead.
 set -uo pipefail
@@ -58,8 +58,8 @@ try:
 except (OSError, UnicodeError) as error:
     fail(f"cannot read map as UTF-8: {error}")
 
-if not lines or lines[0] != "cheng_line_map_v1":
-    fail("map must start with the exact cheng_line_map_v1 marker")
+if not lines or lines[0] != "cheng_line_map":
+    fail("map must start with the exact cheng_line_map marker")
 if len(lines) < 2 or not re.fullmatch(r"entry_count=[0-9]+", lines[1]):
     fail("map must declare entry_count immediately after the schema marker")
 declared_count = int(lines[1].split("=", 1)[1], 10)
@@ -83,10 +83,15 @@ for line_number, line in enumerate(lines[2:], 3):
     missing = [key for key in ("function_name", "module_path", "offset", "size") if key not in keyed]
     if missing:
         fail(f"line {line_number} is missing {','.join(missing)}")
+    unexpected = sorted(set(keyed) - {"function_name", "module_path", "offset", "size"})
+    if unexpected:
+        fail(f"line {line_number} has unsupported fields {','.join(unexpected)}")
     if not keyed["function_name"]:
         fail(f"line {line_number} has an empty function_name")
     if not keyed["module_path"]:
         fail(f"line {line_number} has an empty module_path")
+    if keyed["function_name"] != fields[2] or keyed["module_path"] != fields[3]:
+        fail(f"line {line_number} positional/keyed function identity mismatch")
     off = parse_unsigned(keyed["offset"], f"line {line_number} offset")
     size = parse_unsigned(keyed["size"], f"line {line_number} size")
     if size <= 0:

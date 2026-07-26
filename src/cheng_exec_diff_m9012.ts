@@ -12,6 +12,7 @@ import {createChengTextTool,jsonResult,resolveChengProjectRoot,runChengDriver,ta
 
 var chengExecDiffInputSchema,ChengExecDiffTool;
 
+const EXEC_DIFF_SCHEMA = "cheng_exec_diff";
 const EXPECTED_COMPILE_WALL_RC = 2;
 const PROTOCOL_UNSIGNED_INTEGER = "(?:0|[1-9]\\d*)";
 const PROTOCOL_POSITIVE_INTEGER = "[1-9]\\d*";
@@ -24,6 +25,13 @@ const MAX_DRIVER_BYTES = 512 * 1024 * 1024;
 const MAX_FIXTURE_BYTES = 64 * 1024 * 1024;
 const MAX_FIXTURE_COUNT = 4096;
 const MAX_TOTAL_INPUT_BYTES = 1024 * 1024 * 1024;
+
+function assertExecDiffReportSchema(report) {
+  if (!report || typeof report !== "object" || report.schema !== EXEC_DIFF_SCHEMA) {
+    throw new Error(`unsupported exec-diff report schema: ${report?.schema}`);
+  }
+  return report;
+}
 
 function normalizeMaybeFileUri(value) {
   const text = String(value || "");
@@ -519,8 +527,8 @@ var initChengExecDiffModule = defineModuleInitializer(() => {
           if (result.verdict === "CFAIL") summary.cfail++;
           else summary[result.verdict]++;
         }
-        return jsonResult({
-          schema: "cheng_exec_diff.v1",
+        return jsonResult(assertExecDiffReportSchema({
+          schema: EXEC_DIFF_SCHEMA,
           root,
           driverA: driverAPath,
           driverB: driverBPath,
@@ -532,7 +540,7 @@ var initChengExecDiffModule = defineModuleInitializer(() => {
           maxOutputBytes: maxBuffer,
           summary,
           results,
-        });
+        }));
       } finally {
         rmSync(tempDir, {recursive: true, force: true});
       }
@@ -540,4 +548,4 @@ var initChengExecDiffModule = defineModuleInitializer(() => {
   });
 });
 
-export {ChengExecDiffTool, initChengExecDiffModule};
+export {ChengExecDiffTool, assertExecDiffReportSchema, initChengExecDiffModule};

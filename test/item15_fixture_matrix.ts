@@ -1,9 +1,11 @@
 // cheng_fixture_matrix 真实端到端：临时写入最小 Cheng 源码，使用仓内 stage3 与它的
 // 真实可执行副本跑完整 drivers[] x fixtures[]。不替换生产编译/运行逻辑，不使用 stub。
 import {chmodSync, copyFileSync, existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync} from "node:fs";
+import assert from "node:assert/strict";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {startMcp, assertTrue} from "./mcp_client.ts";
+import {assertFixtureMatrixReportSchema} from "../src/cheng_fixture_matrix_m9021.ts";
 
 const CHENG_ROOT = process.env.CHENG_TOOLCHAIN_ROOT || process.env.CHENG_ROOT || "/Users/lbcheng/cheng-lang";
 const STAGE3 = process.env.CHENG_STAGE3_DRIVER || join(CHENG_ROOT, "artifacts/bootstrap/cheng.stage3");
@@ -74,7 +76,12 @@ async function main() {
           timeoutSec: 30,
         }, undefined, 120000);
         assertTrue(isError !== true, `真实 2x2 matrix 调用成功, 实得 ${JSON.stringify(parsed).slice(0, 400)}`);
-        assertTrue(parsed.schema === "cheng_fixture_matrix.v1", `schema=v1`);
+        assertTrue(parsed.schema === "cheng_fixture_matrix", `schema canonical`);
+        assert.throws(
+          () => assertFixtureMatrixReportSchema({...parsed, schema: "cheng_fixture_matrix.v1"}),
+          /unsupported fixture matrix report schema/,
+          "legacy fixture-matrix report schema must be rejected",
+        );
         assertTrue(parsed.verdict === "GREEN", `全矩阵 verdict=GREEN, 实得 ${parsed.verdict}`);
         assertTrue(parsed.summary?.total === 4 && parsed.summary?.green === 4 && parsed.summary?.red === 0, `四个 cell 全绿`);
         assertTrue(parsed.results?.length === 4, `drivers[] x fixtures[] 真实产生四格`);

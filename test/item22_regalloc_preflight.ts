@@ -6,7 +6,7 @@ import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {spawnSync} from "node:child_process";
 import {getChengFusionToolManifest, getChengFusionTools, initChengFusionToolRegistryModule} from "../src/cheng_fusion_tool_registry.ts";
-import {acquireReleaseWorkClaim, buildPrivateOneShotBundle, closeReleaseWorkClaim, deriveFormalExpressionObligationManifest, evaluateFormalExpressionObligationCoverage, executePreflight, finalizeReleaseWorkClaim, formalChengCompilerProfile, materializeFinalReleaseArtifactManifest, materializePrivateOneShotSourceTree, materializePrivateReleaseToolchain, privateReleaseExecutionEnv, productionRequiredStatuses, rawDriverFixedPoint, sameSourceInputs, snapshotSourceInputs, sourceImports, strictKv, validateAarch64F64RuntimeGateBundle, validateAarch64F64RuntimeGateReport, validateAuthorityProductionClosure, validateBackend2VersionManifest, validateBackend2VersionSentinelReport, validateCIncludeClosure, validateFinalReleaseArtifactManifest, validateMemoryManifestBytes, validateOfficialDriverBuildReceipt, validatePrivateOneShotSourceTree, validatePrivateReleaseToolchain, validateProductionGateDependencyBundle, validateProductionGateEvidence, validateProductionGuardReport, validateQualifiedNestedCallDeclarationWitness, validateReleaseEvidenceFieldPresence, validateReleaseWorkClaim, validateSourceManifestPath, validateTypedExprCoverageLedger, validateTypedExprFormalSpecBinding, validateTypedExprFrozenAuthority, validateX86_64F64RuntimeGateBundle, validateX86_64F64RuntimeGateReport} from "../src/cheng_regalloc_preflight_m9022.ts";
+import {acquireReleaseWorkClaim, buildPrivateOneShotBundle, closeReleaseWorkClaim, deriveFormalExpressionObligationManifest, evaluateFormalExpressionObligationCoverage, executePreflight, finalizeReleaseWorkClaim, formalChengCompilerProfile, materializeFinalReleaseArtifactManifest, materializePrivateOneShotSourceTree, materializePrivateReleaseToolchain, privateReleaseExecutionEnv, productionRequiredStatuses, rawDriverFixedPoint, sameSourceInputs, snapshotSourceInputs, sourceImports, strictKv, validateAarch64F64RuntimeGateBundle, validateAarch64F64RuntimeGateReport, validateAuthorityProductionClosure, validateBackend2VersionManifest, validateBackend2VersionSentinelReport, validateCanonicalRegallocEvidenceLabels, validateCIncludeClosure, validateFinalReleaseArtifactManifest, validateMemoryManifestBytes, validateOfficialDriverBuildReceipt, validatePrivateOneShotSourceTree, validatePrivateReleaseToolchain, validateProductionGateDependencyBundle, validateProductionGateEvidence, validateProductionGuardReport, validateQualifiedNestedCallDeclarationWitness, validateReleaseEvidenceFieldPresence, validateReleaseWorkClaim, validateRemovedBackend2IndependentEmitterModules, validateSourceManifestPath, validateTypedExprCoverageLedger, validateTypedExprFormalSpecBinding, validateTypedExprFrozenAuthority, validateX86_64F64RuntimeGateBundle, validateX86_64F64RuntimeGateReport} from "../src/cheng_regalloc_preflight_m9022.ts";
 import {assertTrue, startMcp} from "./mcp_client.ts";
 
 const PROJECT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -15,6 +15,7 @@ const STAGE3 = process.env.CHENG_STAGE3_DRIVER || join(CHENG_ROOT, "artifacts/bo
 const OFFICIAL_DRIVER = process.env.CHENG_OFFICIAL_DRIVER || join(CHENG_ROOT, "artifacts/backend_driver/cheng");
 const CLI = join(PROJECT, "cli.ts");
 const ROLES = ["csg_path_to_macho", "source_path_to_macho", "source_to_object", "facts_from_source", "csg_roundtrip", "command_csg_emit"];
+const MEMORY_ROW_BYTES = Object.freeze({op: 44, slot: 52, callArg: 24});
 const AUTHORITY_FILES = [
   "src/core/lang/parser.cheng",
   "src/core/lang/typed_expr.cheng",
@@ -57,7 +58,7 @@ function productionGuard(tag: string, stdoutPath: string, stderrPath: string, op
   const enforcedPeak = options.badGuardPeak ? 999 : 1000;
   const rows: Array<[string, string | number]> = [
     ["tool", "tools/beat_c_process_group_guard.sh"],
-    ["schema", "beat_c_process_memory_guard.v4"],
+    ["schema", "beat_c_process_memory_guard"],
     ["platform", "darwin"],
     ["status", "completed"],
     ["rc", 0],
@@ -110,14 +111,14 @@ function productionGuard(tag: string, stdoutPath: string, stderrPath: string, op
     ["command_execution_mode", "direct"],
     ["command_execution_trust_boundary", "direct_path_with_pre_post_identity_detection_not_same_uid_isolation"],
     ["command_execution_snapshot_path", "/bin/echo"],
-    ["command_execution_snapshot_schema", "cheng.guard.command_snapshot.v1"],
+    ["command_execution_snapshot_schema", "cheng.guard.command_snapshot"],
     ["command_execution_snapshot_sha256", "8ee6815604068a5656c6d3d05310e6b11f01d8c3f620fe54eedbaeb67a5ef2a2"],
     ["command_execution_snapshot_size", 101136],
     ["command_execution_snapshot_inode", 1152921500312571397],
     ["command_execution_snapshot_device", 16777230],
     ["command_execution_snapshot_mtime_ns", 1777577597000000000],
     ["command_execution_snapshot_ctime_ns", 1777577597000000000],
-    ["command_argv_schema", "cheng.guard.command_argv.v1"],
+    ["command_argv_schema", "cheng.guard.command_argv"],
     ["command_argv_count", 2],
     ["command_argv_sha256", "907f72a8a4c890563da12f794f6222b030e002ebf79a7e22c1c8f0ce5a0979f3"],
     ["monitor_python_path", "/opt/miniconda3/bin/python3.13"],
@@ -134,13 +135,13 @@ function productionGuard(tag: string, stdoutPath: string, stderrPath: string, op
     ["monitor_psutil_device", 16777230],
     ["monitor_psutil_mtime_ns", 1754734767203902865],
     ["monitor_psutil_ctime_ns", 1754734767203902865],
-    ["monitor_psutil_closure_schema", "cheng.guard.file_closure.v1"],
+    ["monitor_psutil_closure_schema", "cheng.guard.file_closure"],
     ["monitor_psutil_closure_root", "/opt/miniconda3/lib/python3.13/site-packages/psutil"],
     ["monitor_psutil_closure_count", 58],
     ["monitor_psutil_closure_sha256", "1cca0c5052ac3108b592d4322e99f0bd67117995cc24d191e786feff75fcde55"],
-    ["output_artifact_schema", "cheng.guard.output_artifacts.v1"],
+    ["output_artifact_schema", "cheng.guard.output_artifacts"],
     ["output_artifact_count", 3],
-    ["output_path_history_schema", "cheng.guard.output_path_history.v1"],
+    ["output_path_history_schema", "cheng.guard.output_path_history"],
     ["output_path_history_status", "verified_clean"],
     ["output_path_history_monitor", "darwin_kqueue_vnode"],
     ["output_path_history_watch_count", 3],
@@ -157,10 +158,15 @@ function productionGuard(tag: string, stdoutPath: string, stderrPath: string, op
     ["stderr_size", 0],
     ["stderr_inode", 335470753],
     ["stderr_device", 16777230],
-    ["target_env_schema", "cheng.guard.target_env.v1"],
+    ["target_env_schema", "cheng.guard.target_env"],
     ["target_env_mode", "inherit_scrubbed"],
     ["target_env_count", 53],
     ["target_env_sha256", "29bbe24b65d9c14f586e13d95d2b9df7b1d7a7e0d75a05fac5c8eb19879f78e8"],
+    ["parent_guard_mode", "standalone"],
+    ["parent_guard_monitor_pid", 0],
+    ["parent_guard_capability_sha256", ""],
+    ["parent_guard_limit_bytes", 0],
+    ["parent_guard_binding_status", "not_applicable"],
     ["phase_trace_status", "disabled"],
     ["phase_trace_path", ""],
     ["phase_trace_sha256", ""],
@@ -196,8 +202,8 @@ function legacyProductionEvidenceFixture(parent: string, name: string, options: 
   const officialDriverSha256 = hash("official-driver");
   const baselineDriverSha256 = hash("baseline-driver");
   const fixtureSourceSha256 = hash("workload-fixture");
-  const frozen = write("workload.current.regalloc-frozen-plan.v3.txt", render([
-    ["schema", options.badSnapshotSchema ? "regalloc_frozen_plan_snapshot.v2" : "regalloc_frozen_plan_snapshot.v3"],
+  const frozen = write("workload.current.regalloc-frozen-plan.txt", render([
+    ["schema", options.badSnapshotSchema ? "legacy_regalloc_frozen_plan_snapshot" : "regalloc_frozen_plan_snapshot"],
     ["phase", "allocator_and_machine_recipe_freeze_before_fill"],
     ["fixture_source_sha256", fixtureSourceSha256],
     ["source_manifest_sha256", sourceManifestSha256],
@@ -220,7 +226,7 @@ function legacyProductionEvidenceFixture(parent: string, name: string, options: 
       const compilerSha256 = role === "current" ? officialDriverSha256 : baselineDriverSha256;
       const rowSourceSha256 = options.badSourceDrift && pair === 3 && ordinal === 4 ? hash("drifted-workload") : fixtureSourceSha256;
       const metrics = write(`${base}.metrics.txt`, [
-        `schema=${options.badMetricsSchema && pair === 1 && ordinal === 1 ? "regalloc_compile_measurement.v0" : "regalloc_compile_measurement.v1"}`,
+        `schema=${options.badMetricsSchema && pair === 1 && ordinal === 1 ? "regalloc_compile_measurement.v0" : "regalloc_compile_measurement"}`,
         `source_sha256=${rowSourceSha256}`,
         `compiler_sha256=${compilerSha256}`,
         `compile_wall_ns=${wall}`,
@@ -238,14 +244,14 @@ function legacyProductionEvidenceFixture(parent: string, name: string, options: 
       let report;
       if (pair === 1 && ordinal === 2 && role === "current") {
         const ledgerObjectSha256 = options.badLedgerObject ? hash("wrong-object") : object.sha256;
-        const ledger = write("workload.current.regalloc-action-ledger.v4.txt", render([
-          ["schema", "regalloc_action_emission_ledger.v4"],
+        const ledger = write("workload.current.regalloc-action-ledger.txt", render([
+          ["schema", "regalloc_action_emission_ledger"],
           ["output_object_sha256", ledgerObjectSha256],
           ["fixture_source_sha256", fixtureSourceSha256],
           ["function_count", 1],
         ], "ledger_payload_sha256"));
         report = write(`${base}.compile.report.txt`, Buffer.from([
-          `regalloc_receipt_schema=${options.badReceiptSchema ? "regalloc_single_pass.production.v5" : "regalloc_single_pass.production.v6"}`,
+          `regalloc_receipt_schema=${options.badReceiptSchema ? "legacy_regalloc_single_pass.production" : "regalloc_single_pass.production"}`,
           "regalloc_allocator=regalloc_single_pass",
           "regalloc_wiring_mode=production_default",
           `regalloc_driver_sha256=${officialDriverSha256}`,
@@ -278,7 +284,7 @@ function legacyProductionEvidenceFixture(parent: string, name: string, options: 
   assert.ok(selectedObject && selectedReport && selectedLedger);
   const compilePairs = write("workload.compile.pairs.tsv", `${rows.join("\n")}\n`);
   const compileVerdict = write("compile-pair-verdict.txt", render([
-    ["schema", "regalloc_compile_pair_verdict.v1"],
+    ["schema", "regalloc_compile_pair_verdict"],
     ["pair_count", 3], ["sample_count", 12], ["raw_samples_sha256", compilePairs.sha256],
     ["source_sha256", fixtureSourceSha256], ["current_compiler_sha256", officialDriverSha256],
     ["baseline_compiler_sha256", baselineDriverSha256], ["current_object_sha256", hash("object:current")],
@@ -289,7 +295,7 @@ function legacyProductionEvidenceFixture(parent: string, name: string, options: 
   ], "verdict_payload_sha256"));
   const productionStatus = options.badProductionStatus ? "RED" : "GREEN";
   const reportRows: Array<[string, string | number]> = [
-    ["schema", "regalloc_production_gate.v5"],
+    ["schema", "regalloc_production_gate"],
     ["status", productionStatus],
     ["production_status", productionStatus],
     ["local_diagnostic_status", "GREEN"],
@@ -399,7 +405,7 @@ function productionEvidenceFixture(parent: string, name: string, options: any = 
     execSnapshots.set(key, snapshot(path));
   }
   const identityFields: Array<[string, string | number | bigint]> = [
-    ["schema", "regalloc_exec_bundle_identity.v1"],
+    ["schema", "regalloc_exec_bundle_identity"],
     ["source_root", fixture.expected.root],
     ["exec_bundle", execBundle.path],
     ["exec_bundle_device", execBundleStat.dev],
@@ -460,7 +466,7 @@ function productionEvidenceFixture(parent: string, name: string, options: any = 
   }
   const perfPairs = write("perf.pairs.tsv", `${perfRows.join("\n")}\n`);
   const perfVerdict = write("perf.verdict.txt", render([
-    ["schema", "regalloc_perf_pair_verdict.v1"], ["pair_count", 7], ["sample_count", 28],
+    ["schema", "regalloc_perf_pair_verdict"], ["pair_count", 7], ["sample_count", 28],
     ["raw_samples_sha256", perfPairs.sha256], ["current_executable_sha256", currentExe.sha256],
     ["baseline_executable_sha256", baselineExe.sha256], ["median_ratio_ppm", options.badPerfVerdict ? 999999 : 1000000],
     ["spread_ppm", 0], ["baseline_min_ns", 10000000],
@@ -478,7 +484,7 @@ function productionEvidenceFixture(parent: string, name: string, options: any = 
   const requiredManifest = write("required-status.tsv", `${requiredManifestRows.join("\n")}\n`);
   const requiredActual = write("required-status.actual.tsv", `${actualRows.map((row: string[]) => row.join("\t")).join("\n")}\n`);
   const requiredVerdict = write("required-status.detail.txt", render([
-    ["schema", "regalloc_required_status_contract.v1"], ["status", "proved"], ["required_count", 185],
+    ["schema", "regalloc_required_status_contract"], ["status", "proved"], ["required_count", 185],
     ["required_manifest_sha256", requiredManifest.sha256], ["status_rows_path", requiredActual.path],
     ["status_rows_sha256", requiredActual.sha256],
   ], "verdict_payload_sha256"));
@@ -492,7 +498,7 @@ function productionEvidenceFixture(parent: string, name: string, options: any = 
   const productionCount = required.length + 1;
   const localCount = required.filter((entry: any) => entry.scope === "BOTH").length;
   const reportRows: Array<[string, string | number | bigint]> = [
-    ["schema", "regalloc_production_gate.v5"], ["status", options.badProductionStatus ? "RED" : "GREEN"],
+    ["schema", "regalloc_production_gate"], ["status", options.badProductionStatus ? "RED" : "GREEN"],
     ["production_status", options.badProductionStatus ? "RED" : "GREEN"], ["local_diagnostic_status", "GREEN"],
     ["mode", "run"], ["production_green_count", productionCount], ["production_red_count", 0],
     ["local_green_count", localCount], ["local_red_count", 0], ["root", fixture.expected.root],
@@ -564,7 +570,10 @@ function memoryEvent(kind: string, arenaId: number, role: string, bodyId: number
   };
 }
 
-function memoryManifest(mutate?: (events: any[]) => void) {
+function memoryManifest(
+  mutate?: (events: any[]) => void,
+  rowBytes = MEMORY_ROW_BYTES,
+) {
   const events: any[] = [];
   for (let roleIndex = 0; roleIndex < ROLES.length; roleIndex++) {
     const arenaId = roleIndex + 1;
@@ -574,29 +583,34 @@ function memoryManifest(mutate?: (events: any[]) => void) {
     events.push(memoryEvent("arena_open", arenaId, role, 0, zero, 0, 0, 0));
     events.push(memoryEvent("body_birth", arenaId, role, bodyId, zero, 0, 0, 0));
     const op = {...zero, opCapacity: 64};
-    events.push(memoryEvent("slab_replace", arenaId, role, bodyId, op, 0, 1280, 1280, "op", "grow", 0, 64, 0, 1280));
+    const opBytes = 64 * MEMORY_ROW_BYTES.op;
+    events.push(memoryEvent("slab_replace", arenaId, role, bodyId, op, 0, opBytes, opBytes, "op", "grow", 0, 64, 0, opBytes));
     const slot = {...op, slotCapacity: 32};
-    events.push(memoryEvent("slab_replace", arenaId, role, bodyId, slot, 1280, 2432, 2432, "slot", "grow", 0, 32, 0, 1152));
+    const slotBytes = 32 * MEMORY_ROW_BYTES.slot;
+    const opAndSlotBytes = opBytes + slotBytes;
+    events.push(memoryEvent("slab_replace", arenaId, role, bodyId, slot, opBytes, opAndSlotBytes, opAndSlotBytes, "slot", "grow", 0, 32, 0, slotBytes));
     const call = {...slot, callArgCapacity: 8};
-    events.push(memoryEvent("slab_replace", arenaId, role, bodyId, call, 2432, 2496, 2496, "call_arg", "grow", 0, 8, 0, 64));
-    events.push(memoryEvent("arena_release_begin", arenaId, role, 0, zero, 2496, 2496, 2496));
-    events.push(memoryEvent("body_release", arenaId, role, bodyId, call, 2496, 2496, 0));
+    const callArgBytes = 8 * MEMORY_ROW_BYTES.callArg;
+    const bodyBytes = opAndSlotBytes + callArgBytes;
+    events.push(memoryEvent("slab_replace", arenaId, role, bodyId, call, opAndSlotBytes, bodyBytes, bodyBytes, "call_arg", "grow", 0, 8, 0, callArgBytes));
+    events.push(memoryEvent("arena_release_begin", arenaId, role, 0, zero, bodyBytes, bodyBytes, bodyBytes));
+    events.push(memoryEvent("body_release", arenaId, role, bodyId, call, bodyBytes, bodyBytes, 0));
     events.push(memoryEvent("arena_release_end", arenaId, role, 0, zero, 0, 0, 0));
   }
   mutate?.(events);
   const fields: Array<[string, string | number | bigint]> = [
-    ["schema", "cold_bodyir_memory_manifest.v1"],
+    ["schema", "cold_bodyir_memory_manifest"],
     ["scope", "arena_used_plus_bodyir_owned_slabs"],
     ["pointer_width_bits", 64], ["arena_alignment_bytes", 8],
-    ["arena_page_payload_bytes", 65536], ["op_row_bytes", 20],
-    ["slot_row_bytes", 36], ["call_arg_row_bytes", 8],
+    ["arena_page_payload_bytes", 65536], ["op_row_bytes", rowBytes.op],
+    ["slot_row_bytes", rowBytes.slot], ["call_arg_row_bytes", rowBytes.callArg],
     ["initial_op_capacity", 64], ["initial_slot_capacity", 32],
     ["initial_call_arg_capacity", 8], ["max_active_bodyir_arenas", 1],
   ];
   for (let index = 0; index < events.length; index++) {
     for (const [key, value] of Object.entries(events[index])) fields.push([`event.${index}.${key}`, value as any]);
   }
-  fields.push(["event_count", events.length], ["arena_count", 6], ["body_count", 6], ["arena_close_count", 6], ["body_release_count", 6], ["recomputed_peak_retained_bytes", 3520], ["complete", 1]);
+  fields.push(["event_count", events.length], ["arena_count", 6], ["body_count", 6], ["arena_close_count", 6], ["body_release_count", 6], ["recomputed_peak_retained_bytes", 5696], ["complete", 1]);
   return render(fields, "manifest_payload_sha256");
 }
 
@@ -604,7 +618,7 @@ function sourceManifest(root: string) {
   const allocatorPath = join(root, "src/core/backend/regalloc_single_pass.cheng");
   const entryPath = join(root, "src/entry.cheng");
   const fields: Array<[string, string | number]> = [
-    ["schema", "regalloc_source_manifest.v2"],
+    ["schema", "regalloc_source_manifest"],
     ["entry", "src/entry.cheng"], ["entry_module", "entry"],
     ["target", "arm64-apple-darwin"], ["file_count", 2],
     ["file.0.module", "core/backend/regalloc_single_pass"],
@@ -635,7 +649,7 @@ function completeSourceManifest(root: string, entryModule: string) {
   for (const [from, moduleName] of ordered.entries()) for (const imported of modules.get(moduleName)!.imports) edges.push([from, indices.get(imported)!]);
   edges.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
   const fields: Array<[string, string | number]> = [
-    ["schema", "regalloc_source_manifest.v2"], ["entry", `src/${entryModule}.cheng`], ["entry_module", entryModule],
+    ["schema", "regalloc_source_manifest"], ["entry", `src/${entryModule}.cheng`], ["entry_module", entryModule],
     ["target", "arm64-apple-darwin"], ["file_count", ordered.length],
   ];
   for (const [index, moduleName] of ordered.entries()) fields.push(
@@ -756,6 +770,26 @@ async function main() {
     assert.match(readme, /cheng_addr_symbolicate_m9021\.ts\s+executable\/object address resolver/);
     assertTrue(true, "registry, CLI, MCP and README expose the same manifest-derived unique tool set");
 
+    const removedBackend2Root = join(scratch, "removed-backend2-emitter");
+    mkdirSync(join(removedBackend2Root, "src/core/backend2"),
+              {recursive: true});
+    assert.equal(
+      validateRemovedBackend2IndependentEmitterModules(
+        removedBackend2Root).length,
+      3);
+    writeFileSync(
+      join(removedBackend2Root,
+           "src/core/backend2/backend2_emit_ops.cheng"),
+      "fn IndependentEmitterReturned(): int32 =\n    return 1\n");
+    assert.throws(
+      () => validateRemovedBackend2IndependentEmitterModules(
+        removedBackend2Root),
+      /removed independent backend2 emitter module is present: src\/core\/backend2\/backend2_emit_ops\.cheng/);
+    assertTrue(
+      true,
+      "reintroducing any removed backend2 independent emitter is a hard failure");
+
+    (() => {
     console.log("[B] strict source and memory manifests");
     const mini = join(scratch, "mini-tree");
     mkdirSync(join(mini, "src/core/backend"), {recursive: true});
@@ -769,9 +803,32 @@ async function main() {
     assert.deepEqual(sourceVerified.relativePaths, ["src/core/backend/regalloc_single_pass.cheng", "src/entry.cheng"]);
     const memory = memoryManifest();
     const memoryVerified = validateMemoryManifestBytes(memory);
-    assert.equal(memoryVerified.recomputedPeakRetainedBytes, "3520");
+    assert.equal(memoryVerified.recomputedPeakRetainedBytes, "5696");
     assert.equal(memoryVerified.roles.length, 6);
-    assert.throws(() => validateMemoryManifestBytes(memoryManifest((events) => { events[2].new_capacity = 63; events[2].new_bytes = 1260; events[2].owned_slab_peak_bytes = 1260; events[2].owned_slab_after_bytes = 1260; events[2].retained_peak_bytes = 2284; events[2].retained_after_bytes = 2284; })), /doubling chain|byte\/capacity/);
+    assert.throws(
+      () => validateMemoryManifestBytes(memoryManifest(undefined, {...MEMORY_ROW_BYTES, op: 20})),
+      /op_row_bytes mismatch/,
+    );
+    assert.throws(
+      () => validateMemoryManifestBytes(memoryManifest(undefined, {...MEMORY_ROW_BYTES, slot: 36})),
+      /slot_row_bytes mismatch/,
+    );
+    assert.throws(
+      () => validateMemoryManifestBytes(memoryManifest(undefined, {...MEMORY_ROW_BYTES, callArg: 8})),
+      /call_arg_row_bytes mismatch/,
+    );
+    assert.throws(() => validateMemoryManifestBytes(memoryManifest((events) => {
+      events[2].new_capacity = 63;
+      events[2].new_bytes = 2772;
+      events[2].owned_slab_peak_bytes = 2772;
+      events[2].owned_slab_after_bytes = 2772;
+      events[2].retained_peak_bytes = 3796;
+      events[2].retained_after_bytes = 3796;
+    })), /doubling chain|byte\/capacity/);
+    if (process.env.CHENG_ITEM22_FOCUSED_MEMORY_CONTRACT === "1") {
+      console.log("item22 focused BodyIR memory manifest: PASS");
+      return;
+    }
     const goodKv = render([["schema", "x"]], "payload_sha256");
     strictKv(goodKv, "test", "payload_sha256");
     assert.throws(() => strictKv(Buffer.from(`schema=x\nschema=y\npayload_sha256=${"0".repeat(64)}\n`), "test", "payload_sha256"), /duplicate/);
@@ -806,6 +863,10 @@ async function main() {
     assert.equal(aarch64F64GateBundle.finiteCompareCaseCount, 18);
     assert.equal(aarch64F64GateBundle.storeRuntimeCaseCount, 5);
     assert.equal(aarch64F64GateBundle.storeRuntimeFamilyCount, 3);
+    assert.equal(aarch64F64GateBundle.constantPayloadCaseCount, 4);
+    assert.equal(aarch64F64GateBundle.callClobberPayloadCaseCount, 4);
+    assert.equal(aarch64F64GateBundle.callSpillActionCount, 1);
+    assert.equal(aarch64F64GateBundle.callReloadActionCount, 1);
     assert.equal(aarch64F64GateBundle.guardStages.length, 6);
     assert.equal(aarch64F64GateBundle.globalStaticRelocOracle, "PAGE21_PAGEOFF12_CONSECUTIVE_SAME_SYMBOL_AND_TAINTED_F64_STORE");
     assert.equal(aarch64F64GateBundle.d0PoisonStatus, "PROVEN");
@@ -814,6 +875,70 @@ async function main() {
     const aarch64F64GateCountMutation = new Map(aarch64F64GateSources);
     aarch64F64GateCountMutation.set(aarch64F64GatePaths[0], Buffer.from(aarch64F64GateSources.get(aarch64F64GatePaths[0])!.toString("utf8").replace("nan_compare_case_count=30", "nan_compare_case_count=29"), "utf8"));
     assert.throws(() => validateAarch64F64RuntimeGateBundle(aarch64F64GateCountMutation), /runtime_report_exact_counts_missing/);
+    const aarch64F64GuardThirdModeMutation = new Map(aarch64F64GateSources);
+    aarch64F64GuardThirdModeMutation.set(aarch64F64GatePaths[1], Buffer.from(aarch64F64GateSources.get(aarch64F64GatePaths[1])!.toString("utf8").replace(
+      '"same_session_descendant" if parent_guard_mode else "standalone"',
+      '"same_session_descendant" if parent_guard_mode else "detached"',
+    ), "utf8"));
+    assert.throws(() => validateAarch64F64RuntimeGateBundle(aarch64F64GuardThirdModeMutation), /guard_ownership_mode_contract_missing/);
+    const aarch64F64GuardForgedParentMutation = new Map(aarch64F64GateSources);
+    aarch64F64GuardForgedParentMutation.set(aarch64F64GatePaths[1], Buffer.from(aarch64F64GateSources.get(aarch64F64GatePaths[1])!.toString("utf8").replace(
+      "if parent_guard_monitor_pid not in ancestor_pids:",
+      "if False:",
+    ), "utf8"));
+    assert.throws(() => validateAarch64F64RuntimeGateBundle(aarch64F64GuardForgedParentMutation), /guard_parent_binding_proof_missing/);
+    for (const [from, to] of [
+      ['if record["rootPid"] != os.getpid():', "if False:"],
+      ['inherited_sid != record["rootSid"]', "False"],
+      ['inherited_pgid != record["rootPgid"]', "False"],
+    ]) {
+      const mutation = new Map(aarch64F64GateSources);
+      mutation.set(
+        aarch64F64GatePaths[1],
+        Buffer.from(
+          aarch64F64GateSources.get(aarch64F64GatePaths[1])!
+            .toString("utf8")
+            .replace(from, to),
+          "utf8",
+        ),
+      );
+      assert.throws(
+        () => validateAarch64F64RuntimeGateBundle(mutation),
+        /guard_parent_binding_proof_missing/,
+      );
+    }
+    for (const [from, to, reason] of [
+      ["if parent_pid not in ancestry:", "if False:", "runtime_guard_report_parent_session_binding_missing"],
+      ['record["rootPpid"] != parent_pid', "False", "runtime_guard_report_parent_session_binding_missing"],
+      ['self_identity["sid"] != record["rootSid"]', "False", "runtime_guard_report_parent_session_binding_missing"],
+      ['self_identity["pgid"] != record["rootPgid"]', "False", "runtime_guard_report_parent_session_binding_missing"],
+      ["parent_limit_value < int(requested_limit)", "False", "runtime_guard_report_limit_capability_binding_missing"],
+      ["proof_fd != str(PARENT_PROOF_FD)", "False", "runtime_guard_report_parent_proof_transport_missing"],
+      ["hashlib.sha256(raw_record).hexdigest()", '"0" * 64', "runtime_guard_report_parent_proof_transport_missing"],
+    ]) {
+      const mutation = new Map(aarch64F64GateSources);
+      mutation.set(aarch64F64GatePaths[0], Buffer.from(aarch64F64GateSources.get(aarch64F64GatePaths[0])!.toString("utf8").replace(from, to), "utf8"));
+      assert.throws(() => validateAarch64F64RuntimeGateBundle(mutation), new RegExp(reason));
+    }
+    const aarch64F64NonEnforcingLimitAliasMutation = new Map(aarch64F64GateSources);
+    aarch64F64NonEnforcingLimitAliasMutation.set(
+      aarch64F64GatePaths[0],
+      Buffer.from(
+        aarch64F64GateSources.get(aarch64F64GatePaths[0])!
+          .toString("utf8")
+          .replace(
+            '      CHENG_PROCESS_MAX_RSS_BYTES="$FIXED_LIMIT_BYTES" \\\n',
+            '      PROCESS_MAX_RSS_BYTES="$FIXED_LIMIT_BYTES" \\\n      CHENG_PROCESS_MAX_RSS_BYTES="$FIXED_LIMIT_BYTES" \\\n',
+          ),
+        "utf8",
+      ),
+    );
+    assert.throws(
+      () => validateAarch64F64RuntimeGateBundle(
+        aarch64F64NonEnforcingLimitAliasMutation,
+      ),
+      /runtime_guard_report_non_enforcing_limit_alias_present/,
+    );
     const aarch64F64GlobalRelocMutation = new Map(aarch64F64GateSources);
     aarch64F64GlobalRelocMutation.set(aarch64F64GatePaths[2], Buffer.from(aarch64F64GateSources.get(aarch64F64GatePaths[2])!.toString("utf8").replace("adapter.RegallocAarch64RelocPageOff12", "adapter.RegallocAarch64RelocPage21"), "utf8"));
     assert.throws(() => validateAarch64F64RuntimeGateBundle(aarch64F64GlobalRelocMutation), /independent_global_page_relocation_store_oracle_missing/);
@@ -823,16 +948,29 @@ async function main() {
     const aarch64F64LocalDataflowMutation = new Map(aarch64F64GateSources);
     aarch64F64LocalDataflowMutation.set(aarch64F64GatePaths[3], Buffer.from(aarch64F64GateSources.get(aarch64F64GatePaths[3])!.toString("utf8").replace("copy.kind = ir.BodyOpStoreLocalTag", "copy.kind = ir.BodyOpNopTag"), "utf8"));
     assert.throws(() => validateAarch64F64RuntimeGateBundle(aarch64F64LocalDataflowMutation), /store_local_to_fadd_to_x0_runtime_dataflow_missing/);
-    const aarch64F64RuntimeReport = Buffer.from(`schema=regalloc_aarch64_f64_runtime_gate.v1
+    const aarch64F64ConstantPayloadMutation = new Map(aarch64F64GateSources);
+    aarch64F64ConstantPayloadMutation.set(aarch64F64GatePaths[4], Buffer.from(aarch64F64GateSources.get(aarch64F64GatePaths[4])!.toString("utf8").replaceAll("0x0000000000000001", "0x0000000000000002"), "utf8"));
+    assert.throws(() => validateAarch64F64RuntimeGateBundle(aarch64F64ConstantPayloadMutation), /exact_f64_constant_payload_runtime_cases_missing/);
+    const aarch64F64ConstantBackendMutation = new Map(aarch64F64GateSources);
+    aarch64F64ConstantBackendMutation.set(aarch64F64GatePaths[3], Buffer.from(aarch64F64GateSources.get(aarch64F64GatePaths[3])!.toString("utf8").replace('emitFunction("regalloc_raw_f64_const_subnormal"', 'emitFunction("regalloc_raw_f64_const_deleted"'), "utf8"));
+    assert.throws(() => validateAarch64F64RuntimeGateBundle(aarch64F64ConstantBackendMutation), /runtime_image_bridge_cardinality_contract_missing/);
+    const aarch64F64SpillActionMutation = new Map(aarch64F64GateSources);
+    aarch64F64SpillActionMutation.set(aarch64F64GatePaths[3], Buffer.from(aarch64F64GateSources.get(aarch64F64GatePaths[3])!.toString("utf8").replace("alloc.RegallocValueActionSpillCall", "alloc.RegallocValueActionReloadCall"), "utf8"));
+    assert.throws(() => validateAarch64F64RuntimeGateBundle(aarch64F64SpillActionMutation), /canonical_call_clobber_spill_reload_action_runtime_witness_missing/);
+    const aarch64F64RuntimeReport = Buffer.from(`schema=regalloc_aarch64_f64_runtime_gate
 status=GREEN
 target=arm64-apple-darwin
 host_execution=native_arm64
-raw_function_reloc_count=0
+raw_function_reloc_count=1
 nan_compare_case_count=30
 finite_compare_case_count=18
 store_runtime_case_count=5
+constant_payload_case_count=4
+call_clobber_payload_case_count=4
+call_spill_action_count=1
+call_reload_action_count=1
 memory_limit_bytes=1073741824
-memory_guard_scope=identity_history_union_group_and_descendants
+memory_guard_scope=identity_history_union_group_session_and_descendants
 `, "utf8");
     assert.equal(validateAarch64F64RuntimeGateReport(aarch64F64RuntimeReport).nanCompareCaseCount, 30);
     assert.throws(() => validateAarch64F64RuntimeGateReport(Buffer.from(aarch64F64RuntimeReport.toString("utf8").replace("nan_compare_case_count=30", "nan_compare_case_count=29"), "utf8")), /contract mismatch/);
@@ -855,6 +993,38 @@ memory_guard_scope=identity_history_union_group_and_descendants
     assert.equal(x86_64F64GateBundle.bridgeResultTransform, "0x5a5a5a5a");
     assert.deepEqual(x86_64F64GateBundle.disassemblyMarkers, ["ucomisd", "setp", "setnp"]);
     assert.equal(x86_64F64GateBundle.guardStages.length, 6);
+    for (const [from, to, reason] of [
+      ["if parent_pid not in ancestry:", "if False:", "runtime_guard_report_parent_session_binding_missing"],
+      ['record["rootPpid"] != parent_pid', "False", "runtime_guard_report_parent_session_binding_missing"],
+      ['self_identity["sid"] != record["rootSid"]', "False", "runtime_guard_report_parent_session_binding_missing"],
+      ['self_identity["pgid"] != record["rootPgid"]', "False", "runtime_guard_report_parent_session_binding_missing"],
+      ["parent_limit_value < int(requested_limit)", "False", "runtime_guard_report_limit_capability_binding_missing"],
+      ["proof_fd != str(PARENT_PROOF_FD)", "False", "runtime_guard_report_parent_proof_transport_missing"],
+      ["hashlib.sha256(raw_record).hexdigest()", '"0" * 64', "runtime_guard_report_parent_proof_transport_missing"],
+    ]) {
+      const mutation = new Map(x86_64F64GateSources);
+      mutation.set(x86_64F64GatePaths[0], Buffer.from(x86_64F64GateSources.get(x86_64F64GatePaths[0])!.toString("utf8").replace(from, to), "utf8"));
+      assert.throws(() => validateX86_64F64RuntimeGateBundle(mutation), new RegExp(reason));
+    }
+    const x86_64F64NonEnforcingLimitAliasMutation = new Map(x86_64F64GateSources);
+    x86_64F64NonEnforcingLimitAliasMutation.set(
+      x86_64F64GatePaths[0],
+      Buffer.from(
+        x86_64F64GateSources.get(x86_64F64GatePaths[0])!
+          .toString("utf8")
+          .replace(
+            '      CHENG_PROCESS_MAX_RSS_BYTES="$FIXED_LIMIT_BYTES" \\\n',
+            '      PROCESS_MAX_RSS_BYTES="$FIXED_LIMIT_BYTES" \\\n      CHENG_PROCESS_MAX_RSS_BYTES="$FIXED_LIMIT_BYTES" \\\n',
+          ),
+        "utf8",
+      ),
+    );
+    assert.throws(
+      () => validateX86_64F64RuntimeGateBundle(
+        x86_64F64NonEnforcingLimitAliasMutation,
+      ),
+      /runtime_guard_report_non_enforcing_limit_alias_present/,
+    );
     const x86_64CountMutation = new Map(x86_64F64GateSources);
     x86_64CountMutation.set(x86_64F64GatePaths[0], Buffer.from(x86_64F64GateSources.get(x86_64F64GatePaths[0])!.toString("utf8").replace("nan_compare_case_count=60", "nan_compare_case_count=59"), "utf8"));
     assert.throws(() => validateX86_64F64RuntimeGateBundle(x86_64CountMutation), /runtime_marker_missing:nan_compare_case_count=60|runtime_report_marker_missing:nan_compare_case_count=60/);
@@ -864,13 +1034,27 @@ memory_guard_scope=identity_history_union_group_and_descendants
     const x86_64FusedMutation = new Map(x86_64F64GateSources);
     x86_64FusedMutation.set(x86_64F64GatePaths[2], Buffer.from(x86_64F64GateSources.get(x86_64F64GatePaths[2])!.toString("utf8").replace("fused, true", "fused, false"), "utf8"));
     assert.throws(() => validateX86_64F64RuntimeGateBundle(x86_64FusedMutation), /materialized_and_fused_production_emitter_image_contract_missing/);
+    const x86_64StackLayoutMutation = new Map(x86_64F64GateSources);
+    x86_64StackLayoutMutation.set(
+      x86_64F64GatePaths[2],
+      Buffer.from(
+        x86_64F64GateSources.get(x86_64F64GatePaths[2])!
+          .toString("utf8")
+          .replace("x64.X64BodyPrepareStackLayout(body)", "true"),
+        "utf8",
+      ),
+    );
+    assert.throws(
+      () => validateX86_64F64RuntimeGateBundle(x86_64StackLayoutMutation),
+      /materialized_and_fused_production_emitter_image_contract_missing/,
+    );
     const x86_64BridgeMutation = new Map(x86_64F64GateSources);
     x86_64BridgeMutation.set(x86_64F64GatePaths[4], Buffer.from(x86_64F64GateSources.get(x86_64F64GatePaths[4])!.toString("utf8").replace("xorl $0x5a5a5a5a, %eax", "xorl $0x5a5a5a5b, %eax"), "utf8"));
     assert.throws(() => validateX86_64F64RuntimeGateBundle(x86_64BridgeMutation), /x86_64_f64_bridge_transform_contract_missing/);
     const x86_64DisassemblyMutation = new Map(x86_64F64GateSources);
     x86_64DisassemblyMutation.set(x86_64F64GatePaths[0], Buffer.from(x86_64F64GateSources.get(x86_64F64GatePaths[0])!.toString("utf8").replace("grep -Fq 'setnp'", "grep -Fq 'setnz'"), "utf8"));
     assert.throws(() => validateX86_64F64RuntimeGateBundle(x86_64DisassemblyMutation), /x86_64_native_link_and_disassembly_oracle_missing/);
-    const x86_64F64RuntimeReport = Buffer.from(`schema=regalloc_x86_64_f64_runtime_gate.v1
+    const x86_64F64RuntimeReport = Buffer.from(`schema=regalloc_x86_64_f64_runtime_gate
 status=GREEN
 target=x86_64-apple-darwin
 host_execution=rosetta_x86_64
@@ -882,7 +1066,7 @@ materialized_function_count=6
 fused_function_count=6
 bridge_result_transform=0x5a5a5a5a
 memory_limit_bytes=1073741824
-memory_guard_scope=identity_history_union_group_and_descendants
+memory_guard_scope=identity_history_union_group_session_and_descendants
 `, "utf8");
     assert.equal(validateX86_64F64RuntimeGateReport(x86_64F64RuntimeReport).finiteCompareCaseCount, 72);
     assert.throws(() => validateX86_64F64RuntimeGateReport(Buffer.from(x86_64F64RuntimeReport.toString("utf8").replace("finite_compare_case_count=72", "finite_compare_case_count=71"), "utf8")), /contract mismatch/);
@@ -1745,7 +1929,7 @@ fn BuildPrimaryObjectPlanInto(): int32 =
     assert.deepEqual(programEncodingMissingHighHalf.postSealProgramDerivedEncodingCapProofs, []);
 
     const strEqMirrorViolationSources = new Map(wiredAuthoritySources);
-    strEqMirrorViolationSources.set("src/core/backend2/backend2_emit_ops.cheng", Buffer.from(`fn PrimaryBodyIRStrEqWordCount(bodyIR: BodyIR, op: BodyOp): int32 =
+    strEqMirrorViolationSources.set("src/core/backend/primary_object_plan.cheng", Buffer.from(`fn PrimaryBodyIRStrEqWordCount(bodyIR: BodyIR, op: BodyOp): int32 =
     let lhsWords: int32 = 1
     let rhsWords: int32 = 1
     return lhsWords + rhsWords + 19
@@ -1766,7 +1950,7 @@ fn PrimaryBodyIRFillStrEqOp(words: int32[], offset: int32, bodyIR: BodyIR, op: B
     ]);
 
     const strEqMirrorExactSources = new Map(wiredAuthoritySources);
-    strEqMirrorExactSources.set("src/core/backend2/backend2_emit_ops.cheng", Buffer.from(`fn PrimaryBodyIRStrEqWordCount(bodyIR: BodyIR, op: BodyOp): int32 =
+    strEqMirrorExactSources.set("src/core/backend/primary_object_plan.cheng", Buffer.from(`fn PrimaryBodyIRStrEqWordCount(bodyIR: BodyIR, op: BodyOp): int32 =
     let lhsWords: int32 = 1
     let rhsWords: int32 = 1
     let storeWords = PrimaryBodyIrStoreSlotWordCount(bodyIR, op.target)
@@ -1899,7 +2083,6 @@ fn RegallocAarch64PrepareFunctionActionRecipes(bodyIR: BodyIR, plan: Plan): Reci
 ${f64CanonicalCondSource}fn BuildPrimaryObjectPlanInto(): int32 =
     return texpr.TypedExprIrCanonicalFieldMetaState()
 `, "utf8"));
-    f64AdapterExactSources.set("src/core/backend2/backend2_emit_ops.cheng", Buffer.from(f64CanonicalCondSource, "utf8"));
     f64AdapterExactSources.set("src/core/backend/regalloc_single_pass.cheng", Buffer.from(`fn RegallocTargetConstraintsAarch64Darwin(): Constraints =
     var out: Constraints
     add(out.gprTypeKinds, coreir.LocalI32Tag)
@@ -2447,7 +2630,47 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const x64WordsMutation = validateAuthorityProductionClosure(x64WordsMutationSources, false);
     assert.ok(x64WordsMutation.x64WordCountCheckedArithmeticViolations[0]?.reasons.includes("word_count_padding_overflow_guard_missing_or_inexact"));
 
-    const coverage = validateTypedExprCoverageLedger();
+    const formalSpecRaw = readFileSync(
+      join(CHENG_ROOT, "docs/cheng-formal-spec.md"),
+    );
+    const generatedEbnfMapRaw = readFileSync(
+      join(PROJECT, "fixtures/semantic/ebnf_parser_node_map.json"),
+    );
+    const parserRaw = readFileSync(
+      join(CHENG_ROOT, "src/core/lang/parser.cheng"),
+    );
+    const producerDeclarationsRaw = readFileSync(
+      join(
+        PROJECT,
+        "fixtures/semantic/ebnf_parser_producer_claims.json",
+      ),
+    );
+    const formalProfileSourceSnapshotSha256 = hash(Buffer.concat([
+      formalSpecRaw,
+      generatedEbnfMapRaw,
+      parserRaw,
+      producerDeclarationsRaw,
+    ]));
+    const bindFormal = (candidate: Buffer | string) =>
+      validateTypedExprFormalSpecBinding(
+        candidate,
+        generatedEbnfMapRaw,
+        parserRaw,
+        producerDeclarationsRaw,
+        {
+          sourceSnapshotSha256: formalProfileSourceSnapshotSha256,
+          receiptToolClosureSha256:
+            hash("item22-formal-receipt-tool-closure"),
+          receiptSourcePlanSha256:
+            hash("item22-formal-receipt-source-plan"),
+        },
+      );
+    const formalBinding = bindFormal(formalSpecRaw);
+    assert.equal(formalBinding.status, "GREEN", formalBinding.reason);
+    const coverage = validateTypedExprCoverageLedger(
+      formalBinding.sliceSha256,
+      formalBinding.specVersion,
+    );
     assert.equal(coverage.familyCount, 95);
     assert.equal(coverage.selectedLeafAlternativeCount, 69);
     assert.equal(coverage.scope, "selected_leaf_alternatives_only");
@@ -2460,13 +2683,13 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     assert.equal(compilerProfile.env.BACKEND_MULTI_MODULE_CACHE, "0");
     assert.equal(compilerProfile.env.CHENG_DISABLE_PRIMARY_OBJECT_CACHE, "1");
     assert.equal(compilerProfile.env.BACKEND_JOBS, "1");
-    assert.ok(compilerProfile.unsetEnv.includes("CHENG_TYPED_EXPR_V2"));
+    assert.ok(compilerProfile.unsetEnv.includes("CHENG_TYPED_EXPR_LEGACY"));
     assert.ok(compilerProfile.unsetEnv.includes("CHENG_TYPED_IR_KEEP_COLD_CSG_ROWS"));
     assert.ok(compilerProfile.unsetEnv.includes("CHENG_TYPED_IR_KEEP_COLD_CSG_STATEMENTS"));
     assert.equal(compilerProfile.sha256, hash(JSON.stringify({schema: compilerProfile.schema, action: compilerProfile.action, target: compilerProfile.target, env: compilerProfile.env, unsetEnv: compilerProfile.unsetEnv})));
     assert.equal(new Set(coverage.entries.map((entry: any) => entry.family)).size, coverage.familyCount);
     assert.equal(new Set(coverage.entries.map((entry: any) => entry.fixture)).size, coverage.familyCount);
-    assert.equal(coverage.entries.find((entry: any) => entry.family === "qualified_nested_call_canonical_declaration")?.declarationWitnessId, "qualified_nested_call.std_monotimes.v1");
+    assert.equal(coverage.entries.find((entry: any) => entry.family === "qualified_nested_call_canonical_declaration")?.declarationWitnessId, "qualified_nested_call.std_monotimes");
     const nestedFixtureRaw = readFileSync(join(PROJECT, "fixtures/regalloc_preflight/typedexpr_qualified_nested_call_positive.cheng"));
     const monotimesRaw = readFileSync(join(CHENG_ROOT, "src/std/monotimes.cheng"));
     const nestedDeclarationWitness = validateQualifiedNestedCallDeclarationWitness(nestedFixtureRaw, monotimesRaw);
@@ -2482,15 +2705,19 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     assert.equal(wrongBoundInnerDeclaration.status, "RED");
     assert.ok(wrongBoundInnerDeclaration.issues.includes("inner_declaration_signature_mismatch"));
     assert.ok(wrongBoundInnerDeclaration.issues.includes("nested_call_inner_return_outer_parameter_type_mismatch"));
-    const formalSpecRaw = readFileSync(join(CHENG_ROOT, "docs/cheng-formal-spec.md"));
-    const formalBinding = validateTypedExprFormalSpecBinding(formalSpecRaw);
-    assert.equal(formalBinding.status, "GREEN");
-    assert.ok(formalBinding.supplementalBindings.some((entry: any) => entry.schema === "cheng_formal_module_visibility.v1" && entry.sha256 === "a8368440796baa9618426e55b204dfd62bac14c599f31ce1dd2145169ba8b169"));
+    assert.ok(formalBinding.supplementalBindings.some((entry: any) =>
+      entry.schema === "cheng_formal_module_visibility" &&
+      /^[0-9a-f]{64}$/.test(entry.sha256)));
     const mutatedModuleVisibility = formalSpecRaw.toString("utf8").replace("- `import` 仅导入导出符号；未导出符号在模块外不可见。", "- `import` 同时转导入模块的导出符号。");
     assert.notEqual(mutatedModuleVisibility, formalSpecRaw.toString("utf8"));
-    const mutatedModuleVisibilityBinding = validateTypedExprFormalSpecBinding(mutatedModuleVisibility);
+    const mutatedModuleVisibilityBinding = bindFormal(
+      mutatedModuleVisibility,
+    );
     assert.equal(mutatedModuleVisibilityBinding.status, "UNPROVEN");
-    assert.match(mutatedModuleVisibilityBinding.reason, /formal module visibility semantics SHA-256 changed/);
+    assert.match(
+      mutatedModuleVisibilityBinding.reason,
+      /formal spec\/parser identity mismatch/,
+    );
     const obligationManifest = deriveFormalExpressionObligationManifest(formalSpecRaw);
     const obligationCoverage = evaluateFormalExpressionObligationCoverage(obligationManifest, coverage);
     assert.equal(obligationManifest.productionCount, 34);
@@ -2510,7 +2737,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const spaceCallExclusionObligation = obligationManifest.obligations.find((entry: any) => entry.obligation_id === "semantic.profile.strict_call_syntax.spaceCall_exclusion");
     assert.equal(spaceCallExclusionObligation?.bindingStatus, "GREEN");
     assert.equal(spaceCallExclusionObligation?.state, "excluded_by_strict_profile");
-    assert.equal(spaceCallExclusionObligation?.sourceSchema, "cheng_formal_spacecall_exclusion.v1");
+    assert.equal(spaceCallExclusionObligation?.sourceSchema, "cheng_formal_spacecall_exclusion");
     assert.ok(spaceCallExclusionObligation?.fragment.includes("CHENG_STRICT_CALL_SYNTAX=1"));
     assert.ok(spaceCallExclusionObligation?.fragment.includes("space_call_removed"));
     assert.ok(obligationManifest.obligations.some((entry: any) => entry.production === "factor" && entry.kind === "choice" && entry.fragment === "spaceCall"));
@@ -2547,14 +2774,10 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const lexEnd = specTextForLexical.indexOf(lexicalBlockEnd, lexStart) + lexicalBlockEnd.length;
     assert.ok(lexStart > 0 && lexEnd > lexStart, "lexical terminal definitions block must exist in the pinned spec");
     const specWithoutLexical = specTextForLexical.slice(0, lexStart) + specTextForLexical.slice(lexEnd);
-    const noLexicalManifest = deriveFormalExpressionObligationManifest(specWithoutLexical, false);
-    assert.equal(noLexicalManifest.externalReferenceBindings.find((entry: any) => entry.reference === "ident")?.status, "UNPROVEN");
-    const unboundExternalCoverage = structuredClone(coverage);
-    unboundExternalCoverage.entries.find((entry: any) => entry.formalObligationIds.length === 0).formalObligationIds = ["ebnf.external.ident.definition"];
-    const unboundExternalResult = evaluateFormalExpressionObligationCoverage(noLexicalManifest, unboundExternalCoverage);
-    assert.equal(unboundExternalResult.status, "UNPROVEN");
-    assert.ok(unboundExternalResult.unboundFormalObligationIds.includes("ebnf.external.ident.definition"));
-    assert.ok(unboundExternalResult.missingObligationIds.includes("ebnf.external.ident.definition"));
+    assert.throws(
+      () => deriveFormalExpressionObligationManifest(specWithoutLexical),
+      /formal lexical terminal definitions anchors must each occur exactly once/,
+    );
     const exclusionBlockStart = "#### 1.3.5 spaceCall 的 strict-profile 排除\n";
     const exclusionBlockEnd = "- 本排除与 `factor ::= spaceCall | postfix | whenExpr | ifExpr | caseExpr` 的 EBNF 并存：EBNF 描述全量语法空间，生产剖面按本条收窄，二者不构成矛盾。\n";
     const specTextForExclusion = formalSpecRaw.toString("utf8");
@@ -2562,10 +2785,10 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const exEnd = specTextForExclusion.indexOf(exclusionBlockEnd, exStart) + exclusionBlockEnd.length;
     const specWithoutExclusion = specTextForExclusion.slice(0, exStart) + specTextForExclusion.slice(exEnd);
     assert.ok(exStart > 0 && exEnd > exStart, "spaceCall exclusion block must exist in the pinned spec");
-    const noExclusionManifest = deriveFormalExpressionObligationManifest(specWithoutExclusion, false);
+    const noExclusionManifest = deriveFormalExpressionObligationManifest(specWithoutExclusion);
     assert.equal(noExclusionManifest.formalProfileContradictions.length, 1);
     assert.equal(noExclusionManifest.formalProfileContradictions[0].feature, "spaceCall");
-    const tamperedExclusionManifest = deriveFormalExpressionObligationManifest(specTextForExclusion.replace("space_call_removed", "space_call_warned"), false);
+    const tamperedExclusionManifest = deriveFormalExpressionObligationManifest(specTextForExclusion.replace("space_call_removed", "space_call_warned"));
     assert.equal(tamperedExclusionManifest.formalProfileContradictions.length, 1);
     const factorGrammar = `factor         ::= spaceCall
                   | postfix
@@ -2575,7 +2798,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const mutatedBranchText = formalSpecRaw.toString("utf8").replace(factorGrammar, `${factorGrammar.slice(0, -1)}
                   | "futureFactor" ;`);
     assert.notEqual(mutatedBranchText, formalSpecRaw.toString("utf8"));
-    const mutatedObligationManifest = deriveFormalExpressionObligationManifest(mutatedBranchText, false);
+    const mutatedObligationManifest = deriveFormalExpressionObligationManifest(mutatedBranchText);
     const futureObligation = mutatedObligationManifest.obligations.find((entry: any) => entry.kind === "choice" && entry.fragment === '"futureFactor"');
     assert.ok(futureObligation);
     assert.ok(!obligationManifest.obligations.some((entry: any) => entry.obligation_id === futureObligation.obligation_id));
@@ -2589,7 +2812,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
                   | ( "right" [ "b" ] ) ;`;
     const guardedGrammarText = formalSpecRaw.toString("utf8").replace(factorGrammar, guardedFactorGrammar);
     assert.notEqual(guardedGrammarText, formalSpecRaw.toString("utf8"));
-    const guardedManifest = deriveFormalExpressionObligationManifest(guardedGrammarText, false);
+    const guardedManifest = deriveFormalExpressionObligationManifest(guardedGrammarText);
     const guardedInteractions = guardedManifest.obligations.filter((entry: any) => entry.production === "factor" && entry.kind === "structural_interaction");
     const leftChoice = guardedManifest.obligations.find((entry: any) => entry.production === "factor" && entry.kind === "choice" && entry.fragment.includes('"left"'));
     const rightChoice = guardedManifest.obligations.find((entry: any) => entry.production === "factor" && entry.kind === "choice" && entry.fragment.includes('"right"'));
@@ -2606,7 +2829,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const grammarOffset = mutatedFormalSpec.indexOf(Buffer.from('logicalOr      ::= logicalAnd { "||" logicalAnd } ;'));
     assert.ok(grammarOffset >= 0);
     mutatedFormalSpec[grammarOffset] ^= 1;
-    assert.equal(validateTypedExprFormalSpecBinding(mutatedFormalSpec).status, "UNPROVEN");
+    assert.equal(bindFormal(mutatedFormalSpec).status, "UNPROVEN");
     for (const exactText of [
       'boolLiteral    ::= "true" | "false" ;',
       "| 77  | `<< >>` | 移位 |",
@@ -2616,7 +2839,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
       const offset = supplementalMutation.indexOf(Buffer.from(exactText));
       assert.ok(offset >= 0, exactText);
       supplementalMutation[offset] ^= 1;
-      assert.equal(validateTypedExprFormalSpecBinding(supplementalMutation).status, "UNPROVEN");
+      assert.equal(bindFormal(supplementalMutation).status, "UNPROVEN");
     }
     const pinnedSource = join(scratch, "pin-source-manifest");
     const pinnedMemory = join(scratch, "pin-memory-manifest");
@@ -2633,6 +2856,11 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     assert.ok(pinnedBefore.byLabel.has("fusion/src/cheng_regalloc_preflight_m9022.ts"));
     assert.ok(pinnedBefore.byLabel.has("fusion/src/cheng_fusion_tool_registry.ts"));
     assert.ok(pinnedBefore.byLabel.has("fusion/src/cheng_fusion_mcp_server_m9009.ts"));
+    assert.ok(
+      pinnedBefore.byLabel.has(
+        "fusion/fixtures/semantic/ebnf_parser_node_map.json",
+      ),
+    );
     for (const path of aarch64F64GatePaths) assert.ok(pinnedBefore.byLabel.has(path), path);
     for (const path of x86_64F64GatePaths) assert.ok(pinnedBefore.byLabel.has(path), path);
     for (const authorityFile of AUTHORITY_FILES) assert.ok(pinnedBefore.byLabel.has(authorityFile), authorityFile);
@@ -2687,8 +2915,8 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const backendEpochManifestPath = join(backendEpochRoot, "tools/backend2_version_manifest.rec");
     const backendEpochSourcesSha256 = hash("semantic-backend2-source-closure");
     const backendEpochManifestRaw = Buffer.from([
-      "schema=backend2_version_manifest.v2", "version=backend2-slice7",
-      `sources_sha256=${backendEpochSourcesSha256}`, "framing=backend2_codegen_semantic_closure.framed.v3",
+      "schema=backend2_version_manifest", "version=backend2-slice7",
+      `sources_sha256=${backendEpochSourcesSha256}`, "framing=backend2_codegen_semantic_closure.framed",
       `source_count=${backendEpochSources.length}`,
       ...backendEpochSources.map((path, index) => `source_${String(index).padStart(4, "0")}=${path}`),
     ].map((line) => `${line}\n`).join(""), "utf8");
@@ -2698,9 +2926,9 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
       stat: lstatSync(backendEpochManifestPath, {bigint: true}),
     });
     const backendEpochSentinelRaw = Buffer.from([
-      "schema=backend2_version_sentinel.v3", "status=PASS", "rc=0", "version=backend2-slice7",
+      "schema=backend2_version_sentinel", "status=PASS", "rc=0", "version=backend2-slice7",
       `sources_sha256=${backendEpochSourcesSha256}`, `manifest_sha256=${hash(backendEpochManifestRaw)}`,
-      "framing=backend2_codegen_semantic_closure.framed.v3", `source_count=${backendEpochSources.length}`,
+      "framing=backend2_codegen_semantic_closure.framed", `source_count=${backendEpochSources.length}`,
       ...backendEpochSources.map((path, index) => `source_${String(index).padStart(4, "0")}=${path}`),
     ].map((line) => `${line}\n`).join(""), "utf8");
     assert.equal(validateBackend2VersionSentinelReport({raw: backendEpochSentinelRaw}, backendEpochManifest).status, "PASS");
@@ -2753,7 +2981,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const buildCompileBootstrapStage = "stage3";
     const buildCompileProviders = ["cheng/runtime/core_runtime", "cheng/runtime/provider_root"];
     const buildCompileReceiptCid = hash(Buffer.concat([
-      framedOutputReceiptText("cheng.compiler.compile_receipt.v2"), Buffer.from(buildCompileWorldHeadCid, "hex"),
+      framedOutputReceiptText("cheng.compiler.compile_receipt"), Buffer.from(buildCompileWorldHeadCid, "hex"),
       Buffer.from(buildSourceBundleCid, "hex"), buildU32(3), Buffer.from(hash(readFileSync(buildEntry)), "hex"),
       framedOutputReceiptText("unelaborated"), Buffer.from(buildCompilerCsgCid, "hex"),
       Buffer.from(buildCanonicalCompilerCsgCid, "hex"), framedOutputReceiptText("arm64-apple-darwin"),
@@ -2762,7 +2990,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
       ...buildCompileProviders.map((provider) => framedOutputReceiptText(provider)),
     ]));
     const buildCompilerOutputReceiptCid = hash(Buffer.concat([
-      framedOutputReceiptText("cheng.compiler.output_receipt.v1"), Buffer.from(buildCompileReceiptCid, "hex"),
+      framedOutputReceiptText("cheng.compiler.output_receipt"), Buffer.from(buildCompileReceiptCid, "hex"),
       Buffer.from(buildOutputSha256, "hex"), Buffer.from(buildBackend2Sha256, "hex"),
       framedOutputReceiptText("arm64-apple-darwin"), framedOutputReceiptText("unelaborated"),
       framedOutputReceiptText("full_backend_codegen=1"), framedOutputReceiptText("cold_system_link_exec=0"),
@@ -2772,7 +3000,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const compilerReport = (fullBackend = "1") => Buffer.from([
       `entry=${buildEntry}`, "entry_mode=unelaborated", `entry_source_cid=${hash(readFileSync(buildEntry))}`,
       "source_snapshot_count=3", `source_bundle_cid=${buildSourceBundleCid}`, `source_manifest_sha256=${buildSourceBundleCid}`,
-      "compile_receipt_version=2", `compile_receipt_world_head_cid=${buildCompileWorldHeadCid}`,
+      `compile_receipt_world_head_cid=${buildCompileWorldHeadCid}`,
       `compile_receipt_source_bundle_cid=${buildSourceBundleCid}`, "compile_receipt_source_snapshot_count=3",
       `compile_receipt_entry_source_cid=${hash(readFileSync(buildEntry))}`, "compile_receipt_entry_mode=unelaborated",
       `compile_receipt_compiler_csg_cid=${buildCompilerCsgCid}`,
@@ -2781,7 +3009,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
       `compile_receipt_canonical_output_digest=${buildCanonicalCompileOutputDigest}`,
       `compile_receipt_bootstrap_stage=${buildCompileBootstrapStage}`, `compile_receipt_runtime_provider_count=${buildCompileProviders.length}`,
       ...buildCompileProviders.map((provider, index) => `compile_receipt_runtime_provider.${index}=${provider}`),
-      `compile_receipt_cid=${buildCompileReceiptCid}`, "compiler_output_receipt_version=1",
+      `compile_receipt_cid=${buildCompileReceiptCid}`,
       `compiler_output_receipt_cid=${buildCompilerOutputReceiptCid}`, "target=arm64-apple-darwin", "emit=exe",
       `output=${buildCandidate}`, `output_sha256=${buildOutputSha256}`, `backend2_version_manifest_sha256=${buildBackend2Sha256}`,
       "system_link_exec_runtime_execute=1", "system_link_exec=1", "real_backend_codegen=1", `full_backend_codegen=${fullBackend}`,
@@ -2799,7 +3027,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const buildReceiptPath = join(buildDirectory, "cheng.compiler-main.build-receipt.txt");
     const writeBuildReceipt = (overrides: Record<string, string> = {}) => {
       const fields: Array<[string, string | number]> = [
-        ["schema", "current_source_compiler_build_receipt.v3"], ["status", "complete"], ["entry_path", buildEntry],
+        ["schema", "current_source_compiler_build_receipt"], ["status", "complete"], ["entry_path", buildEntry],
         ["entry_mode", "unelaborated"], ["entry_source_sha256", hash(readFileSync(buildEntry))], ["source_snapshot_count", 3],
         ["source_bundle_cid", buildSourceBundleCid], ["compiler_source_manifest_sha256", buildSourceBundleCid],
         ["workspace_source_manifest_sha256", hash(sourceHashesRaw)], ["target", "arm64-apple-darwin"],
@@ -2807,8 +3035,8 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
         ["backend2_version_manifest_path", buildBackend2Manifest], ["backend2_version_manifest_sha256", buildBackend2Sha256],
         ["output_path", buildCandidate], ["output_sha256", buildOutputSha256], ["output_bytes", readFileSync(buildCandidate).length],
         ["compiler_report_path", buildReportPath], ["compiler_report_sha256", hash(readFileSync(buildReportPath))],
-        ["compile_receipt_version", 2], ["compile_receipt_cid", buildCompileReceiptCid],
-        ["compiler_output_receipt_version", 1], ["compiler_output_receipt_cid", buildCompilerOutputReceiptCid], ["full_backend_codegen", 1],
+        ["compile_receipt_cid", buildCompileReceiptCid],
+        ["compiler_output_receipt_cid", buildCompilerOutputReceiptCid], ["full_backend_codegen", 1],
         ["cold_system_link_exec", 0], ["system_link_exec_scope", "selfhost_direct"], ["memory_guard_mode", "process_tree"],
         ["memory_limit_bytes", 1073741824], ["process_tree_enforced_peak_bytes", 1000],
       ].map(([key, value]) => [key, overrides[key] ?? value]);
@@ -2834,7 +3062,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
       `compile_receipt_output_digest=${hash("forged-compile-output-digest")}`,
     ), "utf8"));
     writeBuildReceipt();
-    assert.throws(() => validateOfficialDriverBuildReceipt(buildRoot, pin(buildReceiptPath), pin(buildOfficial), backendEpoch), /compile receipt v2 CID/);
+    assert.throws(() => validateOfficialDriverBuildReceipt(buildRoot, pin(buildReceiptPath), pin(buildOfficial), backendEpoch), /compile receipt CID/);
     writeFileSync(buildReportPath, compilerReport());
     writeBuildReceipt();
     writeFileSync(buildGuardPath, buildGuard("536870912"));
@@ -2848,7 +3076,11 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     writeFileSync(buildOfficial, "#!/bin/bash\nexit 0\n# drift\n"); chmodSync(buildOfficial, 0o755);
     assert.throws(() => validateOfficialDriverBuildReceipt(buildRoot, pin(buildReceiptPath), pin(buildOfficial), backendEpoch), /official driver bytes/);
 
-    console.log("[C] retained production v5/guard-v4/v6-v3-v4 evidence is independently bound");
+    })();
+    if (process.env.CHENG_ITEM22_FOCUSED_MEMORY_CONTRACT === "1") return;
+
+    console.log("[C] retained production evidence is independently bound");
+    console.log("[C.1] production evidence fixtures");
     assert.throws(() => validateReleaseEvidenceFieldPresence({}), /releaseWorkRoot is required/);
     assert.throws(() => validateReleaseEvidenceFieldPresence({releaseWorkRoot: scratch}), /officialManifest and officialManifestSha256 are required/);
     const dependencyPaths = [
@@ -2859,6 +3091,38 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     ];
     const dependencyBundle = validateProductionGateDependencyBundle(new Map(dependencyPaths.map((path) => [path, readFileSync(join(CHENG_ROOT, path))])));
     assert.equal(dependencyBundle.files.length, 4);
+    const canonicalRegallocLabelSurfaces = [
+      ["production gate", join(CHENG_ROOT, "tools/regalloc_production_gate.sh")],
+      ["production gate contract", join(CHENG_ROOT, "docs/regalloc-production-gate.md")],
+      ["production evidence contract", join(CHENG_ROOT, "docs/regalloc-production-evidence.md")],
+      ["Fusion regalloc preflight", join(PROJECT, "src/cheng_regalloc_preflight_m9022.ts")],
+    ];
+    for (const [label, path] of canonicalRegallocLabelSurfaces) {
+      assert.equal(
+        validateCanonicalRegallocEvidenceLabels(readFileSync(path), label)
+          .legacyLabelCount,
+        0,
+      );
+    }
+    for (const legacyLabel of [
+      "workload current v6 receipt",
+      "workload current v3 snapshot identity/count contract mismatch",
+      "workload current v4 ledger identity/count contract mismatch",
+      "production gate v5 report",
+      "guarded_production_compile_and_v6_frozen_fragment_machine_bound_receipt_required",
+      "workload current receipt/object/v3/v4 evidence",
+      "production_v6_v3_v4_artifacts",
+      "schema=regalloc_action_emission_ledger.v4",
+    ]) {
+      assert.throws(
+        () => validateCanonicalRegallocEvidenceLabels(
+          Buffer.from(`canonical\n${legacyLabel}\n`, "utf8"),
+          "legacy-label mutation",
+        ),
+        /retained legacy regalloc evidence labels/,
+        legacyLabel,
+      );
+    }
     const mutatedDependencies = new Map(dependencyPaths.map((path) => [path, readFileSync(join(CHENG_ROOT, path))]));
     mutatedDependencies.set("tools/regalloc_production_gate.sh", Buffer.from("mutated\n", "utf8"));
     assert.throws(() => validateProductionGateDependencyBundle(mutatedDependencies), /exact source hash mismatch/);
@@ -2881,8 +3145,8 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
       ["guard-scope", {badGuardScope: true}, /memory_guard_scope mismatch/],
       ["guard-peak", {badGuardPeak: true}, /RSS does not bind|peak contract mismatch/],
       ["receipt-schema", {badReceiptSchema: true}, /regalloc_receipt_schema mismatch/],
-      ["snapshot-schema", {badSnapshotSchema: true}, /v3 snapshot identity\/count contract mismatch/],
-      ["ledger-object", {badLedgerObject: true}, /v4 ledger identity\/count contract mismatch/],
+      ["snapshot-schema", {badSnapshotSchema: true}, /frozen plan snapshot identity\/count contract mismatch/],
+      ["ledger-object", {badLedgerObject: true}, /action emission ledger identity\/count contract mismatch/],
       ["metrics-schema", {badMetricsSchema: true}, /metrics identity\/schema mismatch/],
       ["source-drift", {badSourceDrift: true}, /source or role-to-compiler identity drift/],
       ["object-nondeterminism", {badObjectDeterminism: true}, /object bytes are nondeterministic/],
@@ -2912,6 +3176,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     writeFileSync(join(extraGuard.workDir, "unexpected.guard.txt"), productionGuard("unexpected", extraStdout, extraStderr));
     assert.throws(() => validateProductionGateEvidence(extraGuard.workDir, extraGuard.report.path, extraGuard.report.sha256, extraGuard.stdout, extraGuard.expected), /guard sets differ/);
 
+    console.log("[C.2] release claims and final artifact manifests");
     const claimDigest = hash("release-input-contract");
     const cleanClaimRoot = join(scratch, "claim-clean");
     mkdirSync(cleanClaimRoot);
@@ -2996,6 +3261,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     assert.throws(() => validateFinalReleaseArtifactManifest(finalBinding.root, finalBinding.evidence.manifestPath, finalBinding.evidence.manifestSha256, {...finalBindings, allocator_sha256: hash("wrong-binding")}), /binding mismatch/);
     assert.throws(() => validateFinalReleaseArtifactManifest(finalBinding.root, finalBinding.evidence.manifestPath, finalBinding.evidence.manifestSha256, {...finalBindings, unexpected_sha256: hash("unexpected-binding")}), /exact key set mismatch/);
 
+    console.log("[C.3] private toolchain and one-shot worker");
     const toolchainRoot = join(scratch, "private-actual-toolchain");
     mkdirSync(toolchainRoot);
     const toolchainDriver = join(scratch, "private-toolchain-driver");
@@ -3047,15 +3313,19 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const oneShotReleaseRoot = join(scratch, "one-shot-release-root");
     mkdirSync(oneShotReleaseRoot);
     const oneShotSmoke = await executePreflight({mode: "release", treeRoot: CHENG_ROOT, coldDriver: STAGE3, sourceManifest: oneShotManifestPath, releaseWorkRoot: oneShotReleaseRoot});
-    assert.equal(oneShotSmoke.verdict, "RED");
+    assert.equal(
+      oneShotSmoke.verdict,
+      "RED",
+      JSON.stringify(oneShotSmoke.checks.filter((entry: any) => entry.status === "CFAIL" || entry.status === "RED")),
+    );
     const oneShotSmokeCheck = oneShotSmoke.checks.find((entry: any) => entry.id === "release_one_shot_worker");
     assert.equal(oneShotSmokeCheck?.status, "GREEN", JSON.stringify(oneShotSmokeCheck));
     assert.equal(oneShotSmokeCheck?.loadedModuleUrl.startsWith("file://"), true);
-    assert.equal(oneShotSmokeCheck?.bundleBuild?.schema, "cheng_regalloc_one_shot_bundle_build_evidence.v1");
+    assert.equal(oneShotSmokeCheck?.bundleBuild?.schema, "cheng_regalloc_one_shot_bundle_build_evidence");
     assert.ok(BigInt(oneShotSmokeCheck?.bundleBuild?.peakBytes || 0) <= 1073741824n);
     assert.ok(BigInt(oneShotSmokeCheck?.outerGuard?.peakBytes || 0) <= 1073741824n);
     assert.equal(oneShotSmoke.checks.find((entry: any) => entry.id === "release_evidence_inputs")?.status, "RED");
-    assertTrue(true, "production success evidence passes; exec bundle, ordered 185 statuses, performance, report, lock, guard, receipt, v3/v4 and complete-set mutations fail closed");
+    assertTrue(true, "production success evidence passes; exec bundle, ordered 185 statuses, performance, report, lock, guard, receipt, frozen-plan/action-ledger and complete-set mutations fail closed");
 
     console.log("[D] raw fixed point has no masking");
     assertTrue(existsSync(STAGE3), `real stage3 exists: ${STAGE3}`);
@@ -3077,7 +3347,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     console.log("[E] missing release artifact manifest and non-1GiB cap stop before every heavy child");
     const fake = join(scratch, "must-not-run.sh");
     const sentinel = join(scratch, "spawned");
-    writeFileSync(fake, `#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s' "$CHENG_STRICT_CALL_SYNTAX" "$CHENG_TYPED_EXPR_V2" "$BACKEND_JOBS" "$BACKEND_INCREMENTAL" "$CHENG_DISABLE_PRIMARY_OBJECT_CACHE" "$CHENG_PROCESS_MAX_RSS_BYTES" > ${JSON.stringify(sentinel)}\ni=0\nwhile [ "$i" -lt 200 ]; do\n  printf 0123456789abcdef0123456789abcdef\n  i=$((i + 1))\ndone\nexit 99\n`);
+    writeFileSync(fake, `#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s' "$CHENG_STRICT_CALL_SYNTAX" "$CHENG_TYPED_EXPR_LEGACY" "$BACKEND_JOBS" "$BACKEND_INCREMENTAL" "$CHENG_DISABLE_PRIMARY_OBJECT_CACHE" "$CHENG_PROCESS_MAX_RSS_BYTES" > ${JSON.stringify(sentinel)}\ni=0\nwhile [ "$i" -lt 200 ]; do\n  printf 0123456789abcdef0123456789abcdef\n  i=$((i + 1))\ndone\nexit 99\n`);
     chmodSync(fake, 0o755);
     const release = await executePreflight({mode: "release", treeRoot: CHENG_ROOT, coldDriver: fake});
     assert.equal(release.verdict, "RED");
@@ -3102,7 +3372,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const releaseCliText = `${releaseCli.stdout}\n${releaseCli.stderr}`;
     assert.match(releaseCliText, /artifact_source_manifest/);
     assert.equal(existsSync(sentinel), false);
-    const poisonedEnv = {...process.env, CHENG_STRICT_CALL_SYNTAX: "0", CHENG_TYPED_EXPR_V2: "fast", BACKEND_JOBS: "19", BACKEND_INCREMENTAL: "1", CHENG_DISABLE_PRIMARY_OBJECT_CACHE: "0", CHENG_FUSION_RSS_CAP: "2147483648", CHENG_FUSION_TIMEOUT_MS: "1"};
+    const poisonedEnv = {...process.env, CHENG_STRICT_CALL_SYNTAX: "0", CHENG_TYPED_EXPR_LEGACY: "fast", BACKEND_JOBS: "19", BACKEND_INCREMENTAL: "1", CHENG_DISABLE_PRIMARY_OBJECT_CACHE: "0", CHENG_FUSION_RSS_CAP: "2147483648", CHENG_FUSION_TIMEOUT_MS: "1"};
     const sourceCli = spawnSync(process.execPath, [CLI, "run", "cheng_regalloc_preflight", "--input", JSON.stringify({mode: "source", treeRoot: CHENG_ROOT, coldDriver: fake, timeoutSec: 30, maxOutputBytes: 1024})], {cwd: PROJECT, env: poisonedEnv, encoding: "utf8", maxBuffer: 8 * 1024 * 1024});
     assert.notEqual(sourceCli.status, 0);
     const sourceCliText = `${sourceCli.stdout}\n${sourceCli.stderr}`;
@@ -3132,7 +3402,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     const liveInputsAfter = snapshotSourceInputs(CHENG_ROOT);
     const liveDriverAfterSha256 = hash(readFileSync(OFFICIAL_DRIVER));
 
-    assert.equal(source.schema, "cheng_regalloc_preflight.v1");
+    assert.equal(source.schema, "cheng_regalloc_preflight");
     assert.equal(source.mode, "source");
     assert.equal(source.release_ready, 0);
     assert.equal(source.check_count, source.checks.length);
@@ -3320,7 +3590,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     assert.equal(typedExpr.cases.find((entry: any) => entry.id === "shared_cross_module_return_binding")?.status, "GREEN");
     const qualifiedNestedCall = typedExpr.cases.find((entry: any) => entry.id === "qualified_nested_call_canonical_declaration");
     assert.equal(qualifiedNestedCall?.status, "GREEN", qualifiedNestedCall?.reason);
-    assert.equal(qualifiedNestedCall?.declarationWitnessId, "qualified_nested_call.std_monotimes.v1");
+    assert.equal(qualifiedNestedCall?.declarationWitnessId, "qualified_nested_call.std_monotimes");
     console.log(`  live source verdict=${source.verdict} red_checks=${source.checks.filter((entry: any) => entry.status === "RED").length} typedexpr_gaps=${failedTypedExprCases.length}`);
     assertTrue(true, "live gaps may only decrease after real fixes; every case still executes, every RED is structured, and any identity drift is CFAIL");
   } finally {

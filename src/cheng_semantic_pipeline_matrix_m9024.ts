@@ -18,12 +18,12 @@ import {
   type SemanticTypeName,
 } from "./cheng_semantic_matrix_m9023.ts";
 
-export const CHENG_SEMANTIC_PIPELINE_MATRIX_SCHEMA = "cheng_semantic_pipeline_matrix.v1";
-export const CHENG_SOURCE_BUNDLE_SCHEMA = "cheng_semantic_source_bundle.v1";
-export const CHENG_GRAMMAR_OBLIGATION_SCHEMA = "cheng_formal_grammar_obligations.v1";
-export const CHENG_GRAMMAR_PARSER_SPAN_RECEIPT_SCHEMA = "cheng_parser_obligation_span_receipt.v1";
-export const CHENG_GRAMMAR_SOURCE_COVERAGE_SCHEMA = "cheng_grammar_source_coverage_receipt.v2";
-export const CHENG_SEMANTIC_PIPELINE_RUNNER_KIND = "cheng-real-source-bound-seven-stage-pipeline.v1";
+export const CHENG_SEMANTIC_PIPELINE_MATRIX_SCHEMA = "cheng_semantic_pipeline_matrix";
+export const CHENG_SOURCE_BUNDLE_SCHEMA = "cheng_semantic_source_bundle";
+export const CHENG_GRAMMAR_OBLIGATION_SCHEMA = "cheng_formal_grammar_obligations";
+export const CHENG_GRAMMAR_PARSER_SPAN_RECEIPT_SCHEMA = "cheng_parser_obligation_span_receipt";
+export const CHENG_GRAMMAR_SOURCE_COVERAGE_SCHEMA = "cheng_grammar_source_coverage_receipt";
+export const CHENG_SEMANTIC_PIPELINE_RUNNER_KIND = "cheng-real-source-bound-seven-stage-pipeline";
 
 function deepFreeze<T>(value: T): Readonly<T> {
   if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
@@ -245,7 +245,7 @@ function obligation(
 ): ChengGrammarObligation {
   const identity = {schema: CHENG_GRAMMAR_OBLIGATION_SCHEMA, production, kind, structuralPath, variant, fragmentSha256, disposition, reasonCode, bound};
   return deepFreeze({
-    obligationId: `grammar.v1.${hashCanonical(identity)}`,
+    obligationId: `grammar.${hashCanonical(identity)}`,
     production,
     kind,
     structuralPath,
@@ -393,10 +393,14 @@ export function buildChengGrammarObligationContract(formalSpecSource: string | B
 export function validateChengGrammarObligationContract(
   formalSpecSource: string | Buffer,
   contract: ChengGrammarObligationContract,
-): Readonly<{obligationCount: number; obligationRootSha256: string}> {
+): Readonly<{obligationCount: number; requiredCount: number; obligationRootSha256: string}> {
   const expected = buildChengGrammarObligationContract(formalSpecSource);
   if (canonicalJson(expected) !== canonicalJson(contract)) throw new Error("formal grammar obligation contract mismatch");
-  return deepFreeze({obligationCount: contract.obligations.length, obligationRootSha256: contract.obligationRootSha256});
+  return deepFreeze({
+    obligationCount: contract.obligations.length,
+    requiredCount: contract.requiredCount,
+    obligationRootSha256: contract.obligationRootSha256,
+  });
 }
 
 function assertGrammarContractSelfConsistent(contract: ChengGrammarObligationContract): void {
@@ -451,7 +455,7 @@ const PROFILE_CONSTRAINT_CODES = Object.freeze([
 export type PipelineProfileConstraintCode = (typeof PROFILE_CONSTRAINT_CODES)[number];
 
 export interface PipelineProfileClassification {
-  readonly schema: "cheng_pipeline_profile_classification.v1";
+  readonly schema: "cheng_pipeline_profile_classification";
   readonly legal: boolean;
   readonly violations: readonly PipelineProfileConstraintCode[];
 }
@@ -534,7 +538,7 @@ function classificationFromMask(mask: number): PipelineProfileClassification {
     if (code === undefined) throw new Error("pipeline profile constraint escaped schema bounds");
     if ((mask & (1 << index)) !== 0) violations.push(code);
   }
-  return deepFreeze({schema: "cheng_pipeline_profile_classification.v1", legal: mask === 0, violations});
+  return deepFreeze({schema: "cheng_pipeline_profile_classification", legal: mask === 0, violations});
 }
 
 function orderedProfile(input: PipelineProfileDimensions): PipelineProfileDimensions {
@@ -784,7 +788,7 @@ function proofProjectionToken(
 }
 
 export interface PipelineProfileCase {
-  readonly schema: "cheng_pipeline_profile_case.v1";
+  readonly schema: "cheng_pipeline_profile_case";
   readonly profileCaseId: string;
   readonly baseCaseId: string;
   readonly baseSemanticSha256: string;
@@ -809,7 +813,7 @@ function profileCaseFromJoin(
     baseCaseId: baseCase.caseId,
     profile: orderedProfile(profile),
   };
-  const profileCaseId = `sempipe.v1.${hashCanonical(identity)}`;
+  const profileCaseId = `sempipe.${hashCanonical(identity)}`;
   const payload = {
     identity,
     baseSemanticSha256: baseCase.semanticSha256,
@@ -819,7 +823,7 @@ function profileCaseFromJoin(
     violationCodes: [...violations],
   };
   return deepFreeze({
-    schema: "cheng_pipeline_profile_case.v1",
+    schema: "cheng_pipeline_profile_case",
     profileCaseId,
     baseCaseId: baseCase.caseId,
     baseSemanticSha256: baseCase.semanticSha256,
@@ -833,7 +837,7 @@ function profileCaseFromJoin(
 }
 
 export interface PipelineCoverageContract {
-  readonly schema: "cheng_pipeline_coverage_contract.v1";
+  readonly schema: "cheng_pipeline_coverage_contract";
   readonly profileSchemaSha256: string;
   readonly baseLegalCount: number;
   readonly profileAssignmentCount: number;
@@ -1034,7 +1038,7 @@ function deriveCoverage(): CoverageDerivation {
   const higherTokens = generationSorted.filter((token) => token.startsWith("higher:"));
   const negativeTokens = PROFILE_CONSTRAINT_CODES.map((code) => `negative|${code}`).sort();
   const payload = {
-    schema: "cheng_pipeline_coverage_contract.v1" as const,
+    schema: "cheng_pipeline_coverage_contract" as const,
     profileSchemaSha256: CHENG_SEMANTIC_PIPELINE_PROFILE_SCHEMA_SHA256,
     baseLegalCount: bases.length,
     profileAssignmentCount: profiles.length,
@@ -1080,7 +1084,7 @@ function proofCoverageTokensForCase(testCase: PipelineProfileCase, base: Semanti
 }
 
 export interface PipelineCoverageReceipt {
-  readonly schema: "cheng_pipeline_coverage_receipt.v1";
+  readonly schema: "cheng_pipeline_coverage_receipt";
   readonly contractSha256: string;
   readonly caseCount: number;
   readonly acceptCount: number;
@@ -1114,7 +1118,7 @@ export function validatePipelineCoverage(cases: readonly PipelineProfileCase[]):
   const missing = required.filter((token) => !covered.has(token));
   if (missing.length > 0) throw new Error(`pipeline profile coverage incomplete: ${missing.length} obligations missing; first=${String(missing[0])}`);
   const payload = {
-    schema: "cheng_pipeline_coverage_receipt.v1" as const,
+    schema: "cheng_pipeline_coverage_receipt" as const,
     contractSha256: derivation.contract.contractSha256,
     caseCount: cases.length,
     acceptCount,
@@ -1125,9 +1129,9 @@ export function validatePipelineCoverage(cases: readonly PipelineProfileCase[]):
 }
 
 export interface PipelineMatrixManifest {
-  readonly schema: "cheng_pipeline_matrix_manifest.v1";
+  readonly schema: "cheng_pipeline_matrix_manifest";
   readonly seed: string;
-  readonly generator: "deterministic_first_obligation_witness_set_cover_non_minimal.v1";
+  readonly generator: "deterministic_first_obligation_witness_set_cover_non_minimal";
   readonly coverageContractSha256: string;
   readonly caseCount: number;
   readonly acceptCount: number;
@@ -1150,9 +1154,9 @@ function assertSeed(seed: string): void {
 
 function buildPipelineManifest(seed: string, cases: readonly PipelineProfileCase[], coverage: PipelineCoverageReceipt): PipelineMatrixManifest {
   const payload = {
-    schema: "cheng_pipeline_matrix_manifest.v1" as const,
+    schema: "cheng_pipeline_matrix_manifest" as const,
     seed,
-    generator: "deterministic_first_obligation_witness_set_cover_non_minimal.v1" as const,
+    generator: "deterministic_first_obligation_witness_set_cover_non_minimal" as const,
     coverageContractSha256: coverage.contractSha256,
     caseCount: cases.length,
     acceptCount: cases.filter((entry) => entry.expected === "accept").length,
@@ -1214,7 +1218,7 @@ export function baseCaseForPipelineCase(testCase: PipelineProfileCase): Semantic
 }
 
 export interface ChengPublicSurfaceLintReceipt {
-  readonly schema: "cheng_public_surface_lint.v1";
+  readonly schema: "cheng_public_surface_lint";
   readonly sourceSha256: string;
   readonly normalizedTokenSha256: string;
   readonly tokenCount: number;
@@ -1344,7 +1348,12 @@ export function lintChengPublicSource(source: string): ChengPublicSurfaceLintRec
     const token = tokens[index];
     const next = tokens[index + 1];
     if (token === undefined) continue;
-    if (FORBIDDEN_PUBLIC_IDENTIFIERS.has(token)) violations.add(`M9024_L01_FORBIDDEN_IDENTIFIER:${token}`);
+    const managedRefObject =
+      token === "ref" && next === "object";
+    if (FORBIDDEN_PUBLIC_IDENTIFIERS.has(token) &&
+        !managedRefObject) {
+      violations.add(`M9024_L01_FORBIDDEN_IDENTIFIER:${token}`);
+    }
     if (token === "@importc" || token === "@exportc") violations.add(`M9024_L02_PUBLIC_C_ABI_FORBIDDEN:${token}`);
     // `->` 唯一语法角色是指针成员访问(spec §0.2), 任何位置都属禁用指针操作;
     // `&`/`*` 仅在前缀(取址/解引用)或指针类型位置禁用, 二元中缀位置合法放行。
@@ -1357,7 +1366,7 @@ export function lintChengPublicSource(source: string): ChengPublicSurfaceLintRec
   }
   const normalized = tokens.join("\u001f");
   const payload = {
-    schema: "cheng_public_surface_lint.v1" as const,
+    schema: "cheng_public_surface_lint" as const,
     sourceSha256: sha256(source),
     normalizedTokenSha256: sha256(normalized),
     tokenCount: tokens.length,
@@ -1936,11 +1945,11 @@ export function buildPipelineProfileSourceBundle(
   const rendered = profileMainSource(baseCase, profileCase, grammar, env, moduleName, marker);
   const relativePath = `src/${moduleName}.cheng`;
   const templateIds: Readonly<Record<PipelineProfileAxisName, string>> = {
-    useSite: `use_site.${profileCase.profile.useSite}.v1`,
-    targetPlace: `target_place.${profileCase.profile.targetPlace}.v1`,
-    abiBoundary: `abi_boundary.${profileCase.profile.abiBoundary}.v1`,
-    lifetime: `lifetime.${profileCase.profile.lifetime}.v1`,
-    regallocPressure: `regalloc_pressure.${profileCase.profile.regallocPressure}.v1`,
+    useSite: `use_site.${profileCase.profile.useSite}`,
+    targetPlace: `target_place.${profileCase.profile.targetPlace}`,
+    abiBoundary: `abi_boundary.${profileCase.profile.abiBoundary}`,
+    lifetime: `lifetime.${profileCase.profile.lifetime}`,
+    regallocPressure: `regalloc_pressure.${profileCase.profile.regallocPressure}`,
   };
   const fragmentByAxis: Readonly<Record<PipelineProfileAxisName, string>> = {
     useSite: rendered.fragments.useSite,
@@ -1972,6 +1981,90 @@ export function validatePipelineProfileSourceBundle(
   return deepFreeze({sourceRootSha256: bundle.sourceRootSha256, sourceWitnessRootSha256: bundle.sourceWitnessRootSha256, bundleSha256: bundle.bundleSha256});
 }
 
+export interface GrammarParserCanonicalToken {
+  readonly index: number;
+  readonly kind: number;
+  readonly kindText: string;
+  readonly sourceTextId: number;
+  readonly startByte: number;
+  readonly endByte: number;
+}
+
+export function grammarParserCanonicalTokenSpanSha256(
+  source: string,
+  spanStartByte: number,
+  spanEndByte: number,
+  tokens: readonly GrammarParserCanonicalToken[],
+): string {
+  const sourceBytes = Buffer.from(source, "utf8");
+  if (!Number.isInteger(spanStartByte) ||
+      !Number.isInteger(spanEndByte) ||
+      spanStartByte < 0 ||
+      spanEndByte <= spanStartByte ||
+      spanEndByte > sourceBytes.length ||
+      tokens.length === 0) {
+    throw new Error("grammar parser canonical token span invalid");
+  }
+  const canonicalRows: Array<GrammarParserCanonicalToken & {
+    readonly rawBytesBase64: string;
+  }> = [];
+  let previousIndex = -1;
+  let previousEnd = -1;
+  for (const token of tokens) {
+    if (canonicalJson(Object.keys(token).sort()) !== canonicalJson([
+      "endByte",
+      "index",
+      "kind",
+      "kindText",
+      "sourceTextId",
+      "startByte",
+    ]) ||
+        !Number.isInteger(token.index) ||
+        token.index < 0 ||
+        (previousIndex >= 0 && token.index !== previousIndex + 1) ||
+        !Number.isInteger(token.kind) ||
+        token.kind <= 0 ||
+        !/^ParserValueToken[A-Za-z0-9_]+$/.test(token.kindText) ||
+        token.sourceTextId !== 0 ||
+        !Number.isInteger(token.startByte) ||
+        !Number.isInteger(token.endByte) ||
+        token.startByte < spanStartByte ||
+        token.endByte <= token.startByte ||
+        token.endByte > spanEndByte ||
+        (previousEnd >= 0 && token.startByte < previousEnd)) {
+      throw new Error("grammar parser canonical token row invalid");
+    }
+    const rawBytes = sourceBytes.subarray(token.startByte, token.endByte);
+    const rawText = rawBytes.toString("utf8");
+    if ((rawText.startsWith('"') &&
+         token.kindText !== "ParserValueTokenString") ||
+        (rawText.startsWith("'") &&
+         token.kindText !== "ParserValueTokenChar") ||
+        (rawText.startsWith('Fmt"') &&
+         token.kindText !== "ParserValueTokenFmtString")) {
+      throw new Error("grammar parser literal token kind invalid");
+    }
+    canonicalRows.push({
+      ...token,
+      rawBytesBase64: rawBytes.toString("base64"),
+    });
+    previousIndex = token.index;
+    previousEnd = token.endByte;
+  }
+  if (tokens[0]!.startByte !== spanStartByte ||
+      tokens[tokens.length - 1]!.endByte !== spanEndByte) {
+    throw new Error("grammar parser canonical token boundary mismatch");
+  }
+  return sha256(canonicalJson({
+    spanStartByte,
+    spanEndByte,
+    rawSpanBase64: sourceBytes
+      .subarray(spanStartByte, spanEndByte)
+      .toString("base64"),
+    tokens: canonicalRows,
+  }));
+}
+
 export interface GrammarParserSpanReceipt {
   readonly schema: typeof CHENG_GRAMMAR_PARSER_SPAN_RECEIPT_SCHEMA;
   readonly stage: "parser";
@@ -1985,6 +2078,9 @@ export interface GrammarParserSpanReceipt {
   readonly sourceSha256: string;
   readonly tokenStart: number;
   readonly tokenEnd: number;
+  readonly spanStartByte: number;
+  readonly spanEndByte: number;
+  readonly canonicalTokens: readonly GrammarParserCanonicalToken[];
   readonly tokenSha256: string;
   readonly parserNodeKind: string;
   readonly parserNodeIdentitySha256: string;
@@ -2039,16 +2135,30 @@ export function buildGrammarSourceCoverageReceipt(
     }
     const source = sourceByPath.get(witness.relativePath);
     if (source === undefined || sha256(source) !== witness.sourceSha256) throw new Error(`grammar witness source bytes are missing or changed: ${witness.obligationId}`);
-    const sourceTokens = chengPublicTokens(source);
-    if (witness.tokenEnd > sourceTokens.length) throw new Error(`grammar witness token span escapes source: ${witness.obligationId}`);
-    const tokenSha256 = sha256(sourceTokens.slice(witness.tokenStart, witness.tokenEnd).join("\u001f"));
-    if (tokenSha256 !== witness.tokenSha256) throw new Error(`grammar witness token bytes changed: ${witness.obligationId}`);
-    const obligation = obligationById.get(witness.obligationId);
-    if (obligation === undefined) throw new Error(`grammar witness obligation escaped contract: ${witness.obligationId}`);
     const parserReceipt = witness.parserSpanReceipt;
     if (parserReceipt === undefined || parserReceipt === null) {
       throw new Error(`grammar parser span receipt missing: ${witness.obligationId}`);
     }
+    let tokenSha256: string;
+    try {
+      tokenSha256 = grammarParserCanonicalTokenSpanSha256(
+        source,
+        parserReceipt.spanStartByte,
+        parserReceipt.spanEndByte,
+        parserReceipt.canonicalTokens,
+      );
+    } catch {
+      throw new Error(`grammar witness canonical parser token span invalid: ${witness.obligationId}`);
+    }
+    if (parserReceipt.canonicalTokens[0]!.index !== witness.tokenStart ||
+        parserReceipt.canonicalTokens[
+          parserReceipt.canonicalTokens.length - 1
+        ]!.index + 1 !== witness.tokenEnd) {
+      throw new Error(`grammar witness token indexes changed: ${witness.obligationId}`);
+    }
+    if (tokenSha256 !== witness.tokenSha256) throw new Error(`grammar witness token bytes changed: ${witness.obligationId}`);
+    const obligation = obligationById.get(witness.obligationId);
+    if (obligation === undefined) throw new Error(`grammar witness obligation escaped contract: ${witness.obligationId}`);
     const {receiptSha256: parserReceiptSha256, ...parserReceiptIdentity} = parserReceipt;
     if (parserReceipt.schema !== CHENG_GRAMMAR_PARSER_SPAN_RECEIPT_SCHEMA ||
         parserReceipt.stage !== "parser" ||
@@ -2140,7 +2250,7 @@ export function mutateSourceBundle(bundle: ChengSemanticSourceBundle, mutation: 
     const file = mutated.sourceFiles[0];
     if (file === undefined) throw new Error("source mutation requires a source file");
     file.source = `${file.source}\nconst MutatedSourceBytes: str = "mutation"\n`;
-  } else if (mutation === "case_binding_swap") mutated.caseId = `sem.v1.${"0".repeat(64)}`;
+  } else if (mutation === "case_binding_swap") mutated.caseId = `sem.${"0".repeat(64)}`;
   else if (mutation === "materializer_binding_swap") mutated.materializerBytesSha256 = "0".repeat(64);
   else if (mutation === "grammar_root_swap") mutated.grammarObligationRootSha256 = "0".repeat(64);
   else {
@@ -2152,7 +2262,7 @@ export function mutateSourceBundle(bundle: ChengSemanticSourceBundle, mutation: 
 }
 
 export interface PipelineDeltaReduction {
-  readonly schema: "cheng_pipeline_delta_reduction.v1";
+  readonly schema: "cheng_pipeline_delta_reduction";
   readonly originalCaseIds: readonly string[];
   readonly reducedCaseIds: readonly string[];
   readonly predicateCalls: number;
@@ -2197,7 +2307,7 @@ export async function deltaReduceFailingPipelineCases(
   predicateCalls += 1;
   if (!(await failurePredicate(current))) throw new Error("pipeline delta reduction lost failure predicate");
   const payload = {
-    schema: "cheng_pipeline_delta_reduction.v1" as const,
+    schema: "cheng_pipeline_delta_reduction" as const,
     originalCaseIds: cases.map((entry) => entry.profileCaseId),
     reducedCaseIds: current.map((entry) => entry.profileCaseId),
     predicateCalls,
@@ -2208,11 +2318,22 @@ export async function deltaReduceFailingPipelineCases(
 }
 
 export const CHENG_REAL_PIPELINE_RECEIPT_PROTOCOL = deepFreeze({
-  schema: "cheng_real_source_bound_seven_stage_protocol.v1",
+  schema: "cheng_real_source_bound_seven_stage_protocol",
+  receiptSchema: "cheng.compiler.execution_stage_bundle",
   kind: CHENG_SEMANTIC_PIPELINE_RUNNER_KIND,
   implemented: false,
   requiredStages: ["typed_expr", "csg", "lowering", "primary", "primary_regalloc", "backend2", "backend2_regalloc"],
-  sourceBindings: ["case_id", "raw_source_files_sha256", "materializer_bytes_sha256", "grammar_obligation_root_sha256", "driver_bytes_sha256", "toolchain_manifest_sha256"],
+  sourceBindings: [
+    "case_id",
+    "source_bundle_raw32",
+    "materializer_bytes_raw32",
+    "grammar_obligation_root_raw32",
+    "compiler_source_closure_raw32",
+    "driver_bytes_raw32",
+    "toolchain_manifest_raw32",
+    "command_manifest_raw32",
+    "target_triple",
+  ],
   requiredObservedFacts: ["int32_node_decl_value_def_identity", "expr_class", "owner_type_layout_offsets", "body_ir_use_def_alias", "emission_bytes", "regalloc_plan_actions_fragments_ingress_roots"],
   requiredMutations: [
     "ownership_flip", "declaration_rebind", "layout_offset_change", "codec_cid_field_drop", "cache_stale_hit", "stage_drop",

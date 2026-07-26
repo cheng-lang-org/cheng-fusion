@@ -46,10 +46,10 @@ import os
 import re
 import sys
 
-SCHEMA_RECEIPT = "cheng-fusion-evidence-receipt/v1"
-SCHEMA_STAGES = "cheng-fusion-evidence-stages/v1"
-SCHEMA_MANIFEST = "cheng-fusion-evidence-manifest/v1"
-SCHEMA_INDEX = "cheng-fusion-evidence-index/v1"
+SCHEMA_RECEIPT = "cheng-fusion-evidence-receipt"
+SCHEMA_STAGES = "cheng-fusion-evidence-stages"
+SCHEMA_MANIFEST = "cheng-fusion-evidence-manifest"
+SCHEMA_INDEX = "cheng-fusion-evidence-index"
 
 VERDICT_SHAPE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
 

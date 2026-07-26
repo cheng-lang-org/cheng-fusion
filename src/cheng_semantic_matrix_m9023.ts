@@ -3,11 +3,11 @@
 // field offsets, or an executed-pipeline verdict.
 import {createHash} from "node:crypto";
 
-export const CHENG_SEMANTIC_MATRIX_SCHEMA = "cheng_semantic_matrix.v1";
-export const CHENG_SEMANTIC_MATRIX_MANIFEST_SCHEMA = "cheng_semantic_matrix_manifest.v1";
-export const CHENG_SEMANTIC_MATRIX_SHARD_SCHEMA = "cheng_semantic_matrix_shard.v1";
-export const CHENG_SEMANTIC_STAGE_LEDGER_SCHEMA = "cheng_semantic_stage_contract_ledger.v1";
-export const CHENG_SEMANTIC_PIPELINE_RUNNER_KIND = "cheng-real-structured-pipeline.v1";
+export const CHENG_SEMANTIC_MATRIX_SCHEMA = "cheng_semantic_matrix";
+export const CHENG_SEMANTIC_MATRIX_MANIFEST_SCHEMA = "cheng_semantic_matrix_manifest";
+export const CHENG_SEMANTIC_MATRIX_SHARD_SCHEMA = "cheng_semantic_matrix_shard";
+export const CHENG_SEMANTIC_STAGE_LEDGER_SCHEMA = "cheng_semantic_stage_contract_ledger";
+export const CHENG_SEMANTIC_PIPELINE_RUNNER_KIND = "cheng-real-structured-pipeline";
 
 const AXES = {
   type: [
@@ -111,13 +111,13 @@ const CRITICAL_FAMILIES: readonly CriticalFamily[] = deepFreeze([
 ] satisfies readonly CriticalFamily[]);
 
 export interface SemanticClassification {
-  readonly schema: "cheng_semantic_classification.v1";
+  readonly schema: "cheng_semantic_classification";
   readonly legal: boolean;
   readonly violations: readonly SemanticConstraintCode[];
 }
 
 export interface SemanticCase {
-  readonly schema: "cheng_semantic_case.v1";
+  readonly schema: "cheng_semantic_case";
   readonly caseId: string;
   readonly modelCaseOrdinal: number;
   readonly expected: SemanticExpectation;
@@ -127,14 +127,14 @@ export interface SemanticCase {
 }
 
 export interface SemanticUniverse {
-  readonly schema: "cheng_semantic_universe.v1";
+  readonly schema: "cheng_semantic_universe";
   readonly assignmentCount: number;
   readonly legalCases: readonly SemanticCase[];
   readonly negativeCases: readonly SemanticCase[];
 }
 
 export interface SemanticCoverageContract {
-  readonly schema: "cheng_semantic_coverage_contract.v1";
+  readonly schema: "cheng_semantic_coverage_contract";
   readonly schemaSha256: string;
   readonly assignmentCount: number;
   readonly legalUniverseCount: number;
@@ -147,7 +147,7 @@ export interface SemanticCoverageContract {
 }
 
 export interface SemanticCoverageReceipt {
-  readonly schema: "cheng_semantic_coverage_receipt.v1";
+  readonly schema: "cheng_semantic_coverage_receipt";
   readonly contractSha256: string;
   readonly caseCount: number;
   readonly criticalCount: number;
@@ -161,7 +161,7 @@ export interface SemanticMatrixManifest {
   readonly modelSchemaSha256: string;
   readonly coverageContractSha256: string;
   readonly seed: string;
-  readonly generator: "deterministic_weighted_set_cover_non_minimal.v1";
+  readonly generator: "deterministic_weighted_set_cover_non_minimal";
   readonly caseCount: number;
   readonly acceptCount: number;
   readonly rejectCount: number;
@@ -238,10 +238,10 @@ export const CHENG_SEMANTIC_MODEL_SCHEMA = deepFreeze({
 });
 export const CHENG_SEMANTIC_MODEL_SCHEMA_SHA256 = sha256(canonicalJson(CHENG_SEMANTIC_MODEL_SCHEMA));
 
-// This protocol is deliberately unavailable in v1. These fields are requirements for
+// This protocol is deliberately unavailable. These fields are requirements for
 // a future compiler-owned runner, not self-reported evidence accepted by this module.
 export const CHENG_SEMANTIC_REAL_RUNNER_PROTOCOL = deepFreeze({
-  schema: "cheng_real_structured_pipeline_protocol.v1",
+  schema: "cheng_real_structured_pipeline_protocol",
   implemented: false,
   sourceBindings: [
     "case_source_bytes_sha256",
@@ -315,7 +315,7 @@ function classificationFromMask(mask: number): SemanticClassification {
     if (code === undefined) throw new Error("constraint bit escaped schema bounds");
     if ((mask & (1 << index)) !== 0) violations.push(code);
   }
-  return deepFreeze({schema: "cheng_semantic_classification.v1", legal: mask === 0, violations});
+  return deepFreeze({schema: "cheng_semantic_classification", legal: mask === 0, violations});
 }
 
 function violationCount(mask: number): number {
@@ -444,10 +444,10 @@ function semanticCaseFromDimensions(
     throw new Error("semantic model case ordinal must be a non-negative int32");
   }
   const identityPayload = {schema: CHENG_SEMANTIC_MATRIX_SCHEMA, dimensions};
-  const caseId = `sem.v1.${sha256(canonicalJson(identityPayload))}`;
+  const caseId = `sem.${sha256(canonicalJson(identityPayload))}`;
   const semanticPayload = {identityPayload, modelCaseOrdinal, expected, violationCodes};
   return deepFreeze({
-    schema: "cheng_semantic_case.v1",
+    schema: "cheng_semantic_case",
     caseId,
     modelCaseOrdinal,
     expected,
@@ -520,7 +520,7 @@ export function enumerateSemanticUniverse(): SemanticUniverse {
   const uniqueNegativeCases = [...new Map(negativeCases.map((entry) => [entry.caseId, entry])).values()]
     .sort((a, b) => a.caseId.localeCompare(b.caseId));
   cachedUniverse = deepFreeze({
-    schema: "cheng_semantic_universe.v1",
+    schema: "cheng_semantic_universe",
     assignmentCount,
     legalCases: legalCases.sort((a, b) => a.caseId.localeCompare(b.caseId)),
     negativeCases: uniqueNegativeCases,
@@ -658,7 +658,7 @@ export function deriveSemanticCoverageContract(): SemanticCoverageContract {
     }
   });
   const payload = {
-    schema: "cheng_semantic_coverage_contract.v1" as const,
+    schema: "cheng_semantic_coverage_contract" as const,
     schemaSha256: CHENG_SEMANTIC_MODEL_SCHEMA_SHA256,
     assignmentCount: proofEnumeration.assignmentCount,
     legalUniverseCount,
@@ -673,7 +673,7 @@ export function deriveSemanticCoverageContract(): SemanticCoverageContract {
 }
 
 export function validateSemanticCase(testCase: SemanticCase): SemanticClassification {
-  if (testCase.schema !== "cheng_semantic_case.v1") throw new Error("invalid semantic case schema");
+  if (testCase.schema !== "cheng_semantic_case") throw new Error("invalid semantic case schema");
   const classification = classifySemanticDimensions(testCase.dimensions);
   const expected: SemanticExpectation = classification.legal ? "accept" : "reject";
   if (testCase.expected !== expected) throw new Error(`semantic case expectation mismatch: ${testCase.caseId}`);
@@ -707,7 +707,7 @@ export function validateSemanticCoverage(cases: readonly SemanticCase[]): Semant
     throw new Error(`semantic coverage incomplete: critical=${missingCritical.length} twise=${missingTwise.length} negative=${missingNegative.length}`);
   }
   const payload = {
-    schema: "cheng_semantic_coverage_receipt.v1" as const,
+    schema: "cheng_semantic_coverage_receipt" as const,
     contractSha256: expected.contractSha256,
     caseCount: cases.length,
     criticalCount: observedCritical.size,
@@ -728,7 +728,7 @@ function buildSuiteManifest(seed: string, cases: readonly SemanticCase[], covera
     modelSchemaSha256: CHENG_SEMANTIC_MODEL_SCHEMA_SHA256,
     coverageContractSha256: coverageContract.contractSha256,
     seed,
-    generator: "deterministic_weighted_set_cover_non_minimal.v1" as const,
+    generator: "deterministic_weighted_set_cover_non_minimal" as const,
     caseCount: cases.length,
     acceptCount,
     rejectCount: cases.length - acceptCount,
@@ -800,7 +800,7 @@ export function validateSemanticMatrix(suite: SemanticMatrix): Readonly<{caseCou
 }
 
 function shardIndexForCase(caseId: string, shardCount: number): number {
-  const match = /^sem\.v1\.([0-9a-f]{64})$/.exec(caseId);
+  const match = /^sem\.([0-9a-f]{64})$/.exec(caseId);
   const digest = match?.[1];
   if (digest === undefined) throw new Error(`invalid semantic case ID for sharding: ${caseId}`);
   return Number(BigInt(`0x${digest.slice(0, 16)}`) % BigInt(shardCount));
@@ -844,7 +844,7 @@ export function reproduceSemanticCase(caseId: string): SemanticCase {
 }
 
 export interface SemanticMaterializationRecipe {
-  readonly schema: "cheng_semantic_materialization_recipe.v1";
+  readonly schema: "cheng_semantic_materialization_recipe";
   readonly caseId: string;
   readonly semanticCaseSha256: string;
   readonly type: {
@@ -889,7 +889,7 @@ export function buildSemanticMaterializationRecipe(testCase: SemanticCase): Sema
   if (!classification.legal) throw new Error(`cannot materialize illegal semantic case ${testCase.caseId}`);
   const descriptor = TYPE_DESCRIPTORS[testCase.dimensions.type];
   const payload = {
-    schema: "cheng_semantic_materialization_recipe.v1" as const,
+    schema: "cheng_semantic_materialization_recipe" as const,
     caseId: testCase.caseId,
     semanticCaseSha256: testCase.semanticSha256,
     type: {
@@ -953,7 +953,7 @@ export interface SymbolicSemanticFacts {
 }
 
 export interface SemanticOracle {
-  readonly schema: "cheng_symbolic_semantic_oracle.v1";
+  readonly schema: "cheng_symbolic_semantic_oracle";
   readonly proofScope: "contract_model_only";
   readonly facts: SymbolicSemanticFacts;
   readonly observableContract: {
@@ -1034,7 +1034,7 @@ export function buildSemanticOracle(testCase: SemanticCase): SemanticOracle {
     aliasInvariant: testCase.dimensions.alias === "no_alias" ? "proved_no_alias" : "retain_before_release_required",
   };
   const payload = {
-    schema: "cheng_symbolic_semantic_oracle.v1" as const,
+    schema: "cheng_symbolic_semantic_oracle" as const,
     proofScope: "contract_model_only" as const,
     facts,
     observableContract: {
@@ -1059,7 +1059,7 @@ const STAGE_ORDER = Object.freeze([
 type ContractStage = (typeof STAGE_ORDER)[number];
 
 export interface SemanticStageContractReceipt {
-  readonly schema: "cheng_semantic_stage_contract_receipt.v1";
+  readonly schema: "cheng_semantic_stage_contract_receipt";
   readonly stage: ContractStage;
   readonly backend: "primary" | "backend2" | null;
   readonly stageAction: string;
@@ -1092,7 +1092,7 @@ function stageAction(stage: ContractStage): string {
 function receiptWithHash(stage: ContractStage, facts: SymbolicSemanticFacts): SemanticStageContractReceipt {
   const backend = stage.startsWith("primary") ? "primary" : stage.startsWith("backend2") ? "backend2" : null;
   const payload = {
-    schema: "cheng_semantic_stage_contract_receipt.v1" as const,
+    schema: "cheng_semantic_stage_contract_receipt" as const,
     stage,
     backend: backend as "primary" | "backend2" | null,
     stageAction: stageAction(stage),
@@ -1165,7 +1165,7 @@ interface MutableSymbolicFacts extends Omit<SymbolicSemanticFacts, "exprClass" |
 }
 
 interface MutableStageReceipt {
-  schema: "cheng_semantic_stage_contract_receipt.v1";
+  schema: "cheng_semantic_stage_contract_receipt";
   stage: ContractStage;
   backend: "primary" | "backend2" | null;
   stageAction: string;
@@ -1229,7 +1229,7 @@ export class SemanticPipelineRunnerUnavailableError extends Error {
   }
 }
 
-// Deliberately returns no success in v1. Accepting a caller object here would turn
+// Deliberately returns no success. Accepting a caller object here would turn
 // self-reported hashes/oracle echoes into a false pipeline proof.
 export async function executeSemanticMatrixShard(
   suite: SemanticMatrix,
@@ -1241,7 +1241,7 @@ export async function executeSemanticMatrixShard(
 }
 
 export interface SemanticDeltaReduction {
-  readonly schema: "cheng_semantic_delta_reduction.v1";
+  readonly schema: "cheng_semantic_delta_reduction";
   readonly originalCaseIds: readonly string[];
   readonly reducedCaseIds: readonly string[];
   readonly predicateCalls: number;
@@ -1284,7 +1284,7 @@ export async function deltaReduceFailingSemanticCases(
   if (!(await failurePredicate(current))) throw new Error("delta reduction lost the failure predicate");
   for (const testCase of current) if (!validateSemanticCase(testCase).legal) throw new Error("delta reduction final set is semantically illegal");
   const payload = {
-    schema: "cheng_semantic_delta_reduction.v1" as const,
+    schema: "cheng_semantic_delta_reduction" as const,
     originalCaseIds: cases.map((entry) => entry.caseId),
     reducedCaseIds: current.map((entry) => entry.caseId),
     predicateCalls,

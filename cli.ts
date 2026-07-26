@@ -554,7 +554,7 @@ async function checkRealMcp(recorder) {
       initialize = await client.request("initialize", {
         protocolVersion: "2025-11-25",
         capabilities: {},
-        clientInfo: {name: "cheng-fusion-doctor", version: "1"},
+        clientInfo: {name: "cheng-fusion-doctor", version: "current"},
       });
     } catch (error) {
       recorder.fail("mcp.initialize", {
@@ -700,7 +700,7 @@ async function doctor() {
   await Promise.all(Object.entries(statuses).map(([label, status]) => checkCodeSign(recorder, label, status)));
   await checkLspSpawn(recorder, statuses.lsp);
   const report = {
-    schema: "cheng_fusion_doctor.v1",
+    schema: "cheng_fusion_doctor",
     ok: recorder.errors.length === 0,
     runtime: {executable: process.execPath, platform: process.platform, arch: process.arch},
     paths: {
@@ -745,7 +745,7 @@ if (import.meta.main) {
       ? error
       : new CliFailure("INTERNAL_ERROR", errorText(error), errorDetails(error));
     writeJson(process.stderr, {
-      schema: "cheng_fusion_cli_error.v1",
+      schema: "cheng_fusion_cli_error",
       ok: false,
       error: {code: failure.code, message: failure.message, ...failure.details},
     });

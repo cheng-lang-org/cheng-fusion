@@ -24,6 +24,7 @@ import {
   reproduceSemanticCase,
   semanticCaseCoverageTokens,
   validateSemanticContractLedger,
+  validateSemanticCase,
   validateSemanticCoverage,
   validateSemanticMatrix,
   validateSemanticMatrixShard,
@@ -53,11 +54,15 @@ async function main() {
   const suiteB = generateSemanticMatrix("item23-seed-b");
   assert.equal(canonicalJson(suiteA), canonicalJson(suiteARepeat));
   assert.notEqual(suiteA.manifest.manifestSha256, suiteB.manifest.manifestSha256);
-  assert.equal(suiteA.manifest.generator, "deterministic_weighted_set_cover_non_minimal.v1");
+  assert.equal(suiteA.manifest.generator, "deterministic_weighted_set_cover_non_minimal");
   assert.ok(suiteA.cases.some((entry) => entry.expected === "accept"));
   assert.ok(suiteA.cases.some((entry) => entry.expected === "reject"));
   const matrixReceipt = validateSemanticMatrix(suiteA);
   assert.equal(matrixReceipt.manifestSha256, suiteA.manifest.manifestSha256);
+  assert.throws(
+    () => validateSemanticMatrix({...suiteA, schema: "cheng_semantic_matrix.v1"} as never),
+    /invalid semantic matrix schema/,
+  );
   const coverage = deriveSemanticCoverageContract();
   assert.ok(coverage.critical.length > 0 && coverage.twise.length > 0 && coverage.negative.length > 0);
   assert.equal(coverage.classifierAgreementCount, coverage.assignmentCount);
@@ -81,6 +86,10 @@ async function main() {
   assert.deepEqual(primaryMutationVerdict.violations, ["RESULT_TRANSPORT_EXACT"]);
   const firstCase = suiteA.cases[0];
   assert.ok(firstCase);
+  assert.throws(
+    () => validateSemanticCase({...firstCase, schema: "cheng_semantic_case.v1"} as never),
+    /invalid semantic case schema/,
+  );
   assert.equal(reproduceSemanticCase(firstCase.caseId).semanticSha256, firstCase.semanticSha256);
   assert.ok(!canonicalJson(firstCase).includes("sourceNodeIndex"));
 
@@ -164,7 +173,7 @@ async function main() {
     (error:unknown) => error instanceof SemanticPipelineRunnerUnavailableError && error.code === "REAL_PIPELINE_RUNNER_REQUIRED",
   );
   await assert.rejects(
-    () => executeSemanticMatrixShard(suiteA, singleShard, {kind: "cheng-real-structured-pipeline.v1", oracleEcho: true}),
+    () => executeSemanticMatrixShard(suiteA, singleShard, {kind: "cheng-real-structured-pipeline", oracleEcho: true}),
     (error:unknown) => error instanceof SemanticPipelineRunnerUnavailableError && error.code === "REAL_PIPELINE_RUNNER_REQUIRED",
   );
 

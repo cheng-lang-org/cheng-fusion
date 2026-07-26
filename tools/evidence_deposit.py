@@ -41,10 +41,10 @@ import os
 import shutil
 import sys
 
-SCHEMA_RECEIPT = "cheng-fusion-evidence-receipt/v1"
-SCHEMA_STAGES = "cheng-fusion-evidence-stages/v1"
-SCHEMA_MANIFEST = "cheng-fusion-evidence-manifest/v1"
-SCHEMA_INDEX = "cheng-fusion-evidence-index/v1"
+SCHEMA_RECEIPT = "cheng-fusion-evidence-receipt"
+SCHEMA_STAGES = "cheng-fusion-evidence-stages"
+SCHEMA_MANIFEST = "cheng-fusion-evidence-manifest"
+SCHEMA_INDEX = "cheng-fusion-evidence-index"
 
 # Stage-record keys that are bulky, workDir-absolute, or both; the verbatim
 # journal.jsonl is deposited alongside, so the stage summary drops them.

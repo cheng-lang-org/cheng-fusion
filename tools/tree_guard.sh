@@ -76,7 +76,7 @@ case "$MODE" in
         mkdir -p "$MANIFEST_DIR" || { echo "tree_guard_error=manifest_dir_create_failed path=$MANIFEST_DIR" >&2; exit 2; }
         TMP="$(mktemp "$MANIFEST_DIR/.tree_guard_manifest.tmp.XXXXXX")" || { echo "tree_guard_error=mktemp_failed" >&2; exit 2; }
         {
-            echo "schema=tree_guard_manifest.v1"
+            echo "schema=tree_guard_manifest"
             echo "tree=$TREE"
             echo "snapshot_epoch=$(date +%s)"
             echo "--- git_porcelain ---"
@@ -93,7 +93,7 @@ case "$MODE" in
         CUR="$(mktemp "${TMPDIR:-/tmp}/tree_guard_verify.XXXXXX")" || { echo "tree_guard_error=mktemp_failed" >&2; exit 2; }
         trap 'rm -f "$CUR"' EXIT
         {
-            echo "schema=tree_guard_manifest.v1"
+            echo "schema=tree_guard_manifest"
             echo "tree=$TREE"
             echo "snapshot_epoch=0"
             echo "--- git_porcelain ---"

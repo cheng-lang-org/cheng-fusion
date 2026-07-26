@@ -30,6 +30,7 @@ import {createChengTextTool, jsonResult, initChengToolkitModule, zodSchema} from
 
 var chengClaimAuditInputSchema, ChengClaimAuditTool;
 
+const CLAIM_AUDIT_SCHEMA = "cheng_claim_audit";
 const DEFAULT_POBJ_PATH = "/Users/lbcheng/cheng-lang/src/core/backend/primary_object_plan.cheng";
 const DEFAULT_CONTEXT_LINES = 30;
 
@@ -41,6 +42,13 @@ const DISPATCH_LOOP_HEADER_HINT = /statements|\bstmt(Index)?\b/i;
 
 const EMIT_EVIDENCE = /add\(\s*bodyIR\.ops|Append\w*\(|FieldStore|\bbl\w*\(/;
 const POISON_EVIDENCE = /AppendInvalidOp/;
+
+function assertClaimAuditReportSchema(report) {
+  if (!report || typeof report !== "object" || report.schema !== CLAIM_AUDIT_SCHEMA) {
+    throw new Error(`unsupported claim audit report schema: ${report?.schema}`);
+  }
+  return report;
+}
 
 function indentOf(rawLine) {
   return rawLine.length - rawLine.replace(/^\s*/, "").length;
@@ -157,9 +165,9 @@ var initChengClaimAuditModule = defineModuleInitializer(() => {
       if (!existsSync(pobjPath)) throw new Error(`pobjPath not found: ${pobjPath}`);
       const contextLines = input.contextLines || DEFAULT_CONTEXT_LINES;
       const {sites, summary} = auditPobjClaims(pobjPath, contextLines);
-      return jsonResult({schema: "cheng_claim_audit.v1", pobjPath, contextLines, sites, summary});
+      return jsonResult(assertClaimAuditReportSchema({schema: CLAIM_AUDIT_SCHEMA, pobjPath, contextLines, sites, summary}));
     },
   });
 });
 
-export {ChengClaimAuditTool, initChengClaimAuditModule};
+export {ChengClaimAuditTool, assertClaimAuditReportSchema, initChengClaimAuditModule};

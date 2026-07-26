@@ -25,6 +25,11 @@ import {ChengOrphanSlotScanTool, initChengOrphanSlotScanModule} from "./cheng_or
 import {ChengFixtureMatrixTool, initChengFixtureMatrixModule} from "./cheng_fixture_matrix_m9021.ts";
 import {ChengAddrSymbolicateTool, initChengAddrSymbolicateModule} from "./cheng_addr_symbolicate_m9021.ts";
 import {ChengRegallocPreflightTool, initChengRegallocPreflightModule} from "./cheng_regalloc_preflight_m9022.ts";
+import {ChengSemanticSnapshotAuditTool, initChengSemanticSnapshotAuditModule} from "./cheng_semantic_snapshot_audit.ts";
+import {ChengCidIdentityChainAuditTool, initChengCidIdentityChainAuditModule} from "./cheng_cid_identity_chain_audit.ts";
+import {ChengMemoryReleaseGateAuditTool, initChengMemoryReleaseGateAuditModule} from "./cheng_memory_release_gate_audit.ts";
+import {ChengDriverFrontierProbeTool, initChengDriverFrontierProbeModule} from "./cheng_driver_frontier_probe_m9026.ts";
+import {ChengTreeQuiesceProbeTool, initChengTreeQuiesceProbeModule} from "./cheng_tree_quiesce_probe_m9027.ts";
 
 var chengFusionTools, chengFusionToolManifest;
 
@@ -38,7 +43,7 @@ function buildChengFusionToolManifest(tools) {
   const sortedNames = [...names].sort();
   if (new Set(sortedNames).size !== sortedNames.length) throw new Error("Cheng Fusion tool registry contains duplicate names");
   const sha256 = createHash("sha256").update(sortedNames.map((name) => `${name}\n`).join(""), "utf8").digest("hex");
-  return Object.freeze({schema: "cheng_fusion_tool_registry.v1", count: sortedNames.length, names: Object.freeze(sortedNames), sha256});
+  return Object.freeze({schema: "cheng_fusion_tool_registry", count: sortedNames.length, names: Object.freeze(sortedNames), sha256});
 }
 
 var initChengFusionToolRegistryModule = defineModuleInitializer(() => {
@@ -62,7 +67,12 @@ var initChengFusionToolRegistryModule = defineModuleInitializer(() => {
   initChengFixtureMatrixModule();
   initChengAddrSymbolicateModule();
   initChengRegallocPreflightModule();
-  chengFusionTools = [ChengCsgQueryTool, ChengEvidenceTool, ChengCsgRoundtripTool, ChengCrashTriageTool, ChengLineMapReadTool, ChengLspQueryTool, ChengProfileReportTool, ChengSymbolDiffTool, ChengExecDiffTool, ChengTemplateLeakAuditTool, ChengZcCensusTool, ChengCorruptHuntTool, ChengShapeMatrixTool, ChengClaimAuditTool, ChengIgnitionChainTool, ChengResidualPeelTool, ChengOrphanSlotScanTool, ChengFixtureMatrixTool, ChengAddrSymbolicateTool, ChengRegallocPreflightTool];
+  initChengSemanticSnapshotAuditModule();
+  initChengCidIdentityChainAuditModule();
+  initChengMemoryReleaseGateAuditModule();
+  initChengDriverFrontierProbeModule();
+  initChengTreeQuiesceProbeModule();
+  chengFusionTools = [ChengCsgQueryTool, ChengEvidenceTool, ChengCsgRoundtripTool, ChengCrashTriageTool, ChengLineMapReadTool, ChengLspQueryTool, ChengProfileReportTool, ChengSymbolDiffTool, ChengExecDiffTool, ChengTemplateLeakAuditTool, ChengZcCensusTool, ChengCorruptHuntTool, ChengShapeMatrixTool, ChengClaimAuditTool, ChengIgnitionChainTool, ChengResidualPeelTool, ChengOrphanSlotScanTool, ChengFixtureMatrixTool, ChengAddrSymbolicateTool, ChengRegallocPreflightTool, ChengSemanticSnapshotAuditTool, ChengCidIdentityChainAuditTool, ChengMemoryReleaseGateAuditTool, ChengDriverFrontierProbeTool, ChengTreeQuiesceProbeTool];
   chengFusionToolManifest = buildChengFusionToolManifest(chengFusionTools);
 });
 

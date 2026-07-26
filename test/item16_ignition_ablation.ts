@@ -108,6 +108,7 @@ async function main() {
       });
       assertTrue(started.isError !== true, "ablation chain starts: " + JSON.stringify(started.parsed));
       const run = started.parsed;
+      assertTrue(run.schema === "cheng_ignition_chain.start", `start schema 精确，实得 ${run.schema}`);
       assertTrue(run.ablation?.baseHead === head, "start result records the exact base HEAD");
       const inputsDir = join(run.runDir, "inputs");
       assertTrue(run.treeRoot.startsWith(inputsDir + "/") && run.seed.startsWith(inputsDir + "/"), "runner consumes only run-local tree and seed snapshots");
@@ -126,6 +127,7 @@ async function main() {
       }
       const status = await mcp.callTool("cheng_ignition_chain", {action: "status", runId: run.runId, workDir});
       assertTrue(status.isError !== true, "status reads completed run");
+      assertTrue(status.parsed.schema === "cheng_ignition_chain.status", `status schema 精确，实得 ${status.parsed.schema}`);
       assertTrue(status.parsed.completionConsistent === true, "journal done record and atomic sentinel match");
       assertTrue(status.parsed.done?.verdict === "ABORTED_DRV_BAKE_FAILED", "failed seed produces an explicit terminal verdict");
       assertTrue(status.parsed.done?.lastStage === "drvBake", "sentinel records the last completed stage");

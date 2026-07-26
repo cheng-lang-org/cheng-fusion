@@ -130,7 +130,7 @@ half-open intervals from every `T`/`t` boundary to the next boundary or section 
 one global `T` at an interval start may own it: a local `t` returns `NO_MATCH` with exit 2,
 and same-address aliases return `ERROR AMBIGUOUS` with exit 3. Section-external offsets
 also return exit 2, so the final symbol is never unbounded. A `.map` lookup first validates
-the complete `cheng_line_map_v1` stream: exact marker, matching `entry_count`, decimal source
+the complete `cheng_line_map` stream: exact marker, matching `entry_count`, decimal source
 lines, unique required `function_name`/`module_path`/`offset`/`size` fields, and positive sizes.
 It then requires exactly one interval: zero matches return 2 and overlaps return 3. Target offsets
 accept strict unsigned decimal (including `08`) or hexadecimal syntax and are parsed as
@@ -246,4 +246,6 @@ runId the whole store is verified.
 **Lesson**: verified by a 7-case perturbation matrix (verdict flips on receipt and
 index, file delete/add, done flip, orphan dir, ghost index entry) -- every tamper
 is caught with an exact FAIL reason. item27 wires the two former GAP-1 mutants
-(M-EVIDENCE-SEED-SWAP, M-EVIDENCE-VERDICT-DROP) onto this gate; kill rate 26/26.
+(M-EVIDENCE-SEED-SWAP, M-EVIDENCE-VERDICT-DROP) onto this gate. Current full
+item27 run is 27/29: both evidence mutants still return `evidence_verify rc=-1`;
+the module-header and flat-zero corpus mutants are killed by their exact contract.

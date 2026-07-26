@@ -131,7 +131,7 @@ function main() {
     assertTrue(invalid.stderr.includes("offset must be an unsigned"), `非法 offset 明确报错: ${invalid.stderr}`);
 
     writeFileSync(map, [
-      "cheng_line_map_v1",
+      "cheng_line_map",
       "entry_count=2",
       "entry\t_alpha\tAlpha\tfixture.cheng\t1\t1\t1\tfunction_name=Alpha\tmodule_path=fixture.cheng\toffset=0x10\tsize=16",
       "entry\t_beta\tBeta\tfixture.cheng\t2\t2\t2\tfunction_name=Beta\tmodule_path=fixture.cheng\toffset=0x18\tsize=16",
@@ -152,10 +152,11 @@ function main() {
     console.log("[map schema] 整份 map 必须满足 marker/count/唯一字段契约");
     for (const [label, content] of [
       ["missing marker", "entry_count=0\n"],
-      ["wrong count", "cheng_line_map_v1\nentry_count=2\nentry\t_a\tA\tf.cheng\t1\t1\t1\tfunction_name=A\tmodule_path=f.cheng\toffset=0\tsize=1\n"],
-      ["duplicate offset", "cheng_line_map_v1\nentry_count=1\nentry\t_a\tA\tf.cheng\t1\t1\t1\tfunction_name=A\tmodule_path=f.cheng\toffset=0\toffset=1\tsize=1\n"],
-      ["invalid source lines", "cheng_line_map_v1\nentry_count=1\nentry\t_a\tA\tf.cheng\tnot-a-line\t2\t3\tfunction_name=A\tmodule_path=f.cheng\toffset=0\tsize=1\n"],
-      ["missing module path", "cheng_line_map_v1\nentry_count=1\nentry\t_a\tA\tf.cheng\t1\t2\t3\tfunction_name=A\toffset=0\tsize=1\n"],
+      ["legacy schema", "cheng_line_map_v1\nentry_count=0\n"],
+      ["wrong count", "cheng_line_map\nentry_count=2\nentry\t_a\tA\tf.cheng\t1\t1\t1\tfunction_name=A\tmodule_path=f.cheng\toffset=0\tsize=1\n"],
+      ["duplicate offset", "cheng_line_map\nentry_count=1\nentry\t_a\tA\tf.cheng\t1\t1\t1\tfunction_name=A\tmodule_path=f.cheng\toffset=0\toffset=1\tsize=1\n"],
+      ["invalid source lines", "cheng_line_map\nentry_count=1\nentry\t_a\tA\tf.cheng\tnot-a-line\t2\t3\tfunction_name=A\tmodule_path=f.cheng\toffset=0\tsize=1\n"],
+      ["missing module path", "cheng_line_map\nentry_count=1\nentry\t_a\tA\tf.cheng\t1\t2\t3\tfunction_name=A\toffset=0\tsize=1\n"],
     ] as const) {
       writeFileSync(invalidMap, content);
       const invalidMapResult = runSymbolize(script, invalidMap, 0);

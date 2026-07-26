@@ -16,9 +16,17 @@ import {createChengTextTool, jsonResult, runChengDriver, takeTrailingText, initC
 
 var chengFixtureMatrixInputSchema, ChengFixtureMatrixTool;
 
+const FIXTURE_MATRIX_SCHEMA = "cheng_fixture_matrix";
 const DEFAULT_TIMEOUT_SEC = 300;
 const DEFAULT_MAX_OUTPUT_BYTES = 1 << 30;
 const TARGET = "arm64-apple-darwin";
+
+function assertFixtureMatrixReportSchema(report) {
+  if (!report || typeof report !== "object" || report.schema !== FIXTURE_MATRIX_SCHEMA) {
+    throw new Error(`unsupported fixture matrix report schema: ${report?.schema}`);
+  }
+  return report;
+}
 
 function normalizeAbsolutePath(value, label) {
   const raw = String(value || "");
@@ -322,7 +330,7 @@ var initChengFixtureMatrixModule = defineModuleInitializer(() => {
         for (const result of results) summary[result.status === "GREEN" ? "green" : "red"]++;
         for (const pair of mirrorReports) summary[pair.pairVerdict === "GREEN" ? "pairGreen" : "pairRed"]++;
         const verdict = summary.red === 0 && summary.pairRed === 0 ? "GREEN" : "RED";
-        return jsonResult({schema: "cheng_fixture_matrix.v1", root, target: TARGET, maxOutputBytes: maxBuffer, drivers, fixtures, verdict, summary, mirrorPairs: mirrorReports, results});
+        return jsonResult(assertFixtureMatrixReportSchema({schema: FIXTURE_MATRIX_SCHEMA, root, target: TARGET, maxOutputBytes: maxBuffer, drivers, fixtures, verdict, summary, mirrorPairs: mirrorReports, results}));
       } finally {
         rmSync(tempDir, {recursive: true, force: true});
       }
@@ -330,4 +338,4 @@ var initChengFixtureMatrixModule = defineModuleInitializer(() => {
   });
 });
 
-export {ChengFixtureMatrixTool, initChengFixtureMatrixModule};
+export {ChengFixtureMatrixTool, assertFixtureMatrixReportSchema, initChengFixtureMatrixModule};

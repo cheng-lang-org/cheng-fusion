@@ -20,11 +20,18 @@ import {
   bindDriverReceipts,
   receiptsToWitnesses,
 } from "./grammar_span_receipt.ts";
-import {bindReceiptAgainstObligations, loadTokenKindNames, type MapRow} from "./grammar_receipt_bind.ts";
+import {
+  bindCurrentReceiptAgainstObligations,
+  loadTokenKindNames,
+  type MapRow,
+} from "./grammar_receipt_bind.ts";
+import {
+  readCurrentChengGrammarCorpus,
+} from "../src/cheng_grammar_corpus_store.ts";
 
 const SPEC_PATH = process.env.CHENG_FORMAL_SPEC_PATH ?? "/Users/lbcheng/cheng-lang/docs/cheng-formal-spec.md";
 const PARSER_PATH = process.env.CHENG_PARSER_PATH ?? "/Users/lbcheng/cheng-lang/src/core/lang/parser.cheng";
-const CORPUS_JSON = resolve(dirname(fileURLToPath(import.meta.url)), "../fixtures/semantic/grammar_corpus/corpus.json");
+const CORPUS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../fixtures/semantic/grammar_corpus");
 const MAP_JSON = resolve(dirname(fileURLToPath(import.meta.url)), "../fixtures/semantic/ebnf_parser_node_map.json");
 const TINY_RECEIPT = "/tmp/pr1.json";
 const TINY_SOURCE = "/Users/lbcheng/cheng-lang/.tmp-exec/gen1_verify/tiny_main.cheng";
@@ -44,7 +51,7 @@ interface CorpusEntry {
   readonly claims: readonly ClaimRow[];
 }
 interface CorpusManifest {
-  readonly counts: {readonly claims: number; readonly blocked: number; readonly coveredRequiredObligations: number};
+  readonly counts: {readonly claims: number; readonly coveredRequiredObligations: number};
   readonly entries: readonly CorpusEntry[];
 }
 
@@ -55,16 +62,26 @@ function remake(fields: GrammarParserSpanReceipt): GrammarParserSpanReceipt {
 
 function main() {
   const tokenNames = loadTokenKindNames(PARSER_PATH);
-  const grammar = buildChengGrammarObligationContract(readFileSync(SPEC_PATH));
+  const formalSpecSource = readFileSync(SPEC_PATH, "utf8");
+  const grammar = buildChengGrammarObligationContract(
+    Buffer.from(formalSpecSource, "utf8"),
+  );
   const mapDoc = JSON.parse(readFileSync(MAP_JSON, "utf8")) as {rows: MapRow[]};
   const mapRows = new Map(mapDoc.rows.map((r) => [r.name, r]));
-  const corpus = JSON.parse(readFileSync(CORPUS_JSON, "utf8")) as CorpusManifest;
+  const corpusSnapshot = readCurrentChengGrammarCorpus(CORPUS_DIR);
+  const corpus = corpusSnapshot.manifest as CorpusManifest;
   const obligationById = new Map(grammar.obligations.map((o) => [o.obligationId, o]));
 
   // ---------------- (a) tiny_main ----------------
   const tinySource = readFileSync(TINY_SOURCE, "utf8");
-  const tiny = bindReceiptAgainstObligations(
-    readFileSync(TINY_RECEIPT, "utf8"), tinySource, grammar.obligations, tokenNames, mapRows);
+  const tiny = bindCurrentReceiptAgainstObligations(
+    readFileSync(TINY_RECEIPT, "utf8"),
+    tinySource,
+    formalSpecSource,
+    grammar.obligations,
+    tokenNames,
+    mapRows,
+  );
   const tinyReceipts = tiny.results.filter((r) => r.receipt !== null).map((r) => r.receipt!);
   const tinyMiss = tiny.results.filter((r) => r.receipt === null);
   const tinySourceFiles = [{relativePath: ".tmp-exec/gen1_verify/tiny_main.cheng", source: tinySource}];
@@ -111,7 +128,14 @@ function main() {
     // 该源的 claims → obligation 对象
     const obligations = entry.claims.map((c) => obligationById.get(c.obligationId)).filter((o): o is ChengGrammarObligation => o !== undefined);
     const receiptPath = `${CORPUS_RECEIPT_DIR}/${entry.shape}.json`;
-    const bound = bindReceiptAgainstObligations(readFileSync(receiptPath, "utf8"), source, obligations, tokenNames, mapRows);
+    const bound = bindCurrentReceiptAgainstObligations(
+      readFileSync(receiptPath, "utf8"),
+      source,
+      formalSpecSource,
+      obligations,
+      tokenNames,
+      mapRows,
+    );
     const srcHits = bound.results.filter((r) => r.receipt !== null);
     const srcMiss = bound.results.filter((r) => r.receipt === null);
     hits += srcHits.length;
@@ -128,7 +152,7 @@ function main() {
     allReceipts.push(...srcHits.map((r) => r.receipt!));
     allSourceFiles.push({relativePath: `src/${entry.shape}.cheng`, source});
   }
-  // 全量回执(仅本批命中的 witness; 全 966 未齐, 预期保持 red)
+  // 全量回执(仅本批命中的 witness; required obligation 未齐时保持 red)
   const corpusBound = bindDriverReceipts(grammar, allReceipts, allSourceFiles);
 
   // ---------------- (c) 摄动 ----------------

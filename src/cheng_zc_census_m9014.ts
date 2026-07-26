@@ -13,6 +13,15 @@ import {ZC_PROCESS_MAX_OUTPUT_BYTES,ZC_TARGET,clusterZcCensusRows,parseZcCensusR
 
 var chengZcCensusInputSchema,ChengZcCensusTool;
 
+const ZC_CENSUS_SCHEMA = "cheng_zc_census";
+
+function assertZcCensusReportSchema(report) {
+  if (!report || typeof report !== "object" || report.schema !== ZC_CENSUS_SCHEMA) {
+    throw new Error(`unsupported ZC census report schema: ${report?.schema}`);
+  }
+  return report;
+}
+
 var initChengZcCensusModule = defineModuleInitializer(() => {
   initChengToolkitModule();
   chengZcCensusInputSchema = zodSchema.strictObject({
@@ -56,8 +65,8 @@ var initChengZcCensusModule = defineModuleInitializer(() => {
         if (run.missingDriver) throw new Error(`tools/zc_enumerate.sh not found under this root: ${scriptPath}`);
         const protocol = parseZcCensusRun(run,{root,script:scriptPath,source:sourcePath,driver,target:ZC_TARGET,diagDir,diagPrefix});
         const clusters = protocol.status === "completed" ? clusterZcCensusRows(protocol.rows) : {byBail:[],byBodyKind:[]};
-        return jsonResult({
-          schema: "cheng_zc_census.v1",
+        return jsonResult(assertZcCensusReportSchema({
+          schema: ZC_CENSUS_SCHEMA,
           root,
           script: scriptPath,
           driver: protocol.status === "completed" ? protocol.fields.zc_driver : driver,
@@ -79,10 +88,10 @@ var initChengZcCensusModule = defineModuleInitializer(() => {
           stderrTail: takeTrailingText(run.stderr, 4000),
           timedOut: Boolean(run.timedOut),
           overflow: Boolean(run.overflow),
-        });
+        }));
       }finally{rmSync(diagDir,{recursive:true,force:true})}
     },
   });
 });
 
-export {ChengZcCensusTool, initChengZcCensusModule};
+export {ChengZcCensusTool, assertZcCensusReportSchema, initChengZcCensusModule};

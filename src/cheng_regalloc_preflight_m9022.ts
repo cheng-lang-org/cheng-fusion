@@ -9,6 +9,16 @@ import {basename, dirname, isAbsolute, join, relative, resolve, sep} from "node:
 import {fileURLToPath, pathToFileURL} from "node:url";
 import {b as defineModuleInitializer} from "./runtime.ts";
 import {createChengTextTool, initChengToolkitModule, jsonResult, runChengDriver, takeTrailingText, zodSchema} from "./cheng_toolkit_m9000.ts";
+import {
+  CHENG_CURRENT_FORMAL_COMPILER_ENV,
+  CHENG_CURRENT_FORMAL_COMPILER_UNSET_ENV,
+  CHENG_PARSER_RECEIPT_DRIVER_ENTRY_RELATIVE,
+  buildEbnfParserNodeMap,
+  parserOwnedStructuredWitnessAccepted,
+} from "./cheng_ebnf_parser_node_map.ts";
+import {validateCompilerExecutionStageReceipt} from "./cheng_execution_stage_receipt_validator.ts";
+import {canonicalJson} from "./cheng_semantic_matrix_m9023.ts";
+import {readCurrentChengGrammarCorpus} from "./cheng_grammar_corpus_store.ts";
 
 var chengRegallocPreflightInputSchema, ChengRegallocPreflightTool;
 
@@ -29,15 +39,16 @@ const PRODUCTION_GATE_DEPENDENCY_FILES = Object.freeze({
   lockValidator: "tools/regalloc_external_lock_validator.py",
 });
 const PRODUCTION_GATE_DEPENDENCY_EXPECTED_SHA256 = Object.freeze({
-  "tools/regalloc_production_gate.sh": "0ec5caf96f160d91a46766c83d5883a32cecbabd47433c15c0c457e327054453",
-  "tools/beat_c_process_group_guard.sh": "2c653f40f723557b36b453ec7a71bb75af4b5d135926c5cca035fe9fc4a02133",
-  "tools/regalloc_production_evidence.sh": "98c25b16a71d55bd69be5362592f483e8f040fe822258fc77a370293139f1b2b",
-  "tools/regalloc_external_lock_validator.py": "1efae4433529bae8e8a2d07c903f715f1ee38c007dadbf0f830083618d3fd61c",
+  "tools/regalloc_production_gate.sh": "d4c3092af0a0be3a618e3d42922d0ca160fd751682bc4be717bbf7a39e538940",
+  "tools/beat_c_process_group_guard.sh": "1a2456ed271bcc5e36f19d2497519d75ede6ac2c204fad74207aa23ad7312532",
+  "tools/regalloc_production_evidence.sh": "eba70942df1c1488a524bdf9a8659d0ea4bf29d4d97a136a2013a2a49dc68741",
+  "tools/regalloc_external_lock_validator.py": "b4266c000cbde7590ef7cb3b7801ba6367b668ff36f5a28a7c4319177c01ae44",
 });
 const RELEASE_EVIDENCE_INPUTS = Object.freeze([
   ["officialManifest", "officialManifestSha256", "REGALLOC_GATE_OFFICIAL_MANIFEST", "REGALLOC_GATE_OFFICIAL_MANIFEST_SHA256"],
   ["baselineManifest", "baselineManifestSha256", "REGALLOC_GATE_BASELINE_MANIFEST", "REGALLOC_GATE_BASELINE_MANIFEST_SHA256"],
   ["officialBuildReceipt", "officialBuildReceiptSha256", "REGALLOC_GATE_OFFICIAL_BUILD_RECEIPT", "REGALLOC_GATE_OFFICIAL_BUILD_RECEIPT_SHA256"],
+  ["executionStagePolicy", "executionStagePolicySha256", "REGALLOC_GATE_EXECUTION_STAGE_POLICY", "REGALLOC_GATE_EXECUTION_STAGE_POLICY_SHA256"],
   ["backend2VersionManifest", "backend2VersionManifestSha256", "REGALLOC_GATE_BACKEND2_VERSION_MANIFEST", "REGALLOC_GATE_BACKEND2_VERSION_MANIFEST_SHA256"],
   ["jobsLock", "jobsLockSha256", "REGALLOC_GATE_JOBS_LOCK", "REGALLOC_GATE_JOBS_LOCK_SHA256"],
   ["execDiffLock", "execDiffLockSha256", "REGALLOC_GATE_EXEC_DIFF_LOCK", "REGALLOC_GATE_EXEC_DIFF_LOCK_SHA256"],
@@ -62,12 +73,12 @@ const AARCH64_F64_RUNTIME_GATE_GUARD_STAGES = Object.freeze([
   "native_run",
 ]);
 const AARCH64_F64_RUNTIME_GATE_EXPECTED_SHA256 = Object.freeze({
-  "tools/regalloc_aarch64_f64_runtime_gate.sh": "42dc3496deba2052ca580c2607f3d9d7f680d0fc807a7ef10b8cfb422245f358",
-  "tools/beat_c_process_group_guard.sh": "2c653f40f723557b36b453ec7a71bb75af4b5d135926c5cca035fe9fc4a02133",
-  "src/tests/regalloc_aarch64_f64_contract_smoke.cheng": "60c99867db958aa2477951ba54354e59bd52ea292f159b9782a8420cdab77d2c",
-  "src/tests/regalloc_aarch64_f64_runtime_image.cheng": "5da16c92a817c1c626cf38410951a723a9a9a7e97d37dffb9003da39937815c8",
-  "src/tests/regalloc_aarch64_f64_runtime_harness.c": "868f2737b6aeed33ce1e0aeb8019b0534c04433c528218f6f4c67eb2772e886b",
-  "src/tests/regalloc_aarch64_f64_runtime_bridge.S": "9488ec20244d353f28bf3f7d7f0bcc21ec126f05eeaaeb96db849bacf9de9846",
+  "tools/regalloc_aarch64_f64_runtime_gate.sh": "3467f9604ce81c1051d584fed60c2832a70880c6945565b8fea7824bf887d9dd",
+  "tools/beat_c_process_group_guard.sh": "1a2456ed271bcc5e36f19d2497519d75ede6ac2c204fad74207aa23ad7312532",
+  "src/tests/regalloc_aarch64_f64_contract_smoke.cheng": "aa4efe675edbb9474497733d6e2af915c466522152786a55bfb2216f43b50d41",
+  "src/tests/regalloc_aarch64_f64_runtime_image.cheng": "3a6b2b624d94a3c505035526058a80a6fbe194339667a705eacedc7f546b2214",
+  "src/tests/regalloc_aarch64_f64_runtime_harness.c": "0694520d7bf6cdc2d5d9133be902bad0d07a6b465eef7fbf67fdd1da42c4084d",
+  "src/tests/regalloc_aarch64_f64_runtime_bridge.S": "3869b3301a34ce454cc868b53d33238f87b7a37ee71efc89f637556f5a0cc572",
 });
 const X86_64_F64_RUNTIME_GATE_FILES = Object.freeze({
   gate: "tools/regalloc_x86_64_f64_runtime_gate.sh",
@@ -86,50 +97,54 @@ const X86_64_F64_RUNTIME_GATE_GUARD_STAGES = Object.freeze([
   "rosetta_run",
 ]);
 const X86_64_F64_RUNTIME_GATE_EXPECTED_SHA256 = Object.freeze({
-  "tools/regalloc_x86_64_f64_runtime_gate.sh": "92d82c13a5550b31bc44c5b07b809242dde5e8a429e07f6db3c2b0f07feac179",
-  "tools/beat_c_process_group_guard.sh": "2c653f40f723557b36b453ec7a71bb75af4b5d135926c5cca035fe9fc4a02133",
-  "src/tests/regalloc_x86_64_f64_runtime_image.cheng": "c3d9868db5fca544ba8da7f8e04a2ed7a46045d44bee70e2286f5b1b77127f4d",
+  "tools/regalloc_x86_64_f64_runtime_gate.sh": "6f780002fe0400cdbdc3a586bdacbac80d4d6e60969aeffe6a9de0bc92f710df",
+  "tools/beat_c_process_group_guard.sh": "1a2456ed271bcc5e36f19d2497519d75ede6ac2c204fad74207aa23ad7312532",
+  "src/tests/regalloc_x86_64_f64_runtime_image.cheng": "7e979e51f13734d47c1c6bb12fcd8aaa8e62c8d068f69fcef539cc7219dbbc28",
   "src/tests/regalloc_x86_64_f64_runtime_harness.c": "2c9d5305ff533a20a97eaa179929449dde12131f5abd481f32f35dd7edb0bad2",
   "src/tests/regalloc_x86_64_f64_runtime_bridge.S": "73e2f3adcadd15be8f143b773c8e884cbb6cab7c3950e7bfa484a9b3ef85d9b7",
 });
 const TYPED_EXPR_SOURCE_RELATIVE = "src/core/lang/typed_expr.cheng";
 const FORMAL_SPEC_RELATIVE = "docs/cheng-formal-spec.md";
+const EBNF_PARSER_NODE_MAP_RELATIVE =
+  "fixtures/semantic/ebnf_parser_node_map.json";
+const EBNF_PARSER_NODE_MAP_PATH =
+  join(FUSION_ROOT, EBNF_PARSER_NODE_MAP_RELATIVE);
+const EBNF_PARSER_PRODUCER_DECLARATIONS_RELATIVE =
+  "fixtures/semantic/ebnf_parser_producer_claims.json";
+const EBNF_PARSER_PRODUCER_DECLARATIONS_PATH =
+  join(FUSION_ROOT, EBNF_PARSER_PRODUCER_DECLARATIONS_RELATIVE);
+const FORMAL_RECEIPT_AUTHORITY_FILES = Object.freeze([
+  CHENG_PARSER_RECEIPT_DRIVER_ENTRY_RELATIVE,
+  "src/core/tooling/compiler_parser_receipt.cheng",
+]);
 const SEMANTIC_PIPELINE_GATE_RELATIVE = "src/cheng_semantic_pipeline_gate_m9025.ts";
 const SEMANTIC_MODEL_RELATIVE = "src/cheng_semantic_matrix_m9023.ts";
 const SEMANTIC_PIPELINE_MODEL_RELATIVE = "src/cheng_semantic_pipeline_matrix_m9024.ts";
-const SEMANTIC_PIPELINE_GATE_RECEIPT_SCHEMA = "cheng_semantic_pipeline_structural_gate_receipt.v1";
+const SEMANTIC_PIPELINE_GATE_RECEIPT_SCHEMA = "cheng_semantic_pipeline_structural_gate_receipt";
 const SEMANTIC_PIPELINE_GATE_TIMEOUT_SECONDS = 300;
 const SEMANTIC_PIPELINE_EXPECTED_COUNTS = Object.freeze({
-  grammarObligationCount: 1124,
-  grammarRequiredCount: 966,
   baseLegalCount: 1584,
   profileAssignmentCount: 2520,
   joinedAssignmentCount: 3991680,
   legalJoinedCount: 285336,
-  matrixCaseCount: 2926,
-  matrixAcceptCount: 2919,
+  matrixCaseCount: 2927,
+  matrixAcceptCount: 2920,
   matrixRejectCount: 7,
 });
-const FORMAL_SPEC_VERSION = "2026-06-03";
-const FORMAL_EXPRESSION_SLICE_SCHEMA = "cheng_formal_expression_ebnf.v1";
-const FORMAL_EXPRESSION_SLICE_SHA256 = "d7ea26c8fc9f27b4e34fd85d134386e4d6d9e8b51a3a916e45da7f5c08fcc76a";
-const FORMAL_LITERAL_DEFINITIONS_SCHEMA = "cheng_formal_expression_literal_definitions.v1";
-const FORMAL_LITERAL_DEFINITIONS_SHA256 = "4398a1ac09bde14929e2a54fb28f074dd634b73c96d3ba873dffb2cb0b0862f0";
-const FORMAL_LEXICAL_DEFINITIONS_SCHEMA = "cheng_formal_lexical_terminal_definitions.v1";
-const FORMAL_LEXICAL_DEFINITIONS_SHA256 = "2a5e23f71a9b02f016f512411d25c63b5f761de786d0854dfed430f1d1d8f049";
-const FORMAL_GRAMMAR_BLOCK_SCHEMA = "cheng_formal_grammar_block.v1";
-const FORMAL_GRAMMAR_BLOCK_SHA256 = "b6a790bf34aed1377d2b0e68d9aa5e6f39e44c445b9f0ab95cec4ff1e3b7023a";
-const FORMAL_OPERATOR_PRECEDENCE_SCHEMA = "cheng_formal_operator_precedence_table.v1";
-const FORMAL_OPERATOR_PRECEDENCE_SHA256 = "eb93aeb5f5a80645dd0b6eb8857714ff0aae88c36a1be0bbc20d708a21afc729";
-const FORMAL_CONDITIONAL_SEMANTICS_SCHEMA = "cheng_formal_conditional_semantics.v1";
-const FORMAL_CONDITIONAL_SEMANTICS_SHA256 = "6a5b5c77e1fbdf010efb6eae122038b99e63376b92b91f9af9f1f690864e98d8";
-const FORMAL_SPACECALL_EXCLUSION_SCHEMA = "cheng_formal_spacecall_exclusion.v1";
-const FORMAL_SPACECALL_EXCLUSION_SHA256 = "380dd8331ac5e58faa76d78b2617f0492b0f66146ada4579993dbf6ebd7353fa";
+const FORMAL_EXPRESSION_SLICE_SCHEMA = "cheng_formal_expression_ebnf";
+const FORMAL_LITERAL_DEFINITIONS_SCHEMA = "cheng_formal_expression_literal_definitions";
+const FORMAL_LEXICAL_DEFINITIONS_SCHEMA = "cheng_formal_lexical_terminal_definitions";
+const FORMAL_GRAMMAR_BLOCK_SCHEMA = "cheng_formal_grammar_block";
+const FORMAL_OPERATOR_PRECEDENCE_SCHEMA = "cheng_formal_operator_precedence_table";
+const FORMAL_CONDITIONAL_SEMANTICS_SCHEMA = "cheng_formal_conditional_semantics";
+const FORMAL_SPACECALL_EXCLUSION_SCHEMA = "cheng_formal_spacecall_exclusion";
 const FORMAL_SPACECALL_EXCLUSION_START = "#### 1.3.5 spaceCall 的 strict-profile 排除\n";
 const FORMAL_SPACECALL_EXCLUSION_END = "- 本排除与 `factor ::= spaceCall | postfix | whenExpr | ifExpr | caseExpr` 的 EBNF 并存：EBNF 描述全量语法空间，生产剖面按本条收窄，二者不构成矛盾。\n";
-const FORMAL_MODULE_VISIBILITY_SCHEMA = "cheng_formal_module_visibility.v1";
-const FORMAL_MODULE_VISIBILITY_SHA256 = "a8368440796baa9618426e55b204dfd62bac14c599f31ce1dd2145169ba8b169";
-const FORMAL_EXPRESSION_LEAF_COVERAGE_SCHEMA = "cheng_formal_expression_leaf_alternative_coverage.v1";
+const FORMAL_MODULE_VISIBILITY_SCHEMA = "cheng_formal_module_visibility";
+const CURRENT_FORMAL_SOURCE_MANIFEST_SCHEMA =
+  "cheng_current_formal_source_manifest";
+const CURRENT_FORMAL_PROFILE_SCHEMA = "cheng_current_formal_profile";
+const FORMAL_EXPRESSION_LEAF_COVERAGE_SCHEMA = "cheng_formal_expression_leaf_alternative_coverage";
 const FORMAL_EXPRESSION_STRUCTURAL_GAPS = Object.freeze([
   "callSuffix empty/nonempty and repeated arguments",
   "postfix and spaceAtom zero/one/multiple suffix composition",
@@ -142,58 +157,11 @@ const FORMAL_EXPRESSION_STRUCTURAL_GAPS = Object.freeze([
   "operator associativity and cross-production precedence require direct executable obligation mappings",
 ]);
 const FORMAL_GRAMMAR_BOUND_EXTERNAL_REFERENCES = Object.freeze(["caseEntry", "paramList", "pattern", "suite", "typeExpr", "typeParamList"]);
-const FORMAL_CHENG_COMPILER_PROFILE_SCHEMA = "cheng_formal_compile_profile.v1";
-const FORMAL_CHENG_COMPILER_ENV = Object.freeze({
-  BACKEND_INCREMENTAL: "0",
-  BACKEND_JOBS: "1",
-  BACKEND_MULTI_MODULE_CACHE: "0",
-  CHENG_BACKEND_DRIVER_HANDOFF: "0",
-  CHENG_DISABLE_COLD_OBJECT_CACHE: "1",
-  CHENG_DISABLE_PRIMARY_OBJECT_CACHE: "1",
-  CHENG_DISABLE_PROVIDER_OBJECT_CACHE: "1",
-  CHENG_DISABLE_PURE_EXE_CACHE: "1",
-  CHENG_NO_BACKEND_DRIVER_HANDOFF: "1",
-  CHENG_REQUIRE_PURE_SYSTEM_LINK_EXEC: "1",
-  CHENG_STRICT_CALL_SYNTAX: "1",
-  CHENG_STRICT_NO_CACHE: "1",
-  CHENG_SYSTEM_LINK_EXEC_NO_CACHE: "1",
-});
-const FORMAL_CHENG_COMPILER_UNSET_ENV = Object.freeze([
-  "BACKEND_FN_SCHED",
-  "BACKEND_STAGE1_LOCAL_ENV_LOOKUP",
-  "BACKEND_TARGET",
-  "CHENG_ALIAS_LICM_GVN",
-  "CHENG_ALIAS_LICM_GVN_APPLY",
-  "CHENG_BACKEND2",
-  "CHENG_BACKEND2_JOBS",
-  "CHENG_BACKEND2_SKIP_LOWER",
-  "CHENG_BACKEND_DRIVER_BOOTSTRAP_DOWNSTREAM",
-  "CHENG_COMPILER_CSG_LEGACY_CANONICAL_CID_DIAGNOSTIC",
-  "CHENG_CSGE_IR_CACHE_ROOT",
-  "CHENG_CSG_TYPED_IR_BATCH_LIMIT",
-  "CHENG_DISABLE_TRIVIAL_WRAPPER_REDIRECT",
-  "CHENG_ESCAPE_ARENA_APPLY",
-  "CHENG_ESCAPE_ARENA_ROUTE",
-  "CHENG_FULL_MATERIALIZE_EXE",
-  "CHENG_LEAF_INLINER",
-  "CHENG_NATIVE_LINK_PARALLEL",
-  "CHENG_NO_BOOTSTRAP_BRIDGE",
-  "CHENG_NO_IMPORT_BODIES",
-  "CHENG_OBJECT_REACHABLE_ONLY",
-  "CHENG_PRIMARY_KEEP_BODYIR_FOR_ZERO_SCAN",
-  "CHENG_PRIMARY_LOWER_RSS",
-  "CHENG_PURE_RAW_FLAG_BRIDGE",
-  "CHENG_REGALLOC_OVERLAY_DRYRUN",
-  "CHENG_SCOPE_EXIT_RELEASE",
-  "CHENG_SKIP_LOWER_DIR",
-  "CHENG_TARGET",
-  "CHENG_TYPED_EXPR_RHS_NODE_INDEX_BUILD",
-  "CHENG_TYPED_EXPR_V2",
-  "CHENG_TYPED_IR_KEEP_COLD_CSG_ROWS",
-  "CHENG_TYPED_IR_KEEP_COLD_CSG_STATEMENTS",
-  "CHENG_ZC_FAST_EXIT",
-  "STAGE1_FN_SCHED",
-]);
+const FORMAL_CHENG_COMPILER_PROFILE_SCHEMA = "cheng_formal_compile_profile";
+const FORMAL_CHENG_COMPILER_ENV =
+  CHENG_CURRENT_FORMAL_COMPILER_ENV;
+const FORMAL_CHENG_COMPILER_UNSET_ENV =
+  CHENG_CURRENT_FORMAL_COMPILER_UNSET_ENV;
 const AUTHORITY_MINIMUM_REQUIRED_FILES = Object.freeze([
   "src/core/lang/parser.cheng",
   "src/core/lang/typed_expr.cheng",
@@ -211,12 +179,16 @@ const POST_SEAL_LEGACY_SCANNER_FILES = Object.freeze(new Set([
   "src/core/backend/regalloc_aarch64_adapter.cheng",
   "src/core/backend/x86_64_body_emit.cheng",
   "src/core/backend2/backend2_pipeline.cheng",
-  "src/core/backend2/backend2_emit_ops.cheng",
   "src/core/backend2/backend2_lower.cheng",
   "src/core/backend2/backend2_lower_slots.cheng",
   "src/core/backend2/backend2_lower_stmt.cheng",
   "src/core/backend2/backend2_lower_util.cheng",
 ]));
+const REMOVED_BACKEND2_INDEPENDENT_EMITTER_MODULES = Object.freeze([
+  "src/core/backend2/backend2_emit.cheng",
+  "src/core/backend2/backend2_emit_ops.cheng",
+  "src/core/backend2/backend2_frame.cheng",
+]);
 const POST_SEAL_LEGACY_SCANNER_NAME_RULES = Object.freeze([
   Object.freeze({family: "source_lines_slot", pattern: /^PrimaryBodyIrSourceLinesSlot$/}),
   Object.freeze({family: "build_source_cache", pattern: /^PrimaryBodyIrBuildSource(?:[A-Z][A-Za-z0-9_]*)+Cache(?:For(?:[A-Z][A-Za-z0-9_]*)+)?$/}),
@@ -261,8 +233,14 @@ const TYPED_EXPR_EXACT_SOURCE_RECOVERY_FUNCTIONS = Object.freeze(new Map([
 ]));
 const TYPED_EXPR_RESULT_INTRINSIC_BUILDER = "TypedExprBuildFactInto";
 const POST_SEAL_FIXED_METADATA_TEXT_FUNCTIONS = Object.freeze(new Set([
+  "MetadataTextStable",
   "PrimaryObjectMetadataTextStable",
   "B2PrimaryObjectMetadataTextStable",
+]));
+const POST_SEAL_FIXED_METADATA_TEXT_FILES = Object.freeze(new Set([
+  "src/core/backend/metadata_text_authority.cheng",
+  "src/core/backend/primary_object_plan.cheng",
+  "src/core/backend2/backend2_lower_util.cheng",
 ]));
 const POST_SEAL_DYNAMIC_WORKLIST_CAP_FUNCTIONS = Object.freeze(new Set([
   "PrimaryBodyIrSeqAddValueNodeIsStructured",
@@ -340,8 +318,8 @@ const PIPELINE_ENTRY_LEGAL_SOURCE_IO_FUNCTION_SHA256 = Object.freeze({
   "src/core/tooling/path.cheng#ReadTextFile": "b3df18e49465c2e08d6caccc3f4a71a46f8635e4adcccfbfc233ec5aeae9f490",
 });
 const QUALIFIED_NESTED_CALL_WITNESS = Object.freeze({
-  schema: "cheng_qualified_nested_call_declaration_witness.v1",
-  id: "qualified_nested_call.std_monotimes.v1",
+  schema: "cheng_qualified_nested_call_declaration_witness",
+  id: "qualified_nested_call.std_monotimes",
   family: "qualified_nested_call_canonical_declaration",
   fixtureFile: "typedexpr_qualified_nested_call_positive.cheng",
   fixtureLabel: "fusion/typedexpr_qualified_nested_call_positive.cheng",
@@ -487,7 +465,7 @@ const FORMAL_OBLIGATION_IDS_BY_FAMILY = Object.freeze({
 });
 const TYPED_EXPR_MATRIX = [
   {family: "shared_cross_module_return_binding", expected: "GREEN", file: "typedexpr_shared_cross_module_positive.cheng"},
-  {family: "qualified_nested_call_canonical_declaration", expected: "GREEN", declarationWitnessId: "qualified_nested_call.std_monotimes.v1", file: "typedexpr_qualified_nested_call_positive.cheng"},
+  {family: "qualified_nested_call_canonical_declaration", expected: "GREEN", declarationWitnessId: "qualified_nested_call.std_monotimes", file: "typedexpr_qualified_nested_call_positive.cheng"},
   {family: "dynamic_seq_contextual_empty", expected: "GREEN", file: "typedexpr_seq_dynamic_empty_positive.cheng"},
   {family: "dynamic_seq_contextual_recursive_elements", expected: "GREEN", file: "typedexpr_contextual_seq_positive.cheng"},
   {family: "fixed_seq_contextual_matching_length", expected: "GREEN", file: "typedexpr_seq_fixed_context_positive.cheng"},
@@ -651,6 +629,11 @@ const MEMORY_EVENT_FIELDS = [
   "owned_slab_before_bytes", "owned_slab_peak_bytes", "owned_slab_after_bytes",
   "retained_before_bytes", "retained_peak_bytes", "retained_after_bytes",
 ];
+const MEMORY_ROW_BYTES = Object.freeze({
+  op: 44n,
+  slot: 52n,
+  call_arg: 24n,
+});
 
 function sha256(raw) {
   return createHash("sha256").update(raw).digest("hex");
@@ -901,10 +884,40 @@ function strictKv(raw, label, payloadKey) {
   return {rows, lines};
 }
 
-function formalExpressionSlice(raw, requirePinnedSha256 = true) {
+function validateCanonicalRegallocEvidenceLabels(raw, label) {
+  const text = typeof raw === "string"
+    ? raw
+    : new TextDecoder("utf-8", {fatal: true}).decode(raw);
+  const forbidden = [
+    /\bv(?:3|4|5|6)\s+(?:receipt|snapshot|ledger|report)\b/g,
+    /\b(?:receipt|object|snapshot|ledger|report)\/v(?:3|4|5|6)\b/g,
+    /(?:^|_)v(?:3|4|5|6)(?:_|$)/g,
+    /\bv(?:3|4|5|6)(?:\/v(?:3|4|5|6))+\s+evidence\b/g,
+    /\bregalloc_(?:single_pass\.production|frozen_plan_snapshot|action_emission_ledger|production_gate)\.v(?:3|4|5|6)\b/g,
+  ];
+  const matches = forbidden.flatMap((pattern) => text.match(pattern) || []);
+  if (matches.length !== 0) {
+    throw new Error(
+      `${label} retained legacy regalloc evidence labels: ${
+        [...new Set(matches)].sort().join(",")
+      }`,
+    );
+  }
+  return {
+    schema: "cheng_regalloc_evidence_label_surface",
+    label,
+    legacyLabelCount: 0,
+  };
+}
+
+function formalExpressionSlice(raw) {
   const text = typeof raw === "string" ? raw : new TextDecoder("utf-8", {fatal: true}).decode(raw);
-  const versionLine = `> 版本：${FORMAL_SPEC_VERSION}`;
-  if (text.split(versionLine).length !== 2) throw new Error(`formal spec version must be exactly ${FORMAL_SPEC_VERSION}`);
+  const versionMatches = [
+    ...text.matchAll(/^> 版本：([0-9]{4}-[0-9]{2}-[0-9]{2})$/gm),
+  ];
+  if (versionMatches.length !== 1 || versionMatches[0]?.[1] === undefined) {
+    throw new Error("formal spec must contain exactly one canonical version");
+  }
   const startAnchor = "expression     ::= conditionalExpr ;\n";
   const endAnchor = "iteratorLiteral ::= \"iterator\" [ ident ] [ typeParamList ] paramList\n                    [ \":\" typeExpr ]\n                    [ \"where\" expression ]\n                    \"=\" suite ;";
   const start = text.indexOf(startAnchor);
@@ -914,11 +927,15 @@ function formalExpressionSlice(raw, requirePinnedSha256 = true) {
   if (text[end] !== "\n") throw new Error("formal expression EBNF slice must end in LF");
   const slice = Buffer.from(text.slice(start, end + 1), "utf8");
   const sliceSha256 = sha256(slice);
-  if (requirePinnedSha256 && sliceSha256 !== FORMAL_EXPRESSION_SLICE_SHA256) throw new Error(`formal expression EBNF SHA-256 changed: ${sliceSha256}`);
-  return {text: slice.toString("utf8"), raw: slice, sha256: sliceSha256};
+  return {
+    text: slice.toString("utf8"),
+    raw: slice,
+    sha256: sliceSha256,
+    specVersion: versionMatches[0][1],
+  };
 }
 
-function exactFormalSpecSlice(text, label, startAnchor, endAnchor, expectedSha256, requirePinnedSha256) {
+function exactFormalSpecSlice(text, label, startAnchor, endAnchor) {
   const start = text.indexOf(startAnchor);
   const endStart = text.indexOf(endAnchor, start + startAnchor.length);
   if (start < 0 || endStart < 0 || text.indexOf(startAnchor, start + 1) >= 0 || text.indexOf(endAnchor, endStart + 1) >= 0) {
@@ -926,104 +943,489 @@ function exactFormalSpecSlice(text, label, startAnchor, endAnchor, expectedSha25
   }
   const end = endStart + endAnchor.length;
   const raw = Buffer.from(text.slice(start, end), "utf8");
-  const actualSha256 = sha256(raw);
-  if (requirePinnedSha256 && actualSha256 !== expectedSha256) throw new Error(`${label} SHA-256 changed: ${actualSha256}`);
-  return {text: raw.toString("utf8"), raw, sha256: actualSha256};
+  return {text: raw.toString("utf8"), raw, sha256: sha256(raw)};
 }
 
-function formalExpressionSupplementalSlices(raw, requirePinnedSha256 = true) {
+function formalExpressionSupplementalSlices(raw) {
   const text = typeof raw === "string" ? raw : new TextDecoder("utf-8", {fatal: true}).decode(raw);
   const grammar = exactFormalSpecSlice(
     text,
     "formal grammar block",
     "module         ::= { NEWLINE }\n",
     "charLiteral    ::= `'` CHARACTER `'` ;\n",
-    FORMAL_GRAMMAR_BLOCK_SHA256,
-    requirePinnedSha256,
   );
   const literals = exactFormalSpecSlice(
     text,
     "formal bool/char literal definitions",
     'boolLiteral    ::= "true" | "false" ;\n',
     "charLiteral    ::= `'` CHARACTER `'` ;\n",
-    FORMAL_LITERAL_DEFINITIONS_SHA256,
-    requirePinnedSha256,
   );
-  const lexical = text.includes("ident          ::= IDENT ;\n")
-    ? exactFormalSpecSlice(
-        text,
-        "formal lexical terminal definitions",
-        "ident          ::= IDENT ;\n",
-        "stringLiteral  ::= SHORT_STRING | MULTILINE_STRING ;\n",
-        FORMAL_LEXICAL_DEFINITIONS_SHA256,
-        requirePinnedSha256,
-      )
-    // 锚点缺席(旧 spec): 空 slice, sha 必不匹配钉值, lexicalBound 自然 UNPROVEN
-    : {text: "", raw: Buffer.alloc(0), sha256: sha256(Buffer.alloc(0))};
+  const lexical = exactFormalSpecSlice(
+    text,
+    "formal lexical terminal definitions",
+    "ident          ::= IDENT ;\n",
+    "stringLiteral  ::= SHORT_STRING | MULTILINE_STRING ;\n",
+  );
   const precedence = exactFormalSpecSlice(
     text,
     "formal operator precedence table",
     "### 1.3 运算符优先级\n",
     "| 15  | `?:` | 条件运算 |\n",
-    FORMAL_OPERATOR_PRECEDENCE_SHA256,
-    requirePinnedSha256,
   );
   const conditional = exactFormalSpecSlice(
     text,
     "formal conditional-expression semantics",
     "#### 1.3.4 条件表达式 `?:` 与 postfix `?` 区分\n",
     "- 例：`flag ? 1 : false ? 2 : 0` 按右结合解析为 `flag ? 1 : (false ? 2 : 0)`。\n",
-    FORMAL_CONDITIONAL_SEMANTICS_SHA256,
-    requirePinnedSha256,
   );
   const moduleVisibility = exactFormalSpecSlice(
     text,
     "formal module visibility semantics",
     "### 1.4 模块导出与可见性\n",
     "- 不支持 `*` 导出标记。\n",
-    FORMAL_MODULE_VISIBILITY_SHA256,
-    requirePinnedSha256,
   );
   return {grammar, literals, lexical, precedence, conditional, moduleVisibility};
 }
 
-function validateTypedExprFormalSpecBinding(raw, sourcePath = FORMAL_SPEC_RELATIVE) {
+function validateGeneratedEbnfParserMapBinding(
+  raw,
+  formalSpecRaw,
+  parserRaw,
+  producerDeclarationsRaw,
+) {
+  let value;
   try {
-    const slice = formalExpressionSlice(raw, true);
-    const supplemental = formalExpressionSupplementalSlices(raw, true);
+    value = JSON.parse(
+      new TextDecoder("utf-8", {fatal: true}).decode(raw),
+    );
+  } catch (error) {
+    throw new Error(
+      `generated EBNF parser map is not strict JSON: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  const exactTopLevel = [
+    "counts",
+    "parser",
+    "producerDeclarations",
+    "receiptEvidence",
+    "rows",
+    "schema",
+    "spec",
+  ];
+  if (value === null || typeof value !== "object" || Array.isArray(value) ||
+      JSON.stringify(Object.keys(value).sort()) !==
+        JSON.stringify(exactTopLevel)) {
+    throw new Error("generated EBNF parser map exact schema mismatch");
+  }
+  if (value.schema !== "cheng_ebnf_parser_node_map" ||
+      /\.v[0-9]+$/.test(value.schema)) {
+    throw new Error("generated EBNF parser map schema is not the unique current schema");
+  }
+  const formalSpecBytes = Buffer.isBuffer(formalSpecRaw)
+    ? formalSpecRaw
+    : Buffer.from(formalSpecRaw);
+  const parserBytes = Buffer.isBuffer(parserRaw)
+    ? parserRaw
+    : Buffer.from(parserRaw);
+  const producerDeclarationsBytes =
+    Buffer.isBuffer(producerDeclarationsRaw)
+      ? producerDeclarationsRaw
+      : Buffer.from(producerDeclarationsRaw);
+  const formalSpecSha256 = sha256(formalSpecBytes);
+  const parserSha256 = sha256(parserBytes);
+  const producerDeclarationsSha256 = sha256(producerDeclarationsBytes);
+  const regenerated = buildEbnfParserNodeMap(
+    formalSpecBytes,
+    parserBytes,
+    producerDeclarationsBytes,
+  );
+  const producerProjection = (doc) => ({
+    schema: doc.schema,
+    spec: doc.spec,
+    parser: doc.parser,
+    producerDeclarations: doc.producerDeclarations,
+    requiredObligationCount: doc.counts.requiredObligationCount,
+    rows: doc.rows.map((row) => ({
+      production: row.production,
+      name: row.name,
+      body_ref: row.body_ref,
+      parser_fn: row.parser_fn,
+      node_kinds: row.node_kinds,
+      node_kind_receipts: row.node_kind_receipts,
+      span_model: row.span_model,
+      required_obligation_count: row.required_obligation_count,
+      producer_receipt_sha256: row.producer_receipt_sha256,
+      notes: row.notes,
+    })),
+  });
+  if (canonicalJson(producerProjection(value)) !==
+      canonicalJson(producerProjection(regenerated))) {
+    throw new Error(
+      "generated EBNF parser map producer projection is not current",
+    );
+  }
+  const counts = value.counts;
+  const receipts = value.receiptEvidence;
+  const rows = value.rows;
+  if (value.spec?.path !== FORMAL_SPEC_RELATIVE ||
+      value.spec?.formalSpecSha256 !== formalSpecSha256 ||
+      typeof value.spec?.ebnfSha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(value.spec.ebnfSha256) ||
+      value.parser?.path !== "src/core/lang/parser.cheng" ||
+      value.parser?.sha256 !== parserSha256 ||
+      !Array.isArray(rows) ||
+      !Number.isSafeInteger(value.spec?.productionCount) ||
+      value.spec.productionCount <= 0 ||
+      rows.length !== value.spec.productionCount ||
+      value.producerDeclarations?.path !==
+        EBNF_PARSER_PRODUCER_DECLARATIONS_RELATIVE ||
+      value.producerDeclarations?.sha256 !==
+        producerDeclarationsSha256) {
+    throw new Error("generated EBNF parser map formal spec/parser identity mismatch");
+  }
+  const receiptRowKeys = [
+    "accepted",
+    "manifestPath",
+    "manifestSha256",
+    "reason",
+    "receiptPath",
+    "receiptSha256",
+    "sourcePath",
+    "sourceSha256",
+  ];
+  if (receipts === null || typeof receipts !== "object" ||
+      Array.isArray(receipts) ||
+      canonicalJson(Object.keys(receipts).sort()) !== canonicalJson([
+        "acceptedCount",
+        "inputCount",
+        "rejectedCount",
+        "rows",
+      ]) ||
+      !Number.isSafeInteger(receipts.inputCount) ||
+      receipts.inputCount <= 0 ||
+      receipts.acceptedCount !== receipts.inputCount ||
+      receipts.rejectedCount !== 0 ||
+      !Array.isArray(receipts.rows) ||
+      receipts.rows.length !== receipts.inputCount ||
+      receipts.rows.some((row) =>
+        row === null || typeof row !== "object" || Array.isArray(row) ||
+        canonicalJson(Object.keys(row).sort()) !==
+          canonicalJson(receiptRowKeys) ||
+        row?.accepted !== true ||
+        row?.reason !== "" ||
+        typeof row?.sourcePath !== "string" ||
+        row.sourcePath.length === 0 ||
+        typeof row?.receiptPath !== "string" ||
+        row.receiptPath.length === 0 ||
+        typeof row?.manifestPath !== "string" ||
+        row.manifestPath.length === 0 ||
+        !/^[0-9a-f]{64}$/.test(row?.sourceSha256 ?? "") ||
+        !/^[0-9a-f]{64}$/.test(row?.receiptSha256 ?? "") ||
+        !/^[0-9a-f]{64}$/.test(row?.manifestSha256 ?? "")
+      )) {
+    throw new Error("generated EBNF parser map has zero, rejected or malformed production receipts");
+  }
+  const receiptPaths = new Set();
+  const receiptFixedPointGroups = new Map();
+  for (const row of receipts.rows) {
+    if (receiptPaths.has(row.receiptPath)) {
+      throw new Error("generated EBNF parser map repeats a receipt path");
+    }
+    receiptPaths.add(row.receiptPath);
+    const groupKey = `${row.manifestSha256}\0${row.sourcePath}`;
+    const group = receiptFixedPointGroups.get(groupKey) ?? [];
+    group.push(row);
+    receiptFixedPointGroups.set(groupKey, group);
+  }
+  if ([...receiptFixedPointGroups.values()].some((group) =>
+    group.length !== 2 ||
+    group[0].sourceSha256 !== group[1].sourceSha256 ||
+    group[0].manifestPath !== group[1].manifestPath ||
+    group[0].receiptSha256 === group[1].receiptSha256
+  )) {
+    throw new Error(
+      "generated EBNF parser map receipt fixed point identity is invalid",
+    );
+  }
+  const mapRowKeys = [
+    "body_ref",
+    "missing_required_count",
+    "missing_required_obligation_ids",
+    "name",
+    "node_kind_receipts",
+    "node_kinds",
+    "notes",
+    "parser_fn",
+    "producer_receipt_sha256",
+    "production",
+    "receipt_ready",
+    "required_obligation_count",
+    "span_model",
+    "status",
+    "witness_projections",
+    "witness_receipt_sha256s",
+    "witnessed_required_count",
+  ];
+  const witnessProjectionKeys = [
+    "channel",
+    "obligation_id",
+    "parser_node_identity_sha256",
+    "parser_node_kind",
+    "receipt_sha256",
+  ];
+  if (counts === null || typeof counts !== "object" ||
+      Array.isArray(counts) ||
+      canonicalJson(Object.keys(counts).sort()) !== canonicalJson([
+        "MAPPED",
+        "PARTIAL",
+        "UNMAPPED",
+        "missingRequiredCount",
+        "requiredObligationCount",
+        "total",
+        "witnessedRequiredCount",
+      ]) ||
+      counts.total !== rows.length ||
+      counts.MAPPED + counts.PARTIAL + counts.UNMAPPED !== rows.length ||
+      counts.requiredObligationCount !==
+        counts.witnessedRequiredCount + counts.missingRequiredCount ||
+      counts.MAPPED !== rows.length ||
+      counts.PARTIAL !== 0 ||
+      counts.UNMAPPED !== 0 ||
+      counts.requiredObligationCount <= 0 ||
+      counts.witnessedRequiredCount !== counts.requiredObligationCount ||
+      counts.missingRequiredCount !== 0 ||
+      rows.some((row, index) =>
+        row === null || typeof row !== "object" || Array.isArray(row) ||
+        canonicalJson(Object.keys(row).sort()) !== canonicalJson(mapRowKeys) ||
+        row?.production !== index + 1 ||
+        row?.status !== "MAPPED" ||
+        row?.receipt_ready !== true ||
+        row.required_obligation_count !==
+          row.witnessed_required_count + row.missing_required_count ||
+        row.witnessed_required_count !== row.required_obligation_count ||
+        row.missing_required_count !== 0 ||
+        !Array.isArray(row.missing_required_obligation_ids) ||
+        row.missing_required_obligation_ids.length !== 0 ||
+        !Array.isArray(row.witness_receipt_sha256s) ||
+        row.witness_receipt_sha256s.length === 0 ||
+        row.witness_receipt_sha256s.some((receiptSha256) =>
+          !/^[0-9a-f]{64}$/.test(receiptSha256)) ||
+        !Array.isArray(row.witness_projections) ||
+        new Set(row.witness_projections.map((projection) =>
+          projection?.obligation_id)).size !==
+            row.required_obligation_count ||
+        row.witness_projections.some((projection) =>
+          projection === null ||
+          typeof projection !== "object" ||
+          Array.isArray(projection) ||
+          canonicalJson(Object.keys(projection).sort()) !==
+            canonicalJson(witnessProjectionKeys) ||
+          typeof projection.channel !== "string" ||
+          projection.channel.length === 0 ||
+          typeof projection.obligation_id !== "string" ||
+          projection.obligation_id.length === 0 ||
+          typeof projection.parser_node_kind !== "string" ||
+          projection.parser_node_kind.length === 0 ||
+          !parserOwnedStructuredWitnessAccepted(
+            row.span_model,
+            projection.parser_node_kind,
+          ) ||
+          !/^[0-9a-f]{64}$/.test(
+            projection.parser_node_identity_sha256 ?? "") ||
+          !/^[0-9a-f]{64}$/.test(projection.receipt_sha256 ?? "") ||
+          !row.witness_receipt_sha256s.includes(
+            projection.receipt_sha256))
+      )) {
+    throw new Error("generated EBNF parser map obligation/status projection is invalid");
+  }
+  const receiptGroupKeyBySha256 = new Map();
+  for (const [groupKey, group] of receiptFixedPointGroups) {
+    for (const receipt of group) {
+      if (receiptGroupKeyBySha256.has(receipt.receiptSha256)) {
+        throw new Error(
+          "generated EBNF parser map repeats a receipt content identity",
+        );
+      }
+      receiptGroupKeyBySha256.set(receipt.receiptSha256, groupKey);
+    }
+  }
+  const admittedReceiptSha256s =
+    new Set(receipts.rows.map((row) => row.receiptSha256));
+  for (const [index, row] of rows.entries()) {
+    const expectedObligationIds =
+      regenerated.rows[index].missing_required_obligation_ids;
+    const projectedObligationIds = [
+      ...new Set(row.witness_projections.map(
+        (projection) => projection.obligation_id,
+      )),
+    ].sort();
+    if (canonicalJson(projectedObligationIds) !==
+          canonicalJson([...expectedObligationIds].sort()) ||
+        row.witness_receipt_sha256s.some(
+          (receiptSha256) =>
+            !admittedReceiptSha256s.has(receiptSha256)) ||
+        row.witness_projections.some(
+          (projection) =>
+            !admittedReceiptSha256s.has(
+              projection.receipt_sha256))) {
+      throw new Error(
+        "generated EBNF parser map witness projection is not receipt-bound",
+      );
+    }
+    for (const obligationId of expectedObligationIds) {
+      const groups = new Map();
+      for (const projection of row.witness_projections) {
+        if (projection.obligation_id !== obligationId) continue;
+        const groupKey =
+          receiptGroupKeyBySha256.get(projection.receipt_sha256);
+        if (groupKey === undefined) {
+          throw new Error(
+            "generated EBNF parser map witness projection receipt is unknown",
+          );
+        }
+        const receiptHashes = groups.get(groupKey) ?? new Set();
+        receiptHashes.add(projection.receipt_sha256);
+        groups.set(groupKey, receiptHashes);
+      }
+      if (![...groups.values()].some(
+        (receiptHashes) => receiptHashes.size === 2)) {
+        throw new Error(
+          "generated EBNF parser map witness projection lacks " +
+          "a two-driver fixed point",
+        );
+      }
+    }
+  }
+  return {
+    schema: value.schema,
+    mapSha256: sha256(Buffer.isBuffer(raw) ? raw : Buffer.from(raw)),
+    formalSpecSha256: value.spec.formalSpecSha256,
+    formalEbnfSha256: value.spec.ebnfSha256,
+    parserSha256: value.parser.sha256,
+    producerDeclarationsSha256: value.producerDeclarations.sha256,
+    receiptEvidenceSha256: sha256(
+      Buffer.from(canonicalJson(receipts)),
+    ),
+    productionCount: value.spec.productionCount,
+    receiptInputCount: receipts.inputCount,
+    receiptAcceptedCount: receipts.acceptedCount,
+    mappedCount: counts.MAPPED,
+    partialCount: counts.PARTIAL,
+    unmappedCount: counts.UNMAPPED,
+    requiredObligationCount: counts.requiredObligationCount,
+    witnessedRequiredCount: counts.witnessedRequiredCount,
+    missingRequiredCount: counts.missingRequiredCount,
+  };
+}
+
+function validateTypedExprFormalSpecBinding(
+  raw,
+  generatedMapRaw,
+  parserRaw,
+  producerDeclarationsRaw,
+  identityContext,
+) {
+  const sourcePath = identityContext?.sourcePath ?? FORMAL_SPEC_RELATIVE;
+  try {
+    if (identityContext === null || typeof identityContext !== "object" ||
+        !/^[0-9a-f]{64}$/.test(
+          identityContext.sourceSnapshotSha256 ?? "") ||
+        !/^[0-9a-f]{64}$/.test(
+          identityContext.receiptToolClosureSha256 ?? "") ||
+        !/^[0-9a-f]{64}$/.test(
+          identityContext.receiptSourcePlanSha256 ?? "")) {
+      throw new Error(
+        "current formal profile requires exact source snapshot, receipt tool closure and source-plan identities",
+      );
+    }
+    const formalSpecRaw = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+    const generatedMap = validateGeneratedEbnfParserMapBinding(
+      generatedMapRaw,
+      formalSpecRaw,
+      parserRaw,
+      producerDeclarationsRaw,
+    );
+    const slice = formalExpressionSlice(formalSpecRaw);
+    const supplemental = formalExpressionSupplementalSlices(raw);
+    const supplementalBindings = [
+      {schema: FORMAL_GRAMMAR_BLOCK_SCHEMA, sha256: supplemental.grammar.sha256, bytes: supplemental.grammar.raw.length},
+      {schema: FORMAL_LITERAL_DEFINITIONS_SCHEMA, sha256: supplemental.literals.sha256, bytes: supplemental.literals.raw.length},
+      {schema: FORMAL_LEXICAL_DEFINITIONS_SCHEMA, sha256: supplemental.lexical.sha256, bytes: supplemental.lexical.raw.length},
+      {schema: FORMAL_OPERATOR_PRECEDENCE_SCHEMA, sha256: supplemental.precedence.sha256, bytes: supplemental.precedence.raw.length},
+      {schema: FORMAL_CONDITIONAL_SEMANTICS_SCHEMA, sha256: supplemental.conditional.sha256, bytes: supplemental.conditional.raw.length},
+      {schema: FORMAL_MODULE_VISIBILITY_SCHEMA, sha256: supplemental.moduleVisibility.sha256, bytes: supplemental.moduleVisibility.raw.length},
+    ];
+    const currentSourceManifest = {
+      schema: CURRENT_FORMAL_SOURCE_MANIFEST_SCHEMA,
+      sourceSnapshotSha256: identityContext.sourceSnapshotSha256,
+      receiptToolClosureSha256:
+        identityContext.receiptToolClosureSha256,
+      receiptSourcePlanSha256:
+        identityContext.receiptSourcePlanSha256,
+      receiptEvidenceSha256: generatedMap.receiptEvidenceSha256,
+      files: [
+        {path: FORMAL_SPEC_RELATIVE, sha256: generatedMap.formalSpecSha256},
+        {path: "src/core/lang/parser.cheng", sha256: generatedMap.parserSha256},
+        {
+          path: EBNF_PARSER_PRODUCER_DECLARATIONS_RELATIVE,
+          sha256: generatedMap.producerDeclarationsSha256,
+        },
+        {
+          path: EBNF_PARSER_NODE_MAP_RELATIVE,
+          sha256: generatedMap.mapSha256,
+        },
+      ],
+    };
+    const currentSourceManifestSha256 = sha256(
+      Buffer.from(canonicalJson(currentSourceManifest)),
+    );
+    const profilePayload = {
+      schema: CURRENT_FORMAL_PROFILE_SCHEMA,
+      specVersion: slice.specVersion,
+      sourceManifestSha256: currentSourceManifestSha256,
+      sourceSnapshotSha256: identityContext.sourceSnapshotSha256,
+      receiptToolClosureSha256:
+        identityContext.receiptToolClosureSha256,
+      receiptSourcePlanSha256:
+        identityContext.receiptSourcePlanSha256,
+      formalSpecSha256: generatedMap.formalSpecSha256,
+      formalEbnfSha256: generatedMap.formalEbnfSha256,
+      expressionSliceSha256: slice.sha256,
+      mapSha256: generatedMap.mapSha256,
+      receiptEvidenceSha256: generatedMap.receiptEvidenceSha256,
+      compilerProfileSha256: formalChengCompilerProfile().sha256,
+      supplementalBindings,
+    };
+    const profileIdentitySha256 = sha256(
+      Buffer.from(canonicalJson(profilePayload)),
+    );
+    if (identityContext.expectedProfileIdentitySha256 !== undefined &&
+        identityContext.expectedProfileIdentitySha256 !==
+          profileIdentitySha256) {
+      throw new Error("current formal profile identity drifted");
+    }
     return {
       status: "GREEN",
-      reason: "formal expression EBNF, literal definitions, precedence, conditional semantics and module import/export visibility are exact-hash bound",
+      reason: "formal blocks, parser producer projection, parser receipts and the current source snapshot manifest share one exact identity",
       sourcePath,
-      schema: FORMAL_EXPRESSION_SLICE_SCHEMA,
-      specVersion: FORMAL_SPEC_VERSION,
+      schema: CURRENT_FORMAL_PROFILE_SCHEMA,
+      specVersion: slice.specVersion,
       sliceSha256: slice.sha256,
       sliceBytes: slice.raw.length,
-      supplementalBindings: [
-        {schema: FORMAL_GRAMMAR_BLOCK_SCHEMA, sha256: supplemental.grammar.sha256, bytes: supplemental.grammar.raw.length},
-        {schema: FORMAL_LITERAL_DEFINITIONS_SCHEMA, sha256: supplemental.literals.sha256, bytes: supplemental.literals.raw.length},
-        {schema: FORMAL_LEXICAL_DEFINITIONS_SCHEMA, sha256: supplemental.lexical.sha256, bytes: supplemental.lexical.raw.length},
-        {schema: FORMAL_OPERATOR_PRECEDENCE_SCHEMA, sha256: supplemental.precedence.sha256, bytes: supplemental.precedence.raw.length},
-        {schema: FORMAL_CONDITIONAL_SEMANTICS_SCHEMA, sha256: supplemental.conditional.sha256, bytes: supplemental.conditional.raw.length},
-        {schema: FORMAL_MODULE_VISIBILITY_SCHEMA, sha256: supplemental.moduleVisibility.sha256, bytes: supplemental.moduleVisibility.raw.length},
-      ],
+      generatedMap,
+      currentSourceManifest,
+      currentSourceManifestSha256,
+      profileIdentitySha256,
+      supplementalBindings,
     };
   } catch (error) {
     return {
       status: "UNPROVEN",
       reason: error instanceof Error ? error.message : String(error),
       sourcePath,
-      schema: FORMAL_EXPRESSION_SLICE_SCHEMA,
-      specVersion: FORMAL_SPEC_VERSION,
-      expectedSliceSha256: FORMAL_EXPRESSION_SLICE_SHA256,
-      expectedSupplementalSha256: {
-        [FORMAL_GRAMMAR_BLOCK_SCHEMA]: FORMAL_GRAMMAR_BLOCK_SHA256,
-        [FORMAL_LITERAL_DEFINITIONS_SCHEMA]: FORMAL_LITERAL_DEFINITIONS_SHA256,
-        [FORMAL_LEXICAL_DEFINITIONS_SCHEMA]: FORMAL_LEXICAL_DEFINITIONS_SHA256,
-        [FORMAL_OPERATOR_PRECEDENCE_SCHEMA]: FORMAL_OPERATOR_PRECEDENCE_SHA256,
-        [FORMAL_CONDITIONAL_SEMANTICS_SCHEMA]: FORMAL_CONDITIONAL_SEMANTICS_SHA256,
-        [FORMAL_MODULE_VISIBILITY_SCHEMA]: FORMAL_MODULE_VISIBILITY_SHA256,
-      },
+      schema: CURRENT_FORMAL_PROFILE_SCHEMA,
     };
   }
 }
@@ -1130,9 +1532,9 @@ function renderFormalEbnfNode(node) {
   throw new Error(`unknown formal EBNF node kind: ${node.kind}`);
 }
 
-function deriveFormalExpressionObligationManifest(raw, requirePinnedSha256 = true) {
-  const slice = formalExpressionSlice(raw, requirePinnedSha256);
-  const supplemental = formalExpressionSupplementalSlices(raw, requirePinnedSha256);
+function deriveFormalExpressionObligationManifest(raw) {
+  const slice = formalExpressionSlice(raw);
+  const supplemental = formalExpressionSupplementalSlices(raw);
   const productions = parseFormalExpressionEbnf(slice.text);
   const productionNames = new Set(productions.map((production) => production.name));
   const externalReferences = new Set();
@@ -1259,11 +1661,15 @@ function deriveFormalExpressionObligationManifest(raw, requirePinnedSha256 = tru
   const externalReferenceBindings = [];
   for (const reference of [...externalReferences].sort()) {
     const definition = literalDefinitions.get(reference) || null;
-    const literalBound = definition !== null && supplemental.literals.text.includes(definition) && supplemental.literals.sha256 === FORMAL_LITERAL_DEFINITIONS_SHA256;
+    const literalBound =
+      definition !== null && supplemental.literals.text.includes(definition);
     const lexicalDefinition = lexicalDefinitions.get(reference) || null;
-    const lexicalBound = lexicalDefinition !== null && supplemental.lexical.text.includes(lexicalDefinition) && supplemental.lexical.sha256 === FORMAL_LEXICAL_DEFINITIONS_SHA256;
+    const lexicalBound = lexicalDefinition !== null &&
+      supplemental.lexical.text.includes(lexicalDefinition);
     const grammarPattern = new RegExp(`^${reference}\\s+::=`, "m");
-    const grammarBound = FORMAL_GRAMMAR_BOUND_EXTERNAL_REFERENCES.includes(reference) && supplemental.grammar.sha256 === FORMAL_GRAMMAR_BLOCK_SHA256 && grammarPattern.test(supplemental.grammar.text);
+    const grammarBound =
+      FORMAL_GRAMMAR_BOUND_EXTERNAL_REFERENCES.includes(reference) &&
+      grammarPattern.test(supplemental.grammar.text);
     const bound = literalBound || lexicalBound || grammarBound;
     const binding = {
       reference,
@@ -1296,7 +1702,7 @@ function deriveFormalExpressionObligationManifest(raw, requirePinnedSha256 = tru
     fragment: supplemental.precedence.text,
     fragment_sha256: supplemental.precedence.sha256,
     evidenceRequirement: "formal_spec_binding",
-    bindingStatus: supplemental.precedence.sha256 === FORMAL_OPERATOR_PRECEDENCE_SHA256 ? "GREEN" : "UNPROVEN",
+    bindingStatus: "GREEN",
     sourceSchema: FORMAL_OPERATOR_PRECEDENCE_SCHEMA,
     sourceSha256: supplemental.precedence.sha256,
   });
@@ -1309,7 +1715,7 @@ function deriveFormalExpressionObligationManifest(raw, requirePinnedSha256 = tru
     fragment: shiftRow,
     fragment_sha256: sha256(Buffer.from(shiftRow, "utf8")),
     evidenceRequirement: "formal_and_fixture",
-    bindingStatus: supplemental.precedence.sha256 === FORMAL_OPERATOR_PRECEDENCE_SHA256 && supplemental.precedence.text.includes(shiftRow) ? "GREEN" : "UNPROVEN",
+    bindingStatus: supplemental.precedence.text.includes(shiftRow) ? "GREEN" : "UNPROVEN",
     sourceSchema: FORMAL_OPERATOR_PRECEDENCE_SCHEMA,
     sourceSha256: supplemental.precedence.sha256,
   });
@@ -1322,7 +1728,7 @@ function deriveFormalExpressionObligationManifest(raw, requirePinnedSha256 = tru
     fragment: conditionalRightAssociative,
     fragment_sha256: sha256(Buffer.from(conditionalRightAssociative, "utf8")),
     evidenceRequirement: "formal_and_fixture",
-    bindingStatus: supplemental.conditional.sha256 === FORMAL_CONDITIONAL_SEMANTICS_SHA256 && supplemental.conditional.text.includes(conditionalRightAssociative) ? "GREEN" : "UNPROVEN",
+    bindingStatus: supplemental.conditional.text.includes(conditionalRightAssociative) ? "GREEN" : "UNPROVEN",
     sourceSchema: FORMAL_CONDITIONAL_SEMANTICS_SCHEMA,
     sourceSha256: supplemental.conditional.sha256,
   });
@@ -1334,10 +1740,14 @@ function deriveFormalExpressionObligationManifest(raw, requirePinnedSha256 = tru
   let spaceCallExclusion = null;
   const specText = typeof raw === "string" ? raw : new TextDecoder("utf-8", {fatal: true}).decode(raw);
   if (specText.includes(FORMAL_SPACECALL_EXCLUSION_START)) {
-    spaceCallExclusion = exactFormalSpecSlice(specText, "formal spaceCall exclusion", FORMAL_SPACECALL_EXCLUSION_START, FORMAL_SPACECALL_EXCLUSION_END, FORMAL_SPACECALL_EXCLUSION_SHA256, false);
+    spaceCallExclusion = exactFormalSpecSlice(
+      specText,
+      "formal spaceCall exclusion",
+      FORMAL_SPACECALL_EXCLUSION_START,
+      FORMAL_SPACECALL_EXCLUSION_END,
+    );
   }
   const spaceCallExclusionBound = spaceCallExclusion !== null
-    && spaceCallExclusion.sha256 === FORMAL_SPACECALL_EXCLUSION_SHA256
     && spaceCallExclusion.text.includes("CHENG_STRICT_CALL_SYNTAX=1")
     && spaceCallExclusion.text.includes("space_call_removed");
   const formalProfileContradictions = [];
@@ -1379,8 +1789,8 @@ function deriveFormalExpressionObligationManifest(raw, requirePinnedSha256 = tru
   }
   obligations.sort((left, right) => left.obligation_id.localeCompare(right.obligation_id));
   const manifestPayload = {
-    schema: "cheng_formal_expression_ebnf_obligation_manifest.v1",
-    specVersion: FORMAL_SPEC_VERSION,
+    schema: "cheng_formal_expression_ebnf_obligation_manifest",
+    specVersion: slice.specVersion,
     sliceSha256: slice.sha256,
     supplementalSliceSha256: {
       grammar: supplemental.grammar.sha256,
@@ -1439,7 +1849,7 @@ function evaluateFormalExpressionObligationCoverage(manifest, leafCoverage) {
   return {
     status: missingObligationIds.length === 0 ? "GREEN" : "UNPROVEN",
     reason: missingObligationIds.length === 0 ? "every mechanically derived EBNF/semantic obligation has an exact formal binding or structured parser/IR execution witness" : `${missingObligationIds.length} mechanically derived EBNF/semantic obligations lack an exact formal binding or structured parser/IR execution witness; ${declaredObligations.size} fixture mappings are declarations only`,
-    schema: "cheng_formal_expression_ebnf_obligation_coverage.v1",
+    schema: "cheng_formal_expression_ebnf_obligation_coverage",
     manifestSha256: manifest.manifestSha256,
     obligationCount: manifest.obligationCount,
     satisfiedObligationCount: satisfied.size,
@@ -2269,7 +2679,7 @@ function validateAuthorityProductionClosure(sourceRows, strictFileSet = true, ro
       family,
       line: node.fn.line,
       functionSha256: sha256(Buffer.from(node.fn.raw, "utf8")),
-      formalModuleVisibilitySha256: FORMAL_MODULE_VISIBILITY_SHA256,
+      formalModuleVisibilityBinding: CURRENT_FORMAL_PROFILE_SCHEMA,
     }];
   }).sort((left, right) => left.key.localeCompare(right.key));
   if (legacyReexportScannerExistence.length > 0) issues.push("post_seal_invalid_import_reexport_scanner_present");
@@ -2522,7 +2932,7 @@ function validateAuthorityProductionClosure(sourceRows, strictFileSet = true, ro
 
   const postSealFixedMetadataTextCaps = [];
   for (const node of nodes.values()) {
-    if (!POST_SEAL_LEGACY_SCANNER_FILES.has(node.file) || !POST_SEAL_FIXED_METADATA_TEXT_FUNCTIONS.has(node.name)) continue;
+    if (!POST_SEAL_FIXED_METADATA_TEXT_FILES.has(node.file) || !POST_SEAL_FIXED_METADATA_TEXT_FUNCTIONS.has(node.name)) continue;
     for (const match of node.fn.code.matchAll(/\btext\.len\s*(?:>|>=)\s*([0-9]+)\b/g)) {
       const relativeLine = node.fn.code.slice(0, match.index).split("\n").length;
       postSealFixedMetadataTextCaps.push({key: keyFor(node.file, node.name), line: node.fn.line + relativeLine - 1, counter: "text.len", limit: Number(match[1]), kind: "semantic_type_or_layout_text_length", reachable: entryForwardReachable.has(keyFor(node.file, node.name))});
@@ -2625,7 +3035,6 @@ function validateAuthorityProductionClosure(sourceRows, strictFileSet = true, ro
   const postSealPredictorFillerMirrorViolations = [];
   for (const file of [
     "src/core/backend/primary_object_plan.cheng",
-    "src/core/backend2/backend2_emit_ops.cheng",
   ]) {
     const predictor = nodes.get(keyFor(file, "PrimaryBodyIRStrEqWordCount"));
     const filler = nodes.get(keyFor(file, "PrimaryBodyIRFillStrEqOp"));
@@ -2948,15 +3357,13 @@ function validateAuthorityProductionClosure(sourceRows, strictFileSet = true, ro
     const condExact = (node, parameter, tag, condition) => !!node && new RegExp(`\\b${parameter}\\s*==\\s*coreir\\.${tag}\\s*:\\s*return\\s+a64\\.${condition}\\b`).test(node.fn.code);
     const adapterCondNode = nodes.get(keyFor(adapterFile, "regallocA64CondCode"));
     const primaryCondNode = nodes.get(keyFor("src/core/backend/primary_object_plan.cheng", "PrimaryBodyCondArm64TrueCode"));
-    const backend2CondNode = nodes.get(keyFor("src/core/backend2/backend2_emit_ops.cheng", "PrimaryBodyCondArm64TrueCode"));
     const condReasons = [];
     for (const [tag, condition] of f64CondMapping) {
       if (!condExact(primaryCondNode, "condTag", tag, condition)) condReasons.push(`primary_canonical_${tag}_${condition}_missing`);
-      if (!condExact(backend2CondNode, "condTag", tag, condition)) condReasons.push(`backend2_canonical_${tag}_${condition}_missing`);
       if (!condExact(adapterCondNode, "cond", tag, condition)) condReasons.push(`adapter_${tag}_must_map_${condition}`);
     }
     if (adapterCondNode && !adapterReachableKeys.has(keyFor(adapterFile, "regallocA64CondCode"))) condReasons.push("adapter_condition_mapper_not_reachable_from_recipe_root");
-    evidenceFor("f64_cond_canonical_mirror", condReasons, [adapterCondNode, primaryCondNode, backend2CondNode]);
+    evidenceFor("f64_cond_canonical_mirror", condReasons, [adapterCondNode, primaryCondNode]);
 
     const machineFragmentsNode = nodes.get(keyFor(adapterFile, "regallocA64BuildMachineFragments"));
     const homeReasons = [];
@@ -3415,7 +3822,7 @@ function validateAuthorityProductionClosure(sourceRows, strictFileSet = true, ro
   return {
     status: issues.length === 0 ? "GREEN" : "RED",
     reason: issues.length === 0 ? "source-wide post-seal invariants pass; reachability fields are bounded syntactic evidence, not compiler-resolved call authority" : issues.join(","),
-    schema: "cheng_regalloc_authority_production_closure.v2",
+    schema: "cheng_regalloc_authority_production_closure",
     productionRoots: exactRootFiles,
     requiredBackend2PipelineRoot: BACKEND2_PIPELINE_AUTHORITY_ROOT,
     fileCount: actualFiles.length,
@@ -3753,6 +4160,29 @@ function validateCIncludeClosure(fixtureSnapshot, bootstrapSnapshots) {
   return {fileCount: reachable.size, edgeCount: edges.length, files: [...reachable].sort(), edges: edges.sort((left, right) => left.from.localeCompare(right.from) || left.line - right.line || left.to.localeCompare(right.to))};
 }
 
+function validateRemovedBackend2IndependentEmitterModules(treeRoot) {
+  const absences = [];
+  for (const relativePath of REMOVED_BACKEND2_INDEPENDENT_EMITTER_MODULES) {
+    const removedPath = join(treeRoot, relativePath);
+    try {
+      lstatSync(removedPath);
+      throw new Error(
+        `removed independent backend2 emitter module is present: ${relativePath}`,
+      );
+    } catch (error) {
+      if (error && error.code === "ENOENT") {
+        absences.push({
+          label: `removed/${relativePath}`,
+          path: removedPath,
+        });
+        continue;
+      }
+      throw error;
+    }
+  }
+  return absences;
+}
+
 function snapshotSourceInputs(treeRoot, explicitInputs = {}) {
   const sourceRoot = join(treeRoot, "src");
   canonicalAbsolute(sourceRoot, "treeRoot/src", "dir");
@@ -3770,7 +4200,8 @@ function snapshotSourceInputs(treeRoot, explicitInputs = {}) {
   ];
   const visited = new Set();
   const snapshots = [];
-  const absences = [];
+  const absences =
+    validateRemovedBackend2IndependentEmitterModules(treeRoot);
   const snapshotPaths = new Map();
   const addSnapshot = (path, label, detail) => {
     const prior = snapshotPaths.get(path);
@@ -3804,6 +4235,50 @@ function snapshotSourceInputs(treeRoot, explicitInputs = {}) {
     if (!path.endsWith(".ts")) throw new Error(`Fusion src closure contains a non-TypeScript file: ${path}`);
     addSnapshot(path, `fusion/${relative(FUSION_ROOT, path).split("\\").join("/")}`, `Fusion source ${path}`);
   }
+  const fusionToolRoot = join(FUSION_ROOT, "tools");
+  canonicalAbsolute(fusionToolRoot, "Fusion tools", "dir");
+  const formalReceiptToolFiles =
+    walkRegularFiles(fusionToolRoot, "Fusion formal receipt tools");
+  for (const path of formalReceiptToolFiles) {
+    addSnapshot(
+      path,
+      `fusion/${relative(FUSION_ROOT, path).split("\\").join("/")}`,
+      `Fusion formal receipt tool ${path}`,
+    );
+  }
+  const formalReceiptSourcePlanRoot =
+    join(FUSION_ROOT, "fixtures/semantic/grammar_corpus");
+  canonicalAbsolute(
+    formalReceiptSourcePlanRoot,
+    "Fusion formal receipt source plan",
+    "dir",
+  );
+  const formalReceiptSourcePlan =
+    readCurrentChengGrammarCorpus(formalReceiptSourcePlanRoot);
+  const formalReceiptSourcePlanFiles = [
+    formalReceiptSourcePlan.pointerPath,
+    ...formalReceiptSourcePlan.filePaths.values(),
+  ].sort();
+  if (formalReceiptSourcePlanFiles.length === 0) {
+    throw new Error("formal receipt source plan is empty");
+  }
+  for (const path of formalReceiptSourcePlanFiles) {
+    addSnapshot(
+      path,
+      `fusion/${relative(FUSION_ROOT, path).split("\\").join("/")}`,
+      `Fusion formal receipt source-plan input ${path}`,
+    );
+  }
+  addSnapshot(
+    EBNF_PARSER_NODE_MAP_PATH,
+    `fusion/${EBNF_PARSER_NODE_MAP_RELATIVE}`,
+    "generated formal EBNF/parser production-receipt map",
+  );
+  addSnapshot(
+    EBNF_PARSER_PRODUCER_DECLARATIONS_PATH,
+    `fusion/${EBNF_PARSER_PRODUCER_DECLARATIONS_RELATIVE}`,
+    "formal EBNF parser producer declarations",
+  );
   const fusionNodeModulesRoot = join(FUSION_ROOT, "node_modules");
   canonicalAbsolute(fusionNodeModulesRoot, "Fusion node_modules", "dir");
   const fusionDependencyFiles = walkRegularFiles(fusionNodeModulesRoot, "Fusion node_modules");
@@ -3844,7 +4319,11 @@ function snapshotSourceInputs(treeRoot, explicitInputs = {}) {
   if (!Array.isArray(manifestAuthorityRoots) || manifestAuthorityRoots.some((path) => typeof path !== "string" || !/^src\/[A-Za-z0-9_/]+\.cheng$/.test(path))) {
     throw new Error("validated source-manifest authority roots must be canonical Cheng source paths");
   }
-  const authorityRootFiles = [...new Set([...AUTHORITY_MINIMUM_REQUIRED_FILES, ...manifestAuthorityRoots])].sort();
+  const authorityRootFiles = [...new Set([
+    ...AUTHORITY_MINIMUM_REQUIRED_FILES,
+    ...FORMAL_RECEIPT_AUTHORITY_FILES,
+    ...manifestAuthorityRoots,
+  ])].sort();
   const authorityProductionFiles = new Set();
   const authorityQueue = authorityRootFiles.map((relativePath) => ({relativePath, path: join(treeRoot, relativePath)}));
   while (authorityQueue.length > 0) {
@@ -3884,6 +4363,31 @@ function snapshotSourceInputs(treeRoot, explicitInputs = {}) {
     ...absences.map((entry) => `A\0${entry.label}\0${entry.path}\n`),
   ];
   const digest = sha256(Buffer.from(digestRows.join(""), "utf8"));
+  const formalReceiptToolClosureRows = formalReceiptToolFiles.map((path) => {
+    const snapshot = snapshotPaths.get(path);
+    if (snapshot === undefined) {
+      throw new Error(`formal receipt tool is absent from snapshot: ${path}`);
+    }
+    return {
+      path: relative(FUSION_ROOT, path).split("\\").join("/"),
+      byteLength: snapshot.raw.length,
+      sha256: snapshot.sha256,
+    };
+  });
+  const formalReceiptSourcePlanRows =
+    formalReceiptSourcePlanFiles.map((path) => {
+      const snapshot = snapshotPaths.get(path);
+      if (snapshot === undefined) {
+        throw new Error(
+          `formal receipt source-plan input is absent from snapshot: ${path}`,
+        );
+      }
+      return {
+        path: relative(FUSION_ROOT, path).split("\\").join("/"),
+        byteLength: snapshot.raw.length,
+        sha256: snapshot.sha256,
+      };
+    });
   return {
     sha256: digest,
     snapshots,
@@ -3897,6 +4401,20 @@ function snapshotSourceInputs(treeRoot, explicitInputs = {}) {
     fusionSourceFileCount: fusionSourceFiles.length,
     fusionDependencyFileCount: fusionDependencyFiles.length,
     fusionFixtureCount: actualFixturePaths.length,
+    formalReceiptToolClosure: {
+      fileCount: formalReceiptToolClosureRows.length,
+      sha256: sha256(Buffer.from(canonicalJson(
+        formalReceiptToolClosureRows,
+      ))),
+      rows: formalReceiptToolClosureRows,
+    },
+    formalReceiptSourcePlan: {
+      fileCount: formalReceiptSourcePlanRows.length,
+      sha256: sha256(Buffer.from(canonicalJson(
+        formalReceiptSourcePlanRows,
+      ))),
+      rows: formalReceiptSourcePlanRows,
+    },
   };
 }
 
@@ -3928,7 +4446,7 @@ function sourceInputsDifference(left, right) {
 function validateSourceManifestPath(treeRoot, manifestPath) {
   const manifest = stableSnapshot(manifestPath, "regalloc source manifest", 64 * 1024 * 1024);
   const {rows} = strictKv(manifest.raw, "regalloc source manifest", "manifest_payload_sha256");
-  if (rows.get("schema") !== "regalloc_source_manifest.v2" || rows.get("target") !== TARGET) throw new Error("regalloc source manifest schema/target mismatch");
+  if (rows.get("schema") !== "regalloc_source_manifest" || rows.get("target") !== TARGET) throw new Error("regalloc source manifest schema/target mismatch");
   const fileCount = Number(uintValue(rows.get("file_count"), "file_count", 1000000n));
   const edgeCount = Number(uintValue(rows.get("import_edge_count"), "import_edge_count", 10000000n));
   if (fileCount <= 0) throw new Error("regalloc source manifest file_count must be positive");
@@ -4003,6 +4521,10 @@ function validateSourceManifestPath(treeRoot, manifestPath) {
     entryModule,
     allocatorIndex: modules.indexOf("core/backend/regalloc_single_pass"),
     relativePaths: files.map((file) => file.relativePath),
+    files: files.map((file) => ({
+      relativePath: file.relativePath,
+      sha256: file.snapshot.sha256,
+    })),
   };
 }
 
@@ -4011,20 +4533,22 @@ function eventNumber(rows, index, name) {
 }
 
 function bodyBytes(body) {
-  return body.opCapacity * 20n + body.slotCapacity * 36n + body.callArgCapacity * 8n;
+  return body.opCapacity * MEMORY_ROW_BYTES.op +
+    body.slotCapacity * MEMORY_ROW_BYTES.slot +
+    body.callArgCapacity * MEMORY_ROW_BYTES.call_arg;
 }
 
 function validateMemoryManifestBytes(raw) {
   const {rows} = strictKv(raw, "cold BodyIR memory manifest", "manifest_payload_sha256");
   const header = {
-    schema: "cold_bodyir_memory_manifest.v1",
+    schema: "cold_bodyir_memory_manifest",
     scope: "arena_used_plus_bodyir_owned_slabs",
     pointer_width_bits: "64",
     arena_alignment_bytes: "8",
     arena_page_payload_bytes: "65536",
-    op_row_bytes: "20",
-    slot_row_bytes: "36",
-    call_arg_row_bytes: "8",
+    op_row_bytes: MEMORY_ROW_BYTES.op.toString(),
+    slot_row_bytes: MEMORY_ROW_BYTES.slot.toString(),
+    call_arg_row_bytes: MEMORY_ROW_BYTES.call_arg.toString(),
     initial_op_capacity: "64",
     initial_slot_capacity: "32",
     initial_call_arg_capacity: "8",
@@ -4121,7 +4645,8 @@ function validateMemoryManifestBytes(raw) {
       } else if (cloneSourceId !== body.cloneSourceId) throw new Error(`event ${index} clone source mismatch`);
       const capKey = family === "op" ? "opCapacity" : family === "slot" ? "slotCapacity" : "callArgCapacity";
       const countKey = family === "op" ? "opCount" : family === "slot" ? "slotCount" : "callArgCount";
-      const rowBytes = family === "op" ? 20n : family === "slot" ? 36n : 8n;
+      const rowBytes = MEMORY_ROW_BYTES[family];
+      if (rowBytes === undefined) throw new Error(`event ${index} has unknown slab row width family`);
       const initial = family === "op" ? 64n : family === "slot" ? 32n : 8n;
       if (body[capKey] !== numbers.old_capacity || numbers.old_bytes !== numbers.old_capacity * rowBytes || numbers.new_bytes !== numbers.new_capacity * rowBytes) throw new Error(`event ${index} slab byte/capacity mismatch`);
       if (cause === "grow" && !((numbers.old_capacity === 0n && numbers.new_capacity === initial) || (numbers.old_capacity > 0n && numbers.new_capacity === numbers.old_capacity * 2n))) throw new Error(`event ${index} is outside the doubling chain`);
@@ -4208,8 +4733,8 @@ function validateBackend2VersionManifest(root, snapshot) {
   const exact = ["schema", "version", "sources_sha256", "framing", "source_count"];
   for (let index = 0; index < count; index++) exact.push(`source_${String(index).padStart(4, "0")}`);
   exactKeys(rows, exact, "backend2 version manifest");
-  if (rows.get("schema") !== "backend2_version_manifest.v2" ||
-      rows.get("framing") !== "backend2_codegen_semantic_closure.framed.v3" ||
+  if (rows.get("schema") !== "backend2_version_manifest" ||
+      rows.get("framing") !== "backend2_codegen_semantic_closure.framed" ||
       !/^backend2-slice[1-9]\d*$/.test(String(rows.get("version") || ""))) {
     throw new Error("backend2 version manifest schema/framing/version mismatch");
   }
@@ -4239,7 +4764,7 @@ function validateBackend2VersionSentinelReport(snapshot, backend2VersionManifest
   for (let index = 0; index < backend2VersionManifest.sourceCount; index++) exact.push(`source_${String(index).padStart(4, "0")}`);
   exactKeys(rows, exact, "backend2 version sentinel report");
   const expected = new Map([
-    ["schema", "backend2_version_sentinel.v3"], ["status", "PASS"], ["rc", "0"],
+    ["schema", "backend2_version_sentinel"], ["status", "PASS"], ["rc", "0"],
     ["version", backend2VersionManifest.version], ["sources_sha256", backend2VersionManifest.sourcesSha256],
     ["manifest_sha256", backend2VersionManifest.manifestSha256], ["framing", backend2VersionManifest.framing],
     ["source_count", String(backend2VersionManifest.sourceCount)],
@@ -4294,7 +4819,7 @@ function recomputeCompilerOutputReceiptCid(compileReceiptCid, outputSha256, back
   };
   const compileReceiptRaw = Buffer.from(requireSha256(compileReceiptCid, "compiler output receipt compile CID"), "hex");
   const payload = Buffer.concat([
-    framedText("cheng.compiler.output_receipt.v1"),
+    framedText("cheng.compiler.output_receipt"),
     compileReceiptRaw,
     Buffer.from(requireSha256(outputSha256, "compiler output receipt output SHA-256"), "hex"),
     Buffer.from(requireSha256(backend2VersionManifestSha256, "compiler output receipt backend2 manifest SHA-256"), "hex"),
@@ -4307,7 +4832,7 @@ function recomputeCompilerOutputReceiptCid(compileReceiptCid, outputSha256, back
   return sha256(payload);
 }
 
-function validateAndRecomputeCompileReceiptV2(rows, expected) {
+function validateAndRecomputeCompileReceipt(rows, expected) {
   const fixedKeys = [
     "compile_receipt_world_head_cid", "compile_receipt_source_bundle_cid", "compile_receipt_entry_source_cid",
     "compile_receipt_compiler_csg_cid", "compile_receipt_canonical_compiler_csg_cid",
@@ -4326,21 +4851,21 @@ function validateAndRecomputeCompileReceiptV2(rows, expected) {
     providers.push(provider);
   }
   const exactPrefixedKeys = new Set([
-    "compile_receipt_version", ...fixedKeys, "compile_receipt_source_snapshot_count", "compile_receipt_entry_mode",
+    ...fixedKeys, "compile_receipt_source_snapshot_count", "compile_receipt_entry_mode",
     "compile_receipt_target", "compile_receipt_bootstrap_stage", "compile_receipt_runtime_provider_count",
     ...providerKeys, "compile_receipt_cid",
   ]);
   const actualPrefixedKeys = [...rows.keys()].filter((key) => key.startsWith("compile_receipt_"));
   if (actualPrefixedKeys.length !== exactPrefixedKeys.size || actualPrefixedKeys.some((key) => !exactPrefixedKeys.has(key))) {
-    throw new Error("compiler report compile receipt v2 field set mismatch");
+    throw new Error("compiler report compile receipt field set mismatch");
   }
-  if (rows.get("compile_receipt_version") !== "2" || rows.get("compile_receipt_entry_mode") !== "unelaborated" || rows.get("compile_receipt_target") !== TARGET) {
-    throw new Error("compiler report compile receipt v2 mode/target/version mismatch");
+  if (rows.get("compile_receipt_entry_mode") !== "unelaborated" || rows.get("compile_receipt_target") !== TARGET) {
+    throw new Error("compiler report compile receipt mode/target mismatch");
   }
   const sourceBundleCid = requireSha256(rows.get("compile_receipt_source_bundle_cid"), "compiler report compile receipt source bundle CID");
   const entrySourceCid = requireSha256(rows.get("compile_receipt_entry_source_cid"), "compiler report compile receipt entry source CID");
   if (sourceBundleCid !== expected.sourceBundleCid || sourceCount.toString() !== expected.sourceSnapshotCount || entrySourceCid !== expected.entrySourceCid) {
-    throw new Error("compiler report compile receipt v2 source identity cross-binding mismatch");
+    throw new Error("compiler report compile receipt source identity cross-binding mismatch");
   }
   const framedText = (value, label) => {
     if (typeof value !== "string" || value.length === 0) throw new Error(`${label} must be nonempty UTF-8 text`);
@@ -4356,7 +4881,7 @@ function validateAndRecomputeCompileReceiptV2(rows, expected) {
     return raw;
   };
   const payload = Buffer.concat([
-    framedText("cheng.compiler.compile_receipt.v2", "compiler receipt domain"),
+    framedText("cheng.compiler.compile_receipt", "compiler receipt domain"),
     Buffer.from(requireSha256(rows.get("compile_receipt_world_head_cid"), "compiler report world-head CID"), "hex"),
     Buffer.from(sourceBundleCid, "hex"), u32be(sourceCount), Buffer.from(entrySourceCid, "hex"),
     framedText(rows.get("compile_receipt_entry_mode"), "compiler receipt entry mode"),
@@ -4371,7 +4896,7 @@ function validateAndRecomputeCompileReceiptV2(rows, expected) {
   const recomputedCid = sha256(payload);
   const reportedCid = requireSha256(rows.get("compile_receipt_cid"), "compiler report compile receipt CID");
   if (recomputedCid !== reportedCid || reportedCid !== expected.compileReceiptCid) {
-    throw new Error("compiler report compile receipt v2 CID does not independently match its canonical payload");
+    throw new Error("compiler report compile receipt CID does not independently match its canonical payload");
   }
   return {cid: recomputedCid, sourceCount: sourceCount.toString(), providerCount: providerCount.toString(), providers};
 }
@@ -4389,8 +4914,8 @@ function validateOfficialDriverBuildReceipt(root, receiptSnapshot, officialDrive
     "source_bundle_cid", "compiler_source_manifest_sha256", "workspace_source_manifest_sha256",
     "target", "driver_path", "driver_sha256", "backend2_version_manifest_path",
     "backend2_version_manifest_sha256", "output_path", "output_sha256", "output_bytes",
-    "compiler_report_path", "compiler_report_sha256", "compile_receipt_version", "compile_receipt_cid",
-    "compiler_output_receipt_version", "compiler_output_receipt_cid",
+    "compiler_report_path", "compiler_report_sha256", "compile_receipt_cid",
+    "compiler_output_receipt_cid",
     "full_backend_codegen", "cold_system_link_exec", "system_link_exec_scope", "memory_guard_mode",
     "memory_limit_bytes", "process_tree_enforced_peak_bytes", "receipt_payload_sha256",
   ], "official build receipt");
@@ -4399,12 +4924,12 @@ function validateOfficialDriverBuildReceipt(root, receiptSnapshot, officialDrive
   const compilerReportPath = join(directory, "cheng.compiler-main.materialize.report.txt");
   const seedPath = join(root, "artifacts/bootstrap/cheng.stage3");
   const exact = new Map([
-    ["schema", "current_source_compiler_build_receipt.v3"], ["status", "complete"],
+    ["schema", "current_source_compiler_build_receipt"], ["status", "complete"],
     ["entry_path", entryPath], ["entry_mode", "unelaborated"], ["target", TARGET],
     ["driver_path", seedPath], ["backend2_version_manifest_path", backend2VersionManifest.manifestPath],
     ["backend2_version_manifest_sha256", backend2VersionManifest.manifestSha256],
     ["output_path", candidatePath], ["compiler_report_path", compilerReportPath],
-    ["compile_receipt_version", "2"], ["compiler_output_receipt_version", "1"], ["full_backend_codegen", "1"],
+    ["full_backend_codegen", "1"],
     ["cold_system_link_exec", "0"], ["system_link_exec_scope", "selfhost_direct"],
     ["memory_guard_mode", "process_tree"], ["memory_limit_bytes", String(DEFAULT_RSS_CAP_BYTES)],
   ]);
@@ -4433,14 +4958,14 @@ function validateOfficialDriverBuildReceipt(root, receiptSnapshot, officialDrive
   const compilerReport = stableSnapshot(compilerReportPath, "official compiler-produced materialize report", 256 * 1024 * 1024);
   if (compilerReport.sha256 !== requireSha256(rows.get("compiler_report_sha256"), "official compiler report SHA-256")) throw new Error("official compiler-produced materialize report hash mismatch");
   const {rows: compilerRows} = parseUniqueUnhashedKv(compilerReport.raw, "official compiler-produced materialize report");
-  const compileReceipt = validateAndRecomputeCompileReceiptV2(compilerRows, {
+  const compileReceipt = validateAndRecomputeCompileReceipt(compilerRows, {
     sourceBundleCid, sourceSnapshotCount: sourceSnapshotCount.toString(), entrySourceCid: entry.sha256, compileReceiptCid,
   });
   const compilerExpected = new Map([
     ["entry", entryPath], ["entry_mode", "unelaborated"], ["entry_source_cid", entry.sha256],
     ["source_snapshot_count", sourceSnapshotCount.toString()], ["source_bundle_cid", sourceBundleCid],
-    ["source_manifest_sha256", sourceBundleCid], ["compile_receipt_version", "2"],
-    ["compile_receipt_cid", compileReceiptCid], ["compiler_output_receipt_version", "1"],
+    ["source_manifest_sha256", sourceBundleCid],
+    ["compile_receipt_cid", compileReceiptCid],
     ["compiler_output_receipt_cid", compilerOutputReceiptCid], ["target", TARGET], ["emit", "exe"],
     ["output", candidatePath], ["output_sha256", outputSha256],
     ["backend2_version_manifest_sha256", backend2VersionManifest.manifestSha256],
@@ -4483,9 +5008,38 @@ function validateProductionGateDependencyBundle(sources) {
     const actualSha256 = sha256(Buffer.from(raw));
     if (source?.sha256 && source.sha256 !== actualSha256) throw new Error(`production gate dependency snapshot hash mismatch: ${relativePath}`);
     if (actualSha256 !== PRODUCTION_GATE_DEPENDENCY_EXPECTED_SHA256[relativePath]) throw new Error(`production gate dependency exact source hash mismatch: ${relativePath}`);
+    if (relativePath === PRODUCTION_GATE_DEPENDENCY_FILES.gate) {
+      const gateText = Buffer.from(raw).toString("utf8");
+      for (const required of [
+        "legacy_definition_or_field_present:",
+        "mutation.task_local_definition=blocked",
+        "mutation.task_local_field=blocked",
+        "mutation.predictor_state=blocked",
+        "mutation.predictor_lookup=blocked",
+        "mutation.legacy_report=blocked",
+        "mutation.x86_plan_path=blocked",
+        "mutation.artifact_target_identity=blocked",
+        "mutation.artifact_darwin_packed=blocked",
+        "mutation.emitter_target_identity=blocked",
+        "mutation.emitter_x86_recipe_path=blocked",
+        "mutation.backend2_generic_entry=blocked",
+        "mutation.x86_reloc_delete=blocked",
+        "mutation.x86_target_swap=blocked",
+        "mutation.x86_symbol_swap=blocked",
+        "mutation.x86_relocation_swap=blocked",
+        "mutation.x86_action_consumer_bypass=blocked",
+        "mutation.x86_cfg_branch_delete=blocked",
+        "mutation.x86_cfg_target_redirect=blocked",
+        "mutation.x86_cfg_duplicate_consumer=blocked",
+        "mutation.x86_primary_reloc_consumer_bypass=blocked",
+        "mutation.x86_backend2_reloc_consumer_bypass=blocked",
+      ]) {
+        if (!gateText.includes(required)) throw new Error(`production gate legacy-source zero-existence contract missing: ${required}`);
+      }
+    }
     files.push({path: relativePath, sha256: actualSha256});
   }
-  return {schema: "cheng_regalloc_production_gate_dependencies.v1", files};
+  return {schema: "cheng_regalloc_production_gate_dependencies", files};
 }
 
 function validateReleaseEvidenceFieldPresence(input) {
@@ -4498,6 +5052,38 @@ function validateReleaseEvidenceFieldPresence(input) {
     if (!input[key]) throw new Error(`${key} is required in release mode`);
   }
   return true;
+}
+
+function validateExecutionStageReleaseBindings(executionStagePolicy, executionStageValidation, officialDriverSha256, currentSourceManifest) {
+  const officialSha256 = requireSha256(officialDriverSha256, "official current-source driver SHA-256");
+  if (executionStagePolicy?.identityInputs?.driverBytes?.bytesRaw32 !== officialSha256) {
+    throw new Error("seven-stage execution identity is not bound to the official current-source driver bytes");
+  }
+  if (executionStagePolicy?.targetTriple !== TARGET) {
+    throw new Error("seven-stage execution identity target differs from the release target");
+  }
+  if (executionStagePolicy?.identityInputs?.compilerSourceClosure?.bytesRaw32 !== currentSourceManifest?.sha256) {
+    throw new Error("seven-stage execution identity is not bound to the current source manifest bytes");
+  }
+  const currentSourceHashes = new Map(
+    (currentSourceManifest?.files || []).map((entry) => [entry.relativePath, entry.sha256]),
+  );
+  if (!Array.isArray(executionStagePolicy?.stages) || executionStagePolicy.stages.length !== 7) {
+    throw new Error("seven-stage execution policy does not contain exactly seven producer bindings");
+  }
+  for (const stage of executionStagePolicy.stages) {
+    if (currentSourceHashes.get(stage?.producerSource?.path) !== stage?.producerSource?.bytesRaw32) {
+      throw new Error(`seven-stage producer source is not an exact current source-manifest member: ${stage?.stageKind || "unknown"}`);
+    }
+  }
+  return {
+    schema: "cheng_regalloc_execution_stage_release_identity",
+    receiptSha256: requireSha256(executionStageValidation?.receiptFileBytesRaw32, "seven-stage receipt SHA-256"),
+    executionRaw32: requireSha256(executionStageValidation?.executionRaw32, "seven-stage execution identity"),
+    sevenStageRootRaw32: requireSha256(executionStageValidation?.sevenStageRootRaw32, "seven-stage root"),
+    stageReceiptRaw32s: executionStageValidation.stageReceiptRaw32s,
+    stageArtifactByteLengths: executionStageValidation.stageArtifactByteLengths,
+  };
 }
 
 function pathIsWithin(parent, candidate) {
@@ -4622,7 +5208,7 @@ function validateReleaseWorkClaim(claim) {
     throw new Error("release claim metadata differs from the exact acquired/finalized contract");
   }
   return {
-    schema: "cheng_regalloc_release_claim_identity.v1",
+    schema: "cheng_regalloc_release_claim_identity",
     path: claim.path,
     sha256: heldSnapshot.sha256,
     device: heldSnapshot.stat.dev.toString(),
@@ -4681,12 +5267,12 @@ function acquireReleaseWorkClaim(root, input) {
     const runId = randomBytes(16).toString("hex");
     const path = join(workRoot, ".cheng-regalloc-preflight.claim");
     fd = openSync(path, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-    const expectedRaw = Buffer.from(`schema=cheng_regalloc_release_claim.v1\nrun_id=${runId}\n`, "utf8");
+    const expectedRaw = Buffer.from(`schema=cheng_regalloc_release_claim\nrun_id=${runId}\n`, "utf8");
     writeAllAt(fd, expectedRaw, 0);
     fsyncSync(fd);
     fsyncDirectory(workRoot);
     const stat = fstatSync(fd, {bigint: true});
-    const claim = {schema: "cheng_regalloc_release_claim.v1", runId, workRoot, path, fd, rootFd, stat, expectedRaw, finalized: false};
+    const claim = {schema: "cheng_regalloc_release_claim", runId, workRoot, path, fd, rootFd, stat, expectedRaw, finalized: false};
     validateReleaseWorkClaim(claim);
     claim.expectedStat = fstatSync(fd, {bigint: true});
     return claim;
@@ -4724,9 +5310,9 @@ function adoptReleaseWorkClaim(root, input, oneShotContext) {
     fd = openSync(path, constants.O_RDWR | constants.O_NOFOLLOW);
     const expectedRaw = Buffer.from(oneShotContext.claimRawBase64, "base64");
     const expectedStat = statIdentityValue(oneShotContext.claimStat, "one-shot release claim stat");
-    const claim = {schema: "cheng_regalloc_release_claim.v1", runId: oneShotContext.claimRunId, workRoot, path, fd, rootFd, expectedRaw, expectedStat, finalized: false, oneShotDirectory};
+    const claim = {schema: "cheng_regalloc_release_claim", runId: oneShotContext.claimRunId, workRoot, path, fd, rootFd, expectedRaw, expectedStat, finalized: false, oneShotDirectory};
     const identity = validateReleaseWorkClaim(claim);
-    const expectedRunRaw = Buffer.from(`schema=cheng_regalloc_release_claim.v1\nrun_id=${oneShotContext.claimRunId}\n`, "utf8");
+    const expectedRunRaw = Buffer.from(`schema=cheng_regalloc_release_claim\nrun_id=${oneShotContext.claimRunId}\n`, "utf8");
     if (!expectedRaw.equals(expectedRunRaw) || identity.sha256 !== sha256(expectedRaw)) throw new Error("one-shot release claim raw/run binding mismatch");
     return claim;
   } catch (error) {
@@ -4772,7 +5358,7 @@ function materializePrivateProductionExecBundle(releaseInputs) {
     exactDistinctSnapshots([...files.values()], "private production exec bundle");
     fsyncDirectory(bundlePath);
     fsyncDirectory(releaseInputs.releaseWorkRoot);
-    return {schema: "cheng_regalloc_private_exec_bundle.v1", path: canonicalAbsolute(bundlePath, "private production exec bundle", "dir"), files};
+    return {schema: "cheng_regalloc_private_exec_bundle", path: canonicalAbsolute(bundlePath, "private production exec bundle", "dir"), files};
   } catch (error) {
     fsyncDirectory(releaseInputs.releaseWorkRoot);
     throw error;
@@ -4834,7 +5420,7 @@ function validatePrivateRuntimeGateBundle(directoryValue, expectedFiles) {
     artifacts.push({relativePath, path, sha256: snapshot.sha256, device: snapshot.stat.dev.toString(), inode: snapshot.stat.ino.toString(), size: snapshot.stat.size.toString(), mtimeNs: snapshot.stat.mtimeNs.toString(), ctimeNs: snapshot.stat.ctimeNs.toString()});
   }
   const artifactSetSha256 = sha256(Buffer.from(artifacts.map((entry) => `${entry.relativePath}\0${entry.sha256}\0${entry.device}\0${entry.inode}\0${entry.size}\0${entry.mtimeNs}\0${entry.ctimeNs}\n`).join(""), "utf8"));
-  return {schema: "cheng_regalloc_private_runtime_gate_bundle.v1", directory, files: expectedFiles, artifacts, artifactSetSha256};
+  return {schema: "cheng_regalloc_private_runtime_gate_bundle", directory, files: expectedFiles, artifacts, artifactSetSha256};
 }
 
 function copyStableExecutableToPrivatePath(sourcePath, label, destination, expectedPin) {
@@ -4926,7 +5512,7 @@ function materializePrivatePythonRuntime(parentDirectory, name = "python-runtime
   }
   for (const path of [...directoryPaths].sort((left, right) => right.length - left.length)) fsyncDirectory(path);
   const artifactSetSha256 = sha256(Buffer.from(artifacts.map((entry) => `${entry.relativePath}\0${entry.sourceSha256}\0${entry.sourceStat.dev}\0${entry.sourceStat.ino}\0${entry.private.sha256}\0${entry.private.stat.dev}\0${entry.private.stat.ino}\n`).join(""), "utf8"));
-  const runtime = {schema: "cheng_regalloc_private_python_runtime.v1", root: canonicalAbsolute(root, "private Python runtime", "dir"), bin: canonicalAbsolute(join(root, "bin"), "private Python bin", "dir"), version: source.version, artifactSetSha256, artifacts};
+  const runtime = {schema: "cheng_regalloc_private_python_runtime", root: canonicalAbsolute(root, "private Python runtime", "dir"), bin: canonicalAbsolute(join(root, "bin"), "private Python bin", "dir"), version: source.version, artifactSetSha256, artifacts};
   validatePrivatePythonRuntime(runtime);
   return runtime;
 }
@@ -4947,7 +5533,7 @@ function validatePrivatePythonRuntime(runtime) {
   }
   const artifactSetSha256 = sha256(Buffer.from(expected.map((entry) => `${entry.relativePath}\0${entry.sourceSha256}\0${entry.sourceStat.dev}\0${entry.sourceStat.ino}\0${entry.private.sha256}\0${entry.private.stat.dev}\0${entry.private.stat.ino}\n`).join(""), "utf8"));
   if (artifactSetSha256 !== runtime.artifactSetSha256) throw new Error("private Python runtime artifact-set binding mismatch");
-  return {schema: "cheng_regalloc_private_python_runtime_evidence.v1", root, bin: runtime.bin, version: runtime.version, artifactCount: expected.length, artifactSetSha256};
+  return {schema: "cheng_regalloc_private_python_runtime_evidence", root, bin: runtime.bin, version: runtime.version, artifactCount: expected.length, artifactSetSha256};
 }
 
 function immutableRootOwnedExecutable(pathValue, label) {
@@ -5020,7 +5606,7 @@ function materializePrivateReleaseToolchain(releaseInputs, coldDriverPath, compi
   const rgSource = stableStreamingSnapshot(canonicalAbsolute(rgSourcePath, "release rg source", "file", true), "release rg source");
   const rgPrivate = copyStableExecutableToPrivatePath(rgSource.path, "release rg", join(bin, "rg"), rgSource);
   tools.set("rg", {name: "rg", kind: "private_copy", target: rgPrivate, source: rgSource, wrapper: rgPrivate});
-  const fields = [["schema", "cheng_regalloc_private_toolchain.v2"], ["path", bin], ["developer_dir", xcode.developer], ["tool_count", tools.size], ["cold_driver_path", coldDriver.path], ["cold_driver_sha256", coldDriver.sha256], ["python_runtime_sha256", pythonRuntime.artifactSetSha256]];
+  const fields = [["schema", "cheng_regalloc_private_toolchain"], ["path", bin], ["developer_dir", xcode.developer], ["tool_count", tools.size], ["cold_driver_path", coldDriver.path], ["cold_driver_sha256", coldDriver.sha256], ["python_runtime_sha256", pythonRuntime.artifactSetSha256]];
   const ordered = [...tools.values()].sort((left, right) => left.name.localeCompare(right.name));
   for (let index = 0; index < ordered.length; index++) {
     const tool = ordered[index];
@@ -5034,7 +5620,7 @@ function materializePrivateReleaseToolchain(releaseInputs, coldDriverPath, compi
   fsyncDirectory(bin);
   fsyncDirectory(directory);
   fsyncDirectory(releaseInputs.releaseWorkRoot);
-  const toolchain = {schema: "cheng_regalloc_private_toolchain.v2", directory: canonicalAbsolute(directory, "private release toolchain", "dir"), bin: canonicalAbsolute(bin, "private release tool bin", "dir"), developerDir: xcode.developer, coldDriver, compiler, compilerInput: compilerPin, pythonRuntime, tools, manifest};
+  const toolchain = {schema: "cheng_regalloc_private_toolchain", directory: canonicalAbsolute(directory, "private release toolchain", "dir"), bin: canonicalAbsolute(bin, "private release tool bin", "dir"), developerDir: xcode.developer, coldDriver, compiler, compilerInput: compilerPin, pythonRuntime, tools, manifest};
   validatePrivateReleaseToolchain(toolchain);
   return toolchain;
 }
@@ -5060,7 +5646,7 @@ function validatePrivateReleaseToolchain(toolchain) {
   const coldDriver = stableStreamingSnapshot(toolchain.coldDriver.path, "private cold driver final");
   const compiler = stableStreamingSnapshot(toolchain.compiler.path, "release actual C compiler final");
   if (coldDriver.sha256 !== toolchain.coldDriver.sha256 || !sameStat(coldDriver.stat, toolchain.coldDriver.stat) || compiler.sha256 !== toolchain.compiler.sha256 || !sameStat(compiler.stat, toolchain.compiler.stat)) throw new Error("private release driver/compiler identity changed");
-  return {schema: "cheng_regalloc_private_toolchain_evidence.v2", manifestPath: manifest.path, manifestSha256: manifest.sha256, path: toolchain.bin, developerDir: toolchain.developerDir, toolCount: toolchain.tools.size, coldDriverSha256: coldDriver.sha256, compilerSha256: compiler.sha256, pythonRuntimeSha256: pythonRuntime.artifactSetSha256, pythonRuntimeArtifactCount: pythonRuntime.artifactCount};
+  return {schema: "cheng_regalloc_private_toolchain_evidence", manifestPath: manifest.path, manifestSha256: manifest.sha256, path: toolchain.bin, developerDir: toolchain.developerDir, toolCount: toolchain.tools.size, coldDriverSha256: coldDriver.sha256, compilerSha256: compiler.sha256, pythonRuntimeSha256: pythonRuntime.artifactSetSha256, pythonRuntimeArtifactCount: pythonRuntime.artifactCount};
 }
 
 function privateReleaseExecutionEnv(toolchain, extraEnv = {}) {
@@ -5086,7 +5672,7 @@ function exactIdentitySnapshot(identity, label, executable = false, allowEmpty =
 
 function validateOneShotBundleBuild(context, directory, bun, guard, bundleSource, privateSourceTree, privatePythonRuntime) {
   const build = context.bundleBuild;
-  if (!build || build.schema !== "cheng_regalloc_one_shot_bundle_build.v1" || build.timeoutSeconds !== ONE_SHOT_BUNDLE_BUILD_TIMEOUT_SECONDS) throw new Error("one-shot private Bun bundle-build schema/timeout mismatch");
+  if (!build || build.schema !== "cheng_regalloc_one_shot_bundle_build" || build.timeoutSeconds !== ONE_SHOT_BUNDLE_BUILD_TIMEOUT_SECONDS) throw new Error("one-shot private Bun bundle-build schema/timeout mismatch");
   const outputDirectory = canonicalAbsolute(build.outputDirectory, "one-shot private Bun bundle output directory", "dir");
   if (dirname(outputDirectory) !== directory || basename(outputDirectory) !== "bundle-build-output") throw new Error("one-shot private Bun bundle output directory mismatch");
   const homeDirectory = canonicalAbsolute(build.homeDirectory, "one-shot private Bun bundle home directory", "dir");
@@ -5121,11 +5707,11 @@ function validateOneShotBundleBuild(context, directory, bun, guard, bundleSource
     throw new Error("one-shot private Bun build guard/stream identity mismatch");
   }
   if (bun.path !== context.bun.path || guard.path !== context.guard.path) throw new Error("one-shot private Bun build tool identity mismatch");
-  return {schema: "cheng_regalloc_one_shot_bundle_build_evidence.v1", outputDirectory, homeDirectory, tempDirectory, guardSha256: buildGuard.sha256, stdoutSha256: buildStdout.sha256, stderrSha256: buildStderr.sha256, peakBytes: revalidated.peakBytes, sampleCount: revalidated.sampleCount, timeoutSeconds: revalidated.timeoutSeconds};
+  return {schema: "cheng_regalloc_one_shot_bundle_build_evidence", outputDirectory, homeDirectory, tempDirectory, guardSha256: buildGuard.sha256, stdoutSha256: buildStdout.sha256, stderrSha256: buildStderr.sha256, peakBytes: revalidated.peakBytes, sampleCount: revalidated.sampleCount, timeoutSeconds: revalidated.timeoutSeconds};
 }
 
 function validateOneShotWorkerContext(context, explicitRequestIdentity = null) {
-  if (!context || context.schema !== "cheng_regalloc_one_shot_request.v1") throw new Error("release requires a valid one-shot worker request");
+  if (!context || context.schema !== "cheng_regalloc_one_shot_request") throw new Error("release requires a valid one-shot worker request");
   const directory = canonicalAbsolute(context.directory, "one-shot worker directory", "dir");
   if (FUSION_ROOT !== context.fusionRoot || process.env.CHENG_REGALLOC_ONE_SHOT_FUSION_ROOT !== context.fusionRoot) throw new Error("one-shot worker Fusion root binding mismatch");
   const loadedModulePath = canonicalAbsolute(fileURLToPath(import.meta.url), "one-shot loaded module", "file", true);
@@ -5166,7 +5752,7 @@ function validateOneShotWorkerContext(context, explicitRequestIdentity = null) {
     throw new Error("one-shot worker private directory contains an unexpected artifact");
   }
   return {
-    schema: "cheng_regalloc_one_shot_worker_evidence.v1",
+    schema: "cheng_regalloc_one_shot_worker_evidence",
     directory,
     requestSha256: request.sha256,
     loadedModuleUrl: import.meta.url,
@@ -5228,7 +5814,7 @@ function materializePrivateOneShotSourceTree(sourceInputs, directory) {
   }
   for (const path of [...directoryPaths].sort((left, right) => right.length - left.length)) fsyncDirectory(path);
   const artifactSetSha256 = sha256(Buffer.from(artifacts.map((entry) => `${entry.relativePath}\0${entry.sourceSha256}\0${entry.sourceStat.dev}\0${entry.sourceStat.ino}\0${entry.private.sha256}\0${entry.private.stat.dev}\0${entry.private.stat.ino}\n`).join(""), "utf8"));
-  return {schema: "cheng_regalloc_one_shot_private_source_tree.v1", sourceRoot: canonicalAbsolute(sourceRoot, "one-shot private source tree", "dir"), artifactSetSha256, artifacts};
+  return {schema: "cheng_regalloc_one_shot_private_source_tree", sourceRoot: canonicalAbsolute(sourceRoot, "one-shot private source tree", "dir"), artifactSetSha256, artifacts};
 }
 
 function validatePrivateOneShotSourceTree(context) {
@@ -5315,7 +5901,7 @@ async function buildPrivateOneShotBundleGuarded(root, directory, privateSourceTr
   fsyncDirectory(outputDirectory);
   fsyncDirectory(directory);
   return {
-    schema: "cheng_regalloc_one_shot_bundle_build.v1",
+    schema: "cheng_regalloc_one_shot_bundle_build",
     outputDirectory: canonicalAbsolute(outputDirectory, "one-shot private Bun bundle output directory", "dir"),
     homeDirectory: canonicalAbsolute(homeDirectory, "one-shot private Bun bundle home directory", "dir"),
     tempDirectory: canonicalAbsolute(tempDirectory, "one-shot private Bun bundle temp directory", "dir"),
@@ -5392,7 +5978,7 @@ async function materializeOneShotReleaseWorker(root, input, releaseClaim, source
 
     const claimIdentity = validateReleaseWorkClaim(releaseClaim);
     const context = {
-      schema: "cheng_regalloc_one_shot_request.v1",
+      schema: "cheng_regalloc_one_shot_request",
       token,
       input,
       directory: canonicalAbsolute(directory, "one-shot worker directory", "dir"),
@@ -5427,7 +6013,7 @@ async function materializeOneShotReleaseWorker(root, input, releaseClaim, source
     held.set("request", requestFd);
     fsyncDirectory(directory);
     fsyncDirectory(releaseClaim.workRoot);
-    return {schema: "cheng_regalloc_one_shot_materialization.v1", directory: context.directory, context, request, sourceManifest, sourceInputs, held};
+    return {schema: "cheng_regalloc_one_shot_materialization", directory: context.directory, context, request, sourceManifest, sourceInputs, held};
   } catch (error) {
     for (const fd of held.values()) closeSync(fd);
     throw error;
@@ -5461,7 +6047,7 @@ function validateHeldOneShotReleaseWorker(worker) {
   if (currentManifest.sha256 !== worker.sourceManifest.sha256 || currentManifest.fileCount !== worker.sourceManifest.fileCount || currentManifest.edgeCount !== worker.sourceManifest.edgeCount) throw new Error("one-shot source manifest changed during worker execution");
   const currentInputs = snapshotSourceInputs(worker.context.input.treeRoot, {sourceManifest: worker.sourceManifest.path, sourceManifestRelativePaths: worker.sourceManifest.relativePaths, memoryManifest: worker.context.input.memoryManifest || null});
   if (!sameSourceInputs(worker.sourceInputs, currentInputs)) throw new Error(`one-shot complete source closure changed during worker execution: ${sourceInputsDifference(worker.sourceInputs, currentInputs)}`);
-  return {schema: "cheng_regalloc_one_shot_outer_identity.v1", requestSha256: request.sha256, sourceSnapshotSha256: currentInputs.sha256, privateSourceSetSha256: privateSourceTree.artifactSetSha256, privateSourceArtifactCount: privateSourceTree.artifactCount, privatePythonRuntimeSha256: privatePythonRuntime.artifactSetSha256, privatePythonRuntimeArtifactCount: privatePythonRuntime.artifactCount, bundleBuild};
+  return {schema: "cheng_regalloc_one_shot_outer_identity", requestSha256: request.sha256, sourceSnapshotSha256: currentInputs.sha256, privateSourceSetSha256: privateSourceTree.artifactSetSha256, privateSourceArtifactCount: privateSourceTree.artifactCount, privatePythonRuntimeSha256: privatePythonRuntime.artifactSetSha256, privatePythonRuntimeArtifactCount: privatePythonRuntime.artifactCount, bundleBuild};
 }
 
 function validateReleaseEvidenceInputs(root, input, options = {}) {
@@ -5516,6 +6102,40 @@ function validateReleaseEvidenceInputs(root, input, options = {}) {
     root, officialBuildReceiptArtifact.snapshot, driverPins.find((entry) => entry.key === "officialDriver").snapshot,
     backend2VersionManifest,
   );
+  const executionStagePolicyArtifact = artifacts.find((entry) => entry.key === "executionStagePolicy");
+  if (!executionStagePolicyArtifact) throw new Error("seven-stage execution policy release artifact is absent");
+  const executionStagePolicyText = new TextDecoder("utf-8", {fatal: true}).decode(executionStagePolicyArtifact.snapshot.raw);
+  if (!executionStagePolicyText.endsWith("\n") || executionStagePolicyText.slice(0, -1).includes("\n")) {
+    throw new Error("seven-stage execution policy must be exactly one canonical JSON line");
+  }
+  let executionStagePolicy;
+  try {
+    executionStagePolicy = JSON.parse(executionStagePolicyText.slice(0, -1));
+  } catch (error) {
+    throw new Error(`seven-stage execution policy JSON is invalid: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (executionStagePolicyText !== `${canonicalJson(executionStagePolicy)}\n`) {
+    throw new Error("seven-stage execution policy is not canonical JSON");
+  }
+  const executionStageValidation = validateCompilerExecutionStageReceipt(executionStagePolicy);
+  const officialDriverPin = driverPins.find((entry) => entry.key === "officialDriver")?.snapshot;
+  if (!officialDriverPin) throw new Error("official current-source driver pin is absent");
+  const currentSourceManifest = validateSourceManifestPath(
+    root,
+    canonicalAbsolute(input.sourceManifest, "sourceManifest", "file"),
+  );
+  if (join(executionStagePolicy.evidenceRoot, ...executionStagePolicy.receipt.path.split("/")) === executionStagePolicyArtifact.snapshot.path) {
+    throw new Error("seven-stage execution policy aliases its compiler-produced receipt");
+  }
+  const executionStageReceipt = {
+    policySha256: executionStagePolicyArtifact.snapshot.sha256,
+    ...validateExecutionStageReleaseBindings(
+      executionStagePolicy,
+      executionStageValidation,
+      officialDriverPin.sha256,
+      currentSourceManifest,
+    ),
+  };
   const allSnapshots = [
     ...dependencySnapshots.entries().map(([key, snapshot]) => ({key: `dependency:${key}`, snapshot})),
     ...artifacts.map((entry) => ({key: `evidence:${entry.key}`, snapshot: entry.snapshot})),
@@ -5526,13 +6146,14 @@ function validateReleaseEvidenceInputs(root, input, options = {}) {
     ...allSnapshots.map((entry) => `${entry.key}\0${entry.snapshot.path}\0${entry.snapshot.sha256}\0${entry.snapshot.stat.dev}\0${entry.snapshot.stat.ino}\0${entry.snapshot.stat.size}\0${entry.snapshot.stat.mtimeNs}\0${entry.snapshot.stat.ctimeNs}\n`),
   ];
   return {
-    schema: "cheng_regalloc_release_inputs.v1",
+    schema: "cheng_regalloc_release_inputs",
     sha256: sha256(Buffer.from(digestRows.join(""), "utf8")),
     dependencyBundle,
     dependencySnapshots,
     artifacts,
     backend2VersionManifest,
     officialDriverBuild,
+    executionStageReceipt,
     env,
     driverPaths,
     driverPins,
@@ -5576,6 +6197,8 @@ function validateProductionGuardReport(workDir, guardPath, options = {}) {
     "command_execution_snapshot_size", "command_execution_snapshot_inode", "command_execution_snapshot_device",
     "command_execution_snapshot_mtime_ns", "command_execution_snapshot_ctime_ns",
     "command_argv_schema", "command_argv_count", "command_argv_sha256",
+    "parent_guard_mode", "parent_guard_monitor_pid", "parent_guard_capability_sha256",
+    "parent_guard_limit_bytes", "parent_guard_binding_status",
     "monitor_python_path", "monitor_python_sha256", "monitor_python_size", "monitor_python_inode",
     "monitor_python_device", "monitor_python_mtime_ns", "monitor_python_ctime_ns",
     "monitor_psutil_path", "monitor_psutil_sha256", "monitor_psutil_size", "monitor_psutil_inode",
@@ -5593,13 +6216,11 @@ function validateProductionGuardReport(workDir, guardPath, options = {}) {
   ], `production guard ${basename(guardPath)}`);
   const expected = new Map([
     ["tool", "tools/beat_c_process_group_guard.sh"],
-    ["schema", "beat_c_process_memory_guard.v4"],
+    ["schema", "beat_c_process_memory_guard"],
     ["platform", "darwin"],
     ["status", "completed"],
     ["abort_reason", ""],
     ["memory_guard_mode", "process_tree"],
-    ["memory_guard_scope", "identity_history_union_group_and_descendants"],
-    ["process_tree_membership_metric", "darwin_libproc_identity_history_group_and_descendants"],
     ["enforcement_kind", "darwin_cooperative_process_tree_poll"],
     ["observed_sample_limit_status", "proved"],
     ["hard_memory_limit_proof_status", "not_provable_userspace_poll"],
@@ -5622,6 +6243,28 @@ function validateProductionGuardReport(workDir, guardPath, options = {}) {
     ["self_test_global_process_iter_trap_call_count", "0"],
   ]);
   for (const [key, value] of expected) if (rows.get(key) !== value) throw new Error(`production guard ${basename(guardPath)} ${key} mismatch`);
+  const parentMode = rows.get("parent_guard_mode");
+  if (parentMode === "same_session_descendant") {
+    if (rows.get("memory_guard_scope") !== "identity_history_descendants_parent_owned_group" ||
+        rows.get("process_tree_membership_metric") !== "darwin_libproc_identity_history_descendants_parent_owned_group" ||
+        rows.get("parent_guard_binding_status") !== "proved" ||
+        rows.get("parent_guard_limit_bytes") !== String(DEFAULT_RSS_CAP_BYTES) ||
+        uintValue(rows.get("parent_guard_monitor_pid"), `${basename(guardPath)} parent guard monitor pid`) <= 1n ||
+        !/^[0-9a-f]{64}$/.test(rows.get("parent_guard_capability_sha256") || "")) {
+      throw new Error(`production guard ${basename(guardPath)} parent ownership proof mismatch`);
+    }
+  } else if (parentMode === "standalone") {
+    if (rows.get("memory_guard_scope") !== "identity_history_union_group_and_descendants" ||
+        rows.get("process_tree_membership_metric") !== "darwin_libproc_identity_history_group_and_descendants" ||
+        rows.get("parent_guard_monitor_pid") !== "0" ||
+        rows.get("parent_guard_capability_sha256") !== "" ||
+        rows.get("parent_guard_limit_bytes") !== "0" ||
+        rows.get("parent_guard_binding_status") !== "not_applicable") {
+      throw new Error(`production guard ${basename(guardPath)} standalone ownership proof mismatch`);
+    }
+  } else {
+    throw new Error(`production guard ${basename(guardPath)} parent guard mode mismatch`);
+  }
   const rc = uintValue(rows.get("rc"), `${basename(guardPath)} rc`, 255n);
   if (options.expectedRc !== undefined && rc !== BigInt(options.expectedRc)) throw new Error(`production guard ${basename(guardPath)} rc mismatch`);
   const numeric = {};
@@ -5675,7 +6318,7 @@ function validateProductionGuardDirectory(workDir, reportRows) {
   const guardEntries = entries.filter((entry) => entry.name.endsWith(".guard.txt"));
   if (guardEntries.some((entry) => !entry.isFile() || entry.isSymbolicLink())) throw new Error("production gate work directory contains a non-regular guard report");
   const names = guardEntries.map((entry) => entry.name).sort();
-  if (names.length === 0) throw new Error("production gate work directory contains no guard-v4 reports");
+  if (names.length === 0) throw new Error("production gate work directory contains no guard reports");
   const reports = names.map((name) => validateProductionGuardReport(workDir, join(workDir, name), {expectedRc: 0}));
   const reportTags = new Map();
   for (const [key, value] of reportRows) {
@@ -5689,7 +6332,7 @@ function validateProductionGuardDirectory(workDir, reportRows) {
   if (actualTags.length !== declaredTags.length || actualTags.some((tag, index) => tag !== declaredTags[index])) {
     throw new Error("production report and work-directory guard sets differ");
   }
-  return {schema: "cheng_regalloc_production_guard_set.v1", guardReportCount: reports.length, reports};
+  return {schema: "cheng_regalloc_production_guard_set", guardReportCount: reports.length, reports};
 }
 
 function productionRequiredStatuses() {
@@ -5778,7 +6421,7 @@ function validateProductionRequiredStatusEvidence(workDir, reportRows) {
   const verdictRows = validatePayloadKv(verdict.raw, "production required-status verdict", "verdict_payload_sha256");
   exactKeys(verdictRows, ["schema", "status", "required_count", "required_manifest_sha256", "status_rows_path", "status_rows_sha256", "verdict_payload_sha256"], "production required-status verdict");
   const exact = new Map([
-    ["schema", "regalloc_required_status_contract.v1"], ["status", "proved"], ["required_count", "185"],
+    ["schema", "regalloc_required_status_contract"], ["status", "proved"], ["required_count", "185"],
     ["required_manifest_sha256", manifest.sha256], ["status_rows_path", actual.path], ["status_rows_sha256", actual.sha256],
   ]);
   for (const [key, value] of exact) if (verdictRows.get(key) !== value) throw new Error(`production required-status verdict ${key} mismatch`);
@@ -5796,7 +6439,7 @@ function validateProductionRequiredStatusEvidence(workDir, reportRows) {
     const row = declaredByKey.get(entry.key);
     return !row || row.scope !== entry.scope || row.status !== "GREEN";
   })) {
-    throw new Error("production v5 report mandatory key/scope set is not the canonical all-GREEN contract");
+    throw new Error("production report mandatory key/scope set is not the canonical all-GREEN contract");
   }
   for (let index = 0; index < expected.length; index++) {
     const [key, scope, status, detail] = actualRows[index];
@@ -5804,7 +6447,7 @@ function validateProductionRequiredStatusEvidence(workDir, reportRows) {
       throw new Error(`production required-status detail/report binding mismatch at index ${index}`);
     }
   }
-  return {schema: "cheng_regalloc_required_status_evidence.v1", requiredCount: expected.length, reportProductionCount: expectedReport.length, manifestPath: manifest.path, manifestSha256: manifest.sha256, rowsPath: actual.path, rowsSha256: actual.sha256, verdictPath: verdict.path, verdictSha256: verdict.sha256};
+  return {schema: "cheng_regalloc_required_status_evidence", requiredCount: expected.length, reportProductionCount: expectedReport.length, manifestPath: manifest.path, manifestSha256: manifest.sha256, rowsPath: actual.path, rowsSha256: actual.sha256, verdictPath: verdict.path, verdictSha256: verdict.sha256};
 }
 
 function validateProductionCompilePairs(workDir, reportRows, expected) {
@@ -5850,7 +6493,7 @@ function validateProductionCompilePairs(workDir, reportRows, expected) {
     }
     const {rows: metricsRows} = parseUniqueUnhashedKv(rawArtifacts.metrics.raw, `compile row ${index} metrics`);
     exactKeys(metricsRows, ["schema", "source_sha256", "compiler_sha256", "compile_wall_ns", "compile_process_tree_peak_bytes", "compile_rc"], `compile row ${index} metrics`);
-    if (metricsRows.get("schema") !== "regalloc_compile_measurement.v1" || metricsRows.get("compile_rc") !== "0" ||
+    if (metricsRows.get("schema") !== "regalloc_compile_measurement" || metricsRows.get("compile_rc") !== "0" ||
         metricsRows.get("source_sha256") !== sourceSha256 || metricsRows.get("compiler_sha256") !== compilerSha256 ||
         metricsRows.get("compile_wall_ns") !== wall.toString() || metricsRows.get("compile_process_tree_peak_bytes") !== rss.toString()) {
       throw new Error(`compile row ${index} metrics identity/schema mismatch`);
@@ -5908,7 +6551,7 @@ function validateProductionCompilePairs(workDir, reportRows, expected) {
     "compile_rss_ratio_spread_ppm", "verdict_payload_sha256",
   ], "production compile pair verdict");
   const verdictExpected = new Map([
-    ["schema", "regalloc_compile_pair_verdict.v1"], ["pair_count", "3"], ["sample_count", "12"],
+    ["schema", "regalloc_compile_pair_verdict"], ["pair_count", "3"], ["sample_count", "12"],
     ["raw_samples_sha256", pairs.sha256], ["source_sha256", expected.workloadSourceSha256],
     ["current_compiler_sha256", expected.officialDriverSha256], ["baseline_compiler_sha256", expected.baselineDriverSha256],
     ["current_object_sha256", [...currentObjectHashes][0]], ["baseline_object_sha256", [...baselineObjectHashes][0]],
@@ -5960,7 +6603,7 @@ function validateProductionPerfEvidence(workDir, reportRows) {
     const {rows: stdoutRows} = parseUniqueUnhashedKv(stdout.raw, `performance row ${index} stdout`);
     if (stdoutRows.get("regalloc_gate_external_elapsed_ns") !== elapsed.toString()) throw new Error(`production performance row ${index} stdout elapsed mismatch`);
     const {rows: guardRows} = parseUniqueUnhashedKv(guard.raw, `performance row ${index} guard`);
-    if (guardRows.get("schema") !== "beat_c_process_memory_guard.v4" || guardRows.get("status") !== "completed" || guardRows.get("rc") !== "0" ||
+    if (guardRows.get("schema") !== "beat_c_process_memory_guard" || guardRows.get("status") !== "completed" || guardRows.get("rc") !== "0" ||
         guardRows.get("platform") !== "darwin" || guardRows.get("stdout") !== stdout.path || guardRows.get("stderr") !== stderr.path) {
       throw new Error(`production performance row ${index} guard binding mismatch`);
     }
@@ -5986,20 +6629,20 @@ function validateProductionPerfEvidence(workDir, reportRows) {
   const verdictRows = validatePayloadKv(verdict.raw, "production performance pair verdict", "verdict_payload_sha256");
   exactKeys(verdictRows, ["schema", "pair_count", "sample_count", "raw_samples_sha256", "current_executable_sha256", "baseline_executable_sha256", "median_ratio_ppm", "spread_ppm", "baseline_min_ns", "verdict_payload_sha256"], "production performance pair verdict");
   const exact = new Map([
-    ["schema", "regalloc_perf_pair_verdict.v1"], ["pair_count", "7"], ["sample_count", "28"], ["raw_samples_sha256", pairs.sha256],
+    ["schema", "regalloc_perf_pair_verdict"], ["pair_count", "7"], ["sample_count", "28"], ["raw_samples_sha256", pairs.sha256],
     ["current_executable_sha256", executables.get("current").sha256], ["baseline_executable_sha256", executables.get("baseline").sha256],
     ["median_ratio_ppm", median.toString()], ["spread_ppm", spread.toString()], ["baseline_min_ns", baselineMin.toString()],
   ]);
   for (const [key, value] of exact) if (verdictRows.get(key) !== value) throw new Error(`production performance pair verdict ${key} mismatch`);
-  return {schema: "cheng_regalloc_production_perf_evidence.v1", rowCount: rows.length, pairsPath: pairs.path, pairsSha256: pairs.sha256, verdictPath: verdict.path, verdictSha256: verdict.sha256, currentExecutableSha256: executables.get("current").sha256, baselineExecutableSha256: executables.get("baseline").sha256};
+  return {schema: "cheng_regalloc_production_perf_evidence", rowCount: rows.length, pairsPath: pairs.path, pairsSha256: pairs.sha256, verdictPath: verdict.path, verdictSha256: verdict.sha256, currentExecutableSha256: executables.get("current").sha256, baselineExecutableSha256: executables.get("baseline").sha256};
 }
 
 function validateProductionReceiptArtifacts(workDir, compileEvidence, expected) {
   const receiptSnapshot = compileEvidence.selected.artifacts.report;
   const objectSnapshot = compileEvidence.selected.artifacts.object;
-  const {rows} = parseUniqueUnhashedKv(receiptSnapshot.raw, "workload current v6 receipt");
+  const {rows} = parseUniqueUnhashedKv(receiptSnapshot.raw, "workload current production receipt");
   const exact = new Map([
-    ["regalloc_receipt_schema", "regalloc_single_pass.production.v6"],
+    ["regalloc_receipt_schema", "regalloc_single_pass.production"],
     ["regalloc_allocator", "regalloc_single_pass"],
     ["regalloc_wiring_mode", "production_default"],
     ["regalloc_driver_sha256", expected.officialDriverSha256],
@@ -6011,28 +6654,28 @@ function validateProductionReceiptArtifacts(workDir, compileEvidence, expected) 
   for (const [key, value] of exact) if (rows.get(key) !== value) throw new Error(`workload current receipt ${key} mismatch`);
   const snapshot = boundWorkSnapshot(workDir, rows.get("regalloc_frozen_plan_snapshot_path"), rows.get("regalloc_frozen_plan_snapshot_sha256"), "workload current frozen plan snapshot", false, 512 * 1024 * 1024);
   const ledger = boundWorkSnapshot(workDir, rows.get("regalloc_action_emission_ledger_path"), rows.get("regalloc_action_emission_ledger_sha256"), "workload current action emission ledger", false, 512 * 1024 * 1024);
-  exactDistinctSnapshots([receiptSnapshot, objectSnapshot, snapshot, ledger], "workload current receipt/object/v3/v4 evidence");
+  exactDistinctSnapshots([receiptSnapshot, objectSnapshot, snapshot, ledger], "workload current receipt/object/frozen-plan/action-ledger evidence");
   const snapshotRows = validatePayloadKv(snapshot.raw, "workload current frozen plan snapshot", "snapshot_payload_sha256");
   const ledgerRows = validatePayloadKv(ledger.raw, "workload current action emission ledger", "ledger_payload_sha256");
   const receiptFunctionCount = uintValue(rows.get("regalloc_function_receipt_count"), "receipt function count");
   if (receiptFunctionCount <= 0n ||
-      snapshotRows.get("schema") !== "regalloc_frozen_plan_snapshot.v3" ||
+      snapshotRows.get("schema") !== "regalloc_frozen_plan_snapshot" ||
       snapshotRows.get("phase") !== "allocator_and_machine_recipe_freeze_before_fill" ||
       snapshotRows.get("source_manifest_sha256") !== expected.sourceManifestSha256 ||
       snapshotRows.get("driver_sha256") !== expected.officialDriverSha256 ||
       snapshotRows.get("target") !== TARGET ||
       uintValue(snapshotRows.get("function_count"), "snapshot function count") !== receiptFunctionCount ||
       snapshotRows.get("fixture_source_sha256") !== rows.get("regalloc_fixture_source_sha256")) {
-    throw new Error("workload current v3 snapshot identity/count contract mismatch");
+    throw new Error("workload current frozen plan snapshot identity/count contract mismatch");
   }
-  if (ledgerRows.get("schema") !== "regalloc_action_emission_ledger.v4" ||
+  if (ledgerRows.get("schema") !== "regalloc_action_emission_ledger" ||
       ledgerRows.get("output_object_sha256") !== objectSnapshot.sha256 ||
       ledgerRows.get("fixture_source_sha256") !== rows.get("regalloc_fixture_source_sha256") ||
       uintValue(ledgerRows.get("function_count"), "ledger function count") !== receiptFunctionCount) {
-    throw new Error("workload current v4 ledger identity/count contract mismatch");
+    throw new Error("workload current action emission ledger identity/count contract mismatch");
   }
   return {
-    schema: "cheng_regalloc_production_receipt_artifacts.v1",
+    schema: "cheng_regalloc_production_receipt_artifacts",
     receiptPath: receiptSnapshot.path,
     receiptSha256: receiptSnapshot.sha256,
     objectPath: objectSnapshot.path,
@@ -6053,7 +6696,7 @@ function releaseDriverManifestIdentity(snapshot, expectedRole, label) {
     "allocator_sha256", "target", "certification_report_path",
     "certification_report_sha256", "manifest_payload_sha256",
   ], label);
-  if (rows.get("schema") !== "regalloc_driver_manifest.v1" || rows.get("role") !== expectedRole || rows.get("target") !== TARGET) {
+  if (rows.get("schema") !== "regalloc_driver_manifest" || rows.get("role") !== expectedRole || rows.get("target") !== TARGET) {
     throw new Error(`${label} schema/role/target mismatch`);
   }
   const allocatorPath = canonicalAbsolute(rows.get("allocator_path"), `${label} allocator`, "file");
@@ -6122,7 +6765,7 @@ function validateProductionExecBundleEvidence(workDir, reportRows, expected) {
   }
   keys.push("identity_payload_sha256");
   exactKeys(rows, keys, "production exec-bundle identity");
-  if (rows.get("schema") !== "regalloc_exec_bundle_identity.v1" || rows.get("source_root") !== expected.root ||
+  if (rows.get("schema") !== "regalloc_exec_bundle_identity" || rows.get("source_root") !== expected.root ||
       rows.get("exec_bundle") !== expected.execBundle.path || rows.get("bash_source_path") !== expected.execBundle.files.get("gate").path ||
       rows.get("binding_mode") !== "explicit_sha256" || reportRows.get("source_root") !== expected.root ||
       reportRows.get("exec_bundle") !== expected.execBundle.path || reportRows.get("exec_bundle_binding_mode") !== "explicit_sha256" ||
@@ -6180,12 +6823,12 @@ function validateProductionExecBundleEvidence(workDir, reportRows, expected) {
     snapshotInodes.add(snapshotInode);
     files.push({label: spec.label, sourcePath: source.path, sourceSha256: source.sha256, snapshotPath: snapshot.path, snapshotSha256: snapshot.sha256});
   }
-  return {schema: "cheng_regalloc_exec_bundle_evidence.v1", identityPath: identity.path, identitySha256: identity.sha256, identityPayloadSha256: rows.get("identity_payload_sha256"), files};
+  return {schema: "cheng_regalloc_exec_bundle_evidence", identityPath: identity.path, identitySha256: identity.sha256, identityPayloadSha256: rows.get("identity_payload_sha256"), files};
 }
 
 function validateProductionGateEvidence(workDirValue, reportPathValue, reportExpectedSha256, stdoutRaw, expected) {
   const workDir = canonicalAbsolute(workDirValue, "production gate work directory", "dir");
-  const report = boundWorkSnapshot(workDir, reportPathValue, reportExpectedSha256, "production gate v5 report", false, 64 * 1024 * 1024);
+  const report = boundWorkSnapshot(workDir, reportPathValue, reportExpectedSha256, "production gate report", false, 64 * 1024 * 1024);
   if (basename(report.path) !== "regalloc-production-gate.report.txt") throw new Error("production gate report basename mismatch");
 
   const {rows: stdoutRows} = parseUniqueUnhashedKv(stdoutRaw, "production gate stdout");
@@ -6206,9 +6849,9 @@ function validateProductionGateEvidence(workDirValue, reportPathValue, reportExp
     throw new Error("production gate stdout identity/status contract mismatch");
   }
 
-  const {rows: reportRows} = parseUniqueUnhashedKv(report.raw, "production gate v5 report");
+  const {rows: reportRows} = parseUniqueUnhashedKv(report.raw, "production gate report");
   const exact = new Map([
-    ["schema", "regalloc_production_gate.v5"],
+    ["schema", "regalloc_production_gate"],
     ["status", "GREEN"],
     ["production_status", "GREEN"],
     ["mode", "run"],
@@ -6292,7 +6935,7 @@ function validateProductionGateEvidence(workDirValue, reportPathValue, reportExp
     throw new Error("selected workload compile guard is not bound into the complete guard set");
   }
   return {
-    schema: "cheng_regalloc_production_gate_evidence.v1",
+    schema: "cheng_regalloc_production_gate_evidence",
     reportPath: report.path,
     reportSha256: report.sha256,
     sourceGitTree,
@@ -6413,11 +7056,22 @@ function canonicalSemanticReceiptJson(value) {
 
 function semanticRealPipelineProtocolSha256() {
   const protocol = {
-    schema: "cheng_real_source_bound_seven_stage_protocol.v1",
-    kind: "cheng-real-source-bound-seven-stage-pipeline.v1",
+    schema: "cheng_real_source_bound_seven_stage_protocol",
+    receiptSchema: "cheng.compiler.execution_stage_bundle",
+    kind: "cheng-real-source-bound-seven-stage-pipeline",
     implemented: false,
     requiredStages: ["typed_expr", "csg", "lowering", "primary", "primary_regalloc", "backend2", "backend2_regalloc"],
-    sourceBindings: ["case_id", "raw_source_files_sha256", "materializer_bytes_sha256", "grammar_obligation_root_sha256", "driver_bytes_sha256", "toolchain_manifest_sha256"],
+    sourceBindings: [
+      "case_id",
+      "source_bundle_raw32",
+      "materializer_bytes_raw32",
+      "grammar_obligation_root_raw32",
+      "compiler_source_closure_raw32",
+      "driver_bytes_raw32",
+      "toolchain_manifest_raw32",
+      "command_manifest_raw32",
+      "target_triple",
+    ],
     requiredObservedFacts: ["int32_node_decl_value_def_identity", "expr_class", "owner_type_layout_offsets", "body_ir_use_def_alias", "emission_bytes", "regalloc_plan_actions_fragments_ingress_roots"],
     requiredMutations: [
       "ownership_flip", "declaration_rebind", "layout_offset_change", "codec_cid_field_drop", "cache_stale_hit", "stage_drop",
@@ -6459,9 +7113,6 @@ function validateSemanticPipelineGateReceipt(raw, expected) {
   for (const key of SEMANTIC_PIPELINE_RECEIPT_KEYS.filter((key) => key.endsWith("Sha256"))) requireSha256(receipt[key], `semantic pipeline receipt ${key}`);
 
   const exactCounts = new Map([
-    ["grammarObligationCount", SEMANTIC_PIPELINE_EXPECTED_COUNTS.grammarObligationCount],
-    ["grammarRequiredCount", SEMANTIC_PIPELINE_EXPECTED_COUNTS.grammarRequiredCount],
-    ["grammarMissingRequiredCount", SEMANTIC_PIPELINE_EXPECTED_COUNTS.grammarRequiredCount],
     ["baseLegalCount", SEMANTIC_PIPELINE_EXPECTED_COUNTS.baseLegalCount],
     ["profileAssignmentCount", SEMANTIC_PIPELINE_EXPECTED_COUNTS.profileAssignmentCount],
     ["joinedAssignmentCount", SEMANTIC_PIPELINE_EXPECTED_COUNTS.joinedAssignmentCount],
@@ -6474,7 +7125,15 @@ function validateSemanticPipelineGateReceipt(raw, expected) {
     ["profileSourceBundleCount", SEMANTIC_PIPELINE_EXPECTED_COUNTS.matrixAcceptCount],
   ]);
   for (const [key, value] of exactCounts) if (receipt[key] !== value) throw new Error(`semantic pipeline receipt ${key} mismatch`);
-  if (receipt.grammarMissingRequiredCount !== receipt.grammarRequiredCount || receipt.grammarRequiredCount > receipt.grammarObligationCount) throw new Error("semantic pipeline missing-parser obligation counts do not remain fail-closed");
+  if (!Number.isSafeInteger(receipt.grammarObligationCount) ||
+      !Number.isSafeInteger(receipt.grammarRequiredCount) ||
+      !Number.isSafeInteger(receipt.grammarMissingRequiredCount) ||
+      receipt.grammarObligationCount <= 0 ||
+      receipt.grammarRequiredCount <= 0 ||
+      receipt.grammarMissingRequiredCount !== receipt.grammarRequiredCount ||
+      receipt.grammarRequiredCount > receipt.grammarObligationCount) {
+    throw new Error("semantic pipeline missing-parser obligation counts do not remain fail-closed");
+  }
   if (receipt.baseLegalCount * receipt.profileAssignmentCount !== receipt.joinedAssignmentCount || receipt.matrixAcceptCount + receipt.matrixRejectCount !== receipt.matrixCaseCount) throw new Error("semantic pipeline receipt count arithmetic mismatch");
   return {receipt, receiptSha256: independentlyRecomputedReceiptSha256};
 }
@@ -6615,7 +7274,7 @@ async function runSemanticPipelineGate(root, mode, sourceInputs, inputColdDriver
     const scratchEvidence = semanticPipelineScratchEvidence(isolated.home, isolated.temp);
     const envEvidence = requestedChildEnvEvidence({env: isolated.env, unsetEnv, hardRssCapBytes: DEFAULT_RSS_CAP_BYTES});
     const fields = [
-      ["schema", "cheng_semantic_pipeline_parent_receipt.v1"], ["mode", mode],
+      ["schema", "cheng_semantic_pipeline_parent_receipt"], ["mode", mode],
       ["child_receipt_sha256", parsed.receiptSha256], ["guard_report_sha256", guardEvidence.sha256],
       ["stdout_sha256", stdout.sha256], ["stderr_sha256", stderr.sha256],
       ["argv_json", JSON.stringify(args)], ["argv_sha256", sha256(Buffer.from(JSON.stringify(args), "utf8"))],
@@ -6630,7 +7289,7 @@ async function runSemanticPipelineGate(root, mode, sourceInputs, inputColdDriver
     fsyncDirectory(directory);
     if (mode === "release") fsyncDirectory(executionRoot);
     return {
-      schema: "cheng_semantic_pipeline_gate_evidence.v1",
+      schema: "cheng_semantic_pipeline_gate_evidence",
       pathsRetained: mode === "release",
       directory: mode === "release" ? directory : null,
       structuralStatus: parsed.receipt.structuralStatus,
@@ -6676,7 +7335,7 @@ function createReleaseSourceGuardContext(releaseInputs, execBundle, privateToolc
   fsyncDirectory(directory);
   fsyncDirectory(releaseInputs.releaseWorkRoot);
   const contracts = releaseSourceChildContracts();
-  return {schema: "cheng_regalloc_source_guard_context.v2", directory: canonicalAbsolute(directory, "release source guard directory", "dir"), guard: execBundle.files.get("guard").path, executionEnv: privateReleaseExecutionEnv(privateToolchain), contracts, tags: new Set(), reports: [], receipts: [], toolPins: new Map(), inputPins: new Map()};
+  return {schema: "cheng_regalloc_source_guard_context", directory: canonicalAbsolute(directory, "release source guard directory", "dir"), guard: execBundle.files.get("guard").path, executionEnv: privateReleaseExecutionEnv(privateToolchain), contracts, tags: new Set(), reports: [], receipts: [], toolPins: new Map(), inputPins: new Map()};
 }
 
 function releaseSourceChildContracts() {
@@ -6787,7 +7446,7 @@ async function runPreflightChild(driver, args, options, guardContext, tag) {
     const finalGuardStat = lstatSync(guardTool.path, {bigint: true});
     if (!sameStat(tool.stat, finalToolStat) || !sameStat(guardTool.stat, finalGuardStat)) throw new Error(`release source child ${tag} tool identity changed`);
     const fields = [
-      ["schema", "cheng_regalloc_source_child_receipt.v1"], ["tag", tag], ["case_id", contract.caseId],
+      ["schema", "cheng_regalloc_source_child_receipt"], ["tag", tag], ["case_id", contract.caseId],
       ["expected_rc", contract.expectedRc], ["actual_rc", evidence.rc], ["expected_output", contract.expectedOutput],
       ["tool_path", tool.path], ["tool_sha256", tool.sha256], ["tool_device", tool.stat.dev], ["tool_inode", tool.stat.ino],
       ["guard_tool_path", guardTool.path], ["guard_tool_sha256", guardTool.sha256], ["cwd", cwd],
@@ -6847,7 +7506,7 @@ function finalizeReleaseSourceGuardContext(context) {
     for (let inputIndex = 0; inputIndex < inputCount; inputIndex++) exactReceiptKeys.push(`input.${inputIndex}.path`, `input.${inputIndex}.sha256`, `input.${inputIndex}.device`, `input.${inputIndex}.inode`);
     exactReceiptKeys.push("output_state", "output_path", "output_sha256", "guard_report_path", "guard_report_sha256", "stdout_path", "stdout_sha256", "stderr_path", "stderr_sha256", "receipt_payload_sha256");
     exactKeys(rows, exactReceiptKeys, `release source child receipt ${entry.tag}`);
-    if (rows.get("schema") !== "cheng_regalloc_source_child_receipt.v1" || rows.get("tag") !== entry.tag ||
+    if (rows.get("schema") !== "cheng_regalloc_source_child_receipt" || rows.get("tag") !== entry.tag ||
         rows.get("case_id") !== entry.contract.caseId || rows.get("expected_rc") !== entry.contract.expectedRc ||
         rows.get("expected_output") !== entry.contract.expectedOutput || rows.get("guard_report_sha256") !== entry.report.sha256 ||
         rows.get("stdout_sha256") !== entry.stdout.sha256 || rows.get("stderr_sha256") !== entry.stderr.sha256 ||
@@ -6858,7 +7517,7 @@ function finalizeReleaseSourceGuardContext(context) {
     }
   }
   const receiptSetSha256 = sha256(Buffer.from(receipts.map((entry) => `${entry.tag}\0${entry.receipt.sha256}\n`).join(""), "utf8"));
-  return {schema: "cheng_regalloc_source_guard_set.v2", independentCaseCount: TYPED_EXPR_MATRIX.length, childReceiptCount: receipts.length, receiptSetSha256, guardReportCount: context.reports.length, tags: actualTags, reports: context.reports.sort((left, right) => left.tag.localeCompare(right.tag)), receipts: receipts.map((entry) => ({tag: entry.tag, path: entry.receipt.path, sha256: entry.receipt.sha256}))};
+  return {schema: "cheng_regalloc_source_guard_set", independentCaseCount: TYPED_EXPR_MATRIX.length, childReceiptCount: receipts.length, receiptSetSha256, guardReportCount: context.reports.length, tags: actualTags, reports: context.reports.sort((left, right) => left.tag.localeCompare(right.tag)), receipts: receipts.map((entry) => ({tag: entry.tag, path: entry.receipt.path, sha256: entry.receipt.sha256}))};
 }
 
 function executableMaterialized(path) {
@@ -6971,7 +7630,19 @@ function validateQualifiedNestedCallDeclarationWitness(fixtureRaw, moduleRaw) {
   };
 }
 
-function validateTypedExprCoverageLedger() {
+function validateTypedExprCoverageLedger(
+  formalSpecSliceSha256,
+  formalSpecVersion,
+) {
+  if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(formalSpecVersion ?? "")) {
+    throw new Error(
+      "TypedExpr coverage ledger requires the current formal spec version",
+    );
+  }
+  requireSha256(
+    formalSpecSliceSha256,
+    "generated formal expression EBNF slice SHA-256",
+  );
   const required = new Set();
   for (const family of TYPED_EXPR_AUDIT_FAMILIES) {
     if (!/^[a-z0-9_]+$/.test(family) || required.has(family)) throw new Error(`duplicate or invalid required TypedExpr audit family: ${family}`);
@@ -7034,8 +7705,8 @@ function validateTypedExprCoverageLedger() {
     selectedLeafAlternativeCount: formalCovered.size,
     directFormalObligationMappingCount: formalObligationIds.size,
     formalSpecSchema: FORMAL_EXPRESSION_SLICE_SCHEMA,
-    formalSpecVersion: FORMAL_SPEC_VERSION,
-    formalSpecSliceSha256: FORMAL_EXPRESSION_SLICE_SHA256,
+    formalSpecVersion,
+    formalSpecSliceSha256,
     compilerProfile,
     entries,
   };
@@ -7118,33 +7789,147 @@ function validateAarch64F64RuntimeGateReport(raw) {
     "nan_compare_case_count",
     "finite_compare_case_count",
     "store_runtime_case_count",
+    "constant_payload_case_count",
+    "call_clobber_payload_case_count",
+    "call_spill_action_count",
+    "call_reload_action_count",
     "memory_limit_bytes",
     "memory_guard_scope",
   ], "AArch64 F64 runtime gate report");
-  if (rows.get("schema") !== "regalloc_aarch64_f64_runtime_gate.v1" ||
+  if (rows.get("schema") !== "regalloc_aarch64_f64_runtime_gate" ||
       rows.get("status") !== "GREEN" ||
       rows.get("target") !== TARGET ||
       rows.get("host_execution") !== "native_arm64" ||
-      rows.get("raw_function_reloc_count") !== "0" ||
+      rows.get("raw_function_reloc_count") !== "1" ||
       rows.get("nan_compare_case_count") !== "30" ||
       rows.get("finite_compare_case_count") !== "18" ||
       rows.get("store_runtime_case_count") !== "5" ||
+      rows.get("constant_payload_case_count") !== "4" ||
+      rows.get("call_clobber_payload_case_count") !== "4" ||
+      rows.get("call_spill_action_count") !== "1" ||
+      rows.get("call_reload_action_count") !== "1" ||
       rows.get("memory_limit_bytes") !== String(AARCH64_F64_RUNTIME_GATE_MEMORY_BYTES) ||
-      rows.get("memory_guard_scope") !== "identity_history_union_group_and_descendants") {
+      rows.get("memory_guard_scope") !== "identity_history_union_group_session_and_descendants") {
     throw new Error("AArch64 F64 runtime gate report contract mismatch");
   }
   return {
     schema: rows.get("schema"),
     target: rows.get("target"),
     hostExecution: rows.get("host_execution"),
-    rawFunctionRelocCount: 0,
+    rawFunctionRelocCount: 1,
     nanCompareCaseCount: 30,
     finiteCompareCaseCount: 18,
     storeRuntimeCaseCount: 5,
     storeRuntimeFamilyCount: 3,
+    constantPayloadCaseCount: 4,
+    callClobberPayloadCaseCount: 4,
+    callSpillActionCount: 1,
+    callReloadActionCount: 1,
     memoryLimitBytes: String(AARCH64_F64_RUNTIME_GATE_MEMORY_BYTES),
     memoryGuardScope: rows.get("memory_guard_scope"),
   };
+}
+
+function processTreeGuardOwnershipSourceReasons(guard) {
+  const reasons = [];
+  const setSidMatches = guard.match(/\bos\.setsid\(\)/g) || [];
+  if (!guard.includes('"same_session_descendant" if parent_guard_mode else "standalone"') ||
+      !guard.includes('memory_guard_scope = "identity_history_descendants_parent_owned_group"') ||
+      !guard.includes('"identity_history_union_group_session_and_descendants"') ||
+      !guard.includes('report.write("parent_guard_binding_status=%s\\n" %')) {
+    reasons.push("guard_ownership_mode_contract_missing");
+  }
+  if (!/parent_guard_mode\s*=\s*bool\(\s*inherited_parent_capability\s+or\s+inherited_parent_monitor_pid\s+or\s+inherited_parent_limit_bytes\s+or\s+inherited_parent_proof_fd\s*\)/.test(guard) ||
+      !/len\(inherited_parent_capability\)\s*!=\s*64/.test(guard) ||
+      !/any\(char not in "0123456789abcdef" for char in inherited_parent_capability\)/.test(guard) ||
+      !/not inherited_parent_monitor_pid\.isdigit\(\)/.test(guard) ||
+      !/not inherited_parent_limit_bytes\.isdigit\(\)/.test(guard) ||
+      !/inherited_parent_proof_fd\s*!=\s*str\(PARENT_PROOF_FD\)/.test(guard) ||
+      !guard.includes("if parent_guard_monitor_pid not in ancestor_pids:") ||
+      !guard.includes('if record["rootPid"] != os.getpid():') ||
+      !guard.includes('if record["rootPid"] not in ancestor_pids:') ||
+      !guard.includes('if ancestor_pids.index(record["rootPid"]) >= monitor_index:') ||
+      !guard.includes('inherited_sid != record["rootSid"]') ||
+      !guard.includes('inherited_pgid != record["rootPgid"]') ||
+      !guard.includes("inherited_sid != os.getpid()") ||
+      !guard.includes("and inherited_sid not in ancestor_pids") ||
+      !guard.includes("os.getsid(inherited_sid) != inherited_sid") ||
+      !guard.includes("os.getpgid(inherited_sid) != inherited_sid") ||
+      !guard.includes("rss_limit_bytes > parent_guard_limit_bytes") ||
+      !/prepare_monitor_identity\(\)\s+validate_parent_guard_context\(\)\s+prepare_command_identity\(\)/.test(guard)) {
+    reasons.push("guard_parent_binding_proof_missing");
+  }
+  if (setSidMatches.length !== 1 ||
+      !/if not parent_guard_mode:\s+os\.setsid\(\)/.test(guard) ||
+      !/root_pid,\s*0 if parent_guard_mode else pgid,\s*sid,\s*footprint_reader/.test(guard) ||
+      !/if not parent_guard_mode:\s+live_groups\s*=\s*sorted\(\{/.test(guard) ||
+      !/for pgid in live_groups:\s+try:\s+os\.killpg\(pgid, sig\)/.test(guard)) {
+    reasons.push("guard_parent_owned_process_group_contract_missing");
+  }
+  return reasons;
+}
+
+function runtimeGateGuardReportValidatorSourceReasons(gate) {
+  const reasons = [];
+  if (!gate.includes('if [ "${1:-}" = "--validate-guard-report" ]') ||
+      !gate.includes('"parent_guard_mode") != "same_session_descendant"') ||
+      !gate.includes('"parent_guard_mode": "standalone"') ||
+      !gate.includes('"identity_history_descendants_parent_owned_group"') ||
+      !gate.includes('"identity_history_union_group_session_and_descendants"') ||
+      !gate.includes('"parent_guard_binding_status") != "proved"') ||
+      !gate.includes('"parent_guard_binding_status": "not_applicable"') ||
+      !gate.includes('"enforcement_kind": "darwin_cooperative_process_tree_poll"') ||
+      !gate.includes('"hard_memory_limit_proof_status": "not_provable_userspace_poll"') ||
+      !gate.includes('"inter_sample_transient_peaks_not_provable_by_userspace_polling"')) {
+    reasons.push("runtime_guard_report_ownership_modes_missing");
+  }
+  if (!gate.includes('PARENT_PROOF_SCHEMA = "cheng.guard.parent_proof"') ||
+      !gate.includes("PARENT_PROOF_FD = 3") ||
+      !gate.includes("PARENT_PROOF_MAX_RECORD_BYTES = 4096") ||
+      !gate.includes("def local_peer_pid(fd):") ||
+      !gate.includes("def parse_parent_proof_record(fd):") ||
+      !gate.includes("stat.S_ISSOCK(before.st_mode)") ||
+      !gate.includes("socket.MSG_PEEK | socket.MSG_DONTWAIT") ||
+      !gate.includes("list(record) != PARENT_PROOF_KEYS") ||
+      !gate.includes('json.dumps(record, separators=(",", ":")) + "\\n" != text') ||
+      !gate.includes('proof_fd = os.environ.get("BEAT_C_GUARD_PARENT_PROOF_FD", "")') ||
+      !gate.includes("proof_fd != str(PARENT_PROOF_FD)") ||
+      !gate.includes('rows.get("parent_guard_proof_fd") != proof_fd') ||
+      !gate.includes('rows.get("parent_guard_proof_peer_pid") != str(peer_pid)') ||
+      !gate.includes('rows.get("parent_guard_proof_record_sha256")') ||
+      !gate.includes("hashlib.sha256(raw_record).hexdigest()")) {
+    reasons.push("runtime_guard_report_parent_proof_transport_missing");
+  }
+  if (!gate.includes("def stable_process_identity(pid):") ||
+      !gate.includes('rows.get("parent_guard_monitor_pid") != monitor_pid') ||
+      !gate.includes("if parent_pid not in ancestry:") ||
+      !gate.includes('record["rootPpid"] != parent_pid') ||
+      !gate.includes("root_pid != os.getpid()") ||
+      !gate.includes("root_pid not in ancestry") ||
+      !gate.includes("ancestry.index(root_pid) >= monitor_index") ||
+      !gate.includes('self_identity["sid"] != record["rootSid"]') ||
+      !gate.includes('self_identity["pgid"] != record["rootPgid"]') ||
+      !gate.includes("session_leader != os.getpid() and session_leader not in ancestry") ||
+      !gate.includes("leader_sid != session_leader or leader_pgid != session_leader") ||
+      !gate.includes('record["monitorStartTvsec"] != monitor_identity["startTvsec"]') ||
+      !gate.includes('record["monitorStartTvusec"] != monitor_identity["startTvusec"]') ||
+      !gate.includes('record["rootStartTvsec"] != root_identity["startTvsec"]') ||
+      !gate.includes('record["rootStartTvusec"] != root_identity["startTvusec"]')) {
+    reasons.push("runtime_guard_report_parent_session_binding_missing");
+  }
+  if (!gate.includes('rows.get("parent_guard_limit_bytes") != parent_limit') ||
+      !gate.includes("parent_limit_value < int(requested_limit)") ||
+      !gate.includes('rows.get("parent_guard_capability_sha256") !=') ||
+      !gate.includes('hashlib.sha256(capability.encode("ascii")).hexdigest()') ||
+      !gate.includes('record["capability"] != capability') ||
+      !gate.includes('record["monitorPid"] != parent_pid') ||
+      !gate.includes('record["limitBytes"] != parent_limit_value')) {
+    reasons.push("runtime_guard_report_limit_capability_binding_missing");
+  }
+  if (/(?:^|[ \t])PROCESS_MAX_RSS_BYTES="\$FIXED_LIMIT_BYTES"/m.test(gate)) {
+    reasons.push("runtime_guard_report_non_enforcing_limit_alias_present");
+  }
+  return reasons;
 }
 
 function validateAarch64F64RuntimeGateBundle(sourceRows) {
@@ -7172,9 +7957,7 @@ function validateAarch64F64RuntimeGateBundle(sourceRows) {
   }
   if (!/^FIXED_LIMIT_BYTES=1073741824$/m.test(gate) ||
       !/--rss-limit:"\$FIXED_LIMIT_BYTES"\s+--timeout:600/.test(gate) ||
-      !/memory_limit_bytes=\$FIXED_LIMIT_BYTES/.test(gate) ||
-      !/observed_sample_limit_status=proved/.test(gate) ||
-      !/memory_guard_scope=identity_history_union_group_and_descendants/.test(gate)) {
+      !/python3 - "\$report" "\$FIXED_LIMIT_BYTES"/.test(gate)) {
     reasons.push("exact_one_gib_process_tree_guard_contract_missing");
   }
   if (!/run_guard contract_compile "\$COMPILER" system-link-exec/.test(gate) ||
@@ -7185,9 +7968,10 @@ function validateAarch64F64RuntimeGateBundle(sourceRows) {
   if (!/run_guard image_compile "\$COMPILER" system-link-exec/.test(gate) ||
       !/--in:"\$ROOT\/src\/tests\/regalloc_aarch64_f64_runtime_image\.cheng"/.test(gate) ||
       !/run_guard image_run "\$WORK\/image_generator"/.test(gate) ||
-      !gate.includes("_regalloc_raw_f64_") || !/\)" -eq 9/.test(gate) ||
-      !/if grep -Fq '\.reloc' "\$WORK\/raw_functions\.S"; then\s+fail "raw_function_contains_relocation"/.test(gate)) {
-    reasons.push("nine_function_relocation_free_runtime_image_contract_missing");
+      !gate.includes("_regalloc_raw_f64_") || !/\)" -eq 15/.test(gate) ||
+      !/grep -Fc '    bl _regalloc_raw_f64_identity'/.test(gate) ||
+      !/fail "call_clobber_relocation_count"/.test(gate)) {
+    reasons.push("fifteen_function_single_exact_call_relocation_runtime_image_contract_missing");
   }
   if (!/src\/tests\/regalloc_aarch64_f64_runtime_harness\.c/.test(gate) ||
       !/src\/tests\/regalloc_aarch64_f64_runtime_bridge\.S/.test(gate) ||
@@ -7195,19 +7979,25 @@ function validateAarch64F64RuntimeGateBundle(sourceRows) {
       !/grep -Fxq 'regalloc_aarch64_f64_runtime_gate ok'/.test(gate)) {
     reasons.push("native_runtime_execution_contract_missing");
   }
-  if (!/printf 'raw_function_reloc_count=0\\n'/.test(gate) ||
+  if (!/printf 'raw_function_reloc_count=1\\n'/.test(gate) ||
       !/printf 'nan_compare_case_count=30\\n'/.test(gate) ||
       !/printf 'finite_compare_case_count=18\\n'/.test(gate) ||
       !/printf 'store_runtime_case_count=5\\n'/.test(gate) ||
+      !/printf 'constant_payload_case_count=4\\n'/.test(gate) ||
+      !/printf 'call_clobber_payload_case_count=4\\n'/.test(gate) ||
+      !/printf 'call_spill_action_count=1\\n'/.test(gate) ||
+      !/printf 'call_reload_action_count=1\\n'/.test(gate) ||
       !/printf 'memory_limit_bytes=%s\\n' "\$FIXED_LIMIT_BYTES"/.test(gate)) {
     reasons.push("runtime_report_exact_counts_missing");
   }
-  if (!/schema=beat_c_process_memory_guard\.v4/.test(guard) ||
-      !/memory_guard_scope=identity_history_union_group_and_descendants/.test(guard) ||
+  const guardOwnershipReasons = processTreeGuardOwnershipSourceReasons(guard);
+  if (!/schema=beat_c_process_memory_guard(?:\\n|")/.test(guard) ||
       !/observed_sample_limit_status=%s/.test(guard) ||
       !/observed_sample_status\s*=\s*\([\s\S]{0,160}?"proved"/.test(guard)) {
     reasons.push("independent_process_tree_guard_source_contract_missing");
   }
+  reasons.push(...guardOwnershipReasons);
+  reasons.push(...runtimeGateGuardReportValidatorSourceReasons(gate));
 
   const contractCode = lexChengSource(contract, false).code;
   if (!/\bglobalEmission\.relocs\.len\s*!=\s*2\b/.test(contractCode) ||
@@ -7235,6 +8025,20 @@ function validateAarch64F64RuntimeGateBundle(sourceRows) {
       !/regalloc_bridge_f64_index\s*\(\s*indexed_words\s*,\s*indexed_payload\.value\s*,\s*3\s*\)/.test(harness) ||
       !/const\s+int\s+store_code\s*=\s*verify_store_payloads\s*\(\s*\)/.test(harness)) {
     reasons.push("five_f64_store_runtime_cases_across_three_families_missing");
+  }
+  if (!/verify_constant_payloads\s*\(\s*void\s*\)/.test(harness) ||
+      !/0x7ff8000000000042/.test(harness) ||
+      !/0x8000000000000000/.test(harness) ||
+      !/0x7ff0000000000000/.test(harness) ||
+      !/0x0000000000000001/.test(harness) ||
+      !/actual\s*\[\s*index\s*\]\.bits\s*!=\s*expected\s*\[\s*index\s*\]/.test(harness)) {
+    reasons.push("exact_f64_constant_payload_runtime_cases_missing");
+  }
+  if (!/verify_call_clobber_payloads\s*\(\s*void\s*\)/.test(harness) ||
+      !/regalloc_bridge_f64_call_clobber\s*\(\s*inputs\s*\[\s*index\s*\]\.value\s*\)/.test(harness) ||
+      !/actual\.bits\s*!=\s*inputs\s*\[\s*index\s*\]\.bits/.test(harness) ||
+      !/const\s+int\s+call_clobber_code\s*=\s*verify_call_clobber_payloads\s*\(\s*\)/.test(harness)) {
+    reasons.push("f64_call_clobber_exact_payload_runtime_cases_missing");
   }
   const localBridgeMatch = bridge.match(/_regalloc_bridge_f64_local:\s*([\s\S]*?)(?=\n\.globl\s|$)/);
   if (!localBridgeMatch) {
@@ -7268,17 +8072,36 @@ function validateAarch64F64RuntimeGateBundle(sourceRows) {
   }
   if ((image.match(/emitFunction\("regalloc_raw_f64_(?:local|field|index)"/g) || []).length !== 3 ||
       !/emission\.relocs\.len\s*!=\s*0/.test(image) ||
-      (bridge.match(/^\.globl _regalloc_bridge_f64_/gm) || []).length !== 9) {
+      (image.match(/emitFunction\("regalloc_raw_f64_const_(?:nan|negative_zero|infinity|subnormal)"/g) || []).length !== 4 ||
+      !/emitFunction\("regalloc_raw_f64_identity"/.test(image) ||
+      !/emitCallClobberFunction\s*\(\s*"regalloc_raw_f64_call_clobber"/.test(image) ||
+      (bridge.match(/^\.globl _regalloc_bridge_f64_/gm) || []).length !== 14) {
     reasons.push("runtime_image_bridge_cardinality_contract_missing");
+  }
+  if (!/\bkind\s*==\s*alloc\.RegallocValueActionSpillCall\b/.test(imageCode) ||
+      !/\bkind\s*==\s*alloc\.RegallocValueActionReloadCall\b/.test(imageCode) ||
+      !/\bkind\s*==\s*alloc\.RegallocValueActionCallClobber\b/.test(imageCode) ||
+      !/\bspillCount\s*!=\s*1\s*\|\|\s*reloadCount\s*!=\s*1\s*\|\|\s*clobberCount\s*!=\s*1\b/.test(imageCode) ||
+      !/regalloc_call_clobber_actions spill=\{spillCount\} reload=\{reloadCount\} clobber=\{clobberCount\}/.test(image) ||
+      !/\bcall\.targetSymbol\s*=\s*"regalloc_raw_f64_identity"/.test(image) ||
+      !/\bcallTargets\s*:\s*str\[\]\s*=\s*\[\s*"_regalloc_raw_f64_identity"\s*\]/.test(image) ||
+      !/\bemission\.relocs\.len\s*!=\s*1\b/.test(imageCode) ||
+      !/\bemission\.relocs\s*\[\s*0\s*\]\.kind\s*!=\s*adapter\.RegallocAarch64RelocCall26\b/.test(imageCode) ||
+      !/\becho\s*\(\s*Fmt"\s*bl\s+\{reloc\.targetSymbol\}"\s*\)/.test(image)) {
+    reasons.push("canonical_call_clobber_spill_reload_action_runtime_witness_missing");
   }
   if (reasons.length > 0) throw new Error(`AArch64 F64 runtime gate source contract violation: ${reasons.join(",")}`);
   return {
-    schema: "regalloc_aarch64_f64_runtime_gate_source.v1",
+    schema: "regalloc_aarch64_f64_runtime_gate_source",
     memoryLimitBytes: String(AARCH64_F64_RUNTIME_GATE_MEMORY_BYTES),
     nanCompareCaseCount: 30,
     finiteCompareCaseCount: 18,
     storeRuntimeCaseCount: 5,
     storeRuntimeFamilyCount: 3,
+    constantPayloadCaseCount: 4,
+    callClobberPayloadCaseCount: 4,
+    callSpillActionCount: 1,
+    callReloadActionCount: 1,
     globalStaticRelocOracle: "PAGE21_PAGEOFF12_CONSECUTIVE_SAME_SYMBOL_AND_TAINTED_F64_STORE",
     d0PoisonStatus: "PROVEN",
     postCallX0ToD0Status: "PROVEN",
@@ -7305,7 +8128,7 @@ function validateX86_64F64RuntimeGateReport(raw) {
     "memory_limit_bytes",
     "memory_guard_scope",
   ], "x86-64 F64 runtime gate report");
-  if (rows.get("schema") !== "regalloc_x86_64_f64_runtime_gate.v1" ||
+  if (rows.get("schema") !== "regalloc_x86_64_f64_runtime_gate" ||
       rows.get("status") !== "GREEN" ||
       rows.get("target") !== "x86_64-apple-darwin" ||
       rows.get("host_execution") !== "rosetta_x86_64" ||
@@ -7317,7 +8140,7 @@ function validateX86_64F64RuntimeGateReport(raw) {
       rows.get("fused_function_count") !== "6" ||
       rows.get("bridge_result_transform") !== "0x5a5a5a5a" ||
       rows.get("memory_limit_bytes") !== String(X86_64_F64_RUNTIME_GATE_MEMORY_BYTES) ||
-      rows.get("memory_guard_scope") !== "identity_history_union_group_and_descendants") {
+      rows.get("memory_guard_scope") !== "identity_history_union_group_session_and_descendants") {
     throw new Error("x86-64 F64 runtime gate report contract mismatch");
   }
   return {
@@ -7361,15 +8184,14 @@ function validateX86_64F64RuntimeGateBundle(sourceRows) {
   }
   if (!/^FIXED_LIMIT_BYTES=1073741824$/m.test(gate) ||
       !/--rss-limit:"\$FIXED_LIMIT_BYTES"\s+--timeout:600/.test(gate) ||
-      !/memory_limit_bytes=\$FIXED_LIMIT_BYTES/.test(gate) ||
-      !/observed_sample_limit_status=proved/.test(gate) ||
-      !/memory_guard_scope=identity_history_union_group_and_descendants/.test(gate) ||
-      !/schema=beat_c_process_memory_guard\.v4/.test(guard) ||
-      !/memory_guard_scope=identity_history_union_group_and_descendants/.test(guard) ||
+      !/python3 - "\$report" "\$FIXED_LIMIT_BYTES"/.test(gate) ||
+      !/schema=beat_c_process_memory_guard(?:\\n|")/.test(guard) ||
       !/observed_sample_limit_status=%s/.test(guard) ||
       !/observed_sample_status\s*=\s*\([\s\S]{0,160}?"proved"/.test(guard)) {
     reasons.push("exact_one_gib_process_tree_guard_contract_missing");
   }
+  reasons.push(...processTreeGuardOwnershipSourceReasons(guard));
+  reasons.push(...runtimeGateGuardReportValidatorSourceReasons(gate));
   if (!/^ARCH_RUNNER="\/usr\/bin\/arch"$/m.test(gate) ||
       !/run_guard rosetta_probe "\$ARCH_RUNNER" -x86_64 \/usr\/bin\/true/.test(gate) ||
       !/run_guard rosetta_run "\$ARCH_RUNNER" -x86_64 "\$WORK\/runtime_gate"/.test(gate) ||
@@ -7468,6 +8290,8 @@ function validateX86_64F64RuntimeGateBundle(sourceRows) {
   const imageCode = lexChengSource(image, false).code;
   if (!/var\s+conditions:\s*int32\[\]\s*=\s*\[\s*ir\.BodyCondF64EqTag\s*,\s*ir\.BodyCondF64NeTag\s*,\s*ir\.BodyCondF64LtTag\s*,\s*ir\.BodyCondF64LeTag\s*,\s*ir\.BodyCondF64GtTag\s*,\s*ir\.BodyCondF64GeTag\s*\]/.test(imageCode) ||
       !/var\s+names:\s*str\[\]\s*=\s*\[\s*"eq"\s*,\s*"ne"\s*,\s*"lt"\s*,\s*"le"\s*,\s*"gt"\s*,\s*"ge"\s*\]/.test(image) ||
+      !/X64BodyPrepareStackLayout\s*\(\s*body\s*\)/.test(imageCode) ||
+      !/body\.x64StackLayoutReady/.test(imageCode) ||
       !/X64BodyCmpFusedAt\s*\(\s*body\s*,\s*0\s*\)\s*!=\s*fusedExpected/.test(imageCode) ||
       !/X64BodyIrWordCount\s*\(\s*body\s*\)/.test(imageCode) ||
       !/X64BodyFillWords\s*\(\s*words\s*,\s*0\s*,\s*wordCount\s*,\s*body\s*\)\s*!=\s*wordCount/.test(imageCode) ||
@@ -7483,7 +8307,7 @@ function validateX86_64F64RuntimeGateBundle(sourceRows) {
   }
   if (reasons.length > 0) throw new Error(`x86-64 F64 runtime gate source contract violation: ${reasons.join(",")}`);
   return {
-    schema: "regalloc_x86_64_f64_runtime_gate_source.v1",
+    schema: "regalloc_x86_64_f64_runtime_gate_source",
     memoryLimitBytes: String(X86_64_F64_RUNTIME_GATE_MEMORY_BYTES),
     hostExecution: "rosetta_x86_64",
     nanCompareCaseCount: 60,
@@ -7539,7 +8363,7 @@ function validateRetainedRuntimeGateWork(workValue, label, stages, extraNames) {
     };
   });
   const artifactSetSha256 = sha256(Buffer.from(artifacts.map((entry) => `${entry.name}\0${entry.sha256}\0${entry.device}\0${entry.inode}\0${entry.size}\0${entry.mtimeNs}\0${entry.ctimeNs}\n`).join(""), "utf8"));
-  return {schema: "cheng_regalloc_retained_runtime_gate.v1", work, artifactCount: artifacts.length, artifactSetSha256, artifacts, guardReportCount: guardReports.length, guardReports};
+  return {schema: "cheng_regalloc_retained_runtime_gate", work, artifactCount: artifacts.length, artifactSetSha256, artifacts, guardReportCount: guardReports.length, guardReports};
 }
 
 const AARCH64_F64_RUNTIME_GATE_EXTRA_ARTIFACTS = Object.freeze([
@@ -7676,6 +8500,8 @@ const FINAL_RELEASE_BINDING_KEYS = Object.freeze([
   "official_source_bundle_cid", "official_entry_source_cid", "official_compile_receipt_cid",
   "official_compiler_output_receipt_cid",
   "official_workspace_source_manifest_sha256", "official_build_seed_sha256",
+  "execution_stage_policy_sha256", "execution_stage_receipt_sha256",
+  "execution_identity_sha256", "execution_stage_root_sha256",
   "jobs_lock_sha256", "exec_diff_lock_sha256", "target_emit_lock_sha256", "gen3_lock_sha256",
   "production_perf_raw_sha256", "production_perf_verdict_sha256",
   "production_compile_raw_sha256", "production_compile_verdict_sha256",
@@ -7734,7 +8560,7 @@ function collectReleaseArtifactRows(root, excludedBasename) {
 
 function releaseArtifactFields(rows, bindings) {
   validateFinalReleaseBindings(bindings, "final release bindings");
-  const fields = [["schema", "cheng_regalloc_release_artifact_manifest.v1"], ...FINAL_RELEASE_BINDING_KEYS.map((key) => [key, bindings[key]]), ["artifact_count", rows.length]];
+  const fields = [["schema", "cheng_regalloc_release_artifact_manifest"], ...FINAL_RELEASE_BINDING_KEYS.map((key) => [key, bindings[key]]), ["artifact_count", rows.length]];
   for (let index = 0; index < rows.length; index++) {
     const row = rows[index];
     fields.push(
@@ -7774,7 +8600,7 @@ function validateFinalReleaseArtifactManifest(rootValue, manifestPathValue, expe
   );
   exact.push("manifest_payload_sha256");
   exactKeys(parsed, exact, "final release artifact manifest");
-  if (parsed.get("schema") !== "cheng_regalloc_release_artifact_manifest.v1") throw new Error("final release artifact manifest schema mismatch");
+  if (parsed.get("schema") !== "cheng_regalloc_release_artifact_manifest") throw new Error("final release artifact manifest schema mismatch");
   for (const key of FINAL_RELEASE_BINDING_KEYS) if (parsed.get(key) !== expectedBindings[key]) throw new Error(`final release artifact binding mismatch: ${key}`);
   const currentRows = collectReleaseArtifactRows(root, basename(manifestPath));
   if (currentRows.length !== count) throw new Error("final release artifact set count changed");
@@ -7785,7 +8611,7 @@ function validateFinalReleaseArtifactManifest(rootValue, manifestPathValue, expe
       ["size", row.stat.size], ["mode", row.stat.mode], ["nlink", row.stat.nlink], ["mtime_ns", row.stat.mtimeNs], ["ctime_ns", row.stat.ctimeNs],
     ]) if (parsed.get(`artifact.${index}.${suffix}`) !== String(value)) throw new Error(`final release artifact changed at index ${index}: ${suffix}`);
   }
-  return {schema: "cheng_regalloc_release_artifact_evidence.v1", root, manifestPath, manifestSha256: manifest.sha256, artifactCount: count, bindings: Object.fromEntries(FINAL_RELEASE_BINDING_KEYS.map((key) => [key, parsed.get(key)]))};
+  return {schema: "cheng_regalloc_release_artifact_evidence", root, manifestPath, manifestSha256: manifest.sha256, artifactCount: count, bindings: Object.fromEntries(FINAL_RELEASE_BINDING_KEYS.map((key) => [key, parsed.get(key)]))};
 }
 
 function check(id, status, reason, extra = {}) {
@@ -7794,7 +8620,7 @@ function check(id, status, reason, extra = {}) {
 
 const RESEARCH_DIAGNOSTIC_CHECK_IDS = Object.freeze(["typedexpr_ebnf_structural_semantic_coverage", "typedexpr_formal_profile_consistency"]);
 const SOURCE_REQUIRED_CHECK_IDS = Object.freeze(["typedexpr_expression_leaf_coverage_ledger", "typedexpr_formal_expression_spec_binding", "typedexpr_qualified_nested_call_declaration_binding", "source_snapshot", "driver_toolchain_identity", "typedexpr_frozen_authority_projection_closure", "semantic_pipeline_structural_matrix", "semantic_pipeline_real_receipts", "aarch64_f64_runtime_gate_source_contract", "aarch64_f64_runtime_gate", "x86_64_f64_runtime_gate_source_contract", "x86_64_f64_runtime_gate", "cheng_internal_contract_fixture", "typedexpr_static_arg_expression_matrix", "bodyir_packed_slab_o2", "bodyir_packed_slab_sanitized", "bodyir_memory_and_arena_release"]);
-const RELEASE_CRITICAL_CHECK_IDS = Object.freeze(["release_one_shot_worker", "typedexpr_expression_leaf_coverage_ledger", "typedexpr_formal_expression_spec_binding", "typedexpr_qualified_nested_call_declaration_binding", "source_snapshot", "driver_toolchain_identity", "private_actual_toolchain", "typedexpr_frozen_authority_projection_closure", "semantic_pipeline_structural_matrix", "semantic_pipeline_real_receipts", "aarch64_f64_runtime_gate_source_contract", "private_runtime_gate_bundle", "aarch64_f64_runtime_gate", "x86_64_f64_runtime_gate_source_contract", "x86_64_f64_runtime_gate", "cheng_internal_contract_fixture", "typedexpr_static_arg_expression_matrix", "bodyir_packed_slab_o2", "bodyir_packed_slab_sanitized", "bodyir_memory_and_arena_release", "release_source_process_tree_guards", "release_cross_bindings", "final_release_artifact_manifest"]);
+const RELEASE_CRITICAL_CHECK_IDS = Object.freeze(["release_one_shot_worker", "typedexpr_expression_leaf_coverage_ledger", "typedexpr_formal_expression_spec_binding", "typedexpr_qualified_nested_call_declaration_binding", "source_snapshot", "driver_toolchain_identity", "private_actual_toolchain", "execution_stage_receipt_identity", "typedexpr_frozen_authority_projection_closure", "semantic_pipeline_structural_matrix", "semantic_pipeline_real_receipts", "aarch64_f64_runtime_gate_source_contract", "private_runtime_gate_bundle", "aarch64_f64_runtime_gate", "x86_64_f64_runtime_gate_source_contract", "x86_64_f64_runtime_gate", "cheng_internal_contract_fixture", "typedexpr_static_arg_expression_matrix", "bodyir_packed_slab_o2", "bodyir_packed_slab_sanitized", "bodyir_memory_and_arena_release", "release_source_process_tree_guards", "release_cross_bindings", "final_release_artifact_manifest"]);
 
 function sourceChecksGreen(checks) {
   return SOURCE_REQUIRED_CHECK_IDS.every((id) => checks.find((entry) => entry.id === id)?.status === "GREEN");
@@ -7814,7 +8640,7 @@ function result(mode, root, snapshotSha256, checks) {
   const releaseCriticalReady = releaseCriticalChecksGreen(checks);
   const releaseReady = mode === "release" && releaseCriticalReady && checks.filter((entry) => entry.requiredForRelease).every((entry) => entry.status === "GREEN");
   const verdict = checks.some((entry) => entry.status === "CFAIL") ? "CFAIL" : releaseReady ? "RELEASE_GREEN" : sourceReady && mode === "source" ? "SOURCE_GREEN" : "RED";
-  return {schema: "cheng_regalloc_preflight.v1", scope: "regalloc_release", mode, verdict, source_ready: sourceReady ? 1 : 0, release_critical_ready: releaseCriticalReady ? 1 : 0, release_ready: releaseReady ? 1 : 0, research_diagnostic_check_ids: RESEARCH_DIAGNOSTIC_CHECK_IDS, tree_root: root || null, snapshot_sha256: snapshotSha256 || null, compiler_profile: formalChengCompilerProfile(), check_count: checks.length, checks};
+  return {schema: "cheng_regalloc_preflight", scope: "regalloc_release", mode, verdict, source_ready: sourceReady ? 1 : 0, release_critical_ready: releaseCriticalReady ? 1 : 0, release_ready: releaseReady ? 1 : 0, research_diagnostic_check_ids: RESEARCH_DIAGNOSTIC_CHECK_IDS, tree_root: root || null, snapshot_sha256: snapshotSha256 || null, compiler_profile: formalChengCompilerProfile(), check_count: checks.length, checks};
 }
 
 async function executePreflightOwned(input, oneShotContext = null) {
@@ -7915,11 +8741,19 @@ async function executePreflightOwned(input, oneShotContext = null) {
   try {
     formalSpecPath = canonicalAbsolute(join(root, FORMAL_SPEC_RELATIVE), `treeRoot/${FORMAL_SPEC_RELATIVE}`, "file");
   } catch (error) {
-    checks.push(check("typedexpr_formal_expression_spec_binding", "UNPROVEN", error instanceof Error ? error.message : String(error), {schema: FORMAL_EXPRESSION_SLICE_SCHEMA, expectedSliceSha256: FORMAL_EXPRESSION_SLICE_SHA256}));
+    checks.push(check("typedexpr_formal_expression_spec_binding", "UNPROVEN", error instanceof Error ? error.message : String(error), {schema: CURRENT_FORMAL_PROFILE_SCHEMA, binding: "generated_ebnf_parser_receipt_map"}));
     return finish();
   }
   try {
-    coverageLedger = validateTypedExprCoverageLedger();
+    const earlyFormalSpec = stableSnapshot(
+      formalSpecPath,
+      "formal specification for TypedExpr coverage ledger",
+    );
+    const earlyFormalSlice = formalExpressionSlice(earlyFormalSpec.raw);
+    coverageLedger = validateTypedExprCoverageLedger(
+      earlyFormalSlice.sha256,
+      earlyFormalSlice.specVersion,
+    );
     for (const entry of TYPED_EXPR_MATRIX) canonicalAbsolute(entry.path, `TypedExpr matrix fixture ${entry.id}`, "file");
     checks.push(check("typedexpr_expression_leaf_coverage_ledger", "GREEN", "every selected leaf alternative and audited expression family has one unique executable fixture and explicit outcome contract", coverageLedger));
   } catch (error) {
@@ -7933,7 +8767,7 @@ async function executePreflightOwned(input, oneShotContext = null) {
     try {
       sourceManifestPath = canonicalAbsolute(input.sourceManifest, "sourceManifest", "file");
       sourceManifest = validateSourceManifestPath(root, sourceManifestPath);
-      checks.push(check("artifact_source_manifest", "GREEN", "strict current v2 closure verified", {requiredForRelease: mode === "release", artifact_path: sourceManifestPath, artifact_sha256: sourceManifest.sha256, fileCount: sourceManifest.fileCount, edgeCount: sourceManifest.edgeCount}));
+      checks.push(check("artifact_source_manifest", "GREEN", "strict current source closure verified", {requiredForRelease: mode === "release", artifact_path: sourceManifestPath, artifact_sha256: sourceManifest.sha256, fileCount: sourceManifest.fileCount, edgeCount: sourceManifest.edgeCount}));
     } catch (error) {
       checks.push(check("artifact_source_manifest", "RED", error instanceof Error ? error.message : String(error), {requiredForRelease: mode === "release", heavyChildStarted: false}));
       return finish();
@@ -7953,6 +8787,11 @@ async function executePreflightOwned(input, oneShotContext = null) {
         evidence: releaseInputs.artifacts.map((entry) => ({key: entry.key, path: entry.snapshot.path, sha256: entry.snapshot.sha256})),
         drivers: releaseInputs.driverPins.map((entry) => ({key: entry.key, path: entry.snapshot.path, sha256: entry.snapshot.sha256})),
         heavyChildStarted: false,
+      }));
+      checks.push(check("execution_stage_receipt_identity", "GREEN", "the exact seven-stage compiler receipt, all stage artifacts and the common current-source execution identity passed independent validation", {
+        requiredForRelease: true,
+        heavyChildStarted: false,
+        ...releaseInputs.executionStageReceipt,
       }));
     } catch (error) {
       checks.push(check("release_evidence_inputs", "RED", error instanceof Error ? error.message : String(error), {requiredForRelease: true, heavyChildStarted: false}));
@@ -8002,7 +8841,7 @@ async function executePreflightOwned(input, oneShotContext = null) {
     sourceInputs = snapshotSourceInputs(root, {sourceManifest: sourceManifestPath, sourceManifestRelativePaths: sourceManifest?.relativePaths || [], memoryManifest: memoryManifestPath});
     snapshotSha256 = sourceInputs.sha256;
     const fusionLockAbsent = sourceInputs.absences.some((entry) => entry.label === "fusion/bun.lock");
-    checks.push(check("source_snapshot", fusionLockAbsent ? "UNPROVEN" : "GREEN", fusionLockAbsent ? "Fusion bun.lock is absent; dependency identity is UNPROVEN" : "Fusion execution sources/fixtures/dependencies/lock, formal specification, Cheng matrix and authority production import closure, and exact C include closure are pinned by raw SHA-256 and file identity", {artifact_sha256: snapshotSha256, fileCount: sourceInputs.snapshots.length, absentInputs: sourceInputs.absences, fusionSourceFileCount: sourceInputs.fusionSourceFileCount, fusionDependencyFileCount: sourceInputs.fusionDependencyFileCount, fusionFixtureCount: sourceInputs.fusionFixtureCount, authorityMinimumRequiredFileCount: AUTHORITY_MINIMUM_REQUIRED_FILES.length, authorityProductionImportFileCount: sourceInputs.authorityProductionFiles.length, authorityProductionRootFileCount: sourceInputs.authorityProductionRoots.length, authorityManifestRootFileCount: sourceInputs.authorityManifestRootFileCount, authorityProductionScope: sourceInputs.authorityProductionScope, cIncludeClosure: sourceInputs.cIncludeClosure, pinnedSourceManifest: sourceManifestPath, pinnedMemoryManifest: memoryManifestPath}));
+    checks.push(check("source_snapshot", fusionLockAbsent ? "UNPROVEN" : "GREEN", fusionLockAbsent ? "Fusion bun.lock is absent; dependency identity is UNPROVEN" : "Fusion execution sources/fixtures/dependencies/lock, formal specification, parser receipt tool/source-plan closures, Cheng authority production import closure, and exact C include closure are pinned by raw SHA-256 and file identity", {artifact_sha256: snapshotSha256, fileCount: sourceInputs.snapshots.length, absentInputs: sourceInputs.absences, fusionSourceFileCount: sourceInputs.fusionSourceFileCount, fusionDependencyFileCount: sourceInputs.fusionDependencyFileCount, fusionFixtureCount: sourceInputs.fusionFixtureCount, formalReceiptToolClosure: sourceInputs.formalReceiptToolClosure, formalReceiptSourcePlan: sourceInputs.formalReceiptSourcePlan, authorityMinimumRequiredFileCount: AUTHORITY_MINIMUM_REQUIRED_FILES.length, authorityFormalReceiptRootFileCount: FORMAL_RECEIPT_AUTHORITY_FILES.length, authorityProductionImportFileCount: sourceInputs.authorityProductionFiles.length, authorityProductionRootFileCount: sourceInputs.authorityProductionRoots.length, authorityManifestRootFileCount: sourceInputs.authorityManifestRootFileCount, authorityProductionScope: sourceInputs.authorityProductionScope, cIncludeClosure: sourceInputs.cIncludeClosure, pinnedSourceManifest: sourceManifestPath, pinnedMemoryManifest: memoryManifestPath}));
     const nestedFixtureSnapshot = sourceInputs.byLabel.get(QUALIFIED_NESTED_CALL_WITNESS.fixtureLabel);
     const nestedModuleSnapshot = sourceInputs.byLabel.get(QUALIFIED_NESTED_CALL_WITNESS.modulePath);
     const nestedBinding = nestedFixtureSnapshot && nestedModuleSnapshot
@@ -8010,11 +8849,50 @@ async function executePreflightOwned(input, oneShotContext = null) {
       : {status: "RED", reason: "qualified nested-call fixture or canonical declaration module is absent from the complete snapshot", schema: QUALIFIED_NESTED_CALL_WITNESS.schema, witnessId: QUALIFIED_NESTED_CALL_WITNESS.id, issues: ["qualified_nested_call_snapshot_edge_missing"]};
     checks.push(check("typedexpr_qualified_nested_call_declaration_binding", nestedBinding.status, nestedBinding.reason, {required: true, executionWitnessFamily: QUALIFIED_NESTED_CALL_WITNESS.family, ...nestedBinding}));
     const formalSpecSnapshot = sourceInputs.byLabel.get(FORMAL_SPEC_RELATIVE);
-    const formalBinding = formalSpecSnapshot ? validateTypedExprFormalSpecBinding(formalSpecSnapshot.raw, formalSpecSnapshot.path) : {status: "UNPROVEN", reason: "formal expression specification is absent from source snapshot"};
+    const generatedEbnfMapSnapshot = sourceInputs.byLabel.get(
+      `fusion/${EBNF_PARSER_NODE_MAP_RELATIVE}`,
+    );
+    const parserSnapshot = sourceInputs.byLabel.get(
+      "src/core/lang/parser.cheng",
+    );
+    const producerDeclarationsSnapshot = sourceInputs.byLabel.get(
+      `fusion/${EBNF_PARSER_PRODUCER_DECLARATIONS_RELATIVE}`,
+    );
+    const formalBinding =
+      formalSpecSnapshot && generatedEbnfMapSnapshot && parserSnapshot &&
+          producerDeclarationsSnapshot
+        ? validateTypedExprFormalSpecBinding(
+            formalSpecSnapshot.raw,
+            generatedEbnfMapSnapshot.raw,
+            parserSnapshot.raw,
+            producerDeclarationsSnapshot.raw,
+            {
+              sourcePath: formalSpecSnapshot.path,
+              sourceSnapshotSha256: sourceInputs.sha256,
+              receiptToolClosureSha256:
+                sourceInputs.formalReceiptToolClosure.sha256,
+              receiptSourcePlanSha256:
+                sourceInputs.formalReceiptSourcePlan.sha256,
+            },
+          )
+        : {
+            status: "UNPROVEN",
+            reason:
+              "formal specification, parser, producer declarations or generated EBNF receipt map is absent from source snapshot",
+          };
+    if (formalBinding.status === "GREEN" &&
+        coverageLedger.formalSpecSliceSha256 !==
+          formalBinding.sliceSha256) {
+      formalBinding.status = "UNPROVEN";
+      formalBinding.reason =
+        "formal expression EBNF drifted between coverage-ledger and source snapshots";
+    }
     checks.push(check("typedexpr_formal_expression_spec_binding", formalBinding.status, formalBinding.reason, {...formalBinding, artifact_path: formalSpecPath, artifact_sha256: formalSpecSnapshot?.sha256 || null}));
     if (formalBinding.status !== "GREEN") return finish();
     try {
-      const obligationManifest = deriveFormalExpressionObligationManifest(formalSpecSnapshot.raw, true);
+      const obligationManifest = deriveFormalExpressionObligationManifest(
+        formalSpecSnapshot.raw,
+      );
       const obligationCoverage = evaluateFormalExpressionObligationCoverage(obligationManifest, coverageLedger);
       checks.push(check("typedexpr_ebnf_structural_semantic_coverage", obligationCoverage.status, obligationCoverage.reason, {required: true, manifest: obligationManifest, coverage: obligationCoverage}));
       const contradictions = obligationManifest.formalProfileContradictions || [];
@@ -8065,7 +8943,7 @@ async function executePreflightOwned(input, oneShotContext = null) {
   }
 
   if (mode !== "release" && !memoryManifestPath) {
-    checks.push(check("bodyir_memory_and_arena_release", "UNPROVEN", "cold_bodyir_memory_manifest.v1 is absent; packed-slab peak and all six top-level arena releases are not proved"));
+    checks.push(check("bodyir_memory_and_arena_release", "UNPROVEN", "cold_bodyir_memory_manifest is absent; packed-slab peak and all six top-level arena releases are not proved"));
   } else if (mode !== "release") {
     try {
       const path = memoryManifestPath;
@@ -8084,7 +8962,21 @@ async function executePreflightOwned(input, oneShotContext = null) {
   try {
     semanticPipelineEvidence = await runSemanticPipelineGate(root, mode, sourceInputs, inputColdDriver, inputCompiler, driverPin, compilerPin, privateReleaseToolchain, oneShotContext, maxBuffer);
     checks.push(check("semantic_pipeline_structural_matrix", "GREEN", "the complete bounded m9024 join, deterministic source materializer and 2,926-case matrix ran in a private Bun child under the exact 1 GiB process-tree guard; the parent independently rehashed the full canonical receipt", {required: true, requiredForRelease: mode === "release", ...semanticPipelineEvidence}));
-    checks.push(check("semantic_pipeline_real_receipts", "RED", "formal parser-span witnesses and compiler-owned source-bound TypedExpr -> CSG/lowering -> primary/backend2 -> both regalloc receipts are absent", {required: true, requiredForRelease: mode === "release", heavyChildStarted: true, receiptSha256: semanticPipelineEvidence.receiptSha256, grammarObligationRootSha256: semanticPipelineEvidence.grammarObligationRootSha256, grammarRequiredCount: semanticPipelineEvidence.grammarRequiredCount, parserEvidenceRootSha256: semanticPipelineEvidence.parserEvidenceRootSha256, parserEvidenceStatus: semanticPipelineEvidence.parserEvidenceStatus, realPipelineReceiptStatus: semanticPipelineEvidence.realPipelineReceiptStatus}));
+    const executionStageReceipt = mode === "release" ? releaseInputs?.executionStageReceipt : null;
+    checks.push(check("semantic_pipeline_real_receipts", "RED", executionStageReceipt
+      ? "the compiler-owned seven-stage receipt is independently valid, but formal parser-span admission remains RED and is not cross-bound to that receipt"
+      : "formal parser-span witnesses and compiler-owned source-bound TypedExpr -> CSG/lowering -> primary/backend2 -> both regalloc receipts are absent", {
+      required: true,
+      requiredForRelease: mode === "release",
+      heavyChildStarted: true,
+      receiptSha256: semanticPipelineEvidence.receiptSha256,
+      grammarObligationRootSha256: semanticPipelineEvidence.grammarObligationRootSha256,
+      grammarRequiredCount: semanticPipelineEvidence.grammarRequiredCount,
+      parserEvidenceRootSha256: semanticPipelineEvidence.parserEvidenceRootSha256,
+      parserEvidenceStatus: semanticPipelineEvidence.parserEvidenceStatus,
+      realPipelineReceiptStatus: semanticPipelineEvidence.realPipelineReceiptStatus,
+      executionStageReceipt,
+    }));
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     checks.push(check("semantic_pipeline_structural_matrix", "CFAIL", reason, {required: true, requiredForRelease: mode === "release", pathsRetained: mode === "release", heavyChildStarted: true}));
@@ -8166,18 +9058,18 @@ async function executePreflightOwned(input, oneShotContext = null) {
       const reason = "production gate was not started because source readiness or raw GEN2/GEN3/official identity is not GREEN";
       checks.push(check("production_gate_report", "RED", reason, {requiredForRelease: true, heavyChildStarted: false}));
       checks.push(check("process_tree_rss_guard", "RED", reason, {requiredForRelease: true, heavyChildStarted: false, rssCapBytes: rssCap.toString()}));
-      checks.push(check("production_v6_v3_v4_artifacts", "RED", reason, {requiredForRelease: true, heavyChildStarted: false, sourceManifestSha256: sourceManifest.sha256}));
+      checks.push(check("production_artifacts", "RED", reason, {requiredForRelease: true, heavyChildStarted: false, sourceManifestSha256: sourceManifest.sha256}));
     } else {
       try {
         production = await runProductionReleaseGate(root, releaseInputs, productionExecBundle, privateReleaseToolchain, sourceManifest.sha256, releaseFixed.officialSha256, Math.round((input.releaseTimeoutSec || DEFAULT_RELEASE_TIMEOUT_SEC) * 1000), maxBuffer);
-        checks.push(check("production_gate_report", "GREEN", "exact-hash-bound production gate exited zero and its retained v5 report was independently reproduced", {requiredForRelease: true, pathsRetained: true, releaseWorkRoot: production.releaseWorkRoot, reportPath: production.reportPath, reportSha256: production.reportSha256, sourceGitTree: production.sourceGitTree, productionGreenCount: production.productionGreenCount, compilePairRowCount: production.compilePairRowCount}));
-        checks.push(check("process_tree_rss_guard", "GREEN", "every retained production guard-v4 report proves sampled process-tree resident/phys-footprint peak at or below exactly 1 GiB", {requiredForRelease: true, pathsRetained: true, releaseWorkRoot: production.releaseWorkRoot, rssCapBytes: rssCap.toString(), ...production.guardEvidence}));
-        checks.push(check("production_v6_v3_v4_artifacts", "GREEN", "retained unique workload current v6 receipt is independently bound to its v3 frozen plan, v4 emission ledger and output object", {requiredForRelease: true, pathsRetained: true, releaseWorkRoot: production.releaseWorkRoot, sourceManifestSha256: sourceManifest.sha256, ...production.receiptEvidence}));
+        checks.push(check("production_gate_report", "GREEN", "exact-hash-bound production gate exited zero and its retained report was independently reproduced", {requiredForRelease: true, pathsRetained: true, releaseWorkRoot: production.releaseWorkRoot, reportPath: production.reportPath, reportSha256: production.reportSha256, sourceGitTree: production.sourceGitTree, productionGreenCount: production.productionGreenCount, compilePairRowCount: production.compilePairRowCount}));
+        checks.push(check("process_tree_rss_guard", "GREEN", "every retained production guard report proves sampled process-tree resident/phys-footprint peak at or below exactly 1 GiB", {requiredForRelease: true, pathsRetained: true, releaseWorkRoot: production.releaseWorkRoot, rssCapBytes: rssCap.toString(), ...production.guardEvidence}));
+        checks.push(check("production_artifacts", "GREEN", "retained unique workload receipt is independently bound to its frozen plan, emission ledger and output object", {requiredForRelease: true, pathsRetained: true, releaseWorkRoot: production.releaseWorkRoot, sourceManifestSha256: sourceManifest.sha256, ...production.receiptEvidence}));
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         checks.push(check("production_gate_report", "RED", reason, {requiredForRelease: true, pathsRetained: true, releaseWorkRoot: releaseInputs.releaseWorkRoot}));
         checks.push(check("process_tree_rss_guard", "RED", "production gate evidence was not fully validated", {requiredForRelease: true, pathsRetained: true, releaseWorkRoot: releaseInputs.releaseWorkRoot, rssCapBytes: rssCap.toString()}));
-        checks.push(check("production_v6_v3_v4_artifacts", "RED", "production gate evidence was not fully validated", {requiredForRelease: true, pathsRetained: true, releaseWorkRoot: releaseInputs.releaseWorkRoot, sourceManifestSha256: sourceManifest.sha256}));
+        checks.push(check("production_artifacts", "RED", "production gate evidence was not fully validated", {requiredForRelease: true, pathsRetained: true, releaseWorkRoot: releaseInputs.releaseWorkRoot, sourceManifestSha256: sourceManifest.sha256}));
       }
       try {
         const finalSourceInputs = snapshotSourceInputs(root, {sourceManifest: sourceManifestPath, sourceManifestRelativePaths: sourceManifest.relativePaths, memoryManifest: memoryManifestPath});
@@ -8237,7 +9129,7 @@ async function executePreflightOwned(input, oneShotContext = null) {
         releaseCheck.status = "CFAIL";
         releaseCheck.reason = error instanceof Error ? error.message : String(error);
         if (production) {
-          for (const id of ["production_gate_report", "process_tree_rss_guard", "production_v6_v3_v4_artifacts"]) {
+          for (const id of ["production_gate_report", "process_tree_rss_guard", "production_artifacts"]) {
             const productionCheck = checks.find((entry) => entry.id === id);
             productionCheck.status = "CFAIL";
             productionCheck.reason = error instanceof Error ? error.message : String(error);
@@ -8281,6 +9173,10 @@ async function executePreflightOwned(input, oneShotContext = null) {
           official_compiler_output_receipt_cid: releaseInputs.officialDriverBuild.compilerOutputReceiptCid,
           official_workspace_source_manifest_sha256: releaseInputs.officialDriverBuild.workspaceSourceManifestSha256,
           official_build_seed_sha256: releaseInputs.officialDriverBuild.seedSha256,
+          execution_stage_policy_sha256: releaseInputs.executionStageReceipt.policySha256,
+          execution_stage_receipt_sha256: releaseInputs.executionStageReceipt.receiptSha256,
+          execution_identity_sha256: releaseInputs.executionStageReceipt.executionRaw32,
+          execution_stage_root_sha256: releaseInputs.executionStageReceipt.sevenStageRootRaw32,
           jobs_lock_sha256: boundReleaseArtifactSha256("jobsLock"),
           exec_diff_lock_sha256: boundReleaseArtifactSha256("execDiffLock"),
           target_emit_lock_sha256: boundReleaseArtifactSha256("targetEmitLock"),
@@ -8322,9 +9218,9 @@ function oneShotFailureResult(input, root, reason, extraChecks = []) {
 
 function adoptFinalizedOuterClaim(claim) {
   const snapshot = exactFdSnapshot(claim.fd, "outer held finalized release claim", 65536);
-  const pattern = new RegExp(`^schema=cheng_regalloc_release_claim\\.v1\\nrun_id=${claim.runId}\\ninput_sha256=([0-9a-f]{64})\\n$`);
+  const pattern = new RegExp(`^schema=cheng_regalloc_release_claim\\nrun_id=${claim.runId}\\ninput_sha256=([0-9a-f]{64})\\n$`);
   const match = snapshot.raw.toString("utf8").match(pattern);
-  const initialRaw = Buffer.from(`schema=cheng_regalloc_release_claim.v1\nrun_id=${claim.runId}\n`, "utf8");
+  const initialRaw = Buffer.from(`schema=cheng_regalloc_release_claim\nrun_id=${claim.runId}\n`, "utf8");
   if (!match && !snapshot.raw.equals(initialRaw)) throw new Error("one-shot worker did not preserve or finalize the exact held release claim");
   claim.expectedRaw = snapshot.raw;
   claim.expectedStat = snapshot.stat;
@@ -8336,7 +9232,7 @@ function adoptFinalizedOuterClaim(claim) {
 function finalizerStageOneReady(report) {
   const cross = report?.checks?.find((entry) => entry.id === "release_cross_bindings");
   const finalManifest = report?.checks?.find((entry) => entry.id === "final_release_artifact_manifest");
-  return report?.schema === "cheng_regalloc_preflight.v1" && report.mode === "release" && report.verdict === "RED" &&
+  return report?.schema === "cheng_regalloc_preflight" && report.mode === "release" && report.verdict === "RED" &&
     releasePreFinalChecksGreen(report.checks) && cross?.status === "GREEN" && finalManifest?.status === "RED" &&
     report.checks.filter((entry) => entry.id !== "final_release_artifact_manifest").every((entry) => entry.status !== "CFAIL");
 }
@@ -8374,6 +9270,7 @@ async function revalidateFinalizerReleaseEvidence(context, stageOneReport, cross
   const artifacts = new Map(releaseInputs.artifacts.map((entry) => [entry.key, entry.snapshot]));
   for (const [key, bindingKey] of [
     ["officialBuildReceipt", "official_build_receipt_sha256"],
+    ["executionStagePolicy", "execution_stage_policy_sha256"],
     ["backend2VersionManifest", "backend2_version_manifest_sha256"],
     ["jobsLock", "jobs_lock_sha256"],
     ["execDiffLock", "exec_diff_lock_sha256"],
@@ -8383,6 +9280,11 @@ async function revalidateFinalizerReleaseEvidence(context, stageOneReport, cross
     const artifact = artifacts.get(key);
     if (!artifact || artifact.sha256 !== cross.bindings[bindingKey]) throw new Error(`finalizer direct release binding changed: ${bindingKey}`);
   }
+  for (const [field, bindingKey] of [
+    ["receiptSha256", "execution_stage_receipt_sha256"],
+    ["executionRaw32", "execution_identity_sha256"],
+    ["sevenStageRootRaw32", "execution_stage_root_sha256"],
+  ]) if (releaseInputs.executionStageReceipt[field] !== cross.bindings[bindingKey]) throw new Error(`finalizer seven-stage execution binding changed: ${bindingKey}`);
   if (releaseInputs.backend2VersionManifest.manifestSha256 !== cross.bindings.backend2_version_manifest_sha256) throw new Error("finalizer backend2 epoch binding changed");
   for (const [field, bindingKey] of [
     ["compilerReportSha256", "official_compiler_report_sha256"], ["guardSha256", "official_build_guard_sha256"],
@@ -8409,10 +9311,10 @@ async function revalidateFinalizerReleaseEvidence(context, stageOneReport, cross
     if (artifact.sha256 !== cross.bindings[bindingKey]) throw new Error(`${label} direct binding changed`);
     productionArtifacts.push({label, path: artifact.path, sha256: artifact.sha256});
   }
-  const receiptCheck = stageOneReport.checks.find((entry) => entry.id === "production_v6_v3_v4_artifacts");
+  const receiptCheck = stageOneReport.checks.find((entry) => entry.id === "production_artifacts");
   if (receiptCheck?.status !== "GREEN") throw new Error("finalizer production receipt evidence is unavailable");
   for (const [pathKey, shaKey, bindingKey, label] of [
-    ["receiptPath", "receiptSha256", "production_receipt_sha256", "finalizer production v6 receipt"],
+    ["receiptPath", "receiptSha256", "production_receipt_sha256", "finalizer production receipt"],
     ["objectPath", "objectSha256", "production_object_sha256", "finalizer production object"],
   ]) {
     const artifact = finalizerBoundSnapshot(receiptCheck[pathKey], receiptCheck[shaKey], label);
@@ -8494,10 +9396,14 @@ async function revalidateFinalizerReleaseEvidence(context, stageOneReport, cross
     reports.push({kind, lockPath: lock.path, lockSha256: lock.sha256, guard: guardEvidence, stdoutSha256: stdout.sha256, stderrSha256: stderr.sha256});
   }
   const receiptFields = [
-    ["schema", "cheng_regalloc_finalizer_external_lock_revalidation.v1"], ["status", "proved"],
+    ["schema", "cheng_regalloc_finalizer_external_lock_revalidation"], ["status", "proved"],
     ["release_input_sha256", releaseInputs.sha256], ["backend2_version_manifest_sha256", releaseInputs.backend2VersionManifest.manifestSha256],
     ["official_build_receipt_sha256", releaseInputs.officialDriverBuild.receiptSha256],
     ["official_compiler_output_receipt_cid", releaseInputs.officialDriverBuild.compilerOutputReceiptCid],
+    ["execution_stage_policy_sha256", releaseInputs.executionStageReceipt.policySha256],
+    ["execution_stage_receipt_sha256", releaseInputs.executionStageReceipt.receiptSha256],
+    ["execution_identity_sha256", releaseInputs.executionStageReceipt.executionRaw32],
+    ["execution_stage_root_sha256", releaseInputs.executionStageReceipt.sevenStageRootRaw32],
     ["backend2_sentinel_guard_sha256", sentinelGuard.sha256], ["backend2_sentinel_stdout_sha256", sentinelStdout.sha256],
     ["backend2_sentinel_stderr_sha256", sentinelStderr.sha256], ["backend2_sources_sha256", sentinelEvidence.sourcesSha256],
     ["report_count", reports.length],
@@ -8517,7 +9423,7 @@ async function revalidateFinalizerReleaseEvidence(context, stageOneReport, cross
   const receipt = writeExclusiveSnapshot(join(revalidationDirectory, "receipt.txt"), renderHashedKv(receiptFields, "receipt_payload_sha256"), "finalizer external-lock revalidation receipt");
   fsyncDirectory(revalidationDirectory);
   fsyncDirectory(releaseRoot);
-  return {schema: "cheng_regalloc_finalizer_external_lock_revalidation.v1", releaseInputSha256: releaseInputs.sha256, backend2VersionManifest: releaseInputs.backend2VersionManifest, backend2VersionSentinel: {evidence: sentinelEvidence, guard: sentinelGuard, stdoutSha256: sentinelStdout.sha256, stderrSha256: sentinelStderr.sha256}, productionArtifacts, directory: revalidationDirectory, reportCount: reports.length, reports, receiptPath: receipt.path, receiptSha256: receipt.sha256};
+  return {schema: "cheng_regalloc_finalizer_external_lock_revalidation", releaseInputSha256: releaseInputs.sha256, backend2VersionManifest: releaseInputs.backend2VersionManifest, backend2VersionSentinel: {evidence: sentinelEvidence, guard: sentinelGuard, stdoutSha256: sentinelStdout.sha256, stderrSha256: sentinelStderr.sha256}, productionArtifacts, directory: revalidationDirectory, reportCount: reports.length, reports, receiptPath: receipt.path, receiptSha256: receipt.sha256};
 }
 
 async function runOneShotFinalizerEntrypoint() {
@@ -8527,7 +9433,7 @@ async function runOneShotFinalizerEntrypoint() {
   let context;
   try { context = JSON.parse(request.raw.toString("utf8")); }
   catch (error) { throw new Error(`one-shot finalizer request JSON is invalid: ${error instanceof Error ? error.message : String(error)}`); }
-  if (context.schema !== "cheng_regalloc_one_shot_finalizer_request.v1" || context.requestPath !== requestPath || context.token !== process.env.CHENG_REGALLOC_ONE_SHOT_FINALIZER_TOKEN) throw new Error("one-shot finalizer request token/path/schema mismatch");
+  if (context.schema !== "cheng_regalloc_one_shot_finalizer_request" || context.requestPath !== requestPath || context.token !== process.env.CHENG_REGALLOC_ONE_SHOT_FINALIZER_TOKEN) throw new Error("one-shot finalizer request token/path/schema mismatch");
   const invokedPath = canonicalAbsolute(realpathSync.native(process.argv[1]), "one-shot finalizer invoked module", "file", true);
   if (pathToFileURL(invokedPath).href !== import.meta.url || invokedPath !== context.baseContext.module.path) throw new Error("one-shot finalizer did not directly invoke the unique private module");
   validateOneShotWorkerContext(context.baseContext, context.baseRequest);
@@ -8548,8 +9454,8 @@ async function runOneShotFinalizerEntrypoint() {
   let stageOneWorkerEnvelope;
   try { stageOneWorkerEnvelope = JSON.parse(stageOneStdout.raw.toString("utf8")); }
   catch (error) { throw new Error(`stage-one outer worker stdout is not exact JSON: ${error instanceof Error ? error.message : String(error)}`); }
-  if (stageOneWorkerEnvelope?.schema !== "cheng_regalloc_one_shot_result.v1" || stageOneWorkerEnvelope.token !== context.baseContext.token ||
-      stageOneWorkerEnvelope.loadedModuleUrl !== pathToFileURL(context.baseContext.module.path).href || stageOneWorkerEnvelope.report?.schema !== "cheng_regalloc_preflight.v1") {
+  if (stageOneWorkerEnvelope?.schema !== "cheng_regalloc_one_shot_result" || stageOneWorkerEnvelope.token !== context.baseContext.token ||
+      stageOneWorkerEnvelope.loadedModuleUrl !== pathToFileURL(context.baseContext.module.path).href || stageOneWorkerEnvelope.report?.schema !== "cheng_regalloc_preflight") {
     throw new Error("stage-one outer worker envelope binding mismatch");
   }
   const reboundOneShotCheck = stageOneWorkerEnvelope.report.checks?.find((entry) => entry.id === "release_one_shot_worker");
@@ -8571,7 +9477,7 @@ async function runOneShotFinalizerEntrypoint() {
   Object.assign(finalCheck, {requiredForRelease: true, pathsRetained: true, ...evidence, stageOneGuardSha256: stageOneGuard.sha256, finalizerRevalidation});
   const finalReport = result("release", context.stageOneReport.tree_root, context.stageOneReport.snapshot_sha256, checks);
   if (finalReport.verdict !== "RELEASE_GREEN") throw new Error("private finalizer could not reproduce RELEASE_GREEN from the frozen artifact tree");
-  process.stdout.write(`${JSON.stringify({schema: "cheng_regalloc_one_shot_finalizer_result.v1", token: context.token, loadedModuleUrl: import.meta.url, report: finalReport})}\n`);
+  process.stdout.write(`${JSON.stringify({schema: "cheng_regalloc_one_shot_finalizer_result", token: context.token, loadedModuleUrl: import.meta.url, report: finalReport})}\n`);
 }
 
 async function runPrivateOneShotFinalizer(root, input, worker, stageOneReport, claimIdentity, stageOneGuardEvidence, stageOneStreams, stageOneOuterIdentity, unsetEnv) {
@@ -8581,7 +9487,7 @@ async function runPrivateOneShotFinalizer(root, input, worker, stageOneReport, c
   if (stageOneGuardSnapshot.sha256 !== stageOneGuardEvidence.sha256) throw new Error("stage-one outer worker guard changed before finalization");
   const requestPath = join(worker.directory, "finalizer-request.json");
   const context = {
-    schema: "cheng_regalloc_one_shot_finalizer_request.v1",
+    schema: "cheng_regalloc_one_shot_finalizer_request",
     token,
     requestPath,
     releaseWorkRoot: worker.context.releaseWorkRoot,
@@ -8633,7 +9539,7 @@ async function runPrivateOneShotFinalizer(root, input, worker, stageOneReport, c
   let envelope;
   try { envelope = JSON.parse(stdout.raw.toString("utf8")); }
   catch (error) { throw new Error(`one-shot finalizer stdout is not exact JSON: ${error instanceof Error ? error.message : String(error)}`); }
-  if (envelope?.schema !== "cheng_regalloc_one_shot_finalizer_result.v1" || envelope.token !== token || envelope.loadedModuleUrl !== pathToFileURL(worker.context.module.path).href || envelope.report?.verdict !== "RELEASE_GREEN") throw new Error("one-shot finalizer result envelope mismatch");
+  if (envelope?.schema !== "cheng_regalloc_one_shot_finalizer_result" || envelope.token !== token || envelope.loadedModuleUrl !== pathToFileURL(worker.context.module.path).href || envelope.report?.verdict !== "RELEASE_GREEN") throw new Error("one-shot finalizer result envelope mismatch");
   const cross = envelope.report.checks.find((entry) => entry.id === "release_cross_bindings");
   const finalCheck = envelope.report.checks.find((entry) => entry.id === "final_release_artifact_manifest");
   if (cross?.status !== "GREEN" || finalCheck?.status !== "GREEN") throw new Error("one-shot finalizer did not return GREEN cross-bindings and recursive manifest");
@@ -8702,7 +9608,7 @@ async function executePreflight(input) {
     let envelope;
     try { envelope = JSON.parse(stdout.raw.toString("utf8")); }
     catch (error) { throw new Error(`one-shot worker stdout is not exact JSON: ${error instanceof Error ? error.message : String(error)}`); }
-    if (envelope?.schema !== "cheng_regalloc_one_shot_result.v1" || envelope.token !== worker.context.token || envelope.loadedModuleUrl !== pathToFileURL(worker.context.module.path).href || envelope.report?.schema !== "cheng_regalloc_preflight.v1" || envelope.report.mode !== "release") {
+    if (envelope?.schema !== "cheng_regalloc_one_shot_result" || envelope.token !== worker.context.token || envelope.loadedModuleUrl !== pathToFileURL(worker.context.module.path).href || envelope.report?.schema !== "cheng_regalloc_preflight" || envelope.report.mode !== "release") {
       throw new Error("one-shot worker result envelope binding mismatch");
     }
     const outerIdentity = validateHeldOneShotReleaseWorker(worker);
@@ -8732,11 +9638,11 @@ async function runOneShotWorkerEntrypoint() {
   let context;
   try { context = JSON.parse(request.raw.toString("utf8")); }
   catch (error) { throw new Error(`one-shot request JSON is invalid: ${error instanceof Error ? error.message : String(error)}`); }
-  if (context.schema !== "cheng_regalloc_one_shot_request.v1" || context.requestPath !== requestPath || context.token !== process.env.CHENG_REGALLOC_ONE_SHOT_TOKEN) throw new Error("one-shot request token/path/schema mismatch");
+  if (context.schema !== "cheng_regalloc_one_shot_request" || context.requestPath !== requestPath || context.token !== process.env.CHENG_REGALLOC_ONE_SHOT_TOKEN) throw new Error("one-shot request token/path/schema mismatch");
   const invokedPath = canonicalAbsolute(realpathSync.native(process.argv[1]), "one-shot invoked module", "file", true);
   if (pathToFileURL(invokedPath).href !== import.meta.url || invokedPath !== context.module.path) throw new Error("one-shot Bun did not directly invoke the unique private module");
   const report = await executePreflightOwned(context.input, context);
-  process.stdout.write(`${JSON.stringify({schema: "cheng_regalloc_one_shot_result.v1", token: context.token, loadedModuleUrl: import.meta.url, report})}\n`);
+  process.stdout.write(`${JSON.stringify({schema: "cheng_regalloc_one_shot_result", token: context.token, loadedModuleUrl: import.meta.url, report})}\n`);
 }
 
 if (process.env.CHENG_REGALLOC_ONE_SHOT_FINALIZER_REQUEST || process.env.CHENG_REGALLOC_ONE_SHOT_REQUEST) {
@@ -8758,8 +9664,8 @@ var initChengRegallocPreflightModule = defineModuleInitializer(() => {
     coldDriver: zodSchema.string().min(1).describe("Canonical absolute executable locked driver used for source fixtures."),
     cCompiler: zodSchema.string().min(1).optional().describe("Canonical absolute C compiler. Default /usr/bin/cc."),
     rssCapBytes: zodSchema.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional().describe("Hard target cap used only to reject the memory model. Default 1 GiB."),
-    memoryManifest: zodSchema.string().min(1).optional().describe("Canonical cold_bodyir_memory_manifest.v1. Absence is UNPROVEN, never GREEN."),
-    sourceManifest: zodSchema.string().min(1).optional().describe("Required in release mode: canonical current regalloc_source_manifest.v2."),
+    memoryManifest: zodSchema.string().min(1).optional().describe("Canonical cold_bodyir_memory_manifest. Absence is UNPROVEN, never GREEN."),
+    sourceManifest: zodSchema.string().min(1).optional().describe("Required in release mode: canonical current regalloc_source_manifest."),
     releaseWorkRoot: zodSchema.string().min(1).optional().describe("Required in release mode: caller-owned canonical empty directory outside Cheng/Fusion; all production evidence is retained here."),
     gen2Driver: zodSchema.string().min(1).optional(),
     gen3Driver: zodSchema.string().min(1).optional(),
@@ -8770,6 +9676,8 @@ var initChengRegallocPreflightModule = defineModuleInitializer(() => {
     baselineManifestSha256: zodSchema.string().regex(/^[0-9a-f]{64}$/).optional(),
     officialBuildReceipt: zodSchema.string().min(1).optional().describe("Required in release mode: sealed current-source compiler build receipt bound to the compiler-produced materialize report."),
     officialBuildReceiptSha256: zodSchema.string().regex(/^[0-9a-f]{64}$/).optional(),
+    executionStagePolicy: zodSchema.string().min(1).optional().describe("Required in release mode: canonical external policy pinning the compiler-produced seven-stage receipt and every stage artifact."),
+    executionStagePolicySha256: zodSchema.string().regex(/^[0-9a-f]{64}$/).optional(),
     backend2VersionManifest: zodSchema.string().min(1).optional().describe("Required in release mode: current backend2 semantic-closure epoch manifest."),
     backend2VersionManifestSha256: zodSchema.string().regex(/^[0-9a-f]{64}$/).optional(),
     jobsLock: zodSchema.string().min(1).optional().describe("Required in release mode: fresh jobs-determinism external lock."),
@@ -8788,7 +9696,7 @@ var initChengRegallocPreflightModule = defineModuleInitializer(() => {
     name: "cheng_regalloc_preflight",
     searchHint: "strict source and release preflight for regalloc ABI reloc ownership memory artifacts and raw GEN2 GEN3 fixed point",
     inputSchema: chengRegallocPreflightInputSchema,
-    description: "Runs every Fusion-owned TypedExpr expression family as an independent real Cheng compile, mechanically binds its formal obligations, keeps frozen module-const metadata as an isolated research diagnostic, requires every realizer to reach canonical read-only TypedExprIr authority, rejects unresolved or ambiguous unqualified exported calls and post-seal source/AnySource/bounded-walker heuristics, runs real regalloc/C contracts, recomputes the cold BodyIR event sweep, pins package/lock/manifests, validates the exact v2 source closure, and compares full raw GEN2/GEN3/official bytes. Release mode also requires the compiler-produced current-source build receipt and backend2 epoch, runs the exact-hash production gate with four pinned external locks, directly binds perf/compile/checksum artifacts, and revalidates the semantic backend2 sentinel plus every external lock under exact 1 GiB guards in the private finalizer. Missing, RED or CFAIL release-critical evidence is an error; research diagnostics remain honest and do not manufacture a release failure.",
+    description: "Runs every Fusion-owned TypedExpr expression family as an independent real Cheng compile, mechanically binds its formal obligations, keeps frozen module-const metadata as an isolated research diagnostic, requires every realizer to reach canonical read-only TypedExprIr authority, rejects unresolved or ambiguous unqualified exported calls and post-seal source/AnySource/bounded-walker heuristics, runs real regalloc/C contracts, recomputes the cold BodyIR event sweep, pins package/lock/manifests, validates the exact current source closure, and compares full raw GEN2/GEN3/official bytes. Release mode also requires the compiler-produced current-source build receipt, the independently pinned seven-stage execution receipt and backend2 epoch, runs the exact-hash production gate with four pinned external locks, directly binds perf/compile/checksum artifacts, and revalidates the semantic backend2 sentinel plus every external lock under exact 1 GiB guards in the private finalizer. Missing, RED or CFAIL release-critical evidence is an error; research diagnostics remain honest and do not manufacture a release failure.",
     prompt: "Use source mode for early regalloc source readiness and release mode only when strict production manifests and distinct GEN2/GEN3 binaries exist.",
     toAutoClassifierInput: (input) => `regalloc_preflight:${input.mode || "unknown"}`,
     async execute(input) {
@@ -8841,6 +9749,7 @@ export {
   validateProductionGateEvidence,
   validateProductionGuardReport,
   validateProductionGuardDirectory,
+  validateRemovedBackend2IndependentEmitterModules,
   validatePrivateRuntimeGateBundle,
   productionRequiredStatuses,
   validateProductionReceiptArtifacts,
@@ -8852,6 +9761,9 @@ export {
   validateQualifiedNestedCallDeclarationWitness,
   validateRetainedRuntimeGateWork,
   validateCIncludeClosure,
+  validateCanonicalRegallocEvidenceLabels,
+  validateExecutionStageReleaseBindings,
+  FINAL_RELEASE_BINDING_KEYS,
   validateSourceManifestPath,
   validateTypedExprCoverageLedger,
   validateTypedExprFormalSpecBinding,

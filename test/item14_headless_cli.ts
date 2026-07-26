@@ -253,6 +253,7 @@ async function testNonzeroErrors(tempRoot: string) {
   const invalidJson = await runCli(["run", "cheng_crash_triage", "--input", "{"]);
   assert.notEqual(invalidJson.exitCode, 0);
   const invalidJsonError = parseJson(invalidJson.stderr, "invalid JSON stderr");
+  assert.equal(invalidJsonError.schema, "cheng_fusion_cli_error");
   assert.equal(invalidJsonError.error?.code, "INPUT_JSON_INVALID");
   assertTrue(true, "invalid JSON exits nonzero with INPUT_JSON_INVALID");
 
@@ -317,7 +318,29 @@ async function testNonzeroErrors(tempRoot: string) {
   assert.notEqual(contractError.exitCode, 0);
   const contractErrorResult = parseJson(contractError.stdout, "tool contract error stdout");
   assert.equal(contractErrorResult.isError, true);
-  assertTrue(JSON.stringify(contractErrorResult).includes("source is required"), "tool contract errors throw and cannot be returned as exit-0 JSON payloads");
+  assertTrue(JSON.stringify(contractErrorResult).includes("source"), "tool contract errors throw and cannot be returned as exit-0 JSON payloads");
+  const missingEntrySource = await runCli(["run", "cheng_csg_roundtrip", "--input", '{"source":"src/main.cheng"}', "--root", contractRoot]);
+  assert.notEqual(missingEntrySource.exitCode, 0);
+  const missingEntrySourceResult = parseJson(missingEntrySource.stdout, "missing entry source stdout");
+  assert.equal(missingEntrySourceResult.isError, true);
+  assertTrue(JSON.stringify(missingEntrySourceResult).includes("entrySource"), "headless CLI requires the explicit package entry source");
+  writeFileSync(join(contractRoot, "src", "library.cheng"), "fn LibraryTarget(): int32 =\n    return 7\n");
+  const explicitEntryRoundtrip = await runCli([
+    "run",
+    "cheng_csg_roundtrip",
+    "--input",
+    '{"source":"src/library.cheng","entrySource":"src/main.cheng","outDir":"artifacts/csg"}',
+    "--root",
+    contractRoot,
+  ]);
+  assert.equal(explicitEntryRoundtrip.exitCode, 0, `explicit entrySource CLI roundtrip failed: ${explicitEntryRoundtrip.stderr}`);
+  const explicitEntryResult = toolJson(parseJson(explicitEntryRoundtrip.stdout, "explicit entrySource stdout"));
+  assert.equal(explicitEntryResult.source, join(contractRoot, "src", "library.cheng"));
+  assert.equal(explicitEntryResult.entrySource, join(contractRoot, "src", "main.cheng"));
+  assert.equal(explicitEntryResult.summary.source, explicitEntryResult.source);
+  assert.equal(explicitEntryResult.summary.entrySource, explicitEntryResult.entrySource);
+  assert.ok(explicitEntryResult.summary.totals.sourceFiles >= 1);
+  assertTrue(true, "headless CLI emits the explicit package entry closure while binding the query source separately");
 
   const oversizedFrame = await runProcess(process.execPath, [ENTRY], {
     stdin: "Content-Length: 9007199254740993\r\n\r\n",
@@ -491,8 +514,8 @@ async function testConcurrentCloneIsolation(tempRoot: string) {
   const cliResultB = parseJson(runB.stdout, "clone B CLI");
   const outputA = toolJson(cliResultA);
   const outputB = toolJson(cliResultB);
-  assert.equal(outputA.schema, "cheng_symbols_v1", `clone A did not use the real driver: ${JSON.stringify(outputA)}`);
-  assert.equal(outputB.schema, "cheng_symbols_v1", `clone B did not use the real driver: ${JSON.stringify(outputB)}`);
+  assert.equal(outputA.schema, "cheng_symbols", `clone A did not use the real driver: ${JSON.stringify(outputA)}`);
+  assert.equal(outputB.schema, "cheng_symbols", `clone B did not use the real driver: ${JSON.stringify(outputB)}`);
   assert.equal(outputA.root, cloneA);
   assert.equal(outputB.root, cloneB);
   assert.equal(outputA.source, join(cloneA, "src/main.cheng"));
@@ -659,7 +682,7 @@ async function testDoctor(tempRoot: string) {
   const healthy = await runCli(["doctor"], {timeoutMs: 60_000});
   assert.equal(healthy.exitCode, 0, `doctor failed: ${healthy.stderr}\n${healthy.stdout}`);
   const report = parseJson(healthy.stdout, "doctor");
-  assert.equal(report.schema, "cheng_fusion_doctor.v1");
+  assert.equal(report.schema, "cheng_fusion_doctor");
   assert.equal(report.ok, true);
   for (const required of [
     "mcp.initialize",

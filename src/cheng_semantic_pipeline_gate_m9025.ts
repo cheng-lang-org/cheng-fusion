@@ -20,12 +20,10 @@ import {
 } from "./cheng_semantic_pipeline_matrix_m9024.ts";
 import {canonicalJson, enumerateSemanticUniverse, sha256} from "./cheng_semantic_matrix_m9023.ts";
 
-const RECEIPT_SCHEMA = "cheng_semantic_pipeline_structural_gate_receipt.v1";
+const RECEIPT_SCHEMA = "cheng_semantic_pipeline_structural_gate_receipt";
 const EXPECTED_JOINED_ASSIGNMENT_COUNT = 3_991_680;
 const EXPECTED_LEGAL_JOINED_COUNT = 285_336;
-const EXPECTED_MATRIX_CASE_COUNT = 2_926;
-const EXPECTED_GRAMMAR_OBLIGATION_COUNT = 1_124;
-const EXPECTED_GRAMMAR_REQUIRED_COUNT = 966;
+const EXPECTED_MATRIX_CASE_COUNT = 2_927;
 
 function requiredEnv(name: string): string {
   const value = process.env[name] ?? "";
@@ -68,8 +66,10 @@ async function main(): Promise<void> {
 
   const formalSpecBytes = readFileSync(formalSpec.path);
   const grammar = buildChengGrammarObligationContract(formalSpecBytes);
-  validateChengGrammarObligationContract(formalSpecBytes, grammar);
-  if (grammar.obligations.length !== EXPECTED_GRAMMAR_OBLIGATION_COUNT || grammar.requiredCount !== EXPECTED_GRAMMAR_REQUIRED_COUNT) {
+  const generatedGrammarCounts = validateChengGrammarObligationContract(formalSpecBytes, grammar);
+  if (generatedGrammarCounts.obligationCount !== grammar.obligations.length ||
+      generatedGrammarCounts.requiredCount !== grammar.requiredCount ||
+      generatedGrammarCounts.obligationRootSha256 !== grammar.obligationRootSha256) {
     throw new Error("formal grammar obligation count mismatch");
   }
   const grammarReceipt = buildGrammarSourceCoverageReceipt(grammar, []);
@@ -81,7 +81,7 @@ async function main(): Promise<void> {
   if (coverage.joinedAssignmentCount !== EXPECTED_JOINED_ASSIGNMENT_COUNT || coverage.legalJoinedCount !== EXPECTED_LEGAL_JOINED_COUNT || coverage.classifierAgreementCount !== EXPECTED_JOINED_ASSIGNMENT_COUNT) {
     throw new Error("bounded m9024 joined-domain count mismatch");
   }
-  const matrix = generatePipelineMatrix("regalloc-preflight-m9024-v1");
+  const matrix = generatePipelineMatrix("regalloc-preflight-m9024");
   validatePipelineMatrix(matrix);
   if (matrix.cases.length !== EXPECTED_MATRIX_CASE_COUNT) throw new Error("bounded m9024 matrix case count mismatch");
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
-// grammar_span_receipt.ts — 966 parser receipt 消费半套之 span 校验器。
+// grammar_span_receipt.ts — production parser receipt 的精确 token/span 校验器。
 //
 // 职责(S1 规格 3.2.3/3.3):
-//   1) fusion chengPublicTokens 模型移植(与 m9024 内部实现逐字符一致; strip 保偏移,
-//      支持 char span ↔ token span 双向换算);
+//   1) 直接消费 production receipt tokens 的 canonical kind、全局 index、
+//      sourceTextId 与原始 UTF-8 byte span，不重分词、不包围字面量;
 //   2) preflightParserSpanReceipts: 对 driver 未来发射的 GrammarParserSpanReceipt[]
 //      做逐项诊断(source/span/obligation 三项绑定 + 自洽 hash + provenance 形态),
 //      按 receipt 收集 issue 而非首错即抛(driver 联调期定位用);
@@ -11,16 +11,12 @@
 //      m9024 buildGrammarSourceCoverageReceipt(唯一权威门禁)产出覆盖回执。
 //      driver receipt 一到, 调这一个函数即可接线。
 //
-// token 模型口径(与 m9024:1226-1287 一致):
-//   注释/字符串/字符字面量逐字符抹成空格(换行保留), 偏移 1:1 不变;
-//   token 正则: @ident | -> | && | || | ..< | .. | ident | number | 任意非空白单字符。
-// 一致性佐证: 本模块 token 数与 m9024 lintChengPublicSource.tokenCount 在全部语料源上
-//   逐一相等(item26 断言); 换算产物最终由 buildGrammarSourceCoverageReceipt 内部
-//   的同一 chengPublicTokens 重算验收 — 双重锚定, 无静默漂移空间。
 import {
   CHENG_GRAMMAR_PARSER_SPAN_RECEIPT_SCHEMA,
   buildGrammarSourceCoverageReceipt,
+  grammarParserCanonicalTokenSpanSha256,
   type ChengGrammarObligationContract,
+  type GrammarParserCanonicalToken,
   type GrammarParserSpanReceipt,
   type GrammarSourceCoverageReceipt,
   type GrammarSourceWitness,
@@ -31,8 +27,9 @@ function hashCanonical(value: unknown): string {
   return sha256(canonicalJson(value));
 }
 
-// ---------------------------------------------------------------- token 模型
-export function chengCodeWithoutCommentsAndLiterals(source: string): string {
+// ---------------------------------------------------------------- source-plan lint token 模型
+// 仅供 source-plan/lint 自测；parser receipt 证据禁止调用本模型。
+function chengCodeWithoutCommentsAndLiteralsForLint(source: string): string {
   let out = "";
   let index = 0;
   while (index < source.length) {
@@ -99,7 +96,7 @@ export interface PublicToken {
 }
 
 export function chengPublicTokensWithOffsets(source: string): readonly PublicToken[] {
-  const code = chengCodeWithoutCommentsAndLiterals(source);
+  const code = chengCodeWithoutCommentsAndLiteralsForLint(source);
   const out: PublicToken[] = [];
   for (const match of code.matchAll(PUBLIC_TOKEN_PATTERN)) {
     out.push({text: match[0], start: match.index, end: match.index + match[0].length});
@@ -111,43 +108,98 @@ export function chengPublicTokensLocal(source: string): readonly string[] {
   return chengPublicTokensWithOffsets(source).map((entry) => entry.text);
 }
 
-// char span → token span(覆盖模式): 取覆盖 [charStart,charEnd) 的最小 token 序列。
-// driver 与 fusion 的 token 粒度在 `@ident` 等处不同(driver 拆 At+ident, fusion 合并),
-// 严格边界模式会误拒; 覆盖模式是 S1 3.2.3 换算的鲁棒形。仍 hard-fail 空交集。
-export function charSpanToTokenSpanCovering(
-  source: string,
-  charStart: number,
-  charEnd: number,
-): {tokenStart: number; tokenEnd: number} {
-  if (charStart < 0 || charEnd <= charStart || charEnd > source.length) {
-    throw new Error(`char span 越界: [${charStart}, ${charEnd}) / source.len=${source.length}`);
-  }
-  const tokens = chengPublicTokensWithOffsets(source);
-  const startIndex = tokens.findIndex((token) => token.end > charStart);
-  if (startIndex < 0) throw new Error(`char span [${charStart}, ${charEnd}) 与 token 流无交集`);
-  let endIndex = -1;
-  for (let i = tokens.length - 1; i >= 0; i -= 1) {
-    if (tokens[i]!.start < charEnd) {endIndex = i; break;}
-  }
-  if (endIndex < startIndex) throw new Error(`char span [${charStart}, ${charEnd}) 与 token 流无交集`);
-  return {tokenStart: startIndex, tokenEnd: endIndex + 1};
+export interface ProductionParserToken {
+  readonly index: number;
+  readonly kind: number;
+  readonly sourceTextId: number;
+  readonly start: number;
+  readonly end: number;
 }
 
-// char span → token span。driver 的节点 span 必须落在 token 边界上, 否则 hard-fail。
-export function charSpanToTokenSpan(
+export interface CanonicalParserTokenSpan {
+  readonly tokenStart: number;
+  readonly tokenEnd: number;
+  readonly spanStartByte: number;
+  readonly spanEndByte: number;
+  readonly canonicalTokens: readonly GrammarParserCanonicalToken[];
+  readonly tokenSha256: string;
+}
+
+export function canonicalParserTokenSpanFromReceipt(
   source: string,
-  charStart: number,
-  charEnd: number,
-): {tokenStart: number; tokenEnd: number} {
-  if (charStart < 0 || charEnd <= charStart || charEnd > source.length) {
-    throw new Error(`char span 越界: [${charStart}, ${charEnd}) / source.len=${source.length}`);
+  receiptTokens: readonly ProductionParserToken[],
+  tokenKindNames: readonly string[],
+  spanStartByte: number,
+  spanEndByte: number,
+): CanonicalParserTokenSpan {
+  const sourceByteLength = Buffer.byteLength(source, "utf8");
+  if (!Number.isInteger(spanStartByte) ||
+      !Number.isInteger(spanEndByte) ||
+      spanStartByte < 0 ||
+      spanEndByte <= spanStartByte ||
+      spanEndByte > sourceByteLength) {
+    throw new Error(
+      `production parser byte span 越界: ` +
+      `[${spanStartByte}, ${spanEndByte}) / bytes=${sourceByteLength}`,
+    );
   }
-  const tokens = chengPublicTokensWithOffsets(source);
-  const startIndex = tokens.findIndex((token) => token.start === charStart);
-  if (startIndex < 0) throw new Error(`char span 起点 ${charStart} 未落在 token 边界`);
-  const endIndex = tokens.findIndex((token) => token.end === charEnd);
-  if (endIndex < startIndex) throw new Error(`char span 终点 ${charEnd} 未落在 token 边界(起点 ${charStart} 之后)`);
-  return {tokenStart: startIndex, tokenEnd: endIndex + 1};
+  const overlapping = receiptTokens.filter((token) =>
+    token.sourceTextId === 0 &&
+    token.end > spanStartByte &&
+    token.start < spanEndByte);
+  if (overlapping.length === 0 ||
+      overlapping[0]!.start !== spanStartByte ||
+      overlapping[overlapping.length - 1]!.end !== spanEndByte) {
+    throw new Error(
+      `production parser byte span 未精确落在 token 边界: ` +
+      `[${spanStartByte}, ${spanEndByte})`,
+    );
+  }
+  const canonicalTokens = overlapping.map((token, offset) => {
+    if (!Number.isInteger(token.index) ||
+        token.index < 0 ||
+        receiptTokens[token.index] !== token ||
+        (offset > 0 &&
+          token.index !== overlapping[offset - 1]!.index + 1) ||
+        !Number.isInteger(token.kind) ||
+        token.kind <= 0 ||
+        !Number.isInteger(token.start) ||
+        !Number.isInteger(token.end) ||
+        token.start < spanStartByte ||
+        token.end <= token.start ||
+        token.end > spanEndByte) {
+      throw new Error("production parser token row invalid");
+    }
+    const kindText = tokenKindNames[token.kind];
+    if (kindText === undefined ||
+        !/^ParserValueToken[A-Za-z0-9_]+$/.test(kindText)) {
+      throw new Error(
+        `production parser token kind 不在 canonical enum: ${token.kind}`,
+      );
+    }
+    return {
+      index: token.index,
+      kind: token.kind,
+      kindText,
+      sourceTextId: token.sourceTextId,
+      startByte: token.start,
+      endByte: token.end,
+    };
+  });
+  const tokenSha256 = grammarParserCanonicalTokenSpanSha256(
+    source,
+    spanStartByte,
+    spanEndByte,
+    canonicalTokens,
+  );
+  return {
+    tokenStart: canonicalTokens[0]!.index,
+    tokenEnd: canonicalTokens[canonicalTokens.length - 1]!.index + 1,
+    spanStartByte,
+    spanEndByte,
+    canonicalTokens,
+    tokenSha256,
+  };
 }
 
 // ---------------------------------------------------------------- 校验
@@ -260,17 +312,38 @@ export function preflightParserSpanReceipts(
     if (!HEX64.test(receipt.sourceSha256) || sha256(source) !== receipt.sourceSha256) {
       issues.push({code: "GSR04_SOURCE_BINDING", obligationId: id, detail: "sourceSha256 与源字节不符"});
     }
-    const tokens = chengPublicTokensLocal(source);
-    if (!Number.isInteger(receipt.tokenStart) || !Number.isInteger(receipt.tokenEnd) ||
-        receipt.tokenStart < 0 || receipt.tokenEnd <= receipt.tokenStart ||
-        receipt.tokenEnd > tokens.length) {
+    const canonicalTokens = Array.isArray(receipt.canonicalTokens)
+      ? receipt.canonicalTokens
+      : [];
+    let canonicalTokenSha256 = "";
+    try {
+      canonicalTokenSha256 = grammarParserCanonicalTokenSpanSha256(
+        source,
+        receipt.spanStartByte,
+        receipt.spanEndByte,
+        canonicalTokens,
+      );
+    } catch (error) {
       issues.push({code: "GSR05_TOKEN_SPAN", obligationId: id,
-        detail: `span [${receipt.tokenStart}, ${receipt.tokenEnd}) / tokens=${tokens.length}`});
-    } else {
-      const tokenSha256 = sha256(tokens.slice(receipt.tokenStart, receipt.tokenEnd).join("\u001f"));
-      if (tokenSha256 !== receipt.tokenSha256) {
-        issues.push({code: "GSR06_TOKEN_HASH", obligationId: id, detail: "tokenSha256 与 span 内 token 流不符"});
-      }
+        detail: error instanceof Error ? error.message :
+          "canonical parser token span invalid"});
+    }
+    const firstCanonicalToken = canonicalTokens[0];
+    const finalCanonicalToken =
+      canonicalTokens[canonicalTokens.length - 1];
+    if (!Number.isInteger(receipt.tokenStart) ||
+        !Number.isInteger(receipt.tokenEnd) ||
+        firstCanonicalToken === undefined ||
+        finalCanonicalToken === undefined ||
+        receipt.tokenStart !== firstCanonicalToken.index ||
+        receipt.tokenEnd !== finalCanonicalToken.index + 1) {
+      issues.push({code: "GSR05_TOKEN_SPAN", obligationId: id,
+        detail: "tokenStart/tokenEnd 未绑定 canonical production token indexes"});
+    }
+    if (canonicalTokenSha256 !== "" &&
+        canonicalTokenSha256 !== receipt.tokenSha256) {
+      issues.push({code: "GSR06_TOKEN_HASH", obligationId: id,
+        detail: "tokenSha256 与 canonical kind/raw byte span 不符"});
     }
     if (receipt.parserNodeKind.length === 0 ||
         !HEX64.test(receipt.parserNodeIdentitySha256) ||
@@ -337,8 +410,39 @@ export function makeSyntheticReceipt(
   charEnd: number,
 ): GrammarParserSpanReceipt {
   const sourceSha256 = sha256(source);
-  const {tokenStart, tokenEnd} = charSpanToTokenSpan(source, charStart, charEnd);
-  const tokenSha256 = sha256(chengPublicTokensLocal(source).slice(tokenStart, tokenEnd).join("\u001f"));
+  if (!Number.isInteger(charStart) ||
+      !Number.isInteger(charEnd) ||
+      charStart < 0 ||
+      charEnd <= charStart ||
+      charEnd > source.length) {
+    throw new Error("synthetic receipt source span invalid");
+  }
+  const spanStartByte = Buffer.byteLength(source.slice(0, charStart), "utf8");
+  const spanEndByte = Buffer.byteLength(source.slice(0, charEnd), "utf8");
+  const raw = source.slice(charStart, charEnd);
+  const kind = raw.startsWith('"') ? 4 :
+    raw.startsWith("'") ? 5 :
+      /^[0-9]/.test(raw) ? 2 : 1;
+  const kindText = kind === 4 ? "ParserValueTokenString" :
+    kind === 5 ? "ParserValueTokenChar" :
+      kind === 2 ? "ParserValueTokenInteger" :
+        "ParserValueTokenIdentifier";
+  const canonicalTokens: readonly GrammarParserCanonicalToken[] = [{
+    index: 0,
+    kind,
+    kindText,
+    sourceTextId: 0,
+    startByte: spanStartByte,
+    endByte: spanEndByte,
+  }];
+  const tokenStart = 0;
+  const tokenEnd = 1;
+  const tokenSha256 = grammarParserCanonicalTokenSpanSha256(
+    source,
+    spanStartByte,
+    spanEndByte,
+    canonicalTokens,
+  );
   const identity = {
     schema: CHENG_GRAMMAR_PARSER_SPAN_RECEIPT_SCHEMA as typeof CHENG_GRAMMAR_PARSER_SPAN_RECEIPT_SCHEMA,
     stage: "parser" as const,
@@ -352,6 +456,9 @@ export function makeSyntheticReceipt(
     sourceSha256,
     tokenStart,
     tokenEnd,
+    spanStartByte,
+    spanEndByte,
+    canonicalTokens,
     tokenSha256,
     parserNodeKind: "SyntheticNode(dev-only)",
     parserNodeIdentitySha256: sha256(`synthetic:node:${obligation.obligationId}`),

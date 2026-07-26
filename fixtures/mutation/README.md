@@ -6,9 +6,9 @@
 
 ## 文件
 
-- `mutants.json` — 算子台账(schema `cheng_mutation_net.v1`): 门清单、缺口登记(GAP-1/GAP-2)、
-  26 破坏性算子 + 4 保持类算子, 每条破坏性算子绑定精确 kill 契约(gate + signal [+ authorityGate + authoritySignal])。
-- `../tools/mutation_net_gen.ts` — 生成器: 台账加载校验 + 基础工件构建 + 26 个算子实现。
+- `mutants.json` — 算子台账(schema `cheng_mutation_net`): 门清单、缺口登记(GAP-1/GAP-2)、
+  29 破坏性算子 + 4 保持类算子, 每条破坏性算子绑定精确 kill 契约(gate + signal [+ authorityGate + authoritySignal])。
+- `../tools/mutation_net_gen.ts` — 生成器: 台账加载校验 + 基础工件构建 + 29 个算子实现。
   `bun tools/mutation_net_gen.ts --check` 校验台账 ↔ 实现覆盖对齐。
 - `../test/item27_mutation_net.ts` — 实跑 harness: `bun test/item27_mutation_net.ts`。
 
@@ -37,4 +37,4 @@
   遗留: 真实 driver receipt 多世代盐并存(pr1/corpus/pr_oracle 三 driver), grammar_bind_run 的锚接线
   待 receipts 用同一 pinned driver 重产后接入并同步重钉 anchor。
 
-当前状态: **kill 26/26 = 100%, 登记缺口 0**。新算子若杀不死, 登记进 `gapRegistry`(带加固规格), 不硬凑 100%。
+当前实测: **kill 27/29 = 93.1%, 登记缺口 0**；module-header 删/换及 caseStmt flat-zero claim 三条均被精确杀死，现存漏网是 `M-EVIDENCE-SEED-SWAP` 与 `M-EVIDENCE-VERDICT-DROP` 的 `evidence_verify rc=-1`。新算子若杀不死, 登记进 `gapRegistry`(带加固规格), 不硬凑 100%。

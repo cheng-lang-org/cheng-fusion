@@ -114,7 +114,7 @@ function writeSymbolProtocolDriver(root: string) {
     '  "primary_symbols=_main",',
     '  "primary_unsupported_count=0",',
     '];',
-    'if (mode === "header_only") { process.stdout.write("cheng_symbols_v1\\n"); process.exit(0); }',
+    'if (mode === "header_only") { process.stdout.write("cheng_symbols\\n"); process.exit(0); }',
     'if (mode === "missing_count") fields = fields.filter((line) => !line.startsWith("primary_symbol_count="));',
     'if (mode === "duplicate_key") fields.splice(6, 0, "primary_symbol_count=1");',
     'if (mode === "count_mismatch") fields[3] = "lowering_symbol_count=2";',
@@ -122,7 +122,8 @@ function writeSymbolProtocolDriver(root: string) {
     'if (mode === "bad_entry") fields[0] = "entry=/wrong/source.cheng";',
     'if (mode === "noncanonical_count") fields[3] = "lowering_symbol_count=01";',
     'if (mode === "extra_field") fields.push("unexpected=1");',
-    'const report = `cheng_symbols_v1${separator}${fields.join("\\n")}\\n`;',
+    'const schema = mode === "legacy_header" ? "cheng_symbols_v1" : "cheng_symbols";',
+    'const report = `${schema}${separator}${fields.join("\\n")}\\n`;',
     'if (mode === "invalid_utf8") { process.stdout.write(Buffer.concat([Buffer.from(report, "utf8"), Buffer.from([0xff])])); process.exit(0); }',
     'process.stdout.write(report);',
     'if (mode === "nonzero") process.exitCode = 7;',
@@ -133,7 +134,7 @@ function writeSymbolProtocolDriver(root: string) {
 }
 
 async function verifySnapshotProtocol(root: string) {
-  console.log("[snapshot protocol] 只接受完整、有序、自洽的 cheng_symbols_v1");
+  console.log("[snapshot protocol] 只接受完整、有序、自洽的 cheng_symbols");
   const driver = writeSymbolProtocolDriver(root);
   const sourceDir = join(root, "snapshot-sources");
   mkdirSync(sourceDir);
@@ -150,10 +151,10 @@ async function verifySnapshotProtocol(root: string) {
     for (const mode of ["valid_blank", "valid_compact"]) {
       const result = await callMode(mode);
       assertTrue(result.isError !== true, `${mode} 正式 producer 布局通过`);
-      assertTrue(result.parsed.schema === "cheng_symbols_v1", `${mode} schema 精确`);
+      assertTrue(result.parsed.schema === "cheng_symbols", `${mode} schema 精确`);
       assertTrue(result.parsed.loweringSymbolCount === 1 && result.parsed.primarySymbolCount === 1, `${mode} count/list 自洽`);
       const expectedReport = [
-        "cheng_symbols_v1",
+        "cheng_symbols",
         ...(mode === "valid_blank" ? [""] : []),
         `entry=${result.parsed.source}`,
         "target=arm64-apple-darwin",
@@ -169,6 +170,7 @@ async function verifySnapshotProtocol(root: string) {
 
     for (const mode of [
       "header_only",
+      "legacy_header",
       "missing_count",
       "duplicate_key",
       "count_mismatch",
@@ -221,7 +223,7 @@ async function verifyArchitecture(mcp: ReturnType<typeof startMcp>, root: string
   const forward = await mcp.callTool("cheng_symbol_diff", {action: "compare", objectA, objectB}, undefined, 30000);
   assertTrue(forward.isError !== true, `正向 compare 未报错: ${JSON.stringify(forward.parsed).slice(0, 300)}`);
   const parsed = forward.parsed;
-  assertTrue(parsed.schema === "cheng_symbol_diff_compare.v1", `schema 保持 v1, 实得 ${parsed.schema}`);
+  assertTrue(parsed.schema === "cheng_symbol_diff_compare", `schema 精确, 实得 ${parsed.schema}`);
   assertTrue(parsed.objectA === objectA && parsed.objectB === objectB, `结果回显原始 objectA/objectB，不泄漏私有快照路径`);
   assertTrue(parsed.objectASha256 === sha256(readFileSync(objectA)), `objectA SHA-256 锁定本次快照`);
   assertTrue(parsed.objectBSha256 === sha256(readFileSync(objectB)), `objectB SHA-256 锁定本次快照`);

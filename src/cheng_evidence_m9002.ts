@@ -24,15 +24,15 @@ var initChengEvidenceModule=defineModuleInitializer(()=>{
     async execute(input){
       const targetPath=input.file||input.source||null;
       const facts=await getChengFacts({root:input.root,file:targetPath});
-      if(!facts)throw new Error("CSG facts not available; run cheng_csg_roundtrip with root and source for this Cheng project");
+      if(!facts)throw new Error("CSG facts not available; run cheng_csg_roundtrip with root, source, and entrySource for this Cheng project");
       if(!input.symbol&&!input.file)throw new Error("provide symbol and/or file");
       const staleWarning=factsStalenessWarning(facts,targetPath);
       const result={
         root:facts.root,
         factsPath:facts.factsPath,
         factsRoot:facts.factsRoot,
-        factsGeneratedAt:facts.generatedAt||null,
         factsSource:facts.source?normalizeToSubstratePath(facts.source,facts.root):null,
+        factsEntrySource:facts.entrySource?normalizeToSubstratePath(facts.entrySource,facts.root):null,
         ...(staleWarning?{staleWarning}:{}),
       };
       if(input.symbol){

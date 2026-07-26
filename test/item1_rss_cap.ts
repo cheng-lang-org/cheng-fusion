@@ -45,6 +45,7 @@ async function testC_endToEndRoundtrip() {
     await mcp.initialize({rootUri: `file://${CHENG_ROOT}`, workspaceFolders: [{uri: `file://${CHENG_ROOT}`, name: "cheng-lang"}]});
     const {isError, parsed} = await mcp.callTool("cheng_csg_roundtrip", {
       source: "src/tests/ordinary_zero_exit_fixture.cheng",
+      entrySource: "src/tests/ordinary_zero_exit_fixture.cheng",
       outDir: "conversion-reports/cheng-csg-fusion-harness-item1",
     });
     assertTrue(isError !== true, `cheng_csg_roundtrip 未报错, 实得: ${JSON.stringify(parsed).slice(0, 300)}`);

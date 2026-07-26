@@ -218,6 +218,7 @@ async function main() {
       }, undefined, 40000);
       assertTrue(symbolResult.isError !== true, `cheng_corrupt_hunt(breakSymbol) 未报错, 实得: ${JSON.stringify(symbolResult.parsed)}`);
       const parsedSymbol = symbolResult.parsed;
+      assertTrue(parsedSymbol.schema === "cheng_corrupt_hunt", `schema 精确, 实得 ${parsedSymbol.schema}`);
       assertTrue(!parsedSymbol.error, `无 stage1 错误, 实得: ${parsedSymbol.error}`);
       assertTrue(/^sha256:[0-9a-f]{64}$/.test(parsedSymbol.inputEvidence?.binary?.sha256 || "") && /^sha256:[0-9a-f]{64}$/.test(parsedSymbol.inputEvidence?.primaryObject?.sha256 || ""), `结果锁定 binary/primaryObject SHA-256，实得 ${JSON.stringify(parsedSymbol.inputEvidence)}`);
       assertTrue(typeof parsedSymbol.stage1?.H === "string" && parsedSymbol.stage1.H.startsWith("0x"), `stage1.H 是十六进制地址, 实得 ${parsedSymbol.stage1?.H}`);

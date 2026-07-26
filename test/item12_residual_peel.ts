@@ -1,9 +1,11 @@
 // cheng_residual_peel 端到端: 静态 mode 确定性 + schema + 主仓真扫。
 // 不跑 mode=full census(20min+ RSS)。
 import {mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync} from "node:fs";
+import assert from "node:assert/strict";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {startMcp, assertTrue} from "./mcp_client.ts";
+import {assertResidualPeelReportSchema} from "../src/cheng_residual_peel_m9019.ts";
 
 const CHENG_ROOT = process.env.CHENG_TOOLCHAIN_ROOT || process.env.CHENG_ROOT || "/Users/lbcheng/cheng-lang";
 
@@ -26,7 +28,12 @@ async function main() {
           30000,
         );
         assertTrue(isError !== true, `no error, got ${JSON.stringify(parsed).slice(0, 400)}`);
-        assertTrue(parsed.schema === "cheng_residual_peel.v1", `schema, got ${parsed.schema}`);
+        assertTrue(parsed.schema === "cheng_residual_peel", `schema, got ${parsed.schema}`);
+        assert.throws(
+          () => assertResidualPeelReportSchema({...parsed, schema: "cheng_residual_peel.v1"}),
+          /unsupported residual peel report schema/,
+          "legacy residual peel report schema must be rejected",
+        );
         assertTrue(parsed.mode === "static", `mode=static`);
         assertTrue(parsed.census === null, `census skipped in static`);
         assertTrue(Array.isArray(parsed.static.hits), `static.hits array`);
@@ -115,11 +122,31 @@ async function main() {
       }
       {
         const proj = join(scratch, "mini");
+        const legacyRulePath = join(scratch, "legacy-schema-rules.json");
+        writeFileSync(
+          legacyRulePath,
+          JSON.stringify({
+            schema: "cheng_residual_rules.v1",
+            description: "legacy schema rejection mutation",
+            phases: [],
+            rules: [],
+          }),
+        );
+        const response = await mcp.request("tools/call", {
+          name: "cheng_residual_peel",
+          arguments: {root: proj, mode: "static", rulesPath: legacyRulePath},
+          context: {workspaceRoots: [proj]},
+        }, 15000);
+        const errorText = response.result?.content?.[0]?.text || "";
+        assertTrue(response.result?.isError === true && errorText.includes("unsupported residual rules schema"), `legacy rules schema must hard-fail, got ${JSON.stringify(response.result).slice(0, 300)}`);
+      }
+      {
+        const proj = join(scratch, "mini");
         const missingRulePath = join(scratch, "missing-source-rules.json");
         writeFileSync(
           missingRulePath,
           JSON.stringify({
-            schema: "cheng_residual_rules.v1",
+            schema: "cheng_residual_rules",
             description: "negative fixture",
             phases: [{id: "call_resolve", depth: 0, bodyKinds: ["missing_call_target"], note: "test"}],
             rules: [{id: "missing", phase: "call_resolve", family: "test", severity: "high", paths: ["src/nope.cheng"], kind: "multi_fn_same_name", fnName: "nope"}],
@@ -138,7 +165,7 @@ async function main() {
         writeFileSync(
           unknownRulePath,
           JSON.stringify({
-            schema: "cheng_residual_rules.v1",
+            schema: "cheng_residual_rules",
             description: "negative fixture",
             phases: [{id: "call_resolve", depth: 0, bodyKinds: ["missing_call_target"], note: "test"}],
             rules: [{id: "unknown", phase: "call_resolve", family: "test", severity: "high", paths: ["src/std/seqs.cheng"], kind: "made_up_rule"}],

@@ -1,10 +1,12 @@
 // cheng_exec_diff 严格证据契约：进程异常不能冒充相同结果，产物必须是真实可执行文件，
 // stdout 差分必须保留原始字节。全部使用本地真实进程，不依赖临时历史 DRV 产物。
 import {chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync} from "node:fs";
+import assert from "node:assert/strict";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {pathToFileURL} from "node:url";
 import {assertTrue, startMcp} from "./mcp_client.ts";
+import {assertExecDiffReportSchema} from "../src/cheng_exec_diff_m9012.ts";
 
 function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -134,6 +136,12 @@ async function main() {
     {
       const {report, result} = await run(rawDriverA, rawDriverB);
       assertTrue(result.verdict === "semantic_divergence", `0xff vs 0xfe 必须分歧，实得 ${result.verdict}`);
+      assertTrue(report.schema === "cheng_exec_diff", `exec_diff 使用唯一 canonical schema，实得 ${report.schema}`);
+      assert.throws(
+        () => assertExecDiffReportSchema({...report, schema: "cheng_exec_diff.v1"}),
+        /unsupported exec-diff report schema/,
+        "legacy exec-diff report schema must be rejected",
+      );
       assertTrue(result.runRcA === 0 && result.runRcB === 0, "两侧运行进程正常结束");
       assertTrue(result.stdoutBytesA === 1 && result.stdoutBytesB === 1 && result.stdoutBytesEqual === false, "比较使用一字节原始 stdout");
       assertTrue(result.stdoutDigestA !== result.stdoutDigestB, "原始字节摘要不同");

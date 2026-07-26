@@ -29,6 +29,8 @@ import {ZC_PROCESS_MAX_OUTPUT_BYTES,ZC_TARGET,clusterZcCensusRows,parseZcCensusR
 
 var chengResidualPeelInputSchema, ChengResidualPeelTool;
 
+const RESIDUAL_PEEL_SCHEMA = "cheng_residual_peel";
+const RESIDUAL_RULES_SCHEMA = "cheng_residual_rules";
 const FUSION_PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_RULES_PATH = join(FUSION_PKG_ROOT, "fixtures", "residual_rules.json");
 const DEFAULT_DISPATCH_MIN = "src/core/tooling/backend_driver_dispatch_min.cheng";
@@ -38,6 +40,13 @@ const FN_DEF = /^\s*fn\s+([A-Za-z_][\w]*)\s*[\(\[]/;
 const MAX_RULES_BYTES = 1024 * 1024;
 const RULE_KINDS = new Set(["multi_fn_same_name", "multi_stmt_line"]);
 const SEVERITIES = new Set(["high", "medium", "low"]);
+
+function assertResidualPeelReportSchema(report) {
+  if (!report || typeof report !== "object" || report.schema !== RESIDUAL_PEEL_SCHEMA) {
+    throw new Error(`unsupported residual peel report schema: ${report?.schema}`);
+  }
+  return report;
+}
 
 function isPathInside(path, parent) {
   const relative = resolve(path).slice(resolve(parent).length);
@@ -100,7 +109,7 @@ function loadRules(rulesPath, root) {
     throw new Error(`invalid residual rules JSON: ${path}: ${error instanceof Error ? error.message : String(error)}`);
   }
   assertExactKeys(raw, new Set(["schema", "description", "phases", "rules"]), "residual rules");
-  if (raw.schema !== "cheng_residual_rules.v1") throw new Error(`unsupported residual rules schema: ${raw.schema}`);
+  if (raw.schema !== RESIDUAL_RULES_SCHEMA) throw new Error(`unsupported residual rules schema: ${raw.schema}`);
   if (typeof raw.description !== "string" || !Array.isArray(raw.phases) || !Array.isArray(raw.rules)) {
     throw new Error(`invalid residual rules structure: ${path}`);
   }
@@ -435,8 +444,8 @@ var initChengResidualPeelModule = defineModuleInitializer(() => {
         staticByPhase[h.phase] = (staticByPhase[h.phase] || 0) + h.count;
       }
 
-      return jsonResult({
-        schema: "cheng_residual_peel.v1",
+      return jsonResult(assertResidualPeelReportSchema({
+        schema: RESIDUAL_PEEL_SCHEMA,
         root,
         mode,
         rulesPath,
@@ -472,9 +481,9 @@ var initChengResidualPeelModule = defineModuleInitializer(() => {
                   ? "Static clean; chase census attack_order bodyKinds (stream/statement)."
                   : "Static clean; run mode=full for live census when machine free.",
         },
-      });
+      }));
     },
   });
 });
 
-export {ChengResidualPeelTool,buildAttackOrder,initChengResidualPeelModule};
+export {ChengResidualPeelTool,assertResidualPeelReportSchema,buildAttackOrder,initChengResidualPeelModule};

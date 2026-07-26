@@ -9,9 +9,10 @@
 //   [E] orphans 列表里没有 offset 0/8 的假阳性(证明 stp/ldp 隐式偏移修复生效)。
 //   [F]/[G]/[H]/[I] 错误路径: objPath 不存在、objPath 非 .o、fnFilter 无命中、未知字段被拒绝。
 import {startMcp, assertTrue} from "./mcp_client.ts";
+import assert from "node:assert/strict";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
-import {classifyFunctionBody} from "../src/cheng_orphan_slot_scan_m9020.ts";
+import {assertOrphanSlotScanReportSchema, classifyFunctionBody} from "../src/cheng_orphan_slot_scan_m9020.ts";
 
 const CHENG_FUSION_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const GOOD_OBJ = join(CHENG_FUSION_ROOT, "fixtures/orphan_slot_scan/ref_good_vb.exe.primary.o");
@@ -26,7 +27,12 @@ async function main() {
     {
       const {isError, parsed} = await mcp.callTool("cheng_orphan_slot_scan", {objPath: GOOD_OBJ, fnFilter: "t66_vb__main"}, undefined, 15000);
       assertTrue(isError !== true, `调用未报错, 实得: ${JSON.stringify(parsed).slice(0, 400)}`);
-      assertTrue(parsed.schema === "cheng_orphan_slot_scan.v2", `schema 正确, 实得 ${parsed.schema}`);
+      assertTrue(parsed.schema === "cheng_orphan_slot_scan", `schema 正确, 实得 ${parsed.schema}`);
+      assert.throws(
+        () => assertOrphanSlotScanReportSchema({...parsed, schema: "cheng_orphan_slot_scan.v2"}),
+        /unsupported orphan slot scan report schema/,
+        "legacy orphan-slot report schema must be rejected",
+      );
       assertTrue(parsed.fn === "_t66_vb__main__L11", `选中函数正确, 实得 ${parsed.fn}`);
       assertTrue(parsed.status === "EXPLICIT_ORPHAN_CANDIDATES", `显式扫描如实保留 5 个候选, 实得 ${parsed.status}`);
       assertTrue(parsed.priorityCandidateCount === 0, `默认 wOnly 下无 32-bit 优先候选, 实得 ${parsed.priorityCandidateCount}`);

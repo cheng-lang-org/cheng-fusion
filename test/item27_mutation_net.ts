@@ -42,6 +42,9 @@ import {
 } from "../tools/grammar_span_receipt.ts";
 import {buildCorpus} from "../tools/grammar_corpus_gen.ts";
 import {
+  readCurrentChengGrammarCorpus,
+} from "../src/cheng_grammar_corpus_store.ts";
+import {
   applyMutant,
   buildMutationBases,
   loadMutantTable,
@@ -79,6 +82,30 @@ function corpusGateIssues(
     if (entry.lintTokenCount !== lint.tokenCount) issues.push(`${entry.shape}: manifest tokenCount 漂移`);
     if (entry.sourceSha256 !== sha256(source)) issues.push(`${entry.shape}: sourceSha256 漂移`);
     const tokens = chengPublicTokensLocal(source);
+    if (entry.shape === "mod_empty") {
+      if (source !== "module corpus_empty\n" ||
+          tokens.length !== 2 ||
+          tokens[0] !== "module" ||
+          tokens[1] !== "corpus_empty") {
+        issues.push("mod_empty: module header-only source invalid");
+      }
+      if (!entry.claims.some((claim) =>
+        claim.production === "module" &&
+        claim.kind === "repetition" &&
+        claim.structuralPath === "root.sequence3" &&
+        claim.variant === "zero")) {
+        issues.push("mod_empty: topLevel zero claim missing");
+      }
+    }
+    if (entry.shape === "stmt_rep" &&
+        !entry.claims.some((claim) =>
+          claim.production === "caseStmt" &&
+          claim.kind === "repetition" &&
+          claim.structuralPath ===
+            "root.sequence3.group0.choice1.sequence1.group0.choice1.sequence1" &&
+          claim.variant === "zero")) {
+      issues.push("stmt_rep: caseStmt flat-zero claim missing");
+    }
     const countOf = (needle: string) => tokens.filter((t) => t === needle).length;
     for (const [needle, min] of Object.entries(entry.evidence.has)) {
       if (countOf(needle) < min) issues.push(`${entry.shape}: evidence.has ${needle} 不足`);
@@ -97,8 +124,8 @@ function corpusGateIssues(
     }
   }
   if (claimCount !== manifest.counts.claims) issues.push("claims 汇总不一致");
-  if (claimCount + manifest.blocked.length !== manifest.counts.coveredRequiredObligations) {
-    issues.push("claims+blocked 与 covered required 总数不一致");
+  if (claimCount !== manifest.counts.coveredRequiredObligations) {
+    issues.push("claims 与 covered required 总数不一致");
   }
   return issues;
 }
@@ -198,9 +225,33 @@ function runContractGate(gate: string, signal: string, payload: ReturnType<typeo
   }
 }
 
+function runCurrentProjectionAdmissionGate(): void {
+  execFileSync(
+    "bun",
+    [
+      "run",
+      "test/item25_ebnf_parser_node_map.ts",
+      "--projection-admission-only",
+    ],
+    {cwd: ROOT, stdio: "pipe"},
+  );
+}
+
 // ---------------------------------------------------------------- main
 function main() {
+  if (process.argv.includes("--projection-only")) {
+    runCurrentProjectionAdmissionGate();
+    console.log(
+      "[item27] current projection mutation gate: PASS " +
+      "receipt delete/swap owner/span token-node old-parser/driver/generation",
+    );
+    return;
+  }
   const table = loadMutantTable();
+  const oldSchemaDir = mkdtempSync(join(tmpdir(), "cheng-mutation-schema-reject-"));
+  const oldSchemaPath = join(oldSchemaDir, "mutants.json");
+  writeFileSync(oldSchemaPath, `${JSON.stringify({...table, schema: "cheng_mutation_net.v1"}, null, 2)}\n`);
+  assert.throws(() => loadMutantTable(oldSchemaPath), /schema 不符/);
   const bases = buildMutationBases();
   const destructive = table.operators.filter((op) => op.class === "destructive");
   const contracted = destructive.filter((op) => op.killContract.gate !== "none");
@@ -239,8 +290,13 @@ function main() {
   // K-CORPUS-REBUILD
   const {files: rebuilt} = buildCorpus();
   const corpusDir = resolve(ROOT, "fixtures/semantic/grammar_corpus");
+  const currentCorpus = readCurrentChengGrammarCorpus(corpusDir);
   for (const [name, content] of rebuilt) {
-    assert.equal(readFileSync(resolve(corpusDir, name), "utf8"), content, `K-CORPUS-REBUILD 假红: ${name} 漂移`);
+    assert.equal(
+      currentCorpus.files.get(name)?.toString("utf8"),
+      content,
+      `K-CORPUS-REBUILD 假红: ${name} 漂移`,
+    );
   }
   console.log(`[K] K-CORPUS-REBUILD 绿: ${rebuilt.size} 文件内存重建 == 磁盘逐字节`);
 
@@ -296,6 +352,14 @@ function main() {
       throw new Error(`缺口算子 ${op.id} payload 类型意外: ${payload.kind}`);
     }
   }
+
+  // ---------- current parser-owned projection 正式门 ----------
+  console.log("[F] current parser-owned projection admission 变异门真跑");
+  runCurrentProjectionAdmissionGate();
+  console.log(
+    "  [gate-green] receipt delete/swap、owner/span、token-node、" +
+    "old-parser/driver/generation mutation 全拒",
+  );
 
   // ---------- oracle 门 + item26 真跑 ----------
   console.log("[O] oracle 子网与 item26 语料门真跑");

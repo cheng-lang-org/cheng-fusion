@@ -1,10 +1,17 @@
-// 加固项 2: 超时孤儿 — line_map_read(以及其它经同一 JsonRpcProcessClient.request 的工具)
-// 超时后必须 kill 掉真实 cheng-lsp 子进程树(SIGKILL, 含 detached), 不留孤儿;
+// 加固项 2: 超时孤儿 — 经 JsonRpcProcessClient.request 的 cheng-lsp 请求超时后
+// 必须 kill 掉真实 cheng-lsp 子进程树(SIGKILL, 含 detached 进程组), 不留孤儿;
 // 超时值可配(env CHENG_FUSION_TIMEOUT_MS)。
 //
-// 用真实 cheng-lsp 二进制(不是 mock): 把 CHENG_FUSION_TIMEOUT_MS 设成极小值(1ms),
-// 任何真实的 spawn+initialize 握手都会超过这个阈值, 从而确定性地触发超时路径,
-// 而不用等一个真的巨文件卡死(那样不确定、还容易撞 RSS/时间红线)。
+// 确定性超时前提(不靠墙钟竞速): 用真实 cheng-lsp 二进制(不是 mock)跑
+// cheng_lsp_query documentSymbol, 目标文件是全项目符号解析不可有界返回的
+// src/core/backend/lowering_plan.cheng(见 README "Important finding": 该查询
+// RSS 以 ~2.4GB/s 无界增长直到超时被杀)。双层保证 1ms 定时器必然先触发:
+// (1) 全新 spawn 的 cheng-lsp 连 LSP initialize 握手都不可能在 1ms 内完成;
+// (2) 即便握手完成, 该 documentSymbol 查询也永不返回。两种分支都收敛到同一条
+// request() 定时器 -> fail(SIGKILL) -> killChengProcessGroup 路径, 正是本项要验的语义。
+// (旧版用 cheng_line_map_read 触发: 该工具已改为纯本地文件解析, 不再 spawn
+// cheng-lsp, "spawn+initialize 必超 1ms" 的前提随之失效 —— 暖态下 <1ms 真实返回,
+// 测试恒 FAIL。)
 //
 // 孤儿判定用差集: 触发前后 snapshot 一次 "artifacts/cheng-lsp" 命令行匹配的 pid 集合,
 // 触发后新增且仍存活的 pid 才算孤儿 —— 这样不会被这台机器上本来就在跑的生产
@@ -20,7 +27,7 @@ function pgrepChengLsp(): Set<string> {
 }
 
 async function testTimeoutKillsOrphan() {
-  console.log("[A] CHENG_FUSION_TIMEOUT_MS=1 强制超时, 断言无孤儿 cheng-lsp 存活");
+  console.log("[A] CHENG_FUSION_TIMEOUT_MS=1 + 永不返回的 documentSymbol(lowering_plan) 强制超时, 断言无孤儿 cheng-lsp 存活");
   const before = pgrepChengLsp();
   const mcp = startMcp({CHENG_FUSION_TIMEOUT_MS: "1"}, CHENG_ROOT);
   try {
@@ -28,14 +35,14 @@ async function testTimeoutKillsOrphan() {
     let timedOut = false;
     let parsed: any = null;
     try {
-      const response = await mcp.callTool("cheng_line_map_read", {file: "src/tests/ordinary_zero_exit_fixture.cheng"}, undefined, 15000);
+      const response = await mcp.callTool("cheng_lsp_query", {kind: "documentSymbol", file: "src/core/backend/lowering_plan.cheng"}, undefined, 15000);
       parsed = response.parsed;
       timedOut = response.isError === true && typeof parsed === "string" && /timed out/i.test(parsed);
     } catch (error) {
       timedOut = true;
       parsed = error instanceof Error ? error.message : String(error);
     }
-    assertTrue(timedOut, `极小超时下 cheng_line_map_read 报超时错误, 实得: ${JSON.stringify(parsed).slice(0, 300)}`);
+    assertTrue(timedOut, `极小超时下 cheng_lsp_query 报超时错误, 实得: ${JSON.stringify(parsed).slice(0, 300)}`);
   } finally {
     mcp.kill();
   }
@@ -55,7 +62,7 @@ async function testNormalTimeoutStillWorks() {
     const {isError, parsed} = await mcp.callTool("cheng_line_map_read", {file: "src/tests/ordinary_zero_exit_fixture.cheng"}, undefined, 15000);
     const elapsedMs = Date.now() - started;
     assertTrue(isError !== true, `正常调用未报错, 实得: ${JSON.stringify(parsed).slice(0, 300)}`);
-    assertTrue(parsed?.schema === "cheng_line_map_v1" && parsed?.functionCount >= 1, `line-map 结果 schema 正确且含函数, 实得: ${JSON.stringify(parsed).slice(0, 200)}`);
+    assertTrue(parsed?.schema === "cheng_line_map" && parsed?.functionCount >= 1, `line-map 结果 schema 正确且含函数, 实得: ${JSON.stringify(parsed).slice(0, 200)}`);
     console.log(`  ok: 正常路径耗时 ${elapsedMs}ms (无超时误伤)`);
   } finally {
     mcp.kill();

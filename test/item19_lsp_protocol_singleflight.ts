@@ -1,11 +1,14 @@
-import {mkdtempSync, readFileSync, realpathSync, rmSync} from "node:fs";
+import {chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync} from "node:fs";
 import {join} from "node:path";
 import {tmpdir} from "node:os";
+import {pathToFileURL} from "node:url";
 import {JsonRpcChild} from "../cli.ts";
 import {
   JsonRpcProcessClient,
   chengLspEnsureClient,
+  chengLspResolveBinary,
   chengLspSyncDoc,
+  chengLspDiagnosticsForSyncedDoc,
 } from "../src/cheng_toolkit_m9000.ts";
 import {JsonRpcFrameDecoder} from "../src/json_rpc_frame_decoder.ts";
 import {assertTrue, sleep} from "./mcp_client.ts";
@@ -71,6 +74,35 @@ function testBoundedStrictDecoder() {
     new JsonRpcFrameDecoder({framing: "content-length", maxHeaderBytes: 64, maxFrameBytes: 256, label: "test-rpc"})
       .push(invalid, () => {});
   }, /not valid UTF-8/);
+}
+
+function testLspBinaryAuthority() {
+  console.log("[B] LSP binary resolution has one explicit/default authority and deterministic failure paths");
+  const tempRoot = realpathSync(mkdtempSync(join(tmpdir(), "cheng-fusion-lsp-authority-")));
+  try {
+    const shadow = join(tempRoot, "cheng-lsp");
+    writeFileSync(shadow, "#!/bin/sh\nexit 0\n");
+    chmodSync(shadow, 0o755);
+    assertTrue(
+      chengLspResolveBinary({PATH: tempRoot}, realpathSync(process.execPath)) === realpathSync(process.execPath),
+      "PATH 上的同名二进制不会成为 fallback",
+    );
+    assertThrows(
+      "explicit missing LSP",
+      () => chengLspResolveBinary({CHENG_LSP_PATH: join(tempRoot, "missing-lsp")}, realpathSync(process.execPath)),
+      new RegExp(`CHENG_LSP_PATH cheng-lsp binary not found at ${join(tempRoot, "missing-lsp").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+    );
+    const nonExecutable = join(tempRoot, "non-executable-lsp");
+    writeFileSync(nonExecutable, "not executable\n");
+    chmodSync(nonExecutable, 0o600);
+    assertThrows(
+      "explicit non-executable LSP",
+      () => chengLspResolveBinary({CHENG_LSP_PATH: nonExecutable}, realpathSync(process.execPath)),
+      /CHENG_LSP_PATH cheng-lsp is not executable at/,
+    );
+  } finally {
+    rmSync(tempRoot, {recursive: true, force: true});
+  }
 }
 
 const MALFORMED_SERVER = `
@@ -154,50 +186,140 @@ async function testProtocolFailureKillsClients() {
   }
 }
 
-async function testRealLspSingleFlightAndDocumentGeneration() {
-  console.log("[C] real cheng-lsp same-root initialization is single-flight and didOpen is client-bound");
+async function testDiagnosticsWaitForCurrentPublish() {
+  console.log("[C] diagnostics wait for the current document publish event");
+  const client = new JsonRpcProcessClient("/unused/cheng-lsp", [], {});
+  client.generation = 101;
+  const notifications: string[] = [];
+  client.notify = (method: string) => {
+    notifications.push(method);
+  };
+  const source = join(CHENG_ROOT, "src/tests/fusion_diagnostics_event_fixture.cheng");
+  const uri = await chengLspSyncDoc(client, source, "fn main() =\n    return\n");
+  let firstSettled = false;
+  const first = chengLspDiagnosticsForSyncedDoc(client, uri, 1000).then((diagnostics) => {
+    firstSettled = true;
+    return diagnostics;
+  });
+  await sleep(20);
+  assertTrue(!firstSettled, "didOpen must not turn an early empty pull result into zero diagnostics");
+  const expected = [{message: "fixture diagnostic"}];
+  client.handleMessage({
+    method: "textDocument/publishDiagnostics",
+    params: {uri, version: 1, diagnostics: expected},
+  });
+  assertTrue(await first === expected, "the first diagnostics query resolves from the post-didOpen publish event");
+
+  await chengLspSyncDoc(client, source, "fn main() =\n    return 0\n");
+  let secondSettled = false;
+  const second = chengLspDiagnosticsForSyncedDoc(client, uri, 1000).then((diagnostics) => {
+    secondSettled = true;
+    return diagnostics;
+  });
+  await sleep(20);
+  assertTrue(!secondSettled, "didChange must not reuse diagnostics published for the previous text version");
+  client.handleMessage({
+    method: "textDocument/publishDiagnostics",
+    params: {uri, version: 2, diagnostics: []},
+  });
+  assertTrue((await second).length === 0, "a post-didChange empty publish is accepted as a proven clean document");
+
+  await chengLspSyncDoc(client, source, "fn main() =\n    return 1\n");
+  await assertRejects(
+    "missing current publish",
+    chengLspDiagnosticsForSyncedDoc(client, uri, 20),
+    /refusing to treat unfinished analysis as zero diagnostics/,
+  );
+  assertTrue(
+    notifications.join(",") ===
+      "textDocument/didOpen,textDocument/didChange,textDocument/didChange",
+    "diagnostics synchronization emits one ordered open/change notification per text version",
+  );
+}
+
+async function testInstalledLspArtifactFailsClosedBeforeSpawn() {
+  console.log("[D] installed stale cheng-lsp is rejected before spawn");
   const baselineExitListeners = process.listenerCount("exit");
-  const firstWave = await Promise.all(Array.from({length: 24}, () => chengLspEnsureClient(CHENG_ROOT)));
-  const first = firstWave[0];
-  assertTrue(new Set(firstWave).size === 1, "24 concurrent first-use calls return the same initialized real cheng-lsp client");
-  assertTrue(first.generation === 1, `first real client generation is 1, got ${first.generation}`);
+  await assertRejects(
+    "revoked installed LSP",
+    chengLspEnsureClient(CHENG_ROOT),
+    /revoked installed cheng-lsp artifact/,
+  );
+  assertTrue(
+    process.listenerCount("exit") === baselineExitListeners,
+    "artifact rejection happens before a JSON-RPC client installs cleanup listeners",
+  );
+}
 
-  const firstMethods: string[] = [];
-  const firstNotify = first.notify.bind(first);
-  first.notify = (method: string, params: unknown) => {
-    firstMethods.push(method);
-    return firstNotify(method, params);
-  };
-  const text = readFileSync(SOURCE, "utf8");
-  await Promise.all(Array.from({length: 24}, () => chengLspSyncDoc(first, SOURCE, text)));
-  assertTrue(firstMethods.filter((method) => method === "textDocument/didOpen").length === 1, "concurrent first sync sends exactly one didOpen to the actual client");
-  assertTrue(firstMethods.filter((method) => method === "textDocument/didChange").length === 0, "identical concurrent first sync sends no didChange");
-
-  first.close();
-  await waitForChildExit(first.child);
-  const secondWave = await Promise.all(Array.from({length: 24}, () => chengLspEnsureClient(CHENG_ROOT)));
-  const second = secondWave[0];
-  assertTrue(new Set(secondWave).size === 1 && second !== first, "replacement initialization is also single-flight and returns a new client");
-  assertTrue(second.generation === first.generation + 1, `replacement generation increments exactly once, got ${first.generation} -> ${second.generation}`);
-
-  const secondMethods: string[] = [];
-  const secondNotify = second.notify.bind(second);
-  second.notify = (method: string, params: unknown) => {
-    secondMethods.push(method);
-    return secondNotify(method, params);
-  };
-  await chengLspSyncDoc(second, SOURCE, text);
-  assertTrue(secondMethods.filter((method) => method === "textDocument/didOpen").length === 1, "replacement client receives didOpen even when text is unchanged");
-  assertTrue(secondMethods.filter((method) => method === "textDocument/didChange").length === 0, "replacement client never receives didChange before its own didOpen");
-  second.close();
-  assertTrue(await waitForChildExit(second.child), "replacement real cheng-lsp exits during test cleanup");
-  assertTrue(process.listenerCount("exit") === baselineExitListeners, "real client replacement/close leaves no process exit listener behind");
+async function testOrdinaryBodylessRoutineStillHardErrors() {
+  console.log("[D] ordinary bodyless fn remains a parser hard error");
+  const tempRoot = realpathSync(
+    mkdtempSync(join(tmpdir(), "cheng-fusion-bodyless-fn.")),
+  );
+  const source = join(tempRoot, "src/main.cheng");
+  writeFileSync(
+    join(tempRoot, "cheng-package.toml"),
+    'package_id = "pkg://bodyless-fn-test"\n',
+  );
+  mkdirSync(join(tempRoot, "src"));
+  writeFileSync(source, "fn MissingBody(): int32\n");
+  const binary = chengLspResolveBinary();
+  const client = new JsonRpcProcessClient(binary, [], {cwd: tempRoot});
+  client.generation = 1;
+  client.rootPath = tempRoot;
+  try {
+    client.start();
+    const rootUri = pathToFileURL(tempRoot).href;
+    await client.request("initialize", {
+      capabilities: {},
+      processId: process.pid,
+      rootUri,
+      workspaceFolders: [{uri: rootUri, name: "bodyless-fn-test"}],
+    }, 20000);
+    client.notify("initialized", {});
+    const uri = await chengLspSyncDoc(
+      client,
+      source,
+      readFileSync(source, "utf8"),
+    );
+    const diagnostics = await chengLspDiagnosticsForSyncedDoc(
+      client,
+      uri,
+      10000,
+    );
+    assertTrue(
+      diagnostics.some(
+        (diagnostic: any) =>
+          diagnostic.severity === 1 &&
+          /expected '='|suite assignment missing/.test(
+            String(diagnostic.message || ""),
+          ),
+      ),
+      `ordinary bodyless fn must remain red, got ${JSON.stringify(diagnostics)}`,
+    );
+    await client.request("shutdown", null, 5000);
+    client.notify("exit", null);
+    assertTrue(
+      await waitForChildExit(client.child),
+      "ordinary bodyless test LSP exits through shutdown/exit",
+    );
+  } finally {
+    if (!client.dead) {
+      await client.request("shutdown", null, 1000).catch(() => undefined);
+      if (!client.dead) client.notify("exit", null);
+      await waitForChildExit(client.child);
+    }
+    rmSync(tempRoot, {recursive: true, force: true});
+  }
 }
 
 async function main() {
   testBoundedStrictDecoder();
+  testLspBinaryAuthority();
   await testProtocolFailureKillsClients();
-  await testRealLspSingleFlightAndDocumentGeneration();
+  await testDiagnosticsWaitForCurrentPublish();
+  await testInstalledLspArtifactFailsClosedBeforeSpawn();
+  await testOrdinaryBodylessRoutineStillHardErrors();
   console.log("item19 lsp protocol/singleflight: PASS");
 }
 

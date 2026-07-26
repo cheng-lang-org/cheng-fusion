@@ -21,6 +21,7 @@ import {createChengTextTool, jsonResult, runChengDriver, takeTrailingText, initC
 
 var chengShapeMatrixInputSchema, ChengShapeMatrixTool;
 
+const SHAPE_MATRIX_SCHEMA = "cheng_shape_matrix";
 const CHENG_FUSION_PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_MATRIX_PATH = join(CHENG_FUSION_PACKAGE_ROOT, "fixtures/ignition/matrix.json");
 const DEFAULT_TIMEOUT_SEC = 300;
@@ -41,6 +42,13 @@ const MAX_FIXTURE_BYTES = 64 * 1024 * 1024;
 const MAX_GOLDEN_BYTES = 64 * 1024 * 1024;
 const MAX_MATRIX_ENTRIES = 4096;
 const MAX_TOTAL_INPUT_BYTES = 1024 * 1024 * 1024;
+
+function assertShapeMatrixReportSchema(report) {
+  if (!report || typeof report !== "object" || report.schema !== SHAPE_MATRIX_SCHEMA) {
+    throw new Error(`unsupported shape matrix report schema: ${report?.schema}`);
+  }
+  return report;
+}
 
 function sameFileGeneration(left, right) {
   return left.dev === right.dev
@@ -721,8 +729,8 @@ var initChengShapeMatrixModule = defineModuleInitializer(() => {
           else if (result.status === "RED") summary.red++;
           else if (result.status === "CFAIL") summary.cfail++;
         }
-        return jsonResult({
-          schema: "cheng_shape_matrix.v1",
+        return jsonResult(assertShapeMatrixReportSchema({
+          schema: SHAPE_MATRIX_SCHEMA,
           driver: driverPath,
           matrixPath,
           root,
@@ -734,7 +742,7 @@ var initChengShapeMatrixModule = defineModuleInitializer(() => {
           maxOutputBytes: maxBuffer,
           results,
           summary,
-        });
+        }));
       } finally {
         rmSync(snapshotDir, {recursive: true, force: true});
       }
@@ -742,4 +750,4 @@ var initChengShapeMatrixModule = defineModuleInitializer(() => {
   });
 });
 
-export {ChengShapeMatrixTool, initChengShapeMatrixModule};
+export {ChengShapeMatrixTool, assertShapeMatrixReportSchema, initChengShapeMatrixModule};

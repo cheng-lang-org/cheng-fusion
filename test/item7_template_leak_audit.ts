@@ -7,8 +7,10 @@
 //      Value[T]/ErrorInfoOf[T])被正确回源到 sourceFile/line/signature, verdict 是合法枚举值,
 //      callEdges 与 objdump -r 直接统计一致, 且如实断言当前 invariantHeld 状态(不预设已修)。
 //  (c) 若该临时构建产物已被清理, 只做 (a) 并跳过 (b), 不伪造数据。
-import {existsSync} from "node:fs";
+import {existsSync, mkdtempSync, rmSync, writeFileSync} from "node:fs";
 import {execFileSync} from "node:child_process";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
 import {startMcp, assertTrue} from "./mcp_client.ts";
 
 const CHENG_ROOT = "/Users/lbcheng/cheng-lang";
@@ -35,16 +37,31 @@ async function main() {
       assertTrue(String(parsed).includes("not found"), `错误信息应指出文件不存在, 实得: ${JSON.stringify(parsed).slice(0, 200)}`);
     }
 
+    console.log("[B] 真实空目标文件返回唯一 current schema");
+    const emptyFixture = mkdtempSync(join(tmpdir(), "fusion-template-leak-schema-"));
+    try {
+      const source = join(emptyFixture, "empty.c");
+      const object = join(emptyFixture, "empty.o");
+      writeFileSync(source, "int schema_probe(void) { return 0; }\n");
+      execFileSync("cc", ["-c", source, "-o", object]);
+      const {isError, parsed} = await mcp.callTool("cheng_template_leak_audit", {objectPath: object, root: CHENG_ROOT});
+      assertTrue(isError !== true, `真实空目标审计不应报错, 实得 ${JSON.stringify(parsed)}`);
+      assertTrue(parsed.schema === "cheng_template_leak_audit", `schema 精确, 实得 ${parsed.schema}`);
+      assertTrue(parsed.scannedMangledSymbolCount === 0 && parsed.invariantHeld === true, `无模板符号的真实目标保持空集不变量, 实得 ${JSON.stringify(parsed)}`);
+    } finally {
+      rmSync(emptyFixture, {recursive: true, force: true});
+    }
+
     if (!existsSync(REAL_FIXTURE_OBJECT)) {
-      console.log(`[B] 跳过: 真实构建产物 ${REAL_FIXTURE_OBJECT} 当前不在(过去会话临时产物已被清理), 不伪造数据`);
+      console.log(`[C] 跳过: 真实构建产物 ${REAL_FIXTURE_OBJECT} 当前不在(过去会话临时产物已被清理), 不伪造数据`);
       console.log("item7 template_leak_audit: PASS (partial: fixture absent)");
       return;
     }
 
-    console.log(`[B] 对真实构建产物 ${REAL_FIXTURE_OBJECT} 跑真实审计`);
+    console.log(`[C] 对真实构建产物 ${REAL_FIXTURE_OBJECT} 跑真实审计`);
     const {isError, parsed} = await mcp.callTool("cheng_template_leak_audit", {objectPath: REAL_FIXTURE_OBJECT, root: CHENG_ROOT}, undefined, 30000);
     assertTrue(isError !== true, `真实审计不应报错, 实得: ${JSON.stringify(parsed).slice(0, 300)}`);
-    assertTrue(parsed.schema === "cheng_template_leak_audit.v1", `schema 正确, 实得 ${parsed.schema}`);
+    assertTrue(parsed.schema === "cheng_template_leak_audit", `schema 精确, 实得 ${parsed.schema}`);
     assertTrue(parsed.scannedMangledSymbolCount > 400, `扫描到大量 __L mangled T 符号(真实大对象), 实得 ${parsed.scannedMangledSymbolCount}`);
     assertTrue(Array.isArray(parsed.leaks), "leaks 是数组");
     assertTrue(parsed.invariantHeld === (parsed.liveLeakCount === 0), `invariantHeld 与 liveLeakCount==0 一致, 实得 invariantHeld=${parsed.invariantHeld} liveLeakCount=${parsed.liveLeakCount}`);

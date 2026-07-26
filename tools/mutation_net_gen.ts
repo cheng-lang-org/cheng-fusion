@@ -18,6 +18,7 @@ import {
   buildChengGrammarObligationContract,
   buildPipelineProfileSourceBundle,
   generatePipelineMatrix,
+  lintChengPublicSource,
   mutateSourceBundle,
   type ChengGrammarObligationContract,
   type ChengSemanticSourceBundle,
@@ -74,7 +75,7 @@ export interface GapEntry {
 }
 
 export interface MutantTable {
-  readonly schema: "cheng_mutation_net.v1";
+  readonly schema: "cheng_mutation_net";
   readonly gates: Readonly<Record<string, string>>;
   readonly gapRegistry: Readonly<Record<string, GapEntry>>;
   readonly operators: readonly MutantDecl[];
@@ -82,7 +83,7 @@ export interface MutantTable {
 
 export function loadMutantTable(path: string = TABLE_PATH): MutantTable {
   const table = JSON.parse(readFileSync(path, "utf8")) as MutantTable;
-  if (table.schema !== "cheng_mutation_net.v1") throw new Error(`mutants.json schema 不符: ${table.schema}`);
+  if (table.schema !== "cheng_mutation_net") throw new Error(`mutants.json schema 不符: ${table.schema}`);
   const ids = new Set<string>();
   for (const op of table.operators) {
     if (ids.has(op.id)) throw new Error(`mutants.json id 重复: ${op.id}`);
@@ -133,9 +134,8 @@ export interface CorpusManifestEntry {
 export interface CorpusManifest {
   readonly schema: string;
   readonly spec: {readonly formalSpecSha256: string; readonly ebnfSha256: string; readonly mapSha256: string; readonly productionCount: number};
-  readonly counts: {readonly coveredProductions: number; readonly sources: number; readonly claims: number; readonly blocked: number; readonly coveredRequiredObligations: number};
+  readonly counts: {readonly coveredProductions: number; readonly sources: number; readonly claims: number; readonly coveredRequiredObligations: number};
   readonly entries: readonly CorpusManifestEntry[];
-  readonly blocked: readonly unknown[];
   readonly hitProductionsByKind: Readonly<Record<string, readonly string[]>>;
 }
 
@@ -143,7 +143,11 @@ export interface NodeMapDoc {
   readonly schema: string;
   readonly spec: {readonly formalSpecSha256: string; readonly ebnfSha256: string};
   readonly counts: {readonly total: number; readonly MAPPED: number; readonly PARTIAL: number; readonly UNMAPPED: number};
-  readonly rows: readonly {readonly name: string; readonly status: "MAPPED" | "PARTIAL" | "UNMAPPED"}[];
+  readonly rows: readonly {
+    readonly name: string;
+    readonly status: "MAPPED" | "PARTIAL" | "UNMAPPED";
+    readonly receipt_ready: boolean;
+  }[];
 }
 
 export interface MutationBases {
@@ -248,7 +252,7 @@ export function buildMutationBases(): MutationBases {
   const anchorDoc = JSON.parse(readFileSync(resolve(HERE, "../fixtures/semantic/toolchain_anchor.json"), "utf8")) as {
     schema: string; driverBytesSha256: string; toolchainManifestSha256: string;
   };
-  if (anchorDoc.schema !== "cheng_fusion_toolchain_anchor.v1") {
+  if (anchorDoc.schema !== "cheng_fusion_toolchain_anchor") {
     throw new Error(`toolchain_anchor.json schema 意外: ${anchorDoc.schema}`);
   }
   const provenanceAnchor: ProvenanceAnchor = {
@@ -329,13 +333,33 @@ export function applyMutant(id: string, bases: MutationBases): MutantPayload {
     }
     case "M-SPAN-SHIFT-REHASH": {
       const wide = bases.wideReceipt;
-      return {kind: "span_receipt", receipt: rehashReceipt({...wide, tokenStart: wide.tokenStart + 1})};
+      return {
+        kind: "span_receipt",
+        receipt: rehashReceipt({
+          ...wide,
+          spanStartByte: wide.spanStartByte + 1,
+          canonicalTokens: [{
+            ...wide.canonicalTokens[0]!,
+            startByte: wide.spanStartByte + 1,
+          }],
+        }),
+      };
     }
     case "M-SPAN-ESCAPE-REHASH": {
       const source = bases.sourceFiles.find((f) => f.relativePath === base.relativePath);
       if (source === undefined) throw new Error("source 缺失");
-      const tokenCount = chengPublicTokensWithOffsets(source.source).length;
-      return {kind: "span_receipt", receipt: rehashReceipt({...base, tokenEnd: tokenCount + 1})};
+      const escapedEnd = Buffer.byteLength(source.source, "utf8") + 1;
+      return {
+        kind: "span_receipt",
+        receipt: rehashReceipt({
+          ...base,
+          spanEndByte: escapedEnd,
+          canonicalTokens: [{
+            ...base.canonicalTokens[0]!,
+            endByte: escapedEnd,
+          }],
+        }),
+      };
     }
     case "M-HASH-SWAP-TOKEN":
       return {kind: "span_receipt", receipt: rehashReceipt({...base, tokenSha256: base.sourceSha256})};
@@ -384,6 +408,63 @@ export function applyMutant(id: string, bases: MutationBases): MutantPayload {
       const files = new Map(bases.corpus.files);
       files.set(`${entry.shape}.cheng`, `${files.get(`${entry.shape}.cheng`)!}\nlet mutationNetDrift = 1\n`);
       return {kind: "corpus", manifest: bases.corpus.manifest, files, mapDoc: bases.mapDoc};
+    }
+    case "M-MODULE-HEADER-DROP":
+    case "M-MODULE-HEADER-REPLACE": {
+      const manifest = clone(bases.corpus.manifest);
+      const entry = manifest.entries.find(
+        (row) => row.shape === "mod_empty",
+      ) as {
+        sourceSha256: string;
+        lintTokenCount: number;
+      } | undefined;
+      if (entry === undefined) throw new Error("mod_empty corpus entry 缺失");
+      const source = id === "M-MODULE-HEADER-DROP"
+        ? ""
+        : "module corpus_replaced\n";
+      const lint = lintChengPublicSource(source);
+      if (!lint.passed) {
+        throw new Error(
+          `${id}: mutation source 未过公开 lint(${lint.violations.join(",")})`,
+        );
+      }
+      entry.sourceSha256 = sha256(source);
+      entry.lintTokenCount = lint.tokenCount;
+      const files = new Map(bases.corpus.files);
+      files.set("mod_empty.cheng", source);
+      return {kind: "corpus", manifest, files, mapDoc: bases.mapDoc};
+    }
+    case "M-CASE-FLAT-ZERO-CLAIM-DROP": {
+      const manifest = clone(bases.corpus.manifest);
+      const entry = manifest.entries.find(
+        (row) => row.shape === "stmt_rep",
+      );
+      if (entry === undefined) throw new Error("stmt_rep corpus entry 缺失");
+      const mutableEntry = entry as unknown as {
+        claims: CorpusManifestEntry["claims"][number][];
+      };
+      const claims = mutableEntry.claims.filter((claim) =>
+        !(claim.production === "caseStmt" &&
+          claim.kind === "repetition" &&
+          claim.structuralPath ===
+            "root.sequence3.group0.choice1.sequence1.group0.choice1.sequence1" &&
+          claim.variant === "zero"));
+      if (claims.length + 1 !== mutableEntry.claims.length) {
+        throw new Error("caseStmt flat-zero claim 缺失或重复");
+      }
+      mutableEntry.claims = claims;
+      const counts = manifest.counts as {
+        claims: number;
+        coveredRequiredObligations: number;
+      };
+      counts.claims -= 1;
+      counts.coveredRequiredObligations -= 1;
+      return {
+        kind: "corpus",
+        manifest,
+        files: bases.corpus.files,
+        mapDoc: bases.mapDoc,
+      };
     }
     case "M-CORPUS-DROP-COUNT": {
       const manifest = clone(bases.corpus.manifest) as {counts: Record<string, unknown>};
@@ -442,7 +523,10 @@ export const IMPLEMENTED_MUTANT_IDS = [
   "M-BINDING-VARIANT", "M-RECEIPT-HASH-BREAK", "M-SOURCE-SHA-DRIFT",
   "M-FORGE-PROVENANCE-SHAPE", "M-FORGE-PROVENANCE-SELFCONS", "M-PROVENANCE-TOOLCHAIN-SALT",
   "M-STALE-SPEC-SALT",
-  "M-CORPUS-SHA-DRIFT", "M-CORPUS-SOURCE-DRIFT", "M-CORPUS-DROP-COUNT", "M-MAP-STATUS-FLIP",
+  "M-CORPUS-SHA-DRIFT", "M-CORPUS-SOURCE-DRIFT",
+  "M-MODULE-HEADER-DROP", "M-MODULE-HEADER-REPLACE",
+  "M-CASE-FLAT-ZERO-CLAIM-DROP",
+  "M-CORPUS-DROP-COUNT", "M-MAP-STATUS-FLIP",
   "M-LEDGER-OWNERSHIP-SWAP", "M-LEDGER-CALL-IDENTITY", "M-LEDGER-FIELD-OFFSET-DROP", "M-LEDGER-STAGE-OMISSION",
   "M-BUNDLE-SOURCE-REPLACE", "M-BUNDLE-CASE-SWAP", "M-BUNDLE-MATERIALIZER-SALT", "M-BUNDLE-GRAMMAR-ROOT-SWAP",
   "M-BUNDLE-AXIS-SPAN-DROP",

@@ -23,6 +23,7 @@ import {createChengTextTool, jsonResult, initChengToolkitModule, zodSchema} from
 
 var chengOrphanSlotScanInputSchema, ChengOrphanSlotScanTool;
 
+const ORPHAN_SLOT_SCAN_SCHEMA = "cheng_orphan_slot_scan";
 const FUNCTION_LABEL_RE = /^(_\S+):$/;
 const ARM64_IMMEDIATE = "-?(?:0x[0-9a-fA-F]+|\\d+)";
 // Single/pair forms accept ordinary, pre-indexed and post-indexed [sp] addressing.
@@ -33,6 +34,13 @@ const PAIR_SP_ACCESS_RE = new RegExp(`\\b(stp|ldp)\\s+(\\w+),\\s*(\\w+),\\s*\\[s
 const ANY_SP_ACCESS_RE = /\b(?:str|stur|ldr|ldur|stp|ldp)\b[^\n]*\[\s*sp\b/i;
 const SP_ADJUST_RE = new RegExp(`\\b(add|sub)\\s+sp,\\s*sp,\\s*#(${ARM64_IMMEDIATE})\\b`, "i");
 const UNSUPPORTED_SP_WRITE_RE = /\b(?:mov|and|orr|eor|lsl|lsr|asr)\s+sp\s*,/i;
+
+function assertOrphanSlotScanReportSchema(report) {
+  if (!report || typeof report !== "object" || report.schema !== ORPHAN_SLOT_SCAN_SCHEMA) {
+    throw new Error(`unsupported orphan slot scan report schema: ${report?.schema}`);
+  }
+  return report;
+}
 
 function parseImmOffset(text, context) {
   if (text === undefined) return 0;
@@ -100,7 +108,10 @@ function pairBytes(first, second, context) {
 }
 
 function runOtoolTv(objPath) {
-  const result = spawnSync("otool", ["-tv", objPath], {encoding: "utf8", timeout: 15000, maxBuffer: 64 * 1024 * 1024});
+  /* Compiler-scale thin objects (current backend driver ~59MB Mach-O) disassemble
+     to ~500MB of text over tens of seconds; fixture-era 64MiB/15s limits
+     ENOBUFS/ETIMEDOUT on exactly the inputs this tool exists for. */
+  const result = spawnSync("otool", ["-tv", objPath], {encoding: "utf8", timeout: 120000, maxBuffer: 1024 * 1024 * 1024});
   if (result.error) throw new Error(`otool -tv failed to run: ${result.error.message}`);
   if (result.status !== 0) {
     throw new Error(`otool -tv exited ${result.status} for ${objPath}: ${(result.stderr || "").trim()}`);
@@ -270,7 +281,7 @@ function scanOrphanSlots(objPath, fnFilter, wOnly) {
     notes.push(`${informationalOrphans.length} non-32-bit explicit orphan candidate(s) are outside the wOnly priority set (callee/computed-pointer writes are invisible to this narrow scan)`);
   }
   return {
-    schema: "cheng_orphan_slot_scan.v2",
+    schema: ORPHAN_SLOT_SCAN_SCHEMA,
     objPath,
     fnFilter,
     wOnly,
@@ -310,9 +321,9 @@ var initChengOrphanSlotScanModule = defineModuleInitializer(() => {
     async execute(input) {
       const objPath = resolveObjPath(input.objPath);
       const wOnly = input.wOnly !== false;
-      return jsonResult(scanOrphanSlots(objPath, input.fnFilter, wOnly));
+      return jsonResult(assertOrphanSlotScanReportSchema(scanOrphanSlots(objPath, input.fnFilter, wOnly)));
     },
   });
 });
 
-export {ChengOrphanSlotScanTool, classifyFunctionBody, initChengOrphanSlotScanModule};
+export {ChengOrphanSlotScanTool, assertOrphanSlotScanReportSchema, classifyFunctionBody, initChengOrphanSlotScanModule};
