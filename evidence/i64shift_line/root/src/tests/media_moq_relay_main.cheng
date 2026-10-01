@@ -1,0 +1,219 @@
+# MoQ segment-stream relay (v1: single fixed upstream publisher).
+#
+# Role in the 秒发秒开 chain: mobile publishers and PWA/cheng players cannot
+# always see each other directly (NAT/carrier), so the relay exposes ONE public
+# QUIC endpoint. A requester connects here instead of the publisher; the relay
+# negotiates the moq segment-stream protocol, reads one range request, dials the
+# upstream publisher as a client, replays the exact request, and streams the
+# response bytes back RAW (the response stream is unframed — same convention as
+# Libp2pMoqSegmentStreamServerWriteRange; only the REQUEST is length-prefixed).
+#
+# v1 scope: fixed upstream, no announce registry, no auth. assetCid 路由与
+# announce 分发在后续版本加(上游先行写 announce 到 relay 的 ready 文件旁)。
+
+import std/result
+import std/system
+import std/strings
+import std/rawbytes
+import std/os as os
+import std/strutils as strutil
+import std/cmdline as cmdline
+import std/times
+import cheng/quic/connection as qconn
+import cheng/quic/msquictransport_native as qtransport
+import cheng/quic/native_runtime as qnative
+import cheng/libp2p/transports/quic_transport as quic_transport
+import cheng/libp2p/protocols/media/moq_segment_stream as moqstream
+
+var echoMode: bool
+
+fn mediaMoqRelayLogLine(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn mediaMoqRelayServeRequest(listener: var qtransport.MsQuicTransport,
+                             conn: var qconn.Connection,
+                             upstreamHost: str,
+                             upstreamPort: int32): int32 =
+    if echoMode:
+        var echoBytes: rawbytes.Bytes = rawbytes.BytesAlloc(2048)
+        var ei: int32
+        for ei in ei..<2048:
+            rawbytes.BytesSet(echoBytes, ei, int32('E'))
+        let echoServeRes = moqstream.Libp2pMoqSegmentStreamServerServeRequestedRange(listener, conn, echoBytes)
+        if IsErr(echoServeRes):
+            mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: echo serve: ", Error(echoServeRes)], ""))
+            return 10
+        return 0
+    let negotiateRes = moqstream.Libp2pMoqSegmentStreamServerNegotiate(listener, conn)
+    if IsErr(negotiateRes):
+        mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: server negotiate: ", Error(negotiateRes)], ""))
+        return 1
+    # Mirror the publisher's per-connection request loop: one negotiated stream
+    # carries an announce request followed by the object request on the SAME
+    # derived conn — keep reading requests until a reply FINs the write side or
+    # the requester closes.
+    var connDone = false
+    var requestIndex = 0
+    while !connDone:
+        let requestRes = moqstream.Libp2pMoqSegmentStreamServerReadRequest(conn)
+        if IsErr(requestRes):
+            mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: server read request idx=", IntToStr(requestIndex),
+                                               ": ", Error(requestRes)], ""))
+            if requestIndex == 0:
+                return 2
+            connDone = true
+            continue
+        let request = Value(requestRes)
+        requestIndex = requestIndex + 1
+        let readChunk: int32 = request.readChunkBytes
+        let segKey: str = strings.CloneStr(request.segmentKey)
+        let reqOff: int32 = request.offsetBytes
+        let reqLen: int32 = request.lengthBytes
+        var upClient = qtransport.InitMsQuicTransport()
+        var upConn: qconn.Connection
+        let dialHost: str = strings.CloneStr(upstreamHost)
+        let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(upClient, upConn,
+                                                                      dialHost, upstreamPort, "localhost")
+        if IsErr(dialRes):
+            mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: upstream dial: ", Error(dialRes)], ""))
+            qtransport.Stop(upClient)
+            return 3
+        upConn = qconn.ConnDeriveStream(upConn, 4, 4)
+        let negRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(upClient, upConn)
+        if IsErr(negRes):
+            mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: upstream negotiate: ", Error(negRes)], ""))
+            qconn.ConnClose(upConn)
+            qtransport.Stop(upClient)
+            return 4
+        let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(upClient, upConn)
+        if IsErr(ackRes):
+            mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: upstream ack: ", Error(ackRes)], ""))
+            qconn.ConnClose(upConn)
+            qtransport.Stop(upClient)
+            return 5
+        var reader: moqstream.Libp2pMoqSegmentStreamReader
+        let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(upConn), request)
+        if IsErr(openRes):
+            mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: upstream open: ", Error(openRes)], ""))
+            qconn.ConnClose(upConn)
+            qtransport.Stop(upClient)
+            return 6
+        # Buffer the whole upstream reply, then serve it with the publisher's
+        # exact write path (ServerWriteRange + conditional FIN). Chunk-by-chunk
+        # interleaved forwarding dropped the tail of large replies in the
+        # dual-role process (subscriber saw FIN before the last bytes).
+        var fetched = rawbytes.EmptyBytes()
+        while !reader.closed:
+            let chunkRes = moqstream.Libp2pMoqSegmentStreamRead(reader, readChunk)
+            if IsErr(chunkRes):
+                mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: upstream read: ", Error(chunkRes)], ""))
+                moqstream.Libp2pMoqSegmentStreamClose(reader)
+                qtransport.Stop(upClient)
+                return 7
+            let chunk = Value(chunkRes)
+            if rawbytes.BytesLen(chunk) <= 0:
+                break
+            fetched = moqstream.Libp2pMoqSegmentStreamAppendBytes(fetched, chunk)
+        # Serve the reply to the requester BEFORE tearing the upstream client
+        # down: the client session's close/recycle resets the process-global
+        # listener datapath id that the server-side send path reads, so a
+        # post-teardown write fails with "send: from id". The next upstream dial
+        # restores it, so reads between requests are unaffected.
+        let fetchedLen: int32 = rawbytes.BytesLen(fetched)
+        let writeRes = moqstream.Libp2pMoqSegmentStreamServerWriteRange(conn, fetched, 0, fetchedLen, readChunk)
+        if IsErr(writeRes):
+            mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: requester write: ", Error(writeRes)], ""))
+            moqstream.Libp2pMoqSegmentStreamClose(reader)
+            qtransport.Stop(upClient)
+            return 8
+        # Publisher stream-life policy: the announce reply keeps the write side
+        # OPEN (the requester reuses the SAME stream for the object request);
+        # keep-open segments (asset/esindex/aindex/frame/aframe) round-trip
+        # successive range requests on one stream; everything else (poster,
+        # object id) FINs the write side and ends this stream's request loop.
+        if segKey != "moq-announce" && segKey != "moq-asset" && segKey != "moq-esindex" &&
+           segKey != "moq-aindex" && segKey != "moq-frame" && segKey != "moq-aframe":
+            connDone = true
+            let shutdownRes = qconn.connShutdownWrite(conn)
+            if IsErr(shutdownRes):
+                mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: requester shutdown: ", Error(shutdownRes)], ""))
+                moqstream.Libp2pMoqSegmentStreamClose(reader)
+                qtransport.Stop(upClient)
+                return 9
+        moqstream.Libp2pMoqSegmentStreamClose(reader)
+        qtransport.Stop(upClient)
+        mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: forwarded=", IntToStr(fetchedLen),
+                                           " segment=", share(segKey),
+                                           " off=", IntToStr(reqOff),
+                                           " len=", IntToStr(reqLen)], ""))
+    return 0
+
+fn mediaMoqRelayWriteReadyPort(readyPath: str, port: int32): bool =
+    if len(readyPath) <= 0:
+        return true
+    return quic_transport.Libp2pQuicWriteReadyPort(readyPath, port)
+
+fn main(): int32 =
+    var listenHostRaw: str
+    let hasListenHost: bool = cmdline.ReadFirstFlagValue("--listen-host", listenHostRaw)
+    let listenHost: str = if hasListenHost: listenHostRaw else: "0.0.0.0"
+    let port: int32 = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    var upstreamHostRaw: str
+    let hasUpstream: bool = cmdline.ReadFirstFlagValue("--upstream-host", upstreamHostRaw)
+    if !hasUpstream:
+        mediaMoqRelayLogLine(" media_moq_relay: missing --upstream-host")
+        return 2
+    let upstreamPort: int32 = cmdline.ReadInt32FlagOrDefault("--upstream-port", 0)
+    if upstreamPort <= 0:
+        mediaMoqRelayLogLine(" media_moq_relay: missing --upstream-port")
+        return 2
+    var readyPathRaw: str
+    let hasReady: bool = cmdline.ReadFirstFlagValue("--ready-path", readyPathRaw)
+    let readyPath: str = if hasReady: readyPathRaw else: ""
+    let waitMs: int32 = cmdline.ReadInt32FlagOrDefault("--wait-ms", 60000)
+    echoMode = cmdline.HasFlag("--echo")
+    let debugTls: bool = cmdline.HasFlag("--debug")
+    if debugTls:
+        qnative.msquicNativeSetDebugTls13(true)
+    var listener = qtransport.InitMsQuicTransport()
+    let startRes = quic_transport.Libp2pQuicStartListenerNamed(listener, listenHost, port, "localhost")
+    if IsErr(startRes):
+        mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: listener start: ", Error(startRes)], ""))
+        return 4
+    let boundPort: int32 = Value(startRes)
+    if !mediaMoqRelayWriteReadyPort(readyPath, boundPort):
+        mediaMoqRelayLogLine(" media_moq_relay: ready path write failed")
+        return 4
+    mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: ready port=", IntToStr(boundPort),
+                                       " upstream=", strings.CloneStr(upstreamHostRaw), ":", IntToStr(upstreamPort)], ""))
+    let deadlineMs: int64 = times.MonotimeMs() + int64(waitMs)
+    var served: int32
+    while times.MonotimeMs() < deadlineMs:
+        let acceptRes = qtransport.AcceptTimed(listener, 5000)
+        if IsErr(acceptRes):
+            let acceptErrText = ErrorText(acceptRes)
+            if acceptErrText == "msquic: accept timeout":
+                continue
+            if quic_transport.Libp2pQuicRetryableAcceptError(share(acceptErrText)):
+                continue
+            mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: accept: ", strings.CloneStr(acceptErrText)], ""))
+            continue
+        var acceptConn = Value(acceptRes)
+        # Mirror the publisher's serve loop: discover each client-initiated
+        # readable stream, derive a per-stream handle (shared pipeIdx), and serve
+        # it; NEVER ConnClose a derived handle — close acceptConn once at the end.
+        var moreStreams = true
+        while moreStreams:
+            let readableRes = qconn.nativeReadableStreamId(acceptConn, 0)
+            if IsErr(readableRes):
+                moreStreams = false
+                continue
+            let streamId: int64 = Value(readableRes)
+            mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: readable stream=", strings.Int64ToStr(streamId)], ""))
+            var conn = qconn.ConnDeriveStream(acceptConn, streamId, streamId)
+            let serveCode: int32 = mediaMoqRelayServeRequest(listener, conn, strings.CloneStr(upstreamHostRaw), upstreamPort)
+            if serveCode == 0:
+                served = served + 1
+        qconn.ConnClose(acceptConn)
+    mediaMoqRelayLogLine(strutil.Join([" media_moq_relay: done served=", IntToStr(served)], ""))
+    return 0

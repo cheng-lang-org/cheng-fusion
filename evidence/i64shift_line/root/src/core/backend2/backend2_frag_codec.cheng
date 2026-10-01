@@ -1,0 +1,3147 @@
+# backend2_frag_codec — FunctionFragment 扁平 LE 字节编解码 (slice-11 fork 管道线格式)。
+# 纲领: docs/beat-c.md §4.B.② slice-11 — worker 子进程经 pipe 回传
+# fragment, 本模块是唯一的线格式定义。铁律同 backend2_types: 零 import 编译器状态
+# (只允许 std / b2t), 纯函数, 无模块级可变态。
+#
+# 线格式 (全 LE, u32 = int32 按位序列化):
+#   header : magic(u32) fieldCount(u32=18)
+#   fields : 按 b2t.FunctionFragment 声明序逐字段, 每字段前置 tag(u32 = 1-based 字段序),
+#            str      → len(u32) + bytes
+#            int32    → u32
+#            int32[]  → count(u32) + count×u32
+#            str[]    → count(u32) + count×(len(u32)+bytes)
+#
+# 完整性契约 (漏字段 = 静默缺 reloc, 双重封死):
+#   ① Backend2FragmentRoundTripAssert: 编→解→再编逐字节等 (封 enc/dec 不对称);
+#   ② round-trip 无法发现 enc/dec **双双**跳过的新增字段 —— 该洞由 jobs=1-vs-N 产物
+#      SHA 等式门封 (tools/backend2_jobs_gate.sh): 缺字段 → fragment 内容缺失 → .o 漂移
+#      → 门 FAIL。给 b2t.FunctionFragment 加字段时必须同步改本文件 3 处
+#      (fieldCount 常量 / EncodedSize / Encode+Decode) 并重跑 jobs 门。
+
+import std/strings
+import std/rawbytes
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/core/backend2/backend2_types as b2t
+import cheng/core/ir/core_types as coreir
+import cheng/core/ir/body_ir_exact_def as exactdef
+
+const
+    backend2FragCodecMagic: int32 = 0x42324647          # "GF2B" (LE 字节序: 47 46 32 42)
+    backend2FragCodecFieldCount: int32 = 18             # = b2t.FunctionFragment 字段数, 加字段必增
+
+# ---- u32 LE 原语 (导出供 fork 池帧头复用) ----
+
+fn Backend2CodecPutU32(buf: var rawbytes.Bytes, off: int32, value: int32) =
+    if off < 0 || off > buf.len || buf.len - off < 4:
+        panic("backend2_frag_codec_put_u32_out_of_bounds")
+    rawbytes.BytesSet(buf, off, value & 255)
+    rawbytes.BytesSet(buf, off + 1, (value >> 8) & 255)
+    rawbytes.BytesSet(buf, off + 2, (value >> 16) & 255)
+    rawbytes.BytesSet(buf, off + 3, (value >> 24) & 255)
+
+@borrows
+fn Backend2CodecReadU32(buf: rawbytes.Bytes, cursor: var int32): int32 =
+    if cursor < 0 || cursor > buf.len || buf.len - cursor < 4:
+        panic("backend2_frag_codec_read_u32_overrun")
+    let off: int32 = cursor
+    let b0 = rawbytes.BytesGet(buf, off)
+    let b1 = rawbytes.BytesGet(buf, off + 1)
+    let b2 = rawbytes.BytesGet(buf, off + 2)
+    let b3 = rawbytes.BytesGet(buf, off + 3)
+    cursor = off + 4
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+# ---- 编码尺寸 (两遍法第一遍: 精确字节数, 单次 alloc) ----
+
+fn backend2CodecSizeAdd(total: var int32, delta: int32) =
+    if total < 0 || delta < 0 || total > 2147483647 - delta:
+        panic("backend2_codec_size_overflow")
+    total = total + delta
+
+fn backend2CodecSizeWithWords(base: int32, count: int32): int32 =
+    if base < 0 || count < 0 || count > (2147483647 - base) / 4:
+        panic("backend2_codec_word_count_overflow")
+    return base + count * 4
+
+@borrows
+fn backend2FragCodecStrSize(s: str): int32 =
+    var total: int32 = 8                                # tag + len
+    backend2CodecSizeAdd(total, strings.Len(s))
+    return total
+
+fn backend2FragCodecStrSeqSize(items: var str[]): int32 =
+    var total: int32 = 4 + 4                            # tag + count
+    for i in 0..<items.len:
+        backend2CodecSizeAdd(total, 4)
+        backend2CodecSizeAdd(total, strings.Len(items[i]))
+    return total
+
+fn backend2FragCodecI32SeqSize(items: var int32[]): int32 =
+    return backend2CodecSizeWithWords(8, items.len)     # tag + count + words
+
+fn Backend2FragmentEncodedSize(
+        frag: var b2t.FunctionFragment): int32 =
+    var total: int32 = 8                                # magic + fieldCount
+    backend2CodecSizeAdd(total, backend2FragCodecStrSize(frag.funcEmitCid))
+    backend2CodecSizeAdd(total, backend2FragCodecStrSize(frag.functionSymbol))
+    backend2CodecSizeAdd(total, 8)                       # tag + wordCount 标量
+    backend2CodecSizeAdd(total, backend2FragCodecI32SeqSize(frag.words))
+    backend2CodecSizeAdd(total, backend2FragCodecI32SeqSize(frag.relocWordOffsets))
+    backend2CodecSizeAdd(total, backend2FragCodecStrSeqSize(frag.relocTargetSymbols))
+    backend2CodecSizeAdd(total, backend2FragCodecStrSeqSize(frag.refSymbols))
+    backend2CodecSizeAdd(total, backend2FragCodecStrSeqSize(frag.cstringLiterals))
+    backend2CodecSizeAdd(total, backend2FragCodecStrSeqSize(frag.cstringDataLabels))
+    backend2CodecSizeAdd(total, backend2FragCodecI32SeqSize(frag.cstringPayloadRawBytes))
+    backend2CodecSizeAdd(total, backend2FragCodecI32SeqSize(frag.cstringPayloadRawByteCounts))
+    backend2CodecSizeAdd(total, backend2FragCodecI32SeqSize(frag.dataRelocFnRelWordOffsets))
+    backend2CodecSizeAdd(total, backend2FragCodecStrSeqSize(frag.dataRelocTargetLabels))
+    backend2CodecSizeAdd(total, backend2FragCodecStrSeqSize(frag.globalDataLabelsRaw))
+    backend2CodecSizeAdd(total, backend2FragCodecStrSeqSize(frag.globalDataPayloadTexts))
+    backend2CodecSizeAdd(total, backend2FragCodecI32SeqSize(frag.globalDataPayloadByteCounts))
+    backend2CodecSizeAdd(total, backend2FragCodecStrSize(frag.bodyIrPayload))
+    backend2CodecSizeAdd(total, backend2FragCodecStrSize(frag.contentCid))
+    return total
+
+# ---- 编码 (第二遍: 游标填充, 终点等式断言封游标漂移) ----
+
+@borrows
+fn backend2FragCodecPutStrBody(buf: var rawbytes.Bytes, cursor: var int32, s: str) =
+    let view = rawbytes.BytesFromString(s)              # 零拷贝视图, 勿 free
+    if cursor < 0 || cursor > buf.len || view.len < 0 ||
+       view.len > buf.len - cursor - 4:
+        panic("backend2_frag_codec_put_str_out_of_bounds")
+    Backend2CodecPutU32(buf, cursor, view.len)
+    cursor = cursor + 4
+    if view.len > 0:
+        rawbytes.BytesCopyRangeInto(buf, cursor, view, 0, view.len)
+        cursor = cursor + view.len
+
+fn backend2FragCodecPutTag(buf: var rawbytes.Bytes, cursor: var int32, tag: int32) =
+    Backend2CodecPutU32(buf, cursor, tag)
+    cursor = cursor + 4
+
+@borrows
+fn backend2FragCodecPutStrField(buf: var rawbytes.Bytes, cursor: var int32, tag: int32, s: str) =
+    backend2FragCodecPutTag(buf, cursor, tag)
+    backend2FragCodecPutStrBody(buf, cursor, s)
+
+fn backend2FragCodecPutStrSeqField(buf: var rawbytes.Bytes,
+                                  cursor: var int32,
+                                  tag: int32,
+                                  items: var str[]) =
+    backend2FragCodecPutTag(buf, cursor, tag)
+    Backend2CodecPutU32(buf, cursor, items.len)
+    cursor = cursor + 4
+    for i in 0..<items.len:
+        backend2FragCodecPutStrBody(buf, cursor, items[i])
+
+fn backend2FragCodecPutI32SeqField(buf: var rawbytes.Bytes,
+                                  cursor: var int32,
+                                  tag: int32,
+                                  items: var int32[]) =
+    backend2FragCodecPutTag(buf, cursor, tag)
+    Backend2CodecPutU32(buf, cursor, items.len)
+    cursor = cursor + 4
+    for i in 0..<items.len:
+        Backend2CodecPutU32(buf, cursor, items[i])
+        cursor = cursor + 4
+
+fn backend2FragmentEncodeExact(
+        frag: var b2t.FunctionFragment,
+        scrubContentCidKeys: bool): rawbytes.Bytes =
+    var total = Backend2FragmentEncodedSize(frag)
+    if scrubContentCidKeys:
+        total = total - strings.Len(frag.funcEmitCid) -
+                strings.Len(frag.contentCid)
+    var buf = rawbytes.BytesAlloc(total)
+    if buf.data == nil:
+        panic("backend2_frag_codec_encode_alloc_failed")
+    var cursor: int32
+    Backend2CodecPutU32(buf, cursor, backend2FragCodecMagic)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, backend2FragCodecFieldCount)
+    cursor = cursor + 4
+    if scrubContentCidKeys:
+        backend2FragCodecPutStrField(buf, cursor, 1, "")
+    else:
+        backend2FragCodecPutStrField(buf, cursor, 1, frag.funcEmitCid)
+    backend2FragCodecPutStrField(buf, cursor, 2, frag.functionSymbol)
+    backend2FragCodecPutTag(buf, cursor, 3)
+    Backend2CodecPutU32(buf, cursor, frag.wordCount)
+    cursor = cursor + 4
+    backend2FragCodecPutI32SeqField(buf, cursor, 4, frag.words)
+    backend2FragCodecPutI32SeqField(buf, cursor, 5, frag.relocWordOffsets)
+    backend2FragCodecPutStrSeqField(buf, cursor, 6, frag.relocTargetSymbols)
+    backend2FragCodecPutStrSeqField(buf, cursor, 7, frag.refSymbols)
+    backend2FragCodecPutStrSeqField(buf, cursor, 8, frag.cstringLiterals)
+    backend2FragCodecPutStrSeqField(buf, cursor, 9, frag.cstringDataLabels)
+    backend2FragCodecPutI32SeqField(buf, cursor, 10, frag.cstringPayloadRawBytes)
+    backend2FragCodecPutI32SeqField(buf, cursor, 11, frag.cstringPayloadRawByteCounts)
+    backend2FragCodecPutI32SeqField(buf, cursor, 12, frag.dataRelocFnRelWordOffsets)
+    backend2FragCodecPutStrSeqField(buf, cursor, 13, frag.dataRelocTargetLabels)
+    backend2FragCodecPutStrSeqField(buf, cursor, 14, frag.globalDataLabelsRaw)
+    backend2FragCodecPutStrSeqField(buf, cursor, 15, frag.globalDataPayloadTexts)
+    backend2FragCodecPutI32SeqField(buf, cursor, 16, frag.globalDataPayloadByteCounts)
+    backend2FragCodecPutStrField(buf, cursor, 17, frag.bodyIrPayload)
+    if scrubContentCidKeys:
+        backend2FragCodecPutStrField(buf, cursor, 18, "")
+    else:
+        backend2FragCodecPutStrField(buf, cursor, 18, frag.contentCid)
+    if cursor != total:
+        panic("backend2_frag_codec_encode_cursor_mismatch")
+    return buf
+
+fn Backend2FragmentEncode(
+        frag: var b2t.FunctionFragment): rawbytes.Bytes =
+    return backend2FragmentEncodeExact(frag, false)
+
+fn Backend2FragmentEncodeForContentCid(
+        frag: var b2t.FunctionFragment): rawbytes.Bytes =
+    return backend2FragmentEncodeExact(frag, true)
+
+# ---- 解码 (malformed = 硬崩, 绝不静默产垃圾) ----
+
+@borrows
+fn backend2FragCodecExpectTag(buf: rawbytes.Bytes, cursor: var int32, tag: int32) =
+    if Backend2CodecReadU32(buf, cursor) != tag:
+        panic("backend2_frag_codec_field_tag_mismatch")
+
+@borrows
+fn backend2FragCodecReadStrBody(buf: rawbytes.Bytes, cursor: var int32): str =
+    let n = Backend2CodecReadU32(buf, cursor)
+    if n < 0 || cursor < 0 || cursor > buf.len || n > buf.len - cursor:
+        panic("backend2_frag_codec_str_len_overrun")
+    if n <= 0:
+        return ""
+    let view = rawbytes.BytesSliceView(buf, cursor, n)
+    cursor = cursor + n
+    return rawbytes.BytesToString(view)
+
+@borrows
+fn backend2FragCodecReadStrField(buf: rawbytes.Bytes, cursor: var int32, tag: int32): str =
+    backend2FragCodecExpectTag(buf, cursor, tag)
+    return backend2FragCodecReadStrBody(buf, cursor)
+
+@borrows
+fn backend2FragCodecReadStrSeqField(buf: rawbytes.Bytes, cursor: var int32, tag: int32): str[] =
+    backend2FragCodecExpectTag(buf, cursor, tag)
+    let count = Backend2CodecReadU32(buf, cursor)
+    if count < 0 || cursor < 0 || cursor > buf.len ||
+       count > (buf.len - cursor) / 4:
+        panic("backend2_frag_codec_str_seq_count_negative")
+    var out: str[]
+    for i in 0..<count:
+        add(out, backend2FragCodecReadStrBody(buf, cursor))
+    return out
+
+@borrows
+fn backend2FragCodecReadI32SeqField(buf: rawbytes.Bytes, cursor: var int32, tag: int32): int32[] =
+    backend2FragCodecExpectTag(buf, cursor, tag)
+    let count = Backend2CodecReadU32(buf, cursor)
+    if count < 0 || cursor < 0 || cursor > buf.len ||
+       count > (buf.len - cursor) / 4:
+        panic("backend2_frag_codec_i32_seq_overrun")
+    var out: int32[]
+    for i in 0..<count:
+        add(out, Backend2CodecReadU32(buf, cursor))
+    return out
+
+@borrows
+fn Backend2FragmentDecode(buf: rawbytes.Bytes, cursor: var int32): b2t.FunctionFragment =
+    if Backend2CodecReadU32(buf, cursor) != backend2FragCodecMagic:
+        panic("backend2_frag_codec_bad_magic")
+    if Backend2CodecReadU32(buf, cursor) != backend2FragCodecFieldCount:
+        panic("backend2_frag_codec_bad_field_count")
+    var frag: b2t.FunctionFragment
+    frag.funcEmitCid = backend2FragCodecReadStrField(buf, cursor, 1)
+    frag.functionSymbol = backend2FragCodecReadStrField(buf, cursor, 2)
+    backend2FragCodecExpectTag(buf, cursor, 3)
+    frag.wordCount = Backend2CodecReadU32(buf, cursor)
+    frag.words = backend2FragCodecReadI32SeqField(buf, cursor, 4)
+    frag.relocWordOffsets = backend2FragCodecReadI32SeqField(buf, cursor, 5)
+    frag.relocTargetSymbols = backend2FragCodecReadStrSeqField(buf, cursor, 6)
+    frag.refSymbols = backend2FragCodecReadStrSeqField(buf, cursor, 7)
+    frag.cstringLiterals = backend2FragCodecReadStrSeqField(buf, cursor, 8)
+    frag.cstringDataLabels = backend2FragCodecReadStrSeqField(buf, cursor, 9)
+    frag.cstringPayloadRawBytes = backend2FragCodecReadI32SeqField(buf, cursor, 10)
+    frag.cstringPayloadRawByteCounts = backend2FragCodecReadI32SeqField(buf, cursor, 11)
+    frag.dataRelocFnRelWordOffsets = backend2FragCodecReadI32SeqField(buf, cursor, 12)
+    frag.dataRelocTargetLabels = backend2FragCodecReadStrSeqField(buf, cursor, 13)
+    frag.globalDataLabelsRaw = backend2FragCodecReadStrSeqField(buf, cursor, 14)
+    frag.globalDataPayloadTexts = backend2FragCodecReadStrSeqField(buf, cursor, 15)
+    frag.globalDataPayloadByteCounts = backend2FragCodecReadI32SeqField(buf, cursor, 16)
+    frag.bodyIrPayload = backend2FragCodecReadStrField(buf, cursor, 17)
+    frag.contentCid = backend2FragCodecReadStrField(buf, cursor, 18)
+    return frag
+
+# ---- round-trip 断言: 编→解→再编逐字节等 (worker 发送前每 fragment 常开自检) ----
+
+fn Backend2FragmentRoundTripAssert(
+        frag: var b2t.FunctionFragment) =
+    var enc1 = Backend2FragmentEncode(frag)
+    var cursor: int32
+    var decoded = Backend2FragmentDecode(enc1, cursor)
+    if cursor != enc1.len:
+        panic("backend2_frag_codec_roundtrip_trailing_bytes")
+    var enc2 = Backend2FragmentEncode(decoded)
+    if !rawbytes.BytesEqual(enc1, enc2):
+        panic("backend2_frag_codec_roundtrip_byte_mismatch")
+    rawbytes.BytesFree(enc1)
+    rawbytes.BytesFree(enc2)
+
+# =============================================================================
+# BodyIR 编解码 (warm-incremental skip-lower, spec §12.6 slice #1)。
+# 复用 frag codec 的 LE u32 原语 (Backend2CodecPutU32/ReadU32) + str body helpers。
+# 线格式 (全 LE):
+#   header : magic(u32) fieldCount(u32=18)
+#   field 1 ops            : tag(u32=1) count(u32) count×BodyOp{ kind(u32), target(u32),
+#                                  canonical value-def authority(u32×10),
+#                                  operands: count(u32)+count×u32 }
+#   field 2 callSequence   : tag(u32=2) count(u32) count×CallOp{ targetSymbol(str),
+#                                  targetSourcePath(str),
+#                                  argSlots:count+u32s, argPassKinds:count+u32s,
+#                                  argAbiSizes:count+u32s, resultSlot(u32),
+#                                  resultPassKind(u32), result/source authority,
+#                                  semanticCallExprNodeIndex(u32),
+#                                  relocWordOffset(u32),
+#                                  targetIsImportc(u32), inlineF64FromIntKind(u32),
+#                                  wholeCallF64FromIntRescue(u32),
+#                                  inlineF64FromIntUnsigned(u32) }
+#   field 3 localSlots     : tag(u32=3) count(u32) count×LocalSlot{ id(u32), name(str),
+#                                  typeKind(u32), typeArenaTypeId(u32),
+#                                  managedStorageKind(u32), placeKind(u32),
+#                                  stackOffset(u32), sizeBytes(u32),
+#                                  alignBytes(u32), auxValue(u32),
+#                                  ownership(u32), aliasClass(u32), escapeKind(u32),
+#                                  noAlias(u32) }
+#   field 4 blocks         : tag(u32=4) count(u32) count×BodyBlock{ id(u32), opStart(u32),
+#                                  opCount(u32), termIndex(u32) }
+#   field 5 terms          : tag(u32=5) count(u32) count×BodyTerm{ kind(u32),
+#                                  conditionKind(u32), resultSlot(u32), lhsSlot(u32),
+#                                  rhsSlot(u32), trueBlock(u32), falseBlock(u32),
+#                                  sourceDefinitionDomain(u32),
+#                                  sourceDefinitionRow(u32),
+#                                  operands: count(u32)+count×u32 }
+#   field 6 cstringLiterals: tag(u32=6) count(u32) count×CStringLiteralEntry{ id(u32),
+#                                  text(str), dataLabel(str) }
+#   field 7 entryIsCAbi    : tag(u32=7) bool(u32)
+#   field 8 debug identity : tag(u32=8) required(u32), complete(u32), functionId(u32)
+#   field 9 op provenance  : tag(u32=9) count(u32) count×{ debugOpId(u32),
+#                                  syntheticKind(u32) }
+#   field 10 term provenance: tag(u32=10) count(u32) count×{ debugOpId(u32),
+#                                  syntheticKind(u32) }
+#   field 12 canonical TypeArena facts : tag(u32=12) + 7 i32 sequences
+#   field 13 structured control facts : tag(u32=13), sealed/function scalars,
+#                                  18 i32 sequences, 2 FixedBytes32 sequences
+#   field 14 manual-consume facts : tag(u32=14), sealed/function scalars,
+#                                  15 i32 sequences, 7 FixedBytes32 sequences,
+#                                  function/effect/body/root FixedBytes32 values
+#   field 15 entry definition ownership : tag(u32=15), sealed(u32),
+#                                  exact LocalSlot-row ownership sequence,
+#                                  immutable function value-definition
+#                                  domain start/count + exact slot binding rows
+#   field 16 extern FFI handle capabilities : tag(u32=16), sealed/function
+#                                  scalars, 24 i32 sequences,
+#                                  11 FixedBytes32 sequences and four
+#                                  authority/root FixedBytes32 values
+#   field 17 cleanup authority atom : tag(u32=17), cleanupSourceProjectionCid,
+#                                  Intent scalars + 47 SoA/CSR columns,
+#                                  Schedule scalars + 27 SoA/CSR columns,
+#                                  Replay scalars + 3 SoA/CSR columns
+#   field 18 data relocation identity : tag(u32=18), sealed(u32),
+#                                  LocalSlot-indexed target domain/row/CID and
+#                                  CString-row/owner-function-fragment-CID
+#   field 19 ExactDef 侧车 (批 1) : tag(u32=19), sealed(u32),
+#                                  op/slot dense 9 + 3 i32 列, call-arg CSR
+#                                  2 + 4 i32 列, exactDefCid 32 字节;
+#                                  在 field 17 之后 field 11 之前
+#   field 11 TypeArena CID : tag(u32=11) fixed 32 raw bytes, intentionally last
+#                                  so the constant-time artifact matcher reads
+#                                  the same canonical payload tail.
+# 故意不序列化（旧 emitter 的派生状态）:
+#   slotNameIndex (byte-neutral 加速器, 空=有效, Put 自动重建, verify-on-hit 保语义),
+#   frameMetricsReady/frame*/layout*/loop* (canonical allocator 不读)。
+# 完整性: round-trip (编→解→再编逐字节等) 封 enc/dec 不对称; 加字段必同步 3 处
+# (fieldCount / EncodedSize / Encode+Decode) 并重跑 skip-lower 字节恒等门。
+# =============================================================================
+
+const
+    backend2BodyIrCodecMagic: int32 = 0x42424956          # exact data relocation identity schema
+    backend2BodyIrCodecFieldCount: int32 = 19
+    backend2BodyIrCleanupFixedBytesAfterTag: int32 = 608
+
+fn Backend2BodyIrCodecFieldCount(): int32 =
+    return backend2BodyIrCodecFieldCount
+
+fn Backend2BodyIrCodecMagic(): int32 =
+    return backend2BodyIrCodecMagic
+
+# ---- 编码尺寸 (两遍法第一遍) ----
+
+@borrows
+fn backend2BodyIrOpSize(op: coreir.BodyOp): int32 =
+    return backend2CodecSizeWithWords(64, op.operands.len)
+
+@borrows
+fn backend2BodyIrCallOpSize(
+        bodyIR: coreir.BodyIR,
+        callIndex: int32): int32 =
+    # str = len(u32)+bytes (无 tag; 结构内字段); 三 i32seq = count(u32)+words.
+    var total: int32 = 4
+    backend2CodecSizeAdd(
+        total, strings.Len(bodyIR.callSequence[callIndex].targetSymbol))
+    backend2CodecSizeAdd(total, 4)
+    backend2CodecSizeAdd(
+        total, strings.Len(bodyIR.callSequence[callIndex].targetSourcePath))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.callSequence[callIndex].argSlots.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.callSequence[callIndex].argPassKinds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.callSequence[callIndex].argAbiSizes.len))
+    backend2CodecSizeAdd(total, 4 * 20)                  # twenty scalar fields
+    return total
+
+@borrows
+fn backend2BodyIrLocalSlotSize(slot: coreir.LocalSlot,
+                               scrubLocalName: bool): int32 =
+    # id(u32) + name str(len+bytes) + 12×u32
+    # (typeKind, semantic storage proof, physical slot fields).
+    var total: int32 = 56
+    if !scrubLocalName ||
+       slot.placeKind == coreir.BodyPlaceGlobalAddressTag:
+        backend2CodecSizeAdd(total, strings.Len(slot.name))
+    return total
+
+@borrows
+fn backend2BodyIrBlockSize(blk: coreir.BodyBlock): int32 =
+    return 4 * 4                                         # id + opStart + opCount + termIndex
+
+@borrows
+fn backend2BodyIrTermSize(term: coreir.BodyTerm): int32 =
+    return backend2CodecSizeWithWords(40, term.operands.len)
+
+@borrows
+fn backend2BodyIrCStringSize(
+        entry: coreir.CStringLiteralEntry): int32 =
+    # id(u32) + text str(len+bytes) + dataLabel str(len+bytes)。
+    var total: int32 = 12
+    backend2CodecSizeAdd(total, strings.Len(entry.text))
+    backend2CodecSizeAdd(total, strings.Len(entry.dataLabel))
+    return total
+
+fn backend2BodyIrFixedBytes32SeqSize(count: int32): int32 =
+    if count < 0 || count > (2147483647 - 4) / 32:
+        panic("backend2_bodyir_codec_fixed32_count_overflow")
+    return 4 + count * 32
+
+@borrows
+fn backend2BodyIrDataRelocationIdentitySize(
+        bodyIR: coreir.BodyIR): int32 =
+    var total: int32 = 8
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.localAddressTargetDomainKinds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.localAddressTargetRows.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.localAddressTargetCids.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.cstringTargetRows.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.cstringOwnerFunctionFragmentCids.len))
+    return total
+
+@borrows
+fn backend2BodyIrControlFlowSize(bodyIR: coreir.BodyIR): int32 =
+    var total: int32 = 12
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.controlScopeParentIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(4, bodyIR.blockScopeIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.termSuccessorStarts.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.termSuccessorCounts.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(4, bodyIR.successorBlockIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(4, bodyIR.successorEdgeKinds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.callTargetDomainKinds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.callTargetRows.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.callTargetInterfaceCids.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.deferDeclarationScopeIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.deferSuiteScopeIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.deferLexicalOrdinals.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(4, bodyIR.deferFunctionRows.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.deferActionCids.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.deferStatementRows.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.deferActivationSiteBlockIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.deferActivationSiteAfterOpOrdinals.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.deferActivationSiteStarts.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.deferActivationSiteCounts.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(4, bodyIR.deferActivationRows.len))
+    return total
+
+@borrows
+fn backend2BodyIrManualConsumeSize(
+        bodyIR: coreir.BodyIR): int32 =
+    # tag + sealed/present + seven function coordinates + three FixedBytes32.
+    var total: int32 = 136
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.callOrdinals.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.snapshotCallIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.targetArgumentOrdinals.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.sourceArgumentOrdinals.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.targetPlaceSlotIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.targetOwnerSlotIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.sourcePlaceSlotIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.manualConsume.targetArgumentBindingCids.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.manualConsume.sourceArgumentBindingCids.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.manualConsume.targetProjectionCids.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.manualConsume.sourceProjectionCids.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.targetDefinitionDomains.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.targetDefinitionRows.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.sourceDefinitionDomains.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.sourceDefinitionRows.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.targetTypeArenaTypeIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.sourceTypeArenaTypeIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.postDefinitionDomains.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.manualConsume.postDefinitionRows.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.manualConsume.effectCids.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.manualConsume.linearTokenCids.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.manualConsume.bridgeCids.len))
+    return total
+
+@borrows
+fn backend2BodyIrExternFfiHandleCapabilitySize(
+        bodyIR: coreir.BodyIR): int32 =
+    # tag + sealed/function + three authority CIDs + root CID.
+    # Canonical shape: 280 + 168 * callCount + 280 * effectCount.
+    var total: int32 = 140
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.callOrdinals.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.callBodyOpRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.
+                semanticCapabilityCallRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.resolvedCallRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.snapshotCallIds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.semanticContractRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.snapshotContractRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.semanticEffectStarts.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.effectStarts.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.effectCounts.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.externFfiHandleCapabilities.callCapabilityCids.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.externFfiHandleCapabilities.contractCids.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.externFfiHandleCapabilities.interfaceCids.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.externFfiHandleCapabilities.callBridgeCids.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.
+                semanticCapabilityEffectRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.contractEffectRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.snapshotEffectRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.
+                snapshotEffectContractRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.effectKinds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.targetKinds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.parameterOrdinals.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.argumentRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.argumentSlotIds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.
+                argumentValueNodeIndexes.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.valueDefinitionRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.
+                generationRootValueDefinitionRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.exactTypeIds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.externFfiHandleCapabilities.carrierKinds.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.externFfiHandleCapabilities.argumentBindingCids.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.externFfiHandleCapabilities.typeCids.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.externFfiHandleCapabilities.generationCids.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.externFfiHandleCapabilities.definitionLineageCids.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.externFfiHandleCapabilities.effectCapabilityCids.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.externFfiHandleCapabilities.contractEffectCids.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(
+            bodyIR.externFfiHandleCapabilities.effectBridgeCids.len))
+    return total
+
+@borrows
+fn backend2BodyIrCleanupI32ColumnSize(
+        total: var int32,
+        rows: int32[]) =
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(4, rows.len))
+
+@borrows
+fn backend2BodyIrCleanupFixed32ColumnSize(
+        total: var int32,
+        rows: layout.FixedBytes32[]) =
+    backend2CodecSizeAdd(
+        total, backend2BodyIrFixedBytes32SeqSize(rows.len))
+
+@borrows
+fn backend2BodyIrCleanupAuthoritySize(
+        bodyIR: coreir.BodyIR): int32 =
+    # One tag17 atom: projection CID, Intent, Schedule and Replay. Fixed bytes
+    # include every scalar; each SoA/CSR column contributes one u32 length.
+    var total: int32 = 304
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.sourceBlockIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.sourceTermRows)
+    backend2BodyIrCleanupFixed32ColumnSize(
+        total, bodyIR.cleanupIntent.sourceTermCids)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.sourceSuccessorOrdinals)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.originalSuccessorCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.sourceExitKinds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.originalTargetBlockIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.originalEdgeKinds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.sourceScopeIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.targetScopeIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.exitOwnershipEdgeIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.selectedDeferStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.selectedDeferCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.exitUnitStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.exitUnitCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.siteOriginalBlockIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.siteAfterOpOrdinals)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.siteOwnershipOpStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.siteOwnershipOpCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.siteUnitStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.siteUnitCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.ownershipOpRows)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.selectedDeferIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.unitKinds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.unitSemanticDomains)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.unitSemanticStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.unitSemanticCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.unitSnapshotSourceSlotStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.unitSnapshotSourceSlotCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.unitConditionStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.unitConditionCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.unitClearStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.unitClearCounts)
+    backend2BodyIrCleanupFixed32ColumnSize(
+        total, bodyIR.cleanupIntent.unitAuthorityCids)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.snapshotSourceSlotIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.snapshotProjectionPolicies)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.snapshotSemanticRows)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.snapshotTypeArenaTypeIds)
+    backend2BodyIrCleanupFixed32ColumnSize(
+        total, bodyIR.cleanupIntent.snapshotInterfaceCids)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.conditionKinds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.conditionInputSourceSlotIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.conditionSemanticRows)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.conditionSemanticOrdinals)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.clearKinds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.clearTargetSourceSlotIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.clearSemanticRows)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupIntent.clearSemanticOrdinals)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.ownerPhysicalSourceBlockIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.ownerSourceTermRows)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.ownerSourceSuccessorOrdinals)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.ownerFinalContinuationBlockIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.ownerFinalEdgeKinds)
+    backend2BodyIrCleanupFixed32ColumnSize(
+        total, bodyIR.cleanupSchedule.ownerContinuationCids)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.opStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.opCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.callStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.callCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.blockStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.blockCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.termStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.termCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.unitLocalStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.unitLocalCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.unitProjectedSnapshotSlotStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.unitProjectedSnapshotSlotCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.unitEffectStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.unitEffectCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.effectSemanticRows)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.effectPhysicalDomains)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.effectPhysicalRows)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.effectRoles)
+    backend2BodyIrCleanupFixed32ColumnSize(
+        total, bodyIR.cleanupSchedule.payloadCids)
+    backend2BodyIrCleanupFixed32ColumnSize(
+        total, bodyIR.cleanupSchedule.placementCids)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.cleanupSchedule.projectedSnapshotSlotIds)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.deferReplay.templateOpMapStarts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.deferReplay.templateOpMapCounts)
+    backend2BodyIrCleanupI32ColumnSize(
+        total, bodyIR.deferReplay.templateOpRows)
+    return total
+
+@borrows
+fn backend2BodyIrCleanupProjectionShapeValid(
+        bodyIR: coreir.BodyIR): bool =
+    let cleanupEmpty =
+        coreir.BodyIRCleanupIntentSidecarIsCanonicalEmpty(
+            bodyIR.cleanupIntent) &&
+        coreir.BodyIRCleanupScheduleSidecarIsCanonicalEmpty(
+            bodyIR.cleanupSchedule) &&
+        coreir.BodyIRDeferReplaySidecarIsCanonicalEmpty(
+            bodyIR.deferReplay)
+    let projectionPresent =
+        coreir.BodyIRTypeArenaArtifactCidValid(
+            bodyIR.cleanupSourceProjectionCid)
+    return (cleanupEmpty && !projectionPresent) ||
+           (!cleanupEmpty && projectionPresent)
+
+# [wall99] relocation identity 守卫判词富化（wall95/wall98 先例同款）：
+# 判据零改动（BodyIRDataRelocationIdentityStrictValidate 原样），仅把失败
+# 实况按 unsealed/sealed 两臂逐列入判词。列坐标全部条件化寻址：列长与
+# 行数漂移时下标不可寻址取 -1，cid 列 0=零值 1=非零 -1=不可寻址，
+# diag 自身永不 panic。
+@borrows
+fn backend2BodyIrDataRelocationIdentityDiagPanic(
+        bodyIR: coreir.BodyIR) =
+    var sealedFlag: int32
+    if bodyIR.dataRelocationIdentitySealed:
+        sealedFlag = 1
+    var globalSlotCount: int32
+    var badSlot: int32 = -1
+    var badSlotPlace: int32 = -1
+    var badSlotDomain: int32 = -1
+    var badSlotRow: int32 = -1
+    var badSlotCid: int32 = -1
+    let localColsParallel =
+        bodyIR.localAddressTargetDomainKinds.len ==
+            bodyIR.localSlots.len &&
+        bodyIR.localAddressTargetRows.len == bodyIR.localSlots.len &&
+        bodyIR.localAddressTargetCids.len == bodyIR.localSlots.len
+    for slotId in 0..<bodyIR.localSlots.len:
+        let place = bodyIR.localSlots[slotId].placeKind
+        if place == coreir.BodyPlaceGlobalAddressTag:
+            globalSlotCount = globalSlotCount + 1
+        var domain: int32 = -1
+        var row: int32 = -1
+        var cidState: int32 = -1
+        if localColsParallel:
+            domain = bodyIR.localAddressTargetDomainKinds[slotId]
+            row = bodyIR.localAddressTargetRows[slotId]
+            if layout.FixedBytes32Equal(
+                   bodyIR.localAddressTargetCids[slotId],
+                   layout.FixedBytes32()):
+                cidState = 0
+            else:
+                cidState = 1
+        var slotOk: bool
+        if place == coreir.BodyPlaceGlobalAddressTag:
+            slotOk = (domain ==
+                          coreir.BodyDataRelocTargetDomainTypedGlobalTag ||
+                      domain ==
+                          coreir.BodyDataRelocTargetDomainFunctionTag) &&
+                     row >= 0 && cidState == 1
+        else:
+            slotOk = domain == coreir.BodyDataRelocTargetDomainInvalidTag &&
+                     row == -1 && cidState == 0
+        if !slotOk && badSlot < 0:
+            badSlot = slotId
+            badSlotPlace = place
+            badSlotDomain = domain
+            badSlotRow = row
+            badSlotCid = cidState
+    let cstrColsParallel =
+        bodyIR.cstringTargetRows.len == bodyIR.cstringLiterals.len &&
+        bodyIR.cstringOwnerFunctionFragmentCids.len ==
+            bodyIR.cstringLiterals.len
+    var badLit: int32 = -1
+    var badLitId: int32 = -1
+    var badLitRow: int32 = -1
+    var badLitCid: int32 = -1
+    for literalRow in 0..<bodyIR.cstringLiterals.len:
+        let literalId = bodyIR.cstringLiterals[literalRow].id
+        var targetRow: int32 = -1
+        var cidState: int32 = -1
+        if cstrColsParallel:
+            targetRow = bodyIR.cstringTargetRows[literalRow]
+            if layout.FixedBytes32Equal(
+                   bodyIR.cstringOwnerFunctionFragmentCids[literalRow],
+                   layout.FixedBytes32()):
+                cidState = 0
+            else:
+                cidState = 1
+        let literalOk = literalId == literalRow &&
+                        targetRow == literalRow && cidState == 1
+        if !literalOk && badLit < 0:
+            badLit = literalRow
+            badLitId = literalId
+            badLitRow = targetRow
+            badLitCid = cidState
+    panic(Fmt"backend2_bodyir_codec_data_relocation_identity_invalid sealed={sealedFlag} slots={bodyIR.localSlots.len} cstrings={bodyIR.cstringLiterals.len} len_d={bodyIR.localAddressTargetDomainKinds.len} len_r={bodyIR.localAddressTargetRows.len} len_c={bodyIR.localAddressTargetCids.len} len_tr={bodyIR.cstringTargetRows.len} len_oc={bodyIR.cstringOwnerFunctionFragmentCids.len} global_slots={globalSlotCount} bad_slot={badSlot} bad_place={badSlotPlace} bad_dom={badSlotDomain} bad_row={badSlotRow} bad_cid={badSlotCid} bad_lit={badLit} lit_id={badLitId} lit_trow={badLitRow} lit_ocid={badLitCid}")
+
+@borrows
+fn backend2BodyIrEncodedSizeExact(
+        bodyIR: coreir.BodyIR,
+        scrubLocalNames: bool): int32 =
+    if !coreir.BodyIRDebugProvenanceShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_debug_provenance_invalid")
+    if !coreir.BodyIRTypeArenaProofDomainValid(bodyIR):
+        panic("backend2_bodyir_codec_type_arena_domain_invalid")
+    if !coreir.BodyIRTypeArenaArtifactCidValid(
+           bodyIR.typeArenaArtifactCid):
+        panic("backend2_bodyir_codec_type_arena_cid_zero")
+    if !coreir.BodyIRControlFlowShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_control_flow_shape_invalid")
+    if !coreir.BodyIREntryDefinitionOwnershipShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_entry_definition_ownership_invalid")
+    if !coreir.BodyIREntryParameterSlotsShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_entry_parameter_index_invalid")
+    if !coreir.BodyIRLocalBindingValueDefinitionRowsShapeValid(
+           bodyIR):
+        panic("backend2_bodyir_codec_local_binding_definition_invalid")
+    if !coreir.BodyIRDataRelocationIdentityStrictValidate(bodyIR):
+        backend2BodyIrDataRelocationIdentityDiagPanic(bodyIR)
+    if !coreir.BodyIRManualConsumeSidecarShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_manual_consume_shape_invalid")
+    if !coreir.BodyIRExternFfiHandleCapabilitySidecarShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_ffi_handle_capability_shape_invalid")
+    if !coreir.BodyIRCleanupProofShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_cleanup_proof_shape_invalid")
+    if !backend2BodyIrCleanupProjectionShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_cleanup_projection_shape_invalid")
+    if !exactdef.BodyIrExactDefSidecarShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_exact_def_shape_invalid")
+    var total: int32 = 8                                 # magic + fieldCount
+    backend2CodecSizeAdd(total, 8)                        # tag=1 + ops.count
+    for i in 0..<bodyIR.ops.len:
+        backend2CodecSizeAdd(total, backend2BodyIrOpSize(bodyIR.ops[i]))
+    backend2CodecSizeAdd(total, 8)                        # tag=2 + callSequence.count
+    for i in 0..<bodyIR.callSequence.len:
+        backend2CodecSizeAdd(total, backend2BodyIrCallOpSize(bodyIR, i))
+    backend2CodecSizeAdd(total, 8)                        # tag=3 + localSlots.count
+    for i in 0..<bodyIR.localSlots.len:
+        backend2CodecSizeAdd(total,
+                             backend2BodyIrLocalSlotSize(
+                                 bodyIR.localSlots[i], scrubLocalNames))
+    backend2CodecSizeAdd(total, 8)                        # tag=4 + blocks.count
+    for i in 0..<bodyIR.blocks.len:
+        backend2CodecSizeAdd(total, backend2BodyIrBlockSize(bodyIR.blocks[i]))
+    backend2CodecSizeAdd(total, 8)                        # tag=5 + terms.count
+    for i in 0..<bodyIR.terms.len:
+        backend2CodecSizeAdd(total, backend2BodyIrTermSize(bodyIR.terms[i]))
+    backend2CodecSizeAdd(total, 8)                        # tag=6 + cstringLiterals.count
+    for i in 0..<bodyIR.cstringLiterals.len:
+        backend2CodecSizeAdd(total,
+                             backend2BodyIrCStringSize(bodyIR.cstringLiterals[i]))
+    backend2CodecSizeAdd(total, 8)                        # tag=7 + entryIsCAbi
+    backend2CodecSizeAdd(total, 16)                       # tag=8 + required + complete + functionId
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            8, bodyIR.debugOpIdsByOpIndex.len * 2))       # tag=9 + op provenance rows
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            8, bodyIR.debugOpIdsByTermIndex.len * 2))     # tag=10 + term provenance rows
+    backend2CodecSizeAdd(total, 36)                       # tag=11 + FixedBytes32
+    backend2CodecSizeAdd(total, 4)                        # tag=12
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.typeFactTypeIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.typeFactStructuralKinds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.typeFactScalarKinds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.typeFactChildTypeIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.typeFactFixedLengths.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.typeFactSizeBytes.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.typeFactAlignBytes.len))
+    backend2CodecSizeAdd(total, backend2BodyIrControlFlowSize(bodyIR))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrManualConsumeSize(bodyIR))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            12, bodyIR.entryDefinitionOwnershipKinds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.entryDefinitionSemanticRows.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            4, bodyIR.entryParameterSlotIds.len))
+    backend2CodecSizeAdd(
+        total,
+        backend2CodecSizeWithWords(
+            12, bodyIR.localBindingValueDefinitionRows.len))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrExternFfiHandleCapabilitySize(bodyIR))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrCleanupAuthoritySize(bodyIR))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrDataRelocationIdentitySize(bodyIR))
+    backend2CodecSizeAdd(
+        total, backend2BodyIrExactDefSize(bodyIR))
+    return total
+
+@borrows
+fn Backend2BodyIrEncodedSize(bodyIR: coreir.BodyIR): int32 =
+    return backend2BodyIrEncodedSizeExact(bodyIR, false)
+
+# ---- 编码 (第二遍) ----
+
+@borrows
+fn backend2BodyIrPutOp(buf: var rawbytes.Bytes,
+                       cursor: var int32,
+                       op: coreir.BodyOp) =
+    Backend2CodecPutU32(buf, cursor, op.kind)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, op.target)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, op.valueDefSlot)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, op.valueDefExprNodeIndex)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, op.valueDefSemanticRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, int32(op.valueDefOwnership))
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, op.valueDefBorrowOwnerSemanticRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, op.valueDefBorrowOwnerDefinitionDomain)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, op.valueDefBorrowOwnerDefinitionRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, op.valueDefConsumeOpIndexPlusOne)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, op.valueDefOriginKind)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, op.valueDefOriginId)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, op.sourceDefinitionDomain)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, op.sourceDefinitionRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, op.consumeActionRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, op.operands.len)
+    cursor = cursor + 4
+    for i in 0..<op.operands.len:
+        Backend2CodecPutU32(buf, cursor, op.operands[i])
+        cursor = cursor + 4
+
+@borrows
+fn backend2BodyIrPutCallOp(buf: var rawbytes.Bytes,
+                           cursor: var int32,
+                           bodyIR: coreir.BodyIR,
+                           callIndex: int32) =
+    backend2FragCodecPutStrBody(
+        buf, cursor, bodyIR.callSequence[callIndex].targetSymbol)
+    backend2FragCodecPutStrBody(
+        buf, cursor, bodyIR.callSequence[callIndex].targetSourcePath)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.callSequence[callIndex].argSlots)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.callSequence[callIndex].argPassKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.callSequence[callIndex].argAbiSizes)
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.callSequence[callIndex].resultSlot)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.callSequence[callIndex].resultPassKind)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        int32(bodyIR.callSequence[callIndex].resultOwnership))
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.callSequence[callIndex].resultExprNodeIndex)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.callSequence[callIndex].resultValueDefinitionRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.callSequence[callIndex].resultBorrowOwnerValueDefinitionRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.callSequence[callIndex].resultBorrowOwnerDefinitionDomain)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.callSequence[callIndex].resultBorrowOwnerDefinitionRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.callSequence[callIndex].resultDefinitionOriginKind)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.callSequence[callIndex].resultDefinitionOriginId)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.callSequence[callIndex].sourceDefinitionDomain)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.callSequence[callIndex].sourceDefinitionRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.callSequence[callIndex].semanticCallExprNodeIndex)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.callSequence[callIndex].consumeActionRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.callSequence[callIndex].managedStoreKind)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.callSequence[callIndex].relocWordOffset)
+    cursor = cursor + 4
+    var importcFlag: int32
+    if bodyIR.callSequence[callIndex].targetIsImportc:
+        importcFlag = 1
+    Backend2CodecPutU32(buf, cursor, importcFlag)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.callSequence[callIndex].inlineF64FromIntKind)
+    cursor = cursor + 4
+    var wholeCallRescueFlag: int32
+    if bodyIR.callSequence[callIndex].wholeCallF64FromIntRescue:
+        wholeCallRescueFlag = 1
+    Backend2CodecPutU32(buf, cursor, wholeCallRescueFlag)
+    cursor = cursor + 4
+    var inlineUnsignedFlag: int32
+    if bodyIR.callSequence[callIndex].inlineF64FromIntUnsigned:
+        inlineUnsignedFlag = 1
+    Backend2CodecPutU32(buf, cursor, inlineUnsignedFlag)
+    cursor = cursor + 4
+
+@borrows
+fn backend2BodyIrPutLocalSlot(buf: var rawbytes.Bytes,
+                              cursor: var int32,
+                              slot: coreir.LocalSlot,
+                              scrubLocalName: bool) =
+    Backend2CodecPutU32(buf, cursor, slot.id)
+    cursor = cursor + 4
+    if scrubLocalName &&
+       slot.placeKind != coreir.BodyPlaceGlobalAddressTag:
+        backend2FragCodecPutStrBody(buf, cursor, "")
+    else:
+        backend2FragCodecPutStrBody(buf, cursor, slot.name)
+    Backend2CodecPutU32(buf, cursor, slot.typeKind)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, slot.typeArenaTypeId)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, slot.managedStorageKind)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, slot.placeKind)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, slot.stackOffset)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, slot.sizeBytes)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, slot.alignBytes)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, slot.auxValue)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, int32(slot.ownership))
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, int32(slot.aliasClass))
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, int32(slot.escapeKind))
+    cursor = cursor + 4
+    var noAliasAsI32: int32
+    noAliasAsI32 = 0
+    if slot.noAlias:
+        noAliasAsI32 = 1
+    Backend2CodecPutU32(buf, cursor, noAliasAsI32)
+    cursor = cursor + 4
+
+@borrows
+fn backend2BodyIrPutBlock(buf: var rawbytes.Bytes,
+                          cursor: var int32,
+                          blk: coreir.BodyBlock) =
+    Backend2CodecPutU32(buf, cursor, blk.id)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, blk.opStart)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, blk.opCount)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, blk.termIndex)
+    cursor = cursor + 4
+
+@borrows
+fn backend2BodyIrPutTerm(buf: var rawbytes.Bytes,
+                         cursor: var int32,
+                         term: coreir.BodyTerm) =
+    Backend2CodecPutU32(buf, cursor, term.kind)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, term.conditionKind)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, term.resultSlot)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, term.lhsSlot)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, term.rhsSlot)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, term.trueBlock)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, term.falseBlock)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, term.sourceDefinitionDomain)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, term.sourceDefinitionRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, term.operands.len)
+    cursor = cursor + 4
+    for i in 0..<term.operands.len:
+        Backend2CodecPutU32(buf, cursor, term.operands[i])
+        cursor = cursor + 4
+
+@borrows
+fn backend2BodyIrPutCString(buf: var rawbytes.Bytes,
+                            cursor: var int32,
+                            entry: coreir.CStringLiteralEntry) =
+    Backend2CodecPutU32(buf, cursor, entry.id)
+    cursor = cursor + 4
+    backend2FragCodecPutStrBody(buf, cursor, entry.text)
+    backend2FragCodecPutStrBody(buf, cursor, entry.dataLabel)
+
+@borrows
+fn backend2BodyIrPutI32SeqBody(
+        buf: var rawbytes.Bytes,
+        cursor: var int32,
+        items: int32[]) =
+    Backend2CodecPutU32(buf, cursor, items.len)
+    cursor = cursor + 4
+    for index in 0..<items.len:
+        Backend2CodecPutU32(buf, cursor, items[index])
+        cursor = cursor + 4
+
+@borrows
+fn backend2BodyIrPutFixedBytes32SeqBody(
+        buf: var rawbytes.Bytes,
+        cursor: var int32,
+        items: layout.FixedBytes32[]) =
+    Backend2CodecPutU32(buf, cursor, items.len)
+    cursor = cursor + 4
+    for itemIndex in 0..<items.len:
+        var itemBytes = layout.FixedBytes32ToBytes(items[itemIndex])
+        if rawbytes.BytesLen(itemBytes) != 32:
+            rawbytes.BytesFree(itemBytes)
+            panic("backend2_bodyir_codec_fixed32_size_invalid")
+        for byteIndex in 0..<32:
+            if cursor < 0 || cursor >= buf.len:
+                rawbytes.BytesFree(itemBytes)
+                panic("backend2_bodyir_codec_fixed32_overrun")
+            rawbytes.BytesSet(
+                buf, cursor, rawbytes.BytesGet(itemBytes, byteIndex))
+            cursor = cursor + 1
+        rawbytes.BytesFree(itemBytes)
+
+fn backend2BodyIrPutFixedBytes32(
+        buf: var rawbytes.Bytes,
+        cursor: var int32,
+        item: layout.FixedBytes32) =
+    var itemBytes = layout.FixedBytes32ToBytes(item)
+    if rawbytes.BytesLen(itemBytes) != 32:
+        rawbytes.BytesFree(itemBytes)
+        panic("backend2_bodyir_codec_fixed32_size_invalid")
+    for byteIndex in 0..<32:
+        if cursor < 0 || cursor >= buf.len:
+            rawbytes.BytesFree(itemBytes)
+            panic("backend2_bodyir_codec_fixed32_overrun")
+        rawbytes.BytesSet(
+            buf, cursor, rawbytes.BytesGet(itemBytes, byteIndex))
+        cursor = cursor + 1
+    rawbytes.BytesFree(itemBytes)
+
+@borrows
+fn backend2BodyIrPutDataRelocationIdentity(
+        buf: var rawbytes.Bytes,
+        cursor: var int32,
+        bodyIR: coreir.BodyIR) =
+    backend2FragCodecPutTag(buf, cursor, 18)
+    backend2BodyIrPutBool(
+        buf, cursor, bodyIR.dataRelocationIdentitySealed)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.localAddressTargetDomainKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.localAddressTargetRows)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.localAddressTargetCids)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cstringTargetRows)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.cstringOwnerFunctionFragmentCids)
+
+@borrows
+fn backend2BodyIrPutExternFfiHandleCapabilities(
+        buf: var rawbytes.Bytes,
+        cursor: var int32,
+        sidecar: coreir.BodyIRExternFfiHandleCapabilitySidecar) =
+    backend2FragCodecPutTag(buf, cursor, 16)
+    Backend2CodecPutU32(
+        buf, cursor, if sidecar.sealed: 1 else: 0)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, sidecar.functionRow)
+    cursor = cursor + 4
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, sidecar.snapshotProjectionAuthorityCid)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, sidecar.semanticCargoCid)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, sidecar.loweringBridgeCid)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.callOrdinals)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.callBodyOpRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.semanticCapabilityCallRows)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.resolvedCallRows)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.snapshotCallIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.semanticContractRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.snapshotContractRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.semanticEffectStarts)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.effectStarts)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.effectCounts)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, sidecar.callCapabilityCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, sidecar.contractCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, sidecar.interfaceCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, sidecar.callBridgeCids)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.semanticCapabilityEffectRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.contractEffectRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.snapshotEffectRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.snapshotEffectContractRows)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.effectKinds)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.targetKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.parameterOrdinals)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.argumentRows)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.argumentSlotIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.argumentValueNodeIndexes)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.valueDefinitionRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, sidecar.generationRootValueDefinitionRows)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.exactTypeIds)
+    backend2BodyIrPutI32SeqBody(buf, cursor, sidecar.carrierKinds)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, sidecar.argumentBindingCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, sidecar.typeCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, sidecar.generationCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, sidecar.definitionLineageCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, sidecar.effectCapabilityCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, sidecar.contractEffectCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, sidecar.effectBridgeCids)
+    backend2BodyIrPutFixedBytes32(buf, cursor, sidecar.rootCid)
+
+fn backend2BodyIrPutBool(
+        buf: var rawbytes.Bytes,
+        cursor: var int32,
+        value: bool) =
+    Backend2CodecPutU32(
+        buf, cursor, if value: 1 else: 0)
+    cursor = cursor + 4
+
+@borrows
+fn backend2BodyIrPutCleanupAuthority(
+        buf: var rawbytes.Bytes,
+        cursor: var int32,
+        bodyIR: coreir.BodyIR) =
+    backend2FragCodecPutTag(buf, cursor, 17)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, bodyIR.cleanupSourceProjectionCid)
+    backend2BodyIrPutBool(
+        buf, cursor, bodyIR.cleanupIntent.building)
+    backend2BodyIrPutBool(
+        buf, cursor, bodyIR.cleanupIntent.sealed)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, bodyIR.cleanupIntent.rootCid)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, bodyIR.cleanupIntent.sourceControlCid)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, bodyIR.cleanupIntent.ownershipIrCid)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, bodyIR.cleanupIntent.ownershipAnalysisCid)
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.cleanupIntent.originalLocalCount)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.cleanupIntent.originalOpCount)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.cleanupIntent.originalCallCount)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.cleanupIntent.originalBlockCount)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.cleanupIntent.originalTermCount)
+    cursor = cursor + 4
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.sourceBlockIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.sourceTermRows)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.sourceTermCids)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.sourceSuccessorOrdinals)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.originalSuccessorCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.sourceExitKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.originalTargetBlockIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.originalEdgeKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.sourceScopeIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.targetScopeIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.exitOwnershipEdgeIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.selectedDeferStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.selectedDeferCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.exitUnitStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.exitUnitCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.siteOriginalBlockIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.siteAfterOpOrdinals)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.siteOwnershipOpStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.siteOwnershipOpCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.siteUnitStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.siteUnitCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.ownershipOpRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.selectedDeferIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.unitKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.unitSemanticDomains)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.unitSemanticStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.unitSemanticCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.unitSnapshotSourceSlotStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.unitSnapshotSourceSlotCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.unitConditionStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.unitConditionCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.unitClearStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.unitClearCounts)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.unitAuthorityCids)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.snapshotSourceSlotIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.snapshotProjectionPolicies)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.snapshotSemanticRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.snapshotTypeArenaTypeIds)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.snapshotInterfaceCids)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.conditionKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.conditionInputSourceSlotIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.conditionSemanticRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.conditionSemanticOrdinals)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.clearKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.clearTargetSourceSlotIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.clearSemanticRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupIntent.clearSemanticOrdinals)
+    backend2BodyIrPutBool(
+        buf, cursor, bodyIR.cleanupSchedule.building)
+    backend2BodyIrPutBool(
+        buf, cursor, bodyIR.cleanupSchedule.sealed)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, bodyIR.cleanupSchedule.rootCid)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, bodyIR.cleanupSchedule.finalControlCid)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.cleanupSchedule.ownerPhysicalSourceBlockIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.ownerSourceTermRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.cleanupSchedule.ownerSourceSuccessorOrdinals)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.cleanupSchedule.ownerFinalContinuationBlockIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.ownerFinalEdgeKinds)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.ownerContinuationCids)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.opStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.opCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.callStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.callCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.blockStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.blockCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.termStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.termCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.unitLocalStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.unitLocalCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.cleanupSchedule.unitProjectedSnapshotSlotStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.cleanupSchedule.unitProjectedSnapshotSlotCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.unitEffectStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.unitEffectCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.effectSemanticRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.effectPhysicalDomains)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.effectPhysicalRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.effectRoles)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.payloadCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.cleanupSchedule.placementCids)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.cleanupSchedule.projectedSnapshotSlotIds)
+    backend2BodyIrPutBool(
+        buf, cursor, bodyIR.deferReplay.building)
+    backend2BodyIrPutBool(
+        buf, cursor, bodyIR.deferReplay.sealed)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, bodyIR.deferReplay.rootCid)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferReplay.templateOpMapStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferReplay.templateOpMapCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferReplay.templateOpRows)
+
+@borrows
+fn backend2BodyIrEncodeExact(bodyIR: coreir.BodyIR,
+                             scrubLocalNames: bool): rawbytes.Bytes =
+    let total = backend2BodyIrEncodedSizeExact(bodyIR, scrubLocalNames)
+    var buf = rawbytes.BytesAlloc(total)
+    if buf.data == nil:
+        panic("backend2_bodyir_codec_encode_alloc_failed")
+    var cursor: int32
+    Backend2CodecPutU32(buf, cursor, backend2BodyIrCodecMagic)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, backend2BodyIrCodecFieldCount)
+    cursor = cursor + 4
+    backend2FragCodecPutTag(buf, cursor, 1)
+    Backend2CodecPutU32(buf, cursor, bodyIR.ops.len)
+    cursor = cursor + 4
+    for i in 0..<bodyIR.ops.len:
+        backend2BodyIrPutOp(buf, cursor, bodyIR.ops[i])
+    backend2FragCodecPutTag(buf, cursor, 2)
+    Backend2CodecPutU32(buf, cursor, bodyIR.callSequence.len)
+    cursor = cursor + 4
+    for i in 0..<bodyIR.callSequence.len:
+        backend2BodyIrPutCallOp(buf, cursor, bodyIR, i)
+    backend2FragCodecPutTag(buf, cursor, 3)
+    Backend2CodecPutU32(buf, cursor, bodyIR.localSlots.len)
+    cursor = cursor + 4
+    for i in 0..<bodyIR.localSlots.len:
+        backend2BodyIrPutLocalSlot(
+            buf, cursor, bodyIR.localSlots[i], scrubLocalNames)
+    backend2FragCodecPutTag(buf, cursor, 4)
+    Backend2CodecPutU32(buf, cursor, bodyIR.blocks.len)
+    cursor = cursor + 4
+    for i in 0..<bodyIR.blocks.len:
+        backend2BodyIrPutBlock(buf, cursor, bodyIR.blocks[i])
+    backend2FragCodecPutTag(buf, cursor, 5)
+    Backend2CodecPutU32(buf, cursor, bodyIR.terms.len)
+    cursor = cursor + 4
+    for i in 0..<bodyIR.terms.len:
+        backend2BodyIrPutTerm(buf, cursor, bodyIR.terms[i])
+    backend2FragCodecPutTag(buf, cursor, 6)
+    Backend2CodecPutU32(buf, cursor, bodyIR.cstringLiterals.len)
+    cursor = cursor + 4
+    for i in 0..<bodyIR.cstringLiterals.len:
+        backend2BodyIrPutCString(buf, cursor, bodyIR.cstringLiterals[i])
+    backend2BodyIrPutDataRelocationIdentity(buf, cursor, bodyIR)
+    backend2FragCodecPutTag(buf, cursor, 7)
+    var entryCAbiFlag: int32
+    if bodyIR.entryIsCAbi:
+        entryCAbiFlag = 1
+    Backend2CodecPutU32(buf, cursor, entryCAbiFlag)
+    cursor = cursor + 4
+    backend2FragCodecPutTag(buf, cursor, 8)
+    var debugRequiredFlag: int32
+    if bodyIR.debugProvenanceRequired:
+        debugRequiredFlag = 1
+    Backend2CodecPutU32(buf, cursor, debugRequiredFlag)
+    cursor = cursor + 4
+    var debugCompleteFlag: int32
+    if bodyIR.debugProvenanceComplete:
+        debugCompleteFlag = 1
+    Backend2CodecPutU32(buf, cursor, debugCompleteFlag)
+    cursor = cursor + 4
+    var debugFunctionId: int32 = -1
+    if bodyIR.debugProvenanceRequired:
+        debugFunctionId = bodyIR.debugFunctionId
+    Backend2CodecPutU32(buf, cursor, debugFunctionId)
+    cursor = cursor + 4
+    backend2FragCodecPutTag(buf, cursor, 9)
+    Backend2CodecPutU32(buf, cursor, bodyIR.debugOpIdsByOpIndex.len)
+    cursor = cursor + 4
+    for index in 0..<bodyIR.debugOpIdsByOpIndex.len:
+        Backend2CodecPutU32(
+            buf, cursor, bodyIR.debugOpIdsByOpIndex[index])
+        cursor = cursor + 4
+        Backend2CodecPutU32(
+            buf, cursor,
+            bodyIR.debugSyntheticKindsByOpIndex[index])
+        cursor = cursor + 4
+    backend2FragCodecPutTag(buf, cursor, 10)
+    Backend2CodecPutU32(buf, cursor, bodyIR.debugOpIdsByTermIndex.len)
+    cursor = cursor + 4
+    for index in 0..<bodyIR.debugOpIdsByTermIndex.len:
+        Backend2CodecPutU32(
+            buf, cursor, bodyIR.debugOpIdsByTermIndex[index])
+        cursor = cursor + 4
+        Backend2CodecPutU32(
+            buf, cursor,
+            bodyIR.debugSyntheticKindsByTermIndex[index])
+        cursor = cursor + 4
+    backend2FragCodecPutTag(buf, cursor, 12)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.typeFactTypeIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.typeFactStructuralKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.typeFactScalarKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.typeFactChildTypeIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.typeFactFixedLengths)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.typeFactSizeBytes)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.typeFactAlignBytes)
+    backend2FragCodecPutTag(buf, cursor, 13)
+    var controlFlowSealedFlag: int32
+    if bodyIR.controlFlowSealed:
+        controlFlowSealedFlag = 1
+    Backend2CodecPutU32(buf, cursor, controlFlowSealedFlag)
+    cursor = cursor + 4
+    Backend2CodecPutU32(buf, cursor, bodyIR.controlFunctionRow)
+    cursor = cursor + 4
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.controlScopeParentIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.blockScopeIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.termSuccessorStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.termSuccessorCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.successorBlockIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.successorEdgeKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.callTargetDomainKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.callTargetRows)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.callTargetInterfaceCids)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferDeclarationScopeIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferSuiteScopeIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferLexicalOrdinals)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferFunctionRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferStatementRows)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.deferActionCids)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferActivationSiteBlockIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.deferActivationSiteAfterOpOrdinals)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferActivationSiteStarts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferActivationSiteCounts)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.deferActivationRows)
+    backend2FragCodecPutTag(buf, cursor, 14)
+    var manualConsumeSealedFlag: int32
+    if bodyIR.manualConsume.sealed:
+        manualConsumeSealedFlag = 1
+    Backend2CodecPutU32(
+        buf, cursor, manualConsumeSealedFlag)
+    cursor = cursor + 4
+    var manualConsumeFunctionPresentFlag: int32
+    if bodyIR.manualConsume.functionPresent:
+        manualConsumeFunctionPresentFlag = 1
+    Backend2CodecPutU32(
+        buf, cursor, manualConsumeFunctionPresentFlag)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.manualConsume.functionRow)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.manualConsume.functionTargetParameterOrdinal)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.manualConsume.functionSourceParameterOrdinal)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.manualConsume.functionTargetSlotId)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.manualConsume.functionSourceSlotId)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.manualConsume.functionTargetTypeArenaTypeId)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor,
+        bodyIR.manualConsume.functionSourceTypeArenaTypeId)
+    cursor = cursor + 4
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, bodyIR.manualConsume.functionEffectCid)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, bodyIR.manualConsume.functionBodyProofCid)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.manualConsume.callOrdinals)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.manualConsume.snapshotCallIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.manualConsume.targetArgumentOrdinals)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.manualConsume.sourceArgumentOrdinals)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.manualConsume.targetPlaceSlotIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.manualConsume.targetOwnerSlotIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.manualConsume.sourcePlaceSlotIds)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor,
+        bodyIR.manualConsume.targetArgumentBindingCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor,
+        bodyIR.manualConsume.sourceArgumentBindingCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.manualConsume.targetProjectionCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.manualConsume.sourceProjectionCids)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.manualConsume.targetDefinitionDomains)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.manualConsume.targetDefinitionRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.manualConsume.sourceDefinitionDomains)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.manualConsume.sourceDefinitionRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.manualConsume.targetTypeArenaTypeIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.manualConsume.sourceTypeArenaTypeIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor,
+        bodyIR.manualConsume.postDefinitionDomains)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.manualConsume.postDefinitionRows)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.manualConsume.effectCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.manualConsume.linearTokenCids)
+    backend2BodyIrPutFixedBytes32SeqBody(
+        buf, cursor, bodyIR.manualConsume.bridgeCids)
+    backend2BodyIrPutFixedBytes32(
+        buf, cursor, bodyIR.manualConsume.rootCid)
+    backend2FragCodecPutTag(buf, cursor, 15)
+    var entryDefinitionOwnershipSealedFlag: int32
+    if bodyIR.entryDefinitionOwnershipSealed:
+        entryDefinitionOwnershipSealedFlag = 1
+    Backend2CodecPutU32(
+        buf, cursor, entryDefinitionOwnershipSealedFlag)
+    cursor = cursor + 4
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.entryDefinitionOwnershipKinds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.entryDefinitionSemanticRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.entryParameterSlotIds)
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.localBindingValueDefinitionDomainStart)
+    cursor = cursor + 4
+    Backend2CodecPutU32(
+        buf, cursor, bodyIR.localBindingValueDefinitionDomainCount)
+    cursor = cursor + 4
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.localBindingValueDefinitionRows)
+    backend2BodyIrPutExternFfiHandleCapabilities(
+        buf, cursor, bodyIR.externFfiHandleCapabilities)
+    backend2BodyIrPutCleanupAuthority(buf, cursor, bodyIR)
+    backend2BodyIrPutExactDef(buf, cursor, bodyIR)
+    backend2FragCodecPutTag(buf, cursor, 11)
+    var typeArenaCidBytes =
+        layout.FixedBytes32ToBytes(bodyIR.typeArenaArtifactCid)
+    if rawbytes.BytesLen(typeArenaCidBytes) != 32:
+        rawbytes.BytesFree(typeArenaCidBytes)
+        panic("backend2_bodyir_codec_type_arena_cid_size_invalid")
+    for index in 0..<32:
+        if cursor < 0 || cursor >= buf.len:
+            rawbytes.BytesFree(typeArenaCidBytes)
+            panic("backend2_bodyir_codec_type_arena_cid_overrun")
+        rawbytes.BytesSet(
+            buf, cursor, rawbytes.BytesGet(typeArenaCidBytes, index))
+        cursor = cursor + 1
+    rawbytes.BytesFree(typeArenaCidBytes)
+    if cursor != total:
+        panic("backend2_bodyir_codec_encode_cursor_mismatch")
+    return buf
+
+@borrows
+fn Backend2BodyIrEncode(bodyIR: coreir.BodyIR): rawbytes.Bytes =
+    return backend2BodyIrEncodeExact(bodyIR, false)
+
+@borrows
+fn Backend2BodyIrEncodeExpectedManualConsumeAuthority(
+        bodyIR: coreir.BodyIR,
+        expectedManualConsumeRootCid:
+            layout.FixedBytes32): rawbytes.Bytes =
+    if !coreir.BodyIRManualConsumeExactValidateAgainst(
+           bodyIR, expectedManualConsumeRootCid):
+        panic(
+            "backend2_bodyir_codec_manual_consume_authority_mismatch")
+    return backend2BodyIrEncodeExact(bodyIR, false)
+
+@borrows
+fn Backend2BodyIrEncodeCanonicalHashIngress(
+        bodyIR: coreir.BodyIR): rawbytes.Bytes =
+    return backend2BodyIrEncodeExact(bodyIR, true)
+
+# ---- 解码 (malformed = 硬崩) ----
+
+@borrows
+fn backend2BodyIrReadI32SeqBody(buf: rawbytes.Bytes, cursor: var int32): int32[] =
+    let count = Backend2CodecReadU32(buf, cursor)
+    if count < 0 || cursor < 0 || cursor > buf.len ||
+       count > (buf.len - cursor) / 4:
+        panic("backend2_bodyir_codec_i32_seq_overrun")
+    var out: int32[]
+    for i in 0..<count:
+        add(out, Backend2CodecReadU32(buf, cursor))
+    return out
+
+@borrows
+fn backend2BodyIrReadFixedBytes32(
+        buf: rawbytes.Bytes,
+        cursor: var int32): layout.FixedBytes32 =
+    if cursor < 0 || cursor > buf.len || buf.len - cursor < 32:
+        panic("backend2_bodyir_codec_fixed32_overrun")
+    var itemBytes = rawbytes.BytesSlice(buf, cursor, 32)
+    cursor = cursor + 32
+    let parsed = layout.FixedBytes32FromBytes(itemBytes)
+    rawbytes.BytesFree(itemBytes)
+    if !IsOk(parsed):
+        panic("backend2_bodyir_codec_fixed32_invalid")
+    return Value(parsed)
+
+@borrows
+fn backend2BodyIrReadFixedBytes32SeqBody(
+        buf: rawbytes.Bytes,
+        cursor: var int32): layout.FixedBytes32[] =
+    let count = Backend2CodecReadU32(buf, cursor)
+    if count < 0 || cursor < 0 || cursor > buf.len ||
+       count > (buf.len - cursor) / 32:
+        panic("backend2_bodyir_codec_fixed32_seq_overrun")
+    var out: layout.FixedBytes32[]
+    for itemIndex in 0..<count:
+        add(out, backend2BodyIrReadFixedBytes32(buf, cursor))
+    return out
+
+@borrows
+fn backend2BodyIrReadBool(buf: rawbytes.Bytes,
+                          cursor: var int32,
+                          errorText: str): bool =
+    let value = Backend2CodecReadU32(buf, cursor)
+    if value != 0 && value != 1:
+        panic(errorText)
+    return value == 1
+
+@borrows
+fn backend2BodyIrReadDataRelocationIdentity(
+        buf: rawbytes.Bytes,
+        cursor: var int32,
+        bodyIR: var coreir.BodyIR) =
+    backend2FragCodecExpectTag(buf, cursor, 18)
+    bodyIR.dataRelocationIdentitySealed =
+        backend2BodyIrReadBool(
+            buf, cursor,
+            "backend2_bodyir_codec_data_relocation_sealed_invalid")
+    bodyIR.localAddressTargetDomainKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.localAddressTargetRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.localAddressTargetCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    bodyIR.cstringTargetRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.cstringOwnerFunctionFragmentCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+
+# ---- field 19 ExactDef 侧车 (批 1): sealed 标量 + 15 int32 列 + CID ----
+# 线格式挂在 cleanup authority (field 17) 之后、TypeArena CID (field 11) 之前,
+# 后者必须保持全载荷尾部。形状由 exactdef 校验封死 (canonical-empty 或
+# sealed dense, 中间态不上线)。
+
+@borrows
+fn backend2BodyIrExactDefSize(bodyIR: coreir.BodyIR): int32 =
+    var total: int32 = 8                             # tag=19 + sealed
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.opPlaceKinds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.opExactTypeIds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.opOriginIds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.opProducerFunctionRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.opSourceDefOpRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.opReadADefOpRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.slotPlaceKinds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.slotOriginIds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.slotStorageKinds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.callArgStarts.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.callArgCounts.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.argDefOpRows.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.argPlaceKinds.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.argOwnerships.len))
+    backend2CodecSizeAdd(
+        total, backend2CodecSizeWithWords(
+            4, bodyIR.exactDef.argOriginIds.len))
+    backend2CodecSizeAdd(total, 32)                  # exactDefCid
+    return total
+
+@borrows
+fn backend2BodyIrPutExactDef(buf: var rawbytes.Bytes,
+                             cursor: var int32,
+                             bodyIR: coreir.BodyIR) =
+    backend2FragCodecPutTag(buf, cursor, 19)
+    var sealedFlag: int32
+    if bodyIR.exactDef.sealed:
+        sealedFlag = 1
+    Backend2CodecPutU32(buf, cursor, sealedFlag)
+    cursor = cursor + 4
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.opPlaceKinds)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.opExactTypeIds)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.opOriginIds)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.exactDef.opProducerFunctionRows)
+    backend2BodyIrPutI32SeqBody(
+        buf, cursor, bodyIR.exactDef.opSourceDefOpRows)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.opReadADefOpRows)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.slotPlaceKinds)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.slotOriginIds)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.slotStorageKinds)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.callArgStarts)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.callArgCounts)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.argDefOpRows)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.argPlaceKinds)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.argOwnerships)
+    backend2BodyIrPutI32SeqBody(buf, cursor, bodyIR.exactDef.argOriginIds)
+    backend2BodyIrPutFixedBytes32(buf, cursor, bodyIR.exactDef.exactDefCid)
+
+@borrows
+fn backend2BodyIrReadExactDef(buf: rawbytes.Bytes,
+                              cursor: var int32,
+                              bodyIR: var coreir.BodyIR) =
+    if !exactdef.BodyIrExactDefSidecarIsCanonicalEmpty(bodyIR.exactDef):
+        panic("backend2_bodyir_codec_exact_def_destination_not_empty")
+    backend2FragCodecExpectTag(buf, cursor, 19)
+    bodyIR.exactDef.sealed = backend2BodyIrReadBool(
+        buf, cursor, "backend2_bodyir_codec_exact_def_sealed_invalid")
+    bodyIR.exactDef.opPlaceKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.opExactTypeIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.opOriginIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.opProducerFunctionRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.opSourceDefOpRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.opReadADefOpRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.slotPlaceKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.slotOriginIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.slotStorageKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.callArgStarts =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.callArgCounts =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.argDefOpRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.argPlaceKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.argOwnerships =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.argOriginIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.exactDef.exactDefCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+
+@borrows
+fn backend2BodyIrReadExternFfiHandleCapabilities(
+        buf: rawbytes.Bytes,
+        cursor: var int32,
+        sidecar: var coreir.BodyIRExternFfiHandleCapabilitySidecar) =
+    if !coreir.BodyIRExternFfiHandleCapabilitySidecarIsCanonicalEmpty(
+           sidecar):
+        panic("backend2_bodyir_codec_ffi_handle_destination_not_empty")
+    backend2FragCodecExpectTag(buf, cursor, 16)
+    sidecar.sealed = backend2BodyIrReadBool(
+        buf, cursor,
+        "backend2_bodyir_codec_ffi_handle_sealed_invalid")
+    sidecar.functionRow = Backend2CodecReadU32(buf, cursor)
+    sidecar.snapshotProjectionAuthorityCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    sidecar.semanticCargoCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    sidecar.loweringBridgeCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    sidecar.callOrdinals =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.callBodyOpRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.semanticCapabilityCallRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.resolvedCallRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.snapshotCallIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.semanticContractRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.snapshotContractRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.semanticEffectStarts =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.effectStarts =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.effectCounts =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.callCapabilityCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    sidecar.contractCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    sidecar.interfaceCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    sidecar.callBridgeCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    sidecar.semanticCapabilityEffectRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.contractEffectRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.snapshotEffectRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.snapshotEffectContractRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.effectKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.targetKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.parameterOrdinals =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.argumentRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.argumentSlotIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.argumentValueNodeIndexes =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.valueDefinitionRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.generationRootValueDefinitionRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.exactTypeIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.carrierKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    sidecar.argumentBindingCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    sidecar.typeCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    sidecar.generationCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    sidecar.definitionLineageCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    sidecar.effectCapabilityCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    sidecar.contractEffectCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    sidecar.effectBridgeCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    sidecar.rootCid = backend2BodyIrReadFixedBytes32(buf, cursor)
+
+fn backend2BodyIrCleanupAllocationBudgetTake(
+        budget: var int32,
+        count: int32,
+        itemBytes: int32) =
+    if budget < 0 || count < 0 || itemBytes <= 0 ||
+       count > budget / itemBytes:
+        panic("backend2_bodyir_codec_cleanup_decode_allocation_budget_exceeded")
+    budget = budget - count * itemBytes
+
+@borrows
+fn backend2BodyIrReadCleanupI32Column(
+        buf: rawbytes.Bytes,
+        cursor: var int32,
+        allocationBudget: var int32): int32[] =
+    let count = Backend2CodecReadU32(buf, cursor)
+    if count < 0 || cursor < 0 || cursor > buf.len ||
+       count > (buf.len - cursor) / 4:
+        panic("backend2_bodyir_codec_cleanup_i32_column_overrun")
+    backend2BodyIrCleanupAllocationBudgetTake(
+        allocationBudget, count, 4)
+    var out: int32[]
+    setLen(out, count)
+    for row in 0..<count:
+        out[row] = Backend2CodecReadU32(buf, cursor)
+    return out
+
+@borrows
+fn backend2BodyIrReadCleanupFixed32Column(
+        buf: rawbytes.Bytes,
+        cursor: var int32,
+        allocationBudget: var int32): layout.FixedBytes32[] =
+    let count = Backend2CodecReadU32(buf, cursor)
+    if count < 0 || cursor < 0 || cursor > buf.len ||
+       count > (buf.len - cursor) / 32:
+        panic("backend2_bodyir_codec_cleanup_fixed32_column_overrun")
+    backend2BodyIrCleanupAllocationBudgetTake(
+        allocationBudget, count, 32)
+    var out: layout.FixedBytes32[]
+    setLen(out, count)
+    for row in 0..<count:
+        out[row] = backend2BodyIrReadFixedBytes32(buf, cursor)
+    return out
+
+@borrows
+fn backend2BodyIrReadCleanupAuthority(
+        buf: rawbytes.Bytes,
+        cursor: var int32,
+        bodyIR: var coreir.BodyIR) =
+    if coreir.BodyIRTypeArenaArtifactCidValid(
+           bodyIR.cleanupSourceProjectionCid) ||
+       !coreir.BodyIRCleanupIntentSidecarIsCanonicalEmpty(
+           bodyIR.cleanupIntent) ||
+       !coreir.BodyIRCleanupScheduleSidecarIsCanonicalEmpty(
+           bodyIR.cleanupSchedule) ||
+       !coreir.BodyIRDeferReplaySidecarIsCanonicalEmpty(
+           bodyIR.deferReplay):
+        panic("backend2_bodyir_codec_cleanup_destination_not_empty")
+    backend2FragCodecExpectTag(buf, cursor, 17)
+    # The following tag11 + TypeArena CID is fixed at 36 bytes. The budget is
+    # the maximum retained cleanup-column payload permitted by this input.
+    if cursor < 0 || cursor > buf.len ||
+       buf.len - cursor <
+           backend2BodyIrCleanupFixedBytesAfterTag + 36:
+        panic("backend2_bodyir_codec_cleanup_section_truncated")
+    var allocationBudget =
+        buf.len - cursor - 36 -
+            backend2BodyIrCleanupFixedBytesAfterTag
+    bodyIR.cleanupSourceProjectionCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    bodyIR.cleanupIntent.building = backend2BodyIrReadBool(
+        buf, cursor,
+        "backend2_bodyir_codec_cleanup_intent_building_invalid")
+    bodyIR.cleanupIntent.sealed = backend2BodyIrReadBool(
+        buf, cursor,
+        "backend2_bodyir_codec_cleanup_intent_sealed_invalid")
+    bodyIR.cleanupIntent.rootCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    bodyIR.cleanupIntent.sourceControlCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    bodyIR.cleanupIntent.ownershipIrCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    bodyIR.cleanupIntent.ownershipAnalysisCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    bodyIR.cleanupIntent.originalLocalCount =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.cleanupIntent.originalOpCount =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.cleanupIntent.originalCallCount =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.cleanupIntent.originalBlockCount =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.cleanupIntent.originalTermCount =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.cleanupIntent.sourceBlockIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.sourceTermRows =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.sourceTermCids =
+        backend2BodyIrReadCleanupFixed32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.sourceSuccessorOrdinals =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.originalSuccessorCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.sourceExitKinds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.originalTargetBlockIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.originalEdgeKinds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.sourceScopeIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.targetScopeIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.exitOwnershipEdgeIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.selectedDeferStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.selectedDeferCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.exitUnitStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.exitUnitCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.siteOriginalBlockIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.siteAfterOpOrdinals =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.siteOwnershipOpStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.siteOwnershipOpCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.siteUnitStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.siteUnitCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.ownershipOpRows =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.selectedDeferIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.unitKinds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.unitSemanticDomains =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.unitSemanticStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.unitSemanticCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.unitSnapshotSourceSlotStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.unitSnapshotSourceSlotCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.unitConditionStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.unitConditionCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.unitClearStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.unitClearCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.unitAuthorityCids =
+        backend2BodyIrReadCleanupFixed32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.snapshotSourceSlotIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.snapshotProjectionPolicies =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.snapshotSemanticRows =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.snapshotTypeArenaTypeIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.snapshotInterfaceCids =
+        backend2BodyIrReadCleanupFixed32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.conditionKinds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.conditionInputSourceSlotIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.conditionSemanticRows =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.conditionSemanticOrdinals =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.clearKinds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.clearTargetSourceSlotIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.clearSemanticRows =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupIntent.clearSemanticOrdinals =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.building = backend2BodyIrReadBool(
+        buf, cursor,
+        "backend2_bodyir_codec_cleanup_schedule_building_invalid")
+    bodyIR.cleanupSchedule.sealed = backend2BodyIrReadBool(
+        buf, cursor,
+        "backend2_bodyir_codec_cleanup_schedule_sealed_invalid")
+    bodyIR.cleanupSchedule.rootCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    bodyIR.cleanupSchedule.finalControlCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    bodyIR.cleanupSchedule.ownerPhysicalSourceBlockIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.ownerSourceTermRows =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.ownerSourceSuccessorOrdinals =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.ownerFinalContinuationBlockIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.ownerFinalEdgeKinds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.ownerContinuationCids =
+        backend2BodyIrReadCleanupFixed32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.opStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.opCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.callStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.callCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.blockStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.blockCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.termStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.termCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.unitLocalStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.unitLocalCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.unitProjectedSnapshotSlotStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.unitProjectedSnapshotSlotCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.unitEffectStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.unitEffectCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.effectSemanticRows =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.effectPhysicalDomains =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.effectPhysicalRows =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.effectRoles =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.payloadCids =
+        backend2BodyIrReadCleanupFixed32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.placementCids =
+        backend2BodyIrReadCleanupFixed32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.cleanupSchedule.projectedSnapshotSlotIds =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.deferReplay.building = backend2BodyIrReadBool(
+        buf, cursor,
+        "backend2_bodyir_codec_defer_replay_building_invalid")
+    bodyIR.deferReplay.sealed = backend2BodyIrReadBool(
+        buf, cursor,
+        "backend2_bodyir_codec_defer_replay_sealed_invalid")
+    bodyIR.deferReplay.rootCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    bodyIR.deferReplay.templateOpMapStarts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.deferReplay.templateOpMapCounts =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+    bodyIR.deferReplay.templateOpRows =
+        backend2BodyIrReadCleanupI32Column(
+            buf, cursor, allocationBudget)
+
+@borrows
+fn backend2BodyIrReadCount(buf: rawbytes.Bytes,
+                           cursor: var int32,
+                           minBytesPerItem: int32,
+                           errorText: str): int32 =
+    let count = Backend2CodecReadU32(buf, cursor)
+    if count < 0 || minBytesPerItem <= 0 || cursor < 0 ||
+       cursor > buf.len || count > (buf.len - cursor) / minBytesPerItem:
+        panic(errorText)
+    return count
+
+@borrows
+fn backend2BodyIrReadOp(buf: rawbytes.Bytes, cursor: var int32): coreir.BodyOp =
+    var op: coreir.BodyOp
+    op.kind = Backend2CodecReadU32(buf, cursor)
+    op.target = Backend2CodecReadU32(buf, cursor)
+    op.valueDefSlot = Backend2CodecReadU32(buf, cursor)
+    op.valueDefExprNodeIndex = Backend2CodecReadU32(buf, cursor)
+    op.valueDefSemanticRow = Backend2CodecReadU32(buf, cursor)
+    op.valueDefOwnership = Backend2CodecReadU32(buf, cursor)
+    op.valueDefBorrowOwnerSemanticRow =
+        Backend2CodecReadU32(buf, cursor)
+    op.valueDefBorrowOwnerDefinitionDomain =
+        Backend2CodecReadU32(buf, cursor)
+    op.valueDefBorrowOwnerDefinitionRow =
+        Backend2CodecReadU32(buf, cursor)
+    op.valueDefConsumeOpIndexPlusOne = Backend2CodecReadU32(buf, cursor)
+    op.valueDefOriginKind = Backend2CodecReadU32(buf, cursor)
+    op.valueDefOriginId = Backend2CodecReadU32(buf, cursor)
+    op.sourceDefinitionDomain = Backend2CodecReadU32(buf, cursor)
+    op.sourceDefinitionRow = Backend2CodecReadU32(buf, cursor)
+    op.consumeActionRow = Backend2CodecReadU32(buf, cursor)
+    op.operands = backend2BodyIrReadI32SeqBody(buf, cursor)
+    return op
+
+@borrows
+fn backend2BodyIrReadCallOp(buf: rawbytes.Bytes, cursor: var int32): coreir.CallOp =
+    var callOp: coreir.CallOp
+    callOp.targetSymbol = backend2FragCodecReadStrBody(buf, cursor)
+    callOp.targetSourcePath = backend2FragCodecReadStrBody(buf, cursor)
+    callOp.argSlots = backend2BodyIrReadI32SeqBody(buf, cursor)
+    callOp.argPassKinds = backend2BodyIrReadI32SeqBody(buf, cursor)
+    callOp.argAbiSizes = backend2BodyIrReadI32SeqBody(buf, cursor)
+    callOp.resultSlot = Backend2CodecReadU32(buf, cursor)
+    callOp.resultPassKind = Backend2CodecReadU32(buf, cursor)
+    callOp.resultOwnership = Backend2CodecReadU32(buf, cursor)
+    callOp.resultExprNodeIndex = Backend2CodecReadU32(buf, cursor)
+    callOp.resultValueDefinitionRow =
+        Backend2CodecReadU32(buf, cursor)
+    callOp.resultBorrowOwnerValueDefinitionRow =
+        Backend2CodecReadU32(buf, cursor)
+    callOp.resultBorrowOwnerDefinitionDomain =
+        Backend2CodecReadU32(buf, cursor)
+    callOp.resultBorrowOwnerDefinitionRow =
+        Backend2CodecReadU32(buf, cursor)
+    callOp.resultDefinitionOriginKind =
+        Backend2CodecReadU32(buf, cursor)
+    callOp.resultDefinitionOriginId = Backend2CodecReadU32(buf, cursor)
+    callOp.sourceDefinitionDomain =
+        Backend2CodecReadU32(buf, cursor)
+    callOp.sourceDefinitionRow = Backend2CodecReadU32(buf, cursor)
+    callOp.semanticCallExprNodeIndex =
+        Backend2CodecReadU32(buf, cursor)
+    callOp.consumeActionRow = Backend2CodecReadU32(buf, cursor)
+    callOp.managedStoreKind = Backend2CodecReadU32(buf, cursor)
+    callOp.relocWordOffset = Backend2CodecReadU32(buf, cursor)
+    callOp.targetIsImportc = backend2BodyIrReadBool(
+        buf, cursor, "backend2_bodyir_codec_importc_flag_invalid")
+    callOp.inlineF64FromIntKind = Backend2CodecReadU32(buf, cursor)
+    callOp.wholeCallF64FromIntRescue = backend2BodyIrReadBool(
+        buf, cursor, "backend2_bodyir_codec_call_rescue_flag_invalid")
+    callOp.inlineF64FromIntUnsigned = backend2BodyIrReadBool(
+        buf, cursor, "backend2_bodyir_codec_call_unsigned_flag_invalid")
+    return callOp
+
+@borrows
+fn backend2BodyIrReadLocalSlot(buf: rawbytes.Bytes, cursor: var int32): coreir.LocalSlot =
+    var slot: coreir.LocalSlot
+    slot.id = Backend2CodecReadU32(buf, cursor)
+    slot.name = backend2FragCodecReadStrBody(buf, cursor)
+    slot.typeKind = Backend2CodecReadU32(buf, cursor)
+    slot.typeArenaTypeId = Backend2CodecReadU32(buf, cursor)
+    slot.managedStorageKind = Backend2CodecReadU32(buf, cursor)
+    slot.placeKind = Backend2CodecReadU32(buf, cursor)
+    slot.stackOffset = Backend2CodecReadU32(buf, cursor)
+    slot.sizeBytes = Backend2CodecReadU32(buf, cursor)
+    slot.alignBytes = Backend2CodecReadU32(buf, cursor)
+    slot.auxValue = Backend2CodecReadU32(buf, cursor)
+    slot.ownership = Backend2CodecReadU32(buf, cursor)
+    slot.aliasClass = Backend2CodecReadU32(buf, cursor)
+    slot.escapeKind = Backend2CodecReadU32(buf, cursor)
+    slot.noAlias = backend2BodyIrReadBool(
+        buf, cursor, "backend2_bodyir_codec_noalias_flag_invalid")
+    return slot
+
+@borrows
+fn backend2BodyIrReadBlock(buf: rawbytes.Bytes, cursor: var int32): coreir.BodyBlock =
+    var blk: coreir.BodyBlock
+    blk.id = Backend2CodecReadU32(buf, cursor)
+    blk.opStart = Backend2CodecReadU32(buf, cursor)
+    blk.opCount = Backend2CodecReadU32(buf, cursor)
+    blk.termIndex = Backend2CodecReadU32(buf, cursor)
+    return blk
+
+@borrows
+fn backend2BodyIrReadTerm(buf: rawbytes.Bytes, cursor: var int32): coreir.BodyTerm =
+    var term: coreir.BodyTerm
+    term.kind = Backend2CodecReadU32(buf, cursor)
+    term.conditionKind = Backend2CodecReadU32(buf, cursor)
+    term.resultSlot = Backend2CodecReadU32(buf, cursor)
+    term.lhsSlot = Backend2CodecReadU32(buf, cursor)
+    term.rhsSlot = Backend2CodecReadU32(buf, cursor)
+    term.trueBlock = Backend2CodecReadU32(buf, cursor)
+    term.falseBlock = Backend2CodecReadU32(buf, cursor)
+    term.sourceDefinitionDomain =
+        Backend2CodecReadU32(buf, cursor)
+    term.sourceDefinitionRow = Backend2CodecReadU32(buf, cursor)
+    term.operands = backend2BodyIrReadI32SeqBody(buf, cursor)
+    return term
+
+@borrows
+fn backend2BodyIrReadCString(buf: rawbytes.Bytes, cursor: var int32): coreir.CStringLiteralEntry =
+    var entry: coreir.CStringLiteralEntry
+    entry.id = Backend2CodecReadU32(buf, cursor)
+    entry.text = backend2FragCodecReadStrBody(buf, cursor)
+    entry.dataLabel = backend2FragCodecReadStrBody(buf, cursor)
+    return entry
+
+@borrows
+fn Backend2BodyIrDecode(buf: rawbytes.Bytes, cursor: var int32): coreir.BodyIR =
+    if Backend2CodecReadU32(buf, cursor) != backend2BodyIrCodecMagic:
+        panic("backend2_bodyir_codec_bad_magic")
+    if Backend2CodecReadU32(buf, cursor) != backend2BodyIrCodecFieldCount:
+        panic("backend2_bodyir_codec_bad_field_count")
+    var bodyIR = coreir.BodyIRNew()
+    backend2FragCodecExpectTag(buf, cursor, 1)
+    let opsCount = backend2BodyIrReadCount(
+        buf, cursor, 64, "backend2_bodyir_codec_ops_count_invalid")
+    for i in 0..<opsCount:
+        add(bodyIR.ops, backend2BodyIrReadOp(buf, cursor))
+    backend2FragCodecExpectTag(buf, cursor, 2)
+    let callCount = backend2BodyIrReadCount(
+        buf, cursor, 100, "backend2_bodyir_codec_call_count_invalid")
+    for i in 0..<callCount:
+        add(bodyIR.callSequence, backend2BodyIrReadCallOp(buf, cursor))
+    backend2FragCodecExpectTag(buf, cursor, 3)
+    let slotsCount = backend2BodyIrReadCount(
+        buf, cursor, 56, "backend2_bodyir_codec_slots_count_invalid")
+    for i in 0..<slotsCount:
+        add(bodyIR.localSlots, backend2BodyIrReadLocalSlot(buf, cursor))
+    backend2FragCodecExpectTag(buf, cursor, 4)
+    let blocksCount = backend2BodyIrReadCount(
+        buf, cursor, 16, "backend2_bodyir_codec_blocks_count_invalid")
+    for i in 0..<blocksCount:
+        add(bodyIR.blocks, backend2BodyIrReadBlock(buf, cursor))
+    backend2FragCodecExpectTag(buf, cursor, 5)
+    let termsCount = backend2BodyIrReadCount(
+        buf, cursor, 40, "backend2_bodyir_codec_terms_count_invalid")
+    for i in 0..<termsCount:
+        add(bodyIR.terms, backend2BodyIrReadTerm(buf, cursor))
+    backend2FragCodecExpectTag(buf, cursor, 6)
+    let cstrCount = backend2BodyIrReadCount(
+        buf, cursor, 12, "backend2_bodyir_codec_cstr_count_invalid")
+    for i in 0..<cstrCount:
+        add(bodyIR.cstringLiterals, backend2BodyIrReadCString(buf, cursor))
+    backend2BodyIrReadDataRelocationIdentity(buf, cursor, bodyIR)
+    backend2FragCodecExpectTag(buf, cursor, 7)
+    bodyIR.entryIsCAbi = backend2BodyIrReadBool(
+        buf, cursor, "backend2_bodyir_codec_entry_cabi_flag_invalid")
+    backend2FragCodecExpectTag(buf, cursor, 8)
+    bodyIR.debugProvenanceRequired = backend2BodyIrReadBool(
+        buf, cursor,
+        "backend2_bodyir_codec_debug_required_flag_invalid")
+    bodyIR.debugProvenanceComplete = backend2BodyIrReadBool(
+        buf, cursor,
+        "backend2_bodyir_codec_debug_complete_flag_invalid")
+    bodyIR.debugFunctionId = Backend2CodecReadU32(buf, cursor)
+    if !bodyIR.debugProvenanceRequired && bodyIR.debugFunctionId != -1:
+        panic("backend2_bodyir_codec_debug_function_id_invalid")
+    backend2FragCodecExpectTag(buf, cursor, 9)
+    let debugOpCount = backend2BodyIrReadCount(
+        buf, cursor, 8,
+        "backend2_bodyir_codec_debug_op_count_invalid")
+    for index in 0..<debugOpCount:
+        add(bodyIR.debugOpIdsByOpIndex,
+            Backend2CodecReadU32(buf, cursor))
+        add(bodyIR.debugSyntheticKindsByOpIndex,
+            Backend2CodecReadU32(buf, cursor))
+    backend2FragCodecExpectTag(buf, cursor, 10)
+    let debugTermCount = backend2BodyIrReadCount(
+        buf, cursor, 8,
+        "backend2_bodyir_codec_debug_term_count_invalid")
+    for index in 0..<debugTermCount:
+        add(bodyIR.debugOpIdsByTermIndex,
+            Backend2CodecReadU32(buf, cursor))
+        add(bodyIR.debugSyntheticKindsByTermIndex,
+            Backend2CodecReadU32(buf, cursor))
+    backend2FragCodecExpectTag(buf, cursor, 12)
+    bodyIR.typeFactTypeIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.typeFactStructuralKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.typeFactScalarKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.typeFactChildTypeIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.typeFactFixedLengths =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.typeFactSizeBytes =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.typeFactAlignBytes =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    backend2FragCodecExpectTag(buf, cursor, 13)
+    bodyIR.controlFlowSealed = backend2BodyIrReadBool(
+        buf, cursor,
+        "backend2_bodyir_codec_control_sealed_flag_invalid")
+    bodyIR.controlFunctionRow = Backend2CodecReadU32(buf, cursor)
+    bodyIR.controlScopeParentIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.blockScopeIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.termSuccessorStarts =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.termSuccessorCounts =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.successorBlockIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.successorEdgeKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.callTargetDomainKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.callTargetRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.callTargetInterfaceCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    bodyIR.deferDeclarationScopeIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.deferSuiteScopeIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.deferLexicalOrdinals =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.deferFunctionRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.deferStatementRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.deferActionCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    bodyIR.deferActivationSiteBlockIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.deferActivationSiteAfterOpOrdinals =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.deferActivationSiteStarts =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.deferActivationSiteCounts =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.deferActivationRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    backend2FragCodecExpectTag(buf, cursor, 14)
+    bodyIR.manualConsume.sealed = backend2BodyIrReadBool(
+        buf, cursor,
+        "backend2_bodyir_codec_manual_consume_sealed_invalid")
+    bodyIR.manualConsume.functionPresent =
+        backend2BodyIrReadBool(
+            buf, cursor,
+            "backend2_bodyir_codec_manual_consume_function_present_invalid")
+    bodyIR.manualConsume.functionRow =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.manualConsume.functionTargetParameterOrdinal =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.manualConsume.functionSourceParameterOrdinal =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.manualConsume.functionTargetSlotId =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.manualConsume.functionSourceSlotId =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.manualConsume.functionTargetTypeArenaTypeId =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.manualConsume.functionSourceTypeArenaTypeId =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.manualConsume.functionEffectCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    bodyIR.manualConsume.functionBodyProofCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    bodyIR.manualConsume.callOrdinals =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.snapshotCallIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.targetArgumentOrdinals =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.sourceArgumentOrdinals =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.targetPlaceSlotIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.targetOwnerSlotIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.sourcePlaceSlotIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.targetArgumentBindingCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    bodyIR.manualConsume.sourceArgumentBindingCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    bodyIR.manualConsume.targetProjectionCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    bodyIR.manualConsume.sourceProjectionCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    bodyIR.manualConsume.targetDefinitionDomains =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.targetDefinitionRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.sourceDefinitionDomains =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.sourceDefinitionRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.targetTypeArenaTypeIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.sourceTypeArenaTypeIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.postDefinitionDomains =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.postDefinitionRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.manualConsume.effectCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    bodyIR.manualConsume.linearTokenCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    bodyIR.manualConsume.bridgeCids =
+        backend2BodyIrReadFixedBytes32SeqBody(buf, cursor)
+    bodyIR.manualConsume.rootCid =
+        backend2BodyIrReadFixedBytes32(buf, cursor)
+    backend2FragCodecExpectTag(buf, cursor, 15)
+    bodyIR.entryDefinitionOwnershipSealed =
+        backend2BodyIrReadBool(
+            buf, cursor,
+            "backend2_bodyir_codec_entry_definition_ownership_sealed_invalid")
+    bodyIR.entryDefinitionOwnershipKinds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.entryDefinitionSemanticRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.entryParameterSlotIds =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    bodyIR.localBindingValueDefinitionDomainStart =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.localBindingValueDefinitionDomainCount =
+        Backend2CodecReadU32(buf, cursor)
+    bodyIR.localBindingValueDefinitionRows =
+        backend2BodyIrReadI32SeqBody(buf, cursor)
+    backend2BodyIrReadExternFfiHandleCapabilities(
+        buf, cursor, bodyIR.externFfiHandleCapabilities)
+    backend2BodyIrReadCleanupAuthority(buf, cursor, bodyIR)
+    backend2BodyIrReadExactDef(buf, cursor, bodyIR)
+    backend2FragCodecExpectTag(buf, cursor, 11)
+    if cursor < 0 || cursor > buf.len || buf.len - cursor < 32:
+        panic("backend2_bodyir_codec_type_arena_cid_overrun")
+    var typeArenaCidBytes = rawbytes.BytesSlice(buf, cursor, 32)
+    cursor = cursor + 32
+    let typeArenaCidResult =
+        layout.FixedBytes32FromBytes(typeArenaCidBytes)
+    rawbytes.BytesFree(typeArenaCidBytes)
+    if !IsOk(typeArenaCidResult):
+        panic("backend2_bodyir_codec_type_arena_cid_invalid")
+    bodyIR.typeArenaArtifactCid = Value(typeArenaCidResult)
+    if !coreir.BodyIRTypeArenaArtifactCidValid(
+           bodyIR.typeArenaArtifactCid):
+        panic("backend2_bodyir_codec_type_arena_cid_zero")
+    if !coreir.BodyIRCanonicalTypeFactShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_type_fact_shape_invalid")
+    if !coreir.BodyIRDebugProvenanceShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_debug_provenance_invalid")
+    if !coreir.BodyIRControlFlowShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_control_flow_shape_invalid")
+    if !coreir.BodyIREntryDefinitionOwnershipShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_entry_definition_ownership_invalid")
+    if !coreir.BodyIREntryParameterSlotsShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_entry_parameter_index_invalid")
+    if !coreir.BodyIRLocalBindingValueDefinitionRowsShapeValid(
+           bodyIR):
+        panic("backend2_bodyir_codec_local_binding_definition_invalid")
+    if !coreir.BodyIRDataRelocationIdentityStrictValidate(bodyIR):
+        backend2BodyIrDataRelocationIdentityDiagPanic(bodyIR)
+    if !coreir.BodyIRManualConsumeSidecarShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_manual_consume_shape_invalid")
+    if !coreir.BodyIRExternFfiHandleCapabilitySidecarShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_ffi_handle_capability_shape_invalid")
+    if !coreir.BodyIRCleanupProofShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_cleanup_proof_shape_invalid")
+    if !backend2BodyIrCleanupProjectionShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_cleanup_projection_shape_invalid")
+    if !coreir.BodyIRTypeArenaProofDomainValid(bodyIR):
+        panic("backend2_bodyir_codec_type_arena_domain_invalid")
+    if !exactdef.BodyIrExactDefSidecarShapeValid(bodyIR):
+        panic("backend2_bodyir_codec_exact_def_shape_invalid")
+    if cursor != buf.len:
+        panic("backend2_bodyir_codec_trailing_bytes")
+    return bodyIR
+
+@borrows
+fn Backend2BodyIrEncodedTypeArenaArtifactMatches(
+        buf: rawbytes.Bytes,
+        expected: layout.FixedBytes32): bool =
+    if !coreir.BodyIRTypeArenaArtifactCidValid(expected) ||
+       buf.len < 32:
+        return false
+    var cidBytes = rawbytes.BytesSlice(buf, buf.len - 32, 32)
+    let parsed = layout.FixedBytes32FromBytes(cidBytes)
+    rawbytes.BytesFree(cidBytes)
+    return IsOk(parsed) &&
+           layout.FixedBytes32Equal(Value(parsed), expected)
+
+@borrows
+fn Backend2BodyIrDecodeExpectedTypeArenaArtifact(
+        buf: rawbytes.Bytes,
+        cursor: var int32,
+        expected: layout.FixedBytes32): coreir.BodyIR =
+    if !Backend2BodyIrEncodedTypeArenaArtifactMatches(buf, expected):
+        panic("backend2_bodyir_codec_type_arena_cid_mismatch")
+    let bodyIR = Backend2BodyIrDecode(buf, cursor)
+    if !layout.FixedBytes32Equal(
+           bodyIR.typeArenaArtifactCid, expected):
+        panic("backend2_bodyir_codec_type_arena_cid_decode_drift")
+    return bodyIR
+
+@borrows
+fn Backend2BodyIrDecodeExpectedManualConsumeAuthority(
+        buf: rawbytes.Bytes,
+        cursor: var int32,
+        expectedTypeArenaArtifactCid:
+            layout.FixedBytes32,
+        expectedManualConsumeRootCid:
+            layout.FixedBytes32): coreir.BodyIR =
+    let bodyIR =
+        Backend2BodyIrDecodeExpectedTypeArenaArtifact(
+            buf, cursor,
+            expectedTypeArenaArtifactCid)
+    if !coreir.BodyIRManualConsumeExactValidateAgainst(
+           bodyIR, expectedManualConsumeRootCid):
+        panic(
+            "backend2_bodyir_codec_manual_consume_authority_mismatch")
+    return bodyIR
+
+# ---- round-trip: 编→解→再编逐字节等 (skip-lower 缓存 put 前自检, 封 enc/dec 不对称) ----
+
+@borrows
+fn Backend2BodyIrRoundTripAssert(bodyIR: coreir.BodyIR) =
+    var enc1 = Backend2BodyIrEncode(bodyIR)
+    var cursor: int32
+    var decoded = Backend2BodyIrDecode(enc1, cursor)
+    if cursor != enc1.len:
+        panic("backend2_bodyir_codec_roundtrip_trailing_bytes")
+    var enc2 = Backend2BodyIrEncode(decoded)
+    if !rawbytes.BytesEqual(enc1, enc2):
+        panic("backend2_bodyir_codec_roundtrip_byte_mismatch")
+    rawbytes.BytesFree(enc1)
+    rawbytes.BytesFree(enc2)

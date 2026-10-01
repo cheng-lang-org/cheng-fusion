@@ -1,0 +1,206 @@
+# S5-B pump backpressure/yield-point contract check (video-seek-scrub-blueprint.md §7.4;
+# extends media_moq_es_pause_backpressure_check_main.cheng's coverage). Proves
+# WebSceneMediaEsStreamLoop's NEW single-bounded-unit-per-call contract (one cached GOP or
+# one network-fetch run, then return — never march through the whole remaining clip in one
+# call) against a REAL QUIC client talking to a REAL media_moq_publisher_main process
+# serving the real hgs_faststart ES fixture — no mocked network, no faked gate.
+#
+# Uses the PERMISSIVE host stub (es_pump_backpressure_test_host_stub.c: sink never reports
+# "full") instead of the sibling test's always-full stub, because an always-full stub forces
+# every call to stop after exactly one frame regardless of whether the bounded-per-call
+# contract holds — it cannot distinguish the old unbounded loop from the new bounded one.
+# With a sink that never says "stop", the old code marched through the ENTIRE remaining
+# clip in a single call; the new code must still stop after one run/GOP.
+#
+# Asserts, in order:
+#   1. WebSceneMediaEsOpen succeeds against the real publisher.
+#   2. ONE unpaused StreamLoop() call is BOUNDED: rc==0 ("more work, call again") and the
+#      sink's own independent capture counter is STRICTLY LESS than the stream's total
+#      frame count — the call did not drain the whole clip, even though the sink never
+#      signalled "full" (this is the regression the fix closes; against the pre-fix code
+#      this assertion fails, since one call would have captured every frame).
+#   3. Repeated unpaused StreamLoop() calls (bounded loop, no hang risk) eventually drain
+#      the WHOLE clip: rc==7 reached, captured count == total frame count, last delivered
+#      frameIdx == frameCount-1, and the pump cursor is NON-DECREASING across every single
+#      call in the sequence (race-window invariant: a single thread issuing bounded calls
+#      never rewinds its own cursor — the property that makes it safe to interleave OTHER
+#      bounded calls, e.g. prefetch, between them without a second pump ever starting mid-
+#      stream from stale state).
+#   4. Re-opening a fresh session and pausing MID-STREAM (after several bounded units have
+#      already been pumped, not just before the very first dial) takes effect at the very
+#      next call: rc==8, sink capture count and pump cursor both UNCHANGED by that call.
+#   5. Unpausing resumes from the SAME cursor with NO redial: rc==0, capture count
+#      increases, WebSceneMediaEsDialedPort() unchanged.
+#   6. A WebSceneMediaEsPrefetchTick() call INTERLEAVED between two ordinary StreamLoop()
+#      ticks (exactly the pattern the Harmony fetch-thread pump loop now uses at its new
+#      yield point) succeeds (rc==1), the target GOP becomes a real cache hit whose byte
+#      length matches the independent ground truth
+#      (media_moq_es_prefetch_tick_check_main.cheng's own oracle, 946127 bytes for GOP
+#      120), and — critically — the FOREGROUND pump's own cursor is byte-for-byte UNCHANGED
+#      by the interleaved prefetch call, and the NEXT ordinary StreamLoop() tick still
+#      succeeds normally: the shared persistent connection/session survives an interleaved
+#      background call with no corruption of the foreground pump's own state.
+#   7. WebSceneMediaEsClose() tears down cleanly: a StreamLoop() call issued AFTER Close()
+#      is honestly rejected (rc==1, "not open") rather than silently continuing on stale
+#      session state.
+# Any failure prints a reason and exits nonzero; success prints "ALL OK" and exits 0.
+
+import std/os
+import std/rawbytes
+import std/strutils as strutil
+import std/cmdline as cmdline
+import cheng/core/runtime/web_scene_media_network_bridge as media_bridge
+import cheng/core/runtime/web_scene_media_block_cache as blockcache
+
+@importc("cheng_test_es_sink_captured")
+fn chengTestEsSinkCaptured(): int32
+
+@importc("cheng_test_es_sink_first_frame_idx")
+fn chengTestEsSinkFirstFrameIdx(): int32
+
+@importc("cheng_test_es_sink_last_frame_idx")
+fn chengTestEsSinkLastFrameIdx(): int32
+
+fn fail(msg: str): int32 =
+    os.WriteLine(os.Get_stdout(), strutil.Join(["FAIL: ", msg], ""))
+    return 1
+
+fn main(): int32 =
+    var hostRaw: str
+    let hasHost: bool = cmdline.ReadFirstFlagValue("--host", hostRaw)
+    let host: str = if hasHost: hostRaw else: "127.0.0.1"
+    let port: int32 = cmdline.ReadInt32FlagOrDefault("--port", 38000)
+    var rootRaw: str
+    let hasRoot: bool = cmdline.ReadFirstFlagValue("--root", rootRaw)
+    if !hasRoot:
+        return fail("missing --root")
+    let targetGop: int32 = 120
+    let oracleGopLen: int32 = 946127
+
+    if !blockcache.WebSceneMediaBlockCacheInit(rootRaw):
+        return fail(strutil.Join(["Init(root) failed: ", rootRaw], ""))
+
+    # 1. Open against the real publisher.
+    if !media_bridge.WebSceneMediaEsOpen(host, port):
+        return fail(strutil.Join(["es_open failed: ", media_bridge.WebSceneMediaEsLastError()], ""))
+    let assetCid: str = media_bridge.WebSceneMediaEsAssetCid()
+    if assetCid.len == 0:
+        return fail("asset_cid empty after open")
+    let frameCount: int32 = media_bridge.WebSceneMediaEsFrameCount()
+    if frameCount <= 1:
+        return fail(strutil.Join(["frameCount too small to prove boundedness: ", IntToStr(frameCount)], ""))
+    os.WriteLine(os.Get_stdout(), "step1_open_ok")
+
+    # 2. ONE unpaused call is bounded even though the sink never signals "full".
+    let firstRc: int32 = media_bridge.WebSceneMediaEsStreamLoop()
+    if firstRc != 0:
+        return fail(strutil.Join(["first bounded-unit StreamLoop rc=", IntToStr(firstRc), " want=0"], ""))
+    let capturedAfterOne: int32 = chengTestEsSinkCaptured()
+    if capturedAfterOne <= 0:
+        return fail("first StreamLoop call captured nothing")
+    if capturedAfterOne >= frameCount:
+        return fail(strutil.Join(["first StreamLoop call drained the WHOLE clip (captured=",
+                                   IntToStr(capturedAfterOne), " frameCount=", IntToStr(frameCount),
+                                   ") — bounded-per-call contract violated"], ""))
+    os.WriteLine(os.Get_stdout(), "step2_bounded_single_call_ok")
+
+    # 3. Repeated calls drain the whole clip; cursor is non-decreasing every step.
+    var prevCursor: int32 = media_bridge.WebSceneMediaEsPumpCursor()
+    var drainRc: int32 = 0
+    var ticks: int32 = 0
+    let safetyCap: int32 = frameCount + 64
+    while drainRc == 0 && ticks < safetyCap:
+        drainRc = media_bridge.WebSceneMediaEsStreamLoop()
+        let curCursor: int32 = media_bridge.WebSceneMediaEsPumpCursor()
+        if curCursor < prevCursor:
+            return fail(strutil.Join(["pump cursor went BACKWARD: prev=", IntToStr(prevCursor),
+                                       " now=", IntToStr(curCursor), " at tick=", IntToStr(ticks)], ""))
+        prevCursor = curCursor
+        ticks = ticks + 1
+    if drainRc != 7:
+        return fail(strutil.Join(["drain loop did not reach ended (rc=7): last rc=", IntToStr(drainRc),
+                                   " ticks=", IntToStr(ticks)], ""))
+    if chengTestEsSinkCaptured() != frameCount:
+        return fail(strutil.Join(["drained captured=", IntToStr(chengTestEsSinkCaptured()),
+                                   " want frameCount=", IntToStr(frameCount)], ""))
+    if chengTestEsSinkLastFrameIdx() != frameCount - 1:
+        return fail(strutil.Join(["last delivered frameIdx=", IntToStr(chengTestEsSinkLastFrameIdx()),
+                                   " want=", IntToStr(frameCount - 1)], ""))
+    os.WriteLine(os.Get_stdout(), "step3_full_drain_monotonic_cursor_ok")
+
+    # 4/5/6 need a FRESH session (the one above already ended) with several bounded units
+    # already pumped before pausing, to prove pause takes effect strictly MID-stream — not
+    # only before the very first dial (already covered by the sibling pause test).
+    media_bridge.WebSceneMediaEsClose()
+    if !media_bridge.WebSceneMediaEsOpen(host, port):
+        return fail(strutil.Join(["re-open failed: ", media_bridge.WebSceneMediaEsLastError()], ""))
+    let dialedPortBefore: int32 = media_bridge.WebSceneMediaEsDialedPort()
+    var warmupRc: int32 = 0
+    var warmupTicks: int32 = 0
+    while warmupRc == 0 && warmupTicks < 3:
+        warmupRc = media_bridge.WebSceneMediaEsStreamLoop()
+        warmupTicks = warmupTicks + 1
+    if warmupRc != 0:
+        return fail(strutil.Join(["warmup before mid-stream pause did not stay bounded: rc=", IntToStr(warmupRc)], ""))
+    let capturedBeforePause: int32 = chengTestEsSinkCaptured()
+    let cursorBeforePause: int32 = media_bridge.WebSceneMediaEsPumpCursor()
+    if capturedBeforePause <= 0:
+        return fail("warmup delivered nothing before mid-stream pause")
+
+    # 4. Pause MID-stream — takes effect at the very next call.
+    media_bridge.WebSceneMediaEsSetPaused(true)
+    let pausedMidRc: int32 = media_bridge.WebSceneMediaEsStreamLoop()
+    if pausedMidRc != 8:
+        return fail(strutil.Join(["mid-stream paused StreamLoop rc=", IntToStr(pausedMidRc), " want=8"], ""))
+    if chengTestEsSinkCaptured() != capturedBeforePause:
+        return fail(strutil.Join(["mid-stream pause let more frames through: captured=",
+                                   IntToStr(chengTestEsSinkCaptured()), " want=", IntToStr(capturedBeforePause)], ""))
+    if media_bridge.WebSceneMediaEsPumpCursor() != cursorBeforePause:
+        return fail("mid-stream pause moved the cursor")
+    os.WriteLine(os.Get_stdout(), "step4_mid_stream_pause_ok")
+
+    # 5. Resume — no redial, forward progress continues from the same cursor.
+    media_bridge.WebSceneMediaEsSetPaused(false)
+    let resumeRc: int32 = media_bridge.WebSceneMediaEsStreamLoop()
+    if resumeRc != 0:
+        return fail(strutil.Join(["resume StreamLoop rc=", IntToStr(resumeRc), " want=0"], ""))
+    if chengTestEsSinkCaptured() <= capturedBeforePause:
+        return fail("resume StreamLoop delivered no new frames")
+    if media_bridge.WebSceneMediaEsDialedPort() != dialedPortBefore:
+        return fail("resume redialed a different port")
+    os.WriteLine(os.Get_stdout(), "step5_resume_no_redial_ok")
+
+    # 6. Interleave a prefetch tick between two ordinary ticks — the exact pattern the
+    # Harmony fetch-thread pump loop now uses at each yield point. Must not perturb the
+    # foreground cursor, and the next ordinary tick must still work normally.
+    let cursorBeforePrefetch: int32 = media_bridge.WebSceneMediaEsPumpCursor()
+    let prefetchRc: int32 = media_bridge.WebSceneMediaEsPrefetchTick(8)
+    if prefetchRc != 1:
+        return fail(strutil.Join(["interleaved PrefetchTick rc=", IntToStr(prefetchRc), " want=1"], ""))
+    if media_bridge.WebSceneMediaEsPumpCursor() != cursorBeforePrefetch:
+        return fail("interleaved PrefetchTick perturbed the foreground pump cursor")
+    let hitAfterPrefetch = blockcache.WebSceneMediaBlockCacheGet(assetCid, targetGop)
+    if IsErr(hitAfterPrefetch):
+        return fail(strutil.Join(["interleaved PrefetchTick did not cache GOP ", IntToStr(targetGop), ": ",
+                                   Error(hitAfterPrefetch)], ""))
+    let gotLen: int32 = BytesLen(Value(hitAfterPrefetch))
+    if gotLen != oracleGopLen:
+        return fail(strutil.Join(["GOP ", IntToStr(targetGop), " byte length mismatch: got=", IntToStr(gotLen),
+                                   " oracle=", IntToStr(oracleGopLen)], ""))
+    let capturedBeforeNextTick: int32 = chengTestEsSinkCaptured()
+    let nextTickRc: int32 = media_bridge.WebSceneMediaEsStreamLoop()
+    if nextTickRc != 0 && nextTickRc != 7:
+        return fail(strutil.Join(["ordinary tick after interleaved prefetch rc=", IntToStr(nextTickRc), " want 0 or 7"], ""))
+    if chengTestEsSinkCaptured() <= capturedBeforeNextTick:
+        return fail("ordinary tick after interleaved prefetch delivered no new frames — shared session corrupted")
+    os.WriteLine(os.Get_stdout(), "step6_interleaved_prefetch_ok")
+
+    # 7. Teardown clean: a tick issued after Close() is honestly rejected, not silently run.
+    media_bridge.WebSceneMediaEsClose()
+    let afterCloseRc: int32 = media_bridge.WebSceneMediaEsStreamLoop()
+    if afterCloseRc != 1:
+        return fail(strutil.Join(["StreamLoop after Close() rc=", IntToStr(afterCloseRc), " want=1 (not open)"], ""))
+    os.WriteLine(os.Get_stdout(), "step7_teardown_clean_ok")
+
+    os.WriteLine(os.Get_stdout(), "ALL OK")
+    return 0

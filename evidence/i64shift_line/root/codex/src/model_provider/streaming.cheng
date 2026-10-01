@@ -1,0 +1,384 @@
+# SSE streaming parser for model provider chat completions
+#
+# Ported from codex-rs SSE streaming logic (codex-api/src/sse/).
+#
+# Parses Server-Sent Events (SSE) from OpenAI-compatible streaming
+# chat completion endpoints.
+#
+# SSE format:
+#   data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}
+#
+#   data: {"choices":[{"delta":{"content":" World"},"index":0}]}
+#
+#   data: [DONE]
+#
+# NOTE: Cheng's HTTP module (HttpPost) returns complete responses only,
+# not streaming byte streams. The SSE parser in this file works on
+# complete SSE text buffers. For real streaming, a future streaming
+# HTTP client is needed.
+
+import std/rawmem_support
+
+# ── Stream event types ──────────────────────────────────────────────────
+
+# Stream event kind constants
+const STREAM_EVENT_DELTA: str = "delta"
+const STREAM_EVENT_DONE: str = "done"
+const STREAM_EVENT_ERROR: str = "error"
+
+@importc("driver_c_new_string")
+fn stream_driver_c_new_string(size: int32): ptr
+
+@importc("ptr_add")
+fn stream_ptr_add(p: ptr, off: int32): ptr
+
+# Stream callback type: invoked for each parsed SSE event.
+# event: "delta" | "done" | "error"
+# data: the parsed delta text content (for "delta"), or empty for "done"/"error"
+# finishReason: the finish reason from the final delta (for "done"), or ""
+type
+    StreamCallback = fn (event: str, data: str, finishReason: str)
+
+# Parsed SSE event
+type
+    SseEvent =
+        kind: str      # "delta", "done", "error"
+        content: str   # delta text content
+        finishReason: str
+        errorMsg: str
+        ok: bool
+
+fn NewSseEvent(): SseEvent =
+    var e: SseEvent
+    e.kind = ""
+    e.content = ""
+    e.finishReason = ""
+    e.errorMsg = ""
+    e.ok = false
+    return e
+
+# ── Low-level SSE helpers ───────────────────────────────────────────────
+
+fn streamLen(s: str): int32 =
+    if s.data == nil:
+        return 0
+    if s.len <= 0:
+        return 0
+    return s.len
+
+fn streamNewStringAlloc(count: int32): str =
+    var out: str
+    if count <= 0:
+        return out
+    let raw: ptr = stream_driver_c_new_string(count)
+    if raw != nil:
+        out.data = raw
+        out.len = count
+        out.flags = 1
+    return out
+
+fn streamSlice(s: str, start: int32, count: int32): str =
+    var out: str
+    let n: int32 = streamLen(s)
+    var start0: int32 = start
+    if count <= 0 || n <= 0:
+        return out
+    if start0 < 0:
+        start0 = 0
+    if start0 >= n:
+        return out
+    var kept: int32 = count
+    if start0 + kept > n:
+        kept = n - start0
+    if kept <= 0:
+        return out
+    out.data = stream_ptr_add(s.data, start0)
+    out.len = kept
+    out.store_id = s.store_id
+    return out
+
+fn streamCat(left: str, right: str): str =
+    let leftLen: int32 = streamLen(left)
+    let rightLen: int32 = streamLen(right)
+    let total: int32 = leftLen + rightLen
+    if total <= 0:
+        return ""
+    let out: str = streamNewStringAlloc(total)
+    let raw: ptr = StrDataPtr(out)
+    if raw == nil:
+        return ""
+    if leftLen > 0:
+        rawmem_support.RawmemCopy(raw, StrDataPtr(left), leftLen)
+    if rightLen > 0:
+        rawmem_support.RawmemCopy(stream_ptr_add(raw, leftLen), StrDataPtr(right), rightLen)
+    rawmem_support.RawmemWriteI8(raw, total, Int8(0))
+    return out
+
+fn streamHasPrefix(s: str, prefix: str): bool =
+    let n: int32 = streamLen(s)
+    let m: int32 = streamLen(prefix)
+    if m == 0:
+        return true
+    if m > n:
+        return false
+    var i: int32
+    while i < m:
+        if s[i] != prefix[i]:
+            return false
+        i = i + 1
+    return true
+
+fn streamIsStripChar(ch: char): bool =
+    let code: int32 = Int32(ch)
+    if code == 32:
+        return true
+    if code == 9:
+        return true
+    if code == 10:
+        return true
+    if code == 13:
+        return true
+    return false
+
+fn streamStrip(s: str): str =
+    let n: int32 = streamLen(s)
+    if n <= 0:
+        return ""
+    var start: int32
+    while start < n && streamIsStripChar(s[start]):
+        start = start + 1
+    if start >= n:
+        return ""
+    var stop: int32 = n - 1
+    while stop >= start && streamIsStripChar(s[stop]):
+        stop = stop - 1
+    return streamSlice(s, start, stop - start + 1)
+
+# Find a substring starting from a position.
+fn findSub(json: str, needle: str, start: int32): int32 =
+    let n: int32 = streamLen(json)
+    let nl: int32 = streamLen(needle)
+    if nl == 0:
+        return -1
+    if start + nl > n:
+        return -1
+    var i: int32 = start
+    while i <= n - nl:
+        var matched: bool = true
+        var j: int32
+        while j < nl:
+            if json[i + j] != needle[j]:
+                matched = false
+                break
+            j = j + 1
+        if matched:
+            return i
+        i = i + 1
+    return -1
+
+# Skip whitespace in JSON.
+fn skipWs(json: str, i: int32): int32 =
+    var pos: int32 = i
+    let n: int32 = streamLen(json)
+    while pos < n:
+        let ch: int32 = int32(json[pos])
+        if ch == 32 or ch == 9 or ch == 10 or ch == 13:
+            pos = pos + 1
+        else:
+            break
+    return pos
+
+# Extract a string value for a given key from a JSON substring.
+fn extractJsonStr(json: str, key: str): str =
+    let n: int32 = streamLen(json)
+    if n == 0 or key == "":
+        return ""
+    var keyPat: str = streamCat(streamCat("\"", key), "\":")
+    var pos: int32 = findSub(json, keyPat, 0)
+    if pos < 0:
+        return ""
+    var i: int32 = pos + streamLen(keyPat)
+    i = skipWs(json, i)
+    if i >= n or json[i] != '"':
+        return ""
+    i = i + 1
+    var result: str
+    while i < n:
+        let ch: char = json[i]
+        if ch == '\\':
+            i = i + 1
+            if i >= n:
+                break
+            let esc: char = json[i]
+            if esc == '"':
+                result = streamCat(result, "\"")
+            elif esc == '\\':
+                result = streamCat(result, "\\")
+            elif esc == 'n':
+                result = streamCat(result, "\n")
+            else:
+                result = streamCat(result, streamSlice(json, i, 1))
+            i = i + 1
+        elif ch == '"':
+            break
+        else:
+            result = streamCat(result, streamSlice(json, i, 1))
+            i = i + 1
+    return result
+
+# ── SSE line parsing ────────────────────────────────────────────────────
+
+# Parse a single SSE "data:" line from a chat completion stream.
+#
+# Input: a line like:
+#   data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}
+# or:
+#   data: [DONE]
+#
+# Returns an SseEvent. If the line is not a data line, ok=false.
+fn ParseSseDataLine(line: str): SseEvent =
+    var event: SseEvent = NewSseEvent()
+
+    let trimmed: str = streamStrip(line)
+    if trimmed == "":
+        return event
+
+    # Check for "data: " prefix
+    if !streamHasPrefix(trimmed, "data: "):
+        return event
+
+    let payload: str = streamSlice(trimmed, 6, streamLen(trimmed) - 6)
+
+    # Check for [DONE] signal
+    if payload == "[DONE]":
+        event.kind = STREAM_EVENT_DONE
+        event.ok = true
+        return event
+
+    # Parse JSON payload to extract delta content
+    # Expected shape:
+    # {"choices":[{"delta":{"content":"text"},"finish_reason":null}]}
+    # or final:
+    # {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+    let deltaContent: str = extractJsonStr(payload, "content")
+    event.content = deltaContent
+
+    if deltaContent != "":
+        event.kind = STREAM_EVENT_DELTA
+    else:
+        # Check if this is a final delta with finish_reason
+        let finishReason: str = extractJsonStr(payload, "finish_reason")
+        if finishReason != "":
+            event.kind = STREAM_EVENT_DONE
+            event.finishReason = finishReason
+        else:
+            # Check for error
+            let errorMsg: str = extractJsonStr(payload, "message")
+            if errorMsg != "":
+                event.kind = STREAM_EVENT_ERROR
+                event.errorMsg = errorMsg
+            else:
+                # Empty delta, skip
+                return event
+
+    event.ok = true
+    return event
+
+# ── Full SSE stream parsing ─────────────────────────────────────────────
+
+# Parse a complete SSE stream buffer into an array of events.
+#
+# This parses the buffer by splitting on double-newlines and processing
+# each "data: ..." line. For real streaming, call ParseSseDataLine on
+# each incoming data line as it arrives.
+#
+# sseBuffer: the full SSE text (with "data:" lines separated by \n\n)
+# outEvents: output array of event kind strings
+# outContents: output array of content strings (parallel to outEvents)
+# Returns the number of events parsed.
+fn ParseSseStream(sseBuffer: str,
+                   outEvents: var str[],
+                   outContents: var str[],
+                   outFinishReasons: var str[]): int32 =
+    let totalLen: int32 = streamLen(sseBuffer)
+    if totalLen == 0:
+        return 0
+
+    var count: int32
+    var lineStart: int32
+    var i: int32
+
+    while i <= totalLen:
+        # Check for end of line (\n)
+        if i == totalLen or sseBuffer[i] == '\n':
+            if i > lineStart:
+                let line: str = streamSlice(sseBuffer, lineStart, i - lineStart)
+                let event: SseEvent = ParseSseDataLine(line)
+                if event.ok:
+                    # Add to arrays (using direct indexed access for str[])
+                    if count == 0:
+                        outEvents[count] = event.kind
+                        outContents[count] = event.content
+                        outFinishReasons[count] = event.finishReason
+                    elif count == 1:
+                        outEvents[count] = event.kind
+                        outContents[count] = event.content
+                        outFinishReasons[count] = event.finishReason
+                    elif count == 2:
+                        outEvents[count] = event.kind
+                        outContents[count] = event.content
+                        outFinishReasons[count] = event.finishReason
+                    elif count == 3:
+                        outEvents[count] = event.kind
+                        outContents[count] = event.content
+                        outFinishReasons[count] = event.finishReason
+                    elif count == 4:
+                        outEvents[count] = event.kind
+                        outContents[count] = event.content
+                        outFinishReasons[count] = event.finishReason
+                    elif count == 5:
+                        outEvents[count] = event.kind
+                        outContents[count] = event.content
+                        outFinishReasons[count] = event.finishReason
+                    elif count == 6:
+                        outEvents[count] = event.kind
+                        outContents[count] = event.content
+                        outFinishReasons[count] = event.finishReason
+                    elif count == 7:
+                        outEvents[count] = event.kind
+                        outContents[count] = event.content
+                        outFinishReasons[count] = event.finishReason
+                    count = count + 1
+            lineStart = i + 1
+        i = i + 1
+
+    return count
+
+# ── Callback-driven streaming (scaffolding) ─────────────────────────────
+
+# Process SSE data lines and invoke callback for each event.
+#
+# This function is designed for use with a streaming HTTP source.
+# In the current implementation without streaming HTTP, it processes
+# a complete SSE buffer. For real streaming, feed data line-by-line.
+#
+# sseBuffer: complete SSE text buffer
+# callback: function to call for each event
+fn ProcessSseBuffer(sseBuffer: str, callback: StreamCallback) =
+    let totalLen: int32 = streamLen(sseBuffer)
+    if totalLen == 0:
+        return
+
+    var lineStart: int32
+    var i: int32
+
+    while i <= totalLen:
+        if i == totalLen or sseBuffer[i] == '\n':
+            if i > lineStart:
+                let line: str = streamSlice(sseBuffer, lineStart, i - lineStart)
+                let event: SseEvent = ParseSseDataLine(line)
+                if event.ok:
+                    callback(event.kind, event.content, event.finishReason)
+            lineStart = i + 1
+        i = i + 1

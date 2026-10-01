@@ -1,0 +1,190 @@
+# Real two-OS-process mDNS discovery smoke.
+#
+# Unlike mdns_lan_two_node_smoke.cheng (which advertises BOTH node A and node B
+# from inside the SAME process/mdnsState, so the "discovery" never needs the
+# network -- the peer is already sitting in the local cache before any packet
+# is sent), this binary only ever knows about ONE identity: its own. It is
+# meant to be launched as two independent OS processes (ROLE=A / ROLE=B),
+# each opening its own real UDP socket, joining the real 224.0.0.251 mDNS
+# multicast group, and finding the OTHER process purely by receiving real
+# multicast packets over the wire. This exercises the exact same production
+# entry points (mdnsAdvertise / mdnsDiscover) that libp2p_mdns_probe uses.
+#
+# Usage: two processes, same host, each with:
+#   ROLE=A  (or ROLE=B)   -- required, selects this process's identity
+#   MDNS_TWO_PROC_NS=<namespace>  -- optional, isolates this run from other
+#                                    mdns traffic on the LAN (defaults below)
+# Exit 0 iff this process observed a peer attrs entry whose PeerId differs
+# from its own within the deadline. Exit 1 on timeout/failure.
+
+import cheng/libp2p/utils/result
+import cheng/libp2p/discovery/mdns
+import cheng/libp2p/multiaddress
+import std/times
+import std/parseutils
+
+# NOTE: identity is derived via peerIdFromInlineBytesUnchecked (a real,
+# non-test production API in peerid.cheng -- PeerId is a plain str alias)
+# instead of generateKeyPair()/peerIdFromPrivateKey(). This is not a shortcut
+# around the mechanism under test (mDNS advertise/discover): key generation
+# is a separate concern from discovery. It also sidesteps a real global-state
+# corruption bug in the current stage3 seed where importing
+# cheng/libp2p/crypto/rand (or crypto/crypto, which pulls it in) together with
+# cheng/libp2p/discovery/mdns in the same entry-file closure corrupts the
+# mdns module's global state init (setMdnsConfig/setMdnsState) -- manifesting
+# as SIGBUS in one import order and an infinite hang inside setRandomSeed in
+# the other. Reproduced in isolation down to a 6-line repro; root cause not
+# yet chased past "global slot layout collision between two modules' package
+# state" (out of scope for a discovery-mechanism smoke).
+#
+# peerIdFromInlineBytesUnchecked (as opposed to the even simpler
+# peerIdFromTextUnchecked used by an earlier version of this file) wraps the
+# role-derived text in a real identity multihash + base58 encoding, exactly
+# like peerIdFromPublicKey's own short-key branch does for a real public key.
+# This was a genuine, previously undiagnosed root cause of "self-discovery
+# works, mutual discovery never closes": peerIdFromTextUnchecked returns its
+# input completely unencoded, so it round-trips fine locally (this process's
+# own selfPeer/selfAttrs never leaves memory), but the *peer* that receives it
+# over the wire in a TXT `id=` field runs the real production parsePeerId
+# (which validates multibase/base58 + multihash framing) on it in
+# mdnsParsePeerFromTxt -- and a bare unencoded role string like
+# "cheng-two-proc-A" always fails that validation. mdnsParsePeerFromTxt used
+# to silently drop the peer id in that case (see mdns.cheng), so the record
+# still landed in the receiver's cache, just permanently id-less -- which can
+# never satisfy this smoke's "discovered peer id differs from mine" check.
+# Both sides were sending/receiving fully real UDP multicast bytes the whole
+# time; the wire and cache-TTL machinery were never the problem.
+
+# NOTE: this driver deliberately never mutates a locally-declared MdnsConfig
+# (`var cfg: MdnsConfig = initMdnsConfig(); cfg.field = ...`) -- doing so from
+# an entry .cheng file that only imports the mdns module (rather than being
+# part of it) trips a real cross-module type-resolution defect in the current
+# stage3 seed ("typed let initializer kind mismatch declared=MdnsConfig
+# declared_kind=2 actual_kind=5"), reproduced identically on the pre-existing
+# mdns_lan_two_node_smoke.cheng. Isolation from other local mdns traffic is
+# done entirely through PeerAttribute-level namespace tagging on locally-typed
+# PeerAttributes values instead, which does not hit that path. The DNS-level
+# service name stays at the module default (mdnsDefaultServiceName) so the
+# real wire query/response matching in mdnsHandlePacket (which keys off
+# mdnsState.config.serviceName) still lines up between both processes.
+const
+    twoProcDefaultNamespace = "cheng-two-proc-lab"
+    roleEnv = "ROLE"
+    nsEnv = "MDNS_TWO_PROC_NS"
+    deadlineMsEnv = "MDNS_TWO_PROC_DEADLINE_MS"
+    defaultDeadlineMs = 4000
+
+@importc("getenv")
+fn twoProcGetEnv(name: cstring): cstring
+
+fn cstrToStr(v: cstring): str =
+    if v == nil:
+        return ""
+    return strFromCStringBorrow(v)
+
+fn envOr(name: str, fallback: str): str =
+    let raw: str = cstrToStr(twoProcGetEnv(name))
+    if len(raw) <= 0:
+        return fallback
+    return raw
+
+fn envIntOr(name: str, fallback: int32): int32 =
+    let raw: str = cstrToStr(twoProcGetEnv(name))
+    if len(raw) <= 0:
+        return fallback
+    var parsed: int32
+    if parseInt32(raw, parsed) <= 0:
+        return fallback
+    return parsed
+
+fn runTwoProcessSmoke(): Result[bool] =
+    let role: str = envOr(roleEnv, "")
+    if role != "A" && role != "B":
+        return Err[bool]("mdns two-process smoke: ROLE env must be A or B (got '" + role + "')")
+    let namespace: str = envOr(nsEnv, twoProcDefaultNamespace)
+    let deadlineMs: int32 = envIntOr(deadlineMsEnv, defaultDeadlineMs)
+    let selfPort: str = if role == "A": "41401" else: "41402"
+
+    # setMdnsConfig(initMdnsConfig()) is safe (MdnsConfig has no large fixed
+    # array). setMdnsState(initMdnsState()) is NOT called here: MdnsState
+    # embeds a ~198KB entries: MdnsEntry[64] cache array, and round-tripping
+    # a struct that large through a function return value on the current
+    # stage3 seed silently zeroes every field at the call site (see the
+    # file-level NOTE). mdnsState.count/.entries already start at their
+    # correct zero value from the module's own top-level var initializer.
+    setMdnsConfig(initMdnsConfig())
+
+    # Role-derived identity: ROLE=A and ROLE=B are guaranteed distinct by the
+    # caller's contract (checked above), so a role-tagged text is sufficient
+    # to make the two processes genuinely different peers for this discovery
+    # smoke -- see the file-level NOTE for why key generation is not used.
+    let selfPeer = peerIdFromInlineBytesUnchecked(BytesFromString("cheng-two-proc-" + role))
+    let selfAddrText: str = "/ip4/127.0.0.1/udp/" + selfPort + "/quic-v1"
+    let selfAddrRes: Result[MultiAddress] = parseMultiAddress(selfAddrText)
+    if IsErr(selfAddrRes):
+        return Err[bool](Error(selfAddrRes))
+
+    var selfAttrs = initPeerAttributes()
+    let addPeerRes: Result[bool] = peerAttributesAddPeerId(selfAttrs, selfPeer)
+    if IsErr(addPeerRes):
+        return Err[bool](Error(addPeerRes))
+    let addAddrRes: Result[bool] = peerAttributesAddAddress(selfAttrs, Value(selfAddrRes))
+    if IsErr(addAddrRes):
+        return Err[bool](Error(addAddrRes))
+    let addNsRes: Result[bool] = peerAttributesAddNamespace(selfAttrs, namespace)
+    if IsErr(addNsRes):
+        return Err[bool](Error(addNsRes))
+
+    echo("mdns two-proc smoke: role=" + role + " peer=" + toString(selfPeer))
+
+    let advRes: Result[bool] = mdnsAdvertise(selfAttrs)
+    if IsErr(advRes):
+        return Err[bool](Error(advRes))
+
+    var query = initPeerAttributes()
+    let addQueryNsRes: Result[bool] = peerAttributesAddNamespace(query, namespace)
+    if IsErr(addQueryNsRes):
+        return Err[bool](Error(addQueryNsRes))
+
+    # PeerAttributesList is a fixed-size composite (count + a 64-entry
+    # PeerAttributes[] array); declared ONCE outside the loop and reset via a
+    # plain field write each round rather than re-materialized per iteration,
+    # since re-running initPeerAttributesList() every round forces a fresh
+    # whole-struct value copy of that (large) fixed array on every pass.
+    var out = initPeerAttributesList()
+    let deadline: int64 = EpochTimeNs() + int64(deadlineMs) * 1000000
+    while EpochTimeNs() < deadline: # cheng-syntax-policy: allow-counting-while
+        out.count = 0
+        # A discover round can genuinely fail on a live LAN: this socket
+        # receives real third-party mDNS traffic (macOS mDNSResponder,
+        # printers, etc.), not just our own two peers, and a malformed or
+        # unsupported-encoding record from any of that foreign traffic can
+        # legitimately fault a single round's parse (e.g. DNS name-pointer
+        # loop detection). That is not fatal to discovery: skip the round
+        # and keep polling within the deadline, matching how any real
+        # client on a noisy network needs to behave.
+        let discRes: Result[bool] = mdnsDiscover(query, out)
+        if IsErr(discRes):
+            continue
+        for i in 0..<out.count:
+            var pid = selfPeer
+            let item = out.items[i]
+            if peerAttributesGetPeerId(item, pid):
+                let eqRes: Result[bool] = peerIdEqual(pid, selfPeer)
+                if IsOk(eqRes) && !(Value(eqRes)):
+                    echo("mdns two-proc smoke: role=" + role + " discovered peer=" + toString(pid))
+                    return Ok[bool](true)
+        # Re-advertise each round so a peer that joins the multicast group
+        # after our first broadcast still sees a query/response it can answer.
+        let readvRes: Result[bool] = mdnsAdvertise(selfAttrs)
+        if IsErr(readvRes):
+            return Err[bool](Error(readvRes))
+    return Err[bool]("mdns two-proc smoke: role=" + role + " timed out with no foreign peer discovered")
+
+fn main(): int32 =
+    let res: Result[bool] = runTwoProcessSmoke()
+    if IsErr(res):
+        echo("mdns two-process smoke failed: " + Error(res))
+        return 1
+    echo("mdns two-process smoke ok")
+    return 0

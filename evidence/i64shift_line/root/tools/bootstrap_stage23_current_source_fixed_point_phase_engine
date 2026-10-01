@@ -1,0 +1,5022 @@
+#!/usr/bin/python3
+"""Canonical 16-phase command contract for the current-source bootstrap chain.
+
+This tool owns phase ordering, argv construction, expected exit codes, timeouts,
+and produced-path roles.  It does not install artifacts, publish authority, or
+create a cgroup.  The production gate is responsible for running each asserted
+phase inside one pre-created cgroup-v2 leaf and for independently validating
+the phase's immutable descendant-exec manifest and terminal receipt.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, NoReturn, Sequence
+
+sys.dont_write_bytecode = True
+
+SCHEMA = "cheng.bootstrap_stage23_current_source_fixed_point_phase"
+PLAN_SCHEMA = "cheng.bootstrap_stage23_current_source_fixed_point_phase_plan"
+PHASE_COUNT = 16
+# Bake phases run inside the frozen source snapshot: every compiler cache
+# (object cache + link cache share this switch) must stay disabled or the
+# compile writes undeclared cold_object_cache entries into the closed tree
+# and the next phase's evidence audit fails. Cache state is byte-neutral
+# (cold/warm/disabled artifacts are identical), so this only affects speed.
+# Keep the tuple sorted: the linux execution manifest canonicalizes env rows
+# and the independent validator compares them byte-exactly against the plan.
+CANONICAL_ENV = (
+    ("CHENG_DISABLE_COLD_OBJECT_CACHE", "1"),
+    ("LANG", "C"),
+    ("LC_ALL", "C"),
+    ("TZ", "UTC"),
+)
+LINUX_GENERATED_ARGV_DIRECTORY = (
+    "/cheng-hardcap-control/compiler-generated-argv"
+)
+LINUX_CANONICAL_ENV = (
+    ("CHENG_DISABLE_COLD_OBJECT_CACHE", "1"),
+    ("LANG", "C"),
+    ("LC_ALL", "C"),
+    ("PATH", "/usr/bin:/bin"),
+    ("TMPDIR", LINUX_GENERATED_ARGV_DIRECTORY),
+    ("TZ", "UTC"),
+)
+PHASE_DIRECTORY_FIRST_OWNER = {
+    "bridge": 2,
+    "candidate": 1,
+    "guards": 0,
+    "phase-receipts": 0,
+    "reports": 0,
+    "source-snapshot": 0,
+    "t7": 11,
+}
+GUARD_LAUNCHER_ENV = {
+    "HOME": "/nonexistent",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/bin:/bin",
+    "TZ": "UTC",
+}
+LANES = ("darwin", "linux")
+LANE_TARGET_TRIPLE = {
+    "darwin": "arm64-apple-darwin",
+    "linux": "x86_64-unknown-linux-gnu",
+}
+LANE_MACHINE_AUTHORITY = {
+    "darwin": "macho-cputype-16777228",
+    "linux": "elf-e_machine-62",
+}
+LANE_EXECUTABLE_FORMAT = {
+    "darwin": "macho64-arm64-darwin",
+    "linux": "elf64-x86_64-linux",
+}
+DARWIN_TOOLCHAIN_SNAPSHOT_RELATIVE = Path("toolchain-snapshot")
+PACKAGE_MANIFEST_RELATIVE = Path("cheng-package.toml")
+BOOTSTRAP_MANIFEST_RELATIVE = Path(
+    "bootstrap/compiler_bootstrap_manifest.cheng"
+)
+STAGE_INPUT_MANIFEST_SCHEMA = (
+    "cheng.bootstrap_stage23_phase_input_manifest"
+)
+PHASE_AUTHORITY_ARTIFACT_SCHEMA = (
+    "cheng.bootstrap_stage23_phase_authority_artifact"
+)
+FROZEN_ROLE_AUTHORITY = "frozen_role_manifest"
+SEALED_OUTPUT_AUTHORITY = "sealed_phase_output"
+STAGE_INPUT_MANIFEST_COMMON_FIELDS = (
+    "schema",
+    "lane",
+    "targetTriple",
+    "machineAuthority",
+    "phaseIndex",
+    "phaseLabel",
+    "phasePlan",
+    "phasePlanSha256",
+    "phaseEnv",
+    "phaseEnvSha256",
+    "runnerArgv",
+    "runnerArgvSha256",
+    "phaseActions",
+    "plannedOutputs",
+    "terminalRelativePath",
+    "declaredDeltaDirectories",
+    "declaredDeltaFiles",
+    "declaredOutputSetSha256",
+    "frozenRoles",
+    "nativeExecutableClosure",
+    "nativeExecutableClosureSha256",
+    "boundScripts",
+    "monitorRuntime",
+)
+STAGE_INPUT_MANIFEST_SINGLE_COMMAND_FIELDS = (
+    *STAGE_INPUT_MANIFEST_COMMON_FIELDS,
+    "phaseCommandArgv",
+    "phaseCommandArgvSha256",
+)
+STAGE_INPUT_MANIFEST_MULTI_ACTION_FIELDS = (
+    *STAGE_INPUT_MANIFEST_COMMON_FIELDS,
+    "phaseCommandActions",
+    "phaseCommandActionsSha256",
+    "commandIdentities",
+    "commandActionPrivateFrozenTrees",
+)
+STAGE_INPUT_MANIFEST_FIELDS = STAGE_INPUT_MANIFEST_SINGLE_COMMAND_FIELDS
+PHASE_ACTION_TERMINAL_SCHEMA = (
+    "cheng.bootstrap_stage23_phase_row_receipt"
+)
+PHASE_ACTION_TERMINAL_COMMON_FIELDS = (
+    "schema",
+    "status",
+    "lane",
+    "targetTriple",
+    "machineAuthority",
+    "phaseIndex",
+    "phaseLabel",
+    "phasePlanSha256",
+    "runnerArgvSha256",
+    "phaseEnvSha256",
+    "stageInputManifestSha256",
+    "terminalRelativePath",
+    "declaredDeltaDirectories",
+    "declaredDeltaFiles",
+    "declaredOutputSetSha256",
+    "actions",
+    "produced",
+)
+PHASE_ACTION_TERMINAL_SINGLE_COMMAND_FIELDS = (
+    *PHASE_ACTION_TERMINAL_COMMON_FIELDS,
+    "phaseCommandArgvSha256",
+    "guardReceiptSha256",
+)
+PHASE_ACTION_TERMINAL_MULTI_ACTION_FIELDS = (
+    *PHASE_ACTION_TERMINAL_COMMON_FIELDS,
+    "phaseCommandActionsSha256",
+    "commandActionReceipts",
+    "guardReceiptsAggregateSha256",
+)
+PHASE_ACTION_TERMINAL_FIELDS = (
+    PHASE_ACTION_TERMINAL_SINGLE_COMMAND_FIELDS
+)
+
+
+class PhaseEngineError(RuntimeError):
+    pass
+
+
+def fail(message: str) -> NoReturn:
+    raise PhaseEngineError(message)
+
+
+def stage_input_manifest_fields(
+    lane: str,
+    phase_index: int,
+) -> tuple[str, ...]:
+    lane = canonical_lane(lane)
+    if (
+        not isinstance(phase_index, int)
+        or isinstance(phase_index, bool)
+        or phase_index < 0
+        or phase_index >= PHASE_COUNT
+    ):
+        fail("stage input manifest phase is outside the chain")
+    if lane == "darwin" and phase_index in (0, 1):
+        return STAGE_INPUT_MANIFEST_MULTI_ACTION_FIELDS
+    return STAGE_INPUT_MANIFEST_SINGLE_COMMAND_FIELDS
+
+
+def phase_action_terminal_fields(
+    lane: str,
+    phase_index: int,
+) -> tuple[str, ...]:
+    lane = canonical_lane(lane)
+    if (
+        not isinstance(phase_index, int)
+        or isinstance(phase_index, bool)
+        or phase_index < 0
+        or phase_index >= PHASE_COUNT
+    ):
+        fail("phase action terminal phase is outside the chain")
+    if lane == "darwin" and phase_index in (0, 1):
+        return PHASE_ACTION_TERMINAL_MULTI_ACTION_FIELDS
+    return PHASE_ACTION_TERMINAL_SINGLE_COMMAND_FIELDS
+
+
+@dataclass(frozen=True)
+class OutputSpec:
+    role: str
+    kind: str
+
+    def __post_init__(self) -> None:
+        if (
+            not self.role
+            or self.kind not in {"executable", "regular"}
+            or any(
+                char not in "abcdefghijklmnopqrstuvwxyz0123456789_"
+                for char in self.role
+            )
+        ):
+            fail("phase output specification is invalid")
+
+
+@dataclass(frozen=True)
+class PhaseSpec:
+    index: int
+    label: str
+    command_role: str
+    expected_exit_code: int
+    timeout_seconds: int
+    outputs: tuple[OutputSpec, ...]
+
+    @property
+    def produced_roles(self) -> tuple[str, ...]:
+        return tuple(item.role for item in self.outputs)
+
+
+# Per-phase hang budgets scale with the host: the certification lane must
+# also complete on x86_64 Linux hosts emulated on arm64 (QEMU TCG measures
+# ~11.3x native cc time), so every budget below is native_budget * 20 (python-dominated snapshot phases measure worse than the 11.3x cc factor).
+# Timeouts carry no correctness weight: phase outputs, cgroup memory
+# enforcement and byte fixed points are timeout-independent.
+PHASE_SPECS = (
+    PhaseSpec(
+        0,
+        "cc-deps-pre",
+        "cc",
+        0,
+        2400,
+        (
+            OutputSpec("cc_deps_pre_stdout", "regular"),
+            OutputSpec("source_pre_manifest", "regular"),
+            OutputSpec("source_snapshot_manifest", "regular"),
+            OutputSpec("snapshot_bootstrap", "regular"),
+            OutputSpec("snapshot_contract", "regular"),
+            OutputSpec("snapshot_bootstrap_manifest", "regular"),
+            OutputSpec("snapshot_package_manifest", "regular"),
+            OutputSpec("snapshot_t7", "regular"),
+        ),
+    ),
+    PhaseSpec(
+        1,
+        "cc-build",
+        "cc",
+        0,
+        6000,
+        (
+            OutputSpec("cold_candidate", "executable"),
+            OutputSpec("seed_atom_manifest", "regular"),
+        ),
+    ),
+    PhaseSpec(
+        2,
+        "stage0-compile",
+        "cold_candidate",
+        0,
+        6000,
+        (
+            OutputSpec("stage0", "executable"),
+            OutputSpec("stage0_report", "regular"),
+            OutputSpec("stage0_generated_c", "regular"),
+        ),
+    ),
+    PhaseSpec(
+        3,
+        "stage0-self-check",
+        "stage0",
+        0,
+        1200,
+        (OutputSpec("stage0_atom_manifest", "regular"),),
+    ),
+    PhaseSpec(
+        4,
+        "stage1-compile",
+        "stage0",
+        0,
+        6000,
+        (
+            OutputSpec("stage1", "executable"),
+            OutputSpec("stage1_report", "regular"),
+            OutputSpec("stage1_generated_c", "regular"),
+        ),
+    ),
+    PhaseSpec(
+        5,
+        "stage1-self-check",
+        "stage1",
+        0,
+        1200,
+        (OutputSpec("stage1_atom_manifest", "regular"),),
+    ),
+    PhaseSpec(
+        6,
+        "stage2-compile",
+        "stage1",
+        0,
+        6000,
+        (
+            OutputSpec("stage2", "executable"),
+            OutputSpec("stage2_report", "regular"),
+            OutputSpec("stage2_generated_c", "regular"),
+        ),
+    ),
+    PhaseSpec(
+        7,
+        "stage2-self-check",
+        "stage2",
+        0,
+        1200,
+        (OutputSpec("stage2_atom_manifest", "regular"),),
+    ),
+    PhaseSpec(
+        8,
+        "stage3-compile",
+        "stage2",
+        0,
+        6000,
+        (
+            OutputSpec("stage3", "executable"),
+            OutputSpec("stage3_report", "regular"),
+            OutputSpec("stage3_generated_c", "regular"),
+        ),
+    ),
+    PhaseSpec(
+        9,
+        "stage3-self-check",
+        "stage3",
+        0,
+        1200,
+        (OutputSpec("stage3_atom_manifest", "regular"),),
+    ),
+    PhaseSpec(
+        10,
+        "stage2-stage3-fixed-point",
+        "phase_engine",
+        0,
+        1200,
+        (OutputSpec("fixed_point_report", "regular"),),
+    ),
+    PhaseSpec(
+        11,
+        "stage2-t7-compile",
+        "stage2",
+        0,
+        6000,
+        (
+            OutputSpec("t7_stage2", "executable"),
+            OutputSpec("t7_stage2_report", "regular"),
+            OutputSpec("t7_stage2_validation", "regular"),
+        ),
+    ),
+    PhaseSpec(12, "stage2-t7-run", "t7_stage2", 7, 600, ()),
+    PhaseSpec(
+        13,
+        "stage3-t7-compile",
+        "stage3",
+        0,
+        6000,
+        (
+            OutputSpec("t7_stage3", "executable"),
+            OutputSpec("t7_stage3_report", "regular"),
+            OutputSpec("t7_stage3_validation", "regular"),
+        ),
+    ),
+    PhaseSpec(14, "stage3-t7-run", "t7_stage3", 7, 600, ()),
+    PhaseSpec(
+        15,
+        "cc-deps-post",
+        "cc",
+        0,
+        2400,
+        (
+            OutputSpec("cc_deps_post_stdout", "regular"),
+            OutputSpec("source_post_manifest", "regular"),
+        ),
+    ),
+)
+
+PHASE_BOUND_ROLES = {
+    0: (
+        "bootstrap_source",
+        "bootstrap_contract",
+        "bootstrap_manifest",
+        "package_manifest",
+        "t7_source",
+    ),
+    1: ("snapshot_bootstrap",),
+    2: ("snapshot_contract", "snapshot_bootstrap_manifest"),
+    3: ("snapshot_bootstrap_manifest",),
+    4: ("snapshot_contract", "snapshot_bootstrap_manifest"),
+    5: ("snapshot_bootstrap_manifest",),
+    6: ("snapshot_contract", "snapshot_bootstrap_manifest"),
+    7: ("snapshot_bootstrap_manifest",),
+    8: ("snapshot_contract", "snapshot_bootstrap_manifest"),
+    9: ("snapshot_bootstrap_manifest",),
+    10: ("stage2", "stage3"),
+    11: ("snapshot_package_manifest", "snapshot_t7"),
+    13: ("snapshot_package_manifest", "snapshot_t7"),
+    15: (
+        "bootstrap_source",
+        "bootstrap_manifest",
+        "source_pre_manifest",
+    ),
+}
+PHASE_OUTPUT_ROLES = tuple(
+    output.role for spec in PHASE_SPECS for output in spec.outputs
+)
+COMMAND_OUTPUT_ROLES = {
+    0: (),
+    1: ("cold_candidate",),
+    2: ("stage0", "stage0_report", "stage0_generated_c"),
+    3: (),
+    4: ("stage1", "stage1_report", "stage1_generated_c"),
+    5: (),
+    6: ("stage2", "stage2_report", "stage2_generated_c"),
+    7: (),
+    8: ("stage3", "stage3_report", "stage3_generated_c"),
+    9: (),
+    10: (),
+    11: ("t7_stage2", "t7_stage2_report"),
+    12: (),
+    13: ("t7_stage3", "t7_stage3_report"),
+    14: (),
+    15: (),
+}
+POST_ACTIONS = {
+    0: (
+        (
+            "freeze_source_snapshot",
+            (
+                "bootstrap_source",
+                "bootstrap_contract",
+                "bootstrap_manifest",
+                "package_manifest",
+                "t7_source",
+                "phase_guard_stdout",
+            ),
+            (
+                "cc_deps_pre_stdout",
+                "source_pre_manifest",
+                "source_snapshot_manifest",
+                "snapshot_bootstrap",
+                "snapshot_contract",
+                "snapshot_bootstrap_manifest",
+                "snapshot_package_manifest",
+                "snapshot_t7",
+            ),
+        ),
+    ),
+    1: (
+        (
+            "seal_seed_atom",
+            ("snapshot_bootstrap", "cold_candidate"),
+            ("seed_atom_manifest",),
+        ),
+    ),
+    3: (
+        (
+            "seal_stage0_self_check",
+            ("stage0", "phase_guard_stdout"),
+            ("stage0_atom_manifest",),
+        ),
+    ),
+    5: (
+        (
+            "seal_stage1_self_check",
+            ("stage1", "phase_guard_stdout"),
+            ("stage1_atom_manifest",),
+        ),
+    ),
+    7: (
+        (
+            "seal_stage2_self_check",
+            ("stage2", "phase_guard_stdout"),
+            ("stage2_atom_manifest",),
+        ),
+    ),
+    9: (
+        (
+            "seal_stage3_self_check",
+            ("stage3", "phase_guard_stdout"),
+            ("stage3_atom_manifest",),
+        ),
+    ),
+    10: (
+        (
+            "seal_stage2_stage3_fixed_point",
+            ("stage2", "stage3"),
+            ("fixed_point_report",),
+        ),
+    ),
+    11: (
+        (
+            "validate_stage2_t7_report",
+            ("t7_stage2", "t7_stage2_report"),
+            ("t7_stage2_validation",),
+        ),
+    ),
+    13: (
+        (
+            "validate_stage3_t7_report",
+            ("t7_stage3", "t7_stage3_report"),
+            ("t7_stage3_validation",),
+        ),
+    ),
+    15: (
+        (
+            "seal_source_post_manifest",
+            (
+                "bootstrap_source",
+                "bootstrap_manifest",
+                "phase_guard_stdout",
+                "source_pre_manifest",
+            ),
+            ("cc_deps_post_stdout", "source_post_manifest"),
+        ),
+    ),
+}
+
+
+@dataclass(frozen=True)
+class PhasePaths:
+    root: Path
+    evidence: Path
+    cc: Path
+
+    @property
+    def snapshot(self) -> Path:
+        return self.evidence / "source-snapshot"
+
+    @property
+    def bootstrap_source(self) -> Path:
+        return self.root / "bootstrap/cheng_cold.c"
+
+    @property
+    def bootstrap_manifest(self) -> Path:
+        return self.root / BOOTSTRAP_MANIFEST_RELATIVE
+
+    @property
+    def package_manifest(self) -> Path:
+        return self.root / PACKAGE_MANIFEST_RELATIVE
+
+    @property
+    def snapshot_bootstrap(self) -> Path:
+        return self.snapshot / "bootstrap/cheng_cold.c"
+
+    @property
+    def snapshot_contract(self) -> Path:
+        return self.snapshot / "bootstrap/stage1_bootstrap.cheng"
+
+    @property
+    def snapshot_bootstrap_manifest(self) -> Path:
+        return self.snapshot / BOOTSTRAP_MANIFEST_RELATIVE
+
+    @property
+    def snapshot_package_manifest(self) -> Path:
+        return self.snapshot / PACKAGE_MANIFEST_RELATIVE
+
+    @property
+    def snapshot_t7(self) -> Path:
+        return self.snapshot / "src/tests/t78_matrix/t7.cheng"
+
+    @property
+    def cold_candidate(self) -> Path:
+        return self.evidence / "candidate/cheng.cold.current"
+
+    @property
+    def cold_candidate_object(self) -> Path:
+        return self.evidence / "candidate/cheng.cold.current.o"
+
+    def command_action_input_root(
+        self,
+        phase_index: int,
+        action_index: int,
+    ) -> Path:
+        return (
+            self.evidence
+            / "command-action-inputs"
+            / f"{phase_index:02d}"
+            / f"{action_index:02d}"
+        )
+
+    def command_action_toolchain(
+        self,
+        phase_index: int,
+        action_index: int,
+    ) -> Path:
+        return (
+            self.command_action_input_root(phase_index, action_index)
+            / "toolchain"
+        )
+
+    def command_action_source(
+        self,
+        phase_index: int,
+        action_index: int,
+    ) -> Path:
+        return (
+            self.command_action_input_root(phase_index, action_index)
+            / "source"
+        )
+
+    def stage(self, index: int) -> Path:
+        return self.evidence / f"bridge/cheng.stage{index}"
+
+    def stage_report(self, index: int) -> Path:
+        return self.evidence / f"bridge/cheng.stage{index}.report.txt"
+
+    def t7(self, index: int) -> Path:
+        return self.evidence / f"t7/t7.stage{index}"
+
+    def t7_report(self, index: int) -> Path:
+        return self.evidence / f"t7/t7.stage{index}.report.txt"
+
+    def command_path(self, role: str) -> Path:
+        if role == "cc":
+            return self.cc
+        if role == "cold_candidate":
+            return self.cold_candidate
+        if role.startswith("stage") and role[5:].isdigit():
+            return self.stage(int(role[5:]))
+        if role == "t7_stage2":
+            return self.t7(2)
+        if role == "t7_stage3":
+            return self.t7(3)
+        fail("phase command role is unknown")
+
+    def output_path(self, role: str) -> Path:
+        reports = self.evidence / "reports"
+        guards = self.evidence / "guards"
+        if role == "cc_deps_pre_stdout":
+            return guards / "cc-deps-pre.inner.stdout.txt"
+        if role == "cc_deps_post_stdout":
+            return guards / "cc-deps-post.inner.stdout.txt"
+        if role == "source_pre_manifest":
+            return reports / "bootstrap-local-include-closure.pre.manifest"
+        if role == "source_post_manifest":
+            return reports / "bootstrap-local-include-closure.post.manifest"
+        if role == "source_snapshot_manifest":
+            return reports / "bootstrap-local-include-closure.snapshot.manifest"
+        if role == "snapshot_bootstrap":
+            return self.snapshot_bootstrap
+        if role == "snapshot_contract":
+            return self.snapshot_contract
+        if role == "snapshot_bootstrap_manifest":
+            return self.snapshot_bootstrap_manifest
+        if role == "snapshot_package_manifest":
+            return self.snapshot_package_manifest
+        if role == "snapshot_t7":
+            return self.snapshot_t7
+        if role == "cold_candidate":
+            return self.cold_candidate
+        if role == "seed_atom_manifest":
+            return reports / "bootstrap-cold-seed.atom.manifest"
+        if role.startswith("stage") and role[5:].isdigit():
+            return self.stage(int(role[5:]))
+        if role.startswith("stage") and role.endswith("_report"):
+            return self.stage_report(int(role[5]))
+        if role.startswith("stage") and role.endswith("_generated_c"):
+            return Path(str(self.stage(int(role[5]))) + ".generated.c")
+        if role.startswith("stage") and role.endswith("_atom_manifest"):
+            return reports / (
+                "bootstrap-stage" + role[5] + ".atom.manifest"
+            )
+        if role == "fixed_point_report":
+            return reports / "stage2-stage3-fixed-point.kv"
+        if role == "t7_stage2":
+            return self.t7(2)
+        if role == "t7_stage2_report":
+            return self.t7_report(2)
+        if role == "t7_stage2_validation":
+            return reports / "t7-stage2-backend-report-validation.kv"
+        if role == "t7_stage3":
+            return self.t7(3)
+        if role == "t7_stage3_report":
+            return self.t7_report(3)
+        if role == "t7_stage3_validation":
+            return reports / "t7-stage3-backend-report-validation.kv"
+        fail("phase output role is unknown")
+
+
+def canonical_existing_directory(raw: str, label: str) -> Path:
+    path = Path(raw)
+    if not path.is_absolute():
+        fail(f"{label} is not absolute")
+    try:
+        resolved = path.resolve(strict=True)
+        info = os.lstat(path)
+    except OSError as exc:
+        raise PhaseEngineError(f"{label} cannot be resolved") from exc
+    if (
+        resolved != path
+        or not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+    ):
+        fail(f"{label} is not a canonical directory")
+    return path
+
+
+def canonical_existing_executable(raw: str, label: str) -> Path:
+    path = Path(raw)
+    if not path.is_absolute():
+        fail(f"{label} is not absolute")
+    try:
+        resolved = path.resolve(strict=True)
+        info = os.lstat(path)
+    except OSError as exc:
+        raise PhaseEngineError(f"{label} cannot be resolved") from exc
+    if (
+        resolved != path
+        or not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or not info.st_mode & 0o111
+    ):
+        fail(f"{label} is not a canonical executable")
+    return path
+
+
+def validate_configuration() -> None:
+    if (
+        tuple(sorted(LANE_TARGET_TRIPLE)) != tuple(sorted(LANES))
+        or tuple(sorted(LANE_MACHINE_AUTHORITY)) != tuple(sorted(LANES))
+        or tuple(sorted(LANE_EXECUTABLE_FORMAT)) != tuple(sorted(LANES))
+        or LANE_TARGET_TRIPLE["linux"]
+            != "x86_64-unknown-linux-gnu"
+        or LANE_MACHINE_AUTHORITY["linux"] != "elf-e_machine-62"
+        or LANE_EXECUTABLE_FORMAT["linux"]
+            != "elf64-x86_64-linux"
+        or LANE_TARGET_TRIPLE["darwin"] != "arm64-apple-darwin"
+        or LANE_MACHINE_AUTHORITY["darwin"]
+            != "macho-cputype-16777228"
+        or LANE_EXECUTABLE_FORMAT["darwin"]
+            != "macho64-arm64-darwin"
+    ):
+        fail("lane target or machine authority drifted")
+    if len(PHASE_SPECS) != PHASE_COUNT:
+        fail("phase count drifted")
+    labels: set[str] = set()
+    produced: set[str] = set()
+    available = {"cc", "phase_engine"}
+    for index, spec in enumerate(PHASE_SPECS):
+        if (
+            spec.index != index
+            or spec.label in labels
+            or spec.command_role not in available
+            or not 0 <= spec.expected_exit_code <= 255
+            or spec.timeout_seconds <= 0
+            or len(set(spec.produced_roles)) != len(spec.produced_roles)
+        ):
+            fail("phase configuration is not a strict ordered chain")
+        labels.add(spec.label)
+        for role in spec.produced_roles:
+            if role in produced or role in available:
+                fail("phase output role has multiple producers")
+            produced.add(role)
+            if next(
+                item.kind for item in spec.outputs if item.role == role
+            ) == "executable":
+                available.add(role)
+    if {
+        role for role in produced
+        if role in {
+            "cold_candidate",
+            "stage0",
+            "stage1",
+            "stage2",
+            "stage3",
+            "t7_stage2",
+            "t7_stage3",
+        }
+    } != {
+        "cold_candidate",
+        "stage0",
+        "stage1",
+        "stage2",
+        "stage3",
+        "t7_stage2",
+        "t7_stage3",
+    }:
+        fail("dynamic executable role set drifted")
+    if set(PHASE_BOUND_ROLES) != {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15
+    }:
+        fail("phase bound input role mapping drifted")
+    if set(COMMAND_OUTPUT_ROLES) != set(range(PHASE_COUNT)):
+        fail("command output producer mapping drifted")
+    for spec in PHASE_SPECS:
+        command_outputs = COMMAND_OUTPUT_ROLES[spec.index]
+        post_outputs = tuple(
+            role
+            for _operation, _inputs, outputs
+            in POST_ACTIONS.get(spec.index, ())
+            for role in outputs
+        )
+        if (
+            len(set((*command_outputs, *post_outputs)))
+                != len(command_outputs) + len(post_outputs)
+            or set((*command_outputs, *post_outputs))
+                != set(spec.produced_roles)
+        ):
+            fail("phase output producer action coverage drifted")
+
+
+def canonical_lane(lane: str) -> str:
+    if lane not in LANES:
+        fail("phase lane is not canonical")
+    return lane
+
+
+def guard_launcher_environment(
+    lane: str,
+    monitor_python: Path,
+) -> dict[str, str]:
+    lane = canonical_lane(lane)
+    environment = dict(GUARD_LAUNCHER_ENV)
+    if lane == "linux":
+        if not monitor_python.is_absolute():
+            fail("Linux guard monitor Python path is not absolute")
+        environment["BEAT_C_GUARD_MONITOR_PYTHON"] = str(
+            monitor_python
+        )
+    return environment
+
+
+def local_c_source_closure(
+    paths: PhasePaths,
+    source_root: Path | None = None,
+) -> tuple[Path, ...]:
+    root = paths.root if source_root is None else source_root
+    bootstrap_source = (
+        paths.bootstrap_source
+        if source_root is None
+        else source_root / "bootstrap/cheng_cold.c"
+    )
+    pending = [bootstrap_source]
+    observed: set[Path] = set()
+    include_pattern = re.compile(
+        rb'^[ \t]*#[ \t]*include[ \t]*"([^"\r\n]+)"',
+        re.MULTILINE,
+    )
+    while pending:
+        path = pending.pop()
+        if path in observed:
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+            info = os.lstat(path)
+            raw = path.read_bytes()
+            resolved.relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise PhaseEngineError(
+                "local C closure input cannot be resolved"
+            ) from exc
+        if (
+            resolved != path
+            or not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_nlink != 1
+        ):
+            fail("local C closure input is not exact regular")
+        observed.add(path)
+        for match in include_pattern.finditer(raw):
+            try:
+                include_text = os.fsdecode(match.group(1))
+            except UnicodeError as exc:
+                raise PhaseEngineError(
+                    "local C include path is not filesystem text"
+                ) from exc
+            include_path = path.parent / include_text
+            try:
+                include_path.resolve(strict=True).relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise PhaseEngineError(
+                    "local C include escapes source root"
+                ) from exc
+            pending.append(include_path)
+    observed.remove(bootstrap_source)
+    return tuple(sorted(
+        observed,
+        key=lambda item: os.fsencode(str(item.relative_to(root))),
+    ))
+
+
+def dynamic_snapshot_outputs(
+    paths: PhasePaths,
+    source_root: Path | None = None,
+) -> tuple[tuple[str, Path], ...]:
+    return tuple(
+        (f"snapshot_closure_{index:04d}", path)
+        for index, path in enumerate(
+            local_c_source_closure(paths, source_root)
+        )
+    )
+
+
+def phase_local_c_source_closure(
+    index: int,
+    paths: PhasePaths,
+    lane: str,
+) -> tuple[Path, ...]:
+    action_source = paths.command_action_source(0, 0)
+    return local_c_source_closure(
+        paths,
+        (
+            action_source
+            if (
+                lane == "darwin"
+                and index == 0
+                and action_source.is_dir()
+                and not action_source.is_symlink()
+            )
+            else None
+        ),
+    )
+
+
+def darwin_toolchain_regular_files(paths: PhasePaths) -> tuple[Path, ...]:
+    root = paths.evidence / DARWIN_TOOLCHAIN_SNAPSHOT_RELATIVE
+    if not root.exists():
+        return ()
+    if root.is_symlink() or not root.is_dir():
+        fail("Darwin toolchain snapshot root is not exact")
+    files: list[Path] = []
+    for current, directories, names in os.walk(
+        root, topdown=True, followlinks=False
+    ):
+        current_path = Path(current)
+        for name in directories:
+            path = current_path / name
+            if path.is_symlink():
+                fail("Darwin toolchain snapshot contains a symlink")
+        for name in names:
+            path = current_path / name
+            info = os.lstat(path)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                fail("Darwin toolchain snapshot file is not regular")
+            if path in {
+                root / "usr/bin/clang",
+                root / "usr/bin/ld",
+            }:
+                continue
+            files.append(path)
+    return tuple(sorted(files, key=lambda item: os.fsencode(str(item))))
+
+
+def phase_bound_roles_for_plan(
+    index: int,
+    paths: PhasePaths,
+    lane: str,
+) -> tuple[str, ...]:
+    roles = (
+        []
+        if lane == "darwin" and index in (0, 1)
+        else list(PHASE_BOUND_ROLES.get(index, ()))
+    )
+    if lane == "darwin":
+        roles.insert(0, "production_gate")
+    if index == 1 and lane != "darwin":
+        roles.extend(
+            role for role, _path in dynamic_snapshot_outputs(
+                paths,
+                (
+                    paths.command_action_source(1, 0)
+                    if lane == "darwin" else None
+                ),
+            )
+        )
+    if lane == "darwin" and index == 15:
+        roles.extend(
+            f"local_c_header_{offset:04d}"
+            for offset, _path in enumerate(
+                phase_local_c_source_closure(index, paths, lane)
+            )
+        )
+    if lane == "darwin" and index == 15:
+        roles.extend(
+            f"darwin_toolchain_input_{offset:04d}"
+            for offset, _path in enumerate(
+                darwin_toolchain_regular_files(paths)
+            )
+        )
+    return tuple(roles)
+
+
+def framed_vector_sha256(domain: bytes, values: Sequence[str]) -> str:
+    payload = bytearray(len(domain).to_bytes(4, "big") + domain)
+    payload.extend(len(values).to_bytes(4, "big"))
+    for value in values:
+        raw = os.fsencode(value)
+        payload.extend(len(raw).to_bytes(4, "big"))
+        payload.extend(raw)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def darwin_cc1_base_argv(
+    paths: PhasePaths,
+    phase_index: int,
+    action_index: int,
+) -> tuple[str, ...]:
+    toolchain = paths.command_action_toolchain(
+        phase_index, action_index
+    )
+    resource = toolchain / "usr/lib/clang/21"
+    sdk = toolchain / "SDKs/MacOSX.sdk"
+    return (
+        str(toolchain / "usr/bin/clang"),
+        "-cc1",
+        "-triple",
+        "arm64-apple-macosx26.0.0",
+        "-target-abi",
+        "darwinpcs",
+        "-fdefine-target-os-macros",
+        "-fgnuc-version=4.2.1",
+        "-isysroot",
+        str(sdk),
+        "-internal-isystem",
+        str(sdk / "usr/local/include"),
+        "-internal-isystem",
+        str(resource / "include"),
+        "-internal-externc-isystem",
+        str(sdk / "usr/include"),
+        "-internal-iframework",
+        str(sdk / "System/Library/Frameworks"),
+        "-std=c11",
+    )
+
+
+def darwin_command_action(
+    *,
+    phase_index: int,
+    action_index: int,
+    label: str,
+    target_executable_role: str,
+    argv: Sequence[str],
+    input_roles: Sequence[str],
+    business_output_roles: Sequence[str],
+    tracked_output_fd_bindings: Sequence[dict[str, Any]],
+    write_files: Sequence[Path],
+    private_tree_root: Path,
+    paths: PhasePaths,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    return {
+        "commandActionIndex": action_index,
+        "actionLabel": label,
+        "guardCapability": "private_frozen_tree_direct",
+        "launcherExecutableRole": "bash",
+        "guardScriptRole": "process_guard",
+        "monitorRuntimeRole": "process_guard_runtime",
+        "targetExecutableRole": target_executable_role,
+        "inputRoles": list(input_roles),
+        "businessOutputRoles": list(business_output_roles),
+        "trackedOutputFdBindings": list(
+            tracked_output_fd_bindings
+        ),
+        "expectedExitCode": 0,
+        "timeoutSeconds": timeout_seconds,
+        "targetArgv": list(argv),
+        "targetArgvSha256": framed_vector_sha256(
+            b"cheng.guard.command_argv", argv
+        ),
+        "execPaths": [str(argv[0])],
+        "writeFiles": [str(path) for path in write_files],
+        "forkPolicy": "deny",
+        "commandIdentityPolicy": "require_exact_path_and_sha256",
+        "privateFrozenTree": {
+            "schema":
+                "cheng.guard.command_action_private_frozen_tree",
+            "root": str(private_tree_root),
+            "bindingMode": "exact_prebound",
+            "expectedSha256Binding": (
+                "phaseTerminal.commandActionReceipts"
+                f"[{action_index}].privateFrozenTree.sha256"
+            ),
+            "watchPolicy":
+                "all_directories_and_all_regular_files",
+            "requiredReportCounts": [
+                "private_frozen_tree_entry_count",
+                "private_frozen_tree_directory_count",
+                "private_frozen_tree_file_count",
+                "private_frozen_tree_watch_count",
+                "private_frozen_tree_attrib_event_count",
+            ],
+            "sameUidBoundary":
+                "not_isolated_honest_mutation_detection_only",
+            "derivedInput": None,
+        },
+        "guardReceiptRole":
+            f"phase_guard_{action_index:02d}_receipt",
+        "guardStdoutRole":
+            f"phase_guard_{action_index:02d}_stdout",
+        "guardStderrRole":
+            f"phase_guard_{action_index:02d}_stderr",
+    }
+
+
+def darwin_phase01_command_actions(
+    spec: PhaseSpec,
+    paths: PhasePaths,
+    bound_input_roles: Sequence[str],
+) -> tuple[dict[str, Any], ...]:
+    if spec.index == 0:
+        base = darwin_cc1_base_argv(paths, 0, 0)
+        source = (
+            paths.command_action_source(0, 0)
+            / "bootstrap/cheng_cold.c"
+        )
+        argv = (
+            *base,
+            "-Eonly",
+            "-dependency-file",
+            "-",
+            "-MT",
+            "cheng_bootstrap_local_closure",
+            "-sys-header-deps",
+            str(source),
+        )
+        return (darwin_command_action(
+            phase_index=0,
+            action_index=0,
+            label="cc1-deps",
+            target_executable_role="cc_phase00_action00",
+            argv=argv,
+            input_roles=bound_input_roles,
+            business_output_roles=(),
+            tracked_output_fd_bindings=(),
+            write_files=(),
+            private_tree_root=paths.command_action_input_root(0, 0),
+            paths=paths,
+            timeout_seconds=spec.timeout_seconds,
+        ),)
+    if spec.index == 1:
+        object_base = darwin_cc1_base_argv(paths, 1, 0)
+        object_source = (
+            paths.command_action_source(1, 0)
+            / "bootstrap/cheng_cold.c"
+        )
+        object_argv = (
+            *object_base,
+            "-O2",
+            "-Werror",
+            "-emit-obj",
+            "-mrelocation-model",
+            "pic",
+            "-pic-level",
+            "2",
+            "-o",
+            str(paths.cold_candidate_object),
+            str(object_source),
+        )
+        object_action = darwin_command_action(
+            phase_index=1,
+            action_index=0,
+            label="cc1-object",
+            target_executable_role="cc_phase01_action00",
+            argv=object_argv,
+            input_roles=bound_input_roles,
+            business_output_roles=("cold_candidate_object",),
+            tracked_output_fd_bindings=(),
+            write_files=(paths.cold_candidate_object,),
+            private_tree_root=paths.command_action_input_root(1, 0),
+            paths=paths,
+            timeout_seconds=spec.timeout_seconds,
+        )
+        toolchain = paths.command_action_toolchain(1, 1)
+        linker = toolchain / "usr/bin/ld"
+        sdk = toolchain / "SDKs/MacOSX.sdk"
+        resource = toolchain / "usr/lib/clang/21"
+        link_argv = (
+            str(linker),
+            "-demangle",
+            "-lto_library",
+            str(toolchain / "usr/lib/libLTO.dylib"),
+            "-dynamic",
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            "26.0.0",
+            "26.5",
+            "-syslibroot",
+            str(sdk),
+            "-O2",
+            "-o",
+            "/dev/fd/10",
+            str(paths.cold_candidate_object),
+            "-lSystem",
+            str(resource / "lib/darwin/libclang_rt.osx.a"),
+        )
+        link_action = darwin_command_action(
+            phase_index=1,
+            action_index=1,
+            label="ld-link",
+            target_executable_role="darwin_ld_phase01_action01",
+            argv=link_argv,
+            input_roles=(
+                "cold_candidate_object",
+                *bound_input_roles,
+            ),
+            business_output_roles=("cold_candidate",),
+            tracked_output_fd_bindings=({
+                "role": "cold_candidate",
+                "fd": 10,
+                "argvPath": "/dev/fd/10",
+            },),
+            write_files=(paths.cold_candidate,),
+            private_tree_root=paths.command_action_input_root(1, 1),
+            paths=paths,
+            timeout_seconds=spec.timeout_seconds,
+        )
+        return object_action, link_action
+    fail("Darwin phase0/1 action request is outside its domain")
+
+
+def validate_darwin_phase01_command_actions(
+    spec: PhaseSpec,
+    paths: PhasePaths,
+    bound_input_roles: Sequence[str],
+    actions: Any,
+) -> None:
+    expected = darwin_phase01_command_actions(
+        spec, paths, bound_input_roles
+    )
+    if (
+        not isinstance(actions, (list, tuple))
+        or list(actions) != list(expected)
+        or len(actions) != spec.index + 1
+        or [item["commandActionIndex"] for item in actions]
+            != list(range(len(actions)))
+        or any(
+            item["guardCapability"] != "private_frozen_tree_direct"
+            or item["launcherExecutableRole"] != "bash"
+            or item["guardScriptRole"] != "process_guard"
+            or item["monitorRuntimeRole"]
+                != "process_guard_runtime"
+            or item["targetArgvSha256"]
+                != framed_vector_sha256(
+                    b"cheng.guard.command_argv",
+                    item["targetArgv"],
+                )
+            or item["forkPolicy"] != "deny"
+            or any(
+                binding["role"]
+                    not in item["businessOutputRoles"]
+                or binding["fd"] < 10
+                or binding["fd"] > 63
+                or binding["argvPath"]
+                    != f"/dev/fd/{binding['fd']}"
+                or item["targetArgv"].count(
+                    binding["argvPath"]
+                ) != 1
+                or str(paths.output_path(binding["role"]))
+                    in item["targetArgv"]
+                for binding in item[
+                    "trackedOutputFdBindings"
+                ]
+            )
+            or len({
+                binding["role"]
+                for binding in item[
+                    "trackedOutputFdBindings"
+                ]
+            }) != len(item["trackedOutputFdBindings"])
+            or len({
+                binding["fd"]
+                for binding in item[
+                    "trackedOutputFdBindings"
+                ]
+            }) != len(item["trackedOutputFdBindings"])
+            or item["privateFrozenTree"]["watchPolicy"]
+                != "all_directories_and_all_regular_files"
+            for item in actions
+        )
+    ):
+        fail("Darwin phase0/1 command action plan drifted")
+
+
+def validate_phase_action_dag(actions: Sequence[Mapping[str, Any]]) -> None:
+    producers: dict[str, int] = {}
+    for expected_index, action in enumerate(actions):
+        input_roles = action.get("inputRoles")
+        output_roles = action.get("outputRoles")
+        if (
+            action.get("actionIndex") != expected_index
+            or not isinstance(input_roles, list)
+            or not isinstance(output_roles, list)
+            or any(
+                not isinstance(role, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_]*", role)
+                for role in (*input_roles, *output_roles)
+            )
+            or len(input_roles) != len(set(input_roles))
+            or len(output_roles) != len(set(output_roles))
+        ):
+            fail("phase action role graph is not canonical")
+        for role in output_roles:
+            if role in producers:
+                fail("phase output role has multiple producers")
+            producers[role] = expected_index
+    for action in actions:
+        consumer_index = action["actionIndex"]
+        for role in action["inputRoles"]:
+            producer_index = producers.get(role)
+            if (
+                producer_index is not None
+                and producer_index >= consumer_index
+            ):
+                fail("phase action consumes an unordered phase output")
+
+
+def darwin_codesign_actions(
+    spec: PhaseSpec,
+    paths: PhasePaths,
+    lane: str,
+) -> tuple[dict[str, Any], ...]:
+    if lane != "darwin":
+        return ()
+    actions: list[dict[str, Any]] = []
+    for output in spec.outputs:
+        if output.kind != "executable":
+            continue
+        argv = (
+            "/usr/bin/codesign",
+            "--verify",
+            "--strict",
+            str(paths.output_path(output.role)),
+        )
+        actions.append({
+            "codesignActionIndex": len(actions),
+            "verifiedOutputRole": output.role,
+            "targetExecutableRole": "codesign",
+            "targetArgv": list(argv),
+            "targetArgvSha256": framed_vector_sha256(
+                b"cheng.guard.command_argv", argv
+            ),
+            "guardReceiptRole":
+                f"codesign_{output.role}_guard_receipt",
+            "guardStdoutRole":
+                f"codesign_{output.role}_guard_stdout",
+            "guardStderrRole":
+                f"codesign_{output.role}_guard_stderr",
+            "expectedExitCode": 0,
+            "timeoutSeconds": 30,
+            "memoryLimitBytes": 805_306_368,
+            "guardCapability":
+                "snapshot_command_exact_identity_process_tree",
+        })
+    return tuple(actions)
+
+
+def phase_argv(
+    spec: PhaseSpec,
+    paths: PhasePaths,
+    lane: str,
+) -> tuple[str, ...]:
+    lane = canonical_lane(lane)
+    if spec.index == 10:
+        return ()
+    command = str(paths.command_path(spec.command_role))
+    toolchain_snapshot = (
+        paths.command_action_toolchain(spec.index, 0)
+        if lane == "darwin" and spec.index in (0, 1)
+        else paths.evidence / DARWIN_TOOLCHAIN_SNAPSHOT_RELATIVE
+    )
+    darwin_resource = toolchain_snapshot / "usr/lib/clang/21"
+    darwin_sdk = toolchain_snapshot / "SDKs/MacOSX.sdk"
+    darwin_linker = toolchain_snapshot / "usr/bin/ld"
+    darwin_cc_authority = (
+        (
+            "-target",
+            LANE_TARGET_TRIPLE["darwin"],
+            "-resource-dir",
+            str(darwin_resource),
+            "-isysroot",
+            str(darwin_sdk),
+        )
+        if lane == "darwin" else ()
+    )
+    if spec.index in (0, 15):
+        return (
+            command,
+            "-std=c11",
+            "-O2",
+            *darwin_cc_authority,
+            "-M",
+            "-MT",
+            "cheng_bootstrap_local_closure",
+            str(paths.bootstrap_source),
+        )
+    if spec.index == 1:
+        return (
+            command,
+            "-std=c11",
+            "-O2",
+            "-Werror",
+            *(("-pipe",) if lane == "linux" else ()),
+            *darwin_cc_authority,
+            *(
+                (
+                    "-B" + str(darwin_linker.parent),
+                    "-fuse-ld=ld",
+                )
+                if lane == "darwin" else ()
+            ),
+            "-o",
+            str(paths.cold_candidate),
+            str(paths.snapshot_bootstrap),
+        )
+    if spec.index in (2, 4, 6, 8):
+        stage_index = (spec.index - 2) // 2
+        self_image_authority = phase_self_image_input_fd_authority(
+            spec, lane
+        )
+        return (
+            command,
+            "compile-bootstrap",
+            "--in:" + str(paths.snapshot_contract),
+            "--out:" + str(paths.stage(stage_index)),
+            "--report-out:" + str(paths.stage_report(stage_index)),
+            *(
+                (self_image_authority["argvToken"],)
+                if self_image_authority is not None else ()
+            ),
+        )
+    if spec.index in (3, 5, 7, 9):
+        return (command, "self-check")
+    if spec.index in (11, 13):
+        stage_index = 2 if spec.index == 11 else 3
+        return (
+            command,
+            "system-link-exec",
+            "--root:" + str(paths.snapshot),
+            "--in:" + str(paths.snapshot_t7),
+            "--emit:exe",
+            "--link-providers",
+            "--target:" + LANE_TARGET_TRIPLE[lane],
+            "--out:" + str(paths.t7(stage_index)),
+            "--report-out:" + str(paths.t7_report(stage_index)),
+        )
+    if spec.index in (12, 14):
+        return (command,)
+    fail("phase argv is undefined")
+
+
+def phase_self_image_input_fd_authority(
+    spec: PhaseSpec,
+    lane: str,
+) -> dict[str, Any] | None:
+    lane = canonical_lane(lane)
+    if spec.index not in (2, 4, 6, 8):
+        return None
+    return {
+        "schema": "cheng.guard.command_self_image_fd",
+        "role": "bootstrap_self_image",
+        "sourceKind": (
+            "command_execution_snapshot"
+            if lane == "darwin"
+            else "command_direct_held_fd_outer_exec_ledger_join_required"
+        ),
+        "targetFd": 198,
+        "argvToken": "--bootstrap-self-image-fd:198",
+    }
+
+
+def phase_process_umask(spec: PhaseSpec, lane: str) -> int:
+    lane = canonical_lane(lane)
+    if (
+        lane == "linux"
+        or (
+            lane == "darwin"
+            and spec.index in (2, 4, 6, 8, 11, 13)
+        )
+    ):
+        return 0o077
+    return 0o277
+
+
+def validate_phase_process_umask(
+    spec: PhaseSpec,
+    lane: str,
+    observed: int,
+) -> int:
+    expected = phase_process_umask(spec, lane)
+    if observed != expected:
+        fail("phase process umask drifted")
+    return expected
+
+
+def phase_directory_first_owner(relative: str) -> int:
+    path = Path(relative)
+    parts = path.parts
+    if (
+        not relative
+        or path.is_absolute()
+        or str(path) != relative
+        or any(part in ("", ".", "..") for part in parts)
+    ):
+        fail("phase declared directory is not canonical relative")
+    top_level = parts[0]
+    if top_level == "phase-receipts":
+        if len(parts) == 1:
+            return 0
+        if (
+            len(parts) != 2
+            or len(parts[1]) != 2
+            or not parts[1].isascii()
+            or not parts[1].isdigit()
+        ):
+            fail("phase receipt directory is not exact")
+        owner = int(parts[1], 10)
+        if owner < 0 or owner >= PHASE_COUNT:
+            fail("phase receipt directory owner is outside the chain")
+        return owner
+    if top_level == "source-snapshot":
+        return 0
+    if len(parts) != 1 or top_level not in PHASE_DIRECTORY_FIRST_OWNER:
+        fail("phase declared directory has no first-owner authority")
+    return PHASE_DIRECTORY_FIRST_OWNER[top_level]
+
+
+def validate_declared_directory_first_owner(
+    spec: PhaseSpec,
+    observed: Any,
+) -> list[str]:
+    if (
+        not isinstance(observed, list)
+        or any(not isinstance(item, str) for item in observed)
+        or observed != sorted(set(observed), key=os.fsencode)
+    ):
+        fail("phase declared directory set is not canonical")
+    for relative in observed:
+        if phase_directory_first_owner(relative) != spec.index:
+            fail("phase declared directory is not first-owned here")
+    return observed
+
+
+def phase_path_replacement_output_authority(
+    spec: PhaseSpec,
+    paths: PhasePaths,
+    lane: str,
+) -> dict[str, Any] | None:
+    lane = canonical_lane(lane)
+    if lane != "darwin" or spec.index not in (11, 13):
+        return None
+    stage_index = 2 if spec.index == 11 else 3
+    role = f"t7_stage{stage_index}"
+    output = paths.t7(stage_index)
+    return {
+        "schema":
+            "cheng.bootstrap_stage23_darwin_path_replacement_output",
+        "role": role,
+        "outputPath": str(output),
+        "reportRole": role + "_report",
+        "processUmask": 0o077,
+        "initialMode": 0o700,
+        "finalMode": 0o500,
+        "ephemeralSidecars": [
+            {"suffix": ".link.log", "mode": 0o600},
+            {"suffix": ".map", "mode": 0o755},
+            {"suffix": ".primary.o.map", "mode": 0o600},
+        ],
+    }
+
+
+def validate_phase_path_replacement_output_authority(
+    spec: PhaseSpec,
+    paths: PhasePaths,
+    lane: str,
+    observed: Any,
+) -> dict[str, Any] | None:
+    expected = phase_path_replacement_output_authority(
+        spec, paths, lane
+    )
+    if observed != expected:
+        fail("phase path-replacement output authority drifted")
+    return expected
+
+
+def phase_plan(index: int, paths: PhasePaths, lane: str) -> dict[str, Any]:
+    validate_configuration()
+    lane = canonical_lane(lane)
+    if index < 0 or index >= PHASE_COUNT:
+        fail("phase index is outside the chain")
+    spec = PHASE_SPECS[index]
+    toolchain_snapshot = (
+        paths.evidence / DARWIN_TOOLCHAIN_SNAPSHOT_RELATIVE
+    )
+    darwin_sdk = toolchain_snapshot / "SDKs/MacOSX.sdk"
+    action_source_root = paths.command_action_source(0, 0)
+    dynamic_source_root = (
+        action_source_root
+        if (
+            lane == "darwin"
+            and index == 0
+            and action_source_root.is_dir()
+            and not action_source_root.is_symlink()
+        )
+        else paths.root
+    )
+    dynamic_snapshot = (
+        dynamic_snapshot_outputs(
+            paths,
+            (
+                dynamic_source_root
+                if lane == "darwin" else None
+            ),
+        )
+        if index == 0 else ()
+    )
+    bound_input_roles = phase_bound_roles_for_plan(index, paths, lane)
+    direct_command_actions = (
+        darwin_phase01_command_actions(
+            spec, paths, bound_input_roles
+        )
+        if lane == "darwin" and index in (0, 1)
+        else ()
+    )
+    codesign_actions = darwin_codesign_actions(spec, paths, lane)
+    path_replacement_authority = (
+        phase_path_replacement_output_authority(spec, paths, lane)
+    )
+    if direct_command_actions:
+        validate_darwin_phase01_command_actions(
+            spec, paths, bound_input_roles, direct_command_actions
+        )
+    engine_owned_phase = spec.index == 10
+    actions: list[dict[str, Any]] = [{
+        "actionIndex": 0,
+        "kind": "precondition",
+        "operation": "assert_exact_frozen_inputs",
+        "ownerExecutableRole": (
+            "phase_engine" if engine_owned_phase else "stage_gate"
+        ),
+        "inputRoles": sorted({
+            *(
+                role
+                for action in direct_command_actions
+                for role in (
+                    action["launcherExecutableRole"],
+                    action["targetExecutableRole"],
+                )
+            ),
+            *(() if direct_command_actions else (spec.command_role,)),
+            *(
+                ("codesign",) if codesign_actions else ()
+            ),
+            *bound_input_roles,
+        }),
+        "outputRoles": [],
+    }]
+    command_auxiliary_roles = tuple(
+        role
+        for action in direct_command_actions
+        for role in (
+            action["guardReceiptRole"],
+            action["guardStdoutRole"],
+            action["guardStderrRole"],
+        )
+    ) or (
+        "phase_guard_receipt",
+        "phase_guard_stdout",
+        "phase_guard_stderr",
+    )
+    output_producers: dict[str, int] = {}
+    if direct_command_actions:
+        for command_action in direct_command_actions:
+            command_action_index = len(actions)
+            output_roles = [
+                *command_action["businessOutputRoles"],
+                command_action["guardReceiptRole"],
+                command_action["guardStdoutRole"],
+                command_action["guardStderrRole"],
+            ]
+            actions.append({
+                "actionIndex": command_action_index,
+                "kind": "command",
+                "operation":
+                    "execute_private_frozen_tree_direct",
+                "ownerExecutableRole":
+                    command_action["launcherExecutableRole"],
+                "inputRoles": command_action["inputRoles"],
+                "businessOutputRoles":
+                    command_action["businessOutputRoles"],
+                "outputRoles": output_roles,
+                **command_action,
+            })
+            for role in output_roles:
+                output_producers[role] = command_action_index
+    elif spec.index != 10:
+        command_action_index = len(actions)
+        path_replacement_role = (
+            path_replacement_authority["role"]
+            if path_replacement_authority is not None else None
+        )
+        tracked_output_roles = tuple(
+            role for role in COMMAND_OUTPUT_ROLES[spec.index]
+            if role != path_replacement_role
+        )
+        actions.append({
+            "actionIndex": command_action_index,
+            "kind": "command",
+            "operation": (
+                "execute_canonical_argv_with_process_guard_and_ptrace_identity"
+                if lane == "linux"
+                else "execute_canonical_argv_with_process_guard_snapshot"
+            ),
+            "ownerExecutableRole": spec.command_role,
+            "inputRoles": list(bound_input_roles),
+            "businessOutputRoles": list(tracked_output_roles),
+            "outputRoles": [
+                *COMMAND_OUTPUT_ROLES[spec.index],
+                *command_auxiliary_roles,
+            ],
+            "argv": list(phase_argv(spec, paths, lane)),
+            "selfImageInputFdAuthority":
+                phase_self_image_input_fd_authority(spec, lane),
+            "pathReplacementOutputAuthority":
+                path_replacement_authority,
+            "processUmask": phase_process_umask(spec, lane),
+        })
+        output_producers.update({
+            role: command_action_index
+            for role in COMMAND_OUTPUT_ROLES[spec.index]
+        })
+    post_actions = list(POST_ACTIONS.get(
+        spec.index, ()
+    ))
+    if direct_command_actions and spec.index == 0:
+        operation, input_roles, output_roles = post_actions[0]
+        post_actions[0] = (
+            operation,
+            tuple(
+                "phase_guard_00_stdout"
+                if role == "phase_guard_stdout" else role
+                for role in input_roles
+            ),
+            output_roles,
+        )
+    if dynamic_snapshot:
+        operation, input_roles, output_roles = post_actions[0]
+        post_actions[0] = (
+            operation,
+            (
+                *input_roles,
+                *(
+                    f"local_c_header_{offset:04d}"
+                    for offset, _path in enumerate(
+                        phase_local_c_source_closure(
+                            index, paths, lane
+                        )
+                    )
+                ),
+            ),
+            (
+                *output_roles,
+                *(role for role, _path in dynamic_snapshot),
+            ),
+        )
+    for operation, input_roles, output_roles in post_actions:
+        action_index = len(actions)
+        action_output_roles = (
+            (*output_roles, *command_auxiliary_roles)
+            if spec.index == 10 else output_roles
+        )
+        actions.append({
+            "actionIndex": action_index,
+            "kind": "authority",
+            "operation": operation,
+            "ownerExecutableRole": (
+                "phase_engine" if engine_owned_phase else "stage_gate"
+            ),
+            "inputRoles": list(input_roles),
+            "outputRoles": list(action_output_roles),
+        })
+        for role in action_output_roles:
+            output_producers[role] = action_index
+    codesign_auxiliary_roles: list[str] = []
+    for codesign_action in codesign_actions:
+        action_index = len(actions)
+        action_output_roles = [
+            codesign_action["guardReceiptRole"],
+            codesign_action["guardStdoutRole"],
+            codesign_action["guardStderrRole"],
+        ]
+        codesign_auxiliary_roles.extend(action_output_roles)
+        actions.append({
+            "actionIndex": action_index,
+            "kind": "guarded_verification",
+            "operation":
+                "verify_darwin_codesign_with_process_guard",
+            "ownerExecutableRole": "phase_engine",
+            "inputRoles": [
+                "codesign",
+                codesign_action["verifiedOutputRole"],
+                "process_guard",
+                "process_guard_runtime",
+            ],
+            "outputRoles": action_output_roles,
+            **codesign_action,
+        })
+        for role in action_output_roles:
+            output_producers[role] = action_index
+    terminal_action_index = len(actions)
+    terminal_roles = (
+        "phase_action_terminal",
+        "phase_action_stdout",
+        "phase_action_stderr",
+    )
+    actions.append({
+        "actionIndex": terminal_action_index,
+        "kind": "authority",
+        "operation": "emit_canonical_phase_terminal",
+        "ownerExecutableRole": (
+            "phase_engine" if engine_owned_phase else "stage_gate"
+        ),
+        "inputRoles": [
+            *spec.produced_roles,
+            *(
+                ("cold_candidate_object",)
+                if direct_command_actions and spec.index == 1 else ()
+            ),
+            *(role for role, _path in dynamic_snapshot),
+            *command_auxiliary_roles,
+            *codesign_auxiliary_roles,
+        ],
+        "outputRoles": list(terminal_roles),
+    })
+    for role in command_auxiliary_roles:
+        if role not in output_producers:
+            output_producers[role] = command_action_index
+    for role in terminal_roles:
+        output_producers[role] = terminal_action_index
+    linux_proof_roles: tuple[str, ...] = ()
+    if lane == "linux" and spec.index != 10:
+        linux_proof_action_index = len(actions)
+        linux_proof_roles = (
+            "phase_ptrace_manifest",
+            "phase_ptrace_receipt",
+            "phase_ptrace_validation",
+            "phase_cgroup_receipt",
+        )
+        actions.append({
+            "actionIndex": linux_proof_action_index,
+            "kind": "runner_authority",
+            "operation": "seal_ptrace_cgroup_phase_proof",
+            "ownerExecutableRole": "linux_phase_runner",
+            "inputRoles": list(terminal_roles),
+            "outputRoles": list(linux_proof_roles),
+        })
+        for role in linux_proof_roles:
+            output_producers[role] = linux_proof_action_index
+    validate_phase_action_dag(actions)
+    receipt_dir = Path("phase-receipts") / f"{spec.index:02d}"
+    planned_outputs = [
+        {
+            "role": item.role,
+            "kind": item.kind,
+            "pathFshex": os.fsencode(
+                str(paths.output_path(item.role))
+            ).hex(),
+            "finalMode": (
+                (
+                    0o555 if item.kind == "executable" else 0o444
+                )
+                if spec.index in (2, 4, 6, 8)
+                else (
+                    0o500 if item.kind == "executable" else 0o400
+                )
+            ),
+            "producerActionIndex": output_producers[item.role],
+        }
+        for item in spec.outputs
+    ]
+    if direct_command_actions and spec.index == 1:
+        planned_outputs.append({
+            "role": "cold_candidate_object",
+            "kind": "regular",
+            "pathFshex": os.fsencode(
+                str(paths.cold_candidate_object)
+            ).hex(),
+            "finalMode": 0o400,
+            "producerActionIndex":
+                output_producers["cold_candidate_object"],
+        })
+    planned_outputs.extend({
+        "role": role,
+        "kind": "regular",
+        "pathFshex": os.fsencode(str(
+            paths.snapshot
+            / source_path.relative_to(dynamic_source_root)
+        )).hex(),
+        "finalMode": 0o400,
+        "producerActionIndex": output_producers[role],
+    } for role, source_path in dynamic_snapshot)
+    planned_outputs.extend({
+        "role": action["guardReceiptRole"],
+        "kind": "regular",
+        "pathFshex": os.fsencode(str(
+            paths.evidence
+            / receipt_dir
+            / (
+                "codesign-"
+                + action["verifiedOutputRole"]
+                + ".guard.kv"
+            )
+        )).hex(),
+        "finalMode": 0o400,
+        "producerActionIndex": output_producers[
+            action["guardReceiptRole"]
+        ],
+    } for action in codesign_actions)
+    terminal_relative_path = str(receipt_dir / "terminal.json")
+    evidence_delta = [
+        {
+            "role": item["role"],
+            "relativePath": str(
+                Path(os.fsdecode(bytes.fromhex(item["pathFshex"])))
+                .relative_to(paths.evidence)
+            ),
+            "kind": item["kind"],
+            "finalMode": item["finalMode"],
+        }
+        for item in planned_outputs
+    ]
+    auxiliary_files = [
+        ("phase_action_terminal", "terminal.json"),
+        ("phase_action_stdout", "action.stdout"),
+        ("phase_action_stderr", "action.stderr"),
+    ]
+    if direct_command_actions:
+        auxiliary_files.extend(
+            (
+                command_action["guardReceiptRole"],
+                f"action-{command_action['commandActionIndex']:02d}.guard.kv",
+            )
+            for command_action in direct_command_actions
+        )
+        auxiliary_files.extend(
+            (
+                command_action["guardStdoutRole"],
+                f"action-{command_action['commandActionIndex']:02d}.guard.stdout",
+            )
+            for command_action in direct_command_actions
+        )
+        auxiliary_files.extend(
+            (
+                command_action["guardStderrRole"],
+                f"action-{command_action['commandActionIndex']:02d}.guard.stderr",
+            )
+            for command_action in direct_command_actions
+        )
+    else:
+        auxiliary_files.extend((
+            ("phase_guard_receipt", "guard.kv"),
+            ("phase_guard_stdout", "guard.stdout"),
+            ("phase_guard_stderr", "guard.stderr"),
+        ))
+    auxiliary_files.extend(
+        (
+            action["guardStdoutRole"],
+            "codesign-"
+            + action["verifiedOutputRole"]
+            + ".guard.stdout",
+        )
+        for action in codesign_actions
+    )
+    auxiliary_files.extend(
+        (
+            action["guardStderrRole"],
+            "codesign-"
+            + action["verifiedOutputRole"]
+            + ".guard.stderr",
+        )
+        for action in codesign_actions
+    )
+    evidence_delta.extend({
+        "role": role,
+        "relativePath": str(receipt_dir / filename),
+        "kind": "regular",
+        "finalMode": 0o400,
+        "producerActionIndex": output_producers[role],
+    } for role, filename in auxiliary_files)
+    if lane == "darwin":
+        evidence_delta.append({
+            "role": "phase_stage_input_manifest",
+            "relativePath": str(
+                receipt_dir / "stage-input-manifest.json"
+            ),
+            "kind": "regular",
+            "finalMode": 0o400,
+        })
+    if lane == "linux" and spec.index != 10:
+        evidence_delta.extend({
+            "role": role,
+            "relativePath": str(receipt_dir / filename),
+            "kind": "regular",
+            "finalMode": 0o400,
+            "producerActionIndex": output_producers[role],
+        } for role, filename in (
+            ("phase_ptrace_manifest", "ptrace-manifest.json"),
+            ("phase_ptrace_receipt", "ptrace-receipt.json"),
+            ("phase_ptrace_validation", "ptrace-validation.kv"),
+            ("phase_cgroup_receipt", "cgroup-receipt.kv"),
+        ))
+    if len({
+        item["relativePath"] for item in evidence_delta
+    }) != len(evidence_delta):
+        fail("phase declared delta path aliases")
+    evidence_delta.sort(key=lambda item: os.fsencode(item["relativePath"]))
+    directory_candidates = sorted({
+        str(parent)
+        for item in evidence_delta
+        for parent in Path(item["relativePath"]).parents
+        if str(parent) != "."
+    }, key=os.fsencode)
+    if any(
+        phase_directory_first_owner(relative) > spec.index
+        for relative in directory_candidates
+    ):
+        fail("phase uses a directory before its first owner")
+    declared_directories = validate_declared_directory_first_owner(
+        spec,
+        [
+            relative
+            for relative in directory_candidates
+            if phase_directory_first_owner(relative) == spec.index
+        ],
+    )
+    output_set_sha256 = hashlib.sha256(
+        canonical_json({
+            "schema": "cheng.bootstrap_stage23_declared_output_set",
+            "lane": lane,
+            "phaseIndex": spec.index,
+            "directories": declared_directories,
+            "files": evidence_delta,
+        })
+    ).hexdigest()
+    return {
+        "schema": PLAN_SCHEMA,
+        "lane": lane,
+        "targetTriple": LANE_TARGET_TRIPLE[lane],
+        "machineAuthority": LANE_MACHINE_AUTHORITY[lane],
+        "nativeExecutableFormat": LANE_EXECUTABLE_FORMAT[lane],
+        "phaseIndex": spec.index,
+        "phaseLabel": spec.label,
+        **(
+            {}
+            if direct_command_actions
+            else {"commandRole": spec.command_role}
+        ),
+        "expectedExitCode": spec.expected_exit_code,
+        "timeoutSeconds": spec.timeout_seconds,
+        "env": [
+            {"name": name, "value": value}
+            for name, value in (
+                (
+                    *CANONICAL_ENV,
+                    (
+                        "CHENG_DARWIN_CC",
+                        str(toolchain_snapshot / "usr/bin/clang"),
+                    ),
+                    (
+                        "CHENG_DARWIN_SYSROOT",
+                        str(darwin_sdk),
+                    ),
+                    ("CHENG_DARWIN_ARCH_FLAGS", "-arch arm64"),
+                    ("PATH", "/usr/bin:/bin"),
+                )
+                if lane == "darwin" else LINUX_CANONICAL_ENV
+            )
+        ],
+        **(
+            {"commandActions": list(direct_command_actions)}
+            if direct_command_actions
+            else {"argv": list(phase_argv(spec, paths, lane))}
+        ),
+        **(
+            {"darwinCodesignActions": list(codesign_actions)}
+            if codesign_actions else {}
+        ),
+        "boundInputRoles": list(bound_input_roles),
+        "actions": actions,
+        "outputs": planned_outputs,
+        "terminalRelativePath": terminal_relative_path,
+        "declaredDeltaDirectories": declared_directories,
+        "declaredDeltaFiles": evidence_delta,
+        "declaredOutputSetSha256": output_set_sha256,
+    }
+
+
+def canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def private_frozen_tree_binding(root: Path) -> dict[str, Any]:
+    if (
+        not root.is_absolute()
+        or root.resolve(strict=True) != root
+        or root.is_symlink()
+        or not root.is_dir()
+    ):
+        fail("private frozen tree root is not canonical")
+    entries: list[tuple[str, str, str, tuple[int, ...]]] = []
+    for directory, directory_names, file_names in os.walk(
+        root, topdown=True, followlinks=False
+    ):
+        directory_names.sort(key=os.fsencode)
+        file_names.sort(key=os.fsencode)
+        directory_path = Path(directory)
+        directory_info = os.lstat(directory_path)
+        if (
+            stat.S_ISLNK(directory_info.st_mode)
+            or not stat.S_ISDIR(directory_info.st_mode)
+        ):
+            fail("private frozen tree contains a non-directory")
+        entries.append((
+            os.path.relpath(directory_path, root).replace(os.sep, "/"),
+            "directory",
+            "",
+            (
+                directory_info.st_mode,
+                directory_info.st_nlink,
+                directory_info.st_uid,
+                directory_info.st_gid,
+                directory_info.st_size,
+            ),
+        ))
+        for name in directory_names:
+            info = os.lstat(directory_path / name)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                fail(
+                    "private frozen tree contains a directory special node"
+                )
+        for name in file_names:
+            path = directory_path / name
+            info, raw = read_exact_regular(
+                path, "private frozen-tree file"
+            )
+            if info.st_nlink != 1:
+                fail("private frozen tree contains a hard-linked file")
+            entries.append((
+                os.path.relpath(path, root).replace(os.sep, "/"),
+                "regular",
+                sha256_bytes(raw),
+                (
+                    info.st_mode,
+                    info.st_nlink,
+                    info.st_uid,
+                    info.st_gid,
+                    info.st_size,
+                ),
+            ))
+    entries.sort(key=lambda item: (
+        os.fsencode(item[0]),
+        0 if item[1] == "directory" else 1,
+    ))
+    domain = b"cheng.guard.private_frozen_tree_closure"
+    payload = bytearray(len(domain).to_bytes(4, "big") + domain)
+    payload.extend(len(entries).to_bytes(4, "big"))
+    for relative, kind, digest, identity in entries:
+        relative_raw = os.fsencode(relative)
+        kind_raw = kind.encode("ascii")
+        payload.extend(
+            len(relative_raw).to_bytes(4, "big") + relative_raw
+        )
+        payload.extend(len(kind_raw).to_bytes(4, "big") + kind_raw)
+        for value in identity:
+            payload.extend(value.to_bytes(8, "big"))
+        payload.extend(
+            bytes.fromhex(digest) if digest else b"\0" * 32
+        )
+    directory_count = sum(
+        1 for item in entries if item[1] == "directory"
+    )
+    file_count = len(entries) - directory_count
+    return {
+        "schema": "cheng.guard.private_frozen_tree_binding",
+        "root": str(root),
+        "sha256": sha256_bytes(bytes(payload)),
+        "entryCount": len(entries),
+        "directoryCount": directory_count,
+        "fileCount": file_count,
+        "watchCount": len(entries),
+        "watchCoverage":
+            "root_all_directories_and_all_regular_files",
+        "sameUidBoundary":
+            "mutation_detected_not_malicious_same_uid_isolation",
+    }
+
+
+def validate_private_tree_binding_shape(
+    value: Any,
+    expected_root: Path,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {
+            "schema",
+            "root",
+            "sha256",
+            "entryCount",
+            "directoryCount",
+            "fileCount",
+            "watchCount",
+            "watchCoverage",
+            "sameUidBoundary",
+        }
+        or value.get("schema")
+            != "cheng.guard.private_frozen_tree_binding"
+        or value.get("root") != str(expected_root)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", value.get("sha256", "")
+        )
+        or any(
+            not isinstance(value.get(key), int)
+            or isinstance(value.get(key), bool)
+            or value[key] <= 0
+            for key in ("entryCount", "directoryCount", "fileCount")
+        )
+        or value.get("watchCount") != value.get("entryCount")
+        or value.get("entryCount")
+            != value.get("directoryCount") + value.get("fileCount")
+        or value.get("watchCoverage")
+            != "root_all_directories_and_all_regular_files"
+        or value.get("sameUidBoundary")
+            != "mutation_detected_not_malicious_same_uid_isolation"
+    ):
+        fail("private frozen tree binding shape drifted")
+    return value
+
+
+def read_exact_regular(path: Path, label: str) -> tuple[os.stat_result, bytes]:
+    try:
+        before_path = os.lstat(path)
+    except OSError as exc:
+        raise PhaseEngineError(label + " is absent") from exc
+    if (
+        not stat.S_ISREG(before_path.st_mode)
+        or stat.S_ISLNK(before_path.st_mode)
+        or before_path.st_nlink <= 0
+    ):
+        fail(label + " is not single-link regular")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                fail(label + " changed during read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after_path = os.lstat(path)
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_uid",
+        "st_gid",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(
+        getattr(before, field) != getattr(other, field)
+        for other in (after, before_path, after_path)
+        for field in stable_fields
+    ):
+        fail(label + " changed during read")
+    return before, b"".join(chunks)
+
+
+def executable_format(raw: bytes) -> str:
+    if (
+        len(raw) >= 20
+        and raw[:4] == b"\x7fELF"
+        and raw[4] == 2
+        and raw[5] == 1
+        and int.from_bytes(raw[18:20], "little") == 62
+    ):
+        return LANE_EXECUTABLE_FORMAT["linux"]
+    if (
+        len(raw) >= 12
+        and raw[:4] == b"\xcf\xfa\xed\xfe"
+        and int.from_bytes(raw[4:8], "little") == 0x0100000C
+    ):
+        return LANE_EXECUTABLE_FORMAT["darwin"]
+    fail("executable output machine format is not exact")
+
+
+def artifact_payload(
+    path: Path,
+    kind: str,
+    expected_mode: int | None = None,
+    include_stable_times: bool = False,
+) -> dict[str, Any]:
+    info, raw = read_exact_regular(path, "phase artifact")
+    if not raw:
+        fail("phase artifact is empty")
+    allowed_modes = (
+        {expected_mode}
+        if expected_mode is not None else (
+            {0o500, 0o555}
+            if kind == "executable" else {0o400, 0o444}
+        )
+    )
+    if (
+        expected_mode not in (None, 0o400, 0o444, 0o500, 0o555)
+        or stat.S_IMODE(info.st_mode) not in allowed_modes
+        or info.st_nlink != 1
+    ):
+        fail("phase artifact final mode drifted")
+    payload = {
+        "pathFshex": os.fsencode(str(path)).hex(),
+        "sha256": sha256_bytes(raw),
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": info.st_mode,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "format": (
+            executable_format(raw)
+            if kind == "executable" else "regular"
+        ),
+    }
+    if include_stable_times:
+        payload.update({
+            "mtimeNs": info.st_mtime_ns,
+            "ctimeNs": info.st_ctime_ns,
+        })
+    return payload
+
+
+def write_new_file(path: Path, raw: bytes, mode: int) -> None:
+    if path.exists() or path.is_symlink():
+        fail("phase output already exists")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags, mode)
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                fail("phase output write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.chmod(path, mode)
+
+
+def copy_new_file(source: Path, destination: Path) -> None:
+    _info, raw = read_exact_regular(source, "snapshot source")
+    if not raw:
+        fail("snapshot source is empty")
+    write_new_file(destination, raw, 0o400)
+
+
+def strict_stage_input_manifest(path: Path) -> tuple[dict[str, Any], bytes]:
+    _info, raw = read_exact_regular(path, "stage input manifest")
+    if not raw.endswith(b"\n") or b"\r" in raw or b"\0" in raw:
+        fail("stage input manifest encoding drifted")
+    try:
+        value = json.loads(raw[:-1].decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PhaseEngineError(
+            "stage input manifest is not strict JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        fail("stage input manifest is not canonical")
+    expected_fields = stage_input_manifest_fields(
+        value.get("lane"), value.get("phaseIndex")
+    )
+    if (
+        set(value) != set(expected_fields)
+        or value.get("schema") != STAGE_INPUT_MANIFEST_SCHEMA
+        or canonical_json(value) + b"\n" != raw
+    ):
+        fail("stage input manifest is not canonical")
+    return value, raw
+
+
+def manifest_role_paths(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Path], dict[str, dict[str, Any]]]:
+    frozen = manifest.get("frozenRoles")
+    if not isinstance(frozen, list):
+        fail("stage input frozen role set is absent")
+    paths: dict[str, Path] = {}
+    identities: dict[str, dict[str, Any]] = {}
+    lane = manifest.get("lane")
+    for row in frozen:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"role", "hostIdentity", "guestPath"}
+            or not isinstance(row["role"], str)
+            or row["role"] in paths
+            or not isinstance(row["hostIdentity"], dict)
+        ):
+            fail("stage input frozen role row drifted")
+        role = row["role"]
+        identity = row["hostIdentity"]
+        if lane == "linux":
+            if not isinstance(row["guestPath"], str):
+                fail("Linux frozen role lacks guest path")
+            path = Path(row["guestPath"])
+        else:
+            if row["guestPath"] is not None:
+                fail("Darwin frozen role has guest path")
+            try:
+                path = Path(os.fsdecode(bytes.fromhex(
+                    identity["pathFshex"]
+                )))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PhaseEngineError(
+                    "frozen host path is invalid"
+                ) from exc
+        if not path.is_absolute():
+            fail("frozen role path is not absolute")
+        paths[role] = path
+        identities[role] = identity
+    return paths, identities
+
+
+def verify_frozen_identity(
+    role: str,
+    path: Path,
+    identity: dict[str, Any],
+    lane: str,
+) -> None:
+    info, raw = read_exact_regular(path, "frozen role " + role)
+    expected = {
+        "sha256": sha256_bytes(raw),
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": info.st_mode,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+    }
+    if any(identity.get(key) != value for key, value in expected.items()):
+        fail("frozen role identity drifted: " + role)
+    if lane == "linux":
+        if info.st_uid != 1 or info.st_gid != 1:
+            fail("Linux frozen role guest ownership drifted: " + role)
+    elif (
+        identity.get("uid") != info.st_uid
+        or identity.get("gid") != info.st_gid
+    ):
+        fail("Darwin frozen role ownership drifted: " + role)
+
+
+def authority_manifest_bytes(
+    operation: str,
+    phase_index: int,
+    inputs: Sequence[dict[str, Any]],
+) -> bytes:
+    rows = list(inputs)
+    roles: set[str] = set()
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {
+                "role",
+                "authorityKind",
+                "identity",
+            }
+            or not isinstance(row["role"], str)
+            or row["role"] in roles
+            or row["authorityKind"] not in {
+                FROZEN_ROLE_AUTHORITY,
+                SEALED_OUTPUT_AUTHORITY,
+            }
+            or not isinstance(row["identity"], dict)
+        ):
+            fail("phase authority input row drifted")
+        roles.add(row["role"])
+    payload = {
+        "schema": PHASE_AUTHORITY_ARTIFACT_SCHEMA,
+        "operation": operation,
+        "phaseIndex": phase_index,
+        "inputs": rows,
+    }
+    return canonical_json({
+        "payload": payload,
+        "payloadSha256": sha256_bytes(canonical_json(payload)),
+    }) + b"\n"
+
+
+def frozen_role_authority_input(
+    role: str,
+    kind: str,
+    expected_path: Path,
+    role_paths: dict[str, Path],
+    identities: dict[str, dict[str, Any]],
+    lane: str,
+) -> dict[str, Any]:
+    if (
+        role not in role_paths
+        or role not in identities
+        or kind not in {"regular", "executable"}
+    ):
+        fail("frozen authority input role is absent")
+    path = role_paths[role]
+    identity = identities[role]
+    required_fields = {
+        "pathFshex",
+        "sha256",
+        "device",
+        "inode",
+        "mode",
+        "nlink",
+        "size",
+        "uid",
+        "gid",
+        "format",
+    }
+    if (
+        set(identity) != required_fields
+        or path != expected_path
+        or (
+            kind == "regular"
+            and identity.get("format") != "regular"
+        )
+        or (
+            kind == "executable"
+            and identity.get("format") == "regular"
+        )
+        or (
+            lane == "darwin"
+            and identity.get("pathFshex")
+                != os.fsencode(str(path)).hex()
+        )
+    ):
+        fail("frozen authority input identity shape drifted")
+    verify_frozen_identity(role, path, identity, lane)
+    return {
+        "role": role,
+        "authorityKind": FROZEN_ROLE_AUTHORITY,
+        "identity": dict(identity),
+    }
+
+
+def sealed_output_authority_input(
+    role: str,
+    plan: dict[str, Any],
+    planned_paths: dict[str, Path],
+) -> dict[str, Any]:
+    planned = [
+        item for item in plan["declaredDeltaFiles"]
+        if item["role"] == role
+    ]
+    if (
+        len(planned) != 1
+        or role not in planned_paths
+        or planned[0]["kind"] not in {"regular", "executable"}
+        or planned[0]["finalMode"]
+            not in (0o400, 0o444, 0o500, 0o555)
+    ):
+        fail("sealed authority output role is not exact")
+    item = planned[0]
+    return {
+        "role": role,
+        "authorityKind": SEALED_OUTPUT_AUTHORITY,
+        "identity": artifact_payload(
+            planned_paths[role],
+            item["kind"],
+            item["finalMode"],
+        ),
+    }
+
+
+def bootstrap_self_image_portable_cid(size: int, digest: str) -> str:
+    if (
+        size <= 0
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+    ):
+        fail("bootstrap self-image portable CID input is invalid")
+    return sha256_bytes(
+        (
+            "cheng.bootstrap.self-image.portable\n"
+            f"size={size}\n"
+            f"sha256={digest}\n"
+        ).encode("ascii")
+    )
+
+
+def validate_bootstrap_self_image_compile_report(
+    report_path: Path,
+    guard_rows: dict[str, str],
+    expected_executable_format: str,
+    executable_path: Path | None = None,
+    generated_path: Path | None = None,
+) -> None:
+    if expected_executable_format not in set(
+        LANE_EXECUTABLE_FORMAT.values()
+    ):
+        fail("bootstrap self-image executable format is unsupported")
+    _info, raw = read_exact_regular(
+        report_path, "bootstrap self-image compile report"
+    )
+    if not raw.endswith(b"\n") or b"\0" in raw or b"\r" in raw:
+        fail("bootstrap self-image compile report encoding drifted")
+    rows: dict[str, str] = {}
+    for line in raw[:-1].split(b"\n"):
+        key_raw, separator, value_raw = line.partition(b"=")
+        if (
+            separator != b"="
+            or not re.fullmatch(rb"[a-z][a-z0-9_]*", key_raw)
+        ):
+            fail("bootstrap self-image compile report row drifted")
+        key = key_raw.decode("ascii")
+        if key in rows:
+            fail("bootstrap self-image compile report key aliases")
+        try:
+            rows[key] = value_raw.decode("utf-8", "strict")
+        except UnicodeDecodeError as exc:
+            raise PhaseEngineError(
+                "bootstrap self-image compile report is not UTF-8"
+            ) from exc
+    required = {
+        "self_image_source",
+        "self_image_executable_format",
+        "self_image_fd",
+        "self_image_pre_device",
+        "self_image_pre_inode",
+        "self_image_pre_mode",
+        "self_image_pre_uid",
+        "self_image_pre_gid",
+        "self_image_pre_nlink",
+        "self_image_pre_size",
+        "self_image_pre_sha256",
+        "self_image_pre_portable_cid",
+        "self_image_copy_sha256",
+        "self_image_copy_matches_pre",
+        "self_image_post_device",
+        "self_image_post_inode",
+        "self_image_post_mode",
+        "self_image_post_uid",
+        "self_image_post_gid",
+        "self_image_post_nlink",
+        "self_image_post_size",
+        "self_image_post_sha256",
+        "self_image_post_portable_cid",
+        "self_image_stable",
+    }
+    if executable_path is not None or generated_path is not None:
+        required.update({
+            "output",
+            "bootstrap_publication_executable_path",
+            "bootstrap_publication_generated_path",
+            "bootstrap_publication_report_path",
+            "bootstrap_generated_c_sha256",
+            "bootstrap_candidate_sha256",
+        })
+    if not required.issubset(rows):
+        fail("bootstrap self-image compile report is incomplete")
+    size = int(guard_rows["self_image_source_size"])
+    digest = guard_rows["self_image_source_sha256"]
+    portable_cid = bootstrap_self_image_portable_cid(size, digest)
+    try:
+        source_mode = int(guard_rows["self_image_source_mode"], 8)
+    except ValueError as exc:
+        raise PhaseEngineError(
+            "bootstrap self-image source mode is invalid"
+        ) from exc
+    source_permission_mode = format(stat.S_IMODE(source_mode), "o")
+    physical_pairs = (
+        ("device", "device"),
+        ("inode", "inode"),
+        ("uid", "uid"),
+        ("gid", "gid"),
+        ("nlink", "nlink"),
+        ("size", "size"),
+    )
+    if (
+        rows["self_image_source"] != "pinned_fd"
+        or rows["self_image_executable_format"]
+            != expected_executable_format
+        or rows["self_image_fd"] != "198"
+        or guard_rows["self_image_source_mode"]
+            not in ("100500", "100555")
+        or rows["self_image_pre_mode"] != source_permission_mode
+        or rows["self_image_post_mode"] != source_permission_mode
+        or rows["self_image_pre_sha256"] != digest
+        or rows["self_image_copy_sha256"] != digest
+        or rows["self_image_post_sha256"] != digest
+        or rows["self_image_pre_portable_cid"] != portable_cid
+        or rows["self_image_post_portable_cid"] != portable_cid
+        or rows["self_image_copy_matches_pre"] != "1"
+        or rows["self_image_stable"] != "1"
+        or any(
+            rows[f"self_image_pre_{report_suffix}"]
+                != guard_rows[f"self_image_source_{guard_suffix}"]
+            or rows[f"self_image_post_{report_suffix}"]
+                != guard_rows[f"self_image_source_{guard_suffix}"]
+            for report_suffix, guard_suffix in physical_pairs
+        )
+    ):
+        fail("bootstrap self-image compile report authority drifted")
+    if executable_path is not None or generated_path is not None:
+        if executable_path is None or generated_path is None:
+            fail("bootstrap publication output authority is incomplete")
+        executable_info, executable_raw = read_exact_regular(
+            executable_path, "bootstrap published executable"
+        )
+        generated_info, generated_raw = read_exact_regular(
+            generated_path, "bootstrap published generated C"
+        )
+        report_info = os.stat(report_path, follow_symlinks=False)
+        if (
+            rows["output"] != str(executable_path)
+            or rows["bootstrap_publication_executable_path"]
+                != str(executable_path)
+            or rows["bootstrap_publication_generated_path"]
+                != str(generated_path)
+            or rows["bootstrap_publication_report_path"]
+                != str(report_path)
+            or rows["bootstrap_candidate_sha256"]
+                != sha256_bytes(executable_raw)
+            or rows["bootstrap_generated_c_sha256"]
+                != sha256_bytes(generated_raw)
+            or stat.S_IMODE(executable_info.st_mode) != 0o555
+            or stat.S_IMODE(generated_info.st_mode) != 0o444
+            or stat.S_IMODE(report_info.st_mode) != 0o444
+            or executable_info.st_nlink != 1
+            or generated_info.st_nlink != 1
+            or report_info.st_nlink != 1
+        ):
+            fail("bootstrap publication terminal authority drifted")
+
+
+def remove_verified_guard_snapshot(
+    report_path: Path,
+    compile_report_path: Path | None = None,
+    executable_path: Path | None = None,
+    generated_path: Path | None = None,
+) -> None:
+    _info, raw = read_exact_regular(
+        report_path, "phase guard receipt"
+    )
+    try:
+        lines = raw.decode("utf-8", "strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise PhaseEngineError(
+            "phase guard receipt is not UTF-8"
+        ) from exc
+    rows: dict[str, str] = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator or key in rows:
+            fail("phase guard receipt row drifted")
+        rows[key] = value
+    required = (
+        "command_execution_mode",
+        "command_execution_snapshot_path",
+        "command_execution_snapshot_sha256",
+        "command_execution_snapshot_device",
+        "command_execution_snapshot_inode",
+        "command_execution_snapshot_size",
+        "self_image_fd_schema",
+        "self_image_fd",
+        "self_image_source_path",
+        "self_image_source_sha256",
+        "self_image_source_device",
+        "self_image_source_inode",
+        "self_image_source_mode",
+        "self_image_source_nlink",
+        "self_image_source_uid",
+        "self_image_source_gid",
+        "self_image_source_size",
+        "self_image_source_mtime_ns",
+        "self_image_source_ctime_ns",
+        "self_image_argv_count",
+        "self_image_argv_sha256",
+        "self_image_authority_status",
+        "self_image_inheritance_status",
+        "self_image_identity_status",
+        "self_image_source_fd_close_status",
+    )
+    if any(key not in rows for key in required):
+        fail("phase guard snapshot identity is incomplete")
+    snapshot = Path(rows["command_execution_snapshot_path"])
+    parent = snapshot.parent
+    if (
+        rows["command_execution_mode"]
+            != "private_single_link_snapshot"
+        or snapshot.name != "command.snapshot"
+        or parent.parent != report_path.parent
+        or not re.fullmatch(r"\.beat-c-command\.[A-Za-z0-9_]+", parent.name)
+    ):
+        fail("phase guard snapshot path is not exact transient")
+    info, snapshot_raw = read_exact_regular(
+        snapshot, "phase guard command snapshot"
+    )
+    if (
+        sha256_bytes(snapshot_raw)
+            != rows["command_execution_snapshot_sha256"]
+        or str(info.st_dev)
+            != rows["command_execution_snapshot_device"]
+        or str(info.st_ino)
+            != rows["command_execution_snapshot_inode"]
+        or str(info.st_size)
+            != rows["command_execution_snapshot_size"]
+        or tuple(parent.iterdir()) != (snapshot,)
+    ):
+        fail("phase guard command snapshot identity drifted")
+    if rows["self_image_fd"] == "198":
+        if (
+            rows["self_image_fd_schema"]
+                != "cheng.guard.command_self_image_fd"
+            or rows["self_image_source_path"] != str(snapshot)
+            or rows["self_image_source_sha256"]
+                != rows["command_execution_snapshot_sha256"]
+            or rows["self_image_source_device"] != str(info.st_dev)
+            or rows["self_image_source_inode"] != str(info.st_ino)
+            or rows["self_image_source_mode"] != format(info.st_mode, "o")
+            or rows["self_image_source_nlink"] != str(info.st_nlink)
+            or rows["self_image_source_uid"] != str(info.st_uid)
+            or rows["self_image_source_gid"] != str(info.st_gid)
+            or rows["self_image_source_size"] != str(info.st_size)
+            or rows["self_image_source_mtime_ns"]
+                != str(info.st_mtime_ns)
+            or rows["self_image_source_ctime_ns"]
+                != str(info.st_ctime_ns)
+            or rows["self_image_argv_count"] != "1"
+            or rows["self_image_argv_sha256"]
+                != rows.get("command_argv_sha256")
+            or rows["self_image_authority_status"]
+                != "verified_snapshot_fd_held_through_terminal"
+            or rows["self_image_inheritance_status"]
+                != "verified_preexec_exact"
+            or rows["self_image_identity_status"]
+                != "verified_snapshot_child_preexec_and_terminal"
+            or rows.get("self_image_source_fd_close_status")
+                != "deferred_to_monitor_process_exit"
+        ):
+            fail("phase guard self-image fd authority drifted")
+        if compile_report_path is None:
+            fail("phase guard self-image compile report is absent")
+        validate_bootstrap_self_image_compile_report(
+            compile_report_path,
+            rows,
+            executable_format(snapshot_raw),
+            executable_path,
+            generated_path,
+        )
+    elif (
+        rows["self_image_fd"] != "0"
+        or rows["self_image_source_path"]
+        or rows["self_image_source_sha256"]
+        or rows["self_image_argv_count"] != "0"
+        or rows["self_image_argv_sha256"]
+        or rows["self_image_authority_status"] != "not_requested"
+        or rows["self_image_inheritance_status"] != "not_requested"
+        or rows["self_image_identity_status"] != "not_requested"
+        or rows.get("self_image_source_fd_close_status")
+            != "not_requested"
+    ):
+        fail("phase guard unexpected self-image fd authority")
+    snapshot.unlink()
+    parent.rmdir()
+
+
+def strict_guard_report(path: Path) -> tuple[dict[str, str], bytes]:
+    _info, raw = read_exact_regular(path, "phase guard report")
+    if not raw.endswith(b"\n") or b"\0" in raw or b"\r" in raw:
+        fail("phase guard report encoding drifted")
+    rows: dict[str, str] = {}
+    for line in raw[:-1].split(b"\n"):
+        if b"=" not in line:
+            fail("phase guard report row lacks separator")
+        key_raw, value_raw = line.split(b"=", 1)
+        try:
+            key = key_raw.decode("ascii", "strict")
+            value = value_raw.decode("utf-8", "strict")
+        except UnicodeDecodeError as exc:
+            raise PhaseEngineError(
+                "phase guard report encoding is invalid"
+            ) from exc
+        if (
+            not re.fullmatch(r"[a-z][a-z0-9_]*", key)
+            or key in rows
+        ):
+            fail("phase guard report key drifted")
+        rows[key] = value
+    return rows, raw
+
+
+def validate_private_tree_guard_report(
+    *,
+    report_path: Path,
+    action: dict[str, Any],
+    target_identity: dict[str, Any],
+    target_physical_identity: dict[str, Any],
+    monitor_python_path: Path,
+    monitor_python_identity: dict[str, Any],
+    monitor_runtime_path: Path,
+    monitor_runtime_identity: dict[str, Any],
+    monitor_runtime_physical_identity: dict[str, Any],
+    private_tree: dict[str, Any],
+    env: Sequence[dict[str, str]],
+    planned_by_role: dict[str, dict[str, Any]],
+    planned_paths: dict[str, Path],
+) -> bytes:
+    rows, raw = strict_guard_report(report_path)
+    target_path = action["targetArgv"][0]
+    required = {
+        "schema",
+        "status",
+        "rc",
+        "abort_reason",
+        "expected_exit_code",
+        "actual_exit_code",
+        "exit_code_contract_status",
+        "command_identity_status",
+        "command_identity_error",
+        "command_path",
+        "command_sha256",
+        "command_device",
+        "command_inode",
+        "command_mode",
+        "command_nlink",
+        "command_uid",
+        "command_gid",
+        "command_size",
+        "command_mtime_ns",
+        "command_ctime_ns",
+        "command_authority_fd",
+        "command_authority_status",
+        "expected_command_path",
+        "expected_command_sha256",
+        "formal_command_identity_status",
+        "command_execution_snapshot_schema",
+        "command_execution_mode",
+        "command_execution_trust_boundary",
+        "command_execution_snapshot_path",
+        "command_execution_snapshot_sha256",
+        "command_execution_snapshot_device",
+        "command_execution_snapshot_inode",
+        "command_execution_snapshot_mode",
+        "command_execution_snapshot_nlink",
+        "command_execution_snapshot_uid",
+        "command_execution_snapshot_gid",
+        "command_execution_snapshot_size",
+        "command_execution_snapshot_mtime_ns",
+        "command_execution_snapshot_ctime_ns",
+        "private_frozen_tree_direct_schema",
+        "private_frozen_tree_direct_status",
+        "private_frozen_tree_root",
+        "private_frozen_tree_expected_sha256",
+        "private_frozen_tree_sha256",
+        "private_frozen_tree_entry_count",
+        "private_frozen_tree_directory_count",
+        "private_frozen_tree_file_count",
+        "private_frozen_tree_ordering",
+        "private_frozen_tree_node_policy",
+        "private_frozen_tree_command_membership_status",
+        "private_frozen_tree_watch_schema",
+        "private_frozen_tree_watch_status",
+        "private_frozen_tree_watch_count",
+        "private_frozen_tree_watch_coverage",
+        "private_frozen_tree_watch_forbidden_events",
+        "private_frozen_tree_precheck_status",
+        "private_frozen_tree_postcheck_status",
+        "private_frozen_tree_attrib_event_status",
+        "private_frozen_tree_attrib_event_count",
+        "private_frozen_tree_ssv_launcher_status",
+        "private_frozen_tree_ssv_root_device",
+        "private_frozen_tree_ssv_root_sealed",
+        "private_frozen_tree_ssv_root_read_only",
+        "private_frozen_tree_same_uid_boundary",
+        "darwin_seatbelt_exact_exec_schema",
+        "darwin_seatbelt_exact_exec_status",
+        "darwin_seatbelt_launcher_path",
+        "darwin_seatbelt_launcher_sha256",
+        "darwin_seatbelt_launcher_device",
+        "darwin_seatbelt_launcher_inode",
+        "darwin_seatbelt_launcher_mode",
+        "darwin_seatbelt_launcher_nlink",
+        "darwin_seatbelt_launcher_uid",
+        "darwin_seatbelt_launcher_gid",
+        "darwin_seatbelt_launcher_size",
+        "darwin_seatbelt_launcher_mtime_ns",
+        "darwin_seatbelt_launcher_ctime_ns",
+        "darwin_seatbelt_profile_sha256",
+        "darwin_seatbelt_allowed_exec_path",
+        "darwin_seatbelt_parameter_count",
+        "darwin_seatbelt_parameter_sha256",
+        "darwin_seatbelt_allowed_output_count",
+        "darwin_seatbelt_hidden_exec_policy",
+        "darwin_seatbelt_fork_policy",
+        "darwin_seatbelt_write_policy",
+        "command_argv_schema",
+        "command_argv_count",
+        "command_argv_sha256",
+        "target_env_requested_count",
+        "target_env_requested_sha256",
+        "monitor_python_path",
+        "monitor_python_sha256",
+        "monitor_python_device",
+        "monitor_python_inode",
+        "monitor_python_size",
+        "monitor_runtime_script_schema",
+        "monitor_runtime_script_path",
+        "monitor_runtime_script_sha256",
+        "monitor_runtime_script_device",
+        "monitor_runtime_script_inode",
+        "monitor_runtime_script_mode",
+        "monitor_runtime_script_nlink",
+        "monitor_runtime_script_uid",
+        "monitor_runtime_script_gid",
+        "monitor_runtime_script_size",
+        "monitor_runtime_script_mtime_ns",
+        "monitor_runtime_script_ctime_ns",
+        "monitor_runtime_script_fd",
+        "monitor_runtime_script_invocation_status",
+        "monitor_runtime_script_stage_expected_sha256",
+        "monitor_runtime_script_builtin_sha256",
+        "monitor_runtime_script_expected_sha_match",
+        "tracked_output_schema",
+        "tracked_output_size_evidence_kind",
+        "tracked_output_publication_policy",
+        "tracked_output_fd_schema",
+        "tracked_output_fd_count",
+        "tracked_output_fd_argv_sha256",
+        "tracked_output_fd_status",
+        "tracked_output_count",
+        "tracked_output_failure_label",
+        "tracked_output_failure_error",
+        "tracked_output_failure_class",
+        "hard_memory_limit_proof_status",
+        "cleanup_status",
+    }
+    requested_env = {
+        item["name"]: item["value"] for item in env
+    }
+    private_tree_info = os.lstat(private_tree["root"])
+    launcher_info, launcher_raw = read_exact_regular(
+        Path("/usr/bin/sandbox-exec"), "Darwin Seatbelt launcher"
+    )
+    output_roles = sorted(action["businessOutputRoles"])
+    fd_bindings = {
+        binding["role"]: binding
+        for binding in action["trackedOutputFdBindings"]
+    }
+    parameters = [
+        ("CHENG_GUARD_EXECUTABLE", target_path),
+        *(
+            (
+                f"CHENG_GUARD_OUTPUT_{index}",
+                (
+                    fd_bindings[role]["argvPath"]
+                    if role in fd_bindings
+                    else str(planned_paths[role])
+                ),
+            )
+            for index, role in enumerate(output_roles)
+        ),
+    ]
+    parameter_payload = bytearray(
+        len(b"cheng.guard.darwin_seatbelt_parameters").to_bytes(4, "big")
+        + b"cheng.guard.darwin_seatbelt_parameters"
+    )
+    parameter_payload.extend(len(parameters).to_bytes(4, "big"))
+    for name, value in parameters:
+        for raw_value in (name.encode("ascii"), os.fsencode(value)):
+            parameter_payload.extend(
+                len(raw_value).to_bytes(4, "big") + raw_value
+            )
+    profile_lines = [
+        "(version 1)",
+        (
+            "(define CHENG_GUARD_EXECUTABLE_VALUE "
+            "(param \"CHENG_GUARD_EXECUTABLE\"))"
+        ),
+        *(
+            (
+                f"(define CHENG_GUARD_OUTPUT_{index}_VALUE "
+                f"(param \"CHENG_GUARD_OUTPUT_{index}\"))"
+            )
+            for index in range(len(output_roles))
+        ),
+        "(allow default)",
+        "(deny process-exec)",
+        "(deny process-fork)",
+        "(deny file-write*)",
+        (
+            "(allow process-exec "
+            "(literal CHENG_GUARD_EXECUTABLE_VALUE))"
+        ),
+        *(
+            (
+                f"(allow file-write* "
+                f"(literal CHENG_GUARD_OUTPUT_{index}_VALUE))"
+            )
+            for index in range(len(output_roles))
+        ),
+    ]
+    profile_sha = hashlib.sha256(
+        ("\n".join(profile_lines) + "\n").encode("utf-8")
+    ).hexdigest()
+    expected_env_sha = hashlib.sha256(
+        (
+            len(b"cheng.guard.target_env").to_bytes(4, "big")
+            + b"cheng.guard.target_env"
+            + len(requested_env).to_bytes(4, "big")
+            + b"".join(
+                len(os.fsencode(key)).to_bytes(4, "big")
+                + os.fsencode(key)
+                + len(os.fsencode(requested_env[key])).to_bytes(4, "big")
+                + os.fsencode(requested_env[key])
+                for key in sorted(requested_env)
+            )
+        )
+    ).hexdigest()
+    dynamic_keys = {
+        f"tracked_output_{output_index}_{suffix}"
+        for output_index in range(len(output_roles))
+        for suffix in (
+            "label", "path", "status", "required_mode",
+            "max_bytes", "sha256", "preopen_path_status",
+                "open_device", "open_inode", "device", "inode",
+                "identity_stable", "size", "mode", "open_mode",
+                "nlink", "uid", "gid", "mtime_ns", "ctime_ns",
+                "preseal_mode", "final_mode", "seal_status",
+                "target_fd", "target_fd_path",
+                "target_fd_argv_count",
+                "target_fd_argv_sha256",
+                "target_fd_inheritance_status",
+                "target_fd_identity_status",
+        )
+    }
+    capability_prefixes = (
+        "command_",
+        "private_frozen_tree_",
+        "darwin_seatbelt_",
+        "monitor_runtime_script_",
+        "tracked_output_",
+    )
+    if (
+        not required.issubset(rows)
+        or {
+            key for key in rows if key.startswith(capability_prefixes)
+        } != {
+            key for key in required.union(dynamic_keys)
+            if key.startswith(capability_prefixes)
+        }
+        or rows["schema"] != "beat_c_process_memory_guard"
+        or rows["status"] != "completed"
+        or rows["rc"] != "0"
+        or rows["abort_reason"]
+        or rows["expected_exit_code"] != "0"
+        or rows["actual_exit_code"] != "0"
+        or rows["exit_code_contract_status"] != "verified"
+        or rows["command_identity_status"] != "available"
+        or rows["command_identity_error"]
+        or rows["command_path"] != target_path
+        or rows["command_sha256"] != target_identity["sha256"]
+        or rows["command_device"]
+            != str(target_physical_identity["device"])
+        or rows["command_inode"]
+            != str(target_physical_identity["inode"])
+        or rows["command_mode"]
+            != format(target_physical_identity["mode"], "o")
+        or rows["command_nlink"]
+            != str(target_physical_identity["nlink"])
+        or rows["command_uid"]
+            != str(target_physical_identity["uid"])
+        or rows["command_gid"]
+            != str(target_physical_identity["gid"])
+        or rows["command_size"]
+            != str(target_physical_identity["size"])
+        or rows["command_mtime_ns"]
+            != str(target_physical_identity["mtimeNs"])
+        or rows["command_ctime_ns"]
+            != str(target_physical_identity["ctimeNs"])
+        or rows["command_authority_fd"] != "0"
+        or rows["command_authority_status"] != "not_requested"
+        or rows["expected_command_path"] != target_path
+        or rows["expected_command_sha256"] != target_identity["sha256"]
+        or rows["formal_command_identity_status"] != "required_verified"
+        or rows["command_execution_snapshot_schema"]
+            != "cheng.guard.command_snapshot"
+        or rows["command_execution_mode"]
+            != "private_frozen_tree_direct"
+        or rows["command_execution_trust_boundary"]
+            != (
+                "darwin_private_frozen_tree_original_path_with_"
+                "pre_post_command_and_full_closure_identity_kqueue_"
+                "full_vnode_watch_ssv_attested_seatbelt_exact_exec_"
+                "not_same_uid_isolation"
+            )
+        or rows["command_execution_snapshot_path"] != target_path
+        or rows["command_execution_snapshot_sha256"]
+            != target_identity["sha256"]
+        or rows["command_execution_snapshot_device"]
+            != str(target_physical_identity["device"])
+        or rows["command_execution_snapshot_inode"]
+            != str(target_physical_identity["inode"])
+        or rows["command_execution_snapshot_mode"]
+            != format(target_physical_identity["mode"], "o")
+        or rows["command_execution_snapshot_nlink"]
+            != str(target_physical_identity["nlink"])
+        or rows["command_execution_snapshot_uid"]
+            != str(target_physical_identity["uid"])
+        or rows["command_execution_snapshot_gid"]
+            != str(target_physical_identity["gid"])
+        or rows["command_execution_snapshot_size"]
+            != str(target_physical_identity["size"])
+        or rows["command_execution_snapshot_mtime_ns"]
+            != str(target_physical_identity["mtimeNs"])
+        or rows["command_execution_snapshot_ctime_ns"]
+            != str(target_physical_identity["ctimeNs"])
+        or rows["private_frozen_tree_direct_schema"]
+            != "cheng.guard.darwin_private_frozen_tree_direct"
+        or rows["private_frozen_tree_direct_status"] != "verified"
+        or rows["private_frozen_tree_root"] != private_tree["root"]
+        or rows["private_frozen_tree_expected_sha256"]
+            != private_tree["sha256"]
+        or rows["private_frozen_tree_sha256"] != private_tree["sha256"]
+        or rows["private_frozen_tree_entry_count"]
+            != str(private_tree["entryCount"])
+        or rows["private_frozen_tree_directory_count"]
+            != str(private_tree["directoryCount"])
+        or rows["private_frozen_tree_file_count"]
+            != str(private_tree["fileCount"])
+        or rows["private_frozen_tree_ordering"]
+            != "relative_path_fsbytes_then_kind_directory_before_regular"
+        or rows["private_frozen_tree_node_policy"]
+            != "directories_and_single_link_regular_files_only"
+        or rows["private_frozen_tree_command_membership_status"]
+            != "verified_single_link_executable_member"
+        or rows["private_frozen_tree_watch_schema"]
+            != "cheng.guard.darwin_private_frozen_tree_kqueue_watch"
+        or rows["private_frozen_tree_watch_count"]
+            != str(private_tree["watchCount"])
+        or rows["private_frozen_tree_watch_status"] != "verified_clean"
+        or rows["private_frozen_tree_watch_coverage"]
+            != private_tree["watchCoverage"]
+        or rows["private_frozen_tree_watch_forbidden_events"]
+            != (
+                "write,delete,extend,link,rename,revoke,"
+                "attrib_without_exact_terminal_identity"
+            )
+        or rows["private_frozen_tree_precheck_status"] != "verified"
+        or rows["private_frozen_tree_postcheck_status"] != "verified"
+        or rows["private_frozen_tree_attrib_event_status"]
+            != "verified_regular_only_sealed_identity_unchanged"
+        or not re.fullmatch(
+            r"[1-9][0-9]*",
+            rows["private_frozen_tree_attrib_event_count"],
+        )
+        or rows["private_frozen_tree_ssv_launcher_status"] != "verified"
+        or rows["private_frozen_tree_ssv_root_device"]
+            != str(private_tree_info.st_dev)
+        or rows["private_frozen_tree_ssv_root_sealed"] != "1"
+        or rows["private_frozen_tree_ssv_root_read_only"] != "1"
+        or rows["private_frozen_tree_same_uid_boundary"]
+            != private_tree["sameUidBoundary"]
+        or rows["darwin_seatbelt_exact_exec_schema"]
+            != "cheng.guard.darwin_seatbelt_exact_exec"
+        or rows["darwin_seatbelt_exact_exec_status"] != "verified"
+        or rows["darwin_seatbelt_launcher_path"]
+            != "/usr/bin/sandbox-exec"
+        or rows["darwin_seatbelt_launcher_sha256"]
+            != sha256_bytes(launcher_raw)
+        or rows["darwin_seatbelt_launcher_device"]
+            != str(launcher_info.st_dev)
+        or rows["darwin_seatbelt_launcher_inode"]
+            != str(launcher_info.st_ino)
+        or rows["darwin_seatbelt_launcher_mode"]
+            != format(launcher_info.st_mode, "o")
+        or rows["darwin_seatbelt_launcher_nlink"]
+            != str(launcher_info.st_nlink)
+        or rows["darwin_seatbelt_launcher_uid"]
+            != str(launcher_info.st_uid)
+        or rows["darwin_seatbelt_launcher_gid"]
+            != str(launcher_info.st_gid)
+        or rows["darwin_seatbelt_launcher_size"]
+            != str(launcher_info.st_size)
+        or rows["darwin_seatbelt_launcher_mtime_ns"]
+            != str(launcher_info.st_mtime_ns)
+        or rows["darwin_seatbelt_launcher_ctime_ns"]
+            != str(launcher_info.st_ctime_ns)
+        or rows["darwin_seatbelt_profile_sha256"] != profile_sha
+        or rows["darwin_seatbelt_allowed_exec_path"] != target_path
+        or rows["darwin_seatbelt_parameter_count"]
+            != str(len(parameters))
+        or rows["darwin_seatbelt_parameter_sha256"]
+            != sha256_bytes(bytes(parameter_payload))
+        or rows["darwin_seatbelt_allowed_output_count"]
+            != str(len(output_roles))
+        or rows["darwin_seatbelt_hidden_exec_policy"]
+            != "deny_all_except_exact_target"
+        or rows["darwin_seatbelt_fork_policy"] != "deny"
+        or rows["darwin_seatbelt_write_policy"]
+            != "deny_all_except_exact_tracked_outputs"
+        or rows["command_argv_schema"] != "cheng.guard.command_argv"
+        or rows["command_argv_count"]
+            != str(len(action["targetArgv"]))
+        or rows["command_argv_sha256"] != action["targetArgvSha256"]
+        or rows["target_env_requested_count"] != str(len(requested_env))
+        or rows["target_env_requested_sha256"] != expected_env_sha
+        or rows["monitor_python_path"] != str(monitor_python_path)
+        or rows["monitor_python_sha256"]
+            != monitor_python_identity["sha256"]
+        or rows["monitor_python_device"]
+            != str(monitor_python_identity["device"])
+        or rows["monitor_python_inode"]
+            != str(monitor_python_identity["inode"])
+        or rows["monitor_python_size"]
+            != str(monitor_python_identity["size"])
+        or rows["monitor_runtime_script_schema"]
+            != "cheng.guard.monitor_runtime_script"
+        or rows["monitor_runtime_script_path"]
+            != str(monitor_runtime_path)
+        or rows["monitor_runtime_script_sha256"]
+            != monitor_runtime_identity["sha256"]
+        or rows["monitor_runtime_script_device"]
+            != str(monitor_runtime_physical_identity["device"])
+        or rows["monitor_runtime_script_inode"]
+            != str(monitor_runtime_physical_identity["inode"])
+        or rows["monitor_runtime_script_mode"]
+            != format(monitor_runtime_physical_identity["mode"], "o")
+        or rows["monitor_runtime_script_nlink"]
+            != str(monitor_runtime_physical_identity["nlink"])
+        or rows["monitor_runtime_script_uid"]
+            != str(monitor_runtime_physical_identity["uid"])
+        or rows["monitor_runtime_script_gid"]
+            != str(monitor_runtime_physical_identity["gid"])
+        or rows["monitor_runtime_script_size"]
+            != str(monitor_runtime_physical_identity["size"])
+        or rows["monitor_runtime_script_mtime_ns"]
+            != str(monitor_runtime_physical_identity["mtimeNs"])
+        or rows["monitor_runtime_script_ctime_ns"]
+            != str(monitor_runtime_physical_identity["ctimeNs"])
+        or rows["monitor_runtime_script_fd"] != "9"
+        or rows["monitor_runtime_script_invocation_status"]
+            != "verified_o_nofollow_loader_fd9"
+        or rows["monitor_runtime_script_stage_expected_sha256"]
+            != monitor_runtime_identity["sha256"]
+        or rows["monitor_runtime_script_builtin_sha256"]
+            != monitor_runtime_identity["sha256"]
+        or rows["monitor_runtime_script_expected_sha_match"] != "1"
+        or rows["tracked_output_schema"]
+            != "cheng.guard.tracked_outputs"
+        or rows["tracked_output_size_evidence_kind"]
+            != "final_size_only_not_runtime_peak"
+        or rows["tracked_output_publication_policy"]
+            != "guard_owned_0600_then_success_seal_0400_or0500"
+        or rows["tracked_output_fd_schema"]
+            != "cheng.guard.tracked_output_inherited_fd"
+        or rows["tracked_output_fd_count"]
+            != str(len(fd_bindings))
+        or rows["tracked_output_fd_argv_sha256"]
+            != (
+                action["targetArgvSha256"]
+                if fd_bindings else ""
+            )
+        or rows["tracked_output_fd_status"]
+            != (
+                "verified_preexec_exact"
+                if fd_bindings else "not_requested"
+            )
+        or rows["tracked_output_count"]
+            != str(len(action["businessOutputRoles"]))
+        or rows["tracked_output_failure_label"]
+        or rows["tracked_output_failure_error"]
+        or rows["tracked_output_failure_class"]
+        or rows["hard_memory_limit_proof_status"]
+            != "not_provable_userspace_poll"
+        or rows["cleanup_status"] != "not_required"
+    ):
+        fail("private frozen-tree guard receipt drifted")
+    for output_index, role in enumerate(sorted(
+        action["businessOutputRoles"]
+    )):
+        prefix = f"tracked_output_{output_index}_"
+        fd_binding = fd_bindings.get(role)
+        identity = artifact_payload(
+            planned_paths[role],
+            planned_by_role[role]["kind"],
+            planned_by_role[role]["finalMode"],
+            include_stable_times=True,
+        )
+        if (
+            rows.get(prefix + "label") != role
+            or rows.get(prefix + "path") != str(planned_paths[role])
+            or rows.get(prefix + "status") != "verified"
+            or rows.get(prefix + "required_mode")
+                != planned_by_role[role]["kind"]
+            or rows.get(prefix + "max_bytes") != "805306368"
+            or rows.get(prefix + "sha256") != identity["sha256"]
+            or rows.get(prefix + "preopen_path_status")
+                != "absent_proved_by_o_excl"
+            or rows.get(prefix + "open_device")
+                != str(identity["device"])
+            or rows.get(prefix + "open_inode")
+                != str(identity["inode"])
+            or rows.get(prefix + "open_mode") != "100600"
+            or rows.get(prefix + "preseal_mode")
+                != (
+                    "100600"
+                    if fd_binding is not None
+                    else (
+                        "100700"
+                        if planned_by_role[role]["kind"]
+                            == "executable"
+                        else "100600"
+                    )
+                )
+            or rows.get(prefix + "final_mode")
+                != (
+                    "100500"
+                    if planned_by_role[role]["kind"] == "executable"
+                    else "100400"
+                )
+            or rows.get(prefix + "seal_status") != "verified"
+            or rows.get(prefix + "device")
+                != str(identity["device"])
+            or rows.get(prefix + "inode")
+                != str(identity["inode"])
+            or rows.get(prefix + "identity_stable") != "1"
+            or rows.get(prefix + "size") != str(identity["size"])
+            or rows.get(prefix + "mode")
+                != format(identity["mode"], "o")
+            or rows.get(prefix + "nlink")
+                != str(identity["nlink"])
+            or rows.get(prefix + "uid") != str(identity["uid"])
+            or rows.get(prefix + "gid") != str(identity["gid"])
+            or rows.get(prefix + "mtime_ns")
+                != str(identity["mtimeNs"])
+            or rows.get(prefix + "ctime_ns")
+                != str(identity["ctimeNs"])
+            or rows.get(prefix + "target_fd")
+                != str(
+                    fd_binding["fd"]
+                    if fd_binding is not None else 0
+                )
+            or rows.get(prefix + "target_fd_path")
+                != (
+                    fd_binding["argvPath"]
+                    if fd_binding is not None else ""
+                )
+            or rows.get(prefix + "target_fd_argv_count")
+                != ("1" if fd_binding is not None else "0")
+            or rows.get(prefix + "target_fd_argv_sha256")
+                != (
+                    action["targetArgvSha256"]
+                    if fd_binding is not None else ""
+                )
+            or rows.get(prefix + "target_fd_inheritance_status")
+                != (
+                    "verified_preexec_exact"
+                    if fd_binding is not None else "not_requested"
+                )
+            or rows.get(prefix + "target_fd_identity_status")
+                != (
+                    "verified_held_single_link_output"
+                    if fd_binding is not None else "not_requested"
+                )
+        ):
+            fail("private frozen-tree tracked output drifted")
+    return raw
+
+
+def execute_darwin_codesign_actions(
+    *,
+    plan: dict[str, Any],
+    root: Path,
+    role_paths: dict[str, Path],
+    identities: dict[str, dict[str, Any]],
+    planned_paths: dict[str, Path],
+) -> None:
+    actions = plan.get("darwinCodesignActions", ())
+    if not actions:
+        return
+    codesign_path = role_paths["codesign"]
+    codesign_identity = identities["codesign"]
+    for action in actions:
+        verify_frozen_identity(
+            "codesign",
+            codesign_path,
+            codesign_identity,
+            plan["lane"],
+        )
+        codesign_before = os.lstat(codesign_path)
+        if any(
+            getattr(codesign_before, field) != codesign_identity[key]
+            for field, key in (
+                ("st_dev", "device"),
+                ("st_ino", "inode"),
+                ("st_mode", "mode"),
+                ("st_nlink", "nlink"),
+                ("st_size", "size"),
+                ("st_uid", "uid"),
+                ("st_gid", "gid"),
+            )
+        ):
+            fail("codesign frozen physical identity drifted")
+        receipt_path = planned_paths[action["guardReceiptRole"]]
+        stdout_path = planned_paths[action["guardStdoutRole"]]
+        stderr_path = planned_paths[action["guardStderrRole"]]
+        guard_argv = [
+            str(role_paths["bash"]),
+            str(role_paths["process_guard"]),
+            "--rss-limit:" + str(action["memoryLimitBytes"]),
+            "--timeout:" + str(action["timeoutSeconds"]),
+            "--combined-output-limit:1073741824",
+            "--monitor-python:" + str(role_paths["python"]),
+            "--expected-monitor-runtime-sha256:"
+                + identities["process_guard_runtime"]["sha256"],
+            "--sealed-system-volume-direct",
+            "--require-command-identity",
+            "--expected-command-path:" + str(codesign_path),
+            "--expected-command-sha256:"
+                + codesign_identity["sha256"],
+            "--expected-exit-code:0",
+            "--report-out:" + str(receipt_path),
+            "--stdout:" + str(stdout_path),
+            "--stderr:" + str(stderr_path),
+            "--target-env-clear",
+        ]
+        guard_argv.extend(
+            "--target-env:" + item["name"] + "=" + item["value"]
+            for item in plan["env"]
+        )
+        guard_argv.extend(("--", *action["targetArgv"]))
+        completed = subprocess.run(
+            guard_argv,
+            cwd=str(root),
+            env=guard_launcher_environment(
+                plan["lane"], role_paths["python"]
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if (
+            completed.returncode != 0
+            or completed.stdout
+            or completed.stderr
+        ):
+            detail = (
+                completed.stderr or completed.stdout
+            ).decode("utf-8", "replace").replace("\n", "_")[:512]
+            fail(
+                "guarded codesign verification failed:"
+                + str(completed.returncode)
+                + ":"
+                + detail
+            )
+        verify_frozen_identity(
+            "codesign",
+            codesign_path,
+            codesign_identity,
+            plan["lane"],
+        )
+        codesign_after = os.lstat(codesign_path)
+        physical_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_uid",
+            "st_gid",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(codesign_before, field)
+                != getattr(codesign_after, field)
+            for field in physical_fields
+        ):
+            fail("codesign physical identity changed during guard")
+        rows, _raw = strict_guard_report(receipt_path)
+        required = {
+            "schema",
+            "status",
+            "rc",
+            "abort_reason",
+            "expected_exit_code",
+            "actual_exit_code",
+            "exit_code_contract_status",
+            "command_identity_status",
+            "command_identity_error",
+            "command_path",
+            "command_sha256",
+            "command_device",
+            "command_inode",
+            "command_size",
+            "command_mtime_ns",
+            "command_ctime_ns",
+            "expected_command_path",
+            "expected_command_sha256",
+            "formal_command_identity_status",
+            "command_execution_mode",
+            "command_argv_sha256",
+            "sealed_system_volume_direct_status",
+            "sealed_system_volume_root_path",
+            "sealed_system_volume_root_device",
+            "sealed_system_volume_format_capabilities",
+            "sealed_system_volume_format_capabilities_valid",
+            "sealed_system_volume_root_sealed",
+            "sealed_system_volume_root_read_only",
+            "sealed_system_volume_platform_path",
+            "sealed_system_volume_platform_identity_status",
+            "sealed_system_volume_platform_sha256",
+            "sealed_system_volume_platform_device",
+            "sealed_system_volume_platform_inode",
+            "sealed_system_volume_platform_mode",
+            "sealed_system_volume_platform_nlink",
+            "sealed_system_volume_platform_uid",
+            "sealed_system_volume_platform_gid",
+            "sealed_system_volume_platform_size",
+            "sealed_system_volume_platform_mtime_ns",
+            "sealed_system_volume_platform_ctime_ns",
+            "darwin_seatbelt_exact_exec_status",
+            "darwin_seatbelt_allowed_exec_path",
+            "darwin_seatbelt_allowed_output_count",
+            "darwin_seatbelt_hidden_exec_policy",
+            "darwin_seatbelt_fork_policy",
+            "darwin_seatbelt_write_policy",
+            "monitor_runtime_script_sha256",
+            "monitor_runtime_script_stage_expected_sha256",
+            "monitor_runtime_script_builtin_sha256",
+            "monitor_runtime_script_expected_sha_match",
+            "tracked_output_count",
+            "hard_memory_limit_proof_status",
+            "cleanup_status",
+        }
+        if (
+            not required.issubset(rows)
+            or rows["schema"] != "beat_c_process_memory_guard"
+            or rows["status"] != "completed"
+            or rows["rc"] != "0"
+            or rows["abort_reason"]
+            or rows["expected_exit_code"] != "0"
+            or rows["actual_exit_code"] != "0"
+            or rows["exit_code_contract_status"] != "verified"
+            or rows["command_identity_status"] != "available"
+            or rows["command_identity_error"]
+            or rows["command_path"] != str(codesign_path)
+            or rows["command_sha256"] != codesign_identity["sha256"]
+            or rows["command_device"] != str(codesign_before.st_dev)
+            or rows["command_inode"] != str(codesign_before.st_ino)
+            or rows["command_size"] != str(codesign_before.st_size)
+            or rows["command_mtime_ns"]
+                != str(codesign_before.st_mtime_ns)
+            or rows["command_ctime_ns"]
+                != str(codesign_before.st_ctime_ns)
+            or rows["expected_command_path"] != str(codesign_path)
+            or rows["expected_command_sha256"]
+                != codesign_identity["sha256"]
+            or rows["formal_command_identity_status"]
+                != "required_verified"
+            or rows["command_execution_mode"]
+                != "sealed_system_volume_direct"
+            or rows["command_argv_sha256"]
+                != action["targetArgvSha256"]
+            or rows["sealed_system_volume_direct_status"]
+                != "verified"
+            or rows["sealed_system_volume_root_path"] != "/"
+            or rows["sealed_system_volume_root_device"]
+                != str(codesign_before.st_dev)
+            or not re.fullmatch(
+                r"[0-9a-f]{8}",
+                rows["sealed_system_volume_format_capabilities"],
+            )
+            or not re.fullmatch(
+                r"[0-9a-f]{8}",
+                rows[
+                    "sealed_system_volume_format_capabilities_valid"
+                ],
+            )
+            or rows["sealed_system_volume_root_sealed"] != "1"
+            or rows["sealed_system_volume_root_read_only"] != "1"
+            or rows["sealed_system_volume_platform_path"]
+                != str(codesign_path)
+            or rows["sealed_system_volume_platform_identity_status"]
+                != "verified"
+            or rows["sealed_system_volume_platform_sha256"]
+                != codesign_identity["sha256"]
+            or rows["sealed_system_volume_platform_device"]
+                != str(codesign_before.st_dev)
+            or rows["sealed_system_volume_platform_inode"]
+                != str(codesign_before.st_ino)
+            or rows["sealed_system_volume_platform_mode"]
+                != format(codesign_before.st_mode, "o")
+            or rows["sealed_system_volume_platform_nlink"]
+                != str(codesign_before.st_nlink)
+            or rows["sealed_system_volume_platform_uid"]
+                != str(codesign_before.st_uid)
+            or rows["sealed_system_volume_platform_gid"]
+                != str(codesign_before.st_gid)
+            or rows["sealed_system_volume_platform_size"]
+                != str(codesign_before.st_size)
+            or rows["sealed_system_volume_platform_mtime_ns"]
+                != str(codesign_before.st_mtime_ns)
+            or rows["sealed_system_volume_platform_ctime_ns"]
+                != str(codesign_before.st_ctime_ns)
+            or rows["darwin_seatbelt_exact_exec_status"]
+                != "verified"
+            or rows["darwin_seatbelt_allowed_exec_path"]
+                != str(codesign_path)
+            or rows["darwin_seatbelt_allowed_output_count"] != "0"
+            or rows["darwin_seatbelt_hidden_exec_policy"]
+                != "deny_all_except_exact_target"
+            or rows["darwin_seatbelt_fork_policy"] != "deny"
+            or rows["darwin_seatbelt_write_policy"]
+                != "deny_all_except_exact_tracked_outputs"
+            or rows["monitor_runtime_script_sha256"]
+                != identities["process_guard_runtime"]["sha256"]
+            or rows["monitor_runtime_script_stage_expected_sha256"]
+                != identities["process_guard_runtime"]["sha256"]
+            or rows["monitor_runtime_script_builtin_sha256"]
+                != identities["process_guard_runtime"]["sha256"]
+            or rows["monitor_runtime_script_expected_sha_match"] != "1"
+            or rows["tracked_output_count"] != "0"
+            or rows["hard_memory_limit_proof_status"]
+                != "not_provable_userspace_poll"
+            or rows["cleanup_status"] != "not_required"
+        ):
+            fail("guarded codesign receipt drifted")
+        if (
+            read_exact_regular(
+                stdout_path, "codesign guard stdout"
+            )[1]
+            or read_exact_regular(
+                stderr_path, "codesign guard stderr"
+            )[1]
+        ):
+            fail("guarded codesign emitted output")
+
+
+def exact_regular_identity_payload(
+    path: Path,
+    info: os.stat_result,
+    raw: bytes,
+) -> dict[str, Any]:
+    return {
+        "pathFshex": os.fsencode(str(path)).hex(),
+        "sha256": sha256_bytes(raw),
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": info.st_mode,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "mtimeNs": info.st_mtime_ns,
+        "ctimeNs": info.st_ctime_ns,
+    }
+
+
+def seal_path_replacement_executable(
+    path: Path,
+    initial_mode: int,
+    final_mode: int,
+) -> dict[str, Any]:
+    before_path = os.lstat(path)
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    stable_fields = (
+        "st_dev", "st_ino", "st_nlink", "st_size",
+        "st_uid", "st_gid", "st_mtime_ns",
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or stat.S_IMODE(before.st_mode) != initial_mode
+            or any(
+                getattr(before, field)
+                    != getattr(before_path, field)
+                for field in (*stable_fields, "st_mode")
+            )
+        ):
+            fail("Darwin path-replacement executable is not exact")
+        os.fchmod(descriptor, final_mode)
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after_path = os.lstat(path)
+    if (
+        stat.S_IMODE(after.st_mode) != final_mode
+        or any(
+            getattr(before, field) != getattr(other, field)
+            for other in (after, after_path)
+            for field in stable_fields
+        )
+        or after.st_mode != after_path.st_mode
+    ):
+        fail("Darwin path-replacement executable seal drifted")
+    return artifact_payload(path, "executable", final_mode)
+
+
+def unlink_exact_ephemeral(
+    path: Path,
+    expected: os.stat_result,
+) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    fields = (
+        "st_dev", "st_ino", "st_mode", "st_nlink", "st_size",
+        "st_uid", "st_gid", "st_mtime_ns", "st_ctime_ns",
+    )
+    try:
+        held = os.fstat(descriptor)
+        named = os.lstat(path)
+        if (
+            not stat.S_ISREG(held.st_mode)
+            or held.st_nlink != 1
+            or any(
+                getattr(expected, field) != getattr(other, field)
+                for other in (held, named)
+                for field in fields
+            )
+        ):
+            fail("Darwin path-replacement sidecar identity drifted")
+        os.unlink(path)
+        after = os.fstat(descriptor)
+        if (
+            after.st_nlink != 0
+            or any(
+                getattr(held, field) != getattr(after, field)
+                for field in fields
+                if field not in ("st_nlink", "st_ctime_ns")
+            )
+        ):
+            fail("Darwin path-replacement sidecar unlink drifted")
+    finally:
+        os.close(descriptor)
+    if path.exists() or path.is_symlink():
+        fail("Darwin path-replacement sidecar remained named")
+
+
+def finalize_darwin_t7_path_replacement(
+    *,
+    plan: dict[str, Any],
+    paths: PhasePaths,
+    planned_paths: dict[str, Path],
+) -> None:
+    spec = PHASE_SPECS[plan["phaseIndex"]]
+    command_action = next(
+        action for action in plan["actions"]
+        if action["kind"] == "command"
+    )
+    authority = validate_phase_path_replacement_output_authority(
+        spec,
+        paths,
+        "darwin",
+        command_action["pathReplacementOutputAuthority"],
+    )
+    if authority is None:
+        fail("Darwin T7 path-replacement authority is absent")
+    output = planned_paths[authority["role"]]
+    report = planned_paths[authority["reportRole"]]
+    if (
+        str(output) != authority["outputPath"]
+        or command_action["processUmask"] != authority["processUmask"]
+        or command_action["businessOutputRoles"]
+            != [authority["reportRole"]]
+    ):
+        fail("Darwin T7 path-replacement command binding drifted")
+    sidecars: list[
+        tuple[Path, os.stat_result, dict[str, Any]]
+    ] = []
+    for item in authority["ephemeralSidecars"]:
+        sidecar = Path(str(output) + item["suffix"])
+        info, raw = read_exact_regular(
+            sidecar, "Darwin T7 path-replacement sidecar"
+        )
+        if (
+            info.st_nlink != 1
+            or info.st_size <= 0
+            or stat.S_IMODE(info.st_mode) != item["mode"]
+        ):
+            fail("Darwin T7 path-replacement sidecar drifted")
+        sidecars.append((
+            sidecar,
+            info,
+            {
+                "suffix": item["suffix"],
+                "identity":
+                    exact_regular_identity_payload(sidecar, info, raw),
+            },
+        ))
+    expected_names = {
+        output.name,
+        report.name,
+        *(sidecar.name for sidecar, _info, _payload in sidecars),
+    }
+    observed_names = {
+        entry.name
+        for entry in os.scandir(output.parent)
+        if (
+            entry.name == output.name
+            or entry.name.startswith(output.name + ".")
+        )
+    }
+    if observed_names != expected_names:
+        fail("Darwin T7 path-replacement closure drifted")
+    output_payload = seal_path_replacement_executable(
+        output,
+        authority["initialMode"],
+        authority["finalMode"],
+    )
+    report_payload = artifact_payload(report, "regular", 0o400)
+    payload = {
+        "schema":
+            "cheng.bootstrap_stage23_darwin_path_replacement_receipt",
+        "phaseIndex": spec.index,
+        "role": authority["role"],
+        "processUmask": authority["processUmask"],
+        "commandArgvSha256": framed_vector_sha256(
+            b"cheng.guard.command_argv",
+            plan["argv"],
+        ),
+        "output": output_payload,
+        "trackedReport": report_payload,
+        "ephemeralSidecars": [
+            sidecar_payload
+            for _sidecar, _info, sidecar_payload in sidecars
+        ],
+        "ephemeralSidecarDisposition":
+            "exact_identity_unlinked_after_receipt",
+    }
+    receipt = canonical_json({
+        "payload": payload,
+        "payloadSha256": sha256_bytes(canonical_json(payload)),
+    }) + b"\n"
+    for sidecar, info, _sidecar_payload in sidecars:
+        unlink_exact_ephemeral(sidecar, info)
+    write_new_file(
+        planned_paths[authority["role"] + "_validation"],
+        receipt,
+        0o400,
+    )
+
+
+def execute_authority_actions(
+    *,
+    plan: dict[str, Any],
+    paths: PhasePaths,
+    role_paths: dict[str, Path],
+    identities: dict[str, dict[str, Any]],
+    planned_paths: dict[str, Path],
+) -> None:
+    index = plan["phaseIndex"]
+    guard_stdout_role = (
+        "phase_guard_00_stdout"
+        if "commandActions" in plan else "phase_guard_stdout"
+    )
+    guard_stdout = planned_paths[guard_stdout_role]
+    if index == 0:
+        action_source = (
+            paths.command_action_source(0, 0)
+            if "commandActions" in plan else None
+        )
+        copy_new_file(
+            (
+                action_source / "bootstrap/cheng_cold.c"
+                if action_source is not None
+                else role_paths["bootstrap_source"]
+            ),
+            planned_paths["snapshot_bootstrap"],
+        )
+        copy_new_file(
+            (
+                action_source / "bootstrap/stage1_bootstrap.cheng"
+                if action_source is not None
+                else role_paths["bootstrap_contract"]
+            ),
+            planned_paths["snapshot_contract"],
+        )
+        copy_new_file(
+            (
+                action_source / BOOTSTRAP_MANIFEST_RELATIVE
+                if action_source is not None
+                else role_paths["bootstrap_manifest"]
+            ),
+            planned_paths["snapshot_bootstrap_manifest"],
+        )
+        copy_new_file(
+            (
+                action_source / PACKAGE_MANIFEST_RELATIVE
+                if action_source is not None
+                else role_paths["package_manifest"]
+            ),
+            planned_paths["snapshot_package_manifest"],
+        )
+        copy_new_file(
+            (
+                action_source / "src/tests/t78_matrix/t7.cheng"
+                if action_source is not None
+                else role_paths["t7_source"]
+            ),
+            planned_paths["snapshot_t7"],
+        )
+        for offset, (role, source_path) in enumerate(
+            dynamic_snapshot_outputs(paths, action_source)
+        ):
+            copy_new_file(
+                (
+                    source_path
+                    if action_source is not None
+                    else role_paths[f"local_c_header_{offset:04d}"]
+                ),
+                planned_paths[role],
+            )
+        copy_new_file(
+            guard_stdout, planned_paths["cc_deps_pre_stdout"]
+        )
+        closure_input_roles = [
+            "snapshot_bootstrap",
+            "snapshot_contract",
+            "snapshot_bootstrap_manifest",
+            "snapshot_package_manifest",
+            "snapshot_t7",
+            *(
+                role
+                for role, _source in dynamic_snapshot_outputs(
+                    paths, action_source
+                )
+            ),
+        ]
+        raw = authority_manifest_bytes(
+            "freeze_source_snapshot",
+            index,
+            tuple(
+                sealed_output_authority_input(
+                    role, plan, planned_paths
+                )
+                for role in closure_input_roles
+            ),
+        )
+        write_new_file(planned_paths["source_pre_manifest"], raw, 0o400)
+        write_new_file(
+            planned_paths["source_snapshot_manifest"], raw, 0o400
+        )
+    elif index == 1:
+        raw = authority_manifest_bytes(
+            "seal_seed_atom",
+            index,
+            (
+                frozen_role_authority_input(
+                    "snapshot_bootstrap",
+                    "regular",
+                    paths.snapshot_bootstrap,
+                    role_paths,
+                    identities,
+                    plan["lane"],
+                ),
+                sealed_output_authority_input(
+                    "cold_candidate", plan, planned_paths
+                ),
+            ),
+        )
+        write_new_file(planned_paths["seed_atom_manifest"], raw, 0o400)
+    elif index in (3, 5, 7, 9):
+        stage = f"stage{(index - 3) // 2}"
+        if not guard_stdout.stat().st_size:
+            fail("self-check stdout is empty")
+        raw = authority_manifest_bytes(
+            "seal_" + stage + "_self_check",
+            index,
+            (
+                frozen_role_authority_input(
+                    stage,
+                    "executable",
+                    paths.command_path(stage),
+                    role_paths,
+                    identities,
+                    plan["lane"],
+                ),
+                sealed_output_authority_input(
+                    "phase_guard_stdout", plan, planned_paths
+                ),
+            ),
+        )
+        write_new_file(
+            planned_paths[stage + "_atom_manifest"], raw, 0o400
+        )
+    elif index == 10:
+        stage2 = role_paths["stage2"]
+        stage3 = role_paths["stage3"]
+        stage2_info, stage2_raw = read_exact_regular(stage2, "stage2")
+        stage3_info, stage3_raw = read_exact_regular(stage3, "stage3")
+        if (
+            stage2_raw != stage3_raw
+            or sha256_bytes(stage2_raw) != sha256_bytes(stage3_raw)
+        ):
+            fail("stage2 and stage3 raw bytes differ")
+        raw = authority_manifest_bytes(
+            "seal_stage2_stage3_fixed_point",
+            index,
+            (
+                frozen_role_authority_input(
+                    "stage2",
+                    "executable",
+                    paths.stage(2),
+                    role_paths,
+                    identities,
+                    plan["lane"],
+                ),
+                frozen_role_authority_input(
+                    "stage3",
+                    "executable",
+                    paths.stage(3),
+                    role_paths,
+                    identities,
+                    plan["lane"],
+                ),
+            ),
+        )
+        write_new_file(planned_paths["fixed_point_report"], raw, 0o400)
+        fixed_point_payload = {
+            "schema":
+                "cheng.bootstrap_stage23_pure_fixed_point_validator",
+            "status": "completed",
+            "phaseIndex": index,
+            "operation": "verify_stage2_stage3_physical_bytes_and_hash",
+            "externalExecCount": 0,
+            "stage2": {
+                "sha256": sha256_bytes(stage2_raw),
+                "device": stage2_info.st_dev,
+                "inode": stage2_info.st_ino,
+                "size": stage2_info.st_size,
+                "mode": stage2_info.st_mode,
+                "nlink": stage2_info.st_nlink,
+            },
+            "stage3": {
+                "sha256": sha256_bytes(stage3_raw),
+                "device": stage3_info.st_dev,
+                "inode": stage3_info.st_ino,
+                "size": stage3_info.st_size,
+                "mode": stage3_info.st_mode,
+                "nlink": stage3_info.st_nlink,
+            },
+            "fixedPointReport": artifact_payload(
+                planned_paths["fixed_point_report"], "regular"
+            ),
+            "byteEqualityStatus": "verified",
+            "hashEqualityStatus": "verified",
+        }
+        fixed_point_raw = canonical_json({
+            "payload": fixed_point_payload,
+            "payloadSha256": sha256_bytes(
+                canonical_json(fixed_point_payload)
+            ),
+        }) + b"\n"
+        write_new_file(
+            planned_paths["phase_guard_receipt"],
+            fixed_point_raw,
+            0o400,
+        )
+        write_new_file(
+            planned_paths["phase_guard_stdout"], b"", 0o400
+        )
+        write_new_file(
+            planned_paths["phase_guard_stderr"], b"", 0o400
+        )
+    elif index in (11, 13):
+        if plan["lane"] != "darwin":
+            stage = "stage2" if index == 11 else "stage3"
+            executable_role = "t7_" + stage
+            report_role = executable_role + "_report"
+            raw = authority_manifest_bytes(
+                "validate_" + stage + "_t7_report",
+                index,
+                (
+                    sealed_output_authority_input(
+                        executable_role, plan, planned_paths
+                    ),
+                    sealed_output_authority_input(
+                        report_role, plan, planned_paths
+                    ),
+                ),
+            )
+            write_new_file(
+                planned_paths[executable_role + "_validation"],
+                raw,
+                0o400,
+            )
+        else:
+            finalize_darwin_t7_path_replacement(
+                plan=plan,
+                paths=paths,
+                planned_paths=planned_paths,
+            )
+    elif index == 15:
+        copy_new_file(
+            guard_stdout, planned_paths["cc_deps_post_stdout"]
+        )
+        raw = authority_manifest_bytes(
+            "seal_source_post_manifest",
+            index,
+            (
+                frozen_role_authority_input(
+                    "bootstrap_source",
+                    "regular",
+                    paths.bootstrap_source,
+                    role_paths,
+                    identities,
+                    plan["lane"],
+                ),
+                frozen_role_authority_input(
+                    "bootstrap_manifest",
+                    "regular",
+                    paths.bootstrap_manifest,
+                    role_paths,
+                    identities,
+                    plan["lane"],
+                ),
+                sealed_output_authority_input(
+                    "cc_deps_post_stdout", plan, planned_paths
+                ),
+                frozen_role_authority_input(
+                    "source_pre_manifest",
+                    "regular",
+                    paths.output_path("source_pre_manifest"),
+                    role_paths,
+                    identities,
+                    plan["lane"],
+                ),
+            ),
+        )
+        write_new_file(
+            planned_paths["source_post_manifest"], raw, 0o400
+        )
+
+
+def run_phase_action(
+    manifest_path: Path,
+    plan_sha256: str,
+    evidence: Path,
+) -> bytes:
+    manifest, manifest_raw = strict_stage_input_manifest(manifest_path)
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", plan_sha256)
+        or manifest.get("phasePlanSha256") != plan_sha256
+        or sha256_bytes(canonical_json(manifest.get("phasePlan")))
+            != plan_sha256
+    ):
+        fail("stage plan hash is not exact")
+    lane = canonical_lane(manifest.get("lane"))
+    if evidence != evidence.resolve(strict=True) or not evidence.is_dir():
+        fail("phase evidence directory is not canonical")
+    role_paths, identities = manifest_role_paths(manifest)
+    root = (
+        Path("/cheng-stage23-source/repo")
+        if lane == "linux"
+        else Path(__file__).resolve(strict=True).parent.parent
+    )
+    cc = Path("/usr/bin/cc") if lane == "linux" else role_paths["cc"]
+    paths = PhasePaths(root, evidence, cc)
+    plan = phase_plan(manifest["phaseIndex"], paths, lane)
+    if (
+        plan != manifest.get("phasePlan")
+        or manifest.get("phaseLabel") != plan["phaseLabel"]
+        or manifest.get("targetTriple") != plan["targetTriple"]
+        or manifest.get("machineAuthority") != plan["machineAuthority"]
+        or manifest.get("phaseActions") != plan["actions"]
+        or manifest.get("plannedOutputs") != plan["outputs"]
+        or manifest.get("terminalRelativePath")
+            != plan["terminalRelativePath"]
+        or manifest.get("declaredDeltaDirectories")
+            != plan["declaredDeltaDirectories"]
+        or manifest.get("declaredDeltaFiles")
+            != plan["declaredDeltaFiles"]
+        or manifest.get("declaredOutputSetSha256")
+            != plan["declaredOutputSetSha256"]
+    ):
+        fail("stage input does not equal canonical phase plan")
+    command_identity_bindings: dict[int, dict[str, Any]] = {}
+    command_action_tree_bindings: dict[int, dict[str, Any]] = {}
+    if "commandActions" in plan:
+        command_identities = manifest.get("commandIdentities")
+        private_trees = manifest.get(
+            "commandActionPrivateFrozenTrees"
+        )
+        if isinstance(command_identities, list):
+            command_identity_bindings = {
+                item.get("commandActionIndex"): item
+                for item in command_identities
+                if isinstance(item, dict)
+            }
+        if isinstance(private_trees, list):
+            command_action_tree_bindings = {
+                item.get("commandActionIndex"): item
+                for item in private_trees
+                if isinstance(item, dict)
+            }
+        if (
+            manifest.get("phaseCommandActions")
+                != plan["commandActions"]
+            or manifest.get("phaseCommandActionsSha256")
+                != sha256_bytes(canonical_json(plan["commandActions"]))
+            or not isinstance(command_identities, list)
+            or len(command_identity_bindings) != len(command_identities)
+            or set(command_identity_bindings)
+                != set(range(len(plan["commandActions"])))
+            or not isinstance(private_trees, list)
+            or len(command_action_tree_bindings) != len(private_trees)
+            or set(command_action_tree_bindings)
+                != set(range(len(plan["commandActions"])))
+            or any(
+                set(command_identity_bindings[index]) != {
+                    "commandActionIndex",
+                    "targetExecutableRole",
+                    "identity",
+                    "physicalIdentity",
+                }
+                or command_identity_bindings[index][
+                    "targetExecutableRole"
+                ] != action["targetExecutableRole"]
+                or command_identity_bindings[index]["identity"]
+                    != identities[action["targetExecutableRole"]]
+                for index, action in enumerate(plan["commandActions"])
+            )
+            or "phaseCommandArgv" in manifest
+            or "phaseCommandArgvSha256" in manifest
+        ):
+            fail("multi-action stage input binding drifted")
+        for index, action in enumerate(plan["commandActions"]):
+            tree_row = command_action_tree_bindings[index]
+            tree_contract = action["privateFrozenTree"]
+            expected_root = Path(tree_contract["root"])
+            binding_mode = tree_contract["bindingMode"]
+            if (
+                tree_row.get("commandActionIndex") != index
+                or binding_mode != "exact_prebound"
+                or tree_row.get("bindingMode") != "exact_prebound"
+                or tree_row.get("derivedInput") is not None
+                or tree_contract["derivedInput"] is not None
+            ):
+                fail("command action private tree row drifted")
+            if set(tree_row) != {
+                "commandActionIndex",
+                "bindingMode",
+                "tree",
+                "derivedInput",
+            }:
+                fail("exact command action tree fields drifted")
+            tree = validate_private_tree_binding_shape(
+                tree_row["tree"], expected_root
+            )
+            if private_frozen_tree_binding(expected_root) != tree:
+                fail("exact command action tree identity drifted")
+            info = os.lstat(role_paths[action["targetExecutableRole"]])
+            if command_identity_bindings[index]["physicalIdentity"] != {
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "mode": info.st_mode,
+                "nlink": info.st_nlink,
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "size": info.st_size,
+                "mtimeNs": info.st_mtime_ns,
+                "ctimeNs": info.st_ctime_ns,
+            }:
+                fail("multi-action command physical identity drifted")
+    runtime_roles = (
+        {"process_guard", "process_guard_runtime"}
+        if plan["phaseIndex"] != 10 else set()
+    )
+    command_roles = {
+        action["targetExecutableRole"]
+        for action in plan.get("commandActions", ())
+    } or {plan["commandRole"]}
+    command_roles.update(
+        action["targetExecutableRole"]
+        for action in plan.get("darwinCodesignActions", ())
+    )
+    for role in {
+        *command_roles,
+        *plan["boundInputRoles"],
+        "bash",
+        "python",
+        *runtime_roles,
+        "stage_gate",
+        "phase_engine",
+    }:
+        if role not in role_paths:
+            fail("phase frozen input role is absent: " + role)
+        verify_frozen_identity(
+            role, role_paths[role], identities[role], lane
+        )
+    monitor_binding = manifest.get("monitorRuntime")
+    expected_monitor_runtime = (
+        None
+        if plan["phaseIndex"] == 10 else {
+            "schema": "cheng.guard.monitor_runtime_binding",
+            "scriptRole": "process_guard_runtime",
+            "interpreterRole": "python",
+            "loaderSourceRole": "process_guard",
+            "startupFlags": ["-I", "-S", "-B"],
+            "heldFd": 9,
+            "expectedSha256":
+                identities["process_guard_runtime"]["sha256"],
+            "physicalIdentity": (
+                monitor_binding.get("physicalIdentity")
+                if isinstance(monitor_binding, dict) else None
+            ),
+        }
+    )
+    if manifest.get("monitorRuntime") != expected_monitor_runtime:
+        fail("phase monitor runtime binding drifted")
+    if lane == "darwin" and expected_monitor_runtime is not None:
+        runtime_info = os.lstat(role_paths["process_guard_runtime"])
+        expected_physical = expected_monitor_runtime["physicalIdentity"]
+        if (
+            not isinstance(expected_physical, dict)
+            or expected_physical != {
+                "device": runtime_info.st_dev,
+                "inode": runtime_info.st_ino,
+                "mode": runtime_info.st_mode,
+                "nlink": runtime_info.st_nlink,
+                "uid": runtime_info.st_uid,
+                "gid": runtime_info.st_gid,
+                "size": runtime_info.st_size,
+                "mtimeNs": runtime_info.st_mtime_ns,
+                "ctimeNs": runtime_info.st_ctime_ns,
+            }
+        ):
+            fail("phase monitor runtime physical identity drifted")
+    planned_paths = {
+        item["role"]: Path(os.fsdecode(bytes.fromhex(
+            item["pathFshex"]
+        )))
+        for item in plan["outputs"]
+    }
+    for item in plan["declaredDeltaFiles"]:
+        planned_paths[item["role"]] = evidence / item["relativePath"]
+    if len(planned_paths) != len(plan["declaredDeltaFiles"]):
+        fail("phase output role set aliases")
+    stage_input_role = "phase_stage_input_manifest"
+    for role, path in planned_paths.items():
+        if role == stage_input_role:
+            if (
+                lane != "darwin"
+                or path != manifest_path
+                or read_exact_regular(
+                    path, "stage input manifest"
+                )[1] != manifest_raw
+            ):
+                fail("phase stage input manifest path drifted")
+            continue
+        if path.exists() or path.is_symlink():
+            fail("phase output existed before action")
+        path.parent.mkdir(parents=True, exist_ok=True)
+    command_actions = [
+        action for action in plan["actions"]
+        if action["kind"] == "command"
+    ]
+    planned_by_role = {
+        item["role"]: item for item in plan["outputs"]
+    }
+    command_action_receipts: list[dict[str, Any]] = []
+    if plan.get("commandActions"):
+        for action in plan["commandActions"]:
+            action_index = action["commandActionIndex"]
+            tree_row = command_action_tree_bindings[action_index]
+            tree_contract = action["privateFrozenTree"]
+            private_tree_root = Path(tree_contract["root"])
+            if tree_row["bindingMode"] != "exact_prebound":
+                fail("command action tree is not exact prebound")
+            private_tree = tree_row["tree"]
+            if (
+                private_frozen_tree_binding(private_tree_root)
+                != private_tree
+            ):
+                fail("command action exact tree changed before launch")
+            receipt_path = planned_paths[action["guardReceiptRole"]]
+            stdout_path = planned_paths[action["guardStdoutRole"]]
+            stderr_path = planned_paths[action["guardStderrRole"]]
+            target_role = action["targetExecutableRole"]
+            target_identity = identities[target_role]
+            guard_argv = [
+                str(role_paths["bash"]),
+                str(role_paths["process_guard"]),
+                "--private-frozen-tree-direct",
+                "--require-command-identity",
+                "--rss-limit:805306368",
+                "--timeout:" + str(action["timeoutSeconds"]),
+                "--combined-output-limit:1073741824",
+                "--monitor-python:" + str(role_paths["python"]),
+                "--expected-monitor-runtime-sha256:"
+                    + identities["process_guard_runtime"]["sha256"],
+                "--frozen-tree-root:" + private_tree["root"],
+                "--expected-frozen-tree-sha256:"
+                    + private_tree["sha256"],
+                "--expected-command-path:" + action["targetArgv"][0],
+                "--expected-command-sha256:"
+                    + target_identity["sha256"],
+                "--expected-exit-code:"
+                    + str(action["expectedExitCode"]),
+                "--report-out:" + str(receipt_path),
+                "--stdout:" + str(stdout_path),
+                "--stderr:" + str(stderr_path),
+            ]
+            if lane == "linux":
+                guard_argv.append(
+                    "--require-precreated-output-authority"
+                )
+            for role in action["businessOutputRoles"]:
+                item = planned_by_role[role]
+                guard_argv.append(
+                    "--tracked-output:"
+                    + role
+                    + "=1073741824:"
+                    + item["kind"]
+                    + ":"
+                    + str(planned_paths[role])
+                )
+            guard_argv.extend(
+                "--tracked-output-fd:"
+                + binding["role"]
+                + "="
+                + str(binding["fd"])
+                for binding in action[
+                    "trackedOutputFdBindings"
+                ]
+            )
+            guard_argv.append("--target-env-clear")
+            guard_argv.extend(
+                "--target-env:" + item["name"] + "=" + item["value"]
+                for item in plan["env"]
+            )
+            guard_argv.extend(("--", *action["targetArgv"]))
+            old_umask = os.umask(0o277)
+            try:
+                completed = subprocess.run(
+                    guard_argv,
+                    cwd=str(root),
+                    env=guard_launcher_environment(
+                        lane, role_paths["python"]
+                    ),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+            finally:
+                os.umask(old_umask)
+            if (
+                completed.returncode != 0
+                or completed.stdout
+                or completed.stderr
+            ):
+                detail = (
+                    completed.stderr or completed.stdout
+                ).decode(
+                    "utf-8", "replace"
+                ).replace("\n", "_")[:512]
+                fail(
+                    "private frozen-tree action failed:"
+                    + str(completed.returncode)
+                    + ":"
+                    + detail
+                )
+            guard_raw = validate_private_tree_guard_report(
+                report_path=receipt_path,
+                action=action,
+                target_identity=target_identity,
+                target_physical_identity=
+                    command_identity_bindings[
+                        action_index
+                    ]["physicalIdentity"],
+                monitor_python_path=role_paths["python"],
+                monitor_python_identity=identities["python"],
+                monitor_runtime_path=
+                    role_paths["process_guard_runtime"],
+                monitor_runtime_identity=
+                    identities["process_guard_runtime"],
+                monitor_runtime_physical_identity=
+                    manifest["monitorRuntime"]["physicalIdentity"],
+                private_tree=private_tree,
+                env=plan["env"],
+                planned_by_role=planned_by_role,
+                planned_paths=planned_paths,
+            )
+            if read_exact_regular(
+                stderr_path, "private action stderr"
+            )[1]:
+                fail("private frozen-tree action stderr is not empty")
+            stdout_raw = read_exact_regular(
+                stdout_path, "private action stdout"
+            )[1]
+            command_action_receipts.append({
+                "commandActionIndex": action_index,
+                "targetExecutableRole": target_role,
+                "targetArgvSha256": action["targetArgvSha256"],
+                "guardReceiptSha256": sha256_bytes(guard_raw),
+                "guardStdoutSha256": sha256_bytes(stdout_raw),
+                "guardStderrSha256": sha256_bytes(b""),
+                "businessOutputRoles":
+                    action["businessOutputRoles"],
+                "privateFrozenTree": private_tree,
+            })
+        execute_authority_actions(
+            plan=plan,
+            paths=paths,
+            role_paths=role_paths,
+            identities=identities,
+            planned_paths=planned_paths,
+        )
+    elif plan["phaseIndex"] == 10:
+        if command_actions or plan["argv"]:
+            fail("pure fixed-point phase acquired an external command")
+        execute_authority_actions(
+            plan=plan,
+            paths=paths,
+            role_paths=role_paths,
+            identities=identities,
+            planned_paths=planned_paths,
+        )
+    else:
+        if len(command_actions) != 1:
+            fail("phase command action is not unique")
+        command_action = command_actions[0]
+        command_identity = identities[plan["commandRole"]]
+        self_image_authority = command_action[
+            "selfImageInputFdAuthority"
+        ]
+        self_image_tokens = [
+            argument for argument in plan["argv"]
+            if argument.startswith("--bootstrap-self-image-fd")
+        ]
+        validate_phase_process_umask(
+            PHASE_SPECS[plan["phaseIndex"]],
+            lane,
+            command_action["processUmask"],
+        )
+        validate_phase_path_replacement_output_authority(
+            PHASE_SPECS[plan["phaseIndex"]],
+            paths,
+            lane,
+            command_action["pathReplacementOutputAuthority"],
+        )
+        expected_self_image_authority = (
+            phase_self_image_input_fd_authority(
+                PHASE_SPECS[plan["phaseIndex"]], lane
+            )
+        )
+        if self_image_authority is None:
+            if self_image_tokens:
+                fail("phase command authority drifted")
+        elif (
+            self_image_authority != expected_self_image_authority
+            or self_image_tokens
+                != [self_image_authority["argvToken"]]
+            or plan["argv"][-1] != self_image_authority["argvToken"]
+            or command_action["processUmask"] != 0o077
+        ):
+            fail("phase self-image input authority drifted")
+        guard_argv = [
+            str(role_paths["bash"]),
+            str(role_paths["process_guard"]),
+            "--rss-limit:805306368",
+            "--timeout:" + str(plan["timeoutSeconds"]),
+            "--combined-output-limit:1073741824",
+            "--monitor-python:" + str(role_paths["python"]),
+            "--expected-monitor-runtime-sha256:"
+                + identities["process_guard_runtime"]["sha256"],
+            "--expected-exit-code:" + str(plan["expectedExitCode"]),
+            "--report-out:"
+                + str(planned_paths["phase_guard_receipt"]),
+            "--stdout:" + str(planned_paths["phase_guard_stdout"]),
+            "--stderr:" + str(planned_paths["phase_guard_stderr"]),
+        ]
+        if lane == "linux":
+            guard_argv.append(
+                "--require-precreated-output-authority"
+            )
+        if lane == "darwin":
+            guard_argv.extend((
+                "--snapshot-command",
+                "--require-command-identity",
+                "--expected-command-path:" + plan["argv"][0],
+                "--expected-command-sha256:"
+                    + command_identity["sha256"],
+            ))
+        if self_image_authority is not None:
+            guard_argv.append(
+                "--command-self-image-fd:"
+                + str(self_image_authority["targetFd"])
+            )
+        guard_tracked_roles = (
+            ()
+            if self_image_authority is not None
+            else command_action["businessOutputRoles"]
+        )
+        for role in guard_tracked_roles:
+            item = planned_by_role[role]
+            guard_argv.append(
+                "--tracked-output:"
+                + role
+                + "=1073741824:"
+                + item["kind"]
+                + ":"
+                + str(planned_paths[role])
+            )
+        guard_argv.append("--target-env-clear")
+        guard_argv.extend(
+            "--target-env:" + item["name"] + "=" + item["value"]
+            for item in plan["env"]
+        )
+        guard_argv.extend(("--", *plan["argv"]))
+        old_umask = os.umask(command_action["processUmask"])
+        try:
+            completed = subprocess.run(
+                guard_argv,
+                cwd=str(root),
+                env=guard_launcher_environment(
+                    lane, role_paths["python"]
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        finally:
+            os.umask(old_umask)
+        if (
+            completed.returncode != 0
+            or completed.stdout
+            or completed.stderr
+        ):
+            detail = (
+                completed.stderr or completed.stdout
+            ).decode("utf-8", "replace").replace("\n", "_")[:512]
+            fail(
+                "canonical guarded phase command failed:"
+                + str(completed.returncode)
+                + ":"
+                + detail
+            )
+        if lane == "darwin":
+            self_image_authority = command_action[
+                "selfImageInputFdAuthority"
+            ]
+            remove_verified_guard_snapshot(
+                planned_paths["phase_guard_receipt"],
+                (
+                    planned_paths[
+                        COMMAND_OUTPUT_ROLES[plan["phaseIndex"]][1]
+                    ]
+                    if self_image_authority is not None else None
+                ),
+                (
+                    planned_paths[
+                        COMMAND_OUTPUT_ROLES[plan["phaseIndex"]][0]
+                    ]
+                    if self_image_authority is not None else None
+                ),
+                (
+                    planned_paths[
+                        COMMAND_OUTPUT_ROLES[plan["phaseIndex"]][2]
+                    ]
+                    if self_image_authority is not None else None
+                ),
+            )
+        for role in command_action["businessOutputRoles"]:
+            artifact_payload(
+                planned_paths[role],
+                planned_by_role[role]["kind"],
+                planned_by_role[role]["finalMode"],
+            )
+        execute_authority_actions(
+            plan=plan,
+            paths=paths,
+            role_paths=role_paths,
+            identities=identities,
+            planned_paths=planned_paths,
+        )
+    execute_darwin_codesign_actions(
+        plan=plan,
+        root=root,
+        role_paths=role_paths,
+        identities=identities,
+        planned_paths=planned_paths,
+    )
+    produced = [{
+        "role": item["role"],
+        "identity": artifact_payload(
+            planned_paths[item["role"]],
+            item["kind"],
+            item["finalMode"],
+        ),
+    } for item in plan["outputs"]]
+    actions = [{
+        "actionIndex": action["actionIndex"],
+        "kind": action["kind"],
+        "operation": action["operation"],
+        "status": (
+            "PENDING_OUTER_PROOF"
+            if action["kind"] == "runner_authority"
+            else "PROVED"
+        ),
+        "outputRoles": action["outputRoles"],
+    } for action in plan["actions"]]
+    payload = {
+        "schema": PHASE_ACTION_TERMINAL_SCHEMA,
+        "status": "PROVED",
+        "lane": lane,
+        "targetTriple": plan["targetTriple"],
+        "machineAuthority": plan["machineAuthority"],
+        "phaseIndex": plan["phaseIndex"],
+        "phaseLabel": plan["phaseLabel"],
+        "phasePlanSha256": plan_sha256,
+        "runnerArgvSha256": manifest["runnerArgvSha256"],
+        **(
+            {
+                "phaseCommandActionsSha256":
+                    manifest["phaseCommandActionsSha256"],
+                "commandActionReceipts": command_action_receipts,
+                "guardReceiptsAggregateSha256": sha256_bytes(
+                    canonical_json(command_action_receipts)
+                ),
+            }
+            if command_action_receipts else {
+                "phaseCommandArgvSha256":
+                    manifest["phaseCommandArgvSha256"],
+                "guardReceiptSha256": sha256_bytes(
+                    read_exact_regular(
+                        planned_paths["phase_guard_receipt"],
+                        "phase guard receipt",
+                    )[1]
+                ),
+            }
+        ),
+        "phaseEnvSha256": manifest["phaseEnvSha256"],
+        "stageInputManifestSha256": sha256_bytes(manifest_raw),
+        "terminalRelativePath": plan["terminalRelativePath"],
+        "declaredDeltaDirectories": plan["declaredDeltaDirectories"],
+        "declaredDeltaFiles": plan["declaredDeltaFiles"],
+        "declaredOutputSetSha256": plan["declaredOutputSetSha256"],
+        "actions": actions,
+        "produced": produced,
+    }
+    if set(payload) != set(phase_action_terminal_fields(
+        lane, plan["phaseIndex"]
+    )):
+        fail("phase action terminal field set drifted")
+    terminal_raw = canonical_json({
+        "payload": payload,
+        "payloadSha256": sha256_bytes(canonical_json(payload)),
+    }) + b"\n"
+    write_new_file(
+        planned_paths["phase_action_terminal"], terminal_raw, 0o400
+    )
+    write_new_file(
+        planned_paths["phase_action_stdout"], terminal_raw, 0o400
+    )
+    write_new_file(
+        planned_paths["phase_action_stderr"], b"", 0o400
+    )
+    return terminal_raw
+
+
+def run_phase_action_cli(argv: Sequence[str]) -> int:
+    if (
+        sys.flags.isolated != 1
+        or sys.flags.no_site != 1
+        or sys.flags.dont_write_bytecode != 1
+    ):
+        fail("phase engine Python runtime requires fixed -I -S -B")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-phase-action", action="store_true")
+    parser.add_argument("--stage-input-manifest", required=True)
+    parser.add_argument("--stage-plan-sha256", required=True)
+    parser.add_argument("--evidence-dir", required=True)
+    args = parser.parse_args(argv)
+    if not args.run_phase_action:
+        fail("run-phase-action capability is absent")
+    manifest = Path(args.stage_input_manifest)
+    evidence = Path(args.evidence_dir)
+    if not manifest.is_absolute() or not evidence.is_absolute():
+        fail("run-phase-action path is not absolute")
+    raw = run_phase_action(
+        manifest,
+        args.stage_plan_sha256,
+        evidence,
+    )
+    sys.stdout.buffer.write(raw)
+    return 0
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--assert-phase", action="store_true")
+    action.add_argument("--describe-phase", action="store_true")
+    parser.add_argument("--phase-index", required=True, type=int)
+    parser.add_argument("--lane", required=True, choices=LANES)
+    parser.add_argument("--phase-label")
+    parser.add_argument("--expected-exit-code", type=int)
+    parser.add_argument("--timeout-seconds", type=int)
+    parser.add_argument("--root", required=True)
+    parser.add_argument("--evidence-dir", required=True)
+    parser.add_argument("--cc", required=True)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    if args.command and args.command[0] == "--":
+        args.command = args.command[1:]
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    raw_argv = tuple(sys.argv[1:] if argv is None else argv)
+    try:
+        if "--run-phase-action" in raw_argv:
+            return run_phase_action_cli(raw_argv)
+        args = parse_args(raw_argv)
+        paths = PhasePaths(
+            root=canonical_existing_directory(args.root, "root"),
+            evidence=canonical_existing_directory(
+                args.evidence_dir, "evidence directory"
+            ),
+            cc=canonical_existing_executable(args.cc, "cc"),
+        )
+        plan = phase_plan(args.phase_index, paths, args.lane)
+        if args.describe_phase:
+            if (
+                args.phase_label is not None
+                or args.expected_exit_code is not None
+                or args.timeout_seconds is not None
+                or args.command
+            ):
+                fail("describe phase received assertion-only arguments")
+            sys.stdout.buffer.write(canonical_json(plan) + b"\n")
+            return 0
+        if "commandActions" in plan:
+            fail(
+                "multi-action phase accepts only the canonical "
+                "stage-input manifest"
+            )
+        if (
+            args.phase_label != plan["phaseLabel"]
+            or args.expected_exit_code != plan["expectedExitCode"]
+            or args.timeout_seconds != plan["timeoutSeconds"]
+            or args.command != plan["argv"]
+        ):
+            fail("phase assertion does not match the canonical plan")
+        return 0
+    except (OSError, PhaseEngineError) as exc:
+        reason = str(exc).replace("\n", "_").replace("\r", "_")[:512]
+        print(f"schema={SCHEMA}", file=sys.stderr)
+        print("status=HARD_RED", file=sys.stderr)
+        print(f"reason={reason}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

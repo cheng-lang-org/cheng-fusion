@@ -1,0 +1,348 @@
+# libp2p P0 本地内容库 (CAS): {sourceSHA, defCid} 三键空间的前两键 sourceSHA 面 + lock 面。
+# 正典 docs/beat-c.md §1.11.6 P0. backend2-独立, 纯本地, offline-first。
+#
+# 规格边界 (硬约束):
+#   - 主键 = 内容 sha256 (裸, 无 multiformats 前缀), 天然路径无关 (免疫 canonicalGraphCid P1 basename 污染)。
+#   - 网络 tier 是 P2+; funcEmitCid/.o 层是 P4。P0 只做 sourceSHA blob + modulePath→cid lock。
+#   - 不与 backend2 / 世界同步 (managed-mirror cheng.lock.toml) 共设 schema — 本模块自有布局。
+#
+# 生产纪律 (no fallback / let it crash):
+#   - CAS.get miss = 硬错 (带 cid), 绝不静默回磁盘。
+#   - blob 内容寻址不可变: 写用 tmp+rename 原子上位, 幂等 (已存在直接返回 cid, 不重写)。
+#   - resolver 路由 vs 兜底的边界: storeRoot=="" → 返回磁盘路径 (CAS 未启用的路由态, 非兜底);
+#     storeRoot!="" 但 lock 无此依赖 = 配置错, 崩; blob 缺 = 硬错, 崩。
+
+import std/result
+import std/rawbytes
+import std/os
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256 as hash256
+import cheng/core/tooling/path as chengpath
+import std/strutils as strutil
+import std/strings as strings
+
+# ---- 网络 fetcher 注入面 (transport-agnostic 函数值; cas_store 绝不 import libp2p) ----
+# 生产 fetcher = S2 的 Libp2pHostQuicFetchCasSource (按 cid 走 QUIC 拉源)。此处只声明
+# 契约, 由 parser.cheng miss-hook 在 driver-bake 窗口注入真实现。命名类型别名 (非内联
+# fn 参) 是刚需: 内联 fn(...) 多参签名在 cold-parser 会误切成多参 (arity 错位)。
+type
+    CasSourceFetcher = fn(cidHex: str): Result[Bytes]
+
+# ---- P5-S1 缺锁自举 ensurer 注入面 (同 CasSourceFetcher 理由: 命名别名避 cold-parser 多参误切) ----
+# 生产实现 = cas_fetch_subprocess.CasSubprocessEnsureLock (channelId→head→manifest→lock 展开);
+# 由 parser.cheng miss-hook 在 driver-bake 窗口注入。cas_store 绝不 import 该实现 (transport-agnostic)。
+type
+    CasLockEnsurer = fn(channelHex: str, modulePath: str, storeRoot: str): Result[bool]
+
+# ---- 内容 cid 原语 (复用 sha256, 与 CompilerWorldPayloadCid 同一底层 hash256.Sha256Fixed) ----
+
+@borrows
+fn CasContentCidBytes(bytes: Bytes): layout.FixedBytes32 =
+    return hash256.Sha256Fixed(layout.ByteSpanFromBytes(bytes))
+
+@borrows
+fn CasContentCid(content: str): layout.FixedBytes32 =
+    return CasContentCidBytes(BytesFromString(content))
+
+@borrows
+fn CasContentCidHex(content: str): str =
+    return layout.FixedBytes32Hex(CasContentCid(content))
+
+# ---- 磁盘布局路径 (storeRoot 为显式参数, 无魔法发现) ----
+
+@borrows
+fn CasBlobShardDir(storeRoot: str, cidHex: str): str =
+    let shard = chengpath.TextSlice(cidHex, 0, 2)
+    return storeRoot + "/cas/" + shard
+
+@borrows
+fn CasBlobPath(storeRoot: str, cidHex: str): str =
+    return CasBlobShardDir(storeRoot, cidHex) + "/" + cidHex
+
+@borrows
+fn CasLockPath(storeRoot: str): str =
+    return storeRoot + "/index.lock.txt"
+
+@borrows
+fn CasMaterializedPath(storeRoot: str, cidHex: str): str =
+    return storeRoot + "/materialized/" + cidHex + ".cheng"
+
+# ---- 原子字节写 (同 fs tmp + rename 上位, 内容寻址 => final 已在即成功) ----
+
+@borrows
+fn casWriteBytesAtomic(finalPath: str, tmpPath: str, bytes: Bytes): Result[bool] =
+    if os.FileExists(tmpPath):
+        os.RemoveFile(tmpPath)
+    var writeRes: Result[bool] = os.WriteFileBytesResult(tmpPath, bytes)
+    if !writeRes.ok:
+        os.RemoveFile(tmpPath)
+        return Err[bool]("cas: tmp write failed: " + tmpPath)
+    if !os.FileExists(tmpPath):
+        return Err[bool]("cas: tmp missing after write: " + tmpPath)
+    if os.RenameFile(tmpPath, finalPath):
+        return Ok[bool](true)
+    if os.FileExists(finalPath):
+        os.RemoveFile(tmpPath)
+        return Ok[bool](true)
+    os.RemoveFile(tmpPath)
+    return Err[bool]("cas: rename failed: " + finalPath)
+
+# ---- 面A blob: sourceSHA(hex) → 内容字节 ----
+
+@borrows
+fn CasStoreIngestBytes(storeRoot: str, bytes: Bytes): Result[str] =
+    if storeRoot == "":
+        return Err[str]("cas: empty storeRoot for ingest")
+    let cid = CasContentCidBytes(bytes)
+    let cidHex = layout.FixedBytes32Hex(cid)
+    let blobPath = CasBlobPath(storeRoot, cidHex)
+    if os.FileExists(blobPath):
+        return Ok[str](cidHex)
+    let tmpDir = storeRoot + "/cas/tmp"
+    os.MkdirAll(tmpDir, 493)
+    os.MkdirAll(CasBlobShardDir(storeRoot, cidHex), 493)
+    let tmpPath = tmpDir + "/" + cidHex + ".tmp"
+    var wr: Result[bool] = casWriteBytesAtomic(blobPath, tmpPath, bytes)
+    if IsErr(wr):
+        return Err[str](Error(wr))
+    return Ok[str](cidHex)
+
+fn CasStoreIngest(storeRoot: str, content: str): Result[str] =
+    var bytes = BytesFromString(content)
+    return CasStoreIngestBytes(storeRoot, bytes)
+
+@borrows
+fn CasStoreGet(storeRoot: str, cidHex: str): Result[Bytes] =
+    if storeRoot == "":
+        return Err[Bytes]("cas: empty storeRoot for get")
+    let blobPath = CasBlobPath(storeRoot, cidHex)
+    var readRes: Result[Bytes] = os.ReadFileBytesResult(blobPath)
+    if IsErr(readRes):
+        return Err[Bytes]("cas: blob miss (no disk fallback) cid=" + cidHex)
+    var bytes = Value(readRes)
+    let actualHex = layout.FixedBytes32Hex(CasContentCidBytes(bytes))
+    if actualHex != cidHex:
+        return Err[Bytes]("cas: blob corruption cid=" + cidHex + " actual=" + actualHex)
+    return Ok[Bytes](bytes)
+
+# HAVE 预筛廉价存在检查 (blob 在不在, 不读盘不校验)。服务端发 BLOCK 前仍走
+# CasStoreGet 重校验, HAVE 只做协议层预筛; HAVE 命中但后续校验失败 = 硬错不静默。
+@borrows
+fn CasStoreHas(storeRoot: str, cidHex: str): bool =
+    if storeRoot == "":
+        return false
+    return os.FileExists(CasBlobPath(storeRoot, cidHex))
+
+# ---- 面B lock: modulePath → cid (行式 modulePath=cidHex, lock 是权威) ----
+
+@borrows
+fn CasLockLoad(storeRoot: str): Result[str[]] =
+    var lines: str[]
+    if storeRoot == "":
+        return Ok[str[]](lines)
+    let lockPath = CasLockPath(storeRoot)
+    if !os.FileExists(lockPath):
+        return Ok[str[]](lines)
+    var readRes: Result[str] = os.ReadFileResult(lockPath)
+    if IsErr(readRes):
+        return Err[str[]]("cas: lock read failed: " + lockPath)
+    lines = strutil.Split(Value(readRes), '\n')
+    return Ok[str[]](lines)
+
+@borrows
+fn CasLockLookup(lines: str[], modulePath: str): str =
+    for i in 0..<lines.len:
+        let line = strutil.Strip(lines[i])
+        if line == "":
+            continue
+        let parts = strutil.Split(line, '=')
+        if parts.len != 2:
+            continue
+        if strutil.Strip(parts[0]) == modulePath:
+            return strutil.Strip(parts[1])
+    return ""
+
+@borrows
+fn CasLockRecord(storeRoot: str, modulePath: str, cidHex: str): Result[bool] =
+    if storeRoot == "":
+        return Err[bool]("cas: empty storeRoot for lock record")
+    var loadRes: Result[str[]] = CasLockLoad(storeRoot)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    let existing = Value(loadRes)
+    if CasLockLookup(existing, modulePath) == cidHex:
+        return Ok[bool](true)
+    var rebuilt = ""
+    for i in 0..<existing.len:
+        let line = strutil.Strip(existing[i])
+        if line != "":
+            let parts = strutil.Split(line, '=')
+            if parts.len == 2 && strutil.Strip(parts[0]) != modulePath:
+                rebuilt = rebuilt + strutil.Strip(parts[0]) + "=" + strutil.Strip(parts[1]) + "\n"
+    rebuilt = rebuilt + modulePath + "=" + cidHex + "\n"
+    os.MkdirAll(storeRoot, 493)
+    let lockPath = CasLockPath(storeRoot)
+    let tmpPath = lockPath + ".tmp"
+    if os.FileExists(tmpPath):
+        os.RemoveFile(tmpPath)
+    var wr: Result[bool] = os.WriteFileResult(tmpPath, rebuilt)
+    if !wr.ok:
+        os.RemoveFile(tmpPath)
+        return Err[bool]("cas: lock tmp write failed: " + tmpPath)
+    if os.RenameFile(tmpPath, lockPath):
+        return Ok[bool](true)
+    os.RemoveFile(tmpPath)
+    return Err[bool]("cas: lock rename failed: " + lockPath)
+
+# ---- resolver: 依赖走 lock/cid/CAS + 物化; 工作区源走磁盘 (路由, 非兜底) ----
+
+@borrows
+fn CasResolveDependencyPath(storeRoot: str, modulePath: str, diskPath: str): Result[str] =
+    if storeRoot == "":
+        var ownedDisk = strings.CloneStr(diskPath)
+        return Ok[str](ownedDisk)
+    var loadRes: Result[str[]] = CasLockLoad(storeRoot)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    let lines = Value(loadRes)
+    let cidHex = CasLockLookup(lines, modulePath)
+    if cidHex == "":
+        return Err[str]("cas: lock has no cid for dependency modulePath=" + modulePath)
+    var getRes: Result[Bytes] = CasStoreGet(storeRoot, cidHex)
+    if IsErr(getRes):
+        return Err[str](Error(getRes))
+    var bytes = Value(getRes)
+    let matDir = storeRoot + "/materialized"
+    os.MkdirAll(matDir, 493)
+    let matPath = CasMaterializedPath(storeRoot, cidHex)
+    if os.FileExists(matPath):
+        var ownedMat = strings.CloneStr(matPath)
+        return Ok[str](ownedMat)
+    let tmpDir = storeRoot + "/cas/tmp"
+    os.MkdirAll(tmpDir, 493)
+    let tmpPath = tmpDir + "/mat_" + cidHex + ".tmp"
+    var wr: Result[bool] = casWriteBytesAtomic(matPath, tmpPath, bytes)
+    if IsErr(wr):
+        return Err[str](Error(wr))
+    var ownedMatOut = strings.CloneStr(matPath)
+    return Ok[str](ownedMatOut)
+
+# ---- CAS admission (消费面): 网络 fetch 回的字节进库前必过 cid 自校验 (S3) ----
+# 服务端发 BLOCK 前已在 S2 codec/fetch 侧校验; 本函数是消费端最后一道门: fetched
+# 字节 sha256 必须 == 请求 cidHex, 不符 = 硬错, 绝不 ingest 错 blob (拒收污染)。
+# 过校验才 ingest (内容寻址, 幂等)。fn-value 无关, 可独立 stage3 验证。
+@borrows
+fn CasAdmitFetchedBytes(storeRoot: str, cidHex: str, fetched: Bytes): Result[bool] =
+    if storeRoot == "":
+        return Err[bool]("cas admit: empty storeRoot")
+    if cidHex == "":
+        return Err[bool]("cas admit: empty cidHex")
+    let fetchedHex = layout.FixedBytes32Hex(CasContentCidBytes(fetched))
+    if fetchedHex != cidHex:
+        return Err[bool]("cas: fetched bytes cid mismatch cid=" + cidHex + " actual=" + fetchedHex)
+    var ingestRes: Result[str] = CasStoreIngestBytes(storeRoot, fetched)
+    if IsErr(ingestRes):
+        return Err[bool](Error(ingestRes))
+    return Ok[bool](true)
+
+# ---- resolver + 网络 fetch-on-miss: 编译时按 cid 拉源 (S3 消费面 (a)) ----
+# 与旧 CasResolveDependencyPath 同前半 (storeRoot=="" 路由 / lock 查 cid), 但 blob
+# miss (HAVE 预筛 false) 时不硬错, 而是调注入的 fetcher (函数值) 拉源 → CasAdmitFetchedBytes
+# cid 自校验 + ingest → 复用旧 resolver 完成 get 重校验 + 物化。fetcher 是 transport-
+# agnostic 注入 (cas_store 绝不 import libp2p, 避免与 parser.cheng 反向依赖环)。
+# 旧 CasResolveDependencyPath 保留不动 (无 fetcher 路径零回归)。
+#
+# ★ cold-parser 限制 (已实测证): stage3/cheng_cold 不 lower 函数值调用 (fetcher(cidHex)
+# 落 SLOT kind:4, 非 SLOT_PTR/OPAQUE, 且间接调用假定返回 i32) — 与 libp2p 全部
+# handler 派发 (dcutrHandlerImpl(req) 等) 同类, 仅经全后端 driver 可 lower。故本函数体
+# 的 fn-value 行是 driver-gated, 只经 driver-bake 端到端验证 (与 parser 集成同窗口);
+# stage3 侧验证走其构件 CasStoreHas + CasAdmitFetchedBytes + CasResolveDependencyPath。
+@borrows
+fn CasResolveDependencyPathWithFetch(storeRoot: str, modulePath: str, diskPath: str, fetcher: CasSourceFetcher): Result[str] =
+    if storeRoot == "":
+        var ownedDisk = strings.CloneStr(diskPath)
+        return Ok[str](ownedDisk)
+    var loadRes: Result[str[]] = CasLockLoad(storeRoot)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    let lines = Value(loadRes)
+    let cidHex = CasLockLookup(lines, modulePath)
+    if cidHex == "":
+        return Err[str]("cas: lock has no cid for dependency modulePath=" + modulePath)
+    if !CasStoreHas(storeRoot, cidHex):
+        # blob miss → 网络 fetch (注入函数值; driver-gated, 见上注) → CAS admission
+        var ownedCid = strings.CloneStr(cidHex)
+        var fetchRes: Result[Bytes] = fetcher(ownedCid)
+        if IsErr(fetchRes):
+            return Err[str]("cas: fetch-on-miss failed cid=" + cidHex + ": " + Error(fetchRes))
+        var fetched = Value(fetchRes)
+        var admitRes: Result[bool] = CasAdmitFetchedBytes(storeRoot, cidHex, fetched)
+        if IsErr(admitRes):
+            return Err[str](Error(admitRes))
+    # blob 此时必在库 → 复用旧 resolver 完成 get 重校验 + 物化 (零重复逻辑)
+    return CasResolveDependencyPath(storeRoot, modulePath, diskPath)
+
+# ---- ingest 入口: 磁盘依赖源 → blob + lock (P0 闭环摄入器) ----
+
+@borrows
+fn CasIngestDependencyFromDisk(storeRoot: str, modulePath: str, diskPath: str): Result[str] =
+    if storeRoot == "":
+        return Err[str]("cas: empty storeRoot for ingest")
+    var readRes: Result[Bytes] = os.ReadFileBytesResult(diskPath)
+    if IsErr(readRes):
+        return Err[str]("cas: dependency source read failed: " + diskPath)
+    var bytes = Value(readRes)
+    var ingestRes: Result[str] = CasStoreIngestBytes(storeRoot, bytes)
+    if IsErr(ingestRes):
+        return Err[str](Error(ingestRes))
+    let cidHex = Value(ingestRes)
+    var recRes: Result[bool] = CasLockRecord(storeRoot, modulePath, cidHex)
+    if IsErr(recRes):
+        return Err[str](Error(recRes))
+    return Ok[str](cidHex)
+
+# ---- CAS admission 边界: 共享 cid 前必须钉死 package_id (P1 裁决丙) ----
+# basename 兜底 (parser.cheng:1808) 是本地/未钉包合法机制, 不改其语义。但 basename
+# 会经 modulePath → factCid → canonicalGraphCid 岔开: 同逻辑源集在不同目录名下产不同
+# cid。根因级堵法不是下游洗 cid, 而是在网络/CAS admission 这个唯一必要点重读
+# cheng-package.toml, package_id 未钉即硬错 (let-it-crash), 未钉包永不进共享 CAS,
+# basename 也就永不进共享 cid。
+#
+# 本模块自读 toml (不 import parser): parser.cheng 已 import cas_store 做 resolver
+# 挂载, 反向依赖会成 import 环。此处复刻 ParserManifestValue 的最小 package_id 抽取
+# (引号定界扫描, 天然忽略行尾注释与非匹配行), 语义与 parser 对齐。
+
+@borrows
+fn casManifestPackageId(packageRoot: str): str =
+    if packageRoot == "":
+        return ""
+    let manifestPath = packageRoot + "/cheng-package.toml"
+    if !os.FileExists(manifestPath):
+        return ""
+    var readRes: Result[str] = os.ReadFileResult(manifestPath)
+    if IsErr(readRes):
+        return ""
+    let lines = strutil.Split(Value(readRes), '\n')
+    let prefix = "package_id = "
+    for i in 0..<lines.len:
+        let line = strutil.Strip(lines[i])
+        if !strutil.StartsWith(line, prefix):
+            continue
+        let valueStart = prefix.len
+        if valueStart >= line.len || line[valueStart] != '"':
+            continue
+        for valueStop in valueStart + 1..<line.len:
+            if line[valueStop] == '"':
+                return strutil.SliceStr(line, valueStart + 1, valueStop - 1)
+    return ""
+
+@borrows
+fn CasAdmissionPackageId(packageRoot: str): Result[str] =
+    if packageRoot == "":
+        return Err[str]("cas admission: empty packageRoot")
+    let packageId = casManifestPackageId(packageRoot)
+    if packageId == "":
+        return Err[str]("cas admission: package_id 未钉 @ " + packageRoot + " — canonicalGraphCid 会被目录 basename 污染, 拒纳共享 CAS (在 cheng-package.toml 钉 pkg:// 后重试)")
+    if !strutil.StartsWith(packageId, "pkg://"):
+        return Err[str]("cas admission: package_id 非 pkg:// 形式: " + packageId + " @ " + packageRoot)
+    return Ok[str](packageId)

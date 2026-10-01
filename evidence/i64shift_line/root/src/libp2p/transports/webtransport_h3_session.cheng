@@ -1,0 +1,336 @@
+# WebTransport-over-HTTP/3 session glue: real per-connection SETTINGS
+# preamble (control + qpack encoder/decoder unidirectional streams) and
+# Extended CONNECT (RFC 9220) exchange, wired onto a real accept()ed/dial()ed
+# QUIC connection via webtransport_wire.cheng's non-double-framed raw I/O.
+#
+# This is the missing glue between the already-shipped pure encoders
+# (http3/frame.cheng, libp2p/transports/webtransport_common.cheng) and a real
+# socket -- recon found neither was ever driven off a real connection before
+# this file (only hand-fed byte arrays in unit probes).
+
+import std/result
+import std/rawbytes
+import std/os
+import cheng/quic/connection as qconn
+import cheng/quic/msquictransport_native as qtransport
+import cheng/http3/frame as h3frame
+import cheng/qpack/min as qpack
+import cheng/libp2p/transports/webtransport_common as wtcommon
+import cheng/libp2p/transports/webtransport_wire as wtwire
+
+const
+    # Stream-role low bits per RFC 9000 §2.1: 0=client-bidi, 1=server-bidi,
+    # 2=client-uni, 3=server-uni.
+    wth3ServerControlStreamId: int64 = 3
+    wth3ServerQpackEncoderStreamId: int64 = 7
+    wth3ServerQpackDecoderStreamId: int64 = 11
+    wth3ClientControlStreamId: int64 = 2
+    wth3ClientQpackEncoderStreamId: int64 = 6
+    wth3ClientQpackDecoderStreamId: int64 = 10
+    wth3StreamTypeControl: int64 = 0
+    wth3StreamTypeQpackEncoder: int64 = 2
+    wth3StreamTypeQpackDecoder: int64 = 3
+    wth3RequestStreamId: int64 = 0
+    # Bounded low: nativeReadableStreamId's underlying poll pumps the real
+    # datapath on every call (not a cheap in-memory check), so a large
+    # attempt count here turns into real, multi-second wall time even though
+    # it can now never succeed (see the VERIFIED TRANSPORT GAP note above)
+    # -- keep this fast so a caller gets an explicit failure quickly instead
+    # of what looks like a hang.
+    wth3DiscoverAttemptsDefault: int32 = 60
+    wth3DiscoverPollMsDefault: int32 = 10
+    # Only the side that accepts inbound Extended CONNECT requests (the
+    # server) advertises SETTINGS_WEBTRANSPORT_MAX_SESSIONS -- see the
+    # wth3PeerSettingsHaveConnectAndDatagram doc comment below for why the
+    # client is not required to send it. Any value >= 1 satisfies the peer's
+    # `maxSessions == 0` rejection check; 1 matches this server's real
+    # concurrency (Wth3ServerHandleConnection handles one session at a time).
+    wth3ServerMaxSessionsAdvertised: int32 = 1
+
+# `maxSessions`: 0 omits SETTINGS_WEBTRANSPORT_MAX_SESSIONS entirely (client
+# side); > 0 encodes it with that value (server side). Identifier
+# (0xc671706a, draft-ietf-webtrans-http3) must match the value
+# wtcommon.Http3SettingsFromEntries decodes on the peer's side -- both go
+# through wtcommon.http3SettingsWebtransportMaxSessionsId() so encode/decode
+# can never drift apart.
+fn wth3BuildSettingsFrame(maxSessions: int32): Result[Bytes] =
+    var entries: h3frame.Http3Setting[]
+    add(entries, h3frame.Http3MakeSetting(int64(0x8), int64(1)))   # SETTINGS_ENABLE_CONNECT_PROTOCOL
+    add(entries, h3frame.Http3MakeSetting(int64(0x33), int64(1))) # SETTINGS_H3_DATAGRAM
+    if maxSessions > 0:
+        add(entries, h3frame.Http3MakeSetting(wtcommon.http3SettingsWebtransportMaxSessionsId(), int64(maxSessions))) # SETTINGS_WEBTRANSPORT_MAX_SESSIONS
+    return h3frame.Http3EncodeSettingsFrame(entries)
+
+# VERIFIED TRANSPORT GAP (2026-07-14, two real separate OS processes,
+# 127.0.0.1 real UDP sockets -- see cheng-lang docs/webtransport-h3-realclient-gap.md):
+# withH3SettingsPreamble still defaults to false at both call sites below
+# (webtransport_wt_listener_main.cheng / webtransport_wt_dial_client_main.cheng)
+# despite the two gaps below being closed, because a *third*, newly-exposed
+# wall now fails --h3-settings-preamble earlier than either of them used to:
+#
+# - Stream-discovery gap (native_runtime.cheng msquicNativeReadableAppStreamIdCurrent
+#   hardcoding `streamId % 4 == 0`, so non-client-bidi streams -- every stream
+#   this preamble uses -- were never observed as readable): fixed, d1190e1f4.
+# - Missing SETTINGS_WEBTRANSPORT_MAX_SESSIONS content in wth3BuildSettingsFrame
+#   above (client-side Wth3ClientValidatePeerControlStream's
+#   settingsIsWebtransportCapable rejects maxSessions==0): fixed, this patch
+#   (server side now advertises wth3ServerMaxSessionsAdvertised).
+# - **New wall**: fixing the SETTINGS content exposed the already-tracked
+#   **F07** hard flaw's still-open same-file/same-module bare-name sub-case
+#   (docs/cheng-hard-flaws-refactor-plan-2026-07-12.md; the cross-module
+#   sub-case was fixed and closed 2026-07-12, that doc's own note flags the
+#   same-file arm as a separate leftover) -- `quic_varint.cheng`'s
+#   `const quicVarIntMax: int64 = 4611686018427387903`, read unqualified by
+#   quicVarIntEncodedLen in the SAME module, compiles to 0 (repro: any
+#   `const x: int64 = <lit > 2^31-1>` read back in its own defining module;
+#   confirmed const-only, `let` with the identical literal is unaffected).
+#   That const gates quicVarIntEncodedLen's/quicVarIntEncode's only
+#   >1073741823 branch (`if value <= quicVarIntMax: return 8`), so it
+#   silently folds to the `value <= 0` false branch and returns 0/"quic
+#   varint: value out of range" for EVERY value >= 2^30 -- not particular to
+#   WebTransport. SETTINGS_WEBTRANSPORT_MAX_SESSIONS's own identifier
+#   (0xc671706a = 3329323114, draft-ietf-webtrans-http3) is the first
+#   production call in this codebase that ever asks quicVarIntEncode to
+#   take its 8-byte branch, so wth3BuildSettingsFrame's own encode call
+#   (Http3EncodeSettingsFrame -> Http3EncodeSettingsPayload ->
+#   qvarint.quicVarIntEncode(entries[i].id)) fails outright with "quic
+#   varint: value out of range" -- confirmed the returned SETTINGS id value
+#   itself is correct up to that call (http3SettingsWebtransportMaxSessionsId's
+#   own two-half shift/or construction is unaffected, since it never declares
+#   a `const` with this literal), so the corruption is entirely inside
+#   quic_varint.cheng's pre-existing quicVarIntMax const, not in this file's
+#   new code. Out of this file's scope (F07 is tracked compiler-frontend/
+#   backend work, its own propose->apply cycle) -- kept
+#   withH3SettingsPreamble default false rather than have every session fail
+#   loud-but-late here instead of at the (now-closed) two gaps above; the
+#   discovery timeout / validation Err paths below still fail loud and
+#   explicit either way (no silent skip, no fallback).
+fn wth3SendPreambleOn(t: var qtransport.MsQuicTransport,
+                       base: qconn.Connection,
+                       controlId: int64,
+                       encoderId: int64,
+                       decoderId: int64,
+                       maxSessions: int32): Result[bool] =
+    let settingsFrameRes: Result[Bytes] = wth3BuildSettingsFrame(maxSessions)
+    if IsErr(settingsFrameRes):
+        return Err[bool](ErrorText(settingsFrameRes))
+    let controlBytesRes: Result[Bytes] = h3frame.Http3EncodeUnidirectionalStream(wth3StreamTypeControl, Value(settingsFrameRes))
+    if IsErr(controlBytesRes):
+        return Err[bool](ErrorText(controlBytesRes))
+    var controlConn: qconn.Connection = qconn.ConnDeriveStream(base, controlId, controlId)
+    let writeControlRes: Result[bool] = wtwire.Wth3WriteRaw(t, controlConn, Value(controlBytesRes))
+    if IsErr(writeControlRes):
+        return Err[bool]("wt h3: write control preamble: " + ErrorText(writeControlRes))
+    let encBytesRes: Result[Bytes] = h3frame.Http3EncodeUnidirectionalStream(wth3StreamTypeQpackEncoder, EmptyBytes())
+    if IsErr(encBytesRes):
+        return Err[bool](ErrorText(encBytesRes))
+    var encConn: qconn.Connection = qconn.ConnDeriveStream(base, encoderId, encoderId)
+    let writeEncRes: Result[bool] = wtwire.Wth3WriteRaw(t, encConn, Value(encBytesRes))
+    if IsErr(writeEncRes):
+        return Err[bool]("wt h3: write qpack encoder preamble: " + ErrorText(writeEncRes))
+    let decBytesRes: Result[Bytes] = h3frame.Http3EncodeUnidirectionalStream(wth3StreamTypeQpackDecoder, EmptyBytes())
+    if IsErr(decBytesRes):
+        return Err[bool](ErrorText(decBytesRes))
+    var decConn: qconn.Connection = qconn.ConnDeriveStream(base, decoderId, decoderId)
+    let writeDecRes: Result[bool] = wtwire.Wth3WriteRaw(t, decConn, Value(decBytesRes))
+    if IsErr(writeDecRes):
+        return Err[bool]("wt h3: write qpack decoder preamble: " + ErrorText(writeDecRes))
+    return Ok[bool](true)
+
+# Opens the 3 mandatory self-initiated unidirectional streams (control +
+# qpack encoder + qpack decoder) and writes a real SETTINGS frame
+# (ENABLE_CONNECT_PROTOCOL=1, H3_DATAGRAM=1, WEBTRANSPORT_MAX_SESSIONS=1) on
+# the control stream. The qpack encoder/decoder streams stay open but empty
+# -- this endpoint only ever emits QPACK *literal* (non-indexed) field lines
+# (cheng/qpack/min.cheng), so no dynamic-table instructions are ever needed
+# on them.
+fn Wth3ServerSendPreamble(t: var qtransport.MsQuicTransport, base: qconn.Connection): Result[bool] =
+    return wth3SendPreambleOn(t, base, wth3ServerControlStreamId, wth3ServerQpackEncoderStreamId, wth3ServerQpackDecoderStreamId, wth3ServerMaxSessionsAdvertised)
+
+# Client does not advertise SETTINGS_WEBTRANSPORT_MAX_SESSIONS -- see
+# wth3PeerSettingsHaveConnectAndDatagram's doc comment (it is only meaningful
+# from the side accepting inbound sessions).
+fn Wth3ClientSendPreamble(t: var qtransport.MsQuicTransport, base: qconn.Connection): Result[bool] =
+    return wth3SendPreambleOn(t, base, wth3ClientControlStreamId, wth3ClientQpackEncoderStreamId, wth3ClientQpackDecoderStreamId, 0)
+
+# Discovers the peer's control unidirectional stream among its newly-opened
+# uni streams (ids are 2,6,10,... for a client peer / 3,7,11,... for a
+# server peer, but WHICH of those carries control vs qpack-encoder vs
+# qpack-decoder is only known from each stream's own leading stream-type
+# varint per RFC 9114 §6.2 -- order is not guaranteed), reads its SETTINGS
+# frame, and hands the decoded entries to `validate`. Explicit, distinct Err
+# on: discovery timeout, non-SETTINGS first frame, or whatever `validate`
+# rejects -- no fallback, no silent accept.
+fn wth3DiscoverPeerControlSettings(t: var qtransport.MsQuicTransport,
+                                    base: var qconn.Connection,
+                                    firstUniStreamId: int64,
+                                    attempts: int32,
+                                    pollMs: int32): Result[h3frame.Http3Setting[]] =
+    var candidate: int64 = firstUniStreamId
+    var attempt: int32
+    while attempt < attempts:
+        let readableRes: Result[int64] = qconn.nativeReadableStreamId(base, candidate)
+        if IsErr(readableRes):
+            os.SleepMs(pollMs)
+            attempt = attempt + 1
+            continue
+        let streamId: int64 = Value(readableRes)
+        var streamConn: qconn.Connection = qconn.ConnDeriveStream(base, streamId, streamId)
+        let typeRes: Result[int64] = wtwire.Wth3ReadVarint(t, streamConn)
+        if IsErr(typeRes):
+            return Err[h3frame.Http3Setting[]]("wt h3: read peer uni-stream type: " + ErrorText(typeRes))
+        if Value(typeRes) != wth3StreamTypeControl:
+            # qpack encoder/decoder stream: not the control stream, keep looking.
+            candidate = streamId + int64(1)
+            attempt = attempt + 1
+            continue
+        let frameRes: Result[h3frame.Http3Frame] = wtwire.Wth3ReadFrame(t, streamConn)
+        if IsErr(frameRes):
+            return Err[h3frame.Http3Setting[]]("wt h3: read peer control frame: " + ErrorText(frameRes))
+        let frame: h3frame.Http3Frame = Value(frameRes)
+        if frame.kind != int64(h3frame.Http3FrameSettings):
+            return Err[h3frame.Http3Setting[]]("wt h3: peer control stream: first frame is not SETTINGS")
+        let framePayloadCopy: Bytes = rawbytes.BytesSlice(frame.payload, 0, rawbytes.BytesLen(frame.payload))
+        let entriesRes: Result[h3frame.Http3Setting[]] = h3frame.Http3DecodeSettingsFramePayload(framePayloadCopy)
+        if IsErr(entriesRes):
+            return Err[h3frame.Http3Setting[]]("wt h3: decode peer SETTINGS: " + ErrorText(entriesRes))
+        return Ok[h3frame.Http3Setting[]](Value(entriesRes))
+    return Err[h3frame.Http3Setting[]]("wt h3: timed out discovering peer control stream")
+
+# SETTINGS_WEBTRANSPORT_MAX_SESSIONS is only meaningful from the side that
+# RECEIVES Extended CONNECT requests (i.e. the server accepting WebTransport
+# sessions) -- a real WebTransport client (e.g. Chrome) has no reason to send
+# it, since it never accepts inbound sessions itself. So the server-side
+# validation of the CLIENT's SETTINGS only checks the two flags that apply
+# symmetrically; reusing webtransport_common.settingsIsWebtransportCapable
+# (which also demands maxSessions > 0) here would reject every real,
+# spec-conforming browser client.
+fn wth3PeerSettingsHaveConnectAndDatagram(entries: h3frame.Http3Setting[]): Result[bool] =
+    let settings: wtcommon.Http3Settings = wtcommon.Http3SettingsFromEntries(entries)
+    if ! settings.enableConnectProtocol:
+        return Err[bool]("peer SETTINGS: missing SETTINGS_ENABLE_CONNECT_PROTOCOL")
+    if ! settings.enableDatagram:
+        return Err[bool]("peer SETTINGS: missing SETTINGS_H3_DATAGRAM")
+    return Ok[bool](true)
+
+# Server validating a client's SETTINGS: only ENABLE_CONNECT_PROTOCOL + H3_DATAGRAM.
+fn Wth3ServerValidatePeerControlStream(t: var qtransport.MsQuicTransport, base: var qconn.Connection): Result[bool] =
+    let entriesRes: Result[h3frame.Http3Setting[]] = wth3DiscoverPeerControlSettings(t, base, wth3ClientControlStreamId, wth3DiscoverAttemptsDefault, wth3DiscoverPollMsDefault)
+    if IsErr(entriesRes):
+        return Err[bool](ErrorText(entriesRes))
+    return wth3PeerSettingsHaveConnectAndDatagram(Value(entriesRes))
+
+# Client validating a server's SETTINGS: the server must also advertise it
+# will accept at least one concurrent WebTransport session
+# (settingsIsWebtransportCapable's original, correct direction).
+fn Wth3ClientValidatePeerControlStream(t: var qtransport.MsQuicTransport, base: var qconn.Connection): Result[bool] =
+    let entriesRes: Result[h3frame.Http3Setting[]] = wth3DiscoverPeerControlSettings(t, base, wth3ServerControlStreamId, wth3DiscoverAttemptsDefault, wth3DiscoverPollMsDefault)
+    if IsErr(entriesRes):
+        return Err[bool](ErrorText(entriesRes))
+    let settings: wtcommon.Http3Settings = wtcommon.Http3SettingsFromEntries(Value(entriesRes))
+    return wtcommon.settingsIsWebtransportCapable(settings)
+
+# Full server-side handshake on an already-accepted connection: (optionally)
+# preamble + validate peer SETTINGS, then read+validate the Extended CONNECT
+# request and reply 200. Every failure is a distinct Err (no fallback, no
+# silent accept).
+#
+# `withH3SettingsPreamble` defaults to false at both call sites below
+# (webtransport_wt_listener_main.cheng / webtransport_wt_dial_client_main.cheng)
+# because of the VERIFIED TRANSPORT GAP documented on wth3SendPreambleOn:
+# turning it on makes every session fail at
+# Wth3ServerValidatePeerControlStream/Wth3ClientValidatePeerControlStream's
+# discovery timeout, every time, on the current native_runtime.cheng. Passing
+# true reproduces that exact, real, bounded failure (useful to confirm the
+# gap is still present / to confirm a future native_runtime fix closes it);
+# it is deliberately a caller-visible flag, not a hidden fallback.
+fn Wth3ServerHandleConnection(t: var qtransport.MsQuicTransport, base: var qconn.Connection, expectedPath: str, withH3SettingsPreamble: bool): Result[bool] =
+    if withH3SettingsPreamble:
+        let preambleRes: Result[bool] = Wth3ServerSendPreamble(t, base)
+        if IsErr(preambleRes):
+            return Err[bool](ErrorText(preambleRes))
+        let validateRes: Result[bool] = Wth3ServerValidatePeerControlStream(t, base)
+        if IsErr(validateRes):
+            return Err[bool](ErrorText(validateRes))
+    var requestConn: qconn.Connection = qconn.ConnDeriveStream(base, wth3RequestStreamId, wth3RequestStreamId)
+    let reqFrameRes: Result[h3frame.Http3Frame] = wtwire.Wth3ReadFrame(t, requestConn)
+    if IsErr(reqFrameRes):
+        return Err[bool]("wt h3: read CONNECT request: " + ErrorText(reqFrameRes))
+    let reqFrame: h3frame.Http3Frame = Value(reqFrameRes)
+    if reqFrame.kind != int64(h3frame.Http3FrameHeaders):
+        return Err[bool]("wt h3: request stream: first frame is not HEADERS")
+    let reqPayloadCopy: Bytes = rawbytes.BytesSlice(reqFrame.payload, 0, rawbytes.BytesLen(reqFrame.payload))
+    let fieldsRes: Result[qpack.QpackFieldSection] = h3frame.Http3DecodeHeadersFramePayload(reqPayloadCopy)
+    if IsErr(fieldsRes):
+        return Err[bool]("wt h3: decode CONNECT HEADERS: " + ErrorText(fieldsRes))
+    let infoRes: Result[wtcommon.WebtransportHandshakeInfo] = wtcommon.WebtransportParseConnectRequestFields(Value(fieldsRes), expectedPath)
+    if IsErr(infoRes):
+        return Err[bool]("wt h3: CONNECT request rejected: " + ErrorText(infoRes))
+    let respFields: qpack.QpackHeaderField[] = wtcommon.WebtransportConnectResponseFields200()
+    let respFrameRes: Result[Bytes] = h3frame.Http3EncodeHeadersFrame(respFields)
+    if IsErr(respFrameRes):
+        return Err[bool](ErrorText(respFrameRes))
+    let writeRespRes: Result[bool] = wtwire.Wth3WriteRaw(t, requestConn, Value(respFrameRes))
+    if IsErr(writeRespRes):
+        return Err[bool]("wt h3: write 200 response: " + ErrorText(writeRespRes))
+    return Ok[bool](true)
+
+# Full client-side handshake on an already-dial()ed connection: (optionally)
+# preamble + validate peer SETTINGS, send the Extended CONNECT request,
+# validate the 200 response. See Wth3ServerHandleConnection's doc comment for
+# what withH3SettingsPreamble=true currently does (always a bounded, explicit
+# failure -- the verified transport gap).
+fn Wth3ClientHandshake(t: var qtransport.MsQuicTransport, base: var qconn.Connection, authority: str, path: str, withH3SettingsPreamble: bool): Result[bool] =
+    if withH3SettingsPreamble:
+        let preambleRes: Result[bool] = Wth3ClientSendPreamble(t, base)
+        if IsErr(preambleRes):
+            return Err[bool](ErrorText(preambleRes))
+        let validateRes: Result[bool] = Wth3ClientValidatePeerControlStream(t, base)
+        if IsErr(validateRes):
+            return Err[bool](ErrorText(validateRes))
+    var requestConn: qconn.Connection = qconn.ConnDeriveStream(base, wth3RequestStreamId, wth3RequestStreamId)
+    let reqFields: qpack.QpackHeaderField[] = wtcommon.WebtransportBuildConnectRequestFields(authority, path)
+    let reqFrameRes: Result[Bytes] = h3frame.Http3EncodeHeadersFrame(reqFields)
+    if IsErr(reqFrameRes):
+        return Err[bool](ErrorText(reqFrameRes))
+    let writeReqRes: Result[bool] = wtwire.Wth3WriteRaw(t, requestConn, Value(reqFrameRes))
+    if IsErr(writeReqRes):
+        return Err[bool]("wt h3: write CONNECT request: " + ErrorText(writeReqRes))
+    let respFrameRes: Result[h3frame.Http3Frame] = wtwire.Wth3ReadFrame(t, requestConn)
+    if IsErr(respFrameRes):
+        return Err[bool]("wt h3: read CONNECT response: " + ErrorText(respFrameRes))
+    let respFrame: h3frame.Http3Frame = Value(respFrameRes)
+    if respFrame.kind != int64(h3frame.Http3FrameHeaders):
+        return Err[bool]("wt h3: response stream: first frame is not HEADERS")
+    let respPayloadCopy: Bytes = rawbytes.BytesSlice(respFrame.payload, 0, rawbytes.BytesLen(respFrame.payload))
+    let fieldsRes: Result[qpack.QpackFieldSection] = h3frame.Http3DecodeHeadersFramePayload(respPayloadCopy)
+    if IsErr(fieldsRes):
+        return Err[bool]("wt h3: decode CONNECT response HEADERS: " + ErrorText(fieldsRes))
+    let okRes: Result[bool] = wtcommon.WebtransportParseConnectResponseFields(Value(fieldsRes))
+    if IsErr(okRes):
+        return Err[bool]("wt h3: CONNECT response rejected: " + ErrorText(okRes))
+    return Ok[bool](true)
+
+# Waits for the peer to open a new bidirectional data stream (any client- or
+# server-opened bidi other than the CONNECT request stream itself) and
+# returns its stream id.
+fn Wth3AwaitBidiStream(t: var qtransport.MsQuicTransport, base: var qconn.Connection, minStreamId: int64, attempts: int32, pollMs: int32): Result[int64] =
+    var attempt: int32
+    while attempt < attempts:
+        let readableRes: Result[int64] = qconn.nativeReadableStreamId(base, minStreamId)
+        if IsErr(readableRes):
+            os.SleepMs(pollMs)
+            attempt = attempt + 1
+            continue
+        let streamId: int64 = Value(readableRes)
+        if streamId % int64(4) < int64(2):
+            return Ok[int64](streamId)
+        # Unidirectional stream (HTTP/3 control/qpack): its stream-type varint
+        # keeps it "readable" forever, so the poll would return it again instead
+        # of the real bidi data stream. Drain the type varint and keep looking.
+        var uniConn: qconn.Connection = qconn.ConnDeriveStream(base, streamId, streamId)
+        let drainRes: Result[int64] = Wth3ReadVarint(t, uniConn)
+        if IsErr(drainRes):
+            return Err[int64]("wt h3: drain uni-stream type: " + ErrorText(drainRes))
+        attempt = attempt + 1
+    return Err[int64]("wt h3: timed out waiting for bidi data stream")

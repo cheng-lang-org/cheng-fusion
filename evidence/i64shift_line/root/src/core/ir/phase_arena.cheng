@@ -1,0 +1,1154 @@
+import std/system
+import std/seqs
+import std/rawbytes
+import std/rawmem_support
+
+type
+    # Frozen production bookkeeping ABI. Existing callers only observe these
+    # five scalar fields; managed storage belongs exclusively to PhaseArenaStore.
+    PhaseArena =
+        capacity: int64
+        used: int64
+        peakUsed: int64
+        resetCount: int32
+        spillCount: int32
+
+    PhaseArenaBlock =
+        offsetBytes: int64
+        sizeBytes: int64
+        alignBytes: int64
+        valid: bool
+
+    PhaseArenaReport =
+        peakBytes: int64
+        resetCount: int32
+        spillCount: int32
+        capacityBytes: int64
+        usedBytes: int64
+
+    PhaseArenaId = int32
+    PhaseArenaGeneration = int32
+    PhaseArenaAllocationIndex = int32
+    PhaseArenaOffset = int32
+
+    # POD capability only. It never owns or embeds registry/storage sequences.
+    PhaseArenaHandle =
+        arenaId: PhaseArenaId
+        generation: PhaseArenaGeneration
+        allocationIndex: PhaseArenaAllocationIndex
+        offset: PhaseArenaOffset
+
+    # POD allocation identity. Size/alignment/state remain authoritative SoA
+    # facts in PhaseArenaStore and are never caller-supplied.
+    PhaseArenaRef =
+        arenaId: PhaseArenaId
+        generation: PhaseArenaGeneration
+        allocationIndex: PhaseArenaAllocationIndex
+        offset: PhaseArenaOffset
+
+    PhaseArenaStoreArenaReport =
+        arenaId: int32
+        generation: int32
+        capacityBytes: int32
+        usedBytes: int32
+        peakBytes: int32
+        resetCount: int32
+        spillCount: int32
+        allocationCount: int32
+        liveAllocationCount: int32
+        liveBytes: int32
+        survivorCount: int32
+        survivorBytes: int32
+        retainedStoreBytes: int64
+        mutationEpoch: int32
+
+    PhaseArenaStoreDestroyReceipt =
+        releasedBufferCount: int32
+        releasedBytes: int64
+        storageReleased: bool
+
+    # Single authority. All storage is POD SoA. Text enters only as an int32
+    # intern ID through the public intern-column adapter below.
+    PhaseArenaStore =
+        lifecycle: int32
+        maxArenaCount: int32
+        payloadCapacity: int32
+        allocationCapacity: int32
+        claimedArenaCount: int32
+        liveArenaCount: int32
+        reservedPayloadBytes: int32
+        reservedAllocationRows: int32
+        mutationEpoch: int32
+        retainedBytes: int64
+
+        arenaClaimed: bool[]
+        arenaStates: int32[]
+        arenaGenerations: int32[]
+        arenaPayloadOffsets: int32[]
+        arenaCapacities: int32[]
+        arenaUsedBytes: int32[]
+        arenaPeakBytes: int32[]
+        arenaAllocationStarts: int32[]
+        arenaAllocationLimits: int32[]
+        arenaAllocationCounts: int32[]
+        arenaLiveCounts: int32[]
+        arenaLiveBytes: int32[]
+        arenaResetCounts: int32[]
+        arenaSpillCounts: int32[]
+        arenaActiveFlags: int32[]
+        arenaSurvivorCounts: int32[]
+        arenaSurvivorBytes: int32[]
+
+        # Five exact logical allocation columns, initialized once.
+        allocationOffsets: int32[]
+        allocationSizes: int32[]
+        allocationAlignments: int32[]
+        allocationGenerations: int32[]
+        allocationStates: int32[]
+        payload: uint8[]
+
+const
+    PhaseArenaStoreLifecycleLive = 1
+    PhaseArenaStoreArenaLive = 1
+    PhaseArenaStoreArenaClosed = 2
+    PhaseArenaStoreAllocationLive = 1
+    PhaseArenaStoreAllocationRehomed = 2
+    PhaseArenaStoreMaxInt32 = 2147483647
+
+fn phaseArenaFail(message: str) =
+    panic(message)
+
+# ---------------------------------------------------------------------------
+# Frozen five-scalar legacy bookkeeping API.
+# ---------------------------------------------------------------------------
+
+fn PhaseArenaInit(capacity: int64): PhaseArena =
+    assert(capacity >= int64(0), " phase arena init: negative capacity")
+    var out: PhaseArena
+    out.capacity = capacity
+    return out
+
+fn PhaseArenaDestroy(arena: var PhaseArena) =
+    arena.capacity = int64(0)
+    arena.used = int64(0)
+    arena.peakUsed = int64(0)
+    arena.resetCount = int32(0)
+    arena.spillCount = int32(0)
+
+fn PhaseArenaReset(arena: var PhaseArena) =
+    assert(arena.used >= int64(0) && arena.used <= arena.capacity,
+           " phase arena reset: used bytes out of range")
+    assert(arena.peakUsed >= arena.used && arena.peakUsed <= arena.capacity,
+           " phase arena reset: peak bytes out of range")
+    arena.used = int64(0)
+    arena.resetCount = arena.resetCount + int32(1)
+
+fn PhaseArenaAlign(used: int64, align: int64): int64 =
+    assert(used >= int64(0), " phase arena align: negative used bytes")
+    assert(align > int64(0), " phase arena align: non-positive alignment")
+    if align == int64(1):
+        return used
+    let rem = used % align
+    if rem == int64(0):
+        return used
+    return used + (align - rem)
+
+fn PhaseArenaAlignWithinCapacity(used: int64,
+                                 align: int64,
+                                 capacity: int64): int64 =
+    assert(used >= int64(0), " phase arena align: negative used bytes")
+    assert(capacity >= int64(0), " phase arena align: negative capacity")
+    assert(align > int64(0), " phase arena align: non-positive alignment")
+    if used > capacity:
+        return -1
+    if align == int64(1):
+        return used
+    let rem = used % align
+    if rem == int64(0):
+        return used
+    let padding = align - rem
+    if padding > capacity - used:
+        return -1
+    return used + padding
+
+fn PhaseArenaInvalidBlock(size: int64, align: int64): PhaseArenaBlock =
+    var out: PhaseArenaBlock
+    out.sizeBytes = size
+    out.alignBytes = align
+    out.valid = false
+    return out
+
+fn PhaseArenaMakeBlock(offset: int64,
+                       size: int64,
+                       align: int64): PhaseArenaBlock =
+    var out: PhaseArenaBlock
+    out.offsetBytes = offset
+    out.sizeBytes = size
+    out.alignBytes = align
+    out.valid = true
+    return out
+
+fn PhaseArenaAllocAligned(arena: var PhaseArena,
+                          size: int64,
+                          align: int64): PhaseArenaBlock =
+    assert(size >= int64(0), " phase arena alloc: negative size")
+    assert(align > int64(0), " phase arena alloc: non-positive alignment")
+    assert(arena.capacity >= int64(0), " phase arena alloc: negative capacity")
+    assert(arena.used >= int64(0) && arena.used <= arena.capacity,
+           " phase arena alloc: used bytes out of range")
+    assert(arena.peakUsed >= arena.used && arena.peakUsed <= arena.capacity,
+           " phase arena alloc: peak bytes out of range")
+    let aligned = PhaseArenaAlignWithinCapacity(arena.used, align, arena.capacity)
+    if aligned < int64(0):
+        arena.spillCount = arena.spillCount + int32(1)
+        return PhaseArenaInvalidBlock(size, align)
+    let remaining = arena.capacity - aligned
+    if size > remaining:
+        arena.spillCount = arena.spillCount + int32(1)
+        return PhaseArenaInvalidBlock(size, align)
+    let newUsed = aligned + size
+    arena.used = newUsed
+    if newUsed > arena.peakUsed:
+        arena.peakUsed = newUsed
+    return PhaseArenaMakeBlock(aligned, size, align)
+
+fn PhaseArenaAlloc(arena: var PhaseArena, size: int64): PhaseArenaBlock =
+    return PhaseArenaAllocAligned(arena, size, int64(8))
+
+fn PhaseArenaReserve(arena: var PhaseArena,
+                     count: int64,
+                     elemSize: int64): PhaseArenaBlock =
+    assert(count >= int64(0), " phase arena reserve: negative count")
+    assert(elemSize >= int64(0), " phase arena reserve: negative element size")
+    assert(arena.capacity >= int64(0), " phase arena reserve: negative capacity")
+    assert(arena.used >= int64(0) && arena.used <= arena.capacity,
+           " phase arena reserve: used bytes out of range")
+    assert(arena.peakUsed >= arena.used && arena.peakUsed <= arena.capacity,
+           " phase arena reserve: peak bytes out of range")
+    if count > int64(0) && elemSize > int64(0):
+        if count > arena.capacity / elemSize:
+            arena.spillCount = arena.spillCount + int32(1)
+            return PhaseArenaInvalidBlock(int64(0), int64(8))
+    let totalSize = count * elemSize
+    return PhaseArenaAllocAligned(arena, totalSize, int64(8))
+
+fn PhaseArenaBlockIsValid(block: PhaseArenaBlock): bool =
+    return block.valid
+
+fn PhaseArenaDidSpill(arena: PhaseArena): bool =
+    return arena.spillCount > 0
+
+fn PhaseArenaHardFailOnSpill(arena: PhaseArena,
+                             phaseName: str) =
+    if arena.spillCount > 0:
+        assert(false, Fmt"phase arena unexpected spill phase={phaseName} spill_count={arena.spillCount}")
+
+fn PhaseArenaReport(arena: PhaseArena): PhaseArenaReport =
+    assert(arena.used >= int64(0) && arena.used <= arena.capacity,
+           " phase arena report: used bytes out of range")
+    assert(arena.peakUsed >= arena.used && arena.peakUsed <= arena.capacity,
+           " phase arena report: peak bytes out of range")
+    var out: PhaseArenaReport
+    out.peakBytes = arena.peakUsed
+    out.resetCount = arena.resetCount
+    out.spillCount = arena.spillCount
+    out.capacityBytes = arena.capacity
+    out.usedBytes = arena.used
+    return out
+
+fn PhaseArenaReportText(report: PhaseArenaReport): str =
+    var out: str
+    out = Fmt"phase_arena_peak_bytes={report.peakBytes}"
+    out = Fmt"{out}\nphase_arena_reset_count={report.resetCount}"
+    out = Fmt"{out}\nphase_arena_spill_count={report.spillCount}"
+    out = Fmt"{out}\nphase_arena_capacity_bytes={report.capacityBytes}"
+    out = Fmt"{out}\nphase_arena_used_bytes={report.usedBytes}"
+    return out
+
+fn PhaseArenaCurrentReportText(arena: PhaseArena): str =
+    return PhaseArenaReportText(PhaseArenaReport(arena))
+
+# ---------------------------------------------------------------------------
+# PhaseArenaStore foundation. Production callers are intentionally not wired
+# yet; every API borrows the single managed authority through `var store`.
+# ---------------------------------------------------------------------------
+
+fn phaseArenaStoreCheckedAdd(left: int32,
+                             right: int32,
+                             message: str): int32 =
+    if left < 0 || right < 0 || right > PhaseArenaStoreMaxInt32 - left:
+        phaseArenaFail(message)
+    return left + right
+
+fn phaseArenaStorePowerOfTwo(value: int32): bool =
+    if value <= 0:
+        return false
+    return (value & (value - 1)) == 0
+
+fn phaseArenaStoreRequireAlignment(value: int32) =
+    if !phaseArenaStorePowerOfTwo(value):
+        phaseArenaFail("phase arena store: alignment must be a positive power of two")
+
+fn phaseArenaStoreRequiredBytes(maxArenaCount: int32,
+                                payloadCapacity: int32,
+                                allocationCapacity: int32): int64 =
+    let arenaColumnBytes = int64(maxArenaCount) * int64(65)
+    let allocationColumnBytes = int64(allocationCapacity) * int64(20)
+    let total = arenaColumnBytes + allocationColumnBytes +
+                int64(payloadCapacity)
+    if total <= int64(0) || total > int64(PhaseArenaStoreMaxInt32):
+        phaseArenaFail("phase arena store: requested retained bytes overflow")
+    return total
+
+@borrows
+fn phaseArenaStoreRetainedBytes(store: PhaseArenaStore): int64 =
+    var total = int64(store.arenaClaimed.cap)
+    total = total + int64(store.arenaStates.cap) * int64(4)
+    total = total + int64(store.arenaGenerations.cap) * int64(4)
+    total = total + int64(store.arenaPayloadOffsets.cap) * int64(4)
+    total = total + int64(store.arenaCapacities.cap) * int64(4)
+    total = total + int64(store.arenaUsedBytes.cap) * int64(4)
+    total = total + int64(store.arenaPeakBytes.cap) * int64(4)
+    total = total + int64(store.arenaAllocationStarts.cap) * int64(4)
+    total = total + int64(store.arenaAllocationLimits.cap) * int64(4)
+    total = total + int64(store.arenaAllocationCounts.cap) * int64(4)
+    total = total + int64(store.arenaLiveCounts.cap) * int64(4)
+    total = total + int64(store.arenaLiveBytes.cap) * int64(4)
+    total = total + int64(store.arenaResetCounts.cap) * int64(4)
+    total = total + int64(store.arenaSpillCounts.cap) * int64(4)
+    total = total + int64(store.arenaActiveFlags.cap) * int64(4)
+    total = total + int64(store.arenaSurvivorCounts.cap) * int64(4)
+    total = total + int64(store.arenaSurvivorBytes.cap) * int64(4)
+    total = total + int64(store.allocationOffsets.cap) * int64(4)
+    total = total + int64(store.allocationSizes.cap) * int64(4)
+    total = total + int64(store.allocationAlignments.cap) * int64(4)
+    total = total + int64(store.allocationGenerations.cap) * int64(4)
+    total = total + int64(store.allocationStates.cap) * int64(4)
+    total = total + int64(store.payload.cap)
+    if total <= int64(0) || total > int64(PhaseArenaStoreMaxInt32):
+        phaseArenaFail("phase arena store: retained byte ledger overflow")
+    return total
+
+@borrows
+fn phaseArenaStoreRequire(store: PhaseArenaStore) =
+    if store.lifecycle != PhaseArenaStoreLifecycleLive:
+        phaseArenaFail("phase arena store: authority is not live")
+    let arenaCount = store.maxArenaCount
+    let allocationCount = store.allocationCapacity
+    if arenaCount <= 0 || allocationCount <= 0 ||
+       store.payloadCapacity <= 0:
+        phaseArenaFail("phase arena store: authority bounds corrupt")
+    if store.arenaClaimed.len != arenaCount ||
+       store.arenaStates.len != arenaCount ||
+       store.arenaGenerations.len != arenaCount ||
+       store.arenaPayloadOffsets.len != arenaCount ||
+       store.arenaCapacities.len != arenaCount ||
+       store.arenaUsedBytes.len != arenaCount ||
+       store.arenaPeakBytes.len != arenaCount ||
+       store.arenaAllocationStarts.len != arenaCount ||
+       store.arenaAllocationLimits.len != arenaCount ||
+       store.arenaAllocationCounts.len != arenaCount ||
+       store.arenaLiveCounts.len != arenaCount ||
+       store.arenaLiveBytes.len != arenaCount ||
+       store.arenaResetCounts.len != arenaCount ||
+       store.arenaSpillCounts.len != arenaCount ||
+       store.arenaActiveFlags.len != arenaCount ||
+       store.arenaSurvivorCounts.len != arenaCount ||
+       store.arenaSurvivorBytes.len != arenaCount:
+        phaseArenaFail("phase arena store: arena SoA length drift")
+    if store.allocationOffsets.len != allocationCount ||
+       store.allocationSizes.len != allocationCount ||
+       store.allocationAlignments.len != allocationCount ||
+       store.allocationGenerations.len != allocationCount ||
+       store.allocationStates.len != allocationCount:
+        phaseArenaFail("phase arena store: allocation SoA length drift")
+    if store.payload.len != store.payloadCapacity:
+        phaseArenaFail("phase arena store: payload length drift")
+    if store.claimedArenaCount < 0 ||
+       store.claimedArenaCount > arenaCount ||
+       store.liveArenaCount < 0 ||
+       store.liveArenaCount > store.claimedArenaCount ||
+       store.reservedPayloadBytes < 0 ||
+       store.reservedPayloadBytes > store.payloadCapacity ||
+       store.reservedAllocationRows < 0 ||
+       store.reservedAllocationRows > allocationCount ||
+       store.mutationEpoch <= 0:
+        phaseArenaFail("phase arena store: authority counters corrupt")
+    if phaseArenaStoreRetainedBytes(store) != store.retainedBytes:
+        phaseArenaFail("phase arena store: retained byte ledger drift")
+
+fn phaseArenaStorePublishMutation(store: var PhaseArenaStore) =
+    phaseArenaStoreRequire(store)
+    if store.mutationEpoch >= PhaseArenaStoreMaxInt32:
+        phaseArenaFail("phase arena store: mutation epoch exhausted")
+    store.mutationEpoch = store.mutationEpoch + 1
+
+fn PhaseArenaStoreInit(store: var PhaseArenaStore,
+                       maxArenaCount: int32,
+                       payloadCapacity: int32,
+                       allocationCapacity: int32) =
+    if store.lifecycle != 0 ||
+       store.arenaStates.len != 0 ||
+       store.allocationOffsets.len != 0 ||
+       store.payload.len != 0:
+        phaseArenaFail("phase arena store: init requires an empty owner")
+    if maxArenaCount <= 0 || payloadCapacity <= 0 || allocationCapacity <= 0:
+        phaseArenaFail("phase arena store: init bounds must be positive")
+    let requiredBytes = phaseArenaStoreRequiredBytes(
+        maxArenaCount, payloadCapacity, allocationCapacity)
+    if requiredBytes <= int64(0):
+        phaseArenaFail("phase arena store: invalid retained byte budget")
+    store.lifecycle = PhaseArenaStoreLifecycleLive
+    store.maxArenaCount = maxArenaCount
+    store.payloadCapacity = payloadCapacity
+    store.allocationCapacity = allocationCapacity
+    store.mutationEpoch = 1
+    setLen(store.arenaClaimed, maxArenaCount)
+    setLen(store.arenaStates, maxArenaCount)
+    setLen(store.arenaGenerations, maxArenaCount)
+    setLen(store.arenaPayloadOffsets, maxArenaCount)
+    setLen(store.arenaCapacities, maxArenaCount)
+    setLen(store.arenaUsedBytes, maxArenaCount)
+    setLen(store.arenaPeakBytes, maxArenaCount)
+    setLen(store.arenaAllocationStarts, maxArenaCount)
+    setLen(store.arenaAllocationLimits, maxArenaCount)
+    setLen(store.arenaAllocationCounts, maxArenaCount)
+    setLen(store.arenaLiveCounts, maxArenaCount)
+    setLen(store.arenaLiveBytes, maxArenaCount)
+    setLen(store.arenaResetCounts, maxArenaCount)
+    setLen(store.arenaSpillCounts, maxArenaCount)
+    setLen(store.arenaActiveFlags, maxArenaCount)
+    setLen(store.arenaSurvivorCounts, maxArenaCount)
+    setLen(store.arenaSurvivorBytes, maxArenaCount)
+    setLen(store.allocationOffsets, allocationCapacity)
+    setLen(store.allocationSizes, allocationCapacity)
+    setLen(store.allocationAlignments, allocationCapacity)
+    setLen(store.allocationGenerations, allocationCapacity)
+    setLen(store.allocationStates, allocationCapacity)
+    setLen(store.payload, payloadCapacity)
+    store.retainedBytes = phaseArenaStoreRetainedBytes(store)
+    phaseArenaStoreRequire(store)
+
+fn PhaseArenaStoreDestroy(store: var PhaseArenaStore) =
+    phaseArenaStoreRequire(store)
+    if store.liveArenaCount != 0:
+        phaseArenaFail("phase arena store: destroy requires all arenas closed")
+    freeSeq(store.arenaClaimed)
+    freeSeq(store.arenaStates)
+    freeSeq(store.arenaGenerations)
+    freeSeq(store.arenaPayloadOffsets)
+    freeSeq(store.arenaCapacities)
+    freeSeq(store.arenaUsedBytes)
+    freeSeq(store.arenaPeakBytes)
+    freeSeq(store.arenaAllocationStarts)
+    freeSeq(store.arenaAllocationLimits)
+    freeSeq(store.arenaAllocationCounts)
+    freeSeq(store.arenaLiveCounts)
+    freeSeq(store.arenaLiveBytes)
+    freeSeq(store.arenaResetCounts)
+    freeSeq(store.arenaSpillCounts)
+    freeSeq(store.arenaActiveFlags)
+    freeSeq(store.arenaSurvivorCounts)
+    freeSeq(store.arenaSurvivorBytes)
+    freeSeq(store.allocationOffsets)
+    freeSeq(store.allocationSizes)
+    freeSeq(store.allocationAlignments)
+    freeSeq(store.allocationGenerations)
+    freeSeq(store.allocationStates)
+    chengSeqFreeTyped(store.payload)
+    var cleared: PhaseArenaStore
+    store = cleared
+
+fn PhaseArenaStorePhysicalBufferCount(store: var PhaseArenaStore): int32 =
+    phaseArenaStoreRequire(store)
+    var count: int32
+    if store.arenaClaimed.cap > 0:
+        count = count + 1
+    if store.arenaStates.cap > 0:
+        count = count + 1
+    if store.arenaGenerations.cap > 0:
+        count = count + 1
+    if store.arenaPayloadOffsets.cap > 0:
+        count = count + 1
+    if store.arenaCapacities.cap > 0:
+        count = count + 1
+    if store.arenaUsedBytes.cap > 0:
+        count = count + 1
+    if store.arenaPeakBytes.cap > 0:
+        count = count + 1
+    if store.arenaAllocationStarts.cap > 0:
+        count = count + 1
+    if store.arenaAllocationLimits.cap > 0:
+        count = count + 1
+    if store.arenaAllocationCounts.cap > 0:
+        count = count + 1
+    if store.arenaLiveCounts.cap > 0:
+        count = count + 1
+    if store.arenaLiveBytes.cap > 0:
+        count = count + 1
+    if store.arenaResetCounts.cap > 0:
+        count = count + 1
+    if store.arenaSpillCounts.cap > 0:
+        count = count + 1
+    if store.arenaActiveFlags.cap > 0:
+        count = count + 1
+    if store.arenaSurvivorCounts.cap > 0:
+        count = count + 1
+    if store.arenaSurvivorBytes.cap > 0:
+        count = count + 1
+    if store.allocationOffsets.cap > 0:
+        count = count + 1
+    if store.allocationSizes.cap > 0:
+        count = count + 1
+    if store.allocationAlignments.cap > 0:
+        count = count + 1
+    if store.allocationGenerations.cap > 0:
+        count = count + 1
+    if store.allocationStates.cap > 0:
+        count = count + 1
+    if store.payload.cap > 0:
+        count = count + 1
+    return count
+
+fn PhaseArenaStoreStorageReleased(store: var PhaseArenaStore): bool =
+    return store.lifecycle == 0 &&
+           store.maxArenaCount == 0 &&
+           store.payloadCapacity == 0 &&
+           store.allocationCapacity == 0 &&
+           store.retainedBytes == int64(0) &&
+           store.arenaClaimed.cap == 0 &&
+           store.arenaStates.cap == 0 &&
+           store.arenaGenerations.cap == 0 &&
+           store.arenaPayloadOffsets.cap == 0 &&
+           store.arenaCapacities.cap == 0 &&
+           store.arenaUsedBytes.cap == 0 &&
+           store.arenaPeakBytes.cap == 0 &&
+           store.arenaAllocationStarts.cap == 0 &&
+           store.arenaAllocationLimits.cap == 0 &&
+           store.arenaAllocationCounts.cap == 0 &&
+           store.arenaLiveCounts.cap == 0 &&
+           store.arenaLiveBytes.cap == 0 &&
+           store.arenaResetCounts.cap == 0 &&
+           store.arenaSpillCounts.cap == 0 &&
+           store.arenaActiveFlags.cap == 0 &&
+           store.arenaSurvivorCounts.cap == 0 &&
+           store.arenaSurvivorBytes.cap == 0 &&
+           store.allocationOffsets.cap == 0 &&
+           store.allocationSizes.cap == 0 &&
+           store.allocationAlignments.cap == 0 &&
+           store.allocationGenerations.cap == 0 &&
+           store.allocationStates.cap == 0 &&
+           store.payload.cap == 0
+
+fn PhaseArenaStoreDestroyWithReceipt(
+        store: var PhaseArenaStore): PhaseArenaStoreDestroyReceipt =
+    var receipt: PhaseArenaStoreDestroyReceipt
+    receipt.releasedBufferCount =
+        PhaseArenaStorePhysicalBufferCount(store)
+    receipt.releasedBytes = PhaseArenaStoreRetainedBytes(store)
+    PhaseArenaStoreDestroy(store)
+    receipt.storageReleased = PhaseArenaStoreStorageReleased(store)
+    if !receipt.storageReleased ||
+       receipt.releasedBufferCount <= 0 ||
+       receipt.releasedBytes <= int64(0):
+        phaseArenaFail("phase arena store: physical release receipt incomplete")
+    return receipt
+
+@borrows
+fn PhaseArenaHandleIsValid(handle: PhaseArenaHandle): bool =
+    return handle.arenaId > 0 && handle.generation > 0 &&
+           handle.allocationIndex >= 0 && handle.offset >= 0
+
+@borrows
+fn PhaseArenaRefIsValid(region: PhaseArenaRef): bool =
+    return region.arenaId > 0 && region.generation > 0 &&
+           region.allocationIndex >= 0 && region.offset >= 0
+
+@borrows
+fn phaseArenaStoreRequireArena(store: PhaseArenaStore,
+                               handle: PhaseArenaHandle): int32 =
+    phaseArenaStoreRequire(store)
+    if !PhaseArenaHandleIsValid(handle):
+        phaseArenaFail("phase arena store: invalid arena handle")
+    if handle.arenaId > store.maxArenaCount:
+        phaseArenaFail("phase arena store: arena id outside authority")
+    let row = handle.arenaId - 1
+    if handle.allocationIndex != row ||
+       !store.arenaClaimed[row] ||
+       store.arenaStates[row] != PhaseArenaStoreArenaLive:
+        phaseArenaFail("phase arena store: arena handle is not live")
+    if handle.generation != store.arenaGenerations[row]:
+        phaseArenaFail("phase arena store: stale arena generation")
+    if handle.offset != store.arenaPayloadOffsets[row]:
+        phaseArenaFail("phase arena store: arena handle authority mismatch")
+    return row
+
+fn PhaseArenaStoreOpenArena(store: var PhaseArenaStore,
+                            arenaId: PhaseArenaId,
+                            capacityBytes: int32,
+                            maxAllocations: int32): PhaseArenaHandle =
+    phaseArenaStoreRequire(store)
+    if arenaId <= 0 || arenaId > store.maxArenaCount:
+        phaseArenaFail("phase arena store: arena id outside dense bound")
+    if capacityBytes <= 0 || maxAllocations <= 0:
+        phaseArenaFail("phase arena store: arena bounds must be positive")
+    let row = arenaId - 1
+    if store.arenaClaimed[row]:
+        phaseArenaFail("phase arena store: duplicate arena id")
+    if capacityBytes > store.payloadCapacity -
+                       store.reservedPayloadBytes:
+        phaseArenaFail("phase arena store: payload authority exhausted")
+    if maxAllocations > store.allocationCapacity -
+                        store.reservedAllocationRows:
+        phaseArenaFail("phase arena store: allocation authority exhausted")
+    store.arenaClaimed[row] = true
+    store.arenaStates[row] = PhaseArenaStoreArenaLive
+    store.arenaGenerations[row] = 1
+    store.arenaPayloadOffsets[row] =
+        store.reservedPayloadBytes
+    store.arenaCapacities[row] = capacityBytes
+    store.arenaAllocationStarts[row] =
+        store.reservedAllocationRows
+    store.arenaAllocationLimits[row] = maxAllocations
+    store.reservedPayloadBytes = phaseArenaStoreCheckedAdd(
+        store.reservedPayloadBytes,
+        capacityBytes,
+        "phase arena store: payload reservation overflow")
+    store.reservedAllocationRows = phaseArenaStoreCheckedAdd(
+        store.reservedAllocationRows,
+        maxAllocations,
+        "phase arena store: allocation reservation overflow")
+    store.claimedArenaCount = store.claimedArenaCount + 1
+    store.liveArenaCount = store.liveArenaCount + 1
+    phaseArenaStorePublishMutation(store)
+    var out: PhaseArenaHandle
+    out.arenaId = arenaId
+    out.generation = 1
+    out.allocationIndex = row
+    out.offset = store.arenaPayloadOffsets[row]
+    return out
+
+fn phaseArenaStoreClearArena(store: var PhaseArenaStore, row: int32) =
+    let payloadStart = store.arenaPayloadOffsets[row]
+    let usedBytes = store.arenaUsedBytes[row]
+    for byteIndex in 0..<usedBytes:
+        store.payload[payloadStart + byteIndex] = uint8(0)
+    let allocationStart = store.arenaAllocationStarts[row]
+    let allocationCount = store.arenaAllocationCounts[row]
+    for localIndex in 0..<allocationCount:
+        let allocationIndex = allocationStart + localIndex
+        store.allocationOffsets[allocationIndex] = 0
+        store.allocationSizes[allocationIndex] = 0
+        store.allocationAlignments[allocationIndex] = 0
+        store.allocationGenerations[allocationIndex] = 0
+        store.allocationStates[allocationIndex] = 0
+    store.arenaUsedBytes[row] = 0
+    store.arenaAllocationCounts[row] = 0
+    store.arenaLiveCounts[row] = 0
+    store.arenaLiveBytes[row] = 0
+    store.arenaSurvivorCounts[row] = 0
+    store.arenaSurvivorBytes[row] = 0
+    store.arenaActiveFlags[row] = 0
+
+@borrows
+fn phaseArenaStoreValidateArenaLedger(store: PhaseArenaStore,
+                                      row: int32) =
+    let allocationStart = store.arenaAllocationStarts[row]
+    let allocationCount = store.arenaAllocationCounts[row]
+    var expectedRelativeOffset: int64
+    var liveCount: int32
+    var liveBytes: int32
+    var survivorCount: int32
+    var survivorBytes: int32
+    for localIndex in 0..<allocationCount:
+        let allocationIndex = allocationStart + localIndex
+        let size = store.allocationSizes[allocationIndex]
+        let align = store.allocationAlignments[allocationIndex]
+        let generation = store.allocationGenerations[allocationIndex]
+        let state = store.allocationStates[allocationIndex]
+        if size <= 0 || !phaseArenaStorePowerOfTwo(align) ||
+           generation != store.arenaGenerations[row]:
+            phaseArenaFail("phase arena store: allocation metadata corrupt")
+        expectedRelativeOffset = PhaseArenaAlign(
+            expectedRelativeOffset, int64(align))
+        let expectedAbsoluteOffset =
+            int64(store.arenaPayloadOffsets[row]) + expectedRelativeOffset
+        if int64(store.allocationOffsets[allocationIndex]) !=
+           expectedAbsoluteOffset:
+            phaseArenaFail("phase arena store: allocation offset ledger drift")
+        expectedRelativeOffset = expectedRelativeOffset + int64(size)
+        if expectedRelativeOffset > int64(store.arenaCapacities[row]):
+            phaseArenaFail("phase arena store: allocation range ledger drift")
+        if state == PhaseArenaStoreAllocationLive:
+            liveCount = liveCount + 1
+            liveBytes = phaseArenaStoreCheckedAdd(
+                liveBytes, size, "phase arena store: live byte ledger overflow")
+        elif state == PhaseArenaStoreAllocationRehomed:
+            survivorCount = survivorCount + 1
+            survivorBytes = phaseArenaStoreCheckedAdd(
+                survivorBytes, size,
+                "phase arena store: survivor byte ledger overflow")
+        else:
+            phaseArenaFail("phase arena store: allocation state corrupt")
+    if int32(expectedRelativeOffset) != store.arenaUsedBytes[row] ||
+       liveCount != store.arenaLiveCounts[row] ||
+       liveBytes != store.arenaLiveBytes[row] ||
+       survivorCount != store.arenaSurvivorCounts[row] ||
+       survivorBytes != store.arenaSurvivorBytes[row]:
+        phaseArenaFail("phase arena store: allocation counters drift")
+
+fn PhaseArenaStoreResetArena(store: var PhaseArenaStore,
+                             handle: var PhaseArenaHandle) =
+    let row = phaseArenaStoreRequireArena(store, handle)
+    phaseArenaStoreValidateArenaLedger(store, row)
+    if store.arenaActiveFlags[row] == 0:
+        phaseArenaFail("phase arena store: reset without phase activity")
+    if store.arenaGenerations[row] >= PhaseArenaStoreMaxInt32:
+        phaseArenaFail("phase arena store: generation exhausted")
+    phaseArenaStoreClearArena(store, row)
+    store.arenaGenerations[row] =
+        store.arenaGenerations[row] + 1
+    store.arenaResetCounts[row] =
+        store.arenaResetCounts[row] + 1
+    handle.generation = store.arenaGenerations[row]
+    phaseArenaStorePublishMutation(store)
+
+fn PhaseArenaStoreCloseArena(store: var PhaseArenaStore,
+                             handle: var PhaseArenaHandle) =
+    let row = phaseArenaStoreRequireArena(store, handle)
+    phaseArenaStoreValidateArenaLedger(store, row)
+    phaseArenaStoreClearArena(store, row)
+    store.arenaStates[row] = PhaseArenaStoreArenaClosed
+    if store.arenaGenerations[row] < PhaseArenaStoreMaxInt32:
+        store.arenaGenerations[row] =
+            store.arenaGenerations[row] + 1
+    store.liveArenaCount = store.liveArenaCount - 1
+    var invalid: PhaseArenaHandle
+    handle = invalid
+    phaseArenaStorePublishMutation(store)
+
+fn phaseArenaStoreAllocRefAligned(store: var PhaseArenaStore,
+                                  handle: PhaseArenaHandle,
+                                  sizeBytes: int32,
+                                  alignmentBytes: int32): PhaseArenaRef =
+    let row = phaseArenaStoreRequireArena(store, handle)
+    if sizeBytes <= 0:
+        phaseArenaFail("phase arena store: allocation size must be positive")
+    phaseArenaStoreRequireAlignment(alignmentBytes)
+    let used = store.arenaUsedBytes[row]
+    let capacity = store.arenaCapacities[row]
+    let aligned64 = PhaseArenaAlignWithinCapacity(
+        int64(used), int64(alignmentBytes), int64(capacity))
+    if aligned64 < int64(0) || int64(sizeBytes) > int64(capacity) - aligned64:
+        store.arenaSpillCounts[row] =
+            store.arenaSpillCounts[row] + 1
+        phaseArenaFail("phase arena store: fixed payload capacity exhausted")
+    let allocationCount = store.arenaAllocationCounts[row]
+    if allocationCount >= store.arenaAllocationLimits[row]:
+        store.arenaSpillCounts[row] =
+            store.arenaSpillCounts[row] + 1
+        phaseArenaFail("phase arena store: fixed descriptor capacity exhausted")
+    let allocationIndex = store.arenaAllocationStarts[row] +
+                          allocationCount
+    let absoluteOffset = store.arenaPayloadOffsets[row] +
+                         int32(aligned64)
+    store.allocationOffsets[allocationIndex] = absoluteOffset
+    store.allocationSizes[allocationIndex] = sizeBytes
+    store.allocationAlignments[allocationIndex] = alignmentBytes
+    store.allocationGenerations[allocationIndex] =
+        store.arenaGenerations[row]
+    store.allocationStates[allocationIndex] =
+        PhaseArenaStoreAllocationLive
+    let nextUsed = int32(aligned64) + sizeBytes
+    store.arenaUsedBytes[row] = nextUsed
+    if nextUsed > store.arenaPeakBytes[row]:
+        store.arenaPeakBytes[row] = nextUsed
+    store.arenaAllocationCounts[row] = allocationCount + 1
+    store.arenaLiveCounts[row] =
+        store.arenaLiveCounts[row] + 1
+    store.arenaLiveBytes[row] = phaseArenaStoreCheckedAdd(
+        store.arenaLiveBytes[row],
+        sizeBytes,
+        "phase arena store: live byte counter overflow")
+    store.arenaActiveFlags[row] = 1
+    phaseArenaStorePublishMutation(store)
+    var out: PhaseArenaRef
+    out.arenaId = handle.arenaId
+    out.generation = handle.generation
+    out.allocationIndex = allocationIndex
+    out.offset = absoluteOffset
+    return out
+
+fn PhaseArenaStoreAllocRefAligned(store: var PhaseArenaStore,
+                                  handle: PhaseArenaHandle,
+                                  sizeBytes: int32,
+                                  alignmentBytes: int32): PhaseArenaRef =
+    return phaseArenaStoreAllocRefAligned(
+        store, handle, sizeBytes, alignmentBytes)
+
+fn PhaseArenaStoreAllocRef(store: var PhaseArenaStore,
+                           handle: PhaseArenaHandle,
+                           sizeBytes: int32): PhaseArenaRef =
+    return phaseArenaStoreAllocRefAligned(store, handle, sizeBytes, 8)
+
+@borrows
+fn phaseArenaStoreRequireRef(store: PhaseArenaStore,
+                             handle: PhaseArenaHandle,
+                             region: PhaseArenaRef): int32 =
+    let row = phaseArenaStoreRequireArena(store, handle)
+    if !PhaseArenaRefIsValid(region):
+        phaseArenaFail("phase arena store: invalid allocation ref")
+    if region.arenaId != handle.arenaId:
+        phaseArenaFail("phase arena store: allocation owner mismatch")
+    if region.generation != handle.generation:
+        phaseArenaFail("phase arena store: stale allocation generation")
+    let allocationStart = store.arenaAllocationStarts[row]
+    let allocationCount = store.arenaAllocationCounts[row]
+    if region.allocationIndex < allocationStart ||
+       region.allocationIndex >= allocationStart + allocationCount:
+        phaseArenaFail("phase arena store: allocation index outside owner range")
+    let allocationIndex = region.allocationIndex
+    if store.allocationOffsets[allocationIndex] != region.offset ||
+       store.allocationGenerations[allocationIndex] !=
+       region.generation:
+        phaseArenaFail("phase arena store: allocation authority mismatch")
+    if store.allocationStates[allocationIndex] !=
+       PhaseArenaStoreAllocationLive:
+        phaseArenaFail("phase arena store: allocation ownership already transferred")
+    return allocationIndex
+
+@borrows
+fn PhaseArenaStoreGetByte(store: PhaseArenaStore,
+                          handle: PhaseArenaHandle,
+                          region: PhaseArenaRef,
+                          index: int32): int32 =
+    let allocationIndex = phaseArenaStoreRequireRef(store, handle, region)
+    let size = store.allocationSizes[allocationIndex]
+    if index < 0 || index >= size:
+        phaseArenaFail("phase arena store: byte read out of bounds")
+    return int32(store.payload[region.offset + index])
+
+@borrows
+fn PhaseArenaStoreSetByte(store: var PhaseArenaStore,
+                          handle: PhaseArenaHandle,
+                          region: PhaseArenaRef,
+                          index: int32,
+                          value: int32) =
+    let allocationIndex = phaseArenaStoreRequireRef(store, handle, region)
+    let size = store.allocationSizes[allocationIndex]
+    if index < 0 || index >= size:
+        phaseArenaFail("phase arena store: byte write out of bounds")
+    store.payload[region.offset + index] = uint8(value & 255)
+    phaseArenaStorePublishMutation(store)
+
+fn PhaseArenaStoreFill(store: var PhaseArenaStore,
+                       handle: PhaseArenaHandle,
+                       region: PhaseArenaRef,
+                       value: int32) =
+    let allocationIndex = phaseArenaStoreRequireRef(store, handle, region)
+    let size = store.allocationSizes[allocationIndex]
+    for index in 0..<size:
+        store.payload[region.offset + index] = uint8(value & 255)
+    phaseArenaStorePublishMutation(store)
+
+@borrows
+fn PhaseArenaStoreCopyBytesInto(
+        store: var PhaseArenaStore,
+        handle: PhaseArenaHandle,
+        region: PhaseArenaRef,
+        regionOffset: int32,
+        source: rawbytes.Bytes,
+        sourceOffset: int32,
+        count: int32) =
+    let allocationIndex = phaseArenaStoreRequireRef(
+        store, handle, region)
+    let size = store.allocationSizes[allocationIndex]
+    let sourceLength = rawbytes.BytesLen(source)
+    if count <= 0 || source.data == nil ||
+       regionOffset < 0 || sourceOffset < 0 ||
+       regionOffset > size - count || sourceOffset > sourceLength - count:
+        phaseArenaFail(
+            "phase arena store: bulk byte write range out of bounds")
+    rawmem_support.RawmemCopy(
+        rawmem_support.RawmemPtrAdd(
+            store.payload.buffer, region.offset + regionOffset),
+        rawmem_support.RawmemPtrAdd(source.data, sourceOffset),
+        count)
+    phaseArenaStorePublishMutation(store)
+
+@borrows
+fn PhaseArenaStoreCopyBytesOut(
+        store: PhaseArenaStore,
+        handle: PhaseArenaHandle,
+        region: PhaseArenaRef,
+        regionOffset: int32,
+        count: int32): rawbytes.Bytes =
+    let allocationIndex = phaseArenaStoreRequireRef(
+        store, handle, region)
+    let size = store.allocationSizes[allocationIndex]
+    if count <= 0 || regionOffset < 0 || regionOffset > size - count:
+        phaseArenaFail(
+            "phase arena store: bulk byte read range out of bounds")
+    var out = rawbytes.BytesAlloc(count)
+    if rawbytes.BytesLen(out) != count || out.data == nil:
+        rawbytes.BytesFree(out)
+        phaseArenaFail(
+            "phase arena store: bulk byte read allocation failed")
+    rawmem_support.RawmemCopy(
+        out.data,
+        rawmem_support.RawmemPtrAdd(
+            store.payload.buffer, region.offset + regionOffset),
+        count)
+    return out
+
+fn PhaseArenaStoreReserveI32Column(store: var PhaseArenaStore,
+                                   handle: PhaseArenaHandle,
+                                   count: int32): PhaseArenaRef =
+    if count <= 0 || count > PhaseArenaStoreMaxInt32 / 4:
+        phaseArenaFail("phase arena store: i32 column count out of range")
+    return phaseArenaStoreAllocRefAligned(store, handle, count * 4, 4)
+
+fn PhaseArenaStoreReserveInternIdColumn(store: var PhaseArenaStore,
+                                        handle: PhaseArenaHandle,
+                                        count: int32): PhaseArenaRef =
+    return PhaseArenaStoreReserveI32Column(store, handle, count)
+
+@borrows
+fn PhaseArenaStoreI32ColumnSet(store: var PhaseArenaStore,
+                               handle: PhaseArenaHandle,
+                               column: PhaseArenaRef,
+                               row: int32,
+                               value: int32) =
+    let allocationIndex = phaseArenaStoreRequireRef(store, handle, column)
+    let size = store.allocationSizes[allocationIndex]
+    if size % 4 != 0 || row < 0 || row >= size / 4:
+        phaseArenaFail("phase arena store: i32 column write out of bounds")
+    let byteOffset = column.offset + row * 4
+    store.payload[byteOffset] = uint8(value & 255)
+    store.payload[byteOffset + 1] = uint8((value >> 8) & 255)
+    store.payload[byteOffset + 2] = uint8((value >> 16) & 255)
+    store.payload[byteOffset + 3] = uint8((value >> 24) & 255)
+    phaseArenaStorePublishMutation(store)
+
+@borrows
+fn PhaseArenaStoreI32ColumnGet(store: PhaseArenaStore,
+                               handle: PhaseArenaHandle,
+                               column: PhaseArenaRef,
+                               row: int32): int32 =
+    let allocationIndex = phaseArenaStoreRequireRef(store, handle, column)
+    let size = store.allocationSizes[allocationIndex]
+    if size % 4 != 0 || row < 0 || row >= size / 4:
+        phaseArenaFail("phase arena store: i32 column read out of bounds")
+    let byteOffset = column.offset + row * 4
+    let b0 = int32(store.payload[byteOffset])
+    let b1 = int32(store.payload[byteOffset + 1])
+    let b2 = int32(store.payload[byteOffset + 2])
+    let b3 = int32(store.payload[byteOffset + 3])
+    return b0 + (b1 << 8) + (b2 << 16) + (b3 << 24)
+
+fn PhaseArenaStoreInternIdSet(store: var PhaseArenaStore,
+                              handle: PhaseArenaHandle,
+                              column: PhaseArenaRef,
+                              row: int32,
+                              internId: int32) =
+    if internId < 0:
+        phaseArenaFail("phase arena store: intern id must be non-negative")
+    PhaseArenaStoreI32ColumnSet(store, handle, column, row, internId)
+
+@borrows
+fn PhaseArenaStoreInternIdGet(store: PhaseArenaStore,
+                              handle: PhaseArenaHandle,
+                              column: PhaseArenaRef,
+                              row: int32): int32 =
+    let internId = PhaseArenaStoreI32ColumnGet(store, handle, column, row)
+    if internId < 0:
+        phaseArenaFail("phase arena store: stored intern id is negative")
+    return internId
+
+fn PhaseArenaStoreRehome(store: var PhaseArenaStore,
+                         source: PhaseArenaHandle,
+                         region: var PhaseArenaRef,
+                         survivorArena: PhaseArenaHandle): PhaseArenaRef =
+    let sourceRow = phaseArenaStoreRequireArena(store, source)
+    let allocationIndex = phaseArenaStoreRequireRef(store, source, region)
+    let survivorRow = phaseArenaStoreRequireArena(store, survivorArena)
+    if sourceRow == survivorRow:
+        phaseArenaFail("phase arena store: rehome requires distinct arenas")
+    let size = store.allocationSizes[allocationIndex]
+    let align = store.allocationAlignments[allocationIndex]
+    let survivor = phaseArenaStoreAllocRefAligned(
+        store, survivorArena, size, align)
+    for index in 0..<size:
+        store.payload[survivor.offset + index] =
+            store.payload[region.offset + index]
+    store.allocationStates[allocationIndex] =
+        PhaseArenaStoreAllocationRehomed
+    store.arenaLiveCounts[sourceRow] =
+        store.arenaLiveCounts[sourceRow] - 1
+    store.arenaLiveBytes[sourceRow] =
+        store.arenaLiveBytes[sourceRow] - size
+    store.arenaSurvivorCounts[sourceRow] =
+        store.arenaSurvivorCounts[sourceRow] + 1
+    store.arenaSurvivorBytes[sourceRow] = phaseArenaStoreCheckedAdd(
+        store.arenaSurvivorBytes[sourceRow],
+        size,
+        "phase arena store: survivor byte counter overflow")
+    var invalid: PhaseArenaRef
+    region = invalid
+    phaseArenaStorePublishMutation(store)
+    return survivor
+
+@borrows
+fn PhaseArenaStoreArenaReport(store: PhaseArenaStore,
+                              handle: PhaseArenaHandle): PhaseArenaStoreArenaReport =
+    let row = phaseArenaStoreRequireArena(store, handle)
+    phaseArenaStoreValidateArenaLedger(store, row)
+    var out: PhaseArenaStoreArenaReport
+    out.arenaId = handle.arenaId
+    out.generation = handle.generation
+    out.capacityBytes = store.arenaCapacities[row]
+    out.usedBytes = store.arenaUsedBytes[row]
+    out.peakBytes = store.arenaPeakBytes[row]
+    out.resetCount = store.arenaResetCounts[row]
+    out.spillCount = store.arenaSpillCounts[row]
+    out.allocationCount = store.arenaAllocationCounts[row]
+    out.liveAllocationCount = store.arenaLiveCounts[row]
+    out.liveBytes = store.arenaLiveBytes[row]
+    out.survivorCount = store.arenaSurvivorCounts[row]
+    out.survivorBytes = store.arenaSurvivorBytes[row]
+    out.retainedStoreBytes = store.retainedBytes
+    out.mutationEpoch = store.mutationEpoch
+    return out
+
+@borrows
+fn PhaseArenaStoreRetainedBytes(store: PhaseArenaStore): int64 =
+    phaseArenaStoreRequire(store)
+    return store.retainedBytes
+
+# Temporary-text adapter: text bytes live in the fixed payload; empty text
+# is the canonical invalid PhaseArenaRef.  Exact survivors leave once
+# (StrCopyOutOwned to a managed owner, or PhaseArenaStoreRehome to a second
+# arena) and survive the batch reset.
+fn PhaseArenaStoreStrPut(store: var PhaseArenaStore,
+                         handle: PhaseArenaHandle,
+                         text: str): PhaseArenaRef =
+    if text.len <= 0:
+        var invalid: PhaseArenaRef
+        return invalid
+    let region = phaseArenaStoreAllocRefAligned(store, handle, text.len, 1)
+    for index in 0..<text.len:
+        store.payload[region.offset + index] =
+            uint8(Int32(text[index]) & 255)
+    phaseArenaStorePublishMutation(store)
+    return region
+
+fn PhaseArenaStoreStrPutInt64(store: var PhaseArenaStore,
+                              handle: PhaseArenaHandle,
+                              value: int64): PhaseArenaRef =
+    # Decimal text is formatted straight into payload bytes: no managed
+    # intermediate text, so the adapter stays ORC-neutral.  min-int64 is
+    # pinned: cold's std-closure compile of int64ToStr loses the exact
+    # boundary guard, and its magnitude (2^63) has no positive int64 form.
+    if value < Int64(-9223372036854775807):
+        return PhaseArenaStoreStrPut(store, handle, "-9223372036854775808")
+    var negative = false
+    var mag = value
+    if value < int64(0):
+        negative = true
+        mag = int64(0) - value
+    var digits: int32 = 1
+    var scale = mag
+    while scale >= int64(10):
+        scale = scale / int64(10)
+        digits = digits + 1
+    var total = digits
+    if negative:
+        total = digits + 1
+    let region = phaseArenaStoreAllocRefAligned(store, handle, total, 1)
+    var cursor = total
+    var n = mag
+    if n == int64(0):
+        cursor = cursor - 1
+        store.payload[region.offset + cursor] = uint8(Int32('0'))
+    while n != int64(0):
+        let q = n / int64(10)
+        let d = n - q * int64(10)
+        cursor = cursor - 1
+        store.payload[region.offset + cursor] =
+            uint8(Int32('0') + Int32(d))
+        n = q
+    if negative:
+        store.payload[region.offset] = uint8(45)
+    phaseArenaStorePublishMutation(store)
+    return region
+
+fn PhaseArenaStoreStrPutInt64FixedWidthDecimal(
+        store: var PhaseArenaStore,
+        handle: PhaseArenaHandle,
+        value: int64,
+        width: int32): PhaseArenaRef =
+    if value < int64(0):
+        phaseArenaFail("phase arena store: fixed-width decimal is negative")
+    if width <= 0 || width > 20:
+        phaseArenaFail("phase arena store: fixed-width decimal width invalid")
+    var digits: int32 = 1
+    var scale = value
+    while scale >= int64(10):
+        scale = scale / int64(10)
+        digits = digits + 1
+    if digits > width:
+        phaseArenaFail("phase arena store: fixed-width decimal overflow")
+    let region = phaseArenaStoreAllocRefAligned(store, handle, width, 1)
+    for index in 0..<width:
+        store.payload[region.offset + index] = uint8(Int32('0'))
+    var cursor = width
+    var n = value
+    if n == int64(0):
+        cursor = cursor - 1
+        store.payload[region.offset + cursor] = uint8(Int32('0'))
+    while n != int64(0):
+        let q = n / int64(10)
+        let d = n - q * int64(10)
+        cursor = cursor - 1
+        store.payload[region.offset + cursor] =
+            uint8(Int32('0') + Int32(d))
+        n = q
+    phaseArenaStorePublishMutation(store)
+    return region
+
+@borrows
+fn PhaseArenaStoreStrEqual(store: PhaseArenaStore,
+                           handle: PhaseArenaHandle,
+                           region: PhaseArenaRef,
+                           text: str): bool =
+    if !PhaseArenaRefIsValid(region):
+        return text.len <= 0
+    let allocationIndex = phaseArenaStoreRequireRef(store, handle, region)
+    let size = store.allocationSizes[allocationIndex]
+    if size != text.len:
+        return false
+    for index in 0..<size:
+        let actual = int32(store.payload[region.offset + index])
+        let expected = Int32(text[index]) & 255
+        if actual != expected:
+            return false
+    return true
+
+@borrows
+fn PhaseArenaStoreStrCopyOutOwned(store: PhaseArenaStore,
+                                  handle: PhaseArenaHandle,
+                                  region: PhaseArenaRef): str =
+    if !PhaseArenaRefIsValid(region):
+        return ""
+    let allocationIndex = phaseArenaStoreRequireRef(store, handle, region)
+    let size = store.allocationSizes[allocationIndex]
+    var bytes = rawbytes.BytesAlloc(size)
+    defer:
+        rawbytes.BytesFree(bytes)
+    if size <= 0 || bytes.data == nil:
+        phaseArenaFail("phase arena store: owned survivor allocation failed")
+    for index in 0..<size:
+        rawbytes.BytesSet(bytes,
+                          index,
+                          int32(store.payload[region.offset + index]))
+    return rawbytes.BytesToString(bytes)

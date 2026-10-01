@@ -1,0 +1,388 @@
+# Rendezvous protocol(minimal, synchronous).
+
+import cheng/libp2p/utils/result
+import cheng/libp2p/utils/bytes
+import cheng/libp2p/utils/strings
+import std/times
+import cheng/libp2p/peerid
+import cheng/libp2p/routing_record
+import cheng/libp2p/protocols/protocol
+import cheng/libp2p/stream/lpstream
+import cheng/libp2p/protocols/rendezvous/protobuf as rendezvousprotobuf
+const
+    rendezvousCodecV1 = "/rendezvous/1.0.0"
+    rendezvousCodecV2 = "/rendezvous/2.0.0"
+    rendezvousCodec = rendezvousCodecV1
+    rendezvousMaxMessage = 4194304
+    rendezvousMinNamespaceLen = 1
+    rendezvousMaxNamespaceLen = 255
+    rendezvousDefaultTtlSeconds = 7200
+    rendezvousMinTtlSeconds = 60
+    rendezvousMaxTtlSeconds = 259200
+    rendezvousDefaultLimit = 32
+    rendezvousMaxEntries = 256
+    rendezvousDefaultPerPeerLimit = 64
+
+type
+    RendezvousRegistration =
+        namespace: str
+        peerId: PeerId
+        signedPeerRecord: Bytes
+        ttlSeconds: int64
+        expiresAtNs: int64
+
+    RendezvousState =
+        count: int32
+        entries: RendezvousRegistration[rendezvousMaxEntries]
+        minTtlSeconds: int64
+        maxTtlSeconds: int64
+        defaultTtlSeconds: int64
+        perPeerLimit: int32
+        totalLimit: int32
+
+var
+    rendezvousState: RendezvousState = RendezvousState(
+        count: 0,
+        minTtlSeconds: rendezvousMinTtlSeconds,
+        maxTtlSeconds: rendezvousMaxTtlSeconds,
+        defaultTtlSeconds: rendezvousDefaultTtlSeconds,
+        perPeerLimit: rendezvousDefaultPerPeerLimit,
+        totalLimit: rendezvousMaxEntries
+    )
+
+fn initRendezvousState(): RendezvousState =
+    RendezvousState(
+        count: 0,
+        minTtlSeconds: rendezvousMinTtlSeconds,
+        maxTtlSeconds: rendezvousMaxTtlSeconds,
+        defaultTtlSeconds: rendezvousDefaultTtlSeconds,
+        perPeerLimit: rendezvousDefaultPerPeerLimit,
+        totalLimit: rendezvousMaxEntries
+    )
+
+fn setRendezvousState(state: RendezvousState) =
+    rendezvousState = state
+
+fn getRendezvousState(): RendezvousState =
+    rendezvousState
+
+fn cloneBytes(data: Bytes): Bytes =
+    if BytesLen(data) <= 0:
+        return EmptyBytes()
+    return BytesSlice(data, 0, BytesLen(data))
+
+fn namespaceValid(ns: str): bool =
+    let nlen: int32 = len(ns)
+    return nlen >= rendezvousMinNamespaceLen && nlen <= rendezvousMaxNamespaceLen
+
+fn clampTtl(state: RendezvousState, requested: int64, hasTtl: bool): Result[int64] =
+    var ttl: int64 = state.defaultTtlSeconds
+    if hasTtl:
+        ttl = requested
+    if ttl < state.minTtlSeconds || ttl > state.maxTtlSeconds:
+        return Err[int64]("rendezvous: ttl out of range")
+    return Ok[int64](ttl)
+
+fn cleanupExpired(state: var RendezvousState, nowNs: int64): int32 =
+    var writeIdx: int32
+    var removed: int32
+    for i in 0..<state.count:
+        if state.entries[i].expiresAtNs > nowNs:
+            if writeIdx != i:
+                state.entries[writeIdx] = state.entries[i]
+            writeIdx = writeIdx + 1
+        else:
+            removed = removed + 1
+    state.count = writeIdx
+    return removed
+
+fn countPeerRegistrations(state: RendezvousState, peerId: PeerId): int32 =
+    var count: int32
+    for i in 0..<state.count:
+        let eqRes: Result[bool] = peerIdEqual(state.entries[i].peerId, peerId)
+        if IsOk(eqRes) && Value(eqRes):
+            count = count + 1
+    return count
+
+fn findRegistrationIndex(state: RendezvousState, ns: str, peerId: PeerId): int32 =
+    for i in 0..<state.count:
+        if (state.entries[i].namespace == ns):
+            let eqRes: Result[bool] = peerIdEqual(state.entries[i].peerId, peerId)
+            if IsOk(eqRes) && Value(eqRes):
+                return i
+    return -1
+
+fn upsertRegistration(
+    state: var RendezvousState,
+    ns: str,
+    peerId: PeerId,
+    signedPeerRecord: Bytes,
+    ttlSeconds: int64,
+    nowNs: int64
+): Result[bool] =
+    let idx: int32 = findRegistrationIndex(state, ns, peerId)
+    let entry: RendezvousRegistration = RendezvousRegistration(
+        namespace: ns,
+        peerId: peerId,
+        signedPeerRecord: cloneBytes(signedPeerRecord),
+        ttlSeconds: ttlSeconds,
+        expiresAtNs: nowNs + (ttlSeconds * 1000000000)
+    )
+    if idx >= 0:
+        state.entries[idx] = entry
+        return Ok[bool](true)
+    if state.totalLimit > 0 && state.count >= state.totalLimit:
+        return Err[bool]("rendezvous: registration limit reached")
+    state.entries[state.count] = entry
+    state.count = state.count + 1
+    return Ok[bool](true)
+
+fn removeNamespace(state: var RendezvousState, ns: str): int32 =
+    var writeIdx: int32
+    var removed: int32
+    for i in 0..<state.count:
+        if (state.entries[i].namespace == ns):
+            removed = removed + 1
+        else:
+            if writeIdx != i:
+                state.entries[writeIdx] = state.entries[i]
+            writeIdx = writeIdx + 1
+    state.count = writeIdx
+    return removed
+
+fn sendRegisterResponse(stream: var Stream, status: RendezvousResponseStatus, ttlSeconds: int64, includeTtl: bool, text: str): Result[bool] =
+    var resp: RendezvousRegisterResponse = initRendezvousRegisterResponse()
+    resp.status = status
+    if len(text) > 0:
+        resp.hasText = true
+        resp.text = text
+    if includeTtl:
+        resp.hasTtl = true
+        resp.ttlSeconds = ttlSeconds
+    var msg: RendezvousMessage = initRendezvousMessage()
+    msg.msgType = rvRegisterResponse
+    msg.hasRegisterResponse = true
+    msg.registerResponse = resp
+    let writeRes: Result[int32] = writeLp(stream, encodeRendezvousMessage(msg))
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    return Ok[bool](true)
+
+fn sendDiscoverResponse(stream: var Stream, resp: RendezvousDiscoverResponse): Result[bool] =
+    var msg: RendezvousMessage = initRendezvousMessage()
+    msg.msgType = rvDiscoverResponse
+    msg.hasDiscoverResponse = true
+    msg.discoverResponse = resp
+    let writeRes: Result[int32] = writeLp(stream, encodeRendezvousMessage(msg))
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    return Ok[bool](true)
+
+fn sendDiscoverError(stream: var Stream, status: RendezvousResponseStatus, text: str): Result[bool] =
+    var resp: RendezvousDiscoverResponse = initRendezvousDiscoverResponse()
+    resp.status = status
+    if len(text) > 0:
+        resp.hasText = true
+        resp.text = text
+    return sendDiscoverResponse(stream, resp)
+
+fn handleRegister(stream: var Stream, reg: RendezvousRegister): Result[bool] =
+    if ! namespaceValid(reg.namespace):
+        return sendRegisterResponse(stream, rvInvalidNamespace, 0, false, "")
+    let nowNs: int64 = EpochTimeNs()
+    cleanupExpired(rendezvousState, nowNs)
+    let ttlRes: Result[int64] = clampTtl(rendezvousState, reg.ttlSeconds, reg.hasTtl)
+    if IsErr(ttlRes):
+        return sendRegisterResponse(stream, rvInvalidTtl, 0, false, "")
+    let sprRes: Result[SignedPeerRecord] = decodeSignedPeerRecord(reg.signedPeerRecord)
+    if IsErr(sprRes):
+        return sendRegisterResponse(stream, rvInvalidSignedPeerRecord, 0, false, "")
+    let peerId: PeerId = Value(sprRes).data.peerId
+    if rendezvousState.perPeerLimit > 0:
+        if countPeerRegistrations(rendezvousState, peerId) >= rendezvousState.perPeerLimit:
+            return sendRegisterResponse(stream, rvNotAuthorized, 0, false, "per-peer limit reached")
+    let ttlSeconds: int64 = Value(ttlRes)
+    let putRes: Result[bool] = upsertRegistration(
+        rendezvousState,
+        reg.namespace,
+        peerId,
+        reg.signedPeerRecord,
+        ttlSeconds,
+        nowNs
+    )
+    if IsErr(putRes):
+        return sendRegisterResponse(stream, rvUnavailable, 0, false, Error(putRes))
+    return sendRegisterResponse(stream, rvOk, ttlSeconds, true, "")
+
+fn handleUnregister(unreg: RendezvousUnregister): Result[bool] =
+    if ! namespaceValid(unreg.namespace):
+        return Ok[bool](true)
+    removeNamespace(rendezvousState, unreg.namespace)
+    return Ok[bool](true)
+
+fn handleDiscover(stream: var Stream, req: RendezvousDiscover): Result[bool] =
+    if req.hasNamespace && ! namespaceValid(req.namespace):
+        return sendDiscoverError(stream, rvInvalidNamespace, "")
+    let nowNs: int64 = EpochTimeNs()
+    cleanupExpired(rendezvousState, nowNs)
+    var limit: int64 = rendezvousDefaultLimit
+    if req.hasLimit:
+        limit = req.limit
+    if limit <= 0:
+        limit = rendezvousDefaultLimit
+    if limit > maxRendezvousRegistrations:
+        limit = maxRendezvousRegistrations
+    var offset: int64
+    var cookieNs: str
+    var cookieHasNs: bool
+    if req.hasCookie && BytesLen(req.cookie) > 0:
+        let cookieRes: Result[RendezvousCookie] = decodeRendezvousCookie(req.cookie)
+        if IsErr(cookieRes):
+            return sendDiscoverError(stream, rvInvalidCookie, "")
+        let cookie: RendezvousCookie = Value(cookieRes)
+        offset = cookie.offset
+        if cookie.hasNamespace:
+            cookieHasNs = true
+            cookieNs = cookie.namespace
+    if req.hasNamespace && cookieHasNs && (req.namespace != cookieNs):
+        offset = 0
+    if offset < 0:
+        offset = 0
+    var resp: RendezvousDiscoverResponse = initRendezvousDiscoverResponse()
+    resp.status = rvOk
+    var matchIdx: int64
+    var returned: int64
+    var hasMore: bool
+    for i in 0..<rendezvousState.count:
+        let entry: RendezvousRegistration = rendezvousState.entries[i]
+        var matches: bool = true
+        if req.hasNamespace && (entry.namespace != req.namespace):
+            matches = false
+        if matches:
+            if matchIdx >= offset:
+                if returned < limit && resp.registrationCount < maxRendezvousRegistrations:
+                    var reg: RendezvousRegister = initRendezvousRegister()
+                    reg.namespace = entry.namespace
+                    reg.signedPeerRecord = cloneBytes(entry.signedPeerRecord)
+                    let remainingNs: int64 = entry.expiresAtNs - nowNs
+                    if remainingNs > 0:
+                        reg.hasTtl = true
+                        reg.ttlSeconds = remainingNs / 1000000000
+                    resp.registrations[resp.registrationCount] = reg
+                    resp.registrationCount = resp.registrationCount + 1
+                    returned = returned + 1
+                else:
+                    hasMore = true
+                    break
+            matchIdx = matchIdx + 1
+    if hasMore:
+        var cookie: RendezvousCookie = initRendezvousCookie()
+        cookie.offset = matchIdx
+        if req.hasNamespace:
+            cookie.hasNamespace = true
+            cookie.namespace = req.namespace
+        resp.hasCookie = true
+        resp.cookie = encodeRendezvousCookie(cookie)
+    return sendDiscoverResponse(stream, resp)
+
+fn readRendezvousMessage(stream: var Stream): Result[RendezvousMessage] =
+    let dataRes: Result[Bytes] = readLp(stream, rendezvousMaxMessage)
+    if IsErr(dataRes):
+        return Err[RendezvousMessage](Error(dataRes))
+    return decodeRendezvousMessage(Value(dataRes))
+
+fn writeRendezvousMessage(stream: var Stream, msg: RendezvousMessage): Result[bool] =
+    let writeRes: Result[int32] = writeLp(stream, encodeRendezvousMessage(msg))
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    return Ok[bool](true)
+
+fn rendezvousHandler(stream: Stream): Result[bool] =
+    var streamVar: Stream = stream
+    let msgRes: Result[RendezvousMessage] = readRendezvousMessage(streamVar)
+    if IsErr(msgRes):
+        return Err[bool](Error(msgRes))
+    let msg: RendezvousMessage = Value(msgRes)
+    if msg.msgType == rvRegister && msg.hasRegister:
+        return handleRegister(streamVar, msg.register)
+    if msg.msgType == rvUnregister && msg.hasUnregister:
+        return handleUnregister(msg.unregister)
+    if msg.msgType == rvDiscover && msg.hasDiscover:
+        return handleDiscover(streamVar, msg.discover)
+    return Ok[bool](true)
+
+fn rendezvousProtocol(): Lp2pProtocol =
+    return newProtocol(rendezvousCodec, rendezvousHandler)
+
+fn rendezvousProtocolV2(): Lp2pProtocol =
+    return newProtocol(rendezvousCodecV2, rendezvousHandler)
+
+fn sendRendezvousRegister(
+    stream: var Stream,
+    ns: str,
+    signedPeerRecord: Bytes,
+    ttlSeconds: int64,
+    hasTtl: bool
+): Result[RendezvousRegisterResponse] =
+    var reg: RendezvousRegister = initRendezvousRegister()
+    reg.namespace = ns
+    reg.signedPeerRecord = signedPeerRecord
+    if hasTtl:
+        reg.hasTtl = true
+        reg.ttlSeconds = ttlSeconds
+    var msg: RendezvousMessage = initRendezvousMessage()
+    msg.msgType = rvRegister
+    msg.hasRegister = true
+    msg.register = reg
+    let writeRes: Result[bool] = writeRendezvousMessage(stream, msg)
+    if IsErr(writeRes):
+        return Err[RendezvousRegisterResponse](Error(writeRes))
+    let replyRes: Result[RendezvousMessage] = readRendezvousMessage(stream)
+    if IsErr(replyRes):
+        return Err[RendezvousRegisterResponse](Error(replyRes))
+    let reply: RendezvousMessage = Value(replyRes)
+    if reply.msgType != rvRegisterResponse || ! reply.hasRegisterResponse:
+        return Err[RendezvousRegisterResponse]("rendezvous: expected register response")
+    return Ok[RendezvousRegisterResponse](reply.registerResponse)
+
+fn sendRendezvousDiscover(
+    stream: var Stream,
+    ns: str,
+    hasNamespace: bool,
+    limit: int64,
+    hasLimit: bool,
+    cookie: Bytes,
+    hasCookie: bool
+): Result[RendezvousDiscoverResponse] =
+    var req: RendezvousDiscover = initRendezvousDiscover()
+    if hasNamespace:
+        req.hasNamespace = true
+        req.namespace = ns
+    if hasLimit:
+        req.hasLimit = true
+        req.limit = limit
+    if hasCookie:
+        req.hasCookie = true
+        req.cookie = cookie
+    var msg: RendezvousMessage = initRendezvousMessage()
+    msg.msgType = rvDiscover
+    msg.hasDiscover = true
+    msg.discover = req
+    let writeRes: Result[bool] = writeRendezvousMessage(stream, msg)
+    if IsErr(writeRes):
+        return Err[RendezvousDiscoverResponse](Error(writeRes))
+    let replyRes: Result[RendezvousMessage] = readRendezvousMessage(stream)
+    if IsErr(replyRes):
+        return Err[RendezvousDiscoverResponse](Error(replyRes))
+    let reply: RendezvousMessage = Value(replyRes)
+    if reply.msgType != rvDiscoverResponse || ! reply.hasDiscoverResponse:
+        return Err[RendezvousDiscoverResponse]("rendezvous: expected discover response")
+    return Ok[RendezvousDiscoverResponse](reply.discoverResponse)
+
+fn sendRendezvousUnregister(stream: var Stream, ns: str): Result[bool] =
+    var unreg: RendezvousUnregister = RendezvousUnregister(namespace: ns)
+    var msg: RendezvousMessage = initRendezvousMessage()
+    msg.msgType = rvUnregister
+    msg.hasUnregister = true
+    msg.unregister = unreg
+    return writeRendezvousMessage(stream, msg)

@@ -1,0 +1,1811 @@
+#!/usr/bin/env python3
+"""Run a canonical CSG test list under an exact 1 GiB process-tree cap.
+
+The Linux authority is the repository's native cgroup-v2 runner. It attaches
+the command root before exec, so every descendant inherits the same aggregate
+memory.max. An aggregate OOM control is required before any CSG command runs.
+
+Darwin has no repository-bound kernel or VM aggregate-memory authority. A
+Darwin invocation therefore writes a sealed hard-red receipt and exits nonzero.
+User-space RSS sampling and per-process rlimits are never proof authorities.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import ctypes
+import hashlib
+import json
+import os
+import platform
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+import secrets
+from pathlib import Path
+from typing import Any, Sequence
+
+
+sys.dont_write_bytecode = True
+
+GATE_SOURCE = Path(
+    os.environ.get("CHENG_EXACT_GATE_SOURCE", os.path.abspath(__file__))
+)
+ROOT = GATE_SOURCE.parents[1]
+VALIDATOR = ROOT / "tools/csg_core_exact_1g_process_tree_receipt_validator"
+KERNEL_RUNNER = ROOT / "tools/beat_c_linux_cgroup_v2_native_hard_memory_gate.sh"
+DARWIN_AUDIT_SOURCE = ROOT / "tools/darwin_current_release_runtime_producer"
+
+MANIFEST_SCHEMA = "csg_core.exact_1g_process_tree.command_list"
+COMMAND_SPEC_SCHEMA = "csg_core.exact_1g_process_tree.command"
+RECEIPT_SCHEMA = "csg_core.exact_1g_process_tree.receipt"
+NATIVE_RECEIPT_SCHEMA = "beat_c_linux_cgroup_v2_native_hard_memory_gate"
+
+LIMIT_BYTES = 805_306_368
+SWAP_BYTES = 0
+ATTACK_CHILD_COUNT = 2
+ATTACK_CHILD_BYTES = 734_003_200
+ATTACK_AGGREGATE_BYTES = ATTACK_CHILD_COUNT * ATTACK_CHILD_BYTES
+PROOF_STATUS = "proved_linux_kernel_cgroup_v2_aggregate"
+MEMORY_SCOPE = "cgroup_and_all_descendants"
+KERNEL_AUTHORITY = "linux_cgroup_v2_memory.max"
+PROCESS_TREE_PLACEMENT = "attach_before_exec_kernel_inherited"
+PROCESS_TREE_COMPLETION = "subreaper_waits_all_descendants"
+PR_SET_KEEPCAPS = 8
+PR_SET_CHILD_SUBREAPER = 36
+PR_SET_NO_NEW_PRIVS = 38
+DARWIN_PROOF_STATUS = "not_provable_macos_without_bound_vm_aggregate_limit"
+OTHER_PROOF_STATUS = "not_provable_on_host_without_kernel_or_vm_aggregate_limit"
+
+MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+MAX_SPEC_BYTES = 8 * 1024 * 1024
+MAX_RECEIPT_BYTES = 8 * 1024 * 1024
+MAX_COMMANDS = 128
+MAX_ARGV = 4096
+MAX_TEXT_BYTES = 1024 * 1024
+MAX_TIMEOUT_SECONDS = 24 * 60 * 60
+MAX_ARTIFACT_BYTES = 16 * 1024 * 1024 * 1024
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+CGROUP_PATH_RE = re.compile(
+    r"^/sys/fs/cgroup/cheng-hardcap-native-[1-9][0-9]*-[0-9a-f]{24}$"
+)
+ATOMIC_EVIDENCE_COMMIT = (
+    "same_directory_temp_fsync_atomic_rename_directory_fsync"
+)
+AUTHORITY_CLOSURE_KEYS = {
+    "ancestorLimitsEffective",
+    "memoryEventsLocal",
+    "cgroupKillUsed",
+    "populatedAfterKill",
+    "cgroupRootIdentityBefore",
+    "cgroupRootIdentityAfter",
+    "cgroupRootOwnershipFrozen",
+    "atomicEvidenceCommit",
+}
+
+BASE_ENV = {
+    "HOME": "/nonexistent",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "TMPDIR": "/tmp",
+    "TZ": "UTC",
+}
+
+
+class GateError(RuntimeError):
+    pass
+
+
+class UnsupportedHostError(GateError):
+    pass
+
+
+def canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise GateError("duplicate_json_key:" + key)
+        result[key] = value
+    return result
+
+
+def identity_tuple(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def require_lexical_absolute(path: Path, label: str) -> Path:
+    raw = os.fspath(path)
+    if (
+        not path.is_absolute()
+        or "\x00" in raw
+        or "\n" in raw
+        or "\r" in raw
+        or os.path.normpath(raw) != raw
+    ):
+        raise GateError(label + "_path_invalid")
+    return path
+
+
+def open_directory_nofollow(path: Path, label: str) -> int:
+    require_lexical_absolute(path, label)
+    parts = os.fsencode(os.fspath(path)).split(b"/")[1:]
+    if any(part in (b"", b".", b"..") for part in parts):
+        raise GateError(label + "_path_invalid")
+    current = os.open(b"/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current,
+            )
+            os.close(current)
+            current = next_fd
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def open_regular_nofollow(path: Path, label: str) -> tuple[int, os.stat_result]:
+    require_lexical_absolute(path, label)
+    parent_fd = open_directory_nofollow(path.parent, label + "_parent")
+    try:
+        before = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(
+            os.fsencode(path.name),
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    finally:
+        os.close(parent_fd)
+    opened = os.fstat(descriptor)
+    if identity_tuple(opened) != identity_tuple(before):
+        os.close(descriptor)
+        raise GateError(label + "_open_race")
+    return descriptor, before
+
+
+def stable_read(
+    path: Path,
+    label: str,
+    max_bytes: int,
+    *,
+    allow_empty: bool = False,
+) -> tuple[os.stat_result, bytes]:
+    descriptor, before = open_regular_nofollow(path, label)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size > max_bytes
+        or (not allow_empty and before.st_size == 0)
+    ):
+        os.close(descriptor)
+        raise GateError(label + "_identity_invalid")
+    try:
+        opened = os.fstat(descriptor)
+        if identity_tuple(opened) != identity_tuple(before):
+            raise GateError(label + "_open_race")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise GateError(label + "_short_read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise GateError(label + "_grew_during_read")
+        closed = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = os.lstat(path)
+    if identity_tuple(before) != identity_tuple(closed) or identity_tuple(
+        before
+    ) != identity_tuple(after):
+        raise GateError(label + "_read_race")
+    return before, b"".join(chunks)
+
+
+def stream_identity(
+    path: Path,
+    label: str,
+    max_bytes: int,
+    *,
+    executable: bool = False,
+    allow_empty: bool = False,
+) -> dict[str, Any]:
+    descriptor, before = open_regular_nofollow(path, label)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size > max_bytes
+        or (not allow_empty and before.st_size == 0)
+        or (executable and before.st_mode & 0o111 == 0)
+    ):
+        os.close(descriptor)
+        raise GateError(label + "_identity_invalid")
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(descriptor)
+        if identity_tuple(opened) != identity_tuple(before):
+            raise GateError(label + "_open_race")
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise GateError(label + "_short_read")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise GateError(label + "_grew_during_read")
+        closed = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = os.lstat(path)
+    if identity_tuple(before) != identity_tuple(closed) or identity_tuple(
+        before
+    ) != identity_tuple(after):
+        raise GateError(label + "_read_race")
+    return {
+        "path": str(path),
+        "pathFshex": os.fsencode(str(path)).hex(),
+        "sha256": digest.hexdigest(),
+        "size": before.st_size,
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "mode": before.st_mode,
+        "uid": before.st_uid,
+        "gid": before.st_gid,
+        "nlink": before.st_nlink,
+        "mtimeNs": before.st_mtime_ns,
+        "ctimeNs": before.st_ctime_ns,
+    }
+
+
+def sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def framed_sha256(values: Sequence[str]) -> str:
+    digest = hashlib.sha256()
+    digest.update(len(values).to_bytes(8, "big"))
+    for value in values:
+        raw = value.encode("utf-8")
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def environment_sha256(value: dict[str, str]) -> str:
+    rows = [f"{key}={value[key]}" for key in sorted(value)]
+    return framed_sha256(rows)
+
+
+def parse_json_bytes(raw: bytes, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            raw.decode("utf-8", "strict"),
+            object_pairs_hook=strict_object,
+            parse_constant=lambda item: (_ for _ in ()).throw(
+                GateError(label + "_non_finite_number:" + item)
+            ),
+        )
+    except (ValueError, UnicodeError, GateError) as error:
+        if isinstance(error, GateError):
+            raise
+        raise GateError(label + "_json_invalid") from error
+    if not isinstance(value, dict):
+        raise GateError(label + "_not_object")
+    return value
+
+
+def require_text(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or len(value.encode("utf-8")) > MAX_TEXT_BYTES
+    ):
+        raise GateError(label + "_invalid")
+    return value
+
+
+def require_exact_int(value: Any, expected: int, label: str) -> None:
+    if type(value) is not int or value != expected:
+        raise GateError(label + "_invalid")
+
+
+def require_uint(
+    value: Any,
+    label: str,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
+    if type(value) is not int or value < minimum:
+        raise GateError(label + "_invalid")
+    if maximum is not None and value > maximum:
+        raise GateError(label + "_invalid")
+    return value
+
+
+def require_directory(path: Path, label: str) -> dict[str, int]:
+    descriptor = open_directory_nofollow(path, label)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            raise GateError(label + "_not_directory")
+        return {
+            "device": info.st_dev,
+            "inode": info.st_ino,
+            "mode": info.st_mode,
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+        }
+    finally:
+        os.close(descriptor)
+
+
+def validate_command(
+    value: Any,
+    index: int,
+    prior_ids: set[str],
+) -> dict[str, Any]:
+    expected_keys = {"id", "argv", "cwd", "env", "timeoutSeconds"}
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise GateError(f"command_{index}_keys_invalid")
+    command_id = require_text(value["id"], f"command_{index}_id")
+    if ID_RE.fullmatch(command_id) is None or command_id in prior_ids:
+        raise GateError(f"command_{index}_id_invalid")
+    prior_ids.add(command_id)
+    argv = value["argv"]
+    if not isinstance(argv, list) or not argv or len(argv) > MAX_ARGV:
+        raise GateError(f"command_{index}_argv_invalid")
+    checked_argv = [
+        require_text(item, f"command_{index}_argv_{position}")
+        for position, item in enumerate(argv)
+    ]
+    executable = Path(checked_argv[0])
+    executable_identity = stream_identity(
+        executable,
+        f"command_{index}_executable",
+        MAX_ARTIFACT_BYTES,
+        executable=True,
+    )
+    cwd = Path(require_text(value["cwd"], f"command_{index}_cwd"))
+    require_directory(cwd, f"command_{index}_cwd")
+    raw_env = value["env"]
+    if not isinstance(raw_env, dict) or len(raw_env) > 1024:
+        raise GateError(f"command_{index}_env_invalid")
+    checked_env: dict[str, str] = {}
+    for key, item in raw_env.items():
+        if not isinstance(key, str) or ENV_KEY_RE.fullmatch(key) is None:
+            raise GateError(f"command_{index}_env_key_invalid")
+        checked_env[key] = require_text(
+            item,
+            f"command_{index}_env_{key}",
+        )
+    timeout = require_uint(
+        value["timeoutSeconds"],
+        f"command_{index}_timeout",
+        minimum=1,
+        maximum=MAX_TIMEOUT_SECONDS,
+    )
+    environment = dict(BASE_ENV)
+    environment.update(checked_env)
+    return {
+        "id": command_id,
+        "argv": checked_argv,
+        "cwd": str(cwd),
+        "env": environment,
+        "timeoutSeconds": timeout,
+        "executable": executable_identity,
+    }
+
+
+def read_manifest(
+    path: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    info, raw = stable_read(path, "command_manifest", MAX_MANIFEST_BYTES)
+    value = parse_json_bytes(raw, "command_manifest")
+    if canonical_json(value) + b"\n" != raw:
+        raise GateError("command_manifest_not_canonical")
+    if set(value) != {
+        "schema",
+        "limitBytes",
+        "runUid",
+        "runGid",
+        "commands",
+    }:
+        raise GateError("command_manifest_keys_invalid")
+    if value["schema"] != MANIFEST_SCHEMA:
+        raise GateError("command_manifest_schema_invalid")
+    require_exact_int(
+        value["limitBytes"],
+        LIMIT_BYTES,
+        "command_manifest_limit_bytes",
+    )
+    run_uid = require_uint(
+        value["runUid"],
+        "command_manifest_run_uid",
+        minimum=1,
+        maximum=2_147_483_647,
+    )
+    run_gid = require_uint(
+        value["runGid"],
+        "command_manifest_run_gid",
+        minimum=1,
+        maximum=2_147_483_647,
+    )
+    raw_commands = value["commands"]
+    if (
+        not isinstance(raw_commands, list)
+        or not raw_commands
+        or len(raw_commands) > MAX_COMMANDS
+    ):
+        raise GateError("command_manifest_commands_invalid")
+    ids: set[str] = set()
+    commands = [
+        validate_command(item, index, ids) for index, item in enumerate(raw_commands)
+    ]
+    for command in commands:
+        command["runUid"] = run_uid
+        command["runGid"] = run_gid
+    identity = {
+        "path": str(path),
+        "pathFshex": os.fsencode(str(path)).hex(),
+        "sha256": sha256_bytes(raw),
+        "size": info.st_size,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": info.st_mode,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "nlink": info.st_nlink,
+        "mtimeNs": info.st_mtime_ns,
+        "ctimeNs": info.st_ctime_ns,
+    }
+    return value, commands, identity
+
+
+def validate_kernel_runner_contract(path: Path) -> dict[str, Any]:
+    identity = stream_identity(
+        path,
+        "kernel_runner",
+        4 * 1024 * 1024,
+        executable=True,
+    )
+    _info, raw = stable_read(path, "kernel_runner", 4 * 1024 * 1024)
+    source = raw.decode("utf-8", "strict")
+    required = (
+        "LIMIT_BYTES=805306368",
+        "SWAP_BYTES=0",
+        "CGROOT=/sys/fs/cgroup",
+        "runner_execution_identity()",
+        "open_absolute_directory_nofollow(CGROUP_ROOT)",
+        "subtree_control = stable_readat(",
+        'b"cgroup.subtree_control"',
+        "ancestor_limit_effective = audit_ancestor_limits(",
+        'stable_readat(child_fd, b"memory.events.local")',
+        'writeat(child_fd, b"cgroup.kill", b"1")',
+        "wait_populated_zero(child_fd, timeout_seconds)",
+        "select.poll()",
+        "os.rename(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)",
+        "os.fsync(parent_fd)",
+        "atomic_evidence_commit = ATOMIC_COMMIT",
+        '"memoryEventsLocalRawBeforeFshex"',
+        '"memoryEventsLocalRawAfterFshex"',
+    )
+    for fragment in required:
+        if fragment not in source:
+            raise GateError("kernel_runner_contract_missing")
+    if source.count("LIMIT_BYTES=805306368") != 1:
+        raise GateError("kernel_runner_limit_definition_ambiguous")
+    exact_counts = {
+        'writeat(child_fd, b"cgroup.kill", b"1")': 3,
+        "wait_populated_zero(child_fd, timeout_seconds)": 2,
+        "os.fsync(parent_fd)": 1,
+        "os.rename(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)": 1,
+        'stable_readat(child_fd, b"memory.events.local")': 2,
+        "runner_execution_identity()": 2,
+    }
+    if any(source.count(token) != count for token, count in exact_counts.items()):
+        raise GateError("kernel_runner_authority_call_count_invalid")
+    payload_start = source.find("<<'PY'\n")
+    payload_end = source.rfind("\nPY\n")
+    if payload_start < 0 or payload_end <= payload_start:
+        raise GateError("kernel_runner_python_payload_missing")
+    payload = source[payload_start + len("<<'PY'\n"):payload_end]
+    try:
+        tree = ast.parse(payload)
+    except SyntaxError as error:
+        raise GateError("kernel_runner_python_payload_invalid") from error
+    constants = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
+    }
+    if b"memory.events" in constants or "memory.events" in constants:
+        raise GateError("kernel_runner_hierarchical_memory_events_forbidden")
+    if b"memory.events.local" not in constants:
+        raise GateError("kernel_runner_local_memory_events_missing")
+    functions = {
+        node.name: ast.get_source_segment(payload, node)
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    main_source = functions.get("main") or ""
+    spawn_source = functions.get("spawn_workload") or ""
+    limit_index = main_source.find('writeat(child_fd, b"memory.max"')
+    spawn_index = main_source.find("spawn_workload(child_fd, mode, command)")
+    attach_index = spawn_source.find("attach_self(child_fd)")
+    exec_index = spawn_source.find("os.execve(argv[0], argv, dict(os.environ))")
+    if not (
+        0 <= limit_index < spawn_index
+        and 0 <= attach_index < exec_index
+    ):
+        raise GateError("kernel_runner_attach_not_before_exec")
+    forbidden = (
+        "resource.set" + "rlimit",
+        "RLIMIT_" + "AS",
+        "RLIMIT_" + "RSS",
+        "psu" + "til",
+        "get" + "rusage",
+        "Vm" + "RSS",
+        "/proc/self/" + "status",
+        "ps -o " + "rss",
+    )
+    lowered = source.lower()
+    for fragment in forbidden:
+        if fragment.lower() in lowered:
+            raise GateError("kernel_runner_userspace_memory_authority_forbidden")
+    return identity
+
+
+def require_sha(value: Any, label: str) -> str:
+    if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+        raise GateError(label + "_invalid")
+    return value
+
+
+def parse_event_bytes(raw: bytes, label: str) -> dict[str, int]:
+    if not raw.endswith(b"\n") or b"\r" in raw:
+        raise GateError(label + "_framing_invalid")
+    result: dict[str, int] = {}
+    for line in raw[:-1].split(b"\n"):
+        fields = line.split(b" ")
+        if len(fields) != 2 or not fields[1].isdigit():
+            raise GateError(label + "_row_invalid")
+        try:
+            key = fields[0].decode("ascii", "strict")
+        except UnicodeError as error:
+            raise GateError(label + "_key_invalid") from error
+        if not key or key in result:
+            raise GateError(label + "_key_invalid")
+        result[key] = int(fields[1])
+    if not result:
+        raise GateError(label + "_empty")
+    return result
+
+
+def validate_root_identity(value: Any, label: str) -> dict[str, Any]:
+    keys = {"pathFshex", "device", "inode", "mode", "uid", "gid"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise GateError(label + "_shape_invalid")
+    if (
+        value["pathFshex"] != os.fsencode("/sys/fs/cgroup").hex()
+        or any(type(value[key]) is not int or value[key] < 0 for key in keys - {"pathFshex"})
+        or value["uid"] != 0
+        or stat.S_IMODE(value["mode"]) & 0o022
+        or not stat.S_ISDIR(value["mode"])
+    ):
+        raise GateError(label + "_value_invalid")
+    return value
+
+
+def validate_authority_closure(
+    value: Any,
+    cgroup_path: str,
+    before_raw: bytes,
+    after_raw: bytes,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != AUTHORITY_CLOSURE_KEYS:
+        raise GateError("authority_closure_shape_invalid")
+    ancestors = value["ancestorLimitsEffective"]
+    if not isinstance(ancestors, list) or len(ancestors) != 2:
+        raise GateError("authority_ancestor_chain_invalid")
+    expected_paths = (cgroup_path, "/sys/fs/cgroup")
+    for index, (row, expected_path) in enumerate(zip(ancestors, expected_paths, strict=True)):
+        if not isinstance(row, dict) or set(row) != {"pathFshex", "memoryMaxBytes"}:
+            raise GateError("authority_ancestor_row_invalid")
+        if row["pathFshex"] != os.fsencode(expected_path).hex():
+            raise GateError("authority_ancestor_path_invalid")
+        maximum = row["memoryMaxBytes"]
+        if index == 0:
+            if type(maximum) is not int or maximum != LIMIT_BYTES:
+                raise GateError("authority_child_limit_not_exact")
+        elif not (maximum == "max" or type(maximum) is int and maximum >= LIMIT_BYTES):
+            raise GateError("authority_ancestor_limit_too_low")
+    events = value["memoryEventsLocal"]
+    if not isinstance(events, dict) or set(events) != {
+        "source", "beforeSha256", "afterSha256", "before", "after"
+    }:
+        raise GateError("authority_local_events_shape_invalid")
+    if events["source"] != "memory.events.local":
+        raise GateError("authority_local_events_source_invalid")
+    before = parse_event_bytes(before_raw, "memory_events_local_before")
+    after = parse_event_bytes(after_raw, "memory_events_local_after")
+    if (
+        events["beforeSha256"] != sha256_bytes(before_raw)
+        or events["afterSha256"] != sha256_bytes(after_raw)
+        or events["before"] != before
+        or events["after"] != after
+        or set(before) != set(after)
+        or any(after[key] < before[key] for key in before)
+    ):
+        raise GateError("authority_local_events_binding_invalid")
+    if value["cgroupKillUsed"] != 1 or value["populatedAfterKill"] != 0:
+        raise GateError("authority_cleanup_invalid")
+    root_before = validate_root_identity(value["cgroupRootIdentityBefore"], "root_before")
+    root_after = validate_root_identity(value["cgroupRootIdentityAfter"], "root_after")
+    if root_before != root_after or value["cgroupRootOwnershipFrozen"] != 1:
+        raise GateError("authority_root_identity_drift")
+    if value["atomicEvidenceCommit"] != ATOMIC_EVIDENCE_COMMIT:
+        raise GateError("authority_atomic_commit_invalid")
+    return value
+
+
+def parse_native_receipt(raw: bytes, mode: str, runner_sha256: str) -> dict[str, Any]:
+    if not raw.endswith(b"\n") or b"\r" in raw:
+        raise GateError("native_receipt_framing_invalid")
+    value = parse_json_bytes(raw, "native_receipt")
+    if canonical_json(value) + b"\n" != raw:
+        raise GateError("native_receipt_not_canonical")
+    expected_keys = {
+        "schema", "mode", "status", "enforcement", "cgroupPathFshex",
+        "limitBytes", "swapBytes", "workloadRc", "oomKill",
+        "memoryPeakBytes", "kernelRelease", "toolSha256",
+        "runnerExecutionIdentity", "memoryEventsLocalRawBeforeFshex",
+        "memoryEventsLocalRawAfterFshex", "authorityClosure",
+    }
+    if set(value) != expected_keys:
+        raise GateError("native_receipt_keys_invalid")
+    exact = {
+        "schema": NATIVE_RECEIPT_SCHEMA,
+        "mode": mode,
+        "status": "pass",
+        "enforcement": "kernel_cgroup_v2_native",
+        "limitBytes": LIMIT_BYTES,
+        "swapBytes": SWAP_BYTES,
+        "toolSha256": runner_sha256,
+        "kernelRelease": platform.release(),
+    }
+    if any(value[key] != expected for key, expected in exact.items()):
+        raise GateError("native_receipt_contract_invalid")
+    try:
+        cgroup_raw = bytes.fromhex(value["cgroupPathFshex"])
+        before_raw = bytes.fromhex(value["memoryEventsLocalRawBeforeFshex"])
+        after_raw = bytes.fromhex(value["memoryEventsLocalRawAfterFshex"])
+        cgroup_path = os.fsdecode(cgroup_raw)
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise GateError("native_receipt_hex_invalid") from error
+    if (
+        cgroup_raw.hex() != value["cgroupPathFshex"]
+        or before_raw.hex() != value["memoryEventsLocalRawBeforeFshex"]
+        or after_raw.hex() != value["memoryEventsLocalRawAfterFshex"]
+        or os.fsencode(cgroup_path) != cgroup_raw
+    ):
+        raise GateError("native_receipt_hex_not_canonical")
+    if CGROUP_PATH_RE.fullmatch(cgroup_path) is None:
+        raise GateError("native_receipt_cgroup_path_invalid")
+    execution = value["runnerExecutionIdentity"]
+    if not isinstance(execution, dict) or set(execution) != {
+        "execution", "device", "inode", "mode", "uid", "gid", "nlink",
+        "size", "sha256",
+    }:
+        raise GateError("native_receipt_runner_identity_shape_invalid")
+    if (
+        execution["execution"] != "held_fd"
+        or execution["nlink"] != 1
+        or execution["sha256"] != runner_sha256
+        or any(type(execution[key]) is not int or execution[key] < 0 for key in {
+            "device", "inode", "mode", "uid", "gid", "nlink", "size"
+        })
+    ):
+        raise GateError("native_receipt_runner_identity_invalid")
+    closure = validate_authority_closure(
+        value["authorityClosure"], cgroup_path, before_raw, after_raw
+    )
+    workload_rc = require_uint(value["workloadRc"], "native_workload_rc")
+    oom_kill = require_uint(value["oomKill"], "native_oom_kill")
+    memory_peak = require_uint(value["memoryPeakBytes"], "native_memory_peak")
+    if memory_peak <= 0 or memory_peak > LIMIT_BYTES:
+        raise GateError("native_receipt_memory_peak_invalid")
+    if mode == "attack":
+        if workload_rc == 0 or oom_kill <= 0:
+            raise GateError("native_receipt_aggregate_attack_not_enforced")
+    elif mode == "workload":
+        if workload_rc != 0 or oom_kill != 0:
+            raise GateError("native_receipt_workload_not_clean")
+    else:
+        raise GateError("native_receipt_mode_invalid")
+    return {
+        "value": value,
+        "workloadRc": workload_rc,
+        "oomKill": oom_kill,
+        "memoryPeakBytes": memory_peak,
+        "cgroupPathFshex": value["cgroupPathFshex"],
+        "authorityClosure": closure,
+        "runnerExecutionIdentity": execution,
+    }
+
+
+def write_bytes_exclusive(path: Path, raw: bytes, mode: int = 0o400) -> None:
+    require_lexical_absolute(path, "output")
+    parent_fd = open_directory_nofollow(path.parent, "output_parent")
+    temporary = "." + path.name + ".tmp." + secrets.token_hex(16)
+    descriptor = -1
+    renamed = False
+    try:
+        try:
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            raise GateError("output_path_exists:" + str(path))
+        except FileNotFoundError:
+            pass
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode,
+            dir_fd=parent_fd,
+        )
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise GateError("output_short_write:" + str(path))
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.rename(
+            temporary,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        renamed = True
+        os.fsync(parent_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not renamed:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
+
+
+def write_sealed_receipt(path: Path, value: dict[str, Any]) -> dict[str, Any]:
+    sealed = dict(value)
+    sealed["receiptSha256"] = sha256_bytes(canonical_json(value))
+    write_bytes_exclusive(path, canonical_json(sealed) + b"\n")
+    return sealed
+
+
+def make_directory(path: Path, label: str) -> Path:
+    require_lexical_absolute(path, label)
+    parent_fd = open_directory_nofollow(path.parent, label + "_parent")
+    try:
+        try:
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            raise GateError(label + "_path_exists")
+        except FileNotFoundError:
+            pass
+        os.mkdir(path.name, 0o700, dir_fd=parent_fd)
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            info = os.fstat(descriptor)
+            expected_uid = 0 if os.geteuid() == 0 else os.geteuid()
+            if info.st_uid != expected_uid or stat.S_IMODE(info.st_mode) != 0o700:
+                raise GateError(label + "_ownership_invalid")
+        finally:
+            os.close(descriptor)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    return path
+
+
+def open_verified_fd(identity: dict[str, Any], label: str) -> int:
+    descriptor, info = open_regular_nofollow(Path(identity["path"]), label)
+    digest = hashlib.sha256()
+    try:
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise GateError(label + "_short_read")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise GateError(label + "_grew")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if (
+            digest.hexdigest() != identity["sha256"]
+            or info.st_dev != identity["device"]
+            or info.st_ino != identity["inode"]
+            or info.st_nlink != 1
+        ):
+            raise GateError(label + "_identity_drift")
+        os.set_inheritable(descriptor, True)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def read_fd_bounded(descriptor: int, maximum: int) -> bytes:
+    chunks: list[bytes] = []
+    offset = 0
+    while True:
+        chunk = os.pread(
+            descriptor,
+            min(1024 * 1024, maximum - offset + 1),
+            offset,
+        )
+        if not chunk:
+            break
+        chunks.append(chunk)
+        offset += len(chunk)
+        if offset > maximum:
+            raise GateError("cgroup_control_read_too_large")
+    return b"".join(chunks)
+
+
+def require_held_source_authority(
+    identity: dict[str, Any],
+    fd_variable: str,
+    sha_variable: str,
+    label: str,
+) -> None:
+    raw_fd = os.environ.get(fd_variable, "")
+    claimed_sha = os.environ.get(sha_variable, "")
+    if not raw_fd.isdigit() or claimed_sha != identity["sha256"]:
+        raise GateError(label + "_held_source_authority_missing")
+    descriptor = int(raw_fd)
+    info = os.fstat(descriptor)
+    raw = read_fd_bounded(descriptor, 16 * 1024 * 1024)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_dev != identity["device"]
+        or info.st_ino != identity["inode"]
+        or info.st_mode != identity["mode"]
+        or info.st_uid != identity["uid"]
+        or info.st_gid != identity["gid"]
+        or info.st_size != identity["size"]
+        or sha256_bytes(raw) != claimed_sha
+    ):
+        raise GateError(label + "_held_source_authority_invalid")
+
+
+def wait_cgroup_populated_zero(directory_fd: int, timeout_seconds: int) -> None:
+    events_fd = os.open(
+        b"cgroup.events",
+        os.O_RDONLY | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    try:
+        poller = select.poll()
+        poller.register(events_fd, select.POLLPRI | select.POLLERR)
+        deadline = time.monotonic_ns() + timeout_seconds * 1_000_000_000
+        while True:
+            values = parse_event_bytes(
+                read_fd_bounded(events_fd, 1024 * 1024),
+                "timeout_cgroup_events",
+            )
+            if values.get("populated") == 0:
+                return
+            if values.get("populated") != 1:
+                raise GateError("timeout_cgroup_populated_invalid")
+            remaining_ns = deadline - time.monotonic_ns()
+            if remaining_ns <= 0:
+                raise GateError("timeout_cgroup_populated_zero_timeout")
+            if not poller.poll(max(1, (remaining_ns + 999_999) // 1_000_000)):
+                raise GateError("timeout_cgroup_populated_zero_timeout")
+    finally:
+        os.close(events_fd)
+
+
+def cleanup_timed_out_runner_cgroups(runner_pid: int) -> None:
+    if platform.system() != "Linux" or os.geteuid() != 0:
+        raise GateError("timeout_cgroup_cleanup_requires_linux_root")
+    root_fd = open_directory_nofollow(Path("/sys/fs/cgroup"), "timeout_cgroup_root")
+    prefix = "cheng-hardcap-native-" + str(runner_pid) + "-"
+    pattern = re.compile(r"^" + re.escape(prefix) + r"[0-9a-f]{24}$")
+    try:
+        root_info = os.fstat(root_fd)
+        if root_info.st_uid != 0 or stat.S_IMODE(root_info.st_mode) & 0o022:
+            raise GateError("timeout_cgroup_root_not_frozen")
+        names = sorted(name for name in os.listdir(root_fd) if pattern.fullmatch(name))
+        for name in names:
+            child_fd = os.open(
+                os.fsencode(name),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+            try:
+                kill_fd = os.open(
+                    b"cgroup.kill",
+                    os.O_WRONLY | os.O_NOFOLLOW,
+                    dir_fd=child_fd,
+                )
+                try:
+                    if os.write(kill_fd, b"1") != 1:
+                        raise GateError("timeout_cgroup_kill_short_write")
+                finally:
+                    os.close(kill_fd)
+                wait_cgroup_populated_zero(child_fd, 10)
+            finally:
+                os.close(child_fd)
+            os.rmdir(os.fsencode(name), dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+
+
+def terminate_timed_out_runner(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    cleanup_error: BaseException | None = None
+    try:
+        cleanup_timed_out_runner_cgroups(process.pid)
+    except BaseException as error:
+        cleanup_error = error
+    process.wait()
+    process.communicate()
+    if cleanup_error is not None:
+        raise GateError("timeout_cgroup_authority_cleanup_failed") from cleanup_error
+
+
+def run_kernel_runner(
+    argv: list[str],
+    cwd: Path,
+    timeout_seconds: int,
+    runner: dict[str, Any],
+    extra_fds: Sequence[int] = (),
+    authority_environment: dict[str, str] | None = None,
+) -> tuple[int, bytes, bytes, int]:
+    runner_fd = open_verified_fd(runner, "kernel_runner_execution")
+    cwd_fd = open_directory_nofollow(cwd, "kernel_runner_cwd")
+    os.set_inheritable(cwd_fd, True)
+    execution_argv = [f"/proc/self/fd/{runner_fd}", *argv[1:]]
+    environment = dict(BASE_ENV)
+    environment["CHENG_AUTHORITY_RUNNER_FD"] = str(runner_fd)
+    environment["CHENG_AUTHORITY_RUNNER_SHA256"] = runner["sha256"]
+    if authority_environment is not None:
+        environment.update(authority_environment)
+    started = time.monotonic_ns()
+    try:
+        process = subprocess.Popen(
+            execution_argv,
+            cwd=f"/proc/self/fd/{cwd_fd}",
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(runner_fd, cwd_fd, *extra_fds),
+            start_new_session=True,
+        )
+        stdout, stderr = process.communicate(timeout=timeout_seconds + 10)
+    except subprocess.TimeoutExpired as error:
+        terminate_timed_out_runner(process)
+        raise GateError("kernel_runner_internal_timeout_cleanup_failed") from error
+    finally:
+        os.close(runner_fd)
+        os.close(cwd_fd)
+    elapsed = time.monotonic_ns() - started
+    return process.returncode, stdout, stderr, elapsed
+
+
+def persist_kernel_receipt(
+    report_path: Path,
+    stdout: bytes,
+    stderr: bytes,
+    return_code: int,
+    mode: str,
+    runner: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if return_code != 0:
+        detail = stderr[:4096].decode("utf-8", "replace").replace("\n", " ")
+        raise GateError(f"kernel_runner_failed:{return_code}:{detail}")
+    _info, raw = stable_read(
+        report_path,
+        "kernel_receipt",
+        MAX_RECEIPT_BYTES,
+    )
+    if stdout != raw or stderr:
+        raise GateError("kernel_runner_stream_contract_invalid")
+    parsed = parse_native_receipt(raw, mode, runner["sha256"])
+    execution = parsed["runnerExecutionIdentity"]
+    for key in ("device", "inode", "mode", "uid", "gid", "nlink", "size", "sha256"):
+        if execution[key] != runner[key]:
+            raise GateError("kernel_runner_held_identity_mismatch")
+    identity = stream_identity(
+        report_path,
+        "kernel_receipt",
+        MAX_RECEIPT_BYTES,
+    )
+    return parsed, identity
+
+
+def command_spec(
+    command: dict[str, Any],
+    stdout_path: Path,
+    stderr_path: Path,
+) -> dict[str, Any]:
+    executable = command["executable"]
+    return {
+        "schema": COMMAND_SPEC_SCHEMA,
+        "id": command["id"],
+        "argv": command["argv"],
+        "cwd": command["cwd"],
+        "env": command["env"],
+        "runUid": command["runUid"],
+        "runGid": command["runGid"],
+        "executablePathFshex": executable["pathFshex"],
+        "executableSha256": executable["sha256"],
+        "executableSize": executable["size"],
+        "stdoutPathFshex": os.fsencode(str(stdout_path)).hex(),
+        "stderrPathFshex": os.fsencode(str(stderr_path)).hex(),
+    }
+
+
+def path_from_fshex(value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value or len(value) % 2:
+        raise GateError(label + "_fshex_invalid")
+    try:
+        raw = bytes.fromhex(value)
+        decoded = os.fsdecode(raw)
+    except (ValueError, UnicodeError) as error:
+        raise GateError(label + "_fshex_invalid") from error
+    if os.fsencode(decoded) != raw:
+        raise GateError(label + "_fshex_not_roundtrip")
+    return Path(decoded)
+
+
+def open_output_exclusive(path: Path, label: str) -> int:
+    require_lexical_absolute(path, label)
+    parent_fd = open_directory_nofollow(path.parent, label + "_parent")
+    try:
+        return os.open(
+            path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+    finally:
+        os.close(parent_fd)
+
+
+def execute_command_spec(path: Path, expected_sha256: str) -> int:
+    if SHA256_RE.fullmatch(expected_sha256) is None:
+        raise GateError("command_spec_expected_sha256_invalid")
+    _info, raw = stable_read(path, "command_spec", MAX_SPEC_BYTES)
+    if sha256_bytes(raw) != expected_sha256:
+        raise GateError("command_spec_sha256_mismatch")
+    value = parse_json_bytes(raw, "command_spec")
+    if canonical_json(value) + b"\n" != raw:
+        raise GateError("command_spec_not_canonical")
+    expected_keys = {
+        "schema",
+        "id",
+        "argv",
+        "cwd",
+        "env",
+        "runUid",
+        "runGid",
+        "executablePathFshex",
+        "executableSha256",
+        "executableSize",
+        "stdoutPathFshex",
+        "stderrPathFshex",
+    }
+    if set(value) != expected_keys or value["schema"] != COMMAND_SPEC_SCHEMA:
+        raise GateError("command_spec_shape_invalid")
+    argv = value["argv"]
+    env = value["env"]
+    run_uid = require_uint(
+        value["runUid"],
+        "command_spec_run_uid",
+        minimum=1,
+        maximum=2_147_483_647,
+    )
+    run_gid = require_uint(
+        value["runGid"],
+        "command_spec_run_gid",
+        minimum=1,
+        maximum=2_147_483_647,
+    )
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or any(not isinstance(item, str) or "\x00" in item for item in argv)
+        or not isinstance(env, dict)
+        or any(
+            not isinstance(key, str)
+            or ENV_KEY_RE.fullmatch(key) is None
+            or not isinstance(item, str)
+            or "\x00" in item
+            for key, item in env.items()
+        )
+    ):
+        raise GateError("command_spec_argv_or_env_invalid")
+    executable = path_from_fshex(
+        value["executablePathFshex"],
+        "command_spec_executable",
+    )
+    if str(executable) != argv[0]:
+        raise GateError("command_spec_executable_argv_mismatch")
+    identity = stream_identity(
+        executable,
+        "command_spec_executable",
+        MAX_ARTIFACT_BYTES,
+        executable=True,
+    )
+    if (
+        identity["sha256"] != value["executableSha256"]
+        or identity["size"] != value["executableSize"]
+    ):
+        raise GateError("command_spec_executable_identity_mismatch")
+    executable_fd = open_verified_fd(identity, "command_spec_executable_execution")
+    cwd = Path(require_text(value["cwd"], "command_spec_cwd"))
+    cwd_fd = open_directory_nofollow(cwd, "command_spec_cwd")
+    stdout_path = path_from_fshex(
+        value["stdoutPathFshex"],
+        "command_spec_stdout",
+    )
+    stderr_path = path_from_fshex(
+        value["stderrPathFshex"],
+        "command_spec_stderr",
+    )
+    stdout_fd = open_output_exclusive(stdout_path, "command_stdout")
+    try:
+        stderr_fd = open_output_exclusive(stderr_path, "command_stderr")
+    except BaseException:
+        os.close(stdout_fd)
+        os.close(executable_fd)
+        os.close(cwd_fd)
+        raise
+    os.dup2(stdout_fd, 1)
+    os.dup2(stderr_fd, 2)
+    os.close(stdout_fd)
+    os.close(stderr_fd)
+    os.fchdir(cwd_fd)
+    os.close(cwd_fd)
+    if platform.system() != "Linux" or os.geteuid() != 0:
+        raise GateError("command_adapter_requires_linux_root_supervisor")
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = (
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    )
+    prctl.restype = ctypes.c_int
+    if prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        raise GateError("command_adapter_subreaper_failed")
+    child = os.fork()
+    if child == 0:
+        try:
+            if prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0:
+                raise GateError("command_adapter_keepcaps_clear_failed")
+            os.setgroups([])
+            os.setgid(run_gid)
+            os.setuid(run_uid)
+            if prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+                raise GateError("command_adapter_no_new_privs_failed")
+            if os.geteuid() != run_uid or os.getegid() != run_gid or os.getgroups():
+                raise GateError("command_adapter_identity_drop_failed")
+            os.set_inheritable(executable_fd, True)
+            os.execve(f"/proc/self/fd/{executable_fd}", argv, env)
+        except BaseException as error:
+            os.write(
+                2,
+                (
+                    "csg_core_command_exec_error="
+                    + str(error).replace("\r", " ").replace("\n", " ")
+                    + "\n"
+                ).encode("utf-8", "replace"),
+            )
+            os._exit(126)
+    os.close(executable_fd)
+    root_status: int | None = None
+    descendant_failure = False
+    while True:
+        try:
+            waited, status = os.waitpid(-1, 0)
+        except ChildProcessError:
+            break
+        if waited == child:
+            root_status = status
+        elif os.waitstatus_to_exitcode(status) != 0:
+            descendant_failure = True
+    if root_status is None:
+        raise GateError("command_adapter_root_wait_missing")
+    root_exit = os.waitstatus_to_exitcode(root_status)
+    if root_exit != 0:
+        return root_exit if root_exit >= 0 else 128 - root_exit
+    if descendant_failure:
+        return 125
+    return 0
+
+
+def relative_path(root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError as error:
+        raise GateError("evidence_path_outside_root") from error
+
+
+def commit_existing_temp(temporary: Path, final: Path, label: str) -> None:
+    if temporary.parent != final.parent or temporary == final:
+        raise GateError(label + "_commit_path_invalid")
+    parent_fd = open_directory_nofollow(final.parent, label + "_parent")
+    descriptor = -1
+    try:
+        try:
+            os.stat(final.name, dir_fd=parent_fd, follow_symlinks=False)
+            raise GateError(label + "_final_exists")
+        except FileNotFoundError:
+            pass
+        info = os.stat(temporary.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != 0
+        ):
+            raise GateError(label + "_temporary_identity_invalid")
+        descriptor = os.open(
+            temporary.name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        if identity_tuple(os.fstat(descriptor)) != identity_tuple(info):
+            raise GateError(label + "_temporary_race")
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.rename(
+            temporary.name,
+            final.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
+def run_aggregate_probe(
+    evidence: Path,
+    runner: dict[str, Any],
+) -> dict[str, Any]:
+    directory = make_directory(evidence / "aggregate-probe", "aggregate_probe")
+    report = directory / "kernel-receipt.kv"
+    argv = [
+        str(KERNEL_RUNNER),
+        "attack",
+        "--report-out:" + str(report),
+        "--timeout-seconds:120",
+    ]
+    rc, stdout, stderr, elapsed = run_kernel_runner(
+        argv,
+        ROOT,
+        120,
+        runner,
+    )
+    parsed, receipt_identity = persist_kernel_receipt(
+        report,
+        stdout,
+        stderr,
+        rc,
+        "attack",
+        runner,
+    )
+    return {
+        "childCount": ATTACK_CHILD_COUNT,
+        "childBytes": ATTACK_CHILD_BYTES,
+        "aggregateBytes": ATTACK_AGGREGATE_BYTES,
+        "kernelReceiptRelativePath": relative_path(evidence, report),
+        "kernelReceiptSha256": receipt_identity["sha256"],
+        "workloadRc": parsed["workloadRc"],
+        "oomKill": parsed["oomKill"],
+        "memoryPeakBytes": parsed["memoryPeakBytes"],
+        "cgroupPathFshex": parsed["cgroupPathFshex"],
+        "authorityClosure": parsed["authorityClosure"],
+        "elapsedNs": elapsed,
+    }
+
+
+def run_command(
+    evidence: Path,
+    index: int,
+    command: dict[str, Any],
+    runner: dict[str, Any],
+    gate: dict[str, Any],
+) -> dict[str, Any]:
+    directory = make_directory(
+        evidence / "commands" / f"{index:03d}-{command['id']}",
+        f"command_{index}_directory",
+    )
+    stdout_path = directory / "stdout.bin"
+    stderr_path = directory / "stderr.bin"
+    stdout_temporary = directory / ".stdout.bin.incomplete"
+    stderr_temporary = directory / ".stderr.bin.incomplete"
+    spec_path = directory / "command.json"
+    spec = command_spec(command, stdout_temporary, stderr_temporary)
+    spec_raw = canonical_json(spec) + b"\n"
+    write_bytes_exclusive(spec_path, spec_raw)
+    spec_sha256 = sha256_bytes(spec_raw)
+    kernel_report = directory / "kernel-receipt.kv"
+    gate_fd = open_verified_fd(gate, f"command_{index}_gate_execution")
+    try:
+        argv = [
+            str(KERNEL_RUNNER),
+            "workload",
+            "--report-out:" + str(kernel_report),
+            "--timeout-seconds:" + str(command["timeoutSeconds"]),
+            "--",
+            f"/proc/self/fd/{gate_fd}",
+            "--execute-command-spec",
+            str(spec_path),
+            "--expected-spec-sha256",
+            spec_sha256,
+        ]
+        rc, native_stdout, native_stderr, elapsed = run_kernel_runner(
+            argv,
+            Path(command["cwd"]),
+            command["timeoutSeconds"],
+            runner,
+            (gate_fd,),
+            {
+                "CHENG_EXACT_GATE_SOURCE": str(GATE_SOURCE),
+                "CHENG_EXACT_GATE_SOURCE_FD": str(gate_fd),
+                "CHENG_EXACT_GATE_SOURCE_SHA256": gate["sha256"],
+            },
+        )
+    finally:
+        os.close(gate_fd)
+    parsed, kernel_identity = persist_kernel_receipt(
+        kernel_report,
+        native_stdout,
+        native_stderr,
+        rc,
+        "workload",
+        runner,
+    )
+    commit_existing_temp(stdout_temporary, stdout_path, f"command_{index}_stdout")
+    commit_existing_temp(stderr_temporary, stderr_path, f"command_{index}_stderr")
+    stdout_identity = stream_identity(
+        stdout_path,
+        f"command_{index}_stdout",
+        MAX_ARTIFACT_BYTES,
+        allow_empty=True,
+    )
+    stderr_identity = stream_identity(
+        stderr_path,
+        f"command_{index}_stderr",
+        MAX_ARTIFACT_BYTES,
+        allow_empty=True,
+    )
+    executable_after = stream_identity(
+        Path(command["argv"][0]),
+        f"command_{index}_executable_after",
+        MAX_ARTIFACT_BYTES,
+        executable=True,
+    )
+    executable_before = command["executable"]
+    for key in ("sha256", "size", "device", "inode", "mode", "mtimeNs", "ctimeNs"):
+        if executable_after[key] != executable_before[key]:
+            raise GateError(f"command_{index}_executable_drift")
+    return {
+        "index": index,
+        "id": command["id"],
+        "argvSha256": framed_sha256(command["argv"]),
+        "envSha256": environment_sha256(command["env"]),
+        "cwdFshex": os.fsencode(command["cwd"]).hex(),
+        "timeoutSeconds": command["timeoutSeconds"],
+        "runUid": command["runUid"],
+        "runGid": command["runGid"],
+        "executablePathFshex": executable_before["pathFshex"],
+        "executableSha256": executable_before["sha256"],
+        "executableSize": executable_before["size"],
+        "executableIdentity": public_file_identity(executable_before),
+        "specRelativePath": relative_path(evidence, spec_path),
+        "specSha256": spec_sha256,
+        "kernelReceiptRelativePath": relative_path(evidence, kernel_report),
+        "kernelReceiptSha256": kernel_identity["sha256"],
+        "stdoutRelativePath": relative_path(evidence, stdout_path),
+        "stdoutSha256": stdout_identity["sha256"],
+        "stdoutBytes": stdout_identity["size"],
+        "stderrRelativePath": relative_path(evidence, stderr_path),
+        "stderrSha256": stderr_identity["sha256"],
+        "stderrBytes": stderr_identity["size"],
+        "workloadRc": parsed["workloadRc"],
+        "oomKill": parsed["oomKill"],
+        "memoryPeakBytes": parsed["memoryPeakBytes"],
+        "cgroupPathFshex": parsed["cgroupPathFshex"],
+        "authorityClosure": parsed["authorityClosure"],
+        "elapsedNs": elapsed,
+    }
+
+
+def source_pin(path: Path, label: str) -> dict[str, Any]:
+    return stream_identity(path, label, 16 * 1024 * 1024, executable=True)
+
+
+def public_file_identity(identity: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: identity[key]
+        for key in (
+            "pathFshex",
+            "sha256",
+            "size",
+            "device",
+            "inode",
+            "mode",
+            "uid",
+            "gid",
+            "nlink",
+            "mtimeNs",
+            "ctimeNs",
+        )
+    }
+
+
+def success_receipt(
+    evidence: Path,
+    manifest_identity: dict[str, Any],
+    gate: dict[str, Any],
+    validator: dict[str, Any],
+    runner: dict[str, Any],
+    aggregate: dict[str, Any],
+    commands: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema": RECEIPT_SCHEMA,
+        "status": "passed",
+        "proofStatus": PROOF_STATUS,
+        "hostSystem": "Linux",
+        "hostMachine": platform.machine(),
+        "kernelRelease": platform.release(),
+        "limitBytes": LIMIT_BYTES,
+        "swapBytes": SWAP_BYTES,
+        "memoryScope": MEMORY_SCOPE,
+        "kernelAuthority": KERNEL_AUTHORITY,
+        "processTreePlacement": PROCESS_TREE_PLACEMENT,
+        "processTreeCompletion": PROCESS_TREE_COMPLETION,
+        "userSpacePollingAuthority": 0,
+        "evidenceDirectoryFshex": os.fsencode(str(evidence)).hex(),
+        "manifestPathFshex": manifest_identity["pathFshex"],
+        "manifestSha256": manifest_identity["sha256"],
+        "manifestIdentity": public_file_identity(manifest_identity),
+        "commandCount": len(commands),
+        "gatePathFshex": gate["pathFshex"],
+        "gateSha256": gate["sha256"],
+        "validatorPathFshex": validator["pathFshex"],
+        "validatorSha256": validator["sha256"],
+        "kernelRunnerPathFshex": runner["pathFshex"],
+        "kernelRunnerSha256": runner["sha256"],
+        "gateSourceIdentity": public_file_identity(gate),
+        "validatorSourceIdentity": public_file_identity(validator),
+        "kernelRunnerSourceIdentity": public_file_identity(runner),
+        "authorityClosure": aggregate["authorityClosure"],
+        "atomicEvidenceCommit": ATOMIC_EVIDENCE_COMMIT,
+        "aggregateProbe": aggregate,
+        "commands": commands,
+    }
+
+
+def proof_status_for_host(system: str) -> str:
+    if system == "Darwin":
+        return DARWIN_PROOF_STATUS
+    if system == "Linux":
+        return "not_proved"
+    return OTHER_PROOF_STATUS
+
+
+def failure_receipt(
+    reason: str,
+    evidence: Path,
+    manifest_identity: dict[str, Any] | None,
+    gate: dict[str, Any] | None,
+    validator: dict[str, Any] | None,
+    runner: dict[str, Any] | None,
+    command_count: int,
+    *,
+    host_system: str | None = None,
+) -> dict[str, Any]:
+    system = host_system or platform.system()
+    clean_reason = reason.replace("\r", " ").replace("\n", " ")[:4096]
+    return {
+        "schema": RECEIPT_SCHEMA,
+        "status": "hard_red",
+        "proofStatus": proof_status_for_host(system),
+        "hostSystem": system,
+        "hostMachine": platform.machine(),
+        "limitBytes": LIMIT_BYTES,
+        "swapBytes": SWAP_BYTES,
+        "memoryScope": "process_tree_unproved",
+        "kernelAuthority": "none",
+        "userSpacePollingAuthority": 0,
+        "evidenceDirectoryFshex": os.fsencode(str(evidence)).hex(),
+        "manifestPathFshex": ""
+        if manifest_identity is None
+        else manifest_identity["pathFshex"],
+        "manifestSha256": "0" * 64
+        if manifest_identity is None
+        else manifest_identity["sha256"],
+        "commandCount": command_count,
+        "gateSha256": "0" * 64 if gate is None else gate["sha256"],
+        "validatorSha256": "0" * 64 if validator is None else validator["sha256"],
+        "kernelRunnerSha256": "0" * 64 if runner is None else runner["sha256"],
+        "atomicEvidenceCommit": ATOMIC_EVIDENCE_COMMIT,
+        "reason": clean_reason or "unknown_gate_error",
+    }
+
+
+def audit_darwin_authority() -> None:
+    _info, raw = stable_read(
+        DARWIN_AUDIT_SOURCE,
+        "darwin_audit_source",
+        16 * 1024 * 1024,
+    )
+    source = raw.decode("utf-8", "strict")
+    if "not_provable_userspace_poll" not in source:
+        raise GateError("darwin_unprovable_authority_marker_missing")
+
+
+def validate_with_independent_tool(
+    evidence: Path,
+    manifest: Path,
+    receipt: Path,
+    timeout_seconds: int,
+) -> None:
+    validator_identity = stream_identity(
+        VALIDATOR,
+        "independent_validator_source",
+        16 * 1024 * 1024,
+        executable=True,
+    )
+    validator_fd = open_verified_fd(
+        validator_identity,
+        "independent_validator_execution",
+    )
+    python_fd = os.open("/proc/self/exe", os.O_RDONLY)
+    try:
+        python_info = os.fstat(python_fd)
+        if not stat.S_ISREG(python_info.st_mode) or python_info.st_nlink != 1:
+            raise GateError("independent_python_identity_invalid")
+        os.set_inheritable(python_fd, True)
+        command = [
+            f"/proc/self/fd/{python_fd}",
+            "-B",
+            f"/proc/self/fd/{validator_fd}",
+            "--evidence-dir",
+            str(evidence),
+            "--manifest",
+            str(manifest),
+            "--receipt",
+            str(receipt),
+        ]
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+            pass_fds=(python_fd, validator_fd),
+            env={
+                **BASE_ENV,
+                "CHENG_EXACT_VALIDATOR_SOURCE": str(VALIDATOR),
+                "CHENG_EXACT_VALIDATOR_SOURCE_FD": str(validator_fd),
+                "CHENG_EXACT_VALIDATOR_SOURCE_SHA256": validator_identity["sha256"],
+            },
+        )
+    finally:
+        os.close(python_fd)
+        os.close(validator_fd)
+    expected = b"csg_core_exact_1g_receipt_validation=passed\n"
+    if completed.returncode != 0 or completed.stdout != expected or completed.stderr:
+        raise GateError("independent_receipt_validation_failed")
+
+
+def run_gate(manifest_path: Path, evidence_path: Path) -> dict[str, Any]:
+    evidence = make_directory(evidence_path, "evidence_directory")
+    manifest_identity: dict[str, Any] | None = None
+    gate_identity: dict[str, Any] | None = None
+    validator_identity: dict[str, Any] | None = None
+    runner_identity: dict[str, Any] | None = None
+    command_count = 0
+    receipt_path = evidence / "receipt.json"
+    candidate_receipt_path = evidence / "receipt.candidate.json"
+    try:
+        _manifest, commands, manifest_identity = read_manifest(manifest_path)
+        command_count = len(commands)
+        gate_identity = source_pin(GATE_SOURCE, "gate_source")
+        validator_identity = source_pin(VALIDATOR, "validator_source")
+        runner_identity = validate_kernel_runner_contract(KERNEL_RUNNER)
+        system = platform.system()
+        if system == "Darwin":
+            audit_darwin_authority()
+            raise UnsupportedHostError(
+                "macos_has_no_bound_kernel_or_vm_aggregate_limit"
+            )
+        if system != "Linux":
+            raise UnsupportedHostError("host_has_no_bound_kernel_or_vm_aggregate_limit")
+        require_held_source_authority(
+            gate_identity,
+            "CHENG_EXACT_GATE_SOURCE_FD",
+            "CHENG_EXACT_GATE_SOURCE_SHA256",
+            "gate_source",
+        )
+        make_directory(evidence / "commands", "commands_directory")
+        aggregate = run_aggregate_probe(evidence, runner_identity)
+        results = [
+            run_command(
+                evidence,
+                index,
+                command,
+                runner_identity,
+                gate_identity,
+            )
+            for index, command in enumerate(commands)
+        ]
+        value = success_receipt(
+            evidence,
+            manifest_identity,
+            gate_identity,
+            validator_identity,
+            runner_identity,
+            aggregate,
+            results,
+        )
+        sealed = write_sealed_receipt(candidate_receipt_path, value)
+        validate_with_independent_tool(
+            evidence,
+            manifest_path,
+            candidate_receipt_path,
+            max(command["timeoutSeconds"] for command in commands) + 60,
+        )
+        commit_existing_temp(
+            candidate_receipt_path,
+            receipt_path,
+            "final_receipt",
+        )
+        return sealed
+    except (
+        GateError,
+        OSError,
+        ValueError,
+        TypeError,
+        UnicodeError,
+        subprocess.SubprocessError,
+    ) as error:
+        if not receipt_path.exists():
+            if candidate_receipt_path.exists():
+                candidate_receipt_path.unlink()
+            value = failure_receipt(
+                str(error),
+                evidence,
+                manifest_identity,
+                gate_identity,
+                validator_identity,
+                runner_identity,
+                command_count,
+            )
+            write_sealed_receipt(receipt_path, value)
+        raise
+
+
+def parse_gate_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run a canonical CSG command manifest under an exact 1 GiB "
+            "kernel aggregate process-tree cap"
+        ),
+    )
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--evidence-dir", required=True)
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str]) -> int:
+    if argv and argv[0] == "--execute-command-spec":
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--execute-command-spec", required=True)
+        parser.add_argument("--expected-spec-sha256", required=True)
+        args = parser.parse_args(argv)
+        try:
+            gate_identity = source_pin(GATE_SOURCE, "command_adapter_gate_source")
+            require_held_source_authority(
+                gate_identity,
+                "CHENG_EXACT_GATE_SOURCE_FD",
+                "CHENG_EXACT_GATE_SOURCE_SHA256",
+                "command_adapter_gate_source",
+            )
+            return execute_command_spec(
+                Path(args.execute_command_spec),
+                args.expected_spec_sha256,
+            )
+        except (GateError, OSError, ValueError, TypeError, UnicodeError) as error:
+            print("csg_core_command_adapter_error=" + str(error), file=sys.stderr)
+            return 126
+    try:
+        args = parse_gate_args(argv)
+        receipt = run_gate(
+            Path(args.manifest),
+            Path(args.evidence_dir),
+        )
+        print("csg_core_exact_1g_gate_status=passed")
+        print("receipt=" + str(Path(args.evidence_dir) / "receipt.json"))
+        print("receipt_sha256=" + receipt["receiptSha256"])
+        return 0
+    except (
+        GateError,
+        OSError,
+        ValueError,
+        TypeError,
+        UnicodeError,
+        subprocess.SubprocessError,
+    ) as error:
+        print("csg_core_exact_1g_gate_status=hard_red", file=sys.stderr)
+        print(
+            "csg_core_exact_1g_gate_error="
+            + str(error).replace("\r", " ").replace("\n", " "),
+            file=sys.stderr,
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

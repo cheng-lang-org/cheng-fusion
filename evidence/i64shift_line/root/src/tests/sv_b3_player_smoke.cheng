@@ -1,0 +1,255 @@
+import std/strings
+import std/os
+import std/rawbytes
+import std/result
+import cheng/game/assets/semantic_video/schema
+import cheng/game/assets/semantic_video/reader
+import cheng/game/assets/semantic_video/validator
+import cheng/game/assets/semantic_video/writer
+import cheng/game/assets/semantic_video/source_index
+
+# B3 播放器 smoke (进程内断言, 不测 realtime):
+# 1) b2_sample.svblock+sample.mp4: 验证链全绿 (validate/manifest 恰 1/
+#    resCid[0] 源 CID/resCid[1] 重建索引 CID); query [0,14336) matched=14;
+#    query [0,7168) 条目 pts<7168 且升序; seek 7168 → kf_pts=0 且 readahead
+#    覆盖到目标样本; 证据抽检 (offset+size 界内且样本字节非全零)。
+# 2) b2_hgs.svblock+hgs_faststart.mp4: 验证链 ok; seek 10000000 →
+#    kf_pts=8000000 (第 4 关键帧); query [4e6,8e6) matched>0。
+# 3) 负例: sample.mp4 复制到 .scratch/b3/corrupt.mp4 翻转一个非零字节 →
+#    验证链必须在 resCid[0] 处拒绝。
+
+type
+    SvSmSeekResult =
+        ok: bool
+        kfPts: int64
+        kfSample: int32
+        targetSample: int32
+        intervalStart: int64
+        intervalEnd: int64
+        readaheadSamples: int32
+        readaheadBytes: int64
+
+# 二分下界: 首个 pts >= tick 的样本号。
+@borrows
+fn SvSmLowerBound(idx: source_index.SvSourceIndex, tick: int64): int32 =
+    var lo: int32 = 0
+    var hi: int32 = idx.sampleCount
+    while lo < hi:
+        let mid = (lo + hi) / 2
+        if idx.pts[mid] < tick:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+# query [t1,t2): 返回 matched (升序破坏返回 -1), outBytes 累计样本字节。
+@borrows
+fn SvSmQuery(idx: source_index.SvSourceIndex, t1: int64, t2: int64,
+             outBytes: var int64): int32 =
+    var matched: int32 = 0
+    outBytes = int64(0)
+    var at = SvSmLowerBound(idx, t1)
+    while at < idx.sampleCount && idx.pts[at] < t2:
+        if matched > 0 && idx.pts[at] <= idx.pts[at - 1]:
+            outBytes = int64(-1)
+            return -1
+        outBytes = outBytes + int64(idx.size[at])
+        matched = matched + 1
+        at = at + 1
+    return matched
+
+# seek: 覆盖 tick 的恢复单元 = 关键帧起始的 GOP 到 tick 所在样本。
+@borrows
+fn SvSmSeek(idx: source_index.SvSourceIndex, tick: int64,
+            timeEnd: int64): SvSmSeekResult =
+    var out: SvSmSeekResult
+    var target = SvSmLowerBound(idx, tick + int64(1)) - 1
+    if target < 0:
+        return out
+    var kf = target
+    while kf >= 0 && idx.key[kf] != 1:
+        kf = kf - 1
+    if kf < 0:
+        return out
+    var nextKf = kf + 1
+    while nextKf < idx.sampleCount && idx.key[nextKf] != 1:
+        nextKf = nextKf + 1
+    out.ok = true
+    out.kfPts = idx.pts[kf]
+    out.kfSample = kf
+    out.targetSample = target
+    out.intervalStart = idx.pts[kf]
+    if nextKf < idx.sampleCount:
+        out.intervalEnd = idx.pts[nextKf]
+    else:
+        out.intervalEnd = timeEnd
+    out.readaheadSamples = target - kf + 1
+    var total: int64 = int64(0)
+    for i in kf..target:
+        total = total + int64(idx.size[i])
+    out.readaheadBytes = total
+    return out
+
+# B3 验证链 (与 apps/semantic_player 同一序列, 进程内复算): 返回解析出的
+# manifest 与索引。失败即 assert 崩, 不降级。
+@borrows
+fn SvSmVerifyChain(blockBytes: rawbytes.Bytes,
+                   data: rawbytes.Bytes): schema.SvManifestRec =
+    var decoded = reader.SvReaderDecode(blockBytes)
+    assert(decoded.ok, schema.SvCat(" decode: ", decoded.error))
+    var parsed = reader.SvParseRecords(decoded.lines)
+    assert(parsed.ok, schema.SvCat(" parse: ", parsed.error))
+    var validation = validator.SvValidate(blockBytes)
+    assert(validation.ok, schema.SvCat(" validate: ", validation.error))
+    assert(parsed.records.manifests.len == 1, " manifest exactly 1")
+    let m = parsed.records.manifests[0]
+    assert(m.resCid.len == 2 && m.resLength.len == 2 && m.resType.len == 2,
+        " res arrays len 2")
+    assert(m.resType[0] == "video_sample" && m.resType[1] == "index",
+        " resType video_sample+index")
+    let sourceCid = writer.SvResourceCid(data)
+    assert(sourceCid == m.resCid[0], " source cid bound")
+    var idx = source_index.SvSourceIndexBuild(data)
+    assert(idx.ok, schema.SvCat(" index: ", idx.error))
+    var indexBytes = source_index.SvSourceIndexEncodeResource(idx)
+    let indexCid = writer.SvResourceCid(indexBytes)
+    assert(indexCid == m.resCid[1], " index cid bound")
+    assert(idx.timescale == m.tbDen, " index timescale == manifest tbDen")
+    return m
+
+fn main(): int32 =
+    # ---- 夹具 1: b2_sample ------------------------------------------------
+    let samplePath = "src/tests/network_milestone_assets/sample.mp4"
+    let blockResult = os.ReadFileBytesResult(
+        "docs/campaigns/2026-09-16-csg-semantic-video-standard/fixtures/b2_sample.svblock")
+    if result.IsErr(blockResult):
+        echo(" sv_b3 smoke FAIL: read b2_sample.svblock")
+        return 1
+    var blockBytes = result.Value(blockResult)
+    let fileResult = os.ReadFileBytesResult(samplePath)
+    if result.IsErr(fileResult):
+        echo(" sv_b3 smoke FAIL: read sample.mp4")
+        return 1
+    var data = result.Value(fileResult)
+
+    var m = SvSmVerifyChain(blockBytes, data)
+    var idx = source_index.SvSourceIndexBuild(data)
+    assert(idx.ok, " sample index")
+    assert(idx.sampleCount == 14, " sample count 14")
+    assert(idx.keyframeCount == 1, " sample keyframes 1")
+    assert(idx.timescale == 12288, " sample timescale 12288")
+    assert(m.timeEnd == int64(14336), " sample timeEnd 14336")
+    assert(m.timeStart == int64(0), " sample timeStart 0")
+    assert(idx.pts[0] == int64(0), " first pts 0")
+
+    var qBytes: int64 = int64(0)
+    let qAll = SvSmQuery(idx, int64(0), int64(14336), qBytes)
+    assert(qAll == 14, " query [0,14336) matched 14")
+    assert(qBytes > int64(0), " query total bytes positive")
+
+    var hBytes: int64 = int64(0)
+    let qHalf = SvSmQuery(idx, int64(0), int64(7168), hBytes)
+    assert(qHalf >= 1 && qHalf <= 13, " query [0,7168) nonempty subset")
+    assert(hBytes > int64(0) && hBytes <= qBytes, " half bytes subset")
+    var at = SvSmLowerBound(idx, int64(0))
+    var prev: int64 = int64(-1)
+    while at < idx.sampleCount && idx.pts[at] < int64(7168):
+        assert(idx.pts[at] > prev, " half entries pts ascending")
+        assert(idx.pts[at] < int64(7168), " half entries pts < 7168")
+        prev = idx.pts[at]
+        at = at + 1
+
+    var sk = SvSmSeek(idx, int64(7168), int64(14336))
+    assert(sk.ok, " sample seek ok")
+    assert(sk.kfSample == 0, " sample seek kf from sample 0")
+    assert(sk.kfPts == int64(0), " sample seek kf_pts 0")
+    assert(sk.readaheadSamples == sk.targetSample - sk.kfSample + 1,
+        " readahead covers target")
+    assert(sk.readaheadBytes > int64(0), " readahead bytes positive")
+    assert(sk.intervalStart == int64(0) && sk.intervalEnd == int64(14336),
+        " sample seek interval [0,14336)")
+
+    # 证据抽检: 中位与末样本 offset+size 界内且字节非全零。
+    var k = idx.sampleCount / 2
+    while true:
+        let off = idx.offset[k]
+        let sz = idx.size[k]
+        assert(off >= int64(0) && sz > 0 &&
+            off + int64(sz) <= int64(rawbytes.BytesLen(data)),
+            " evidence bounds")
+        let w = rawbytes.BytesGet(data, int32(off)) |
+            (rawbytes.BytesGet(data, int32(off) + 1) << 8) |
+            (rawbytes.BytesGet(data, int32(off) + 2) << 16) |
+            (rawbytes.BytesGet(data, int32(off) + 3) << 24)
+        assert(w != 0, " evidence bytes nonzero")
+        if k == idx.sampleCount - 1:
+            break
+        k = idx.sampleCount - 1
+
+    echo(" sv_b3 smoke: sample fixture ok")
+
+    # ---- 夹具 2: b2_hgs ---------------------------------------------------
+    let hgsPath = "src/tests/real_media_assets/hgs_faststart.mp4"
+    let hgsBlockResult = os.ReadFileBytesResult(
+        "docs/campaigns/2026-09-16-csg-semantic-video-standard/fixtures/b2_hgs.svblock")
+    if result.IsErr(hgsBlockResult):
+        echo(" sv_b3 smoke FAIL: read b2_hgs.svblock")
+        return 1
+    var hgsBlockBytes = result.Value(hgsBlockResult)
+    let hgsFileResult = os.ReadFileBytesResult(hgsPath)
+    if result.IsErr(hgsFileResult):
+        echo(" sv_b3 smoke FAIL: read hgs_faststart.mp4")
+        return 1
+    var hgsData = result.Value(hgsFileResult)
+
+    var m2 = SvSmVerifyChain(hgsBlockBytes, hgsData)
+    var idx2 = source_index.SvSourceIndexBuild(hgsData)
+    assert(idx2.ok, " hgs index")
+    assert(idx2.sampleCount == 675, " hgs count 675")
+    assert(idx2.keyframeCount == 6, " hgs keyframes 6")
+    assert(idx2.timescale == 1000000, " hgs timescale 1000000")
+    assert(m2.timeEnd == int64(22500000), " hgs timeEnd 22500000")
+
+    var sk2 = SvSmSeek(idx2, int64(10000000), int64(22500000))
+    assert(sk2.ok, " hgs seek ok")
+    assert(sk2.kfPts == int64(8000000), " hgs seek kf_pts 8000000")
+    assert(sk2.readaheadSamples >= 1, " hgs readahead covers target")
+
+    var gBytes: int64 = int64(0)
+    let qGop = SvSmQuery(idx2, int64(4000000), int64(8000000), gBytes)
+    assert(qGop > 0, " hgs query [4e6,8e6) matched > 0")
+    assert(gBytes > int64(0), " hgs query bytes > 0")
+
+    echo(" sv_b3 smoke: hgs fixture ok")
+
+    # ---- 负例: 翻转一个非零字节的拷贝必须被验证链拒绝 ---------------------
+    os.MkdirAll(".scratch/b3", 755)
+    var corrupt = result.Value(os.ReadFileBytesResult(samplePath))
+    var flipAt: int32 = -1
+    var i: int32 = 0
+    while i < rawbytes.BytesLen(corrupt):
+        if rawbytes.BytesGet(corrupt, i) != 0:
+            flipAt = i
+            i = rawbytes.BytesLen(corrupt)
+        else:
+            i = i + 1
+    assert(flipAt >= 0, " nonzero byte found")
+    let oldByte = rawbytes.BytesGet(corrupt, flipAt)
+    rawbytes.BytesSet(corrupt, flipAt, (oldByte + 1) & 255)
+    assert(rawbytes.BytesGet(corrupt, flipAt) != oldByte, " byte flipped")
+    var written = os.WriteFileBytesResult(".scratch/b3/corrupt.mp4", corrupt)
+    assert(!result.IsErr(written) && result.Value(written),
+        " corrupt copy written")
+    let backResult = os.ReadFileBytesResult(".scratch/b3/corrupt.mp4")
+    if result.IsErr(backResult):
+        echo(" sv_b3 smoke FAIL: read back corrupt copy")
+        return 1
+    var back = result.Value(backResult)
+    assert(rawbytes.BytesLen(back) == rawbytes.BytesLen(data),
+        " corrupt copy same size")
+    # 验证链在 resCid[0] 处必须拒绝 (源 CID 绑定被破坏), 不降级放行。
+    let corruptCid = writer.SvResourceCid(back)
+    assert(corruptCid != m.resCid[0], " corrupt rejected at source cid")
+
+    echo(" sv_b3_player_smoke ok")
+    return 0

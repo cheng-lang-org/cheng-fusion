@@ -1,0 +1,435 @@
+# lbm2d: deterministic lattice-Boltzmann ink-wash engine (宣纸水墨物理).
+# D2Q9, tau=1 moment-form BGK (maximal lattice viscosity -> laminar wash),
+# pure int32/int64 fixed-point. Models the real physics of ink on/in paper:
+#   - water field (lattice density) streams via LBM collide+stream
+#   - pigment is a passive scalar advected by the water velocity + diffusion
+#   - paper fiber map (deterministic lattice noise) resists flow locally
+#   - evaporation dries cells; drying cells deposit pigment permanently,
+#     so edge darkening (水渍痕/咖啡环) and granulation EMERGE from the model
+# Every step folds a receipt fingerprint (same replay discipline as physics2d).
+#
+# Units: distributions/density in Q12 (Lbm2dQ); velocity in Q8 lattice units
+# per tick, clamped to |u| <= 64 (0.25 lattice) for stability.
+
+const
+    Lbm2dQ = 4096
+    Lbm2dUQ = 256
+    Lbm2dUMax = 64
+    Lbm2dStatusOk = 1
+    Lbm2dStatusInvalidConfig = 2
+    Lbm2dSchema = 0x4C424D32
+
+type
+    Lbm2dWorld =
+        gridW: int32
+        gridH: int32
+        tick: int32
+        seed: int32
+        water: int32[]
+        momX: int32[]
+        momY: int32[]
+        pigment: int32[]
+        deposit: int32[]
+        fiber: int32[]
+        accWater: int32[]
+        accMomX: int32[]
+        accMomY: int32[]
+        accPigment: int32[]
+        activeIdx: int32[]
+        activeMark: int32[]
+        activeGen: int32
+        touchedIdx: int32[]
+        touchedMark: int32[]
+        touchedGen: int32
+        view: int32[]
+
+    Lbm2dConfig =
+        ambientWater: int32
+        evapNum: int32
+        evapDen: int32
+        dryThreshold: int32
+        depositNum: int32
+        depositDen: int32
+        pigmentDiffNum: int32
+        pigmentDiffDen: int32
+        fiberDragMax: int32
+        sinkForceQ8: int32
+
+    Lbm2dStepReceipt =
+        schema: int32
+        tick: int32
+        statusCode: int32
+        wetCells: int32
+        worldFingerprint: int32
+        receiptFingerprint: int32
+
+fn lbmMix(hash: int32, value: int32): int32 =
+    var mixed = hash * 31 + value
+    if mixed < 0:
+        mixed = 0 - mixed
+    return mixed
+
+fn lbmClamp(value: int32, lo: int32, hi: int32): int32 =
+    if value < lo:
+        return lo
+    if value > hi:
+        return hi
+    return value
+
+@borrows
+fn Lbm2dConfigValid(cfg: var Lbm2dConfig): bool =
+    if cfg.ambientWater <= 0:
+        return false
+    if cfg.evapDen <= 0 || cfg.evapNum < 0 || cfg.evapNum >= cfg.evapDen:
+        return false
+    if cfg.depositDen <= 0 || cfg.depositNum <= 0 || cfg.depositNum > cfg.depositDen:
+        return false
+    if cfg.pigmentDiffDen <= 0 || cfg.pigmentDiffNum < 0 || cfg.pigmentDiffNum * 4 >= cfg.pigmentDiffDen:
+        return false
+    if cfg.fiberDragMax < 0 || cfg.fiberDragMax > 200:
+        return false
+    return true
+
+fn Lbm2dInit(gridW: int32, gridH: int32, seed: int32, cfg: var Lbm2dConfig): Lbm2dWorld =
+    var world: Lbm2dWorld
+    world.gridW = gridW
+    world.gridH = gridH
+    world.tick = 0
+    world.seed = seed
+    world.water = []
+    world.momX = []
+    world.momY = []
+    world.pigment = []
+    world.deposit = []
+    world.fiber = []
+    world.accWater = []
+    world.accMomX = []
+    world.accMomY = []
+    world.accPigment = []
+    world.activeIdx = []
+    world.activeMark = []
+    world.activeGen = 1
+    world.touchedIdx = []
+    world.touchedMark = []
+    world.touchedGen = 1
+    let total = gridW * gridH
+    var i = 0
+    while i < total:
+        add(world.water, cfg.ambientWater)
+        add(world.momX, 0)
+        add(world.momY, 0)
+        add(world.pigment, 0)
+        add(world.deposit, 0)
+        var h = lbmMix(seed, i * 2654435761)
+        add(world.fiber, h % 64)
+        add(world.accWater, 0)
+        add(world.accMomX, 0)
+        add(world.accMomY, 0)
+        add(world.accPigment, 0)
+        add(world.activeMark, 0)
+        add(world.touchedMark, 0)
+        add(world.view, 0)
+        i = i + 1
+    return world
+
+# Inject a wet ink source (drop impact / plume column).
+fn Lbm2dInjectInk(world: var Lbm2dWorld,
+                  cellX: int32,
+                  cellY: int32,
+                  waterAdd: int32,
+                  pigmentAdd: int32,
+                  velXQ8: int32,
+                  velYQ8: int32) =
+    if cellX < 0 || cellY < 0 || cellX >= world.gridW || cellY >= world.gridH:
+        return
+    let idx = cellY * world.gridW + cellX
+    if world.activeMark[idx] != world.activeGen:
+        world.activeMark[idx] = world.activeGen
+        add(world.activeIdx, idx)
+    world.water[idx] = world.water[idx] + waterAdd
+    world.pigment[idx] = world.pigment[idx] + pigmentAdd
+    let vx = lbmClamp(velXQ8, 0 - Lbm2dUMax, Lbm2dUMax)
+    let vy = lbmClamp(velYQ8, 0 - Lbm2dUMax, Lbm2dUMax)
+    world.momX[idx] = world.momX[idx] + (waterAdd * vx) / Lbm2dUQ
+    world.momY[idx] = world.momY[idx] + (waterAdd * vy) / Lbm2dUQ
+
+@borrows
+fn lbmWorldFingerprint(world: Lbm2dWorld): int32 =
+    var hash = 2166136261
+    if hash < 0:
+        hash = 0 - hash
+    let total = world.gridW * world.gridH
+    var i = 0
+    while i < total:
+        hash = lbmMix(hash, world.water[i])
+        hash = lbmMix(hash, world.pigment[i])
+        hash = lbmMix(hash, world.deposit[i])
+        i = i + 1
+    return hash
+
+@borrows
+fn lbmReceiptFingerprint(receipt: Lbm2dStepReceipt): int32 =
+    var hash = 7
+    hash = lbmMix(hash, receipt.schema)
+    hash = lbmMix(hash, receipt.tick)
+    hash = lbmMix(hash, receipt.statusCode)
+    hash = lbmMix(hash, receipt.wetCells)
+    hash = lbmMix(hash, receipt.worldFingerprint)
+    return hash
+
+fn lbmTouch(world: var Lbm2dWorld, cfg: Lbm2dConfig, idx: int32) =
+    if world.touchedMark[idx] != world.touchedGen:
+        world.touchedMark[idx] = world.touchedGen
+        add(world.touchedIdx, idx)
+        world.accWater[idx] = cfg.ambientWater
+        world.accMomX[idx] = 0
+        world.accMomY[idx] = 0
+        world.accPigment[idx] = 0
+
+fn Lbm2dStep(world: var Lbm2dWorld, cfg: var Lbm2dConfig): Lbm2dStepReceipt =
+    var receipt: Lbm2dStepReceipt
+    receipt.schema = Lbm2dSchema
+    receipt.statusCode = Lbm2dStatusOk
+    if !Lbm2dConfigValid(cfg):
+        receipt.statusCode = Lbm2dStatusInvalidConfig
+        receipt.tick = world.tick
+        receipt.worldFingerprint = lbmWorldFingerprint(world)
+        receipt.receiptFingerprint = lbmReceiptFingerprint(receipt)
+        return receipt
+    world.tick = world.tick + 1
+    let w = world.gridW
+    let h = world.gridH
+
+    # lazy accumulator prefill: a cell is initialized on first touch this step
+    world.touchedGen = world.touchedGen + 1
+    world.touchedIdx = []
+
+    # collide (tau=1) + stream over the active (non-rest) cells only
+    var ai = 0
+    let activeCount = world.activeIdx.len
+    while ai < activeCount:
+        if true:
+            let idx = world.activeIdx[ai]
+            let y = idx / w
+            let x = idx - y * w
+            let rho = world.water[idx]
+            let isRest = rho == cfg.ambientWater && world.momX[idx] == 0 && world.momY[idx] == 0
+            if rho > 0 && !isRest:
+                let drag = (world.fiber[idx] * cfg.fiberDragMax) / 64
+                var ux = (world.momX[idx] * Lbm2dUQ) / rho
+                var uy = (world.momY[idx] * Lbm2dUQ + cfg.sinkForceQ8 * Lbm2dUQ / 64) / rho
+                ux = (ux * (256 - drag)) / 256
+                uy = (uy * (256 - drag)) / 256
+                ux = lbmClamp(ux, 0 - Lbm2dUMax, Lbm2dUMax)
+                uy = lbmClamp(uy, 0 - Lbm2dUMax, Lbm2dUMax)
+                let usq3 = (3 * (ux * ux + uy * uy)) / (2 * Lbm2dUQ)
+                var dir = 0
+                while dir < 9:
+                    var ex = 0
+                    var ey = 0
+                    var wgt = 16
+                    if dir == 1:
+                        ex = 1
+                        wgt = 4
+                    elif dir == 2:
+                        ex = 0 - 1
+                        wgt = 4
+                    elif dir == 3:
+                        ey = 1
+                        wgt = 4
+                    elif dir == 4:
+                        ey = 0 - 1
+                        wgt = 4
+                    elif dir == 5:
+                        ex = 1
+                        ey = 1
+                        wgt = 1
+                    elif dir == 6:
+                        ex = 0 - 1
+                        ey = 1
+                        wgt = 1
+                    elif dir == 7:
+                        ex = 1
+                        ey = 0 - 1
+                        wgt = 1
+                    elif dir == 8:
+                        ex = 0 - 1
+                        ey = 0 - 1
+                        wgt = 1
+                    let eu = ex * ux + ey * uy
+                    var bracket = Lbm2dUQ + 3 * eu + (9 * eu * eu) / (2 * Lbm2dUQ) - usq3
+                    if bracket < 0:
+                        bracket = 0
+                    let feq = int32((int64(wgt) * int64(rho) * int64(bracket)) / int64(36 * Lbm2dUQ))
+                    let deltaFeq = feq - (wgt * cfg.ambientWater) / 36
+                    var tx = x + ex
+                    var ty = y + ey
+                    var bounce = false
+                    if tx < 0 || tx >= w || ty < 0 || ty >= h:
+                        bounce = true
+                        tx = x
+                        ty = y
+                    let tidx = ty * w + tx
+                    lbmTouch(world, cfg, tidx)
+                    world.accWater[tidx] = world.accWater[tidx] + deltaFeq
+                    if bounce:
+                        world.accMomX[tidx] = world.accMomX[tidx] - (deltaFeq * ex)
+                        world.accMomY[tidx] = world.accMomY[tidx] - (deltaFeq * ey)
+                    else:
+                        world.accMomX[tidx] = world.accMomX[tidx] + (deltaFeq * ex)
+                        world.accMomY[tidx] = world.accMomY[tidx] + (deltaFeq * ey)
+                    dir = dir + 1
+                let pig = world.pigment[idx]
+                if pig > 0:
+                    var stay = pig
+                    let fluxX = (pig * ux) / (Lbm2dUQ * 2)
+                    let fluxY = (pig * uy) / (Lbm2dUQ * 2)
+                    let diffuse = (pig * cfg.pigmentDiffNum) / cfg.pigmentDiffDen
+                    var dx = 1
+                    if fluxX < 0:
+                        dx = 0 - 1
+                    var dy = 1
+                    if fluxY < 0:
+                        dy = 0 - 1
+                    var ax = fluxX
+                    if ax < 0:
+                        ax = 0 - ax
+                    var ay = fluxY
+                    if ay < 0:
+                        ay = 0 - ay
+                    if x + dx >= 0 && x + dx < w && ax > 0:
+                        lbmTouch(world, cfg, idx + dx)
+                        world.accPigment[idx + dx] = world.accPigment[idx + dx] + ax
+                        stay = stay - ax
+                    if y + dy >= 0 && y + dy < h && ay > 0:
+                        lbmTouch(world, cfg, idx + dy * w)
+                        world.accPigment[idx + dy * w] = world.accPigment[idx + dy * w] + ay
+                        stay = stay - ay
+                    var side = 0
+                    while side < 4:
+                        var nx = x
+                        var ny = y
+                        if side == 0:
+                            nx = x + 1
+                        elif side == 1:
+                            nx = x - 1
+                        elif side == 2:
+                            ny = y + 1
+                        else:
+                            ny = y - 1
+                        if nx >= 0 && nx < w && ny >= 0 && ny < h && diffuse > 0:
+                            lbmTouch(world, cfg, ny * w + nx)
+                            world.accPigment[ny * w + nx] = world.accPigment[ny * w + nx] + diffuse
+                            stay = stay - diffuse
+                        side = side + 1
+                    if stay > 0:
+                        lbmTouch(world, cfg, idx)
+                        world.accPigment[idx] = world.accPigment[idx] + stay
+            elif world.pigment[idx] > 0:
+                let pigR = world.pigment[idx]
+                var stayR = pigR
+                let diffuseR = (pigR * cfg.pigmentDiffNum) / cfg.pigmentDiffDen
+                var sideR = 0
+                while sideR < 4:
+                    var nxR = x
+                    var nyR = y
+                    if sideR == 0:
+                        nxR = x + 1
+                    elif sideR == 1:
+                        nxR = x - 1
+                    elif sideR == 2:
+                        nyR = y + 1
+                    else:
+                        nyR = y - 1
+                    if nxR >= 0 && nxR < w && nyR >= 0 && nyR < h && diffuseR > 0:
+                        lbmTouch(world, cfg, nyR * w + nxR)
+                        world.accPigment[nyR * w + nxR] = world.accPigment[nyR * w + nxR] + diffuseR
+                        stayR = stayR - diffuseR
+                    sideR = sideR + 1
+                if stayR > 0:
+                    lbmTouch(world, cfg, idx)
+                    world.accPigment[idx] = world.accPigment[idx] + stayR
+        ai = ai + 1
+
+    # gather + evaporation + deposition + view + fingerprint, touched cells only
+    world.activeGen = world.activeGen + 1
+    world.activeIdx = []
+    var wetCells = 0
+    var fold = 16777619
+    var g = 0
+    let touchedCount = world.touchedIdx.len
+    while g < touchedCount:
+        let i = world.touchedIdx[g]
+        var waterNew = world.accWater[i]
+        if waterNew > cfg.ambientWater:
+            waterNew = cfg.ambientWater + ((waterNew - cfg.ambientWater) * (cfg.evapDen - cfg.evapNum)) / cfg.evapDen
+        var momXNew = world.accMomX[i]
+        var momYNew = world.accMomY[i]
+        var dw = waterNew - cfg.ambientWater
+        if dw < 0:
+            dw = 0 - dw
+        var amx = momXNew
+        if amx < 0:
+            amx = 0 - amx
+        var amy = momYNew
+        if amy < 0:
+            amy = 0 - amy
+        if dw <= 6 && amx <= 2 && amy <= 2:
+            waterNew = cfg.ambientWater
+            momXNew = 0
+            momYNew = 0
+        world.water[i] = waterNew
+        world.momX[i] = momXNew
+        world.momY[i] = momYNew
+        var pig = world.accPigment[i]
+        if pig > 0:
+            let wet = waterNew - cfg.ambientWater
+            if wet < cfg.dryThreshold:
+                var dep = (pig * cfg.depositNum) / cfg.depositDen
+                if dep <= 0 && pig > 0:
+                    dep = 1
+                world.deposit[i] = world.deposit[i] + dep
+                pig = pig - dep
+        world.pigment[i] = pig
+        var viewV = (pig * 320) / Lbm2dQ + (world.deposit[i] * 360) / Lbm2dQ
+        if viewV > 255:
+            viewV = 255
+        world.view[i] = viewV
+        if waterNew != cfg.ambientWater || momXNew != 0 || momYNew != 0 || pig > 0:
+            if world.activeMark[i] != world.activeGen:
+                world.activeMark[i] = world.activeGen
+                add(world.activeIdx, i)
+        if waterNew > cfg.ambientWater + cfg.dryThreshold:
+            wetCells = wetCells + 1
+        fold = lbmMix(fold, i)
+        fold = lbmMix(fold, waterNew)
+        fold = lbmMix(fold, pig)
+        fold = lbmMix(fold, world.deposit[i])
+        g = g + 1
+
+    receipt.tick = world.tick
+    receipt.wetCells = wetCells
+    receipt.worldFingerprint = fold
+    receipt.receiptFingerprint = lbmReceiptFingerprint(receipt)
+    return receipt
+
+@borrows
+fn Lbm2dReceiptValid(receipt: Lbm2dStepReceipt): bool =
+    if receipt.statusCode != Lbm2dStatusOk:
+        return false
+    if receipt.receiptFingerprint != lbmReceiptFingerprint(receipt):
+        return false
+    return true
+
+@borrows
+fn Lbm2dRequireValid(receipt: Lbm2dStepReceipt) =
+    if !Lbm2dReceiptValid(receipt):
+        panic("lbm2d: invalid step receipt")
+
+# Visible ink intensity for a cell, 0..255 (pigment in suspension + deposit).
+@borrows
+fn Lbm2dInkAt(world: Lbm2dWorld, idx: int32): int32 =
+    if idx < 0 || idx >= world.gridW * world.gridH:
+        return 0
+    let v = (world.pigment[idx] * 320) / Lbm2dQ + (world.deposit[idx] * 360) / Lbm2dQ
+    return lbmClamp(v, 0, 255)

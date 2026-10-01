@@ -1,0 +1,869 @@
+import std/result
+import std/hashmaps
+import std/seqs
+import std/buffer
+import std/strings
+
+const
+    # InternPool arm64 payload outside texts' seq header and index columns:
+    # scalar state is 72 bytes (56 legacy + indexMask 8 + indexUsed 4 + pad 4)
+    # and four 24-byte owner slots are 96 bytes. Allocator headers remain
+    # outside this structured retained-byte contract.
+    InternPoolA64InlineFieldBytes: int64 = 168
+    InternPoolOwnerActive: int32 = 0
+    InternPoolOwnerReleased: int32 = 1
+    InternPoolDefaultEntryLimit: int32 = 64
+
+type
+    InternId = int32
+
+    InternPoolOwnedBufferState =
+        # Private physical sequence-buffer identity. Public receipts expose
+        # only monotonic ids, never the raw address.
+        allocationId: int64
+        lastFreedAllocationId: int64
+        bufferRaw: uint64
+
+    # Index storage is three flat columns plus mask/used scalars instead of an
+    # embedded HashMapStrInt aggregate. Two constraints force this shape (see
+    # findings.md 2026-08-13 聚合字段 take 案卷 + repro_flatcols_d2):
+    #   1. aggregate-field take through a ref object is outside the cold
+    #      backend's staged take scope (bit-copy without source clear =>
+    #      double-owner release at exit), and
+    #   2. only str[]/int32[] element kinds take correctly through the
+    #      hoist/write-back idiom; uint8[]/uint64[] columns corrupt the same
+    #      way.
+    # Hence every column is a staged-safe kind: states/occupied are int32[]
+    # (0/1 states; occupied-slot directory), and no hash column is stored --
+    # probe start slots hash the query text on the fly and occupied probes
+    # compare texts exactly. No key column is stored either (BIGSRC-SPLIT
+    # 2026-09-09): keys[slot] was the same shared handle as
+    # texts[vals[slot]], so occupied probes compare texts[vals[slot]] and
+    # the 24-byte str header per slot is gone from every pool.
+    InternPool = ref object
+        texts: str[]
+        indexVals: int32[]
+        indexStates: int32[]
+        indexOccupied: int32[]
+        emptyId: InternId = -1
+        logicalPayloadBytes: int64
+        ownerLifecycleState: int32
+        ownerNextAllocationId: int64
+        ownerAllocationCount: int64
+        ownerFreeCount: int64
+        ownerLiveCount: int64
+        textsOwner: InternPoolOwnedBufferState
+        indexValsOwner: InternPoolOwnedBufferState
+        indexStatesOwner: InternPoolOwnedBufferState
+        indexOccupiedOwner: InternPoolOwnedBufferState
+        indexMask: uint64
+        indexUsed: int32
+
+    InternPoolOwnerReceipt =
+        # Covers the four owned sequence buffers: texts plus the three index
+        # columns. String payload bytes remain in logicalPayloadBytes.
+        lifecycleState: int32
+        nextAllocationId: int64
+        allocationCount: int64
+        freeCount: int64
+        liveCount: int64
+        textsAllocationId: int64
+        textsLastFreedAllocationId: int64
+        indexValsAllocationId: int64
+        indexValsLastFreedAllocationId: int64
+        indexStatesAllocationId: int64
+        indexStatesLastFreedAllocationId: int64
+        indexOccupiedAllocationId: int64
+        indexOccupiedLastFreedAllocationId: int64
+
+    # Caller-owned receipt for proving lookup complexity without mutating the
+    # pool or relying on wall-clock thresholds.
+    InternLookupProbe =
+        queryCount: int64
+        bucketLookupCount: int64
+        emptyLookupCount: int64
+        linearTextScanStepCount: int64
+
+    InternPoolResetProbe =
+        indexOccupiedTailReadCount: int64
+        indexBucketReadCount: int64
+        indexOccupiedSlotVisitCount: int64
+        textSlotVisitCount: int64
+        indexCapacityBefore: int32
+        indexCapacityAfter: int32
+        textCapacityBefore: int32
+        textCapacityAfter: int32
+        retainedEntryLimit: int32
+        retainedIndexCapacityLimit: int32
+        retainedIndexStateCapacityLimit: int32
+        retainedTextCapacityLimit: int32
+        indexStateCapacityBefore: int32
+        indexStateCapacityAfter: int32
+        retainedIndexByteLimit: int64
+        indexRetainedBytesBefore: int64
+        indexRetainedBytesAfter: int64
+        indexRebuilt: bool
+        textStorageReleased: bool
+
+    InternPoolRetainedByteReport =
+        textSequenceHeaderBytes: int64
+        poolInlineFieldBytes: int64
+        textSlotBytes: int64
+        indexBytes: int64
+        structuredBytes: int64
+        logicalPayloadBytes: int64
+
+fn InvalidInternId(): InternId =
+    return -1
+
+@borrows
+fn internPoolRequireActive(pool: InternPool) =
+    if pool == nil:
+        panic("intern: pool is nil")
+    if pool.ownerLifecycleState != InternPoolOwnerActive:
+        panic("intern: pool already released")
+
+@borrows
+fn internPoolObserveOwnedBuffer(pool: InternPool,
+                                state: var InternPoolOwnedBufferState,
+                                newBufferRaw: uint64,
+                                ownerName: str) =
+    if state.bufferRaw == newBufferRaw:
+        if (newBufferRaw == uint64(0) && state.allocationId != Int64(0)) ||
+           (newBufferRaw != uint64(0) && state.allocationId <= Int64(0)):
+            panic(Fmt"intern: owner identity mismatch owner={ownerName}")
+        return
+    if state.bufferRaw != uint64(0):
+        if state.allocationId <= Int64(0) || pool.ownerLiveCount <= Int64(0):
+            panic(Fmt"intern: owner free state mismatch owner={ownerName}")
+        if pool.ownerFreeCount >= Int64(9223372036854775807):
+            panic("intern: owner free count overflow")
+        state.lastFreedAllocationId = state.allocationId
+        state.allocationId = Int64(0)
+        state.bufferRaw = uint64(0)
+        pool.ownerFreeCount = pool.ownerFreeCount + Int64(1)
+        pool.ownerLiveCount = pool.ownerLiveCount - Int64(1)
+    if newBufferRaw != uint64(0):
+        if pool.ownerNextAllocationId <= Int64(0) ||
+           pool.ownerNextAllocationId >= Int64(9223372036854775807) ||
+           pool.ownerAllocationCount >= Int64(9223372036854775807) ||
+           pool.ownerLiveCount >= Int64(5):
+            panic("intern: owner allocation state overflow")
+        state.allocationId = pool.ownerNextAllocationId
+        state.bufferRaw = newBufferRaw
+        pool.ownerNextAllocationId = pool.ownerNextAllocationId + Int64(1)
+        pool.ownerAllocationCount = pool.ownerAllocationCount + Int64(1)
+        pool.ownerLiveCount = pool.ownerLiveCount + Int64(1)
+
+@borrows
+fn internPoolValidateOwnerState(pool: InternPool) =
+    if pool.ownerAllocationCount < Int64(0) ||
+       pool.ownerFreeCount < Int64(0) ||
+       pool.ownerLiveCount < Int64(0) ||
+       pool.ownerLiveCount > Int64(4) ||
+       pool.ownerAllocationCount - pool.ownerFreeCount !=
+           pool.ownerLiveCount ||
+       pool.ownerNextAllocationId != pool.ownerAllocationCount + Int64(1):
+        panic("intern: owner ledger balance mismatch")
+    var liveFromSlots: int64
+    if pool.textsOwner.allocationId > Int64(0):
+        liveFromSlots = liveFromSlots + Int64(1)
+    if pool.indexValsOwner.allocationId > Int64(0):
+        liveFromSlots = liveFromSlots + Int64(1)
+    if pool.indexStatesOwner.allocationId > Int64(0):
+        liveFromSlots = liveFromSlots + Int64(1)
+    if pool.indexOccupiedOwner.allocationId > Int64(0):
+        liveFromSlots = liveFromSlots + Int64(1)
+    if liveFromSlots != pool.ownerLiveCount:
+        panic("intern: owner ledger live slot mismatch")
+    if pool.ownerLifecycleState == InternPoolOwnerReleased &&
+       pool.ownerLiveCount != Int64(0):
+        panic("intern: released pool still owns buffers")
+    if pool.ownerLifecycleState != InternPoolOwnerActive &&
+       pool.ownerLifecycleState != InternPoolOwnerReleased:
+        panic("intern: owner lifecycle state invalid")
+
+@borrows
+fn internPoolSyncTextOwner(pool: InternPool) =
+    var textsOwner = pool.textsOwner
+    internPoolObserveOwnedBuffer(pool,
+                                 textsOwner,
+                                 uint64(pool.texts.buffer),
+                                 "texts")
+    pool.textsOwner = textsOwner
+
+@borrows
+fn internPoolSyncIndexOwners(pool: InternPool) =
+    var indexValsOwner = pool.indexValsOwner
+    internPoolObserveOwnedBuffer(pool,
+                                 indexValsOwner,
+                                 uint64(pool.indexVals.buffer),
+                                 "index_vals")
+    pool.indexValsOwner = indexValsOwner
+    var indexStatesOwner = pool.indexStatesOwner
+    internPoolObserveOwnedBuffer(pool,
+                                 indexStatesOwner,
+                                 uint64(pool.indexStates.buffer),
+                                 "index_states")
+    pool.indexStatesOwner = indexStatesOwner
+    var indexOccupiedOwner = pool.indexOccupiedOwner
+    internPoolObserveOwnedBuffer(pool,
+                                 indexOccupiedOwner,
+                                 uint64(pool.indexOccupied.buffer),
+                                 "index_occupied")
+    pool.indexOccupiedOwner = indexOccupiedOwner
+
+fn internPoolSyncOwnedBuffers(pool: var InternPool) =
+    if pool == nil:
+        return
+    internPoolSyncTextOwner(pool)
+    internPoolSyncIndexOwners(pool)
+    internPoolValidateOwnerState(pool)
+
+# ---- flat index column machinery (staged-safe kinds only) ----
+
+fn internPoolIndexCapacityForEntryLimit(entryLimit: int32): int32 =
+    if entryLimit < 0:
+        panic("intern: entry limit must be non-negative")
+    if entryLimit > 536870912:
+        panic("intern: entry limit too large")
+    return hashmaps.HashMapNextPow2(entryLimit * 2, 8)
+
+@borrows
+fn internPoolIndexInitColumns(pool: InternPool, cap0: int32) =
+    let cap = hashmaps.HashMapNextPow2(cap0, 8)
+    var vals: int32[]
+    seqs.setLen(vals, cap)
+    var states: int32[]
+    seqs.setLen(states, cap)
+    var occupied: int32[]
+    seqs.setLen(occupied, cap)
+    for i in 0..<cap:
+        vals[i] = 0
+        states[i] = 0
+        occupied[i] = 0
+    pool.indexVals = vals
+    pool.indexStates = states
+    pool.indexOccupied = occupied
+    pool.indexMask = uint64(cap - 1)
+    pool.indexUsed = 0
+
+@borrows
+fn internPoolTextHash(text: str): uint64 =
+    var hashValue =
+        (uint64(1469598103) * uint64(1000000000)) + uint64(934665603)
+    for index in 0..<text.len:
+        let byteValue = uint64(Int32(text[index]) & 255)
+        hashValue = hashValue ^ byteValue
+        hashValue = hashValue *
+            ((uint64(1099511628) * uint64(1000)) + uint64(211))
+    return hashValue
+
+@borrows
+fn InternPoolTextHash(text: str): uint64 =
+    return internPoolTextHash(text)
+
+@borrows
+fn internPoolTextExact(left: str, right: str): bool =
+    if left.len != right.len:
+        return false
+    for index in 0..<left.len:
+        if left[index] != right[index]:
+            return false
+    return true
+
+@borrows
+fn InternPoolTextExact(left: str, right: str): bool =
+    return internPoolTextExact(left, right)
+
+# Insert one intern id mapping to `id` for `text`. Double-hash probe
+# from the FNV-1a-64 start slot, 87.5% load-factor doubling (2026-09-08 memory
+# knife: 50% growth made the line pool index land on 2^21 slots for the
+# 580k-line kernel closure; 75% kept it on 2^20; 87.5% keeps the kernel
+# closure at 2^19, saving another ~12MB of private resident bytes with
+# identical intern-id assignment order). All mutation happens on hoisted
+# locals (one-hop take + write-back of staged-safe columns, direct index
+# stores only); growth rebuilds fresh local columns rehashing the texts
+# addressed by vals (BIGSRC-SPLIT 2026-09-09: no key column is stored --
+# keys[slot] was the same shared handle as texts[vals[slot]], so probes and
+# rehash read the canonical text through texts[vals[slot]] directly).
+@borrows
+fn internPoolIndexPutOwnedCopy(pool: InternPool, text: str, id: int32) =
+    if text.len <= 0:
+        panic("intern: index put requires non-empty text")
+    # share-take: the only hoist idiom whose runtime ownership balances for
+    # live buffers (plain field take bit-copies without clearing the source;
+    # see findings.md 2026-08-13 案卷 + repro_flatcols_d3/d8).
+    var vals = share(pool.indexVals)
+    pool.indexVals = []
+    var states = share(pool.indexStates)
+    pool.indexStates = []
+    var occupied = share(pool.indexOccupied)
+    pool.indexOccupied = []
+    var mask = pool.indexMask
+    var used = pool.indexUsed
+    if mask == uint64(0):
+        panic("intern: index put on uninitialized columns")
+    var cap = vals.len
+    if cap <= 0 || states.len != cap ||
+       occupied.len != cap ||
+       mask != uint64(cap - 1) || used < 0 || used > cap:
+        panic("intern: index put storage invariant failed")
+    if (used + 1) * 8 >= cap * 7:
+        let nextCap = hashmaps.HashMapNextPow2(cap * 2, 8)
+        var nextVals: int32[]
+        seqs.setLen(nextVals, nextCap)
+        var nextStates: int32[]
+        seqs.setLen(nextStates, nextCap)
+        var nextOccupied: int32[]
+        seqs.setLen(nextOccupied, nextCap)
+        for i in 0..<nextCap:
+            nextVals[i] = 0
+            nextStates[i] = 0
+            nextOccupied[i] = 0
+        let nextMask = uint64(nextCap - 1)
+        var nextUsed: int32
+        for occupiedIndex in 0..<used:
+            let oldSlot = occupied[occupiedIndex]
+            if oldSlot < 0 || oldSlot >= cap || states[oldSlot] != 1:
+                panic("intern: index grow occupied slot state mismatch")
+            let movedText = LookupInternShared(pool, vals[oldSlot])
+            let movedHash = internPoolTextHash(movedText)
+            let movedStep = int32(movedHash >> 32) | 1
+            var probeSlot = int32(movedHash & nextMask)
+            var placed = false
+            for scanIndex in 0..<nextCap:
+                if nextStates[probeSlot] == 0:
+                    nextVals[probeSlot] = vals[oldSlot]
+                    nextStates[probeSlot] = 1
+                    nextOccupied[nextUsed] = probeSlot
+                    nextUsed = nextUsed + 1
+                    placed = true
+                    break
+                probeSlot = int32((uint64(probeSlot) + uint64(movedStep)) &
+                                  nextMask)
+            if !placed:
+                panic("intern: index grow rehash overflow")
+        vals = nextVals
+        states = nextStates
+        occupied = nextOccupied
+        mask = nextMask
+        used = nextUsed
+        cap = nextCap
+    let hashValue = internPoolTextHash(text)
+    let step = int32(hashValue >> 32) | 1
+    var slot = int32(hashValue & mask)
+    var inserted = false
+    for scanIndex in 0..<cap:
+        let state = states[slot]
+        if state == 0:
+            vals[slot] = id
+            states[slot] = 1
+            occupied[used] = slot
+            used = used + 1
+            inserted = true
+            break
+        if state != 1:
+            panic("intern: index put state invalid")
+        let slotText = LookupInternShared(pool, vals[slot])
+        if internPoolTextExact(slotText, text):
+            vals[slot] = id
+            inserted = true
+            break
+        slot = int32((uint64(slot) + uint64(step)) & mask)
+    if !inserted:
+        panic("intern: index put probe overflow")
+    pool.indexVals = vals
+    vals = []
+    pool.indexStates = states
+    states = []
+    pool.indexOccupied = occupied
+    occupied = []
+    pool.indexMask = mask
+    pool.indexUsed = used
+
+# Zero every occupied slot (contents cleared, capacity retained). Probe
+# counter semantics mirror the retired HashMapStrInt clear: one directory
+# read plus one bucket state read plus one visit per occupied slot.
+@borrows
+fn internPoolIndexClearRetaining(pool: InternPool,
+                                 occupiedTailReadCount: var int64,
+                                 bucketReadCount: var int64,
+                                 occupiedSlotVisitCount: var int64) =
+    occupiedTailReadCount = Int64(0)
+    bucketReadCount = Int64(0)
+    occupiedSlotVisitCount = Int64(0)
+    var vals = share(pool.indexVals)
+    pool.indexVals = []
+    var states = share(pool.indexStates)
+    pool.indexStates = []
+    var occupied = share(pool.indexOccupied)
+    pool.indexOccupied = []
+    var used = pool.indexUsed
+    let cap = vals.len
+    if cap <= 0:
+        pool.indexMask = uint64(0)
+        pool.indexUsed = 0
+        pool.indexVals = vals
+        pool.indexStates = states
+        pool.indexOccupied = occupied
+        return
+    if states.len != cap || occupied.len != cap ||
+       pool.indexMask != uint64(cap - 1) ||
+       used < 0 || used > cap:
+        panic("intern: index clear storage invariant failed")
+    for occupiedIndex in 0..<used:
+        let slot = occupied[occupiedIndex]
+        occupiedTailReadCount = occupiedTailReadCount + Int64(1)
+        if slot < 0 || slot >= cap:
+            panic("intern: index clear occupied slot corrupt")
+        let occupiedState = states[slot]
+        bucketReadCount = bucketReadCount + Int64(1)
+        if occupiedState != 1:
+            panic("intern: index clear occupied slot state mismatch")
+        vals[slot] = 0
+        states[slot] = 0
+        occupied[occupiedIndex] = 0
+        occupiedSlotVisitCount = occupiedSlotVisitCount + Int64(1)
+    pool.indexUsed = 0
+    pool.indexVals = vals
+    vals = []
+    pool.indexStates = states
+    states = []
+    pool.indexOccupied = occupied
+    occupied = []
+
+@borrows
+fn internPoolIndexRetainedBytes(pool: InternPool): int64 =
+    # Truthful structural accounting for the flat columns: three sequence
+    # headers plus per-column slot storage. mask/used live in the pool's
+    # inline field bytes.
+    return Int64(3) * hashmaps.ChengA64SequenceHeaderBytes +
+           Int64(pool.indexVals.cap) * Int64(4) +
+           Int64(pool.indexStates.cap) * Int64(4) +
+           Int64(pool.indexOccupied.cap) * Int64(4)
+
+fn InternPoolOwnerReceiptRead(pool: var InternPool): InternPoolOwnerReceipt =
+    var out: InternPoolOwnerReceipt
+    if pool == nil:
+        return out
+    internPoolSyncOwnedBuffers(pool)
+    out.lifecycleState = pool.ownerLifecycleState
+    out.nextAllocationId = pool.ownerNextAllocationId
+    out.allocationCount = pool.ownerAllocationCount
+    out.freeCount = pool.ownerFreeCount
+    out.liveCount = pool.ownerLiveCount
+    out.textsAllocationId = pool.textsOwner.allocationId
+    out.textsLastFreedAllocationId =
+        pool.textsOwner.lastFreedAllocationId
+    out.indexValsAllocationId = pool.indexValsOwner.allocationId
+    out.indexValsLastFreedAllocationId =
+        pool.indexValsOwner.lastFreedAllocationId
+    out.indexStatesAllocationId = pool.indexStatesOwner.allocationId
+    out.indexStatesLastFreedAllocationId =
+        pool.indexStatesOwner.lastFreedAllocationId
+    out.indexOccupiedAllocationId = pool.indexOccupiedOwner.allocationId
+    out.indexOccupiedLastFreedAllocationId =
+        pool.indexOccupiedOwner.lastFreedAllocationId
+    return out
+
+fn InternPoolNew(entryLimit: int32 = 64): InternPool =
+    var out: InternPool = new(InternPool)
+    out.texts = []
+    internPoolIndexInitColumns(
+        out, internPoolIndexCapacityForEntryLimit(entryLimit))
+    out.emptyId = InvalidInternId()
+    out.ownerLifecycleState = InternPoolOwnerActive
+    out.ownerNextAllocationId = Int64(1)
+    internPoolSyncOwnedBuffers(out)
+    return out
+
+@borrows
+fn InternPoolCount(pool: InternPool): int32 =
+    return pool.texts.len
+
+@borrows
+fn InternPoolLogicalPayloadBytes(pool: InternPool): int64 =
+    if pool == nil:
+        return Int64(0)
+    return pool.logicalPayloadBytes
+
+@borrows
+fn InternPoolRetainedBytes(pool: InternPool): InternPoolRetainedByteReport =
+    var out: InternPoolRetainedByteReport
+    if pool == nil:
+        return out
+    out.textSequenceHeaderBytes = hashmaps.ChengA64SequenceHeaderBytes
+    out.poolInlineFieldBytes = InternPoolA64InlineFieldBytes
+    out.textSlotBytes = Int64(pool.texts.cap) *
+                        hashmaps.ChengA64StringSlotBytes
+    out.indexBytes = internPoolIndexRetainedBytes(pool)
+    out.structuredBytes = out.textSequenceHeaderBytes +
+                          out.poolInlineFieldBytes +
+                          out.textSlotBytes + out.indexBytes
+    out.logicalPayloadBytes = pool.logicalPayloadBytes
+    return out
+
+fn InternPoolReleaseIndex(pool: var InternPool) =
+    internPoolRequireActive(pool)
+    var tailReads: int64
+    var bucketReads: int64
+    var slotVisits: int64
+    internPoolIndexClearRetaining(pool, tailReads, bucketReads, slotVisits)
+
+# [MEM-EXACT] 释放哈希索引存储但保留 texts: 索引只在 Intern/FindInternId
+# 插入查询期需要; 相位后只按 InternId 直查 texts 的消费者可提前归还索引
+# (kernel line pool 索引 ~14-29MB, 是 metadata 相 resident 峰的主要固定项).
+@borrows
+fn InternPoolReleaseIndexStorage(pool: var InternPool) =
+    internPoolRequireActive(pool)
+    internPoolReleaseIndexStorage(pool)
+
+# [MEM-EXACT] Shrink the texts slot array to its exact live length. The pool
+# grows texts by add(); after the line-intern phase the capacity can be up to
+# 2x the unique line count and is retained through metadata. Rebuild the slot
+# array at exact length (shallow string retain) and release the old buffer.
+@borrows
+fn InternPoolShrinkTextStorage(pool: var InternPool) =
+    internPoolRequireActive(pool)
+    let exactLen = pool.texts.len
+    if exactLen <= 0 || pool.texts.cap <= exactLen:
+        return
+    var oldTexts = share(pool.texts)
+    var newTexts: str[]
+    seqs.setLen(newTexts, exactLen)
+    for textIndex in 0..<exactLen:
+        newTexts[textIndex] = share(oldTexts[textIndex])
+    pool.texts = newTexts
+    internPoolSyncTextOwner(pool)
+    seqs.freeSeqStrRelease(oldTexts)
+
+# [MEM-EXACT] 按 InternId 清空单个文本槽 (流式释放: 最后一位消费者用完后
+# 归还行文本 payload, texts 数组容量保留). 已清空/越界为幂等 no-op.
+@borrows
+fn InternPoolClearTextAt(pool: InternPool, id: InternId) =
+    internPoolRequireActive(pool)
+    if id < 0 || id >= pool.texts.len:
+        return
+    let text = share(pool.texts[id])
+    let textBytes = Int64(len(text))
+    pool.texts[id] = ""
+    if textBytes > 0:
+        if pool.logicalPayloadBytes < textBytes:
+            panic("intern: logical payload underflow on clear")
+        pool.logicalPayloadBytes = pool.logicalPayloadBytes - textBytes
+
+fn internPoolClearTextsRetainingCapacity(pool: var InternPool,
+                                         probe: var InternPoolResetProbe) =
+    var texts = share(pool.texts)
+    pool.texts = []
+    for textIndex in 0..<texts.len:
+        texts[textIndex] = ""
+        probe.textSlotVisitCount = probe.textSlotVisitCount + Int64(1)
+    seqs.setLen(texts, 0)
+    pool.texts = texts
+    texts = []
+
+fn InternPoolResetBoundedWithProbe(pool: var InternPool,
+                                   retainedEntryLimit: int32,
+                                   probe: var InternPoolResetProbe) =
+    probe.indexOccupiedTailReadCount = Int64(0)
+    probe.indexBucketReadCount = Int64(0)
+    probe.indexOccupiedSlotVisitCount = Int64(0)
+    probe.textSlotVisitCount = Int64(0)
+    probe.indexCapacityBefore = 0
+    probe.indexCapacityAfter = 0
+    probe.textCapacityBefore = 0
+    probe.textCapacityAfter = 0
+    probe.retainedEntryLimit = 0
+    probe.retainedIndexCapacityLimit = 0
+    probe.retainedIndexStateCapacityLimit = 0
+    probe.retainedTextCapacityLimit = 0
+    probe.indexStateCapacityBefore = 0
+    probe.indexStateCapacityAfter = 0
+    probe.retainedIndexByteLimit = Int64(0)
+    probe.indexRetainedBytesBefore = Int64(0)
+    probe.indexRetainedBytesAfter = Int64(0)
+    probe.indexRebuilt = false
+    probe.textStorageReleased = false
+    if retainedEntryLimit < 0:
+        panic("intern: retained entry limit must be non-negative")
+    probe.retainedEntryLimit = retainedEntryLimit
+    probe.retainedIndexCapacityLimit =
+        hashmaps.HashMapStrIntCapacityForEntryLimit(retainedEntryLimit)
+    # Column model: states/occupied are int32 columns sized exactly at bucket
+    # capacity; byte limit covers four headers plus per-column slot storage.
+    probe.retainedIndexStateCapacityLimit =
+        probe.retainedIndexCapacityLimit
+    probe.retainedIndexByteLimit =
+        Int64(3) * hashmaps.ChengA64SequenceHeaderBytes +
+        Int64(probe.retainedIndexCapacityLimit) * Int64(12)
+    probe.retainedTextCapacityLimit =
+        hashmaps.HashMapNextPow2(retainedEntryLimit, 8)
+    if pool == nil:
+        return
+    internPoolRequireActive(pool)
+    internPoolSyncOwnedBuffers(pool)
+    probe.indexCapacityBefore = pool.indexVals.len
+    probe.indexStateCapacityBefore = pool.indexStates.cap
+    probe.textCapacityBefore = pool.texts.cap
+    probe.indexRetainedBytesBefore = internPoolIndexRetainedBytes(pool)
+
+    internPoolIndexClearRetaining(pool,
+                                  probe.indexOccupiedTailReadCount,
+                                  probe.indexBucketReadCount,
+                                  probe.indexOccupiedSlotVisitCount)
+    internPoolClearTextsRetainingCapacity(pool, probe)
+
+    if pool.indexVals.len > probe.retainedIndexCapacityLimit ||
+       pool.indexStates.cap > probe.retainedIndexStateCapacityLimit ||
+       probe.indexRetainedBytesBefore > probe.retainedIndexByteLimit:
+        var resetCapacity: int32 = 64
+        if resetCapacity > probe.retainedIndexCapacityLimit:
+            resetCapacity = probe.retainedIndexCapacityLimit
+        internPoolReleaseIndexStorage(pool)
+        internPoolIndexInitColumns(pool, resetCapacity)
+        internPoolSyncOwnedBuffers(pool)
+        probe.indexRebuilt = true
+    if pool.texts.cap > probe.retainedTextCapacityLimit:
+        seqs.freeSeqStrRelease(pool.texts)
+        internPoolSyncOwnedBuffers(pool)
+        probe.textStorageReleased = true
+
+    pool.emptyId = InvalidInternId()
+    pool.logicalPayloadBytes = Int64(0)
+    probe.indexCapacityAfter = pool.indexVals.len
+    probe.indexStateCapacityAfter = pool.indexStates.cap
+    probe.textCapacityAfter = pool.texts.cap
+    probe.indexRetainedBytesAfter = internPoolIndexRetainedBytes(pool)
+    internPoolSyncOwnedBuffers(pool)
+    if probe.indexStateCapacityAfter >
+           probe.retainedIndexStateCapacityLimit ||
+       probe.indexRetainedBytesAfter > probe.retainedIndexByteLimit:
+        panic("intern: bounded reset retained index limit exceeded")
+
+fn InternPoolResetBounded(pool: var InternPool,
+                          retainedEntryLimit: int32) =
+    var probe: InternPoolResetProbe
+    InternPoolResetBoundedWithProbe(pool, retainedEntryLimit, probe)
+
+fn InternPoolReset(pool: var InternPool) =
+    if pool == nil:
+        return
+    internPoolRequireActive(pool)
+    internPoolSyncOwnedBuffers(pool)
+    var tailReads: int64
+    var bucketReads: int64
+    var slotVisits: int64
+    internPoolIndexClearRetaining(pool, tailReads, bucketReads, slotVisits)
+    var resetProbe: InternPoolResetProbe
+    internPoolClearTextsRetainingCapacity(pool, resetProbe)
+    pool.emptyId = InvalidInternId()
+    pool.logicalPayloadBytes = Int64(0)
+    internPoolSyncOwnedBuffers(pool)
+
+fn internPoolReleaseIndexStorage(pool: var InternPool) =
+    internPoolSyncOwnedBuffers(pool)
+    # Store fresh empty columns; the managed field stores release the old
+    # buffers with exact owner authority (one-hop stores, no aggregate hop).
+    pool.indexVals = []
+    pool.indexStates = []
+    pool.indexOccupied = []
+    pool.indexMask = uint64(0)
+    pool.indexUsed = 0
+    internPoolSyncOwnedBuffers(pool)
+
+fn InternPoolRelease(pool: var InternPool) =
+    if pool == nil:
+        return
+    if pool.ownerLifecycleState == InternPoolOwnerReleased:
+        internPoolSyncOwnedBuffers(pool)
+        return
+    internPoolRequireActive(pool)
+    internPoolSyncOwnedBuffers(pool)
+    internPoolReleaseIndexStorage(pool)
+    seqs.freeSeqStrRelease(pool.texts)
+    pool.emptyId = InvalidInternId()
+    pool.logicalPayloadBytes = Int64(0)
+    internPoolSyncOwnedBuffers(pool)
+    pool.ownerLifecycleState = InternPoolOwnerReleased
+    internPoolValidateOwnerState(pool)
+
+@borrows
+fn InternPoolClone(pool: InternPool): InternPool =
+    if pool == nil:
+        return nil
+    internPoolRequireActive(pool)
+    var out = InternPoolNew(pool.texts.len)
+    # Intern ids are positional. Re-interning in source order preserves every
+    # id while giving the clone independent, deterministically releasable
+    # storage.
+    for i in 0..<pool.texts.len:
+        let textResult = LookupInternOwnedCopy(pool, i)
+        assert(IsOk(textResult), "intern: clone source lookup")
+        let clonedText = Value(textResult)
+        let clonedId = Intern(out, clonedText)
+        assert(clonedId == i, "intern: clone id drift")
+    return out
+
+@borrows
+fn internPoolAppendUnique(pool: InternPool, text: str): InternId =
+    # @borrows text cannot be stored by-value; share(text) keeps a retained
+    # handle without cloning the caller's owned text.
+    let ownedText = share(text)
+    let textBytes = Int64(len(ownedText))
+    if pool.logicalPayloadBytes < Int64(0) ||
+       textBytes < Int64(0) ||
+       pool.logicalPayloadBytes > Int64(9223372036854775807) - textBytes:
+        panic("intern: logical payload byte overflow")
+    var texts = share(pool.texts)
+    pool.texts = []
+    seqs.Add(texts, ownedText)
+    pool.texts = texts
+    texts = []
+    pool.logicalPayloadBytes = pool.logicalPayloadBytes + textBytes
+    return pool.texts.len - 1
+
+@borrows
+fn Intern(pool: InternPool, text: str): InternId =
+    internPoolRequireActive(pool)
+    let existing = FindInternId(pool, text)
+    if existing >= 0:
+        return existing
+    let ownedText = strings.CloneStr(text)
+    if len(ownedText) == 0:
+        if pool.emptyId >= 0:
+            return pool.emptyId
+        pool.emptyId = internPoolAppendUnique(pool, ownedText)
+        internPoolSyncTextOwner(pool)
+        return pool.emptyId
+    let indexMayGrow = pool.indexMask == uint64(0) ||
+                       (pool.indexUsed + 1) * 10 >=
+                           pool.indexVals.len * 5
+    let id = internPoolAppendUnique(pool, ownedText)
+    internPoolSyncTextOwner(pool)
+    internPoolIndexPutOwnedCopy(pool, ownedText, id)
+    if indexMayGrow:
+        internPoolSyncIndexOwners(pool)
+    return id
+
+@borrows
+fn FindInternId(pool: InternPool, text: str): InternId =
+    if pool == nil:
+        return InvalidInternId()
+    internPoolRequireActive(pool)
+    if len(text) == 0:
+        return pool.emptyId
+    if pool.indexMask == uint64(0):
+        return InvalidInternId()
+    let hashValue = internPoolTextHash(text)
+    let mask = int32(pool.indexMask)
+    if mask < 0 || pool.indexVals.len != mask + 1 ||
+       pool.indexStates.len != pool.indexVals.len ||
+       pool.indexOccupied.len != pool.indexVals.len:
+        panic("intern: lookup index shape invalid")
+    let step = int32(hashValue >> 32) | 1
+    var slot = int32(hashValue & pool.indexMask)
+    for scanIndex in 0..mask:
+        let state = pool.indexStates[slot]
+        if state == 0:
+            return InvalidInternId()
+        if state != 1:
+            panic("intern: lookup index state invalid")
+        let slotId = pool.indexVals[slot]
+        let slotText = LookupInternShared(pool, slotId)
+        if internPoolTextExact(slotText, text):
+            return slotId
+        slot = int32((uint64(slot) + uint64(step)) & pool.indexMask)
+    return InvalidInternId()
+
+fn internLookupProbeIncrement(value: var int64,
+                              fieldName: str) =
+    if value < Int64(0) || value >= Int64(9223372036854775807):
+        panic(Fmt"intern: lookup probe overflow field={fieldName}")
+    value = value + Int64(1)
+
+@borrows
+fn FindInternIdWithProbe(pool: InternPool,
+                         text: str,
+                         probe: var InternLookupProbe): InternId =
+    internLookupProbeIncrement(probe.queryCount, "query_count")
+    if len(text) == 0:
+        internLookupProbeIncrement(probe.emptyLookupCount,
+                                   "empty_lookup_count")
+    else:
+        internLookupProbeIncrement(probe.bucketLookupCount,
+                                   "bucket_lookup_count")
+    return FindInternId(pool, text)
+
+@borrows
+fn HasIntern(pool: InternPool, text: str): bool =
+    return FindInternId(pool, text) >= 0
+
+@borrows
+@borrow_result
+fn internPoolTextAt(pool: InternPool, id: InternId): str =
+    internPoolRequireActive(pool)
+    if id < 0 || id >= pool.texts.len:
+        panic("intern: invalid id")
+    return pool.texts[id]
+
+@borrows
+@borrow_result
+fn LookupIntern(pool: InternPool, id: InternId): Result[str] =
+    let textView = internPoolTextAt(pool, id)
+    var out: Result[str]
+    out.ok = true
+    out.value = textView
+    return out
+
+@borrows
+@borrow_result
+fn LookupInternBorrowedText(pool: InternPool, id: InternId): str =
+    return internPoolTextAt(pool, id)
+
+# Share of the interned text itself: the caller stores the returned handle
+# in an owning slot whose lifetime stays inside the pool's. This is the
+# verified element-share idiom (findings.md 2026-08-13 miscompile 3: a bare
+# element borrow bound to a local drops the lender; the shared handle drops
+# only its own retain). Consumers must treat the text as immutable.
+@borrows
+fn LookupInternShared(pool: InternPool, id: InternId): str =
+    internPoolRequireActive(pool)
+    if id < 0 || id >= pool.texts.len:
+        panic("intern: shared lookup id out of range")
+    return share(pool.texts[id])
+
+@borrows
+fn LookupInternOwnedCopy(pool: InternPool, id: InternId): Result[str] =
+    internPoolRequireActive(pool)
+    if id < 0 || id >= pool.texts.len:
+        return Err[str](" intern: invalid id")
+    # share(): binding a bare seq element to a local releases the lender's
+    # string when the local drops (element-borrow drop miscompile,
+    # findings.md 2026-08-13); the shared handle drops its own retain only.
+    let text = share(pool.texts[id])
+    var out = buffer.NewByteBuffer()
+    for index in 0..<text.len:
+        buffer.AppendByte(out, Int32(text[index]) & 255)
+    return Ok[str](buffer.FinishString(out))
+
+# Owned copy of just [start, start+length) of the interned text.  Same
+# share()-of-element shape as LookupInternOwnedCopy (element-borrow drop
+# miscompile, findings.md 2026-08-13), but span projections must not pay a
+# full-source byte copy per token/identifier.
+@borrows
+fn LookupInternOwnedRangeCopy(pool: InternPool,
+                              id: InternId,
+                              start: int32,
+                              length: int32): Result[str] =
+    internPoolRequireActive(pool)
+    if id < 0 || id >= pool.texts.len:
+        return Err[str](" intern: invalid id")
+    let text = share(pool.texts[id])
+    if start < 0 || length < 0 || start > text.len - length:
+        return Err[str](" intern: range out of bounds")
+    var out = buffer.NewByteBuffer()
+    for index in start..<start + length:
+        buffer.AppendByte(out, Int32(text[index]) & 255)
+    return Ok[str](buffer.FinishString(out))

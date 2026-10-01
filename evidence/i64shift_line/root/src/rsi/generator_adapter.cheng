@@ -1,0 +1,637 @@
+# 纯 Cheng RSI 框架: 外部 LLM 提案源适配器 (批次七)。
+# 职责边界 (提案纪律): LLM 只是「多一个提案来源」, 不是权威 ——
+#   本模块把 ollama 兼容 HTTP 服务 (POST /api/chat, stream=false) 的
+#   回复解析为 (taskDomain, strategy, param) 整数三元组, 逐个过
+#   proposal.RsiProposalCellValid 同一白名单; 任何解析失败/畸形行/
+#   越白名单/超 allowCount 的提案一律静默丢弃并计数, 绝不进评价管线。
+#   评价权与准入权完全留在引擎 (engine.cheng 同一严格评价+严格准入)。
+# 错误码契约 (引擎侧 rc != 0 = 跳过该来源, 不影响其它来源与账本):
+#   0 = 成功 (可能 0 个合法提案); 1 = endpoint 形参非法 (仅支持
+#   http://host:port, 固定 POST /api/chat); 2 = 连接失败/连接超时;
+#   3 = 发送失败; 4 = 接收失败/读超时; 5 = HTTP 响应帧不合法
+#   (状态行/头界/chunked 帧); 6 = HTTP 状态码非 200; 7 = 响应 JSON
+#   中提取 message.content 失败 (非 JSON / 键缺失 / 字符串截断)。
+# 超时: 连接与读取共享 RsiAdapterTimeoutMs 总时限 (单调钟), 任何一段
+#   超时返回可判别错误码, 绝不无限阻塞引擎轮次。
+# 实现纪律 (冷链六墙, lessons 2026-09-07 / findings 6): call-result 局部
+#   str 每次外呼一律 Fmt 再拷贝; 禁连续两次 Split (全文至多一次 Split,
+#   其余手工扫描); var-out 副作用函数 Into 模式; add() 构造数组不传参
+#   (数组字面量实参位内联); 嵌套调用不作实参 (Fmt 拷贝除外); 容器索引
+#   先 let; int64 插值先 Int64ToStr。零 @importc (IO 走 std/net 传输层)。
+import std/result
+import std/strings as strings
+import std/strutils as strutil
+import std/rawbytes as rawbytes
+import std/monotimes as mono
+import std/net/transports/tcp_syscall as tcp
+import cheng/rsi/types as types
+import cheng/rsi/proposal as proposal
+
+const
+    RsiAdapterOk = 0
+    RsiAdapterErrEndpoint = 1
+    RsiAdapterErrConnect = 2
+    RsiAdapterErrSend = 3
+    RsiAdapterErrRecv = 4
+    RsiAdapterErrHttp = 5
+    RsiAdapterErrStatus = 6
+    RsiAdapterErrBody = 7
+    RsiAdapterTimeoutMs = 120000
+    RsiAdapterRecvChunk = 4096
+
+# 在 text 中从 fromIdx 起找 needle 首次出现, 返回下标; 未找到 -1。
+fn adapterFindSub(text: str, needle: str, fromIdx: int32): int32 =
+    let n: int32 = len(text)
+    let m: int32 = len(needle)
+    if m <= 0:
+        return fromIdx
+    var i: int32 = fromIdx
+    while i + m <= n:
+        var hit: int32 = 1
+        for k in 0..<m:
+            if text[i + k] != needle[k]:
+                hit = 0
+        if hit == 1:
+            return i
+        i = i + 1
+    return -1
+
+# endpoint 形参解析 (Into 模式): 仅 http://host:port; host 不得为空,
+# 端口 1..65535 纯十进制; https 与带路径 endpoint 拒绝 (不静默降级)。
+fn adapterParseEndpointInto(endpoint: str, outHost: var str,
+                            outPort: var int32): int32 =
+    outHost = ""
+    outPort = 0
+    var rest: str = ""
+    if strings.HasPrefix(Fmt"{endpoint}", "https://"):
+        return RsiAdapterErrEndpoint
+    if strings.HasPrefix(Fmt"{endpoint}", "http://"):
+        rest = strings.CloneStrRange(Fmt"{endpoint}", 7, len(endpoint) - 7)
+    else:
+        rest = strings.CloneStr(Fmt"{endpoint}")
+    let n: int32 = len(rest)
+    var colon: int32 = -1
+    for i in 0..<n:
+        if rest[i] == ':':
+            colon = i
+    if colon <= 0 || colon >= n - 1:
+        return RsiAdapterErrEndpoint
+    outHost = strings.CloneStrRange(Fmt"{rest}", 0, colon)
+    var portVal: int32 = 0
+    for i in (colon + 1)..<n:
+        let ch: char = rest[i]
+        if ch < '0' || ch > '9':
+            return RsiAdapterErrEndpoint
+        portVal = portVal * 10 + (int32(ch) - int32('0'))
+        if portVal > 65535:
+            return RsiAdapterErrEndpoint
+    if portVal <= 0:
+        return RsiAdapterErrEndpoint
+    if len(outHost) <= 0:
+        return RsiAdapterErrEndpoint
+    outPort = portVal
+    return RsiAdapterOk
+
+# JSON 字符串转义 (Into 模式): " \ \n \r \t 直映, <0x20 走 \u00XX。
+fn adapterJsonEscapeInto(text: str, outEsc: var str) =
+    var parts: str[]
+    for i in 0..<len(text):
+        let ch: char = text[i]
+        let code: int32 = int32(ch)
+        if ch == '"':
+            add(parts, "\\\"")
+        elif ch == '\\':
+            add(parts, "\\\\")
+        elif ch == '\n':
+            add(parts, "\\n")
+        elif ch == '\r':
+            add(parts, "\\r")
+        elif code == 9:
+            add(parts, "\\t")
+        elif code < 32:
+            let hi: int32 = code / 16
+            let lo: int32 = code % 16
+            var hexParts: str[]
+            add(hexParts, "\\u00")
+            if hi < 10:
+                add(hexParts, strings.charToStr(char(int32('0') + hi)))
+            else:
+                add(hexParts, strings.charToStr(char(int32('a') + hi - 10)))
+            if lo < 10:
+                add(hexParts, strings.charToStr(char(int32('0') + lo)))
+            else:
+                add(hexParts, strings.charToStr(char(int32('a') + lo - 10)))
+            add(parts, strutil.Join(hexParts, ""))
+        else:
+            add(parts, strings.charToStr(ch))
+    outEsc = strutil.Join(parts, "")
+
+# 提案请求正文 (ollama /api/chat 形态, stream=false)。
+fn adapterBuildRequestBodyInto(model: str, prompt: str, outBody: var str) =
+    var escModel: str
+    var escPrompt: str
+    adapterJsonEscapeInto(Fmt"{model}", escModel)
+    adapterJsonEscapeInto(Fmt"{prompt}", escPrompt)
+    outBody = strutil.Join(["{\"model\":\"", Fmt"{escModel}",
+                            "\",\"messages\":[{\"role\":\"user\",\"content\":\"",
+                            Fmt"{escPrompt}",
+                            "\"}],\"stream\":false}"], "")
+
+# 提案提示词: 只描述白名单形状与观测表, 准入判定不在此 (控制器专权)。
+fn adapterBuildPromptInto(tableText: str, limit: int32, outPrompt: var str) =
+    let limitText: str = strings.IntToStr(limit)
+    outPrompt = strutil.Join(["You are one proposal source for a task optimizer.",
+                              "Reply with at most", Fmt"{limitText}",
+                              "lines, each exactly three integers:",
+                              "taskDomain strategy param.",
+                              "Allowed cells only: domain 0 strategy 0..5 param 0..2;",
+                              "domain 1 strategy 0..3 param 0;",
+                              "domain 3 strategy 0..3 param 0.",
+                              "No other text.",
+                              "Observation table (cell:count:min):",
+                              Fmt"{tableText}"], " ")
+
+# HTTP/1.x 响应切分 (Into 模式): 状态码 + 头块 + 原始体。帧不合法 -> 5。
+fn adapterSplitHttpInto(rawText: str, outCode: var int32,
+                        outHeaders: var str, outBodyRaw: var str): int32 =
+    outCode = 0
+    outHeaders = ""
+    outBodyRaw = ""
+    let n: int32 = len(rawText)
+    if n < 16:
+        return RsiAdapterErrHttp
+    var statusEnd: int32 = -1
+    var i: int32 = 0
+    while statusEnd < 0:
+        if i + 1 >= n:
+            return RsiAdapterErrHttp
+        if rawText[i] == '\r':
+            if rawText[i + 1] == '\n':
+                statusEnd = i
+        i = i + 1
+    var spacePos: int32 = -1
+    var j: int32 = 0
+    while spacePos < 0:
+        if j >= statusEnd:
+            return RsiAdapterErrHttp
+        if rawText[j] == ' ':
+            spacePos = j
+        j = j + 1
+    if spacePos + 3 >= n:
+        return RsiAdapterErrHttp
+    var code: int32 = 0
+    for k in 0..<3:
+        let ch: char = rawText[spacePos + 1 + k]
+        if ch < '0' || ch > '9':
+            return RsiAdapterErrHttp
+        code = code * 10 + (int32(ch) - int32('0'))
+    outCode = code
+    var headerEnd: int32 = -1
+    var m: int32 = statusEnd + 2
+    while headerEnd < 0:
+        if m + 3 >= n:
+            return RsiAdapterErrHttp
+        if rawText[m] == '\r':
+            if rawText[m + 1] == '\n':
+                if rawText[m + 2] == '\r':
+                    if rawText[m + 3] == '\n':
+                        headerEnd = m + 4
+        m = m + 1
+    outHeaders = strings.CloneStrRange(Fmt"{rawText}", statusEnd + 2,
+                                       headerEnd - statusEnd - 6)
+    outBodyRaw = strings.CloneStrRange(Fmt"{rawText}", headerEnd,
+                                       n - headerEnd)
+    return RsiAdapterOk
+
+# Transfer-Encoding: chunked 解帧 (完整缓冲上的确定性解码; 扩展/非 hex 拒)。
+fn adapterDechunkInto(raw: str, outBody: var str): int32 =
+    var parts: str[]
+    var pos: int32 = 0
+    let n: int32 = len(raw)
+    var go: int32 = 1
+    while go == 1:
+        var lineEnd: int32 = -1
+        var i: int32 = pos
+        while lineEnd < 0:
+            if i + 1 >= n:
+                return RsiAdapterErrHttp
+            if raw[i] == '\r':
+                if raw[i + 1] == '\n':
+                    lineEnd = i
+            i = i + 1
+        if lineEnd == pos:
+            return RsiAdapterErrHttp
+        var size: int32 = 0
+        for k in pos..<lineEnd:
+            let ch: char = raw[k]
+            var dv: int32 = -1
+            if ch >= '0':
+                if ch <= '9':
+                    dv = int32(ch) - int32('0')
+            if dv < 0:
+                if ch >= 'a':
+                    if ch <= 'f':
+                        dv = int32(ch) - int32('a') + 10
+            if dv < 0:
+                if ch >= 'A':
+                    if ch <= 'F':
+                        dv = int32(ch) - int32('A') + 10
+            if dv < 0:
+                return RsiAdapterErrHttp
+            size = size * 16 + dv
+            if size > 16777216:
+                return RsiAdapterErrHttp
+        let dataStart: int32 = lineEnd + 2
+        if size == 0:
+            go = 0
+        else:
+            if dataStart + size + 2 > n:
+                return RsiAdapterErrHttp
+            add(parts, strings.CloneStrRange(Fmt"{raw}", dataStart, size))
+            pos = dataStart + size + 2
+    outBody = strutil.Join(parts, "")
+    return RsiAdapterOk
+
+# 头块取 Content-Length (十进制, 冒号后容空白); 无该头返回 -1。
+fn adapterContentLengthOf(headers: str): int64 =
+    let keyPos: int32 = adapterFindSub(Fmt"{headers}", "Content-Length:", 0)
+    if keyPos < 0:
+        return -1
+    let n: int32 = len(headers)
+    var i: int32 = keyPos + 15
+    var wsGo: int32 = 1
+    while wsGo == 1:
+        if i >= n:
+            return -1
+        let wsCode: int32 = int32(headers[i])
+        if wsCode == 32 || wsCode == 9:
+            i = i + 1
+        else:
+            wsGo = 0
+    var val: int64 = 0
+    var digitCount: int32 = 0
+    var go: int32 = 1
+    while go == 1:
+        if i >= n:
+            go = 0
+        else:
+            let ch: char = headers[i]
+            if ch >= '0':
+                if ch <= '9':
+                    val = val * 10 + int64(int32(ch) - int32('0'))
+                    digitCount = digitCount + 1
+                    i = i + 1
+                else:
+                    go = 0
+            else:
+                go = 0
+    if digitCount <= 0:
+        return -1
+    return val
+
+# 响应体按帧取净荷: chunked 解帧 > Content-Length 截取 > EOF 界定。
+fn adapterExtractBodyInto(headers: str, rawBody: str,
+                          outBody: var str): int32 =
+    let chunkPos: int32 = adapterFindSub(Fmt"{headers}", "chunked", 0)
+    if chunkPos >= 0:
+        return adapterDechunkInto(Fmt"{rawBody}", outBody)
+    let contentLen: int64 = adapterContentLengthOf(Fmt"{headers}")
+    if contentLen < 0:
+        outBody = Fmt"{rawBody}"
+        return RsiAdapterOk
+    if contentLen == 0:
+        outBody = ""
+        return RsiAdapterOk
+    let have: int64 = int64(len(rawBody))
+    if have < contentLen:
+        return RsiAdapterErrHttp
+    outBody = strings.CloneStrRange(Fmt"{rawBody}", 0, int32(contentLen))
+    return RsiAdapterOk
+
+# 从响应 JSON 提取 message.content (Into 模式); 完整转义解码
+# (\n \r \t \b \f \" \\ \/ \uXXXX); 非 ASCII 码点映射 '?' (后续整数
+# 解析必拒, 计入丢弃)。任一环节失败 -> 7。
+fn adapterExtractMessageContentInto(respText: str, outContent: var str): int32 =
+    outContent = ""
+    let msgPos: int32 = adapterFindSub(Fmt"{respText}", "\"message\"", 0)
+    if msgPos < 0:
+        return RsiAdapterErrBody
+    let keyPos: int32 = adapterFindSub(Fmt"{respText}", "\"content\"",
+                                       msgPos + 9)
+    if keyPos < 0:
+        return RsiAdapterErrBody
+    let n: int32 = len(respText)
+    var i: int32 = keyPos + 9
+    var sawColon: int32 = 0
+    while sawColon == 0:
+        if i >= n:
+            return RsiAdapterErrBody
+        let ch: char = respText[i]
+        if ch == ':':
+            sawColon = 1
+            i = i + 1
+        else:
+            let code: int32 = int32(ch)
+            if code != 32:
+                if code != 9:
+                    if code != 10:
+                        if code != 13:
+                            return RsiAdapterErrBody
+            i = i + 1
+    var sawQuote: int32 = 0
+    while sawQuote == 0:
+        if i >= n:
+            return RsiAdapterErrBody
+        let ch2: char = respText[i]
+        if ch2 == '"':
+            sawQuote = 1
+            i = i + 1
+        else:
+            let code2: int32 = int32(ch2)
+            if code2 != 32:
+                if code2 != 9:
+                    return RsiAdapterErrBody
+            i = i + 1
+    var parts: str[]
+    var go: int32 = 1
+    var esc: int32 = 0
+    while go == 1:
+        if i >= n:
+            return RsiAdapterErrBody
+        let c: char = respText[i]
+        if esc == 1:
+            if c == 'n':
+                add(parts, "\n")
+            elif c == 'r':
+                add(parts, "\r")
+            elif c == 't':
+                add(parts, strings.charToStr(char(9)))
+            elif c == 'b':
+                add(parts, strings.charToStr(char(8)))
+            elif c == 'f':
+                add(parts, strings.charToStr(char(12)))
+            elif c == '"':
+                add(parts, strings.charToStr(char(34)))
+            elif c == '\\':
+                add(parts, strings.charToStr(char(92)))
+            elif c == '/':
+                add(parts, strings.charToStr(char(47)))
+            elif c == 'u':
+                if i + 4 >= n:
+                    return RsiAdapterErrBody
+                var cp: int32 = 0
+                for k in 1..4:
+                    let hx: char = respText[i + k]
+                    var dv: int32 = -1
+                    if hx >= '0':
+                        if hx <= '9':
+                            dv = int32(hx) - int32('0')
+                    if dv < 0:
+                        if hx >= 'a':
+                            if hx <= 'f':
+                                dv = int32(hx) - int32('a') + 10
+                    if dv < 0:
+                        if hx >= 'A':
+                            if hx <= 'F':
+                                dv = int32(hx) - int32('A') + 10
+                    if dv < 0:
+                        return RsiAdapterErrBody
+                    cp = cp * 16 + dv
+                if cp >= 32 && cp <= 126:
+                    add(parts, strings.charToStr(char(cp)))
+                else:
+                    add(parts, "?")
+                i = i + 4
+            else:
+                return RsiAdapterErrBody
+            esc = 0
+        else:
+            if c == '"':
+                go = 0
+            else:
+                if c == '\\':
+                    esc = 1
+                else:
+                    add(parts, strings.charToStr(c))
+        i = i + 1
+    outContent = strutil.Join(parts, "")
+    return RsiAdapterOk
+
+# 行内跳空白 (空格/制表/回车), 返回首个非空白下标 (行尾返回 n)。
+fn adapterScanWs(line: str, iIn: int32): int32 =
+    let n: int32 = len(line)
+    var i: int32 = iIn
+    var go: int32 = 1
+    while go == 1:
+        if i >= n:
+            go = 0
+        else:
+            let code: int32 = int32(line[i])
+            if code == 32 || code == 9 || code == 13:
+                i = i + 1
+            else:
+                go = 0
+    return i
+
+# 一行解析为三个整数 (可带符号; 空行/缺数/多余记号/溢出钳制 -> 1)。
+# 溢出钳制到 1e8 量级: 白名单上界远小于钳制值, 拒收结论不变。
+fn adapterParseTripleInto(line: str, outD: var int32, outS: var int32,
+                          outP: var int32): int32 =
+    outD = 0
+    outS = 0
+    outP = 0
+    let n: int32 = len(line)
+    var v0: int32 = 0
+    var v1: int32 = 0
+    var v2: int32 = 0
+    var pos: int32 = adapterScanWs(Fmt"{line}", 0)
+    var which: int32 = 0
+    var fail: int32 = 0
+    while which < 3:
+        if fail == 1:
+            which = 3
+        else:
+            if pos >= n:
+                fail = 1
+            else:
+                var sign: int32 = 1
+                if line[pos] == '-':
+                    sign = -1
+                    pos = pos + 1
+                else:
+                    if line[pos] == '+':
+                        pos = pos + 1
+                var digitCount: int32 = 0
+                var val: int32 = 0
+                var goDigit: int32 = 1
+                while goDigit == 1:
+                    if pos >= n:
+                        goDigit = 0
+                    else:
+                        let c: char = line[pos]
+                        if c < '0' || c > '9':
+                            goDigit = 0
+                        else:
+                            digitCount = digitCount + 1
+                            if val < 100000000:
+                                val = val * 10 + (int32(c) - int32('0'))
+                            pos = pos + 1
+                if digitCount <= 0:
+                    fail = 1
+                else:
+                    let v: int32 = val * sign
+                    if which == 0:
+                        v0 = v
+                    elif which == 1:
+                        v1 = v
+                    else:
+                        v2 = v
+                    which = which + 1
+                    pos = adapterScanWs(Fmt"{line}", pos)
+    if fail == 1:
+        return 1
+    if pos < n:
+        return 1
+    outD = v0
+    outS = v1
+    outP = v2
+    return 0
+
+# 单次 HTTP POST (固定 /api/chat): 连接/发送/接收三段, 单调钟总时限。
+# 返回 0 并经 outRespText 带回完整响应原文 (状态行+头+体, 帧解析在
+# adapterSplitHttpInto); 非零为可判别错误码。
+fn adapterHttpPostInto(host: str, port: int32, body: str,
+                       outRespText: var str): int32 =
+    outRespText = ""
+    let connRes: Result[tcp.TcpConnectionHandle] = tcp.TcpConnect4Timeout(
+        Fmt"{host}", port, RsiAdapterTimeoutMs)
+    if IsErr(connRes):
+        return RsiAdapterErrConnect
+    var conn: tcp.TcpConnectionHandle = Value(connRes)
+    let portText: str = strings.IntToStr(port)
+    let hostLine: str = strutil.Join(["Host: ", Fmt"{host}", ":",
+                                      Fmt"{portText}"], "")
+    let bodyLen: int32 = len(body)
+    let bodyLenText: str = strings.IntToStr(bodyLen)
+    let clLine: str = strutil.Join(["Content-Length: ", Fmt"{bodyLenText}"],
+                                   "")
+    let request: str = strutil.Join(["POST /api/chat HTTP/1.1",
+                                     Fmt"{hostLine}",
+                                     "Content-Type: application/json",
+                                     Fmt"{clLine}", "Connection: close", "",
+                                     body], "\r\n")
+    let reqBytes: rawbytes.Bytes = rawbytes.BytesFromString(Fmt"{request}")
+    let sendRes: Result[int32] = tcp.TcpSend(conn, reqBytes)
+    if IsErr(sendRes):
+        tcp.TcpClose(conn)
+        return RsiAdapterErrSend
+    let t0: mono.MonoTime = mono.GetMonoTime()
+    let t0ns: int64 = mono.MonoTimeNs(t0)
+    var acc: rawbytes.BytesBuilder = rawbytes.BytesBuilderNew()
+    var state: int32 = 0
+    while state == 0:
+        var tn: mono.MonoTime = mono.GetMonoTime()
+        let tns: int64 = mono.MonoTimeNs(tn)
+        let elapsedMs: int32 = int32((tns - t0ns) / 1000000)
+        var remain: int32 = RsiAdapterTimeoutMs - elapsedMs
+        if remain <= 0:
+            state = 2
+        else:
+            let waitRes: Result[bool] = tcp.TcpConnectionWaitReadable(conn,
+                                                                      remain)
+            if IsErr(waitRes):
+                state = 2
+            else:
+                let recRes: Result[rawbytes.Bytes] = tcp.TcpRecv(conn,
+                                                                 RsiAdapterRecvChunk)
+                if IsErr(recRes):
+                    state = 2
+                else:
+                    var chunk: rawbytes.Bytes = Value(recRes)
+                    let chunkLen: int32 = rawbytes.BytesLen(chunk)
+                    if chunkLen <= 0:
+                        state = 1
+                    else:
+                        rawbytes.BytesBuilderAppend(acc, chunk)
+    tcp.TcpClose(conn)
+    if state == 2:
+        return RsiAdapterErrRecv
+    var total: rawbytes.Bytes = rawbytes.BytesBuilderFinish(acc)
+    outRespText = rawbytes.BytesToString(total)
+    return RsiAdapterOk
+
+# 适配器主入口 (Into 模式): 拉取 LLM 提案 -> 逐个白名单过滤。
+#   endpoint  = http://host:port (ollama 兼容; 固定 POST /api/chat)
+#   model     = 模型名 (如 llama3)
+#   tableText = 观测表快照 (model.RsiModelTableTextInto 产物, 仅提示词上下文)
+#   allowCount= 最多接受的提案数 (>0)
+#   out 三数组 = 已过白名单的 (domain, strategy, param) 提案
+#   outDropped= 被丢弃提案计数 (畸形行 + 越白名单 + 超 allowCount)
+# 返回可判别错误码 (见卷首); rc != 0 时三数组为空, 引擎侧跳过该来源。
+fn RsiGeneratorAdapterProposeInto(endpoint: str, model: str, tableText: str,
+                                  allowCount: int32,
+                                  outDomains: var int32[],
+                                  outStrategies: var int32[],
+                                  outParams: var int32[],
+                                  outDropped: var int32): int32 =
+    outDropped = 0
+    if allowCount < 1:
+        return RsiAdapterErrEndpoint
+    var host: str
+    var port: int32 = 0
+    let parseRc: int32 = adapterParseEndpointInto(Fmt"{endpoint}", host, port)
+    if parseRc != RsiAdapterOk:
+        return parseRc
+    var prompt: str
+    adapterBuildPromptInto(Fmt"{tableText}", allowCount, prompt)
+    var reqBody: str
+    adapterBuildRequestBodyInto(Fmt"{model}", Fmt"{prompt}", reqBody)
+    var respText: str
+    let httpRc: int32 = adapterHttpPostInto(Fmt"{host}", port,
+                                            Fmt"{reqBody}", respText)
+    if httpRc != RsiAdapterOk:
+        return httpRc
+    var code: int32 = 0
+    var headers: str
+    var rawBody: str
+    let splitRc: int32 = adapterSplitHttpInto(Fmt"{respText}", code, headers,
+                                              rawBody)
+    if splitRc != RsiAdapterOk:
+        return splitRc
+    if code != 200:
+        return RsiAdapterErrStatus
+    var bodyText: str
+    let bodyRc: int32 = adapterExtractBodyInto(Fmt"{headers}",
+                                               Fmt"{rawBody}", bodyText)
+    if bodyRc != RsiAdapterOk:
+        return bodyRc
+    var content: str
+    let contentRc: int32 = adapterExtractMessageContentInto(Fmt"{bodyText}",
+                                                            content)
+    if contentRc != RsiAdapterOk:
+        return contentRc
+    let lines: str[] = strutil.Split(Fmt"{content}", '\n')
+    var accepted: int32 = 0
+    for i in 0..<lines.len:
+        let lineRaw: str = Fmt"{lines[i]}"
+        let line: str = strutil.Strip(Fmt"{lineRaw}")
+        if len(line) <= 0:
+            continue
+        var d: int32 = 0
+        var s: int32 = 0
+        var p: int32 = 0
+        let triRc: int32 = adapterParseTripleInto(Fmt"{line}", d, s, p)
+        if triRc != 0:
+            outDropped = outDropped + 1
+            continue
+        if accepted >= allowCount:
+            outDropped = outDropped + 1
+            continue
+        if !proposal.RsiProposalCellValid(d, types.RsiChangeTask, s, p):
+            outDropped = outDropped + 1
+            continue
+        add(outDomains, d)
+        add(outStrategies, s)
+        add(outParams, p)
+        accepted = accepted + 1
+    return RsiAdapterOk

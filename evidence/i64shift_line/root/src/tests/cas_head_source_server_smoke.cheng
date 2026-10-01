@@ -1,0 +1,138 @@
+# libp2p P3 正片: 发布方 (A) 服务端 exe (正典 §11.6 P3 网络接线主门)。
+# A 真两进程之一: 派生发布密钥 → 把源 blob ingest 进本地 CAS (得 headCid) → 真 ed25519 签
+# channel-head → 存入 head 库 → 真 bind + AcceptTimed 应答 HEAD_REQ + WANT (统一分发)。
+#
+# mode 造场 (线上负路径的应答方侧, A 是敌手时存的坏字节; 全部校验在客户端 B):
+#   positive : 干净自签 head, 存于 channelId(pubA)。
+#   tamper   : 自签 head 编码后翻 headCid 1 字节 (sig 陈旧), 原样存 → B 验签拒。
+#   forge    : channelId=sha256(pubA) 但 signerPubKey=pubB (自证不一致), 存于 channelId(pubA)
+#              → B decode 绑定拒。
+#   keychange: keyC 合法自签 head (channelId=sha256(pubC)), 却存于 channelId(pubA) 槽位
+#              → B 请求绑定拒 (返回 head channelId != 请求)。
+#
+# 用法: --port 0 --ready-path <f> --store-root <dir> --seed N --epoch E --source-content <s>
+#       [--prev-content <s>] [--mode positive|tamper|forge|keychange] [--forge-seed M]
+#       [--serve-count N] [--wait-ms W]
+
+import std/system
+import std/result
+import std/cmdline as cmdline
+import std/rawbytes as rawbytes
+import cheng/std/bytes_layout as layout
+import std/crypto/sha512 as sha512
+import std/crypto/ed25519/ref10 as ref10
+import cheng/libp2p/cas_store as cas
+import cheng/libp2p/protocols/cas_source/channel_head/head_codec as head
+import cheng/libp2p/protocols/cas_source/channel_head/head_store as headstore
+import cheng/libp2p/host/host_quic as hq
+import std/strutils as strutil
+
+# 手工造真 ed25519 keypair (照 channel_head_signing_smoke 已验证口径; keyPairFromSeed
+# conditional-let miscompile, 绕开)。
+fn deriveKeypair(seedv: int32, priv: var Bytes, pub: var Bytes) =
+    var seed = BytesAlloc(32)
+    for i in 0..<32:
+        BytesSet(seed, i, (seedv + i) & 255)
+    var digest = sha512.Sha512Digest(seed)
+    BytesSet(digest, 0, BytesGet(digest, 0) & 248)
+    BytesSet(digest, 31, (BytesGet(digest, 31) & 63) | 64)
+    var r: ref10.GeP3
+    ref10.geScalarMultBase(r, BytesSlice(digest, 0, 32))
+    pub = ref10.geP3ToBytes(r)
+    priv = BytesConcat(seed, pub)
+
+fn main(): int32 =
+    let port = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    let readyPath = cmdline.ReadFlagOrDefault("--ready-path", "")
+    let storeRoot = cmdline.ReadFlagOrDefault("--store-root", "")
+    let seedv = cmdline.ReadInt32FlagOrDefault("--seed", 7)
+    let epoch = int64(cmdline.ReadInt32FlagOrDefault("--epoch", 1))
+    let sourceContent = cmdline.ReadFlagOrDefault("--source-content", "")
+    let prevContent = cmdline.ReadFlagOrDefault("--prev-content", "")
+    let mode = cmdline.ReadFlagOrDefault("--mode", "positive")
+    let forgeSeed = cmdline.ReadInt32FlagOrDefault("--forge-seed", 200)
+    let serveCount = cmdline.ReadInt32FlagOrDefault("--serve-count", 2)
+    let waitMs = cmdline.ReadInt32FlagOrDefault("--wait-ms", 4000)
+    assert(readyPath != "", " server: --ready-path required")
+    assert(storeRoot != "", " server: --store-root required")
+    assert(sourceContent != "", " server: --source-content required")
+
+    var privA: Bytes
+    var pubA: Bytes
+    deriveKeypair(seedv, privA, pubA)
+    assert(BytesLen(pubA) == 32, " server: pubA 32B")
+    let channelId = head.ChannelIdForPubKey(pubA)
+    let channelIdHex = layout.FixedBytes32Hex(channelId)
+
+    # 源进 A 的 CAS (headCid = 内容 sha256); WANT serve 靠这份 blob 应答。
+    let ingestRes = cas.CasStoreIngest(storeRoot, sourceContent)
+    assert(ingestRes.ok, " server: cas ingest: " + Error(ingestRes))
+    let headCidHex = ingestRes.value
+    let headCid = cas.CasContentCid(sourceContent)
+
+    var prevHeadCid = head.ChannelHeadGenesisPrev()
+    if prevContent != "":
+        prevHeadCid = cas.CasContentCid(prevContent)
+
+    # 真 ed25519 签 head。
+    var signRes = head.ChannelHeadSign(privA, epoch, headCid, prevHeadCid, pubA)
+    assert(signRes.ok, " server: sign head: " + Error(signRes))
+    let recA = signRes.value
+
+    if mode == "positive":
+        var putRes = headstore.ChannelHeadStorePut(storeRoot, recA)
+        assert(putRes.ok, " server: head store put: " + Error(putRes))
+    elif mode == "tamper":
+        var encRes = head.ChannelHeadEncode(recA)
+        assert(encRes.ok, " server: encode for tamper: " + Error(encRes))
+        var wire = encRes.value
+        # headCid 域在偏移 41 (tag1 + channelId32 + epoch8)。翻 1 字节, 不重签。
+        BytesSet(wire, 41, (BytesGet(wire, 41) ^ 0x01) & 255)
+        var putRes = headstore.ChannelHeadStorePutWire(storeRoot, channelIdHex, wire)
+        assert(putRes.ok, " server: tamper store put: " + Error(putRes))
+    elif mode == "forge":
+        var privB: Bytes
+        var pubB: Bytes
+        deriveKeypair(forgeSeed, privB, pubB)
+        # channelId 仍声明为 pubA 的, 但 signerPubKey 换成 pubB (自证不一致)。
+        var forgeRec = recA
+        forgeRec.signerPubKey = pubB
+        # sig 用 keyB 对该 record 的真签 (即便签对, decode 绑定层先拒)。
+        var forgeSignRes = head.ChannelHeadSign(privB, epoch, headCid, prevHeadCid, pubB)
+        assert(forgeSignRes.ok, " server: forge keyB sign")
+        forgeRec.sig = forgeSignRes.value.sig
+        var encRes = head.ChannelHeadEncode(forgeRec)
+        assert(encRes.ok, " server: encode forge: " + Error(encRes))
+        var wire = encRes.value
+        var putRes = headstore.ChannelHeadStorePutWire(storeRoot, channelIdHex, wire)
+        assert(putRes.ok, " server: forge store put: " + Error(putRes))
+    elif mode == "keychange":
+        var privC: Bytes
+        var pubC: Bytes
+        deriveKeypair(forgeSeed, privC, pubC)
+        # keyC 合法自签 (channelId=sha256(pubC)), 但存于 channelId(pubA) 槽位。
+        var signC = head.ChannelHeadSign(privC, epoch, headCid, prevHeadCid, pubC)
+        assert(signC.ok, " server: keyC sign: " + Error(signC))
+        var encRes = head.ChannelHeadEncode(signC.value)
+        assert(encRes.ok, " server: encode keychange: " + Error(encRes))
+        var wire = encRes.value
+        var putRes = headstore.ChannelHeadStorePutWire(storeRoot, channelIdHex, wire)
+        assert(putRes.ok, " server: keychange store put: " + Error(putRes))
+    else:
+        assert(false, " server: unknown mode: " + mode)
+
+    echo(strutil.Join([" cas_head server channel_id=", channelIdHex,
+                       " head_cid=", headCidHex,
+                       " epoch=", IntToStr(cmdline.ReadInt32FlagOrDefault("--epoch", 1)),
+                       " mode=", mode], ""))
+
+    let serveRes = hq.Libp2pHostQuicServeCasUnified("127.0.0.1",
+                                                     port,
+                                                     "localhost",
+                                                     storeRoot,
+                                                     readyPath,
+                                                     serveCount,
+                                                     waitMs)
+    assert(serveRes.ok, " server: serve: " + Error(serveRes))
+    echo(strutil.Join([" cas_head_source_server ok served=", IntToStr(serveRes.value)], ""))
+    return 0

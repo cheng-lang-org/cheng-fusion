@@ -1,0 +1,848 @@
+# skeleton_film (SKELETON): the 15-second skeleton-walk film with the
+# walk feasibility audit as its pass 1.
+#
+# The world is artifacts/csg_world_video/csgworld/skeleton.csgworld: an
+# 11-mass-point skeleton figure (7 base masses + 4 knee/elbow overlay
+# masses) standing station-anchored to tick 690, free afterwards. Pass 1
+# runs 3600 authority ticks headless: 0-800 standing, at tick 800 it
+# injects execution.CsgExecutionQueueWalk(st, facts, 8) (the exact
+# --play WALK semantics: 0.25 m per pair landing, 135-tick half cycle,
+# continuing from the current mean foot position), then lets the figure
+# settle. The walk contract (audited at tick 3000, journey_film
+# precedent for an 8-step gait):
+#   - zero rejected physics steps
+#   - pelvis advances >= 0.5 m along +x (8 queued steps = 4 pair
+#     landings x 0.25 m => ~0.75 m lane advance)
+#   - pelvis still upright at the gate tick (z >= 0.5 m), chest above
+#     pelvis at the end
+# Every tick's receipt status is checked; the full pelvis trajectory is
+# buffered and printed after the loop (no echo inside the physics loop).
+#
+# Pass 1 also dumps one render-state file plus one follow-camera /
+# caption parameter file per 24 fps frame. The camera is a smoothed
+# pelvis chase (position = pelvis + fixed offset, look-at = smoothed
+# pelvis), frozen into the parameter file per frame. Pass 2 renders all
+# 360 frames in parallel — each worker loads only its own state and
+# parameter files and writes its own PPM. Unlike RenderCharacterState
+# (7 base masses only), the worker draws the full 11-point skeleton:
+# thin limb segments through the knee/elbow masses plus the dark
+# overlay joint spheres, exactly the character.RenderCharacter
+# appearance, but sourced from the state stream. Pass 3 streams the
+# PPMs through the VideoToolbox bridge, encodes the 15 s score into
+# AAC-LC and assembles skeleton_walk.mp4 (video + audio trak) with a
+# bound manifest.
+import cheng/game/csg/schema
+import cheng/game/csg/validation
+import cheng/game/csg/csgworld
+import cheng/game/csg/materializer
+import cheng/game/csg/execution
+import cheng/game/csg/numerics
+import cheng/game/world3d
+import cheng/game/physics3d
+import cheng/game/cinema/camera
+import cheng/game/cinema/vtbr
+import cheng/game/cinema/mp4
+import cheng/game/cinema/aac
+import cheng/game/cinema/score
+import cheng/game/render/cpu_raster as raster
+import cheng/game/render/character
+import cheng/game/render/text
+import cheng/game/render/render_state
+import std/os
+import std/strings as strings
+import std/rawbytes
+import std/thread
+import std/cmdline
+
+const
+    SkeletonSchema = "cheng.apps.skeleton_film.v1"
+    FilmWidth = 1280
+    FilmHeight = 720
+    FilmDir = "artifacts/csg_world_video/skeleton_film"
+    WorldPath = "artifacts/csg_world_video/csgworld/skeleton.csgworld"
+    FilmTicks = 3600
+    FrameStep = 10
+    FilmFrames = 360
+    WalkInjectTick = 800
+    WalkSteps = 8
+    Act2StartTick = 800
+    Act3StartTick = 2600
+    GateTick = 3000
+    ProbeTicks = 3000
+    # walk contract: journey_film's 8-step precedent (>= 0.5 m pelvis
+    # advance); QueueWalk lands 0.25 m per pair, so 8 queued steps give
+    # a ~0.75 m lane advance — 1.5 m would exceed the gait's own reach
+    WalkGateDispMin = 0.5
+    WalkGateUprightZ = 0.5
+    # follow camera: position = pelvis + offset, look-at = smoothed pelvis
+    CamOffX = -2.6
+    CamOffY = 2.2
+    CamOffZ = 0.9
+    FollowFocal = 950.0
+    FollowSmooth = 0.15
+    TrajStride = 200
+    # spot-check PPMs kept on disk (stand / mid-walk / rest)
+    KeepFrame0 = 0
+    KeepFrame1 = 130
+    KeepFrame2 = 330
+
+fn framePath(frame: int32): str =
+    return FilmDir + "/skel_f" + strings.IntToStr(frame) + ".ppm"
+
+fn ParamFramePath(frame: int32): str =
+    return FilmDir + "/param_f" + strings.IntToStr(frame) + ".txt"
+
+fn QuantMm(v: float64): int64 =
+    return int64(v * 1000.0)
+
+fn MicronOf(v: float64): int64 =
+    if v >= 0.0:
+        return int64(v * 1000000.0 + 0.5)
+    return int64(v * 1000000.0 - 0.5)
+
+fn MicronToFloat(mcr: int64): float64 =
+    return float64(mcr) / 1000000.0
+
+fn IsKeepFrame(frame: int32): bool =
+    if frame == KeepFrame0:
+        return true
+    if frame == KeepFrame1:
+        return true
+    if frame == KeepFrame2:
+        return true
+    return false
+
+# Exact joint-topology lookup: do parts p and q share one joint?
+@borrows
+fn HasJointBetween(facts: schema.CsgWorldFacts, p: int32, q: int32): bool =
+    var ji: int32 = 0
+    while ji < facts.jointA.len:
+        if facts.jointA[ji] == p:
+            if facts.jointB[ji] == q:
+                return true
+        if facts.jointA[ji] == q:
+            if facts.jointB[ji] == p:
+                return true
+        ji = ji + 1
+    return false
+
+# The knee/elbow overlay masses carry role none in the .csgworld; their
+# semantic identity is exact joint topology (knee = mass jointed to both
+# pelvis and one foot, elbow = mass jointed to both chest and one hand).
+# Annotate those roles so the state-stream renderer can address them by
+# role, the same way RenderCharacter does over the live world.
+@borrows
+fn OverlayRolesAnnotated(facts: schema.CsgWorldFacts,
+                         pelvisPart: int32,
+                         chestPart: int32,
+                         footLPart: int32,
+                         footRPart: int32,
+                         handLPart: int32,
+                         handRPart: int32): int32[] =
+    var roles: int32[]
+    setLen(roles, 0)
+    var pi: int32 = 0
+    while pi < facts.partRole.len:
+        add(roles, facts.partRole[pi])
+        pi = pi + 1
+    pi = 0
+    while pi < facts.partRole.len:
+        if facts.partRole[pi] == schema.CsgRoleNone:
+            if HasJointBetween(facts, pi, pelvisPart):
+                if HasJointBetween(facts, pi, footLPart):
+                    roles[pi] = schema.CsgRoleKneeL
+                if HasJointBetween(facts, pi, footRPart):
+                    roles[pi] = schema.CsgRoleKneeR
+            if HasJointBetween(facts, pi, chestPart):
+                if HasJointBetween(facts, pi, handLPart):
+                    roles[pi] = schema.CsgRoleElbowL
+                if HasJointBetween(facts, pi, handRPart):
+                    roles[pi] = schema.CsgRoleElbowR
+        pi = pi + 1
+    return roles
+
+@borrows
+fn StateRoleSlot(s: render_state.RenderState, role: int32): int32 =
+    var i: int32 = 0
+    while i < s.roleCount:
+        if s.roles[i] == role:
+            return i
+        i = i + 1
+    return 0 - 1
+
+# Full 11-point skeleton over the state stream: the exact
+# character.RenderCharacter appearance (thin limb capsules through the
+# knee/elbow masses, overlay joint spheres drawn last) with every
+# coordinate read from the loaded state.
+@borrows
+fn DrawSkeletonState(t: raster.RasterTarget,
+                     cam: camera.CinemaCamera,
+                     s: render_state.RenderState) =
+    let head: int32 = StateRoleSlot(s, schema.CsgRoleHead)
+    let chest: int32 = StateRoleSlot(s, schema.CsgRoleChest)
+    let pelvis: int32 = StateRoleSlot(s, schema.CsgRolePelvis)
+    let handL: int32 = StateRoleSlot(s, schema.CsgRoleHandL)
+    let handR: int32 = StateRoleSlot(s, schema.CsgRoleHandR)
+    let footL: int32 = StateRoleSlot(s, schema.CsgRoleFootL)
+    let footR: int32 = StateRoleSlot(s, schema.CsgRoleFootR)
+    let kneeL: int32 = StateRoleSlot(s, schema.CsgRoleKneeL)
+    let kneeR: int32 = StateRoleSlot(s, schema.CsgRoleKneeR)
+    let elbowL: int32 = StateRoleSlot(s, schema.CsgRoleElbowL)
+    let elbowR: int32 = StateRoleSlot(s, schema.CsgRoleElbowR)
+    if chest < 0:
+        return
+    if pelvis < 0:
+        return
+    # torso: chest -> pelvis, red shirt
+    character.RasterCapsule(t, cam, s.px[chest], s.py[chest], s.pz[chest],
+        s.px[pelvis], s.py[pelvis], s.pz[pelvis], 0.13, 185, 45, 45)
+    # arms: chest -> elbow -> hand, red sleeves; the thin segment capsules
+    # keep the tagged elbow joint sphere visible
+    if elbowL >= 0:
+        character.RasterCapsule(t, cam, s.px[chest], s.py[chest], s.pz[chest],
+            s.px[elbowL], s.py[elbowL], s.pz[elbowL], 0.024, 165, 55, 55)
+        if handL >= 0:
+            character.RasterCapsule(t, cam, s.px[elbowL], s.py[elbowL], s.pz[elbowL],
+                s.px[handL], s.py[handL], s.pz[handL], 0.024, 165, 55, 55)
+    else:
+        if handL >= 0:
+            character.RasterCapsule(t, cam, s.px[chest], s.py[chest], s.pz[chest],
+                s.px[handL], s.py[handL], s.pz[handL], 0.05, 165, 55, 55)
+    if elbowR >= 0:
+        character.RasterCapsule(t, cam, s.px[chest], s.py[chest], s.pz[chest],
+            s.px[elbowR], s.py[elbowR], s.pz[elbowR], 0.024, 165, 55, 55)
+        if handR >= 0:
+            character.RasterCapsule(t, cam, s.px[elbowR], s.py[elbowR], s.pz[elbowR],
+                s.px[handR], s.py[handR], s.pz[handR], 0.024, 165, 55, 55)
+    else:
+        if handR >= 0:
+            character.RasterCapsule(t, cam, s.px[chest], s.py[chest], s.pz[chest],
+                s.px[handR], s.py[handR], s.pz[handR], 0.05, 165, 55, 55)
+    # legs: pelvis -> knee -> foot, deep blue pants
+    if kneeL >= 0:
+        character.RasterCapsule(t, cam, s.px[pelvis], s.py[pelvis], s.pz[pelvis],
+            s.px[kneeL], s.py[kneeL], s.pz[kneeL], 0.024, 45, 45, 65)
+        if footL >= 0:
+            character.RasterCapsule(t, cam, s.px[kneeL], s.py[kneeL], s.pz[kneeL],
+                s.px[footL], s.py[footL], s.pz[footL], 0.024, 45, 45, 65)
+    else:
+        if footL >= 0:
+            character.RasterCapsule(t, cam, s.px[pelvis], s.py[pelvis], s.pz[pelvis],
+                s.px[footL], s.py[footL], s.pz[footL], 0.065, 45, 45, 65)
+    if kneeR >= 0:
+        character.RasterCapsule(t, cam, s.px[pelvis], s.py[pelvis], s.pz[pelvis],
+            s.px[kneeR], s.py[kneeR], s.pz[kneeR], 0.024, 45, 45, 65)
+        if footR >= 0:
+            character.RasterCapsule(t, cam, s.px[kneeR], s.py[kneeR], s.pz[kneeR],
+                s.px[footR], s.py[footR], s.pz[footR], 0.024, 45, 45, 65)
+    else:
+        if footR >= 0:
+            character.RasterCapsule(t, cam, s.px[pelvis], s.py[pelvis], s.pz[pelvis],
+                s.px[footR], s.py[footR], s.pz[footR], 0.065, 45, 45, 65)
+    # head: skin sphere
+    if head >= 0:
+        raster.RasterSphere(t, cam, s.px[head], s.py[head], s.pz[head], 0.10, 220, 178, 140)
+    # hands/feet: gray spheres
+    if handL >= 0:
+        raster.RasterSphere(t, cam, s.px[handL], s.py[handL], s.pz[handL], 0.05, 150, 150, 160)
+    if handR >= 0:
+        raster.RasterSphere(t, cam, s.px[handR], s.py[handR], s.pz[handR], 0.05, 150, 150, 160)
+    if footL >= 0:
+        raster.RasterSphere(t, cam, s.px[footL], s.py[footL], s.pz[footL], 0.06, 90, 90, 100)
+    if footR >= 0:
+        raster.RasterSphere(t, cam, s.px[footR], s.py[footR], s.pz[footR], 0.06, 90, 90, 100)
+    # knee/elbow skeleton joints: dark-gray spheres, drawn last so their
+    # caps survive the depth test against every limb capsule
+    if kneeL >= 0:
+        raster.RasterSphere(t, cam, s.px[kneeL], s.py[kneeL], s.pz[kneeL], 0.045, 60, 60, 70)
+    if kneeR >= 0:
+        raster.RasterSphere(t, cam, s.px[kneeR], s.py[kneeR], s.pz[kneeR], 0.045, 60, 60, 70)
+    if elbowL >= 0:
+        raster.RasterSphere(t, cam, s.px[elbowL], s.py[elbowL], s.pz[elbowL], 0.04, 70, 70, 80)
+    if elbowR >= 0:
+        raster.RasterSphere(t, cam, s.px[elbowR], s.py[elbowR], s.pz[elbowR], 0.04, 70, 70, 80)
+
+# Pass 2 worker: load this frame's state file plus its frozen follow-
+# camera/caption parameter file, render and write the frame PPM. Every
+# input comes from this frame's own files — no shared state across
+# threads.
+fn skeletonRenderWorker(raw: ptr, index: int32, worker: int32): int32 =
+    let _raw = raw
+    let _worker = worker
+    let ptext: str = os.ReadFile(ParamFramePath(index))
+    var camv: int64[]
+    setLen(camv, 0)
+    var subOn: int32
+    var pos: int32 = 0
+    var fi: int32 = 0
+    while fi < 8:
+        var v: int64
+        var neg: bool
+        var seen: bool
+        v = 0
+        neg = false
+        seen = false
+        while pos < ptext.len:
+            let c: int32 = int32(ptext[pos])
+            if c == 45:
+                neg = true
+                seen = true
+                pos = pos + 1
+            else:
+                if c == 32 || c == 10:
+                    if seen:
+                        pos = pos + 1
+                        break
+                    pos = pos + 1
+                else:
+                    v = v * 10 + int64(c - 48)
+                    seen = true
+                    pos = pos + 1
+        if neg:
+            v = 0 - v
+        if fi < 7:
+            add(camv, v)
+        else:
+            subOn = int32(v)
+        fi = fi + 1
+    # line 2: act label (skipped by the worker)
+    while pos < ptext.len:
+        if int32(ptext[pos]) == 10:
+            break
+        pos = pos + 1
+    pos = pos + 1
+    # line 3: caption text
+    var cs: int32 = pos
+    while pos < ptext.len:
+        if int32(ptext[pos]) == 10:
+            break
+        pos = pos + 1
+    let caption: str = strings.sliceBytes(ptext, cs, pos - cs)
+    var cam = camera.CinemaCameraLookAt(
+        MicronToFloat(camv[0]), MicronToFloat(camv[1]), MicronToFloat(camv[2]),
+        MicronToFloat(camv[3]), MicronToFloat(camv[4]), MicronToFloat(camv[5]),
+        MicronToFloat(camv[6]), FilmWidth, FilmHeight)
+    let state = render_state.RenderStateLoad(render_state.RenderStateFramePath(FilmDir, index))
+    if state == nil:
+        return 1
+    var t: raster.RasterTarget
+    t = raster.RasterMake(FilmWidth, FilmHeight)
+    raster.RasterGround(t, cam)
+    raster.RasterWallFace(t, cam, 0.5, -2.0, 2.0, 0.0, 4.0)
+    DrawSkeletonState(t, cam, state)
+    # act label top-left
+    text.RasterText(t, 40, 40, 2, "SKELETON FILM", 255, 255, 255)
+    # caption bottom center when this frame carries one
+    if subOn >= 1:
+        let tw: int32 = text.TextPixelWidth(caption, 3)
+        text.RasterText(t, (FilmWidth - tw) / 2, FilmHeight - 90, 3, caption, 240, 240, 220)
+    raster.RasterWritePpm(t, framePath(index))
+    return 0
+
+# Failure-archive frame: one side view of the last good state, drawn
+# with the same 11-point skeleton renderer.
+@borrows
+fn RenderEvidencePpm(frameIdx: int32, pelX: float64, pelY: float64) =
+    let state = render_state.RenderStateLoad(render_state.RenderStateFramePath(FilmDir, frameIdx))
+    if state == nil:
+        return
+    var cam = camera.CinemaCameraLookAt(pelX, pelY + 3.4, 1.1, pelX, pelY, 0.85, 950.0, FilmWidth, FilmHeight)
+    var t: raster.RasterTarget
+    t = raster.RasterMake(FilmWidth, FilmHeight)
+    raster.RasterGround(t, cam)
+    raster.RasterWallFace(t, cam, 0.5, -2.0, 2.0, 0.0, 4.0)
+    DrawSkeletonState(t, cam, state)
+    raster.RasterWritePpm(t, FilmDir + "/standing_evidence.ppm")
+    echo("evidence=" + FilmDir + "/standing_evidence.ppm")
+
+# Buffered trajectory print (never inside the physics loop)
+fn PrintTrajectory(pelX: float64[], pelZ: float64[], upTo: int32) =
+    var t: int32 = 0
+    while t <= upTo:
+        echo("traj tick=" + strings.IntToStr(t) + " pelvisXmm=" + strings.Int64ToStr(QuantMm(pelX[t])) + " pelvisZmm=" + strings.Int64ToStr(QuantMm(pelZ[t])))
+        t = t + TrajStride
+
+# Render-path isolation: two cameras over the same state, printed basis
+# values, ground+wall+skeleton each. Discriminates camera-basis vs draw
+# problems behind an empty evidence frame.
+fn RunCamTest(): int32 =
+    let state = render_state.RenderStateLoad(render_state.RenderStateFramePath(FilmDir, 97))
+    if state == nil:
+        echo("FAIL camtest state nil")
+        return 1
+    let pel: int32 = StateRoleSlot(state, schema.CsgRolePelvis)
+    echo("camtest pelvisSlot=" + strings.IntToStr(pel) + " roleCount=" + strings.IntToStr(state.roleCount) + " bodyCount=" + strings.IntToStr(state.bodyCount))
+    echo("camtest pelvis mm=" + strings.Int64ToStr(QuantMm(state.px[pel])) + "," + strings.Int64ToStr(QuantMm(state.py[pel])) + "," + strings.Int64ToStr(QuantMm(state.pz[pel])))
+    let pelX: float64 = state.px[pel]
+    let pelY: float64 = state.py[pel]
+    var camA = camera.CinemaCameraLookAt(pelX, pelY + 3.4, 1.1, pelX, pelY, 0.85, 950.0, FilmWidth, FilmHeight)
+    echo("camA f=" + strings.Int64ToStr(QuantMm(camA.fx)) + "," + strings.Int64ToStr(QuantMm(camA.fy)) + "," + strings.Int64ToStr(QuantMm(camA.fz)))
+    echo("camA r=" + strings.Int64ToStr(QuantMm(camA.rx)) + "," + strings.Int64ToStr(QuantMm(camA.ry)) + "," + strings.Int64ToStr(QuantMm(camA.rz)))
+    echo("camA u=" + strings.Int64ToStr(QuantMm(camA.ux)) + "," + strings.Int64ToStr(QuantMm(camA.uy)) + "," + strings.Int64ToStr(QuantMm(camA.uz)))
+    var tA: raster.RasterTarget
+    tA = raster.RasterMake(FilmWidth, FilmHeight)
+    raster.RasterGround(tA, camA)
+    raster.RasterWallFace(tA, camA, 0.5, -2.0, 2.0, 0.0, 4.0)
+    DrawSkeletonState(tA, camA, state)
+    raster.RasterWritePpm(tA, FilmDir + "/camtest_a.ppm")
+    var camB = camera.CinemaCameraLookAt(-4.6, 3.2, 1.7, 0.0, 0.8, 1.35, 950.0, FilmWidth, FilmHeight)
+    var tB: raster.RasterTarget
+    tB = raster.RasterMake(FilmWidth, FilmHeight)
+    raster.RasterGround(tB, camB)
+    raster.RasterWallFace(tB, camB, 0.5, -2.0, 2.0, 0.0, 4.0)
+    DrawSkeletonState(tB, camB, state)
+    raster.RasterWritePpm(tB, FilmDir + "/camtest_b.ppm")
+    echo("camtest done")
+    return 0
+
+# Walk-feasibility probe (audit only, no film, no frame dumps): the
+# control experiment for the overlay question — run the exact same
+# injection against a different world (e.g. the 7-point playground).
+fn RunProbe(worldPath: str): int32 =
+    var facts: schema.CsgWorldFacts
+    let cid: str = csgworld.CsgWorldLoad(worldPath, facts)
+    if cid == "":
+        echo("FAIL cannot load " + worldPath)
+        return 1
+    var verdict = validation.CsgValidateFacts(facts)
+    if verdict.statusCode != validation.CsgValidOk:
+        echo("FAIL facts validation status=" + strings.IntToStr(verdict.statusCode))
+        return 1
+    var w: world3d.World3d
+    var mp: materializer.CsgMaterializerMapping
+    var err: str
+    if !materializer.CsgMaterialize(facts, w, mp, err):
+        echo("FAIL materialize: " + err)
+        return 1
+    var st: execution.CsgExecutionState
+    execution.CsgExecutionInit(st, facts, w, mp.partSlot, mp.ropeNodeSlot)
+    var pelvisPart: int32 = 0 - 1
+    var ri: int32 = 0
+    while ri < facts.partRole.len:
+        if facts.partRole[ri] == schema.CsgRolePelvis:
+            pelvisPart = ri
+        ri = ri + 1
+    if pelvisPart < 0:
+        echo("FAIL probe pelvis role missing")
+        return 1
+    let pelvisSlot: int32 = mp.partSlot[pelvisPart]
+    var pelX: float64[]
+    var pelY: float64[]
+    var pelZ: float64[]
+    setLen(pelX, ProbeTicks + 1)
+    setLen(pelY, ProbeTicks + 1)
+    setLen(pelZ, ProbeTicks + 1)
+    var rejectedTick: int64 = 0 - 1
+    var rejectedCode: int32 = 0 - 1
+    var rejectedResidMm: int64 = 0 - 1
+    var tick: int32 = 0
+    while tick < ProbeTicks:
+        pelX[tick] = st.w.bodyPx[pelvisSlot]
+        pelY[tick] = st.w.bodyPy[pelvisSlot]
+        pelZ[tick] = st.w.bodyPz[pelvisSlot]
+        if tick == WalkInjectTick:
+            let wrc = execution.CsgExecutionQueueWalk(st, facts, WalkSteps)
+            if wrc != 0:
+                echo("FAIL walk queue: no foot parts")
+                return 1
+        var receipt = execution.CsgExecutionTick(st, facts)
+        if receipt.statusCode != physics3d.Physics3dStatusOk:
+            rejectedTick = receipt.tick
+            rejectedCode = receipt.statusCode
+            rejectedResidMm = QuantMm(receipt.maxResidualMm)
+            break
+        tick = tick + 1
+    # final trajectory row: the loop exits at tick == ProbeTicks before
+    # its own record step (on rejection the row is already recorded and
+    # the rolled-back state is identical)
+    pelX[tick] = st.w.bodyPx[pelvisSlot]
+    pelY[tick] = st.w.bodyPy[pelvisSlot]
+    pelZ[tick] = st.w.bodyPz[pelvisSlot]
+    echo("probe world=" + worldPath)
+    echo("probeCid=" + cid)
+    echo("balance=" + strings.IntToStr(st.balOn))
+    echo("walkInject tick=" + strings.IntToStr(WalkInjectTick) + " steps=" + strings.IntToStr(WalkSteps))
+    if rejectedTick >= 0:
+        echo("FAIL physics rejected")
+        echo("rejectTick=" + strings.Int64ToStr(rejectedTick))
+        echo("rejectCode=" + strings.IntToStr(rejectedCode))
+        echo("rejectResidualMm=" + strings.Int64ToStr(rejectedResidMm))
+        PrintTrajectory(pelX, pelZ, rejectedTick)
+        echo("FAIL walk probe infeasible")
+        return 1
+    let dispX: float64 = pelX[GateTick] - pelX[WalkInjectTick]
+    let dy: float64 = pelY[GateTick] - pelY[WalkInjectTick]
+    let dispH: float64 = numerics.CsgSqrt(dispX * dispX + dy * dy)
+    # int-mm gates: the cold backend miscompiles the direct float64
+    # array-load vs float-const compare here (gateZ read 0.712 against a
+    # 0.5 threshold and took the branch); QuantMm's int32 hop is the
+    # documented-safe boundary and integer compares are exact
+    let dispXmm: int64 = QuantMm(dispX)
+    let gateZmm: int64 = QuantMm(pelZ[GateTick])
+    let dispGateMm: int64 = QuantMm(WalkGateDispMin)
+    let uprightMinMm: int64 = QuantMm(WalkGateUprightZ)
+    echo("gateCheck dispXmm=" + strings.Int64ToStr(dispXmm) + " dispGateMm=" + strings.Int64ToStr(dispGateMm) + " gateZmm=" + strings.Int64ToStr(gateZmm) + " uprightMinMm=" + strings.Int64ToStr(uprightMinMm))
+    echo("auditGateTick=" + strings.IntToStr(GateTick))
+    echo("walkDispXmm=" + strings.Int64ToStr(dispXmm))
+    echo("walkDispHmm=" + strings.Int64ToStr(QuantMm(dispH)))
+    echo("gatePelvisZmm=" + strings.Int64ToStr(gateZmm))
+    echo("rejectedCount=0")
+    PrintTrajectory(pelX, pelZ, GateTick)
+    if dispXmm < dispGateMm:
+        echo("FAIL walk displacement below contract")
+        echo("FAIL walk probe infeasible")
+        return 1
+    if gateZmm < uprightMinMm:
+        echo("FAIL pelvis not upright at gate tick")
+        echo("FAIL walk probe infeasible")
+        return 1
+    echo("PASS walk probe")
+    return 0
+
+@borrows
+fn HasPrefix(s: str, pre: str): bool =
+    if s.len < pre.len:
+        return false
+    var k: int32 = 0
+    while k < pre.len:
+        if s[k] != pre[k]:
+            return false
+        k = k + 1
+    return true
+
+fn main(): int32 =
+    if cmdline.paramCount() >= 1:
+        let mode: str = cmdline.paramStr(1)
+        if mode == "--camtest":
+            return RunCamTest()
+        if HasPrefix(mode, "--probe:"):
+            let ppath: str = strings.CloneStrRange(mode, 8, mode.len - 8)
+            return RunProbe(ppath)
+    os.MkdirAll(FilmDir, 493)
+    var facts: schema.CsgWorldFacts
+    let cid: str = csgworld.CsgWorldLoad(WorldPath, facts)
+    if cid == "":
+        echo("FAIL cannot load " + WorldPath)
+        return 1
+    let recomputed: str = Fmt"{schema.CsgWorldFactsCid(facts)}"
+    if recomputed != cid:
+        echo("FAIL csgworld cid mismatch")
+        return 1
+    var verdict = validation.CsgValidateFacts(facts)
+    if verdict.statusCode != validation.CsgValidOk:
+        echo("FAIL facts validation status=" + strings.IntToStr(verdict.statusCode))
+        return 1
+    var w: world3d.World3d
+    var mp: materializer.CsgMaterializerMapping
+    var err: str
+    if !materializer.CsgMaterialize(facts, w, mp, err):
+        echo("FAIL materialize: " + err)
+        return 1
+    var st: execution.CsgExecutionState
+    execution.CsgExecutionInit(st, facts, w, mp.partSlot, mp.ropeNodeSlot)
+    var partRoles: int32[]
+    setLen(partRoles, 0)
+    var ri: int32 = 0
+    while ri < facts.partRole.len:
+        add(partRoles, facts.partRole[ri])
+        ri = ri + 1
+    # semantic part indices through the role table (exact identity)
+    var pelvisPart: int32 = 0 - 1
+    var chestPart: int32 = 0 - 1
+    var footLPart: int32 = 0 - 1
+    var footRPart: int32 = 0 - 1
+    var handLPart: int32 = 0 - 1
+    var handRPart: int32 = 0 - 1
+    ri = 0
+    while ri < facts.partRole.len:
+        if facts.partRole[ri] == schema.CsgRolePelvis:
+            pelvisPart = ri
+        if facts.partRole[ri] == schema.CsgRoleChest:
+            chestPart = ri
+        if facts.partRole[ri] == schema.CsgRoleFootL:
+            footLPart = ri
+        if facts.partRole[ri] == schema.CsgRoleFootR:
+            footRPart = ri
+        if facts.partRole[ri] == schema.CsgRoleHandL:
+            handLPart = ri
+        if facts.partRole[ri] == schema.CsgRoleHandR:
+            handRPart = ri
+        ri = ri + 1
+    if pelvisPart < 0 or chestPart < 0:
+        echo("FAIL skeleton core roles missing")
+        return 1
+    let annotated: int32[] = OverlayRolesAnnotated(facts, pelvisPart, chestPart,
+        footLPart, footRPart, handLPart, handRPart)
+    var overlayCount: int32 = 0
+    ri = 0
+    while ri < annotated.len:
+        if annotated[ri] == schema.CsgRoleKneeL:
+            overlayCount = overlayCount + 1
+        if annotated[ri] == schema.CsgRoleKneeR:
+            overlayCount = overlayCount + 1
+        if annotated[ri] == schema.CsgRoleElbowL:
+            overlayCount = overlayCount + 1
+        if annotated[ri] == schema.CsgRoleElbowR:
+            overlayCount = overlayCount + 1
+        ri = ri + 1
+    if overlayCount != 4:
+        echo("FAIL skeleton overlay roles unresolved n=" + strings.IntToStr(overlayCount))
+        return 1
+    let pelvisSlot: int32 = mp.partSlot[pelvisPart]
+    let chestSlot: int32 = mp.partSlot[chestPart]
+    # per-tick pelvis/chest trajectory (the audit data)
+    var pelX: float64[]
+    var pelY: float64[]
+    var pelZ: float64[]
+    var chestZ: float64[]
+    setLen(pelX, FilmTicks + 1)
+    setLen(pelY, FilmTicks + 1)
+    setLen(pelZ, FilmTicks + 1)
+    setLen(chestZ, FilmTicks + 1)
+    # ---- pass 1: serial physics + walk audit + per-frame state dump ----
+    var rejectedTick: int64 = 0 - 1
+    var rejectedCode: int32 = 0 - 1
+    var rejectedResidMm: int64 = 0 - 1
+    var frame: int32 = 0
+    var tick: int32 = 0
+    # smoothed follow-camera cross-frame state
+    var fTgtX: float64
+    var fTgtY: float64
+    var fTgtZ: float64
+    var fCamX: float64
+    var fCamY: float64
+    var fCamZ: float64
+    while tick < FilmTicks:
+        pelX[tick] = st.w.bodyPx[pelvisSlot]
+        pelY[tick] = st.w.bodyPy[pelvisSlot]
+        pelZ[tick] = st.w.bodyPz[pelvisSlot]
+        chestZ[tick] = st.w.bodyPz[chestSlot]
+        if tick == WalkInjectTick:
+            let wrc = execution.CsgExecutionQueueWalk(st, facts, WalkSteps)
+            if wrc != 0:
+                echo("FAIL walk queue: no foot parts")
+                return 1
+        if tick % FrameStep == 0:
+            # smoothed pelvis chase: converge target and camera toward
+            # the pelvis (position = pelvis + fixed offset)
+            let pelNowX: float64 = st.w.bodyPx[pelvisSlot]
+            let pelNowY: float64 = st.w.bodyPy[pelvisSlot]
+            let pelNowZ: float64 = st.w.bodyPz[pelvisSlot]
+            if frame == 0:
+                fTgtX = pelNowX
+                fTgtY = pelNowY
+                fTgtZ = pelNowZ
+                fCamX = pelNowX + CamOffX
+                fCamY = pelNowY + CamOffY
+                fCamZ = pelNowZ + CamOffZ
+            else:
+                fTgtX = fTgtX + (pelNowX - fTgtX) * FollowSmooth
+                fTgtY = fTgtY + (pelNowY - fTgtY) * FollowSmooth
+                fTgtZ = fTgtZ + (pelNowZ - fTgtZ) * FollowSmooth
+                fCamX = fCamX + (pelNowX + CamOffX - fCamX) * FollowSmooth
+                fCamY = fCamY + (pelNowY + CamOffY - fCamY) * FollowSmooth
+                fCamZ = fCamZ + (pelNowZ + CamOffZ - fCamZ) * FollowSmooth
+            var label: str
+            var caption: str
+            if tick < Act2StartTick:
+                label = "ACT 1 STAND"
+                caption = "SKELETON WALK"
+            elif tick < Act3StartTick:
+                label = "ACT 2 WALK"
+                caption = "KNEES AND ELBOWS ONLINE"
+            else:
+                label = "ACT 3 REST"
+                caption = "PURE CHENG PHYSICS"
+            var ptext: str = ""
+            ptext = ptext + strings.Int64ToStr(MicronOf(fCamX))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(fCamY))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(fCamZ))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(fTgtX))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(fTgtY))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(fTgtZ))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(FollowFocal))
+            ptext = ptext + " 1\n"
+            ptext = ptext + label + "\n"
+            ptext = ptext + caption + "\n"
+            os.WriteFile(ParamFramePath(frame), ptext)
+            render_state.RenderStateSave(st.w, annotated, render_state.RenderStateFramePath(FilmDir, frame))
+            frame = frame + 1
+        var receipt = execution.CsgExecutionTick(st, facts)
+        if receipt.statusCode != physics3d.Physics3dStatusOk:
+            # a rejected step rolls back: the tick never advances, so
+            # stop here and audit with the buffered trajectory
+            rejectedTick = receipt.tick
+            rejectedCode = receipt.statusCode
+            rejectedResidMm = QuantMm(receipt.maxResidualMm)
+            break
+        tick = tick + 1
+    # final trajectory row (loop exits at tick == FilmTicks before its
+    # own record step; identical values on the rejection rollback)
+    pelX[tick] = st.w.bodyPx[pelvisSlot]
+    pelY[tick] = st.w.bodyPy[pelvisSlot]
+    pelZ[tick] = st.w.bodyPz[pelvisSlot]
+    chestZ[tick] = st.w.bodyPz[chestSlot]
+    # ---- walk audit (all I/O buffered until here) ----
+    echo("world=" + WorldPath)
+    echo("worldCid=" + cid)
+    echo("balance=" + strings.IntToStr(st.balOn))
+    echo("walkInject tick=" + strings.IntToStr(WalkInjectTick) + " steps=" + strings.IntToStr(WalkSteps))
+    if rejectedTick >= 0:
+        echo("FAIL physics rejected during skeleton sequence")
+        echo("rejectTick=" + strings.Int64ToStr(rejectedTick))
+        echo("rejectCode=" + strings.IntToStr(rejectedCode))
+        echo("rejectResidualMm=" + strings.Int64ToStr(rejectedResidMm))
+        if frame > 0:
+            let lastGood: int32 = frame - 1
+            PrintTrajectory(pelX, pelZ, lastGood * FrameStep)
+            RenderEvidencePpm(lastGood, pelX[lastGood * FrameStep], pelY[lastGood * FrameStep])
+        echo("FAIL skeleton walk infeasible")
+        return 1
+    if frame != FilmFrames:
+        echo("FAIL frame count n=" + strings.IntToStr(frame))
+        return 1
+    let walkStartX: float64 = pelX[WalkInjectTick]
+    let gateX: float64 = pelX[GateTick]
+    let gateY: float64 = pelY[GateTick]
+    let gateZ: float64 = pelZ[GateTick]
+    let dispX: float64 = gateX - walkStartX
+    let dy: float64 = gateY - pelY[WalkInjectTick]
+    let dispH: float64 = numerics.CsgSqrt(dispX * dispX + dy * dy)
+    let dispXmm: int64 = QuantMm(dispX)
+    let dispHmm: int64 = QuantMm(dispH)
+    let gateZmm: int64 = QuantMm(gateZ)
+    let dispGateMm: int64 = QuantMm(WalkGateDispMin)
+    let uprightMinMm: int64 = QuantMm(WalkGateUprightZ)
+    echo("auditGateTick=" + strings.IntToStr(GateTick))
+    echo("walkStartXmm=" + strings.Int64ToStr(QuantMm(walkStartX)))
+    echo("gatePelvisXmm=" + strings.Int64ToStr(QuantMm(gateX)))
+    echo("walkDispXmm=" + strings.Int64ToStr(dispXmm))
+    echo("walkDispHmm=" + strings.Int64ToStr(dispHmm))
+    echo("gatePelvisZmm=" + strings.Int64ToStr(gateZmm))
+    echo("rejectedCount=0")
+    PrintTrajectory(pelX, pelZ, GateTick)
+    if dispXmm < dispGateMm:
+        echo("FAIL walk displacement below contract")
+        echo("gate min mm=" + strings.Int64ToStr(dispGateMm))
+        echo("FAIL skeleton walk infeasible")
+        return 1
+    if gateZmm < uprightMinMm:
+        echo("FAIL pelvis not upright at gate tick")
+        echo("FAIL skeleton walk infeasible")
+        return 1
+    if st.w.bodyPz[chestSlot] < st.w.bodyPz[pelvisSlot]:
+        echo("FAIL upright chest below pelvis at end")
+        echo("FAIL skeleton walk infeasible")
+        return 1
+    echo("walk audit PASS")
+    # ---- pass 2: frame-parallel render from the state stream ----
+    var pool = thread.PoolNew(0)
+    thread.ParallelFor(pool, FilmFrames, &skeletonRenderWorker, nil)
+    # ---- pass 3: stream PPM frames -> VideoToolbox -> skeleton_walk.mp4 ----
+    let vctx: ptr = vtbr.VtbrVideoSessionCreate(FilmWidth, FilmHeight)
+    if vctx == nil:
+        echo("FAIL vt session")
+        return 1
+    var encodeFail: int32 = 0
+    var pixTotal: int32 = FilmWidth * FilmHeight
+    var f: int32 = 0
+    while f < FilmFrames:
+        let ppm: str = os.ReadFile(framePath(f))
+        if ppm.len < 16 + pixTotal * 3:
+            echo("FAIL ppm short frame=" + strings.IntToStr(f))
+            return 1
+        var b: rawbytes.Bytes = rawbytes.BytesAlloc(pixTotal * 4)
+        var pi: int32 = 0
+        while pi < pixTotal:
+            rawbytes.BytesSet(b, pi * 4, int32(ppm[16 + pi * 3 + 2]) & 255)
+            rawbytes.BytesSet(b, pi * 4 + 1, int32(ppm[16 + pi * 3 + 1]) & 255)
+            rawbytes.BytesSet(b, pi * 4 + 2, int32(ppm[16 + pi * 3]) & 255)
+            rawbytes.BytesSet(b, pi * 4 + 3, int32(255))
+            pi = pi + 1
+        let erc = vtbr.VtbrVideoEncodeBgra(vctx, rawbytes.BytesDataPtr(b), FilmWidth * 4, FilmWidth, FilmHeight, f * 1000)
+        rawbytes.BytesFree(b)
+        if erc != 0:
+            encodeFail = encodeFail + 1
+        if !IsKeepFrame(f):
+            let _removed = os.RemoveFile(framePath(f))
+        f = f + 1
+    if encodeFail > 0:
+        echo("FAIL encode frames n=" + strings.IntToStr(encodeFail))
+        return 1
+    if vtbr.VtbrVideoFinish(vctx) != 0:
+        echo("FAIL video finish")
+        return 1
+    let _drained = vtbr.VtbrVideoDrain(vctx)
+    var videoPayload: uint8[]
+    setLen(videoPayload, 0)
+    vtbr.VtbrVideoCopyPayload(vctx, videoPayload)
+    var videoSizes: int32[]
+    setLen(videoSizes, 0)
+    vtbr.VtbrVideoCopySizes(vctx, videoSizes)
+    var videoKf: int32[]
+    setLen(videoKf, 0)
+    vtbr.VtbrVideoCopyKeyframes(vctx, videoKf)
+    var sps: uint8[]
+    setLen(sps, 0)
+    var pps: uint8[]
+    setLen(pps, 0)
+    vtbr.VtbrVideoCopyParamSets(vctx, sps, pps)
+    if sps.len == 0 || pps.len == 0:
+        echo("FAIL paramsets empty")
+        return 1
+    if videoSizes.len != FilmFrames:
+        echo("FAIL video sample count n=" + strings.IntToStr(videoSizes.len))
+        return 1
+    var inp: mp4.Mp4Input
+    inp.videoSizes = videoSizes
+    inp.videoKf = videoKf
+    inp.videoPayload = videoPayload
+    inp.sps = sps
+    inp.pps = pps
+    var scorePcm: uint8[]
+    setLen(scorePcm, 0)
+    let scoreSamples: int32 = score.ScorePcm48k(scorePcm, 15)
+    var audioPayload: uint8[]
+    setLen(audioPayload, 0)
+    var audioSizes: int32[]
+    setLen(audioSizes, 0)
+    let arc = aac.AacEncodePcm16(scorePcm, scorePcm.len, audioPayload, audioSizes)
+    if arc != 0:
+        echo("FAIL audio encode rc=" + strings.IntToStr(arc))
+        return 1
+    var packetBytes: int32 = 0
+    var asi: int32 = 0
+    while asi < audioSizes.len:
+        packetBytes = packetBytes + audioSizes[asi]
+        asi = asi + 1
+    if packetBytes != audioPayload.len:
+        echo("FAIL audio payload mismatch")
+        return 1
+    inp.audioPayload = audioPayload
+    inp.audioSizes = audioSizes
+    inp.audioSamples = scoreSamples
+    let filmPath: str = FilmDir + "/skeleton_walk.mp4"
+    mp4.Mp4Assemble(inp, filmPath)
+    var man: str = ""
+    man = man + "schema=" + SkeletonSchema + "\n"
+    man = man + "world=" + WorldPath + "\n"
+    man = man + "worldCid=" + cid + "\n"
+    man = man + "ticks=" + strings.IntToStr(FilmTicks) + "\n"
+    man = man + "frames=" + strings.IntToStr(frame) + "\n"
+    man = man + "audioPackets=" + strings.IntToStr(audioSizes.len) + "\n"
+    man = man + "audioSamples=" + strings.IntToStr(scoreSamples) + "\n"
+    man = man + "walkSteps=" + strings.IntToStr(WalkSteps) + "\n"
+    man = man + "walkInjectTick=" + strings.IntToStr(WalkInjectTick) + "\n"
+    man = man + "rejectedCount=0\n"
+    man = man + "walkDispXmm=" + strings.Int64ToStr(dispXmm) + "\n"
+    man = man + "walkDispHmm=" + strings.Int64ToStr(dispHmm) + "\n"
+    man = man + "gatePelvisZmm=" + strings.Int64ToStr(gateZmm) + "\n"
+    man = man + "factsCid=" + Fmt"{schema.CsgWorldFactsCid(facts)}" + "\n"
+    man = man + "chainCid=" + Fmt"{st.chainCid}" + "\n"
+    os.WriteFile(FilmDir + "/manifest.txt", man)
+    echo("frames=" + strings.IntToStr(frame))
+    echo("audioPackets=" + strings.IntToStr(audioSizes.len))
+    echo("chainCid=" + Fmt"{st.chainCid}")
+    echo("film=" + filmPath)
+    echo("PASS skeleton film")
+    return 0

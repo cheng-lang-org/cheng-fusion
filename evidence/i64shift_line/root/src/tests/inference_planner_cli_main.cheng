@@ -1,0 +1,367 @@
+import std/result
+import std/os
+import std/monotimes as mono
+import std/strings
+import std/strutils as strutil
+import std/cmdline
+import cheng/std/unicode as uni
+import cheng/inference/tokenizer as tok
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/hf_model_graph as hfgraph
+import cheng/inference/weight_store as ws
+import cheng/inference/weight_binding as wb
+import cheng/inference/model_executor as mexec
+import cheng/inference/distributed_engine as engine
+import cheng/inference/planner_task as ptask
+
+# 小优 S4: planner CLI 真权重文件路径入口。
+#
+# 生产入口 (无合成权重、无 mock 解码):
+#   --config  <HF config.json 路径>     或 env CHENG_PLANNER_CONFIG
+#   --weights <*.safetensors 路径>      或 env CHENG_PLANNER_WEIGHTS
+# 二者任一缺失 / 文件不存在 → 非 0 退出 (hard-fail)。
+# 有路径则走 WeightSafetensorsLoadGraphFilePathStreaming 真解码 →
+# ModelExecutorValidateDenseTransformerGraph →
+# DistributedGenerateGreedyDenseTransformerTokens。
+#
+# 可选:
+#   --prompt <text>                 真 tokenizer 编码 (默认: 帮我发布一个宠物视频)
+#   --prompt-tokens <csv int32>     跳过 tokenizer, 直接喂 token id (小词表夹具用)
+#   --max-new-tokens <n>            默认 3
+#   --tensor-scale <n>              默认 100000 (#155q 量化精度 lever: 1000→100000,
+#                                    TOP5 3/5→5/5, 逐层 fitted-gain-err 收窄一个数量级)
+#   --model-cid <cid>               默认 cid:model:xiaoyou-planner-cli
+#   --tokenizer <bin>               默认 artifacts/tokenizer/qwen25/tokenizer_qwen25.bin
+#   --unicode-tables <bin>          默认 artifacts/tokenizer/unicode_tables.bin
+#
+# 片8 (f0761f07a) 已补 dense HF 形状执行器; 片9 (32c5d5be8) 已证磁盘
+# safetensors→解码→greedy 桥接。本片只把 planner CLI 从「合成权重 plumbing」
+# 换成「真实路径入口」。真 Qwen 0.5B 多 GB 分片流式/mmap 解码仍是独立课题
+# (接口签名零改动可承接); 仓库无真权重时用夹具小 safetensors 冒烟即可。
+
+type
+    PlannerCliFixture =
+        graph: mg.ModelGraph
+        bindings: wb.WeightBindingSet
+        store: ws.WeightTensorStore
+
+fn cliUsage(): str =
+    return strutil.Join([
+        "usage: inference_planner_cli",
+        " --config <config.json>",
+        " --weights <model.safetensors>",
+        " [--prompt <text>|--prompt-tokens <csv>]",
+        " [--max-new-tokens N] [--tensor-scale N] [--model-cid CID]",
+        " [--tokenizer PATH] [--unicode-tables PATH]",
+        " (env fallback: CHENG_PLANNER_CONFIG / CHENG_PLANNER_WEIGHTS)"
+    ], "")
+
+fn cliResolvePath(flagName: str, envName: str): str =
+    var flagValue: str
+    if cmdline.ReadFirstFlagValue(flagName, flagValue):
+        if flagValue != "":
+            return flagValue
+    let envValue = os.GetEnv(envName)
+    if envValue != "":
+        return envValue
+    return ""
+
+fn cliPeerIds(count: int32): str[] =
+    var peers: str[]
+    for i in 0..<count:
+        add(peers, strutil.Join(["peer:xiaoyou-planner:", strings.IntToStr(i)], ""))
+    return peers
+
+fn cliTokenIdsToString(ids: int32[]): str =
+    var parts: str[]
+    for i in 0..<ids.len:
+        add(parts, strings.IntToStr(ids[i]))
+    return strutil.Join(parts, ",")
+
+fn cliParsePromptTokensCsv(csv: str): Result[int32[]] =
+    if csv == "":
+        return Err[int32[]]("inference planner cli: empty prompt-tokens")
+    let fields = strutil.Split(csv, ',')
+    if fields.len == 0:
+        return Err[int32[]]("inference planner cli: no prompt-tokens")
+    var ids: int32[]
+    for i in 0..<fields.len:
+        if fields[i] == "":
+            return Err[int32[]]("inference planner cli: empty prompt-tokens field")
+        add(ids, int32(strutil.ParseInt(fields[i])))
+    return Ok[int32[]](ids)
+
+fn cliLoadFromPaths(configPath: str,
+                    weightsPath: str,
+                    modelCid: str,
+                    tensorScale: int32,
+                    linearDtype: str): Result[PlannerCliFixture] =
+    if configPath == "":
+        return Err[PlannerCliFixture]("inference planner cli: missing --config / CHENG_PLANNER_CONFIG")
+    if weightsPath == "":
+        return Err[PlannerCliFixture]("inference planner cli: missing --weights / CHENG_PLANNER_WEIGHTS")
+    if !os.FileExists(configPath):
+        return Err[PlannerCliFixture](strutil.Join([
+            "inference planner cli: config path not found: ", configPath
+        ], ""))
+    if !os.FileExists(weightsPath):
+        return Err[PlannerCliFixture](strutil.Join([
+            "inference planner cli: weights path not found: ", weightsPath
+        ], ""))
+
+    let configRes = os.ReadFileResult(configPath)
+    if IsErr(configRes):
+        return Err[PlannerCliFixture](Error(configRes))
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        Value(configRes),
+        modelCid,
+        linearDtype,
+        mg.ModelQuantSchemeNone
+    )
+    if IsErr(graphRes):
+        return Err[PlannerCliFixture](Error(graphRes))
+    let graph = Value(graphRes)
+    let graphOk = mg.ModelGraphValidate(graph)
+    if IsErr(graphOk):
+        return Err[PlannerCliFixture](Error(graphOk))
+    if graph.architecture != mg.InferenceModelArchitectureDenseTransformer:
+        return Err[PlannerCliFixture]("inference planner cli: expected dense_transformer architecture")
+    if graph.weights.len <= 0:
+        return Err[PlannerCliFixture]("inference planner cli: empty weight inventory")
+
+    let peerIds = cliPeerIds(graph.weights.len)
+    let loaded = ws.WeightSafetensorsLoadGraphFilePathStreaming(weightsPath, share(graph), peerIds, tensorScale)
+    if IsErr(loaded):
+        return Err[PlannerCliFixture](Error(loaded))
+    let loadResult = Value(loaded)
+    if loadResult.store.payloads.len != graph.weights.len:
+        return Err[PlannerCliFixture]("inference planner cli: loaded payload count mismatch")
+
+    var hashes: int64[]
+    for i in 0..<loadResult.store.payloads.len:
+        if loadResult.store.payloads[i].tensorName != graph.weights[i].tensorName:
+            return Err[PlannerCliFixture]("inference planner cli: payload order mismatch")
+        add(hashes, loadResult.store.payloads[i].payloadHash)
+    let boundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(graph, hashes)
+    if IsErr(boundGraphRes):
+        return Err[PlannerCliFixture](Error(boundGraphRes))
+    let boundGraph = Value(boundGraphRes)
+    let bindOk = wb.WeightBindingValidate(loadResult.bindings, boundGraph)
+    if IsErr(bindOk):
+        return Err[PlannerCliFixture](Error(bindOk))
+    let storeOk = ws.WeightTensorValidateStore(loadResult.store, loadResult.bindings, boundGraph)
+    if IsErr(storeOk):
+        return Err[PlannerCliFixture](Error(storeOk))
+    let gateRes = mexec.ModelExecutorValidateDenseTransformerGraph(
+        boundGraph, loadResult.bindings, loadResult.store)
+    if IsErr(gateRes):
+        return Err[PlannerCliFixture](Error(gateRes))
+    if !Value(gateRes):
+        return Err[PlannerCliFixture]("inference planner cli: dense transformer graph gate false")
+    return Ok[PlannerCliFixture](PlannerCliFixture(
+        graph: boundGraph,
+        bindings: loadResult.bindings,
+        store: loadResult.store
+    ))
+
+fn main(): int32 =
+    let configPath = cliResolvePath("--config", "CHENG_PLANNER_CONFIG")
+    let weightsPath = cliResolvePath("--weights", "CHENG_PLANNER_WEIGHTS")
+    if configPath == "" || weightsPath == "":
+        echo(cliUsage())
+        echo("inference_planner_cli_main: hard-fail missing config/weights path")
+        return 2
+    if !os.FileExists(configPath):
+        echo(strutil.Join(["config_path_error=not_found:", configPath], ""))
+        return 2
+    if !os.FileExists(weightsPath):
+        echo(strutil.Join(["weights_path_error=not_found:", weightsPath], ""))
+        return 2
+
+    let modelCid = cmdline.ReadFlagOrDefault("--model-cid", "cid:model:xiaoyou-planner-cli")
+    let tensorScale = cmdline.ReadInt32FlagOrDefault("--tensor-scale", 100000)
+    if tensorScale <= 0:
+        echo("tensor_scale_error=expected_positive_int32")
+        return 2
+    # Real HF checkpoints declare their storage dtype (Qwen2.5 = bfloat16);
+    # the synthetic smoke fixtures are written as F16. Default stays fp16 so
+    # every existing fixture invocation is byte-for-byte unchanged.
+    let dtypeFlag = cmdline.ReadFlagOrDefault("--dtype", "fp16")
+    var linearDtype = kir.KernelDtypeFp16
+    if dtypeFlag == "bf16":
+        linearDtype = kir.KernelDtypeBf16
+    elif dtypeFlag != "fp16":
+        echo("dtype_error=expected fp16|bf16")
+        return 2
+    let maxNewTokens = cmdline.ReadInt32FlagOrDefault("--max-new-tokens", 3)
+    if maxNewTokens <= 0:
+        echo("max_new_tokens_error=expected_positive_int32")
+        return 2
+    let tokenizerPath = cmdline.ReadFlagOrDefault(
+        "--tokenizer", "artifacts/tokenizer/qwen25/tokenizer_qwen25.bin")
+    let unicodePath = cmdline.ReadFlagOrDefault(
+        "--unicode-tables", "artifacts/tokenizer/unicode_tables.bin")
+
+    var promptTokenIds: int32[]
+    var promptTokensCsv: str
+    let hasPromptTokens = cmdline.ReadFirstFlagValue("--prompt-tokens", promptTokensCsv)
+    if hasPromptTokens:
+        let parsed = cliParsePromptTokensCsv(promptTokensCsv)
+        if IsErr(parsed):
+            echo(strutil.Join(["prompt_tokens_error=", Error(parsed)], ""))
+            return 2
+        promptTokenIds = Value(parsed)
+        echo("prompt_tokens_source: flag")
+        echo(strutil.Join(["prompt_token_ids: ", cliTokenIdsToString(promptTokenIds)], ""))
+    else:
+        let prompt = cmdline.ReadFlagOrDefault("--prompt", "帮我发布一个宠物视频")
+        let uniRes = uni.UnicodeTablesLoad(unicodePath)
+        if IsErr(uniRes):
+            echo(strutil.Join(["unicode_tables_error=", Error(uniRes)], ""))
+            return 1
+        let tokRes = tok.TokenizerLoad(tokenizerPath)
+        if IsErr(tokRes):
+            echo(strutil.Join(["tokenizer_error=", Error(tokRes)], ""))
+            return 1
+        let t = Value(tokRes)
+        promptTokenIds = tok.TokenizerEncode(t, Value(uniRes), prompt)
+        if promptTokenIds.len <= 0:
+            echo("prompt_encode_error=empty")
+            return 1
+        echo(strutil.Join(["prompt: ", prompt], ""))
+        echo(strutil.Join(["prompt_token_ids: ", cliTokenIdsToString(promptTokenIds)], ""))
+        let roundtrip = tok.TokenizerDecode(t, promptTokenIds)
+        if roundtrip != prompt:
+            echo("prompt_roundtrip_error=mismatch")
+            return 1
+        echo("prompt_roundtrip_ok: true")
+        # 任务03 失败语义: 模型模式显式状态, 失败如实报错退出, 不回落规则
+        # 伪装成 task_kind。classify 是 prompt 的末次使用 (move 进 owned 形参;
+        # 先 clone 会因 prompt 已被 TokenizerEncode 借用过而缺 exact live source)。
+        let classifyKindRes = ptask.PlannerTaskClassifyFromTextWithBudget(
+            prompt, engine.DistributedGenerationBudgetUnbounded())
+        if IsErr(classifyKindRes):
+            echo(strutil.Join(["task_kind_error=", Error(classifyKindRes)], ""))
+            return 1
+        echo(strutil.Join(["task_kind: ", Value(classifyKindRes)], ""))
+
+    echo(strutil.Join(["config_path: ", configPath], ""))
+    echo(strutil.Join(["weights_path: ", weightsPath], ""))
+    echo("weight_source: WeightSafetensorsLoadGraphFilePathStreaming")
+
+    let loadStart = mono.GetMonoTime()
+    let fixtureRes = cliLoadFromPaths(configPath, weightsPath, modelCid, tensorScale, linearDtype)
+    if IsErr(fixtureRes):
+        echo(strutil.Join(["load_error=", Error(fixtureRes)], ""))
+        return 1
+    let fixture = Value(fixtureRes)
+    let loadEnd = mono.GetMonoTime()
+    echo(strutil.Join(["load_ms: ", strings.IntToStr(int32((mono.MonoTimeNs(loadEnd) - mono.MonoTimeNs(loadStart)) / int64(1000000)))], ""))
+    echo(strutil.Join(["graph_weights: ", strings.IntToStr(fixture.graph.weights.len)], ""))
+    echo(strutil.Join(["graph_ops: ", strings.IntToStr(fixture.graph.ops.len)], ""))
+    echo(strutil.Join(["graph_hidden_size: ", strings.IntToStr(fixture.graph.hiddenSize)], ""))
+    echo(strutil.Join(["graph_layer_count: ", strings.IntToStr(fixture.graph.layerCount)], ""))
+    echo("graph_structurally_valid: true")
+
+    var promptTensor: infer.TensorQ
+    let promptTensorOk = infer.TensorFromDataFill(
+        promptTensor, [promptTokenIds.len], 1, promptTokenIds)
+    if IsErr(promptTensorOk):
+        echo(strutil.Join(["prompt_tensor_error=", Error(promptTensorOk)], ""))
+        return 1
+
+    echo(strutil.Join([
+        "attempting DistributedGenerateGreedyDenseTransformerTokens (maxNewTokens=",
+        strings.IntToStr(maxNewTokens),
+        ", real safetensors weights)..."
+    ], ""))
+    let logitsTop5 = cmdline.ReadFlagOrDefault("--logits-top5", "0")
+    if logitsTop5 == "1":
+        # 单次 forward, 打印 prompt 末位 logits 的 top-5 (id:value 定点整数,
+        # scale 与 tensorScale 同) —— 供与 HF 参考 logits top-5 对拍。
+        let probeStart = mono.GetMonoTime()
+        let outputRes = mexec.ModelExecutorExecuteDenseTransformerTokens(
+            fixture.graph, fixture.bindings, fixture.store, promptTensor)
+        if IsErr(outputRes):
+            echo(strutil.Join(["logits_probe_error=", Error(outputRes)], ""))
+            return 1
+        let probeEnd = mono.GetMonoTime()
+        let logits = Value(outputRes).logits
+        let lastRow = promptTokenIds.len - 1
+        var top5Ids: int32[]
+        var top5Vals: int32[]
+        for k in 0..<5:
+            var bestId: int32 = -1
+            var bestVal: int32
+            for col in 0..<logits.shape[1]:
+                var taken = false
+                for j in 0..<top5Ids.len:
+                    if top5Ids[j] == col:
+                        taken = true
+                if taken:
+                    continue
+                let v = logits.data[infer.TensorOffset2(logits.shape, lastRow, col)]
+                if bestId < 0 || v > bestVal:
+                    bestVal = v
+                    bestId = col
+            add(top5Ids, bestId)
+            add(top5Vals, bestVal)
+        echo(strutil.Join(["logits_top5_ids: ", cliTokenIdsToString(top5Ids)], ""))
+        echo(strutil.Join(["logits_top5_vals: ", cliTokenIdsToString(top5Vals)], ""))
+        echo(strutil.Join(["forward_ms: ", strings.IntToStr(int32((mono.MonoTimeNs(probeEnd) - mono.MonoTimeNs(probeStart)) / int64(1000000)))], ""))
+        echo("inference_planner_cli_main ok")
+        return 0
+    let genStart = mono.GetMonoTime()
+    var outputTokenIds: infer.TensorQ
+    let timedSteps = cmdline.ReadFlagOrDefault("--timed-steps", "0")
+    if timedSteps == "1":
+        # 逐 token 计时模式: 每外层迭代请求 1 个新 token。无 kv cache 的
+        # 全量重算贪心对 token 前缀是马尔可夫的, 序列与单次调用逐 token 相同,
+        # 仅多打印每步耗时。
+        var current = promptTensor
+        var stop = false
+        for step in 0..<maxNewTokens:
+            if stop:
+                break
+            let stepStart = mono.GetMonoTime()
+            let stepRes = engine.DistributedGenerateGreedyDenseTransformerTokens(
+                fixture.graph, fixture.bindings, fixture.store, current, 1, -1)
+            if IsErr(stepRes):
+                echo(strutil.Join(["generate_error=", Error(stepRes)], ""))
+                return 1
+            let stepOut = Value(stepRes)
+            let stepEnd = mono.GetMonoTime()
+            if stepOut.data.len <= current.data.len:
+                stop = true
+            else:
+                echo(strutil.Join([
+                    "step_", strings.IntToStr(step),
+                    "_ms: ", strings.IntToStr(int32((mono.MonoTimeNs(stepEnd) - mono.MonoTimeNs(stepStart)) / int64(1000000))),
+                    " token: ", strings.IntToStr(stepOut.data[stepOut.data.len - 1]),
+                    " context_len: ", strings.IntToStr(current.data.len)
+                ], ""))
+                current = stepOut
+        outputTokenIds = current
+    else:
+        let generateRes = engine.DistributedGenerateGreedyDenseTransformerTokens(
+            fixture.graph, fixture.bindings, fixture.store, promptTensor, maxNewTokens, -1)
+        if IsErr(generateRes):
+            echo(strutil.Join(["generate_error=", Error(generateRes)], ""))
+            return 1
+        outputTokenIds = Value(generateRes)
+    let genEnd = mono.GetMonoTime()
+    echo(strutil.Join(["generate_total_ms: ", strings.IntToStr(int32((mono.MonoTimeNs(genEnd) - mono.MonoTimeNs(genStart)) / int64(1000000)))], ""))
+    echo(strutil.Join(["generated_token_ids: ", cliTokenIdsToString(outputTokenIds.data)], ""))
+
+    # Optional decode when real tokenizer was used (prompt-tokens mode skips it).
+    if !hasPromptTokens:
+        let uniRes2 = uni.UnicodeTablesLoad(unicodePath)
+        let tokRes2 = tok.TokenizerLoad(tokenizerPath)
+        if IsOk(uniRes2) && IsOk(tokRes2):
+            let decoded = tok.TokenizerDecode(Value(tokRes2), outputTokenIds.data)
+            echo(strutil.Join(["decoded_text: ", decoded], ""))
+
+    echo("inference_planner_cli_main ok")
+    return 0

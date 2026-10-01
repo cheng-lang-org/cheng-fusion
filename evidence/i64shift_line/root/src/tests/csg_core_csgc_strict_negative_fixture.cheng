@@ -1,0 +1,777 @@
+import std/cmdline as cmdline
+import std/os as os
+import std/rawbytes
+import std/result
+import std/strings
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
+import cheng/core/csg_core/csgc
+
+const
+    HeaderSize: int32 = 64
+    Magic: int32 = 1128747843
+    FactA: str = "{\"id\":\"a\",\"kind\":\"csg.symbol\",\"name\":\"A\"}"
+    FactB: str = "{\"id\":\"b\",\"kind\":\"csg.symbol\",\"name\":\"B\"}"
+    SectionTagDictionary: int32 = 1
+    SectionTagFactKind: int32 = 2
+    DirectoryPrefixSize: int32 = 8
+    SectionDigestSize: int32 = 32
+    SectionHashDomain: str = "csg_core.csgc.section"
+
+type
+    FixtureVarintRead =
+        ok: bool
+        value: int32
+        nextOffset: int32
+
+    FixtureBytes =
+        ok: bool
+        bytes: rawbytes.Bytes
+        expectedError: str
+        error: str
+
+    FixtureSectionEntry =
+        tag: int32
+        kind: str
+        payloadOffset: int32
+        payloadLength: int32
+        itemCount: int32
+        lengthFieldOffset: int32
+        itemCountFieldOffset: int32
+        digestOffset: int32
+
+    FixtureDirectory =
+        ok: bool
+        directorySize: int32
+        sectionCount: int32
+        bodySize: int32
+        entries: FixtureSectionEntry[]
+        error: str
+
+@borrows
+fn fixtureFail(message: str): int32 =
+    os.WriteLine(os.Get_stderr(), message)
+    return 1
+
+@borrows
+fn fixtureBytesFail(message: str): FixtureBytes =
+    var out: FixtureBytes
+    out.error = strings.CloneStr(message)
+    return out
+
+@borrows
+fn cloneBytes(bytes: rawbytes.Bytes): rawbytes.Bytes =
+    var copy = rawbytes.BytesAlloc(rawbytes.BytesLen(bytes))
+    rawbytes.BytesCopyInto(copy, 0, bytes)
+    return copy
+
+fn writeU16Le(
+        bytes: var rawbytes.Bytes,
+        offset: int32,
+        value: int32) =
+    rawbytes.BytesSet(bytes, offset, value & 255)
+    rawbytes.BytesSet(
+        bytes, offset + 1, (value >> 8) & 255)
+
+fn writeU32Le(
+        bytes: var rawbytes.Bytes,
+        offset: int32,
+        value: int32) =
+    rawbytes.BytesSet(bytes, offset, value & 255)
+    rawbytes.BytesSet(
+        bytes, offset + 1, (value >> 8) & 255)
+    rawbytes.BytesSet(
+        bytes, offset + 2, (value >> 16) & 255)
+    rawbytes.BytesSet(
+        bytes, offset + 3, (value >> 24) & 255)
+
+@borrows
+fn readU32Le(
+        bytes: rawbytes.Bytes,
+        offset: int32): int32 =
+    if offset < 0 ||
+       offset > rawbytes.BytesLen(bytes) - 4:
+        return -1
+    return (
+        (rawbytes.BytesGet(bytes, offset) & 255) |
+        ((rawbytes.BytesGet(bytes, offset + 1) & 255) << 8) |
+        ((rawbytes.BytesGet(bytes, offset + 2) & 255) << 16) |
+        ((rawbytes.BytesGet(bytes, offset + 3) & 255) << 24))
+
+@borrows
+fn readVarint(
+        bytes: rawbytes.Bytes,
+        offset: int32): FixtureVarintRead =
+    var out: FixtureVarintRead
+    var cursor = offset
+    var value: int32
+    var shift: int32
+    while cursor < rawbytes.BytesLen(bytes):
+        let item =
+            rawbytes.BytesGet(bytes, cursor) & 255
+        if shift > 28 ||
+           (shift == 28 && (item & 127) > 7):
+            return out
+        value = value | ((item & 127) << shift)
+        cursor = cursor + 1
+        if (item & 128) == 0:
+            out.ok = true
+            out.value = value
+            out.nextOffset = cursor
+            return out
+        shift = shift + 7
+    return out
+
+fn fixtureBufAppendU32(
+        buf: var layout.ByteBuf,
+        value: int32) =
+    layout.ByteBufAppendByte(buf, value & 255)
+    layout.ByteBufAppendByte(buf, (value >> 8) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 16) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 24) & 255)
+
+@borrows
+fn fixtureBufAppendText(
+        buf: var layout.ByteBuf,
+        text: str) =
+    fixtureBufAppendU32(buf, text.len)
+    let textBytes = rawbytes.BytesFromString(text)
+    layout.ByteBufAppendBytes(buf, textBytes)
+
+# Same digest claim shape as the encoder's section digest:
+# sha256(text(domain) || tag || text(kind) || count || len || payload).
+@borrows
+fn fixtureSectionDigest(
+        bytes: rawbytes.Bytes,
+        tag: int32,
+        kind: str,
+        itemCount: int32,
+        payloadOffset: int32,
+        payloadLength: int32): layout.FixedBytes32 =
+    var prefix = layout.ByteBufInit(96 + kind.len)
+    fixtureBufAppendText(prefix, SectionHashDomain)
+    layout.ByteBufAppendByte(prefix, tag)
+    fixtureBufAppendText(prefix, kind)
+    fixtureBufAppendU32(prefix, itemCount)
+    fixtureBufAppendU32(prefix, payloadLength)
+    let allBytes = layout.ByteSpanFromBytes(bytes)
+    let payload = layout.ByteSpanSlice(
+        allBytes, payloadOffset, payloadLength)
+    let digest = hash256.Sha256FixedTwo(
+        layout.ByteBufView(prefix), payload)
+    layout.ByteBufFree(prefix)
+    return digest
+
+fn writeDigestBytes(
+        bytes: var rawbytes.Bytes,
+        offset: int32,
+        digest: layout.FixedBytes32) =
+    for i in 0..<SectionDigestSize:
+        rawbytes.BytesSet(
+            bytes, offset + i, int32(digest.data[i]) & 255)
+
+# Walks the current CSGC section directory: header body size, directory
+# prefix, per-section entry fields with their wire offsets, payload
+# contiguity, and header fact count binding.  Any deviation from the
+# canonical layout is a fixture source defect, not a decoder signal.
+@borrows
+fn walkDirectory(bytes: rawbytes.Bytes): FixtureDirectory =
+    var out: FixtureDirectory
+    let totalLen = rawbytes.BytesLen(bytes)
+    if totalLen < HeaderSize + DirectoryPrefixSize:
+        out.error = strings.CloneStr("fixture directory truncated")
+        return out
+    let bodySize = readU32Le(bytes, 16)
+    if bodySize < 0 ||
+       bodySize != totalLen - HeaderSize:
+        out.error = strings.CloneStr("fixture body size mismatch")
+        return out
+    let directorySize = readU32Le(bytes, HeaderSize)
+    let sectionCount = readU32Le(bytes, HeaderSize + 4)
+    if directorySize < DirectoryPrefixSize ||
+       directorySize > bodySize:
+        out.error = strings.CloneStr(
+            "fixture directory size invalid")
+        return out
+    if sectionCount < 1:
+        out.error = strings.CloneStr("fixture section count invalid")
+        return out
+    var cursor = HeaderSize + DirectoryPrefixSize
+    let directoryEnd = HeaderSize + directorySize
+    var expectedPayloadOffset = directorySize
+    var countedFacts: int32
+    for i in 0..<sectionCount:
+        if cursor >= directoryEnd:
+            out.error = strings.CloneStr(
+                "fixture section entry truncated")
+            return out
+        let tag = rawbytes.BytesGet(bytes, cursor) & 255
+        cursor = cursor + 1
+        let kindLen = readVarint(bytes, cursor)
+        if !kindLen.ok || kindLen.value < 0:
+            out.error = strings.CloneStr(
+                "fixture section kind length invalid")
+            return out
+        cursor = kindLen.nextOffset
+        if kindLen.value > directoryEnd - cursor:
+            out.error = strings.CloneStr(
+                "fixture section kind truncated")
+            return out
+        let kindView =
+            rawbytes.BytesSliceView(bytes, cursor, kindLen.value)
+        let kind = rawbytes.BytesToString(kindView)
+        cursor = cursor + kindLen.value
+        if cursor >
+               directoryEnd - 12 - SectionDigestSize:
+            out.error = strings.CloneStr(
+                "fixture section entry fields truncated")
+            return out
+        let payloadOffset = readU32Le(bytes, cursor)
+        let payloadLength = readU32Le(bytes, cursor + 4)
+        let itemCount = readU32Le(bytes, cursor + 8)
+        let lengthFieldOffset = cursor + 4
+        let itemCountFieldOffset = cursor + 8
+        let digestOffset = cursor + 12
+        cursor = cursor + 12 + SectionDigestSize
+        if payloadOffset < 0 || payloadLength < 0 ||
+           itemCount < 0:
+            out.error = strings.CloneStr(
+                "fixture section field out of range")
+            return out
+        if payloadLength < 4:
+            out.error = strings.CloneStr(
+                "fixture section payload length invalid")
+            return out
+        if payloadOffset != expectedPayloadOffset:
+            out.error = strings.CloneStr(
+                "fixture section payload not contiguous")
+            return out
+        if payloadLength > bodySize - payloadOffset:
+            out.error = strings.CloneStr(
+                "fixture section payload out of bounds")
+            return out
+        expectedPayloadOffset = payloadOffset + payloadLength
+        var entry: FixtureSectionEntry
+        entry.tag = tag
+        entry.kind = kind
+        entry.payloadOffset = payloadOffset
+        entry.payloadLength = payloadLength
+        entry.itemCount = itemCount
+        entry.lengthFieldOffset = lengthFieldOffset
+        entry.itemCountFieldOffset = itemCountFieldOffset
+        entry.digestOffset = digestOffset
+        if i == 0:
+            if tag != SectionTagDictionary || kindLen.value != 0:
+                out.error = strings.CloneStr(
+                    "fixture dictionary section not first")
+                return out
+        else:
+            if tag != SectionTagFactKind || kindLen.value <= 0:
+                out.error = strings.CloneStr(
+                    "fixture fact section tag invalid")
+                return out
+            if countedFacts > 2147483647 - itemCount:
+                out.error = strings.CloneStr(
+                    "fixture fact count overflow")
+                return out
+            countedFacts = countedFacts + itemCount
+        add(out.entries, entry)
+    if cursor != directoryEnd:
+        out.error = strings.CloneStr(
+            "fixture directory size mismatch")
+        return out
+    if expectedPayloadOffset != bodySize:
+        out.error = strings.CloneStr(
+            "fixture payload does not cover body")
+        return out
+    if countedFacts != readU32Le(bytes, 8):
+        out.error = strings.CloneStr(
+            "fixture header fact count mismatch")
+        return out
+    out.ok = true
+    out.directorySize = directorySize
+    out.sectionCount = sectionCount
+    out.bodySize = bodySize
+    return out
+
+# Recomputes every claimed section digest from the walked directory and
+# compares it byte-for-byte against the stored claim; proves the walk
+# landed exactly on the encoder's field boundaries before any mutation.
+@borrows
+fn fixtureDigestsMatch(
+        bytes: rawbytes.Bytes,
+        directory: FixtureDirectory): bool =
+    for i in 0..<directory.entries.len:
+        let digest = fixtureSectionDigest(
+            bytes,
+            directory.entries[i].tag,
+            directory.entries[i].kind,
+            directory.entries[i].itemCount,
+            HeaderSize + directory.entries[i].payloadOffset,
+            directory.entries[i].payloadLength)
+        let digestOffset = directory.entries[i].digestOffset
+        for j in 0..<SectionDigestSize:
+            let stored =
+                rawbytes.BytesGet(bytes, digestOffset + j) & 255
+            if stored != int32(digest.data[j]) & 255:
+                return false
+    return true
+
+@borrows
+fn rowEnd(
+        bytes: rawbytes.Bytes,
+        offset: int32): int32 =
+    let tokenCount = readVarint(bytes, offset)
+    if !tokenCount.ok || tokenCount.value < 0:
+        return -1
+    var cursor = tokenCount.nextOffset
+    for i in 0..<tokenCount.value:
+        if cursor >= rawbytes.BytesLen(bytes):
+            return -1
+        let tag = rawbytes.BytesGet(bytes, cursor) & 255
+        cursor = cursor + 1
+        let payload = readVarint(bytes, cursor)
+        if !payload.ok || payload.value < 0:
+            return -1
+        cursor = payload.nextOffset
+        if tag == 2:
+            if cursor >
+                   rawbytes.BytesLen(bytes) - payload.value:
+                return -1
+            cursor = cursor + payload.value
+        elif tag != 1:
+            return -1
+    return cursor
+
+@borrows
+fn encoded(lines: str[]): FixtureBytes =
+    let cargo =
+        csgc.CsgCoreCsgcEncodeCanonicalLines(lines)
+    if !cargo.ok:
+        return fixtureBytesFail(
+            strings.ConcatStr(
+                "fixture encode failed: ", cargo.error))
+    var out: FixtureBytes
+    out.ok = true
+    out.bytes = cargo.bytes
+    return out
+
+# Validates the encoded source carrier for single-kind fact payloads and
+# returns the fact section index; the fact payload must be the terminal
+# payload so length-changing mutations keep every other offset valid.
+@borrows
+fn factSectionIndex(
+        bytes: rawbytes.Bytes,
+        directory: FixtureDirectory,
+        caseName: str): int32 =
+    if !fixtureDigestsMatch(bytes, directory):
+        return -1
+    if directory.sectionCount != 2 ||
+       directory.entries.len != 2:
+        return -1
+    let index = 1
+    if directory.entries[index].tag != SectionTagFactKind ||
+       directory.entries[index].kind != "csg.symbol":
+        return -1
+    if directory.entries[index].payloadOffset +
+           directory.entries[index].payloadLength !=
+           directory.bodySize:
+        return -1
+    return index
+
+@borrows
+fn headerSizeFixture(): FixtureBytes =
+    let canonical = encoded([FactA])
+    if !canonical.ok:
+        return canonical
+    var attacked = cloneBytes(canonical.bytes)
+    writeU16Le(attacked, 4, HeaderSize - 1)
+    var out: FixtureBytes
+    out.ok = true
+    out.bytes = attacked
+    out.expectedError = "unsupported_header_size 63"
+    return out
+
+@borrows
+fn nonShortestVarintFixture(): FixtureBytes =
+    let canonical = encoded([FactA])
+    if !canonical.ok:
+        return canonical
+    let directory = walkDirectory(canonical.bytes)
+    if !directory.ok:
+        return fixtureBytesFail(directory.error)
+    let factIndex =
+        factSectionIndex(
+            canonical.bytes, directory, "non-shortest-varint")
+    if factIndex < 0 ||
+       directory.entries[factIndex].itemCount != 1:
+        return fixtureBytesFail(
+            "non-shortest varint source shape invalid")
+    let payloadStart =
+        HeaderSize + directory.entries[factIndex].payloadOffset
+    if readU32Le(canonical.bytes, payloadStart) != 1:
+        return fixtureBytesFail(
+            "non-shortest varint source row count invalid")
+    let rowStart = payloadStart + 4
+    let tokenCount =
+        readVarint(canonical.bytes, rowStart)
+    if !tokenCount.ok ||
+       tokenCount.nextOffset != rowStart + 1 ||
+       tokenCount.value < 0 ||
+       tokenCount.value >= 128:
+        return fixtureBytesFail(
+            "non-shortest varint source shape invalid")
+    let oldLen = rawbytes.BytesLen(canonical.bytes)
+    var attacked = rawbytes.BytesAlloc(oldLen + 1)
+    let prefix =
+        rawbytes.BytesSliceView(
+            canonical.bytes, 0, rowStart)
+    rawbytes.BytesCopyInto(attacked, 0, prefix)
+    rawbytes.BytesSet(
+        attacked, rowStart, tokenCount.value | 128)
+    rawbytes.BytesSet(attacked, rowStart + 1, 0)
+    let suffix =
+        rawbytes.BytesSliceView(
+            canonical.bytes,
+            tokenCount.nextOffset,
+            oldLen - tokenCount.nextOffset)
+    rawbytes.BytesCopyInto(
+        attacked, rowStart + 2, suffix)
+    let newPayloadLength =
+        directory.entries[factIndex].payloadLength + 1
+    writeU32Le(
+        attacked, 16,
+        rawbytes.BytesLen(attacked) - HeaderSize)
+    writeU32Le(
+        attacked,
+        directory.entries[factIndex].lengthFieldOffset,
+        newPayloadLength)
+    let digest = fixtureSectionDigest(
+        attacked,
+        SectionTagFactKind,
+        directory.entries[factIndex].kind,
+        directory.entries[factIndex].itemCount,
+        payloadStart,
+        newPayloadLength)
+    writeDigestBytes(
+        attacked,
+        directory.entries[factIndex].digestOffset,
+        digest)
+    var out: FixtureBytes
+    out.ok = true
+    out.bytes = attacked
+    out.expectedError =
+        "truncated_token_count non_canonical_varint"
+    return out
+
+@borrows
+fn invalidUtf8Fixture(): FixtureBytes =
+    let canonical = encoded([FactA])
+    if !canonical.ok:
+        return canonical
+    let directory = walkDirectory(canonical.bytes)
+    if !directory.ok:
+        return fixtureBytesFail(directory.error)
+    let factIndex =
+        factSectionIndex(
+            canonical.bytes, directory, "invalid-utf8")
+    if factIndex < 0 ||
+       directory.entries[factIndex].itemCount != 1:
+        return fixtureBytesFail(
+            "invalid UTF-8 source shape invalid")
+    let payloadStart =
+        HeaderSize + directory.entries[factIndex].payloadOffset
+    if readU32Le(canonical.bytes, payloadStart) != 1:
+        return fixtureBytesFail(
+            "invalid UTF-8 source row count invalid")
+    let tokenCount =
+        readVarint(canonical.bytes, payloadStart + 4)
+    if !tokenCount.ok:
+        return fixtureBytesFail(
+            "invalid UTF-8 source row invalid")
+    var attacked = cloneBytes(canonical.bytes)
+    var cursor = tokenCount.nextOffset
+    for i in 0..<tokenCount.value:
+        if cursor >= rawbytes.BytesLen(attacked):
+            return fixtureBytesFail(
+                "invalid UTF-8 token tag missing")
+        let tag = rawbytes.BytesGet(attacked, cursor) & 255
+        cursor = cursor + 1
+        let payload = readVarint(attacked, cursor)
+        if !payload.ok || payload.value < 0:
+            return fixtureBytesFail(
+                "invalid UTF-8 token payload invalid")
+        cursor = payload.nextOffset
+        if tag == 2:
+            if payload.value <= 0 ||
+               cursor >
+                   rawbytes.BytesLen(attacked) - payload.value:
+                return fixtureBytesFail(
+                    "invalid UTF-8 inline token empty")
+            rawbytes.BytesSet(attacked, cursor, 255)
+            let digest = fixtureSectionDigest(
+                attacked,
+                SectionTagFactKind,
+                directory.entries[factIndex].kind,
+                directory.entries[factIndex].itemCount,
+                payloadStart,
+                directory.entries[factIndex].payloadLength)
+            writeDigestBytes(
+                attacked,
+                directory.entries[factIndex].digestOffset,
+                digest)
+            var out: FixtureBytes
+            out.ok = true
+            out.bytes = attacked
+            out.expectedError = "invalid_utf8"
+            return out
+        if tag != 1:
+            return fixtureBytesFail(
+                "invalid UTF-8 token tag invalid")
+    return fixtureBytesFail(
+        "invalid UTF-8 inline token missing")
+
+fn duplicateDictionaryFixture(): FixtureBytes =
+    # Current layout, dictionary-only carrier whose two entries are
+    # byte-identical length-2 strings: header + one-entry directory +
+    # dictionary payload u32 count=2 || (varint 2 "xx") x2.
+    let directorySize: int32 = 54
+    let payloadLength: int32 = 10
+    let bodySize: int32 = 64
+    var attacked =
+        rawbytes.BytesAlloc(HeaderSize + bodySize)
+    writeU32Le(attacked, 0, Magic)
+    writeU16Le(attacked, 4, HeaderSize)
+    writeU16Le(attacked, 6, 0)
+    writeU32Le(attacked, 8, 0)
+    writeU32Le(attacked, 12, 0)
+    writeU32Le(attacked, 16, bodySize)
+    writeU32Le(attacked, HeaderSize, directorySize)
+    writeU32Le(attacked, HeaderSize + 4, 1)
+    var cursor = HeaderSize + DirectoryPrefixSize
+    rawbytes.BytesSet(attacked, cursor, SectionTagDictionary)
+    cursor = cursor + 1
+    rawbytes.BytesSet(attacked, cursor, 0)
+    cursor = cursor + 1
+    writeU32Le(attacked, cursor, directorySize)
+    cursor = cursor + 4
+    writeU32Le(attacked, cursor, payloadLength)
+    cursor = cursor + 4
+    writeU32Le(attacked, cursor, 2)
+    cursor = cursor + 4
+    let digestOffset = cursor
+    cursor = cursor + SectionDigestSize
+    let payloadStart = HeaderSize + directorySize
+    if cursor != payloadStart:
+        return fixtureBytesFail(
+            "duplicate dictionary layout mismatch")
+    writeU32Le(attacked, payloadStart, 2)
+    rawbytes.BytesSet(attacked, payloadStart + 4, 2)
+    rawbytes.BytesSet(attacked, payloadStart + 5, 120)
+    rawbytes.BytesSet(attacked, payloadStart + 6, 120)
+    rawbytes.BytesSet(attacked, payloadStart + 7, 2)
+    rawbytes.BytesSet(attacked, payloadStart + 8, 120)
+    rawbytes.BytesSet(attacked, payloadStart + 9, 120)
+    let digest = fixtureSectionDigest(
+        attacked,
+        SectionTagDictionary,
+        "",
+        2,
+        payloadStart,
+        payloadLength)
+    writeDigestBytes(attacked, digestOffset, digest)
+    var out: FixtureBytes
+    out.ok = true
+    out.bytes = attacked
+    out.expectedError = "duplicate_dictionary_entry"
+    return out
+
+@borrows
+fn duplicateFactFixture(): FixtureBytes =
+    let canonical = encoded([FactA])
+    if !canonical.ok:
+        return canonical
+    let directory = walkDirectory(canonical.bytes)
+    if !directory.ok:
+        return fixtureBytesFail(directory.error)
+    let factIndex =
+        factSectionIndex(
+            canonical.bytes, directory, "duplicate-fact")
+    if factIndex < 0 ||
+       directory.entries[factIndex].itemCount != 1:
+        return fixtureBytesFail(
+            "duplicate fact source shape invalid")
+    let payloadStart =
+        HeaderSize + directory.entries[factIndex].payloadOffset
+    if readU32Le(canonical.bytes, payloadStart) != 1:
+        return fixtureBytesFail(
+            "duplicate fact source row count invalid")
+    let rowStart = payloadStart + 4
+    let rowLength =
+        directory.entries[factIndex].payloadLength - 4
+    let oldLen = rawbytes.BytesLen(canonical.bytes)
+    if rowLength <= 0 ||
+       rowStart > oldLen - rowLength:
+        return fixtureBytesFail(
+            "duplicate fact source row invalid")
+    var attacked = rawbytes.BytesAlloc(oldLen + rowLength)
+    rawbytes.BytesCopyInto(attacked, 0, canonical.bytes)
+    let row =
+        rawbytes.BytesSliceView(
+            canonical.bytes, rowStart, rowLength)
+    rawbytes.BytesCopyInto(attacked, oldLen, row)
+    let newPayloadLength =
+        directory.entries[factIndex].payloadLength + rowLength
+    writeU32Le(attacked, 8, 2)
+    writeU32Le(
+        attacked, 16,
+        rawbytes.BytesLen(attacked) - HeaderSize)
+    writeU32Le(attacked, payloadStart, 2)
+    writeU32Le(
+        attacked,
+        directory.entries[factIndex].lengthFieldOffset,
+        newPayloadLength)
+    writeU32Le(
+        attacked,
+        directory.entries[factIndex].itemCountFieldOffset,
+        2)
+    let digest = fixtureSectionDigest(
+        attacked,
+        SectionTagFactKind,
+        directory.entries[factIndex].kind,
+        2,
+        payloadStart,
+        newPayloadLength)
+    writeDigestBytes(
+        attacked,
+        directory.entries[factIndex].digestOffset,
+        digest)
+    var out: FixtureBytes
+    out.ok = true
+    out.bytes = attacked
+    out.expectedError =
+        "non_canonical_facts csgc_physical_order_failed merkle_duplicate_fact_key id:a"
+    return out
+
+@borrows
+fn outOfOrderFixture(): FixtureBytes =
+    let canonical = encoded([FactA, FactB])
+    if !canonical.ok:
+        return canonical
+    let directory = walkDirectory(canonical.bytes)
+    if !directory.ok:
+        return fixtureBytesFail(directory.error)
+    let factIndex =
+        factSectionIndex(
+            canonical.bytes, directory, "out-of-order")
+    if factIndex < 0 ||
+       directory.entries[factIndex].itemCount != 2:
+        return fixtureBytesFail(
+            "out-of-order source shape invalid")
+    let payloadStart =
+        HeaderSize + directory.entries[factIndex].payloadOffset
+    if readU32Le(canonical.bytes, payloadStart) != 2:
+        return fixtureBytesFail(
+            "out-of-order source row count invalid")
+    let firstStart = payloadStart + 4
+    let firstFinish =
+        rowEnd(canonical.bytes, firstStart)
+    let secondFinish =
+        rowEnd(canonical.bytes, firstFinish)
+    let totalLen = rawbytes.BytesLen(canonical.bytes)
+    if firstFinish <= firstStart ||
+       secondFinish <= firstFinish ||
+       secondFinish != totalLen:
+        return fixtureBytesFail(
+            "out-of-order source rows invalid")
+    var attacked = rawbytes.BytesAlloc(totalLen)
+    let prefix =
+        rawbytes.BytesSliceView(
+            canonical.bytes, 0, firstStart)
+    let firstRow =
+        rawbytes.BytesSliceView(
+            canonical.bytes,
+            firstStart,
+            firstFinish - firstStart)
+    let secondRow =
+        rawbytes.BytesSliceView(
+            canonical.bytes,
+            firstFinish,
+            secondFinish - firstFinish)
+    rawbytes.BytesCopyInto(attacked, 0, prefix)
+    rawbytes.BytesCopyInto(
+        attacked, firstStart, secondRow)
+    rawbytes.BytesCopyInto(
+        attacked,
+        firstStart + rawbytes.BytesLen(secondRow),
+        firstRow)
+    let digest = fixtureSectionDigest(
+        attacked,
+        SectionTagFactKind,
+        directory.entries[factIndex].kind,
+        directory.entries[factIndex].itemCount,
+        payloadStart,
+        directory.entries[factIndex].payloadLength)
+    writeDigestBytes(
+        attacked,
+        directory.entries[factIndex].digestOffset,
+        digest)
+    var out: FixtureBytes
+    out.ok = true
+    out.bytes = attacked
+    out.expectedError = "non_canonical_csgc"
+    return out
+
+@borrows
+fn buildFixture(caseName: str): FixtureBytes =
+    if caseName == "header-size":
+        return headerSizeFixture()
+    if caseName == "non-shortest-varint":
+        return nonShortestVarintFixture()
+    if caseName == "invalid-utf8":
+        return invalidUtf8Fixture()
+    if caseName == "duplicate-dictionary":
+        return duplicateDictionaryFixture()
+    if caseName == "duplicate-fact":
+        return duplicateFactFixture()
+    if caseName == "out-of-order":
+        return outOfOrderFixture()
+    return fixtureBytesFail("unknown negative fixture case")
+
+fn main(): int32 =
+    if cmdline.ParamCount() != 3:
+        return fixtureFail(
+            "usage: csg_core_csgc_strict_negative_fixture CASE OUT.csgc")
+    let caseName = cmdline.ParamStr(1)
+    let outputPath = cmdline.ParamStr(2)
+    if outputPath.len == 0:
+        return fixtureFail("negative fixture output path required")
+    let fixture = buildFixture(caseName)
+    if !fixture.ok:
+        return fixtureFail(fixture.error)
+    let first =
+        csgc.CsgCoreCsgcDecodeLines(fixture.bytes)
+    let second =
+        csgc.CsgCoreCsgcDecodeLines(fixture.bytes)
+    if first.ok ||
+       second.ok ||
+       first.error != fixture.expectedError ||
+       second.error != fixture.expectedError:
+        os.WriteLine(os.Get_stderr(), first.error)
+        os.WriteLine(os.Get_stderr(), second.error)
+        return fixtureFail(
+            "negative fixture rejection mismatch")
+    var outputBytes = cloneBytes(fixture.bytes)
+    var writeResult =
+        os.WriteFileBytesResult(outputPath, outputBytes)
+    if result.IsErr(writeResult):
+        return fixtureFail("negative fixture write failed")
+    os.WriteLine(
+        os.Get_stdout(),
+        strings.ConcatStr(
+            strings.ConcatStr(
+                "csg_core_csgc_strict_negative_fixture ok case=",
+                caseName),
+            strings.ConcatStr(
+                " error=", fixture.expectedError)))
+    return 0

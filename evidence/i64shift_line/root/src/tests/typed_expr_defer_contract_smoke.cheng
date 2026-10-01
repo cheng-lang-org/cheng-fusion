@@ -1,0 +1,747 @@
+import std/cmdline as cmdline
+import std/os as os
+import std/os_host_process as hostos
+import std/rawbytes as rawbytes
+import std/result
+import std/strformat
+import std/strutils as strutil
+import cheng/core/lang/intern as langintern
+import cheng/core/lang/parser
+import cheng/core/lang/typed_expr as texpr
+import cheng/core/lang/typed_expr_frag_codec as tefc
+import cheng/core/runtime/arena as arenamod
+
+fn fixtureMainText(): str =
+    var lines: str[]
+    add(lines, "import pkg/helper_a as helperA")
+    add(lines, "import pkg/helper_b as helperB")
+    add(lines, "")
+    add(lines, "type Pair =")
+    add(lines, "    value: int32")
+    add(lines, "")
+    add(lines, "fn SliceA(value: int32): int32 = helperA.TouchA(value)")
+    add(lines, "fn SliceB(value: int32): int32 = helperB.TouchB(value)")
+    add(lines, "")
+    for i in 0..<8:
+        add(lines, Fmt"fn Early{i}(value: int32): int32 =")
+        add(lines, "    if value > 0:")
+        add(lines, "        return helperA.TouchA(value)")
+        add(lines, "    else:")
+        add(lines, "        return value")
+        add(lines, "")
+    add(lines, "fn Late(limit: int32): int32 =")
+    add(lines, "    var total: int32")
+    add(lines, "    var pair: Pair")
+    add(lines, "    total = pair.value")
+    add(lines, "    if limit > 0:")
+    add(lines, "        defer:")
+    add(lines, "            total = helperA.TouchA(total)")
+    add(lines, "        while total < limit:")
+    add(lines, "            total = total + 1")
+    add(lines, "            if total == 2:")
+    add(lines, "                continue")
+    add(lines, "            elif total == 3:")
+    add(lines, "                break")
+    add(lines, "            else:")
+    add(lines, "                total = helperB.TouchB(total)")
+    add(lines, "    else:")
+    add(lines, "        defer: helperB.TouchB(total)")
+    add(lines, "    return total")
+    add(lines, "")
+    return strutil.Join(lines, "\n")
+
+fn sourceNew(sourcePath: str, text: str): texpr.TypedExprSourceText =
+    var externalRoots: parser.ParserExternalPackageRoot[]
+    return texpr.TypedExprSourceTextNewWithPackageFacts("/work",
+                                                       "/work",
+                                                       "pkg://typed-defer",
+                                                       "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                                                       externalRoots,
+                                                       sourcePath,
+                                                       text)
+
+fn resetFixtureSources(sourceTexts: var texpr.TypedExprSourceText[]) =
+    sourceTexts = [
+        sourceNew("/work/pkg/main.cheng", fixtureMainText()),
+        sourceNew("/work/pkg/helper_a.cheng",
+                  "fn TouchA(value: int32): int32 = value + 1\n"),
+        sourceNew("/work/pkg/helper_b.cheng",
+                  "fn TouchB(value: int32): int32 = value + 2\n")]
+
+fn functionScopeByName(ctx: var texpr.TypedExprSourceContext,
+                       name: str): texpr.TypedExprFunctionScope =
+    for i in 0..<ctx.scopes.len:
+        if ctx.scopes[i].name == name:
+            return ctx.scopes[i]
+    panic(Fmt"missing function scope {name}")
+
+fn buildStructuredFunctionLayer(layer: var parser.NormalizedExprLayer,
+                                slice: var parser.ParserStructuredSourceSlice,
+                                out: var parser.NormalizedExprLayer,
+                                err: var str): bool =
+    parser.NormalizedExprLayerReset(out)
+    for i in 0..<layer.exprs.len:
+        if layer.exprs[i].sourcePath != slice.sourcePath ||
+           layer.exprs[i].lineNumber < slice.lineStartNumber ||
+           layer.exprs[i].lineNumber > slice.lineEndNumber ||
+           parser.ParserNormalizedExprKindIsSidecarStructured(layer.exprs[i].kind):
+            continue
+        var expr: NormalizedExpr
+        parser.NormalizedExprCloneInto(layer.exprs[i], expr)
+        if expr.statementOrdinal >= 0 || expr.suiteScopeId >= 0:
+            panic("raw function expression retained structured sidecar identity")
+        expr.lexicalScopeId = -1
+        expr.lexicalOrdinal = -1
+        expr.deferOwnerStatementOrdinal = -1
+        parser.NormalizedExprLayerAppendExisting(out, expr)
+    let rawExprCount = out.exprs.len
+    if !parser.ParserStructuredSourceSliceAppendToLayer(slice, out, err):
+        return false
+    if slice.applyExprVisitCount != Int64(rawExprCount) ||
+       out.scopes.len != slice.scopes.len:
+        panic("structured source sidecar apply visit bound violated")
+    for scopeIndex in 0..<slice.scopes.len:
+        let actual = out.scopes[scopeIndex]
+        let expected = slice.scopes[scopeIndex]
+        if actual.sourcePath != expected.sourcePath ||
+           actual.scopeId != expected.scopeId ||
+           actual.sourceScopeId != expected.sourceScopeId ||
+           actual.parentScopeId != expected.parentScopeId ||
+           actual.kind != expected.kind ||
+           actual.ownerStatementOrdinal != expected.ownerStatementOrdinal ||
+           actual.lexicalOrdinal != expected.lexicalOrdinal ||
+           actual.indentColumn != expected.indentColumn ||
+           actual.startLineNumber != expected.startLineNumber ||
+           actual.startColumnNumber != expected.startColumnNumber ||
+           actual.endLineNumber != expected.endLineNumber ||
+           actual.endColumnNumber != expected.endColumnNumber:
+            panic("structured source sidecar scope roundtrip mismatch")
+    texpr.TypedExprValidateNormalizedDeferFacts(out)
+    err = ""
+    return true
+
+fn assertBorrowedIndexesSurviveTwoSlices(
+        sourceTexts: var texpr.TypedExprSourceText[],
+        contexts: var texpr.TypedExprSourceContext[],
+        layer: var parser.NormalizedExprLayer,
+        mainPath: str) =
+    assert(contexts.len == 3, "x")
+    assert(contexts[0].importedModules.len == 2,
+           "x")
+    var sourceIdentity: texpr.TypedExprSourceIdentityIndex
+    var contextLookup: parser.ParserSourcePathIndexLookup
+    var err: str
+    assert(texpr.TypedExprBuildSourceIdentityIndex(sourceTexts,
+                                                   sourceIdentity,
+                                                   err),
+           err)
+    assert(texpr.TypedExprBuildSourceContextExactIndex(contexts,
+                                                       contextLookup,
+                                                       err),
+           err)
+    let sourceIdentityCount = sourceIdentity.sourcePhysicalPaths.len
+    let contextLookupSlotCount = contextLookup.slots.len
+    let contextLookupBucketCount = contextLookup.buckets.len
+    var reusableContext: texpr.TypedExprSourceContext
+    assert(texpr.TypedExprBuildReusableFactsSourceContext(sourceTexts,
+                                                           0,
+                                                           contexts,
+                                                           contextLookup,
+                                                           reusableContext,
+                                                           err),
+           err)
+    var sourceLines = parser.ParserSplitChar(fixtureMainText(), '\n')
+    parser.ParserJoinContinuationLinesInPlace(sourceLines)
+    var sourceFacts: parser.ParserStructuredSourceFacts
+    assert(parser.ParserStructuredSourceFactsBuild(mainPath,
+                                                    sourceLines,
+                                                    sourceFacts,
+                                                    err),
+           err)
+    assert(sourceFacts.sourceLineCount == sourceLines.len &&
+           sourceFacts.scopeBuildLineVisitCount == Int64(sourceLines.len) &&
+           sourceFacts.structuredBuildLineVisitCount == Int64(sourceLines.len),
+           "x")
+    let firstScope = functionScopeByName(contexts[0], "Early0")
+    let secondScope = functionScopeByName(contexts[0], "Late")
+    var firstSidecar: parser.ParserStructuredSourceSlice
+    var secondSidecar: parser.ParserStructuredSourceSlice
+    assert(parser.ParserStructuredSourceFactsSliceBuild(sourceFacts,
+                                                         firstScope.startLine,
+                                                         firstScope.endLine,
+                                                         firstSidecar,
+                                                         err),
+           err)
+    assert(parser.ParserStructuredSourceFactsSliceBuild(sourceFacts,
+                                                         secondScope.startLine,
+                                                         secondScope.endLine,
+                                                         secondSidecar,
+                                                         err),
+           err)
+    assert(firstSidecar.lineVisitCount ==
+               Int64(firstScope.endLine - firstScope.startLine + 1) &&
+           secondSidecar.lineVisitCount ==
+               Int64(secondScope.endLine - secondScope.startLine + 1) &&
+           firstSidecar.scopeVisitCount == Int64(firstSidecar.scopes.len) &&
+           secondSidecar.scopeVisitCount == Int64(secondSidecar.scopes.len) &&
+           firstSidecar.seedVisitCount == Int64(firstSidecar.seeds.len) &&
+           secondSidecar.seedVisitCount == Int64(secondSidecar.seeds.len) &&
+           firstSidecar.sourceStatementOrdinals.len > 0 &&
+           secondSidecar.sourceStatementOrdinals.len > 0 &&
+           secondSidecar.sourceStatementOrdinals[0] >
+               firstSidecar.sourceStatementOrdinals[0],
+           "x")
+    var firstLayer: parser.NormalizedExprLayer
+    var secondLayer: parser.NormalizedExprLayer
+    assert(buildStructuredFunctionLayer(layer,
+                                         firstSidecar,
+                                         firstLayer,
+                                         err),
+           err)
+    assert(buildStructuredFunctionLayer(layer,
+                                         secondSidecar,
+                                         secondLayer,
+                                         err),
+           err)
+    assert(firstLayer.exprs.len > 0 && secondLayer.exprs.len > 0 &&
+           firstLayer.scopes.len == firstSidecar.scopes.len &&
+           secondLayer.scopes.len == secondSidecar.scopes.len,
+           "x")
+    var sliceFacts: texpr.TypedExprFactTable
+    assert(texpr.TypedExprBuildFactsAppendSourceExprLayerWithContext(
+               sourceTexts,
+               contexts,
+               sourceIdentity,
+               contextLookup,
+               firstLayer,
+               reusableContext,
+               sliceFacts,
+               err),
+           err)
+    assert(texpr.TypedExprFactTableCount(sliceFacts) > 0,
+           "x")
+    assert(texpr.TypedExprBuildFactsAppendSourceExprLayerWithContext(
+               sourceTexts,
+               contexts,
+               sourceIdentity,
+               contextLookup,
+               secondLayer,
+               reusableContext,
+               sliceFacts,
+               err),
+           err)
+    assert(texpr.TypedExprFactTableCount(sliceFacts) > 0,
+           "x")
+    assert(sourceIdentity.sourcePhysicalPaths.len == sourceIdentityCount &&
+           contextLookup.slots.len == contextLookupSlotCount &&
+           contextLookup.buckets.len == contextLookupBucketCount,
+           "x")
+    for sourceIndex in 0..<sourceTexts.len:
+        var foundIndex: int32
+        assert(texpr.TypedExprSourceIdentityIndexFind(sourceIdentity,
+                                                       sourceTexts[sourceIndex].sourcePath,
+                                                       foundIndex,
+                                                       err) &&
+               foundIndex == sourceIndex,
+               "x")
+        assert(parser.ParserProfileIndexLookupForNormalizedSourcePathExact(
+                   contextLookup,
+                   sourceTexts[sourceIndex].sourcePath) == sourceIndex,
+               "x")
+    assert(contexts[0].importedModules.len == 2 &&
+           contexts[0].importedModules[0].targetSourcePath != "" &&
+           contexts[0].importedModules[1].targetSourcePath != "",
+           "x")
+    texpr.TypedExprFactTableRelease(sliceFacts)
+    texpr.TypedExprReleaseReusableFactsSourceContext(reusableContext)
+    parser.NormalizedExprLayerReset(firstLayer)
+    parser.NormalizedExprLayerReset(secondLayer)
+    parser.ParserStructuredSourceSliceReset(firstSidecar)
+    parser.ParserStructuredSourceSliceReset(secondSidecar)
+    parser.ParserStructuredSourceFactsReset(sourceFacts)
+
+fn irFunctionIndex(ir: var texpr.TypedExprIr, name: str): int32 =
+    for i in 0..<ir.functions2_functionNameIds.len:
+        let nameResult = langintern.LookupIntern(ir.internPool,
+                                                  ir.functions2_functionNameIds[i])
+        if IsOk(nameResult) && Value(nameResult) == name:
+            return i
+    return -1
+
+fn assertI32ColumnsEqual(lhs: int32[], rhs: int32[], label: str) =
+    assert(lhs.len == rhs.len, label)
+    for i in 0..<lhs.len:
+        assert(lhs[i] == rhs[i], label)
+
+fn assertLateFunctionContract(ir: var texpr.TypedExprIr): int32 =
+    let functionIndex = irFunctionIndex(ir, "Late")
+    assert(functionIndex >= 0, "x")
+    let statementStart = arenamod.ArenaArrayInt32Get(
+        ir.arena, ir.functions2_statementStarts, functionIndex)
+    let statementCount = arenamod.ArenaArrayInt32Get(
+        ir.arena, ir.functions2_statementCounts, functionIndex)
+    let scopeStart = arenamod.ArenaArrayInt32Get(
+        ir.arena, ir.functions2_scopeStarts, functionIndex)
+    let scopeCount = arenamod.ArenaArrayInt32Get(
+        ir.arena, ir.functions2_scopeCounts, functionIndex)
+    assert(statementCount > 0 && scopeCount > 1,
+           "x")
+    var structuredCount: int32
+    var deferCount: int32
+    var breakCount: int32
+    var continueCount: int32
+    var deferredBodyCount: int32
+    for localIndex in 0..<statementCount:
+        let row = statementStart + localIndex
+        let ordinal = arenamod.ArenaArrayInt32Get(
+            ir.arena, ir.statements2_statementOrdinals, row)
+        let lexicalScopeId = arenamod.ArenaArrayInt32Get(
+            ir.arena, ir.statements2_lexicalScopeIds, row)
+        let suiteScopeId = arenamod.ArenaArrayInt32Get(
+            ir.arena, ir.statements2_suiteScopeIds, row)
+        let deferOwner = arenamod.ArenaArrayInt32Get(
+            ir.arena, ir.statements2_deferOwnerStatementOrdinals, row)
+        assert(lexicalScopeId >= 0 && lexicalScopeId < scopeCount,
+               "x")
+        assert(arenamod.ArenaArrayInt32Get(ir.arena,
+                                           ir.statements2_endLineNumbers,
+                                           row) >=
+               arenamod.ArenaArrayInt32Get(ir.arena,
+                                           ir.statements2_lineNumbers,
+                                           row),
+               "x")
+        if ordinal >= 0:
+            assert(ordinal == structuredCount,
+                   "x")
+            structuredCount = structuredCount + 1
+        if suiteScopeId >= 0:
+            assert(suiteScopeId < scopeCount && ordinal >= 0,
+                   "x")
+            assert(arenamod.ArenaArrayInt32Get(
+                       ir.arena,
+                       ir.scopes2_ownerStatementOrdinals,
+                       scopeStart + suiteScopeId) == ordinal,
+                   "x")
+        if deferOwner >= 0:
+            assert(deferOwner < structuredCount,
+                   "x")
+            deferredBodyCount = deferredBodyCount + 1
+        if ir.statements2_kinds[row] == texpr.TypedExprIrStmtDefer:
+            deferCount = deferCount + 1
+        elif ir.statements2_kinds[row] == texpr.TypedExprIrStmtBreak:
+            breakCount = breakCount + 1
+        elif ir.statements2_kinds[row] == texpr.TypedExprIrStmtContinue:
+            continueCount = continueCount + 1
+    assert(structuredCount > 0 && deferCount == 2 && breakCount == 1 &&
+           continueCount == 1 && deferredBodyCount > 0,
+           "x")
+    for localScopeId in 0..<scopeCount:
+        let row = scopeStart + localScopeId
+        assert(arenamod.ArenaArrayInt32Get(ir.arena,
+                                           ir.scopes2_scopeIds,
+                                           row) == localScopeId,
+               "x")
+        if localScopeId == 0:
+            assert(arenamod.ArenaArrayInt32Get(ir.arena,
+                                               ir.scopes2_parentScopeIds,
+                                               row) == -1,
+                   "x")
+        else:
+            assert(arenamod.ArenaArrayInt32Get(ir.arena,
+                                               ir.scopes2_parentScopeIds,
+                                               row) < localScopeId,
+                   "x")
+
+    var fragment =
+        tefc.TypedExprIrFunctionFragmentExtract(ir, functionIndex)
+    var sawDirectCallValueStatement: bool
+    for localStatementIndex in 0..<fragment.statements.statementIndexs.len:
+        assert(fragment.statements.statementIndexs[localStatementIndex] ==
+                   localStatementIndex,
+               "function fragment statement indexes must be local")
+        let callArgStart =
+            fragment.statements.callArgNodeStarts[localStatementIndex]
+        let callArgCount =
+            fragment.statements.callArgNodeCounts[localStatementIndex]
+        assert(callArgCount >= 0 &&
+               ((callArgCount == 0 &&
+                 callArgStart >= -1 &&
+                 callArgStart <= fragment.nodes.nodeIndexs.len) ||
+                (callArgCount > 0 &&
+                 callArgStart >= 0 &&
+                 callArgStart + callArgCount <=
+                     fragment.nodes.nodeIndexs.len)),
+               "function fragment call argument range must be local")
+        let statementKind = fragment.statements.kinds[localStatementIndex]
+        let rhsNodeIndex =
+            fragment.statements.rhsNodeIndexs[localStatementIndex]
+        let isValueStatement =
+            statementKind == int32(texpr.TypedExprIrStmtLocalDecl) ||
+            statementKind == int32(texpr.TypedExprIrStmtAssign) ||
+            statementKind == int32(texpr.TypedExprIrStmtReturn)
+        if isValueStatement &&
+           rhsNodeIndex >= 0 &&
+           fragment.nodes.opKinds[rhsNodeIndex] ==
+               int32(texpr.TypedExprIrOpCallExpr):
+            assert(fragment.statements.callTargetIds[
+                       localStatementIndex] ==
+                       fragment.nodes.callTargetIds[rhsNodeIndex] &&
+                   fragment.statements.callTargetSourcePathIds[
+                       localStatementIndex] ==
+                       fragment.nodes.callTargetSourcePathIds[
+                           rhsNodeIndex] &&
+                   fragment.statements.callTargetSignatureLineNumbers[
+                       localStatementIndex] ==
+                       fragment.nodes.callTargetSignatureLineNumbers[
+                           rhsNodeIndex] &&
+                   fragment.statements.callTargetImportcs[
+                       localStatementIndex] ==
+                       fragment.nodes.callTargetImportcs[rhsNodeIndex],
+                   "direct-call value statement must preserve exact node authority")
+            sawDirectCallValueStatement = true
+    assert(sawDirectCallValueStatement,
+           "fixture must cover a direct-call value statement")
+    for localNodeIndex in 0..<fragment.nodes.nodeIndexs.len:
+        assert(fragment.nodes.nodeIndexs[localNodeIndex] == localNodeIndex,
+               "function fragment node indexes must be local")
+    tefc.TypedExprIrFunctionFragmentRoundTripAssert(fragment)
+    var encoded = tefc.TypedExprIrFunctionFragmentEncode(fragment)
+    var cursor: int32
+    let decoded = tefc.TypedExprIrFunctionFragmentDecode(encoded, cursor)
+    assert(cursor == rawbytes.BytesLen(encoded) && decoded.scopeStart == 0 &&
+           decoded.scopeCount == scopeCount,
+           "x")
+    assertI32ColumnsEqual(decoded.statements.endLineNumbers,
+                          fragment.statements.endLineNumbers,
+                          "x")
+    assertI32ColumnsEqual(decoded.statements.endColumnNumbers,
+                          fragment.statements.endColumnNumbers,
+                          "x")
+    assertI32ColumnsEqual(decoded.statements.lexicalScopeIds,
+                          fragment.statements.lexicalScopeIds,
+                          "x")
+    assertI32ColumnsEqual(decoded.statements.suiteScopeIds,
+                          fragment.statements.suiteScopeIds,
+                          "x")
+    assertI32ColumnsEqual(decoded.statements.statementOrdinals,
+                          fragment.statements.statementOrdinals,
+                          "x")
+    assertI32ColumnsEqual(decoded.statements.lexicalOrdinals,
+                          fragment.statements.lexicalOrdinals,
+                          "x")
+    assertI32ColumnsEqual(decoded.statements.deferOwnerStatementOrdinals,
+                          fragment.statements.deferOwnerStatementOrdinals,
+                          "x")
+    assertI32ColumnsEqual(decoded.statements.callTargetSignatureLineNumbers,
+                          fragment.statements.callTargetSignatureLineNumbers,
+                          "x")
+    assertI32ColumnsEqual(decoded.nodes.callTargetSignatureLineNumbers,
+                          fragment.nodes.callTargetSignatureLineNumbers,
+                          "x")
+    assertI32ColumnsEqual(decoded.nodes.fieldAlignBytes,
+                          fragment.nodes.fieldAlignBytes,
+                          "x")
+    var sawStatementDeclarationLine: bool
+    for i in 0..<decoded.statements.callTargetSignatureLineNumbers.len:
+        if decoded.statements.callTargetSignatureLineNumbers[i] > 0:
+            sawStatementDeclarationLine = true
+    var sawNodeDeclarationLine: bool
+    var sawExactFieldAuthority: bool
+    for i in 0..<decoded.nodes.callTargetSignatureLineNumbers.len:
+        if decoded.nodes.callTargetSignatureLineNumbers[i] > 0:
+            sawNodeDeclarationLine = true
+        if decoded.nodes.opKinds[i] == int32(texpr.TypedExprIrOpFieldGet):
+            assert(decoded.nodes.fieldTypeSourcePathIds[i] ==
+                       fragment.nodes.fieldTypeSourcePathIds[i] &&
+                   decoded.nodes.fieldTypeSourcePathIds[i] ==
+                       "/work/pkg/main.cheng" &&
+                   decoded.nodes.fieldAlignBytes[i] == 4,
+                   "exact field-node owner/alignment must survive fragment tags 101 and 102")
+            sawExactFieldAuthority = true
+    assert(sawStatementDeclarationLine && sawNodeDeclarationLine,
+           "exact call declaration lines must survive fragment tags 99 and 100")
+    assert(sawExactFieldAuthority,
+           "field-node authority fixture must produce a structured field node")
+    assertI32ColumnsEqual(decoded.scopes.scopeIds,
+                          fragment.scopes.scopeIds,
+                          "x")
+    assertI32ColumnsEqual(decoded.scopes.parentScopeIds,
+                          fragment.scopes.parentScopeIds,
+                          "x")
+    assertI32ColumnsEqual(decoded.scopes.kinds,
+                          fragment.scopes.kinds,
+                          "x")
+    assertI32ColumnsEqual(decoded.scopes.ownerStatementOrdinals,
+                          fragment.scopes.ownerStatementOrdinals,
+                          "x")
+    assertI32ColumnsEqual(decoded.scopes.lexicalOrdinals,
+                          fragment.scopes.lexicalOrdinals,
+                          "x")
+    assertI32ColumnsEqual(decoded.scopes.startLineNumbers,
+                          fragment.scopes.startLineNumbers,
+                          "x")
+    assertI32ColumnsEqual(decoded.scopes.startColumnNumbers,
+                          fragment.scopes.startColumnNumbers,
+                          "x")
+    assertI32ColumnsEqual(decoded.scopes.endLineNumbers,
+                          fragment.scopes.endLineNumbers,
+                          "x")
+    assertI32ColumnsEqual(decoded.scopes.endColumnNumbers,
+                          fragment.scopes.endColumnNumbers,
+                          "x")
+    let reinternPool = langintern.InternPoolNew()
+    let reinterned = tefc.TypedExprFragReinternColumn(
+        reinternPool,
+        decoded.statements.sourcePathIds)
+    assert(reinterned.len == decoded.statements.sourcePathIds.len,
+           "x")
+    for i in 0..<reinterned.len:
+        let value = langintern.LookupIntern(reinternPool, reinterned[i])
+        assert(IsOk(value) && Value(value) == decoded.statements.sourcePathIds[i],
+               "x")
+    rawbytes.BytesFree(encoded)
+    return functionIndex
+
+fn runMissingSidecarNegative() =
+    var layer: parser.NormalizedExprLayer
+    var err: str
+    assert(parser.ParserReadNormalizedExprLayerFromText(
+               "/work/pkg/missing_scope.cheng",
+               "fn Run(v: int32): int32 =\n    if v > 0:\n        return v\n    return 0\n",
+               layer,
+               err),
+           err)
+    layer.scopes = []
+    texpr.TypedExprValidateNormalizedDeferFacts(layer)
+
+fn runMissingOwnerNegative() =
+    var layer: parser.NormalizedExprLayer
+    var err: str
+    assert(parser.ParserReadNormalizedExprLayerFromText(
+               "/work/pkg/missing_owner.cheng",
+               "fn Run(v: int32): int32 =\n    if v > 0:\n        return v\n    return 0\n",
+               layer,
+               err),
+           err)
+    var changed: bool
+    for i in 1..<layer.scopes.len:
+        if layer.scopes[i].ownerStatementOrdinal >= 0:
+            layer.scopes[i].ownerStatementOrdinal = -1
+            changed = true
+            break
+    assert(changed, "x")
+    texpr.TypedExprValidateNormalizedDeferFacts(layer)
+
+fn runDuplicateOrdinalNegative() =
+    var layer: parser.NormalizedExprLayer
+    var err: str
+    assert(parser.ParserReadNormalizedExprLayerFromText(
+               "/work/pkg/duplicate_ordinal.cheng",
+               "fn Run(v: int32): int32 =\n    if v > 0:\n        return v\n    else:\n        return 1\n",
+               layer,
+               err),
+           err)
+    var firstOrdinal: int32 = -1
+    var changed: bool
+    for i in 0..<layer.exprs.len:
+        if !parser.ParserNormalizedExprKindIsSidecarStructured(layer.exprs[i].kind):
+            continue
+        if firstOrdinal < 0:
+            firstOrdinal = layer.exprs[i].statementOrdinal
+        else:
+            layer.exprs[i].statementOrdinal = firstOrdinal
+            changed = true
+            break
+    assert(changed, "x")
+    texpr.TypedExprValidateNormalizedDeferFacts(layer)
+
+fn runFragmentFieldCountNegative() =
+    var bytes = rawbytes.BytesAlloc(8)
+    rawbytes.BytesSet(bytes, 0, 0x54)
+    rawbytes.BytesSet(bytes, 1, 0x45)
+    rawbytes.BytesSet(bytes, 2, 0x52)
+    rawbytes.BytesSet(bytes, 3, 0x46)
+    rawbytes.BytesSet(bytes, 4, 1)
+    var cursor: int32
+    let _ = tefc.TypedExprIrFunctionFragmentDecode(bytes, cursor)
+
+fn runFragmentCallOwnerMismatchNegative(ir: var texpr.TypedExprIr,
+                                        functionIndex: int32) =
+    var fragment =
+        tefc.TypedExprIrFunctionFragmentExtract(ir, functionIndex)
+    var changed: bool
+    for statementIndex in 0..<fragment.statements.statementIndexs.len:
+        let statementKind = fragment.statements.kinds[statementIndex]
+        let rhsNodeIndex = fragment.statements.rhsNodeIndexs[statementIndex]
+        let isValueStatement =
+            statementKind == int32(texpr.TypedExprIrStmtLocalDecl) ||
+            statementKind == int32(texpr.TypedExprIrStmtAssign) ||
+            statementKind == int32(texpr.TypedExprIrStmtReturn)
+        if isValueStatement &&
+           rhsNodeIndex >= 0 &&
+           fragment.nodes.opKinds[rhsNodeIndex] ==
+               int32(texpr.TypedExprIrOpCallExpr) &&
+           fragment.statements.callTargetIds[statementIndex] != "":
+            fragment.statements.callTargetIds[statementIndex] =
+                "forged.call.owner"
+            changed = true
+            break
+    assert(changed,
+           "fixture must expose a direct-call value statement owner")
+    let _ = tefc.TypedExprIrFunctionFragmentEncode(fragment)
+
+fn requireHardFail(mode: str, diagnostic: str) =
+    let result = hostos.ExecFileCapture(cmdline.ParamStr(0),
+                                         [mode],
+                                         [],
+                                         "",
+                                         true,
+                                         60)
+    assert(os.ExecCmdResultExitCode(result) != 0 &&
+           strutil.Contains(os.ExecCmdResultOutput(result), diagnostic),
+           "hard-fail child contract mismatch")
+
+fn runHardFailMatrix() =
+    requireHardFail("missing-sidecar",
+                    "typed expr: structured facts have no normalized scope table")
+    requireHardFail("missing-owner",
+                    "typed expr: structured suite owner fact is mismatched")
+    requireHardFail("duplicate-ordinal",
+                    "typed expr: duplicate structured statement ordinal")
+    requireHardFail("fragment-field-count",
+                    "typed_expr_frag_codec_bad_field_count")
+
+fn main(): int32 =
+    let mode = cmdline.ParamStr(1)
+    if mode == "missing-sidecar":
+        runMissingSidecarNegative()
+        return 91
+    if mode == "missing-owner":
+        runMissingOwnerNegative()
+        return 92
+    if mode == "duplicate-ordinal":
+        runDuplicateOrdinalNegative()
+        return 93
+    if mode == "fragment-field-count":
+        runFragmentFieldCountNegative()
+        return 94
+
+    let mainPath = "/work/pkg/main.cheng"
+    let helperAPath = "/work/pkg/helper_a.cheng"
+    let helperBPath = "/work/pkg/helper_b.cheng"
+    var sourceTexts: texpr.TypedExprSourceText[]
+    resetFixtureSources(sourceTexts)
+    var contexts: texpr.TypedExprSourceContext[]
+    var err: str
+    var mainContext: texpr.TypedExprSourceContext
+    assert(texpr.TypedExprBuildSourceContext(
+               sourceNew(mainPath, fixtureMainText()), mainContext, err), err)
+    texpr.TypedExprSourceContextAppendMove(contexts, mainContext)
+    var helperAContext: texpr.TypedExprSourceContext
+    assert(texpr.TypedExprBuildSourceContext(
+               sourceNew(helperAPath,
+                         "fn TouchA(value: int32): int32 = value + 1\n"),
+               helperAContext,
+               err),
+           err)
+    texpr.TypedExprSourceContextAppendMove(contexts, helperAContext)
+    var helperBContext: texpr.TypedExprSourceContext
+    assert(texpr.TypedExprBuildSourceContext(
+               sourceNew(helperBPath,
+                         "fn TouchB(value: int32): int32 = value + 2\n"),
+               helperBContext,
+               err),
+           err)
+    texpr.TypedExprSourceContextAppendMove(contexts, helperBContext)
+    var layer: parser.NormalizedExprLayer
+    assert(texpr.TypedExprReadNormalizedExprLayerForSourceTexts(sourceTexts,
+                                                                layer,
+                                                                err),
+           err)
+    resetFixtureSources(sourceTexts)
+    assertBorrowedIndexesSurviveTwoSlices(sourceTexts, contexts, layer, mainPath)
+
+    var factsLayer = parser.NormalizedExprLayerClone(layer)
+    var facts: texpr.TypedExprFactTable
+    assert(texpr.TypedExprBuildFactsWithMetadataContexts(sourceTexts,
+                                                         factsLayer,
+                                                         contexts,
+                                                         facts,
+                                                         err),
+           err)
+    resetFixtureSources(sourceTexts)
+    var ir: texpr.TypedExprIr
+    var filterSourcePaths: str[]
+    var filterFunctionNames: str[]
+    var filterStartLines: int32[]
+    assert(texpr.TypedExprSnapshotBuild(sourceTexts,
+                                     contexts,
+                                     facts,
+                                     layer,
+                                     ir,
+                                     false,
+                                     filterSourcePaths,
+                                     filterFunctionNames,
+                                     filterStartLines),
+           "x")
+    let lateFunctionIndex = assertLateFunctionContract(ir)
+    if mode == "fragment-call-owner-mismatch":
+        runFragmentCallOwnerMismatchNegative(ir, lateFunctionIndex)
+        return 95
+
+    var ordinalProbe = texpr.TypedExprFunctionOrdinalMapInit(2)
+    texpr.TypedExprFunctionOrdinalMapInsert(ordinalProbe, 100000, 0)
+    texpr.TypedExprFunctionOrdinalMapInsert(ordinalProbe, 100001, 1)
+    assert(ordinalProbe.keys.len <= 8 && ordinalProbe.count == 2 &&
+           texpr.TypedExprFunctionOrdinalMapFind(ordinalProbe, 100001) == 1 &&
+           ordinalProbe.probeVisitCount <= 8,
+           "x")
+    var pairGroupCounts: int32[] = [2, 0, 2]
+    var pairIndex = texpr.TypedExprDensePairIndexInit(pairGroupCounts)
+    assert(texpr.TypedExprDensePairIndexInsert(pairIndex, 0, 0) &&
+           texpr.TypedExprDensePairIndexInsert(pairIndex, 0, 1) &&
+           texpr.TypedExprDensePairIndexInsert(pairIndex, 2, 0) &&
+           texpr.TypedExprDensePairIndexInsert(pairIndex, 2, 1) &&
+           pairIndex.count == 4 && pairIndex.visitCount == 4 &&
+           pairIndex.seen.len == 4 && pairIndex.groupStarts.len == 4,
+           "x")
+    assert(!texpr.TypedExprDensePairIndexInsert(pairIndex, 2, 1) &&
+           pairIndex.count == 4 && pairIndex.visitCount == 5,
+           "x")
+    assert(texpr.TypedExprFactTablePhysicalColumnCount() == 41 &&
+           texpr.TypedExprFactTablePhysicalInt32ColumnCount() == 26 &&
+           texpr.TypedExprFactTablePhysicalU8ColumnCount() == 15 &&
+           texpr.TypedExprFactTablePhysicalRowBytes() == 119 &&
+           texpr.TypedExprFactTableScratchRetainedInternEntryLimit() == 512 &&
+           texpr.TypedExprIrOrdinarySoAColumnCount() == 56,
+           "x")
+    runHardFailMatrix()
+    requireHardFail(
+        "fragment-call-owner-mismatch",
+        "typed_expr_frag_codec_statement_direct_call_owner_mismatch")
+
+    let liveBytes = texpr.TypedExprIrArenaLogicalLiveBytes(ir)
+    var cloned = texpr.TypedExprIrClone(ir)
+    assert(texpr.TypedExprIrArenaLogicalLiveBytes(cloned) == liveBytes &&
+           cloned.scopes2_scopeIds.len == ir.scopes2_scopeIds.len &&
+           cloned.statements2_endLineNumbers.len == ir.statements2_endLineNumbers.len,
+           "x")
+    var moved: texpr.TypedExprIr
+    texpr.TypedExprIrMoveInto(moved, cloned)
+    assert(cloned.scopes2_scopeIds.len == 0 &&
+           moved.scopes2_scopeIds.len == ir.scopes2_scopeIds.len &&
+           texpr.TypedExprIrArenaLogicalLiveBytes(moved) == liveBytes,
+           "x")
+    texpr.TypedExprIrReleasePayload(moved)
+    assert(moved.scopes2_scopeIds.len == 0 &&
+           moved.statements2_endLineNumbers.len == 0,
+           "x")
+
+    echo(Fmt"typed_defer_contract_ok functions={ir.functions2_functionNameIds.len} late_index={lateFunctionIndex} statements={ir.statements2_statementIndexs.len} scopes={ir.scopes2_scopeIds.len} live_bytes={liveBytes}")
+    texpr.TypedExprIrReleasePayload(ir)
+    texpr.TypedExprFactTableRelease(facts)
+    parser.NormalizedExprLayerReset(factsLayer)
+    parser.NormalizedExprLayerReset(layer)
+    for i in 0..<contexts.len:
+        texpr.TypedExprClearSourceContextAllFields(contexts[i])
+    return 0

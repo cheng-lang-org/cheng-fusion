@@ -1,0 +1,485 @@
+# CSG 统一决策执行内核 —— 有界确定性精确规划器(任务 07 首切片)。
+#
+# 合同: docs/campaigns/2026-09-21-csg-decision-computer-use/contract.md §1
+# deterministic 节点错误终态 BudgetExceeded / Unreachable / NeedEvidence;
+# 提案 openspec/proposals/csg-semantic-decision-computer-use.md §2:
+#   - 等成本有限域用 BFS;非负加权动作用 Dijkstra;
+#   - 按规范状态编码精确去重,哈希碰撞必须回退原值比较;
+#   - 达到预算返回 BudgetExceeded,不得把预算耗尽当成不可达;
+#   - 搜索完全穷尽才允许返回 Unreachable;
+#   - 必要证据未知返回 NeedEvidence(Unknown != false)。
+#
+# 状态编码:定长 int64 变量向量 + 逐变量 unknown 字节,分量按变量 int32
+# 索引确定序排列 —— 该向量即规范编码,同一状态有且仅有唯一字节序列。
+# 去重表:开放寻址(int32 槽 + uint64 指纹),槽位数 ≥ 2×状态预算
+# (负载 ≤ 0.5,建表一次,不扩容)。指纹仅选桶:命中候选必须再做
+# 原值逐分量精确比较,哈希碰撞不影响正确性(verify f 注入退化哈希验证)。
+#
+# 内存模型项(提案「规划」相):已访问状态数×状态字节(values+unknown+
+# 指纹+parent+g+closed 列)+ 槽表(≥2×预算×4B)+ 前沿(等成本 BFS 队列
+# 即状态列本身;Dijkstra 为二叉堆两列)+ 求值临时列。全部随任务帧分配、
+# 随返回释放,无跨任务留存。
+#
+# 终态语义(status 分立,绝无成功伪装):
+#   GoalReached      路径 + 精确总代价(路径可独立仿真复核)
+#   Unreachable      搜索完全穷尽且全程无未知(否则一律 NeedEvidence)
+#   BudgetExceeded   访问状态数或边扩展数达上限;expandedStates/
+#                    expandedEdges 恰等于预算值,可断言
+#   NeedEvidence     初始目标未知,或穷尽前见到未知目标/未知前置
+#   ModelRejected    动作模型未过准入(含 BFS 代价不均匀),rejectedAction 精确
+#   InvalidInput     状态向量空/两列不等长/目标根越界/预算非法
+
+import std/seqs
+import cheng/core/runtime/csg_goal as cgoal
+import cheng/core/runtime/csg_action_model as camodel
+
+const
+    CsgExactPlannerGoalReached: int32 = 0
+    CsgExactPlannerUnreachable: int32 = 1
+    CsgExactPlannerBudgetExceeded: int32 = 2
+    CsgExactPlannerNeedEvidence: int32 = 3
+    CsgExactPlannerModelRejected: int32 = 4
+    CsgExactPlannerInvalidInput: int32 = 5
+
+    # 本切片状态预算上限(槽数 = 2 的幂 ≥ 2×预算,建表 ≤ 16MiB)。
+    # 合同:预测超门就明确拒绝该任务域,不放宽守卫。
+    CsgExactPlannerMaxStateBudget: int32 = 1048576
+
+type
+    CsgExactPlannerOptions =
+        # 测试钩子(verify f):非 0 时所有状态哈希到同一退化指纹,
+        # 去重完全依赖原值精确比较 —— 强制碰撞注入。
+        degenerateConstantHash: uint8
+
+    CsgExactPlannerOutcome =
+        status: int32           # CsgExactPlanner* 终态
+        actions: int32[]        # GoalReached 时的动作下标路径(执行序)
+        totalCost: int64        # GoalReached 时的精确总代价
+        expandedStates: int32   # 已访问(进入状态表)状态数
+        expandedEdges: int64    # 已扩展边数(前置为真的迁移尝试)
+        rejectedAction: int32   # ModelRejected 时的动作行号,其余 -1
+
+    csgExactPlannerStore =
+        varCount: int32
+        values: int64[]         # 展平:stateCount × varCount
+        unknown: uint8[]        # 展平:stateCount × varCount
+        fingerprint: uint64[]   # 每状态一个(仅选桶,不作相等判据)
+        parentState: int32[]    # 路径回溯;-1 = 初始
+        parentAction: int32[]   # 路径回溯;-1 = 初始
+        g: int64[]              # 起点到该状态的已知最小代价
+        closed: uint8[]         # Dijkstra 出堆封账标记(BFS 不用)
+        slots: int32[]          # 开放寻址表;-1 空,否则状态下标
+        slotMask: int32         # slotCount-1,slotCount 为 2 的幂
+        stateCount: int32
+
+# ---- 指纹 ----
+
+# FNV-1a 64(惯用法与 std/hashmaps 一致):只用于选桶,相等性由原值比较定。
+@borrows
+fn csgExactPlannerHashState(values: int64[], unknown: uint8[], varCount: int32, degenerate: uint8): uint64 =
+    if degenerate != uint8(0):
+        return uint64(1)
+    var h: uint64 = (uint64(1469598103) * uint64(1000000000)) + uint64(934665603)
+    h = h ^ uint64(varCount)
+    h = h * ((uint64(1099511628) * uint64(1000)) + uint64(211))
+    for j in 0..<varCount:
+        h = h ^ uint64(values[j])
+        h = h * ((uint64(1099511628) * uint64(1000)) + uint64(211))
+        h = h ^ (uint64(unknown[j]) & uint64(0xFF))
+        h = h * ((uint64(1099511628) * uint64(1000)) + uint64(211))
+    return h
+
+# ---- 原值精确比较(碰撞回退判据) ----
+
+@borrows
+fn csgExactPlannerStatesEqual(aVals: int64[], aUnk: uint8[], aBase: int32,
+                              bVals: int64[], bUnk: uint8[], bBase: int32,
+                              varCount: int32): bool =
+    for j in 0..<varCount:
+        if aVals[aBase + j] != bVals[bBase + j]:
+            return false
+        if aUnk[aBase + j] != bUnk[bBase + j]:
+            return false
+    return true
+
+# ---- 去重查表 ----
+# 返回:found=true 时为已存在状态下标;found=false 时为可插入槽位下标;
+# -2 = 表满(不变量破坏,调用方 assert 硬失败)。
+@borrows
+fn csgExactPlannerLookup(store: csgExactPlannerStore,
+                         candVals: int64[],
+                         candUnk: uint8[],
+                         degenerate: uint8,
+                         found: var bool,
+                         fpOut: var uint64): int32 =
+    let fp: uint64 = csgExactPlannerHashState(candVals, candUnk, store.varCount, degenerate)
+    fpOut = fp
+    var probe: int32 = int32(fp & uint64(store.slotMask))
+    var guard: int32 = 0
+    while guard <= store.slotMask:
+        let s = store.slots[probe]
+        if s < 0:
+            found = false
+            return probe
+        if store.fingerprint[s] == fp &&
+           csgExactPlannerStatesEqual(store.values, store.unknown, s * store.varCount,
+                                      candVals, candUnk, 0, store.varCount):
+            found = true
+            return s
+        probe = probe + 1
+        if probe > store.slotMask:
+            probe = 0
+        guard = guard + 1
+    return -2
+
+# ---- 状态表初始化(含初始状态入表) ----
+
+@borrows
+fn csgExactPlannerStoreInit(out: var csgExactPlannerStore,
+                            initialValues: int64[],
+                            initialUnknown: uint8[],
+                            varCount: int32,
+                            maxStates: int32,
+                            degenerate: uint8) =
+    out.varCount = varCount
+    for j in 0..<varCount:
+        add(out.values, initialValues[j])
+        add(out.unknown, initialUnknown[j])
+    add(out.fingerprint, csgExactPlannerHashState(initialValues, initialUnknown, varCount, degenerate))
+    add(out.parentState, -1)
+    add(out.parentAction, -1)
+    add(out.g, int64(0))
+    add(out.closed, uint8(0))
+    out.stateCount = 1
+    var sc: int32 = 16
+    while sc < maxStates * 2:
+        sc = sc * 2
+    out.slotMask = sc - 1
+    for i in 0..<sc:
+        add(out.slots, -1)
+    let fp = out.fingerprint[0]
+    var probe: int32 = int32(fp & uint64(out.slotMask))
+    while out.slots[probe] >= 0:
+        probe = probe + 1
+        if probe > out.slotMask:
+            probe = 0
+    out.slots[probe] = 0
+
+# ---- 路径回溯 ----
+
+@borrows
+fn csgExactPlannerCollectPath(store: csgExactPlannerStore, target: int32): int32[] =
+    var rev: int32[]
+    var s = target
+    while s >= 0:
+        let a = store.parentAction[s]
+        if a >= 0:
+            add(rev, a)
+        s = store.parentState[s]
+    var path: int32[]
+    var i: int32 = rev.len - 1
+    while i >= 0:
+        add(path, rev[i])
+        i = i - 1
+    return path
+
+# ---- 终态构造 ----
+
+fn csgExactPlannerFail(status: int32, expandedStates: int32, expandedEdges: int64, rejectedAction: int32): CsgExactPlannerOutcome =
+    var emptyPath: int32[]
+    return CsgExactPlannerOutcome(status: status, actions: emptyPath,
+        totalCost: int64(0), expandedStates: expandedStates,
+        expandedEdges: expandedEdges, rejectedAction: rejectedAction)
+
+# ---- Dijkstra 前沿:二叉最小堆(惰性删除) ----
+# 堆列物理长度即元素数:pop 末尾以 setLen 截断,push 尾插上滤。
+
+fn csgExactPlannerHeapPush(states: var int32[], dists: var int64[], s: int32, d: int64) =
+    add(states, s)
+    add(dists, d)
+    var i: int32 = states.len - 1
+    while i > 0:
+        let p: int32 = (i - 1) / 2
+        if dists[p] <= dists[i]:
+            break
+        let ts: int32 = states[p]
+        states[p] = states[i]
+        states[i] = ts
+        let td: int64 = dists[p]
+        dists[p] = dists[i]
+        dists[i] = td
+        i = p
+
+# 弹出堆顶到 outState/outDist。
+fn csgExactPlannerHeapPopTop(states: var int32[], dists: var int64[], outState: var int32, outDist: var int64) =
+    assert(states.len > 0, "csg exact planner: heap pop on empty frontier")
+    outState = states[0]
+    outDist = dists[0]
+    let lastIdx: int32 = states.len - 1
+    states[0] = states[lastIdx]
+    dists[0] = dists[lastIdx]
+    setLen(states, lastIdx)
+    setLen(dists, lastIdx)
+    var i: int32 = 0
+    while true:
+        let l: int32 = i * 2 + 1
+        let r: int32 = l + 1
+        var m: int32 = i
+        if l < lastIdx && dists[l] < dists[m]:
+            m = l
+        if r < lastIdx && dists[r] < dists[m]:
+            m = r
+        if m == i:
+            break
+        let ts: int32 = states[m]
+        states[m] = states[i]
+        states[i] = ts
+        let td: int64 = dists[m]
+        dists[m] = dists[i]
+        dists[i] = td
+        i = m
+
+# ---- 公共输入校验 + 准入 ----
+# 通过返回 varCount;失败直接返回终态。
+
+@borrows
+fn csgExactPlannerValidateAndAdmit(preds: cgoal.CsgGoalPredicateSet,
+                                   goalRoot: int32,
+                                   actions: camodel.CsgActionModel,
+                                   initialValues: int64[],
+                                   initialUnknown: uint8[],
+                                   maxStates: int32,
+                                   maxEdges: int64,
+                                   rejectedAction: var int32): int32 =
+    assert(rejectedAction == -1, "csg exact planner: rejectedAction must start at -1")
+    if initialValues.len <= 0 || initialValues.len != initialUnknown.len:
+        return -1
+    if goalRoot < 0 || goalRoot >= preds.count:
+        return -1
+    if maxStates < 1 || maxStates > CsgExactPlannerMaxStateBudget:
+        return -1
+    if maxEdges < int64(0):
+        return -1
+    let varCount: int32 = initialValues.len
+    if !camodel.CsgActionValidateForPlanning(actions, preds, varCount, rejectedAction):
+        return -2
+    return varCount
+
+# ---- 等成本 BFS 精确求解 ----
+# 前置:全部动作代价相等(否则 ModelRejected —— BFS 对非均匀代价不精确,
+# 绝不静默返回近似解)。FIFO 展开序 = 状态表追加序,首次生成即最优,
+# 目标判定在生成处完成。
+
+@borrows
+fn CsgExactPlannerPlanBfs(preds: cgoal.CsgGoalPredicateSet,
+                          goalRoot: int32,
+                          actions: camodel.CsgActionModel,
+                          initialValues: int64[],
+                          initialUnknown: uint8[],
+                          maxStates: int32,
+                          maxEdges: int64,
+                          opts: CsgExactPlannerOptions): CsgExactPlannerOutcome =
+    var rejected: int32 = -1
+    let admitted = csgExactPlannerValidateAndAdmit(preds, goalRoot, actions,
+        initialValues, initialUnknown, maxStates, maxEdges, rejected)
+    if admitted == -1:
+        return csgExactPlannerFail(CsgExactPlannerInvalidInput, 0, int64(0), -1)
+    if admitted == -2:
+        return csgExactPlannerFail(CsgExactPlannerModelRejected, 0, int64(0), rejected)
+    let varCount: int32 = admitted
+    # BFS 专属门:代价必须全等
+    if actions.count > 1:
+        let c0 = camodel.CsgActionCostOf(actions, 0)
+        for i in 1..<actions.count:
+            if camodel.CsgActionCostOf(actions, i) != c0:
+                return csgExactPlannerFail(CsgExactPlannerModelRejected, 0, int64(0), i)
+    var store: csgExactPlannerStore
+    csgExactPlannerStoreInit(store, initialValues, initialUnknown, varCount, maxStates,
+        opts.degenerateConstantHash)
+    var edgeCount: int64 = int64(0)
+    var sawUnknownGoal: bool = false
+    var sawUnknownPrecond: bool = false
+    # 初始状态目标分类
+    let initGoal = cgoal.CsgGoalEvaluateAt(preds, goalRoot, store.values, store.unknown, 0)
+    if initGoal == cgoal.CsgGoalTrue:
+        var emptyPath: int32[]
+        return CsgExactPlannerOutcome(status: CsgExactPlannerGoalReached, actions: emptyPath,
+            totalCost: int64(0), expandedStates: store.stateCount,
+            expandedEdges: edgeCount, rejectedAction: -1)
+    if initGoal == cgoal.CsgGoalUnknown:
+        return csgExactPlannerFail(CsgExactPlannerNeedEvidence, store.stateCount, edgeCount, -1)
+    # 候选暂存(复用,不逐次分配)
+    var candVals: int64[]
+    var candUnk: uint8[]
+    for j in 0..<varCount:
+        add(candVals, int64(0))
+        add(candUnk, uint8(0))
+    # BFS 主循环:队列即状态表追加序,head 为队首
+    var head: int32 = 0
+    while head < store.stateCount:
+        let cur = head
+        head = head + 1
+        let curBase: int32 = cur * varCount
+        let curG: int64 = store.g[cur]
+        for a in 0..<actions.count:
+            let pre = camodel.CsgActionPreconditionOf(actions, a)
+            if pre >= 0:
+                let pe = cgoal.CsgGoalEvaluateAt(preds, pre, store.values, store.unknown, curBase)
+                if pe == cgoal.CsgGoalFalse:
+                    continue
+                if pe == cgoal.CsgGoalUnknown:
+                    sawUnknownPrecond = true
+                    continue
+            if edgeCount == maxEdges:
+                return csgExactPlannerFail(CsgExactPlannerBudgetExceeded, store.stateCount, edgeCount, -1)
+            edgeCount = edgeCount + int64(1)
+            for j in 0..<varCount:
+                candVals[j] = store.values[curBase + j]
+                candUnk[j] = store.unknown[curBase + j]
+            camodel.CsgActionApplyEffectsAt(actions, a, candVals, candUnk, 0)
+            let gEval = cgoal.CsgGoalEvaluateAt(preds, goalRoot, candVals, candUnk, 0)
+            if gEval == cgoal.CsgGoalTrue:
+                # 等代价域:生成序非降代价,首次生成即最优解
+                let stepCost = camodel.CsgActionCostOf(actions, a)
+                var path: int32[] = csgExactPlannerCollectPath(store, cur)
+                add(path, a)
+                return CsgExactPlannerOutcome(status: CsgExactPlannerGoalReached, actions: path,
+                    totalCost: curG + stepCost, expandedStates: store.stateCount,
+                    expandedEdges: edgeCount, rejectedAction: -1)
+            if gEval == cgoal.CsgGoalUnknown:
+                sawUnknownGoal = true
+            var found: bool = false
+            var fp: uint64 = uint64(0)
+            let slotOrState = csgExactPlannerLookup(store, candVals, candUnk,
+                opts.degenerateConstantHash, found, fp)
+            assert(slotOrState != -2, "csg exact planner: dedup table invariant broken")
+            if found:
+                continue
+            if store.stateCount == maxStates:
+                return csgExactPlannerFail(CsgExactPlannerBudgetExceeded, store.stateCount, edgeCount, -1)
+            let newState: int32 = store.stateCount
+            for j in 0..<varCount:
+                add(store.values, candVals[j])
+                add(store.unknown, candUnk[j])
+            add(store.fingerprint, fp)
+            add(store.parentState, cur)
+            add(store.parentAction, a)
+            add(store.g, curG + camodel.CsgActionCostOf(actions, a))
+            add(store.closed, uint8(0))
+            store.slots[slotOrState] = newState
+            store.stateCount = newState + 1
+    # 完全穷尽:见过未知即不能宣称不可达
+    if sawUnknownGoal || sawUnknownPrecond:
+        return csgExactPlannerFail(CsgExactPlannerNeedEvidence, store.stateCount, edgeCount, -1)
+    return csgExactPlannerFail(CsgExactPlannerUnreachable, store.stateCount, edgeCount, -1)
+
+# ---- 非负加权 Dijkstra 精确求解 ----
+# 二叉最小堆 + 惰性删除 + 出堆封账(closed);目标判定在出堆处完成,
+# 零权/正权混合下仍精确。开放状态发现更小代价时原地松弛并重推堆。
+
+@borrows
+fn CsgExactPlannerPlanDijkstra(preds: cgoal.CsgGoalPredicateSet,
+                               goalRoot: int32,
+                               actions: camodel.CsgActionModel,
+                               initialValues: int64[],
+                               initialUnknown: uint8[],
+                               maxStates: int32,
+                               maxEdges: int64,
+                               opts: CsgExactPlannerOptions): CsgExactPlannerOutcome =
+    var rejected: int32 = -1
+    let admitted = csgExactPlannerValidateAndAdmit(preds, goalRoot, actions,
+        initialValues, initialUnknown, maxStates, maxEdges, rejected)
+    if admitted == -1:
+        return csgExactPlannerFail(CsgExactPlannerInvalidInput, 0, int64(0), -1)
+    if admitted == -2:
+        return csgExactPlannerFail(CsgExactPlannerModelRejected, 0, int64(0), rejected)
+    let varCount: int32 = admitted
+    var store: csgExactPlannerStore
+    csgExactPlannerStoreInit(store, initialValues, initialUnknown, varCount, maxStates,
+        opts.degenerateConstantHash)
+    var edgeCount: int64 = int64(0)
+    var sawUnknownGoal: bool = false
+    var sawUnknownPrecond: bool = false
+    let initGoal = cgoal.CsgGoalEvaluateAt(preds, goalRoot, store.values, store.unknown, 0)
+    if initGoal == cgoal.CsgGoalTrue:
+        var emptyPath: int32[]
+        return CsgExactPlannerOutcome(status: CsgExactPlannerGoalReached, actions: emptyPath,
+            totalCost: int64(0), expandedStates: store.stateCount,
+            expandedEdges: edgeCount, rejectedAction: -1)
+    if initGoal == cgoal.CsgGoalUnknown:
+        return csgExactPlannerFail(CsgExactPlannerNeedEvidence, store.stateCount, edgeCount, -1)
+    var candVals: int64[]
+    var candUnk: uint8[]
+    for j in 0..<varCount:
+        add(candVals, int64(0))
+        add(candUnk, uint8(0))
+    var heapState: int32[]
+    var heapDist: int64[]
+    csgExactPlannerHeapPush(heapState, heapDist, 0, int64(0))
+    while heapState.len > 0:
+        var cur: int32 = -1
+        var curDist: int64 = int64(0)
+        csgExactPlannerHeapPopTop(heapState, heapDist, cur, curDist)
+        if store.closed[cur] != uint8(0):
+            continue
+        if curDist > store.g[cur]:
+            continue
+        store.closed[cur] = uint8(1)
+        # 出堆封账后判定目标:零权边存在时插入处判定不精确
+        let gEval = cgoal.CsgGoalEvaluateAt(preds, goalRoot, store.values, store.unknown, cur * varCount)
+        if gEval == cgoal.CsgGoalTrue:
+            var path: int32[] = csgExactPlannerCollectPath(store, cur)
+            return CsgExactPlannerOutcome(status: CsgExactPlannerGoalReached, actions: path,
+                totalCost: store.g[cur], expandedStates: store.stateCount,
+                expandedEdges: edgeCount, rejectedAction: -1)
+        if gEval == cgoal.CsgGoalUnknown:
+            sawUnknownGoal = true
+        let curBase: int32 = cur * varCount
+        for a in 0..<actions.count:
+            let pre = camodel.CsgActionPreconditionOf(actions, a)
+            if pre >= 0:
+                let pe = cgoal.CsgGoalEvaluateAt(preds, pre, store.values, store.unknown, curBase)
+                if pe == cgoal.CsgGoalFalse:
+                    continue
+                if pe == cgoal.CsgGoalUnknown:
+                    sawUnknownPrecond = true
+                    continue
+            if edgeCount == maxEdges:
+                return csgExactPlannerFail(CsgExactPlannerBudgetExceeded, store.stateCount, edgeCount, -1)
+            edgeCount = edgeCount + int64(1)
+            for j in 0..<varCount:
+                candVals[j] = store.values[curBase + j]
+                candUnk[j] = store.unknown[curBase + j]
+            camodel.CsgActionApplyEffectsAt(actions, a, candVals, candUnk, 0)
+            var found: bool = false
+            var fp: uint64 = uint64(0)
+            let slotOrState = csgExactPlannerLookup(store, candVals, candUnk,
+                opts.degenerateConstantHash, found, fp)
+            assert(slotOrState != -2, "csg exact planner: dedup table invariant broken")
+            let stepCost = camodel.CsgActionCostOf(actions, a)
+            let ng: int64 = store.g[cur] + stepCost
+            if found:
+                # 未封账且更优:松弛(更新父指针)并重推堆
+                if store.closed[slotOrState] == uint8(0) && ng < store.g[slotOrState]:
+                    store.g[slotOrState] = ng
+                    store.parentState[slotOrState] = cur
+                    store.parentAction[slotOrState] = a
+                    csgExactPlannerHeapPush(heapState, heapDist, slotOrState, ng)
+                continue
+            if store.stateCount == maxStates:
+                return csgExactPlannerFail(CsgExactPlannerBudgetExceeded, store.stateCount, edgeCount, -1)
+            let newState: int32 = store.stateCount
+            for j in 0..<varCount:
+                add(store.values, candVals[j])
+                add(store.unknown, candUnk[j])
+            add(store.fingerprint, fp)
+            add(store.parentState, cur)
+            add(store.parentAction, a)
+            add(store.g, ng)
+            add(store.closed, uint8(0))
+            store.slots[slotOrState] = newState
+            store.stateCount = newState + 1
+            csgExactPlannerHeapPush(heapState, heapDist, newState, ng)
+    if sawUnknownGoal || sawUnknownPrecond:
+        return csgExactPlannerFail(CsgExactPlannerNeedEvidence, store.stateCount, edgeCount, -1)
+    return csgExactPlannerFail(CsgExactPlannerUnreachable, store.stateCount, edgeCount, -1)

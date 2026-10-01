@@ -1019,7 +1019,13 @@ const CHENG_CSG_QUERY_MAX_REPORT_BYTES = 8 * 1024 * 1024;
 const CHENG_CSG_QUERY_MAX_OBJECT_BYTES = 512 * 1024 * 1024;
 const CHENG_CSG_QUERY_FNV64_BASIS = 1469598103934665603n;
 const CHENG_CSG_QUERY_FNV64_PRIME = 1099511628211n;
-const CHENG_CSG_QUERY_LOADED_TOOL_IDENTITY = captureCsgToolIdentityForQuery();
+// 惰性首次捕获(2026-08-27): 原为模块作用域常量, 令每个进程(含只跑单工具的 CLI 冷启动)在
+// import 时就付 producer/consumer/contract 三份源码哈希; 移到首次 CSG 查询时执行一次。
+let CHENG_CSG_QUERY_LOADED_TOOL_IDENTITY = null;
+function loadedCsgQueryToolIdentity() {
+  if (CHENG_CSG_QUERY_LOADED_TOOL_IDENTITY === null) CHENG_CSG_QUERY_LOADED_TOOL_IDENTITY = captureCsgToolIdentityForQuery();
+  return CHENG_CSG_QUERY_LOADED_TOOL_IDENTITY;
+}
 
 function sameCsgStableFile(left, right) {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
@@ -1376,7 +1382,7 @@ function validateCsgToolIdentityForQuery(identity, summaryPath) {
     const artifact = readStableCsgArtifact(identity[pathField], label, CHENG_CSG_QUERY_MAX_REPORT_BYTES);
     if (artifact.hash !== identity[hashField]) throw new Error(`canonical CSG summary toolIdentity ${hashField} is stale: declared=${identity[hashField]} actual=${artifact.hash}`);
   }
-  if (JSON.stringify(identity) !== JSON.stringify(CHENG_CSG_QUERY_LOADED_TOOL_IDENTITY)) {
+  if (JSON.stringify(identity) !== JSON.stringify(loadedCsgQueryToolIdentity())) {
     throw new Error(`canonical CSG summary toolIdentity does not match the implementation loaded by this process: ${summaryPath}`);
   }
   return identity;
@@ -2023,6 +2029,50 @@ function withChengDriverRawOutput(result, stdoutBuffer, stderrBuffer) {
     stderrBuffer: {value: stderrBuffer, enumerable: false},
   });
   return result;
+}
+
+// 受控并发 worker pool: 结果严格按输入顺序返回, 与串行循环逐元素等价(报告 deterministic)。
+// 并行度从 CHENG_FUSION_MATRIX_PARALLELISM 读取; 未设/非法回退 1(串行), 保持既有内存行为。
+// 每子进程仍各自受 CHENG_PROCESS_MAX_RSS_BYTES 帽约束; 并发只改变调度, 不改变判定。
+function matrixParallelism() {
+  const raw = String(process.env.CHENG_FUSION_MATRIX_PARALLELISM || "").trim();
+  if (!raw) return 1;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) return 1;
+  return Math.min(value, 64);
+}
+
+// 输入快照必须落在 <root>/src/ 内: 当前 backend/stage3 冷快照把源 realpath 映射为
+// 相对 src/ 的模块身份(bootstrap/cheng_cold.c cold_source_snapshot_resolve_document),
+// 包根外的源一律报 "leaves package root" —— /tmp 快照让编译型工具全 CFAIL(2026-08-14 实测)。
+// 快照目录名不含点(避开模块路径文本校验), 用完由调用方 finally rmSync 删除;
+// 崩溃遗留的 cheng-fusion-tmp-* 目录是 root/src 下的临时垃圾, 可安全清理。
+function mkdtempInRootSrc(root) {
+  const srcDir = join(root, "src");
+  if (!existsSync(srcDir) || !statSync(srcDir).isDirectory()) {
+    throw new Error(`Cheng root has no src/ directory for input snapshots: ${srcDir}`);
+  }
+  return mkdtempSync(join(srcDir, "cheng-fusion-tmp-"));
+}
+
+async function runPool(items, fn) {
+  const parallelism = matrixParallelism();
+  if (parallelism <= 1 || items.length <= 1) {
+    const results = [];
+    for (const item of items) results.push(await fn(item));
+    return results;
+  }
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index], index);
+    }
+  };
+  await Promise.all(Array.from({length: Math.min(parallelism, items.length)}, worker));
+  return results;
 }
 
 function runChengDriver(driver, args, options = {}) {
@@ -3352,6 +3402,25 @@ function pathToUri(filePath) {
   return pathToFileURL(isAbsolute(filePath) ? filePath : resolve(filePath)).href;
 }
 
+// SIGINT/SIGTERM 走默认处置时进程直接死亡, 不触发 "exit" 事件, detached 的 cheng-lsp
+// 进程树就泄漏成孤儿。守卫把终止信号转为: 先对全部存活客户端做进程组 SIGKILL, 再以
+// 惯例退出码退出。只在首个客户端启动时安装一次。
+let jsonRpcProcessClientSignalGuardInstalled = false;
+function installJsonRpcProcessClientSignalGuard() {
+  if (jsonRpcProcessClientSignalGuardInstalled) return;
+  jsonRpcProcessClientSignalGuardInstalled = true;
+  const terminate = (signal, exitCode) => {
+    for (const client of chengLspClients.values()) {
+      try {
+        client.close();
+      } catch {}
+    }
+    process.exit(exitCode);
+  };
+  process.once("SIGINT", () => terminate("SIGINT", 130));
+  process.once("SIGTERM", () => terminate("SIGTERM", 143));
+}
+
 class JsonRpcProcessClient {
   constructor(command, args, options = {}) {
     this.command = command;
@@ -3369,6 +3438,7 @@ class JsonRpcProcessClient {
   }
 
   start() {
+    installJsonRpcProcessClientSignalGuard();
     this.child = spawn(this.command, this.args, {
       cwd: this.options.cwd || process.cwd(),
       env: chengDriverSpawnEnv(this.options.env),
@@ -4786,48 +4856,48 @@ function nmMachOSymbolFacts(objectPath) {
   return {definedGlobalTextNames, undefinedNames: [...undefinedNames].sort(), textSymbols};
 }
 
+function machOString16(buf, off) {
+  const slice = buf.subarray(off, off + 16);
+  const nul = slice.indexOf(0);
+  return (nul >= 0 ? slice.subarray(0, nul) : slice).toString("utf8");
+}
+
+// 纯 JS 解析 Mach-O load commands 找 __TEXT,__text 的 addr/size(替代 otool -l 文本解析:
+// 省一次每对象子进程, 也消除 otool 版本间文本格式漂移)。兼容可执行文件与可重定位
+// .o(单匿名段): 两种布局都只看 section 自己的 sectname/segname 字段, 不看外层 segment 名。
+// (cheng_addr_symbolicate_m9021.ts 的 findTextSection 是同一布局的 Number 版独立实现,
+// 各自服务 BigInt/Number 调用方, 不强行合并。)
 function machOTextSection(objectPath) {
-  const result = runProbeTool("otool", ["-l", objectPath], "otool -l");
-  if (result.status !== 0) throw new Error(`otool -l exited ${result.status}: ${takeTrailingText(result.stderr, 2000)}`);
-  let inSection = false;
-  let sectname = null;
-  let segname = null;
-  let address = null;
-  let size = null;
-  for (const rawLine of result.stdout.split("\n")) {
-    const line = rawLine.trim();
-    if (line === "Section") {
-      inSection = true;
-      sectname = null;
-      segname = null;
-      address = null;
-      size = null;
-      continue;
-    }
-    if (!inSection) continue;
-    let match = line.match(/^sectname\s+(\S+)$/);
-    if (match) {
-      sectname = match[1];
-      continue;
-    }
-    match = line.match(/^segname\s+(\S+)$/);
-    if (match) {
-      segname = match[1];
-      continue;
-    }
-    match = line.match(/^addr\s+0x([0-9a-fA-F]+)$/);
-    if (match) {
-      address = BigInt(`0x${match[1]}`);
-      continue;
-    }
-    match = line.match(/^size\s+0x([0-9a-fA-F]+)$/);
-    if (!match) continue;
-    size = BigInt(`0x${match[1]}`);
-    if (sectname === "__text" && segname === "__TEXT" && address !== null) {
-      return {segment: segname, section: sectname, address, size, end: address + size};
-    }
+  const buf = readFileSync(objectPath);
+  if (buf.length < 32) throw new Error(`Mach-O file too small for a header: ${objectPath}`);
+  const magic = buf.readUInt32LE(0);
+  if (magic !== 0xfeedfacf) {
+    throw new Error(`machOTextSection requires a 64-bit little-endian Mach-O (MH_MAGIC_64), got 0x${magic.toString(16)}: ${objectPath}`);
   }
-  throw new Error(`otool -l did not report a __TEXT,__text section: ${objectPath}`);
+  const ncmds = buf.readUInt32LE(16);
+  let off = 32; // sizeof(mach_header_64)
+  for (let i = 0; i < ncmds; i++) {
+    if (off + 8 > buf.length) break;
+    const cmd = buf.readUInt32LE(off);
+    const cmdsize = buf.readUInt32LE(off + 4);
+    if (cmdsize <= 0) break;
+    if (cmd === 0x19 /* LC_SEGMENT_64 */) {
+      const nsects = buf.readUInt32LE(off + 64);
+      let sectOff = off + 72;
+      for (let s = 0; s < nsects; s++) {
+        const sectname = machOString16(buf, sectOff);
+        const segname = machOString16(buf, sectOff + 16);
+        if (sectname === "__text" && segname === "__TEXT") {
+          const address = buf.readBigUInt64LE(sectOff + 32);
+          const size = buf.readBigUInt64LE(sectOff + 40);
+          return {segment: segname, section: sectname, address, size, end: address + size};
+        }
+        sectOff += 80; // sizeof(section_64)
+      }
+    }
+    off += cmdsize;
+  }
+  throw new Error(`Mach-O load commands did not report a __TEXT,__text section: ${objectPath}`);
 }
 
 const MACHO_DIRECT_CALL_RELOCATION_TYPES = new Set([
@@ -4840,6 +4910,7 @@ const MACHO_DIRECT_CALL_RELOCATION_TYPES = new Set([
 // otool -rv prints both Darwin spellings used by the supported architectures:
 // arm64 uses BR26, x86_64 uses BRANCH. The relocation address is section-relative in MH_OBJECT,
 // so retain it verbatim and also compute the section-address-adjusted site used for range lookup.
+// (-v 必需: 只有 verbose 行才渲染符号名与类型名; 不带 -v 的 -r 只有数字 symbolnum, 无法归因。)
 function machODirectUndefinedCallRelocations(objectPath, undefinedNames, textSection) {
   const result = runProbeTool("otool", ["-rv", objectPath], "otool -rv");
   if (result.status !== 0) throw new Error(`otool -rv exited ${result.status}: ${takeTrailingText(result.stderr, 2000)}`);
@@ -5239,6 +5310,8 @@ export {
   chengProcessIdentitySnapshot,
   verifyInheritedParentGuardForChild,
   runChengDriver,
+  runPool,
+  mkdtempInRootSrc,
   chengDriverSpawnEnv,
   chengFusionRssCapBytes,
   resolveChengPath,

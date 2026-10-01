@@ -1,0 +1,1037 @@
+# Standalone MoQ media publisher process.
+#
+# Loads a real MP4 bundle from disk, builds a real media asset manifest, binds a
+# QUIC listener on 127.0.0.1:<port>, writes the bound port to --ready-path, then
+# serves MoQ segment-stream object-range fetches over real UDP localhost until
+# --max-serve requests are handled or the accept window times out.
+#
+# This is the publisher half of the two-process "secondly send / secondly open"
+# network track: a separate OS process from the subscriber, communicating only
+# through real UDP sockets (no in-process pipe shortcut).
+
+import std/result
+import std/system
+import std/strings
+import std/rawbytes
+import std/os
+import std/times
+import std/strutils as strutil
+import std/cmdline as cmdline
+import cheng/quic/connection as qconn
+import cheng/quic/platform/datapath_udp as datapath_udp
+import cheng/quic/msquictransport_native as qtransport
+import cheng/libp2p/transports/quic_transport as quic_transport
+import cheng/libp2p/protocols/media/moq_segment_stream as moqstream
+import cheng/moq/media_asset_manifest as media
+import cheng/moq/publish_cid_pipeline as pubcid
+import cheng/core/runtime/web_scene_media_factfirst as ff
+
+# Video + poster are served over MoQ-over-QUIC: the video as on-demand byte ranges
+# of the whole asset ("moq-asset" segment, for progressive streaming the player's
+# data-source pulls range-by-range), the poster as a fixed object. No kernel-TCP
+# side channel — production transport is MoQ-over-QUIC end-to-end.
+fn mediaMoqPublisherLogLine(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn mediaMoqPublisherIngest(index: var media.MediaLocalIndex,
+                           mp4Path: str,
+                           posterPath: str): Result[media.MediaIngestReceipt] =
+    let posterRes: Result[rawbytes.Bytes] = os.ReadFileBytesResult(posterPath)
+    if IsErr(posterRes):
+        return Err[media.MediaIngestReceipt](strutil.Join(["publisher: poster read: ", Error(posterRes)], ""))
+    var fileReq: media.MediaVideoFileIngestRequest
+    fileReq.sourcePath = mp4Path
+    fileReq.ownerPeerId = "publisher-alpha"
+    fileReq.remotePeersCsv = "subscriber-bravo"
+    fileReq.mime = "video/mp4"
+    fileReq.durationMs = int64(22500)
+    fileReq.codec = "h264/aac"
+    fileReq.posterBytes = Value(posterRes)
+    fileReq.contentSignature = "network-milestone-moq-publisher-v1"
+    fileReq.objectTargetBytes = 65536
+    fileReq.sourceBlockBytes = 1024
+    fileReq.repairDropletCount = 2
+    return media.MediaIngestVideoFilePin(index, fileReq)
+
+# Publish-result return channel: the asset cid is written next to the ready-port
+# file (moq_ready.port → moq_ready.cid; other names get ".cid" appended) so the GUI
+# host reporter can read the real publish result back into runtime state
+# (publishedAssetCid). Same write-then-verify pattern as Libp2pQuicWriteReadyPort.
+fn mediaMoqPublisherReadyCidPath(readyPath: str): str =
+    let n: int32 = len(readyPath)
+    if n <= 0:
+        return ""
+    if n > 5 && strings.HasSuffix(readyPath, ".port"):
+        return strings.ConcatStr(strings.CloneStrRange(readyPath, 0, n - 6), ".cid")
+    return strings.ConcatStr(strings.CloneStr(readyPath), ".cid")
+
+# Written right AFTER the port file (its parent dir is guaranteed by then); readers
+# key on the port file and poll-tolerate the cid appearing one beat later.
+fn mediaMoqPublisherWriteReadyCid(readyPath: str, assetCid: str): bool =
+    let cidPath: str = mediaMoqPublisherReadyCidPath(readyPath)
+    if len(cidPath) <= 0:
+        return true
+    let cidText: str = strings.ConcatStr(strings.CloneStr(assetCid), "\n")
+    os.WriteFile(cidPath, cidText)
+    return os.FileExists(cidPath)
+
+# Connected-peer signal channel for the Harmony GUI host's nodes-tab bridge: written
+# next to the ready-port file (moq_ready.port → moq_ready.peer), same naming and
+# write-then-verify discipline as mediaMoqPublisherReadyCidPath/WriteReadyCid above.
+# Empty content means "no peer currently connected" (own-serve accepts one QUIC
+# session at a time — see the accept loop below), not "file missing/error".
+fn mediaMoqPublisherPeerFilePath(readyPath: str): str =
+    let n: int32 = len(readyPath)
+    if n <= 0:
+        return ""
+    if n > 5 && strings.HasSuffix(readyPath, ".port"):
+        return strings.ConcatStr(strings.CloneStrRange(readyPath, 0, n - 6), ".peer")
+    return strings.ConcatStr(strings.CloneStr(readyPath), ".peer")
+
+# The accepted connection's remoteAddr.raw is a real multiaddr text built from the
+# actual UDP source address of the QUIC handshake (msquicNativePeerDialAddrInto ->
+# gMsQuicSessions[slot].dialAddr, native_runtime.cheng), e.g. "/ip4/1.2.3.4/udp/5678/
+# quic-v1" (or "/ip6/.../udp/.../quic-v1"). Reduced to a plain "ip:port" label here
+# (not the raw multiaddr) because the display side's row label trims the LAST 6
+# characters of the peerId for a short on-screen tag (__nodesRowLabel) — leaving the
+# "/quic-v1" protocol suffix on would make every peer's short label identical.
+fn mediaMoqPublisherPeerLabelFromMultiaddr(raw: str): str =
+    if len(raw) <= 0:
+        return ""
+    let parts: str[] = strutil.Split(raw, '/')
+    if parts.len < 5:
+        return ""
+    let ip: str = parts[2]
+    let port: str = parts[4]
+    if len(ip) <= 0 || len(port) <= 0:
+        return ""
+    return strutil.Join([strings.CloneStr(ip), ":", strings.CloneStr(port)], "")
+
+fn mediaMoqPublisherWritePeerFile(readyPath: str, peerLabel: str) =
+    let peerPath: str = mediaMoqPublisherPeerFilePath(readyPath)
+    if len(peerPath) <= 0:
+        return
+    os.WriteFile(peerPath, strings.ConcatStr(strings.CloneStr(peerLabel), "\n"))
+
+# Reusable publish-and-serve: read the asset/poster/ES from paths, ingest, bind a QUIC
+# listener on bindHost:port, then serve MoQ object-range fetches. Called by the CLI main
+# (cmdline → params) AND by the Harmony HAP @exportc (cache paths → params), so the exact
+# same production serve path runs on both Android (pub_droid) and Harmony (publisher HAP).
+# cidStorePath: non-empty = this run is a real user publish, so persist the real CID
+# pipeline's store record (publish_cid_pipeline.cheng PublishCidPipelinePersist) right
+# after ingest; empty = startup own-serve/test invocation (not a publish, no record).
+fn mediaMoqPublisherRun(mp4Path: str, posterPath: str, esPath: str, esIndexPath: str,
+                        audioEsPath: str, audioEsIndexPath: str, hasAudioEs: bool,
+                        hasEs: bool, bindHost: str, port: int32, readyPath: str,
+                        maxServe: int32, waitMs: int32, cidStorePath: str): int32 =
+    # Poster bytes are also served as a fixed segment ("moq-poster") so a remote
+    # peer (the GUI image card) can fetch + decode the still image directly.
+    let posterBytesRes = os.ReadFileBytesResult(posterPath)
+    if IsErr(posterBytesRes):
+        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: poster read: ", Error(posterBytesRes)], ""))
+        return 2
+    let posterBytes = Value(posterBytesRes)
+    # MoQ per-frame video: a pre-demuxed Annex-B elementary stream ("moq-frame" byte ranges
+    # = one access unit each) + a compact frame index ("moq-esindex"). Absent = whole-asset only.
+    var esBytes: rawbytes.Bytes
+    var esIndexBytes: rawbytes.Bytes
+    if hasEs:
+        let esBytesRes = os.ReadFileBytesResult(esPath)
+        if IsErr(esBytesRes):
+            mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: es read: ", Error(esBytesRes)], ""))
+            return 2
+        esBytes = Value(esBytesRes)
+        let esIndexBytesRes = os.ReadFileBytesResult(esIndexPath)
+        if IsErr(esIndexBytesRes):
+            mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: es-index read: ", Error(esIndexBytesRes)], ""))
+            return 2
+        esIndexBytes = Value(esIndexBytesRes)
+    # MoQ per-frame AUDIO ES: an ADTS AAC elementary stream ("moq-aframe" byte ranges = one
+    # access unit each) + a compact ADTS frame index ("moq-aindex"). Absent = video-only.
+    var audioEsBytes: rawbytes.Bytes
+    var audioEsIndexBytes: rawbytes.Bytes
+    if hasAudioEs:
+        let aBytesRes = os.ReadFileBytesResult(audioEsPath)
+        if IsErr(aBytesRes):
+            mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: aes read: ", Error(aBytesRes)], ""))
+            return 2
+        audioEsBytes = Value(aBytesRes)
+        let aIndexRes = os.ReadFileBytesResult(audioEsIndexPath)
+        if IsErr(aIndexRes):
+            mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: aes-index read: ", Error(aIndexRes)], ""))
+            return 2
+        audioEsIndexBytes = Value(aIndexRes)
+
+    let publishStartMs = times.MonotimeMs()
+    var index = media.MediaLocalIndexInit()
+    let ingestRes = mediaMoqPublisherIngest(index, mp4Path, posterPath)
+    if IsErr(ingestRes):
+        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: ingest: ", Error(ingestRes)], ""))
+        return 3
+    let ingestDoneMs = times.MonotimeMs()
+    let ingest = Value(ingestRes)
+    if len(cidStorePath) > 0:
+        # Publish-time CID record: the real pipeline's own persist step
+        # (publish_cid_pipeline.cheng) appends one "taskId\tcontentId\tjson" line in
+        # the exact shape the Android published-task store writes, so both platforms'
+        # publish stores stay format-compatible. This serve flow just ran the same
+        # real ingest the pipeline's PublishCidPipelineIngest would run, so the
+        # receipt is reused directly (no second 5.9MB re-hash on the publish hot
+        # path). contentId = assetCid: on this host-publish path there is no social
+        # post id (no gossipsub announce here), the content-addressed cid IS the
+        # content's identity. Persist failure is loud (rc=3), never swallowed.
+        let persistTaskId: str = strutil.Join(["harmony-publish-", strings.CloneStr(ingest.assetCid)], "")
+        let persistRes = pubcid.PublishCidPipelinePersist(cidStorePath, persistTaskId, strings.CloneStr(ingest.assetCid), share(ingest))
+        if IsErr(persistRes):
+            mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: cid store persist: ", Error(persistRes)], ""))
+            return 3
+
+    let recordRes = media.MediaLocalIndexFindAssetRecord(index, strings.CloneStr(ingest.assetCid))
+    if IsErr(recordRes):
+        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: asset record: ", Error(recordRes)], ""))
+        return 3
+    let assetBytes = Value(recordRes).assetBytes
+    # bundle_hash == asset_cid by construction (both are SHA256 of the exact same
+    # pinned asset bytes: assetCid = MoqFountainBuild's blobCid = SHA256(fileBytes),
+    # assetBytes = that same pinned blob). Reuse the already-computed cid instead of
+    # re-hashing the whole 5.9MB asset a second time on the publish hot path.
+    let assetHash = ingest.assetCid
+
+    let manifestRes = media.MediaLocalIndexFind(index, strings.CloneStr(ingest.assetCid))
+    if IsErr(manifestRes):
+        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: manifest find: ", Error(manifestRes)], ""))
+        return 3
+    var manifest = Value(manifestRes)
+    if manifest.objects.len <= 0:
+        mediaMoqPublisherLogLine(" media_moq_publisher: manifest has no objects")
+        return 3
+    let firstObject = manifest.objects[0]
+    # object_hash == firstObject.objectCid by construction (objectCid = SHA256 of the
+    # object's byte range, which is exactly BytesSlice(assetBytes, offset, length)).
+    # Reuse the manifest cid instead of re-hashing the first object range again — the
+    # subscriber verifies its fetched bytes against this same value.
+    let firstObjectHash = firstObject.objectCid
+
+    var listener = qtransport.InitMsQuicTransport()
+    let startRes = quic_transport.Libp2pQuicStartListenerNamed(listener, bindHost, port, "localhost")
+    if IsErr(startRes):
+        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: listener start: ", Error(startRes)], ""))
+        return 4
+    let boundPort: int32 = Value(startRes)
+    if !quic_transport.Libp2pQuicWriteReadyPort(strings.CloneStr(readyPath), boundPort):
+        qtransport.Stop(listener)
+        mediaMoqPublisherLogLine(" media_moq_publisher: ready path write failed")
+        return 4
+    if !mediaMoqPublisherWriteReadyCid(strings.CloneStr(readyPath), strings.CloneStr(ingest.assetCid)):
+        qtransport.Stop(listener)
+        mediaMoqPublisherLogLine(" media_moq_publisher: ready cid write failed")
+        return 4
+
+    # Announce: emit the manifest identity the subscriber will fetch against.
+    var announceParts: str[]
+    add(announceParts, "media_moq_publisher announce")
+    add(announceParts, " bound_port=")
+    add(announceParts, IntToStr(boundPort))
+    add(announceParts, " asset_cid=")
+    add(announceParts, strings.CloneStr(ingest.assetCid))
+    add(announceParts, " manifest_cid=")
+    add(announceParts, strings.CloneStr(ingest.manifestCid))
+    add(announceParts, " bundle_hash=")
+    add(announceParts, strings.CloneStr(assetHash))
+    add(announceParts, " bundle_bytes=")
+    add(announceParts, IntToStr(rawbytes.BytesLen(assetBytes)))
+    add(announceParts, " init_segment_bytes=")
+    add(announceParts, IntToStr(manifest.initSegmentByteLength))
+    add(announceParts, " object_id=")
+    add(announceParts, strings.CloneStr(firstObject.objectId))
+    add(announceParts, " object_offset=")
+    add(announceParts, IntToStr(firstObject.byteOffset))
+    add(announceParts, " object_length=")
+    add(announceParts, IntToStr(firstObject.byteLength))
+    add(announceParts, " object_hash=")
+    add(announceParts, strings.CloneStr(firstObjectHash))
+    add(announceParts, " poster_length=")
+    add(announceParts, IntToStr(rawbytes.BytesLen(posterBytes)))
+    add(announceParts, " asset_bytes=")
+    add(announceParts, IntToStr(rawbytes.BytesLen(assetBytes)))
+    add(announceParts, " asset_segment_key=moq-asset")
+    add(announceParts, " asset_stream_id=")
+    add(announceParts, strings.CloneStr(ingest.assetCid))
+    if hasEs:
+        # Per-frame ES: the player fetches moq-esindex (the frame table: header w/h/fps/
+        # count + per-frame offset/size) then pulls each frame via moq-frame ranges.
+        add(announceParts, " es_segment_key=moq-frame")
+        add(announceParts, " es_bytes=")
+        add(announceParts, IntToStr(rawbytes.BytesLen(esBytes)))
+        add(announceParts, " es_index_segment_key=moq-esindex")
+        add(announceParts, " es_index_bytes=")
+        add(announceParts, IntToStr(rawbytes.BytesLen(esIndexBytes)))
+        add(announceParts, " es_stream_id=")
+        add(announceParts, strings.CloneStr(ingest.assetCid))
+    if hasAudioEs:
+        # Per-frame audio ES: the player fetches moq-aindex (the ADTS frame table: header
+        # sr/ch/profile/count + per-frame offset/size) then pulls each AU via moq-aframe ranges.
+        add(announceParts, " audio_es_segment_key=moq-aframe")
+        add(announceParts, " audio_es_bytes=")
+        add(announceParts, IntToStr(rawbytes.BytesLen(audioEsBytes)))
+        add(announceParts, " audio_es_index_segment_key=moq-aindex")
+        add(announceParts, " audio_es_index_bytes=")
+        add(announceParts, IntToStr(rawbytes.BytesLen(audioEsIndexBytes)))
+        add(announceParts, " audio_es_stream_id=")
+        add(announceParts, strings.CloneStr(ingest.assetCid))
+    let publishReadyMs = times.MonotimeMs()
+    add(announceParts, " publish_ingest_ms=")
+    add(announceParts, IntToStr(int32(ingestDoneMs - publishStartMs)))
+    add(announceParts, " publish_listen_ms=")
+    add(announceParts, IntToStr(int32(publishReadyMs - ingestDoneMs)))
+    add(announceParts, " publish_total_ms=")
+    add(announceParts, IntToStr(int32(publishReadyMs - publishStartMs)))
+    let announce = strutil.Join(announceParts, "")
+    os.WriteLine(os.Get_stdout(), announce)
+
+    # Fixed-size announce block served over the network as segment "moq-announce"
+    # so a remote peer can learn the object identity without a control plane.
+    var blockParts: str[]
+    add(blockParts, strings.CloneStr(announce))
+    var padNeeded: int32 = 1024 - len(announce)
+    while padNeeded > 0:
+        add(blockParts, " ")
+        padNeeded = padNeeded - 1
+    let announceBlock = strutil.Join(blockParts, "")
+    let announceBlockView = rawbytes.BytesFromString(announceBlock)
+    var announceBlockBytes: rawbytes.Bytes = rawbytes.BytesAlloc(rawbytes.BytesLen(announceBlockView))
+    rawbytes.BytesCopyInto(announceBlockBytes, 0, announceBlockView)
+
+    var servedCount: int32
+    while maxServe <= 0 || servedCount < maxServe:
+        let acceptRes = qtransport.AcceptTimed(listener, waitMs)
+        if IsErr(acceptRes):
+            let acceptErrText = ErrorText(acceptRes)
+            if acceptErrText == "msquic: accept timeout":
+                break
+            if quic_transport.Libp2pQuicRetryableAcceptError(strings.CloneStr(acceptErrText)):
+                os.SleepMs(10)
+                continue
+            if acceptErrText == "msquic native: accept failed":
+                os.SleepMs(10)
+                continue
+            mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: accept: ", strings.CloneStr(acceptErrText)], ""))
+            qtransport.Stop(listener)
+            return 5
+        var acceptConn = Value(acceptRes)
+        # Real-peer bridge for the GUI host's nodes-tab (cheng_app_nodes_update_utf8):
+        # a successful AcceptTimed means a real QUIC handshake with a real remote UDP
+        # source just completed on THIS thread, and AcceptTimed (msquictransport_native.cheng)
+        # already populated acceptConn.remoteAddr from the SAME native_runtime accept-session
+        # state via its own (unqualified) native_runtime import. Read that field directly
+        # instead of re-querying native_runtime through this file's qualified `qnative.`
+        # import: qualified-vs-unqualified imports of native_runtime observe two
+        # desynced views of its `var` globals (gMsQuicSessions) — a compiler
+        # module-import bug, see docs — so a second read through `qnative.` here would
+        # silently see stale/empty session state even though acceptConn.remoteAddr is
+        # already correct. NOTE: qconn.remoteAddress/localAddress/remotePeerId
+        # (Connection's own str/struct-returning getters) were tried first but hit a
+        # pre-existing cold-parser defect ("reachable function body missing") the
+        # instant any of them becomes reachable from a NEW call site — reproduced in
+        # isolation, unrelated to this change's own syntax (see verify_peer_bridge
+        # notes); a plain field read sidesteps that dead code entirely.
+        let acceptPeerAddrRaw: str = acceptConn.remoteAddr.raw
+        let acceptPeerLabel: str = mediaMoqPublisherPeerLabelFromMultiaddr(strings.CloneStr(acceptPeerAddrRaw))
+        mediaMoqPublisherWritePeerFile(strings.CloneStr(readyPath), strings.CloneStr(acceptPeerLabel))
+        # Single connection, multiple QUIC streams: the AV bridge opens video=stream4 and
+        # audio=stream8 (each with its OWN multistream-select negotiate); control clients
+        # use the default stream 0. Discover whichever client-initiated stream (id % 4 == 0)
+        # has bytes ready via the native readable-stream probe, derive a per-stream server
+        # handle (ConnDeriveStream reuses acceptConn.pipeIdx — the SAME native session — and
+        # pipeSide=1, only swapping the streamId), then negotiate+serve that one stream. Loop
+        # until no more readable streams. NEVER ConnClose a derived handle (shares pipeIdx);
+        # close acceptConn once after all streams drained.
+        var anyServed: bool
+        var moreStreams = true
+        while moreStreams:
+            let readableRes = qconn.nativeReadableStreamId(acceptConn, 0)
+            if IsErr(readableRes):
+                moreStreams = false
+                continue
+            let streamId: int64 = Value(readableRes)
+            var conn = qconn.ConnDeriveStream(acceptConn, streamId, streamId)
+            var dropConn: bool
+            let negotiateRes = moqstream.Libp2pMoqSegmentStreamServerNegotiate(listener, conn)
+            if IsErr(negotiateRes):
+                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: negotiate: ", Error(negotiateRes)], ""))
+                dropConn = true
+            # One stream may carry an announce request followed by the object
+            # request; the announce reply keeps the stream open, the object reply
+            # shuts down the write side.
+            var connDone = false
+            var requestIndex = 0
+            while !dropConn && !connDone:
+                let requestRes = moqstream.Libp2pMoqSegmentStreamServerReadRequest(conn)
+                if IsErr(requestRes):
+                    if requestIndex == 0:
+                        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: request: ", Error(requestRes)], ""))
+                        dropConn = true
+                    connDone = true
+                else:
+                    let request = Value(requestRes)
+                    requestIndex = requestIndex + 1
+                    if request.segmentKey == "moq-announce":
+                        if request.offsetBytes < 0 || request.lengthBytes <= 0 ||
+                           request.offsetBytes + request.lengthBytes > rawbytes.BytesLen(announceBlockBytes):
+                            mediaMoqPublisherLogLine(" media_moq_publisher: announce range invalid")
+                            dropConn = true
+                        else:
+                            let annRes = moqstream.Libp2pMoqSegmentStreamServerWriteRange(conn,
+                                                                                          announceBlockBytes,
+                                                                                          request.offsetBytes,
+                                                                                          request.lengthBytes,
+                                                                                          request.readChunkBytes)
+                            if IsErr(annRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: announce serve: ", Error(annRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(" media_moq_publisher: served announce")
+                    elif request.segmentKey == "moq-poster":
+                        # Serve the poster exactly like the video object: WriteRequestedRange
+                        # shuts the write side on completion so the client drain sees EOF and
+                        # stops (a plain WriteRange leaves the stream open, so a large drain
+                        # waits past the requested length and errors).
+                        connDone = true
+                        if request.offsetBytes < 0 || request.lengthBytes <= 0 ||
+                           request.offsetBytes + request.lengthBytes > rawbytes.BytesLen(posterBytes):
+                            mediaMoqPublisherLogLine(" media_moq_publisher: poster range invalid")
+                            dropConn = true
+                        else:
+                            let posterServeRes = moqstream.Libp2pMoqSegmentStreamServerWriteRequestedRange(conn,
+                                                                                                           posterBytes,
+                                                                                                           request)
+                            if IsErr(posterServeRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: poster serve: ", Error(posterServeRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: served poster length=", IntToStr(request.lengthBytes)], ""))
+                    elif request.segmentKey == "moq-asset":
+                        # Whole-asset byte-range serve for MoQ-over-QUIC PROGRESSIVE
+                        # streaming: the player's OHOS data-source readAt pulls arbitrary
+                        # ranges of the full mp4 on demand. Keep the connection open (no
+                        # connDone, no shutdown) so ONE QUIC connection serves the whole
+                        # playback session (successive range requests round-trip on it).
+                        if request.offsetBytes < 0 || request.lengthBytes <= 0 ||
+                           request.offsetBytes + request.lengthBytes > rawbytes.BytesLen(assetBytes):
+                            mediaMoqPublisherLogLine(" media_moq_publisher: moq-asset range invalid")
+                            dropConn = true
+                        else:
+                            let assetServeRes = moqstream.Libp2pMoqSegmentStreamServerWriteRange(conn,
+                                                                                                 assetBytes,
+                                                                                                 request.offsetBytes,
+                                                                                                 request.lengthBytes,
+                                                                                                 request.readChunkBytes)
+                            if IsErr(assetServeRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: moq-asset serve: ", Error(assetServeRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: served moq-asset offset=",
+                                                                       IntToStr(request.offsetBytes),
+                                                                       " length=", IntToStr(request.lengthBytes)], ""))
+                    elif request.segmentKey == "moq-esindex":
+                        # Frame index blob: WriteRange (no FIN, no connDone) so the SAME
+                        # connection keeps serving the moq-frame requests after it. The
+                        # client reader stops by expectedBytes, so no FIN is needed.
+                        if request.offsetBytes < 0 || request.lengthBytes <= 0 ||
+                           request.offsetBytes + request.lengthBytes > rawbytes.BytesLen(esIndexBytes):
+                            mediaMoqPublisherLogLine(" media_moq_publisher: moq-esindex range invalid")
+                            dropConn = true
+                        else:
+                            let esIndexServeRes = moqstream.Libp2pMoqSegmentStreamServerWriteRange(conn,
+                                                                                                   esIndexBytes,
+                                                                                                   request.offsetBytes,
+                                                                                                   request.lengthBytes,
+                                                                                                   request.readChunkBytes)
+                            if IsErr(esIndexServeRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: moq-esindex serve: ", Error(esIndexServeRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: served moq-esindex length=", IntToStr(request.lengthBytes)], ""))
+                    elif request.segmentKey == "moq-frame":
+                        # One access unit per range (small, ~8KB avg) — fits the flow window and
+                        # survives loss without STREAM retransmit. Keep the connection open (no
+                        # connDone): the bridge re-dials per frame, but a single conn could also
+                        # serve successive frame ranges.
+                        if request.offsetBytes < 0 || request.lengthBytes <= 0 ||
+                           request.offsetBytes + request.lengthBytes > rawbytes.BytesLen(esBytes):
+                            mediaMoqPublisherLogLine(" media_moq_publisher: moq-frame range invalid")
+                            dropConn = true
+                        else:
+                            let esFrameServeRes = moqstream.Libp2pMoqSegmentStreamServerWriteRange(conn,
+                                                                                                   esBytes,
+                                                                                                   request.offsetBytes,
+                                                                                                   request.lengthBytes,
+                                                                                                   request.readChunkBytes)
+                            if IsErr(esFrameServeRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: moq-frame serve: ", Error(esFrameServeRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: served moq-frame offset=",
+                                                                       IntToStr(request.offsetBytes),
+                                                                       " length=", IntToStr(request.lengthBytes)], ""))
+                    elif request.segmentKey == "moq-aindex":
+                        # ADTS audio frame index blob (WriteRange, no FIN — same connection keeps
+                        # serving the moq-aframe requests; the client stops by expectedBytes).
+                        if request.offsetBytes < 0 || request.lengthBytes <= 0 ||
+                           request.offsetBytes + request.lengthBytes > rawbytes.BytesLen(audioEsIndexBytes):
+                            mediaMoqPublisherLogLine(" media_moq_publisher: moq-aindex range invalid")
+                            dropConn = true
+                        else:
+                            let aIndexServeRes = moqstream.Libp2pMoqSegmentStreamServerWriteRange(conn,
+                                                                                                  audioEsIndexBytes,
+                                                                                                  request.offsetBytes,
+                                                                                                  request.lengthBytes,
+                                                                                                  request.readChunkBytes)
+                            if IsErr(aIndexServeRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: moq-aindex serve: ", Error(aIndexServeRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: served moq-aindex length=", IntToStr(request.lengthBytes)], ""))
+                    elif request.segmentKey == "moq-aframe":
+                        # One ADTS access unit per range (small). Keep the connection open (no
+                        # connDone) so successive AU ranges round-trip on the same conn — mirror moq-frame.
+                        if request.offsetBytes < 0 || request.lengthBytes <= 0 ||
+                           request.offsetBytes + request.lengthBytes > rawbytes.BytesLen(audioEsBytes):
+                            mediaMoqPublisherLogLine(" media_moq_publisher: moq-aframe range invalid")
+                            dropConn = true
+                        else:
+                            let aFrameServeRes = moqstream.Libp2pMoqSegmentStreamServerWriteRange(conn,
+                                                                                                  audioEsBytes,
+                                                                                                  request.offsetBytes,
+                                                                                                  request.lengthBytes,
+                                                                                                  request.readChunkBytes)
+                            if IsErr(aFrameServeRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: moq-aframe serve: ", Error(aFrameServeRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: served moq-aframe offset=",
+                                                                       IntToStr(request.offsetBytes),
+                                                                       " length=", IntToStr(request.lengthBytes)], ""))
+                    else:
+                        connDone = true
+                        var rangeOk = true
+                        if request.segmentKey != firstObject.objectId:
+                            rangeOk = false
+                        if request.offsetBytes < firstObject.byteOffset:
+                            rangeOk = false
+                        if request.offsetBytes + request.lengthBytes > firstObject.byteOffset + firstObject.byteLength:
+                            rangeOk = false
+                        if !rangeOk:
+                            mediaMoqPublisherLogLine(" media_moq_publisher: serve: range/key mismatch")
+                            dropConn = true
+                        else:
+                            let serveRes = moqstream.Libp2pMoqSegmentStreamServerWriteRequestedRange(conn,
+                                                                                                     assetBytes,
+                                                                                                     request)
+                            if IsErr(serveRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: serve: ", Error(serveRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: served segment_key=", strings.CloneStr(request.segmentKey),
+                                                                       " offset=", IntToStr(request.offsetBytes),
+                                                                       " length=", IntToStr(request.lengthBytes)], ""))
+            # Gracefully FIN this stream's write side (per-stream FIN, NOT a connection
+            # close): a bare close abort-drops the unread tail of a big transfer. The
+            # derived handle shares acceptConn.pipeIdx, so we NEVER ConnClose it here —
+            # the whole session is closed once below after all streams drain.
+            if connDone && !dropConn:
+                let ignoredShutdown = qconn.ConnShutdownWrite(conn)
+                ignoredShutdown
+            if dropConn:
+                moreStreams = false
+            else:
+                anyServed = true
+                servedCount = servedCount + 1
+        # All readable streams on this connection drained: close the session once.
+        qconn.ConnClose(acceptConn)
+        mediaMoqPublisherWritePeerFile(strings.CloneStr(readyPath), "")
+        if !anyServed:
+            continue
+
+    qtransport.Stop(listener)
+    mediaMoqPublisherWritePeerFile(strings.CloneStr(readyPath), "")
+    os.WriteLine(os.Get_stdout(), strutil.Join([" media_moq_publisher ok served=", IntToStr(servedCount)], ""))
+    return 0
+
+# Fact-first publish run (docs/cheng-csg-video-facts-bytes-plan.md §S2): 发布=封签
+# 事实包，不是传完字节。只读 `.moqidx`（KB 级）并封签 CFFM v1 manifest，ready 即
+# 发布完成——封签成本由索引大小界定，与 ES 大小解耦（GB 级资产秒发的结构性前提）；
+# ES 字节不经整片 ingest，按 moq-frame 范围请求逐帧兑现。服务面：
+#   moq-announce   1024B 事实包元数据（factfirst_manifest_bytes/seal_ms/index_cid…）
+#   moq-factfirst  CFFM v1 manifest 字节（WriteRequestedRange，完成即 FIN）
+#   moq-esindex    帧索引原字节（接收端以 manifest.esIndexCid 对拍）
+#   moq-frame      ES 字节范围（首帧预算=manifest.FirstGopByteLen）
+fn mediaMoqPublisherFactFirstRun(esPath: str, esIndexPath: str, bindHost: str, port: int32,
+                                 readyPath: str, maxServe: int32, waitMs: int32): int32 =
+    let esBytesRes = os.ReadFileBytesResult(esPath)
+    if IsErr(esBytesRes):
+        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst es read: ", Error(esBytesRes)], ""))
+        return 2
+    let esBytes = Value(esBytesRes)
+    let esIndexBytesRes = os.ReadFileBytesResult(esIndexPath)
+    if IsErr(esIndexBytesRes):
+        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst es-index read: ", Error(esIndexBytesRes)], ""))
+        return 2
+    let esIndexBytes = Value(esIndexBytesRes)
+
+    let sealStartMs = times.MonotimeMs()
+    var manifestRes = ff.WebSceneMediaFactFirstSeal(esIndexBytes)
+    if IsErr(manifestRes):
+        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst seal: ", Error(manifestRes)], ""))
+        return 3
+    let manifestBytes = Value(manifestRes)
+    if ff.WebSceneMediaFactFirstVerify(manifestBytes) != 0:
+        mediaMoqPublisherLogLine(" media_moq_publisher: factfirst seal self-verify failed")
+        return 3
+    let sealDoneMs = times.MonotimeMs()
+    let sealMs: int32 = int32(sealDoneMs - sealStartMs)
+    let manifestCidHex = media.MediaAssetSha256Hex(manifestBytes)
+    let esIndexCidHex = media.MediaAssetSha256Hex(esIndexBytes)
+
+    var listener = qtransport.InitMsQuicTransport()
+    let startRes = quic_transport.Libp2pQuicStartListenerNamed(listener, bindHost, port, "localhost")
+    if IsErr(startRes):
+        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst listener start: ", Error(startRes)], ""))
+        return 4
+    let boundPort: int32 = Value(startRes)
+    if !quic_transport.Libp2pQuicWriteReadyPort(strings.CloneStr(readyPath), boundPort):
+        qtransport.Stop(listener)
+        mediaMoqPublisherLogLine(" media_moq_publisher: factfirst ready path write failed")
+        return 4
+    if !mediaMoqPublisherWriteReadyCid(strings.CloneStr(readyPath), strings.CloneStr(manifestCidHex)):
+        qtransport.Stop(listener)
+        mediaMoqPublisherLogLine(" media_moq_publisher: factfirst ready cid write failed")
+        return 4
+
+    var announceParts: str[]
+    add(announceParts, "media_moq_publisher factfirst announce")
+    add(announceParts, " bound_port=")
+    add(announceParts, IntToStr(boundPort))
+    add(announceParts, " factfirst_manifest_cid=")
+    add(announceParts, strings.CloneStr(manifestCidHex))
+    add(announceParts, " factfirst_manifest_bytes=")
+    add(announceParts, IntToStr(rawbytes.BytesLen(manifestBytes)))
+    add(announceParts, " factfirst_seal_ms=")
+    add(announceParts, IntToStr(sealMs))
+    add(announceParts, " factfirst_index_cid=")
+    add(announceParts, strings.CloneStr(esIndexCidHex))
+    add(announceParts, " es_segment_key=moq-frame")
+    add(announceParts, " es_bytes=")
+    add(announceParts, IntToStr(rawbytes.BytesLen(esBytes)))
+    add(announceParts, " es_index_segment_key=moq-esindex")
+    add(announceParts, " es_index_bytes=")
+    add(announceParts, IntToStr(rawbytes.BytesLen(esIndexBytes)))
+    add(announceParts, " publish_seal_ms=")
+    add(announceParts, IntToStr(sealMs))
+    add(announceParts, " publish_total_ms=")
+    add(announceParts, IntToStr(sealMs))
+    let announce = strutil.Join(announceParts, "")
+    os.WriteLine(os.Get_stdout(), announce)
+
+    var blockParts: str[]
+    add(blockParts, strings.CloneStr(announce))
+    var padNeeded: int32 = 1024 - len(announce)
+    while padNeeded > 0:
+        add(blockParts, " ")
+        padNeeded = padNeeded - 1
+    let announceBlock = strutil.Join(blockParts, "")
+    let announceBlockView = rawbytes.BytesFromString(announceBlock)
+    var announceBlockBytes: rawbytes.Bytes = rawbytes.BytesAlloc(rawbytes.BytesLen(announceBlockView))
+    rawbytes.BytesCopyInto(announceBlockBytes, 0, announceBlockView)
+
+    var servedCount: int32
+    while maxServe <= 0 || servedCount < maxServe:
+        let acceptRes = qtransport.AcceptTimed(listener, waitMs)
+        if IsErr(acceptRes):
+            let acceptErrText = ErrorText(acceptRes)
+            if acceptErrText == "msquic: accept timeout":
+                break
+            if quic_transport.Libp2pQuicRetryableAcceptError(strings.CloneStr(acceptErrText)):
+                os.SleepMs(10)
+                continue
+            mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst accept: ", strings.CloneStr(acceptErrText)], ""))
+            qtransport.Stop(listener)
+            return 5
+        var acceptConn = Value(acceptRes)
+        let acceptPeerAddrRaw: str = acceptConn.remoteAddr.raw
+        let acceptPeerLabel: str = mediaMoqPublisherPeerLabelFromMultiaddr(strings.CloneStr(acceptPeerAddrRaw))
+        mediaMoqPublisherWritePeerFile(strings.CloneStr(readyPath), strings.CloneStr(acceptPeerLabel))
+        var anyServed: bool = false
+        var moreStreams = true
+        while moreStreams:
+            let readableRes = qconn.nativeReadableStreamId(acceptConn, 0)
+            if IsErr(readableRes):
+                moreStreams = false
+                continue
+            let streamId: int64 = Value(readableRes)
+            var conn = qconn.ConnDeriveStream(acceptConn, streamId, streamId)
+            var dropConn: bool
+            let negotiateRes = moqstream.Libp2pMoqSegmentStreamServerNegotiate(listener, conn)
+            if IsErr(negotiateRes):
+                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst negotiate: ", Error(negotiateRes)], ""))
+                dropConn = true
+            var connDone = false
+            var requestIndex = 0
+            while !dropConn && !connDone:
+                let requestRes = moqstream.Libp2pMoqSegmentStreamServerReadRequest(conn)
+                if IsErr(requestRes):
+                    if requestIndex == 0:
+                        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst request: ", Error(requestRes)], ""))
+                        dropConn = true
+                    connDone = true
+                else:
+                    let request = Value(requestRes)
+                    requestIndex = requestIndex + 1
+                    if request.segmentKey == "moq-announce":
+                        if request.offsetBytes < 0 || request.lengthBytes <= 0 ||
+                           request.offsetBytes + request.lengthBytes > rawbytes.BytesLen(announceBlockBytes):
+                            mediaMoqPublisherLogLine(" media_moq_publisher: factfirst announce range invalid")
+                            dropConn = true
+                        else:
+                            let annRes = moqstream.Libp2pMoqSegmentStreamServerWriteRange(conn,
+                                                                                          announceBlockBytes,
+                                                                                          request.offsetBytes,
+                                                                                          request.lengthBytes,
+                                                                                          request.readChunkBytes)
+                            if IsErr(annRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst announce serve: ", Error(annRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(" media_moq_publisher: served factfirst announce")
+                    elif request.segmentKey == "moq-factfirst":
+                        connDone = true
+                        if request.offsetBytes < 0 || request.lengthBytes <= 0 ||
+                           request.offsetBytes + request.lengthBytes > rawbytes.BytesLen(manifestBytes):
+                            mediaMoqPublisherLogLine(" media_moq_publisher: factfirst manifest range invalid")
+                            dropConn = true
+                        else:
+                            let mfRes = moqstream.Libp2pMoqSegmentStreamServerWriteRequestedRange(conn,
+                                                                                                  manifestBytes,
+                                                                                                  request)
+                            if IsErr(mfRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst manifest serve: ", Error(mfRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: served moq-factfirst length=", IntToStr(request.lengthBytes)], ""))
+                    elif request.segmentKey == "moq-esindex":
+                        if request.offsetBytes < 0 || request.lengthBytes <= 0 ||
+                           request.offsetBytes + request.lengthBytes > rawbytes.BytesLen(esIndexBytes):
+                            mediaMoqPublisherLogLine(" media_moq_publisher: factfirst moq-esindex range invalid")
+                            dropConn = true
+                        else:
+                            let esIndexServeRes = moqstream.Libp2pMoqSegmentStreamServerWriteRange(conn,
+                                                                                                   esIndexBytes,
+                                                                                                   request.offsetBytes,
+                                                                                                   request.lengthBytes,
+                                                                                                   request.readChunkBytes)
+                            if IsErr(esIndexServeRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst moq-esindex serve: ", Error(esIndexServeRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: served moq-esindex length=", IntToStr(request.lengthBytes)], ""))
+                    elif request.segmentKey == "moq-frame":
+                        if request.offsetBytes < 0 || request.lengthBytes <= 0 ||
+                           request.offsetBytes + request.lengthBytes > rawbytes.BytesLen(esBytes):
+                            mediaMoqPublisherLogLine(" media_moq_publisher: factfirst moq-frame range invalid")
+                            dropConn = true
+                        else:
+                            let esFrameServeRes = moqstream.Libp2pMoqSegmentStreamServerWriteRange(conn,
+                                                                                                   esBytes,
+                                                                                                   request.offsetBytes,
+                                                                                                   request.lengthBytes,
+                                                                                                   request.readChunkBytes)
+                            if IsErr(esFrameServeRes):
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst moq-frame serve: ", Error(esFrameServeRes)], ""))
+                                dropConn = true
+                            else:
+                                mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: served moq-frame offset=",
+                                                                       IntToStr(request.offsetBytes),
+                                                                       " length=", IntToStr(request.lengthBytes)], ""))
+                    else:
+                        connDone = true
+                        mediaMoqPublisherLogLine(strutil.Join([" media_moq_publisher: factfirst segment key mismatch key=", strings.CloneStr(request.segmentKey)], ""))
+                        dropConn = true
+            if connDone && !dropConn:
+                let ignoredShutdown = qconn.ConnShutdownWrite(conn)
+                ignoredShutdown
+            if dropConn:
+                moreStreams = false
+            else:
+                anyServed = true
+                servedCount = servedCount + 1
+        qconn.ConnClose(acceptConn)
+        mediaMoqPublisherWritePeerFile(strings.CloneStr(readyPath), "")
+        if !anyServed:
+            continue
+
+    qtransport.Stop(listener)
+    mediaMoqPublisherWritePeerFile(strings.CloneStr(readyPath), "")
+    os.WriteLine(os.Get_stdout(), strutil.Join([" media_moq_publisher factfirst ok served=", IntToStr(servedCount)], ""))
+    return 0
+
+fn main(): int32 =
+    let port: int32 = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    var readyPathRaw: str
+    let hasReady: bool = cmdline.ReadFirstFlagValue("--ready-path", readyPathRaw)
+    let readyPath: str = if hasReady: readyPathRaw else: ""
+    var factFirstRaw: str
+    let hasFactFirst: bool = cmdline.ReadFirstFlagValue("--fact-first", factFirstRaw)
+    var mp4PathRaw: str
+    let hasMp4: bool = cmdline.ReadFirstFlagValue("--mp4", mp4PathRaw)
+    if !hasMp4 && !hasFactFirst:
+        mediaMoqPublisherLogLine(" media_moq_publisher: missing --mp4")
+        return 2
+    var posterPathRaw: str
+    let hasPoster: bool = cmdline.ReadFirstFlagValue("--poster", posterPathRaw)
+    if !hasPoster && !hasFactFirst:
+        mediaMoqPublisherLogLine(" media_moq_publisher: missing --poster")
+        return 2
+    var esPathRaw: str
+    let hasEs: bool = cmdline.ReadFirstFlagValue("--es", esPathRaw)
+    var esIndexPathRaw: str
+    let hasEsIndex: bool = cmdline.ReadFirstFlagValue("--es-index", esIndexPathRaw)
+    if hasEs != hasEsIndex:
+        mediaMoqPublisherLogLine(" media_moq_publisher: --es and --es-index required together")
+        return 2
+    var audioEsPathRaw: str
+    let hasAudioEs: bool = cmdline.ReadFirstFlagValue("--audio-es", audioEsPathRaw)
+    var audioEsIndexPathRaw: str
+    let hasAudioEsIndex: bool = cmdline.ReadFirstFlagValue("--audio-es-index", audioEsIndexPathRaw)
+    if hasAudioEs != hasAudioEsIndex:
+        mediaMoqPublisherLogLine(" media_moq_publisher: --audio-es and --audio-es-index required together")
+        return 2
+    var bindHostRaw: str
+    let hasBindHost: bool = cmdline.ReadFirstFlagValue("--bind-host", bindHostRaw)
+    let bindHost: str = if hasBindHost: bindHostRaw else: "127.0.0.1"
+    let maxServe: int32 = cmdline.ReadInt32FlagOrDefault("--max-serve", 6)
+    let waitMs: int32 = cmdline.ReadInt32FlagOrDefault("--wait-ms", 20000)
+    let esP: str = if hasEs: esPathRaw else: ""
+    let esIdxP: str = if hasEs: esIndexPathRaw else: ""
+    let aEsP: str = if hasAudioEs: audioEsPathRaw else: ""
+    let aEsIdxP: str = if hasAudioEs: audioEsIndexPathRaw else: ""
+    if hasFactFirst:
+        if !hasEs || !hasEsIndex:
+            mediaMoqPublisherLogLine(" media_moq_publisher: --fact-first requires --es and --es-index")
+            return 2
+        return mediaMoqPublisherFactFirstRun(esP, esIdxP, bindHost, port, readyPath, maxServe, waitMs)
+    return mediaMoqPublisherRun(mp4PathRaw, posterPathRaw, esP, esIdxP, aEsP, aEsIdxP, hasAudioEs, hasEs, bindHost, port, readyPath, maxServe, waitMs, "")
+
+# Harmony HAP publish entry: the reverse direction (Harmony publishes → Android plays).
+# HarmonyOS forbids running native CLI binaries from /data/local/tmp (SELinux), so the
+# real publisher runs in-app. The NAPI extracts the bundled 麦田 assets to the HAP cache,
+# then calls this on a background thread; it binds 0.0.0.0:38000 and serves until killed.
+# On rc=4 (listener bind failed) triangulate the EADDRINUSE shape from inside the app
+# network namespace (hdc shell reads root netns and saw no 38000 occupant, so the truth
+# is only observable in-process): probe 38000 again, a neighbor fixed port, and port 0.
+# Diagnostic-only: runs strictly after the real serve has already failed loud.
+fn chengMoqHarmonyBindTriage() =
+    var probes: str[] = [
+        "/ip4/0.0.0.0/udp/38000/quic-v1",
+        "/ip4/0.0.0.0/udp/38001/quic-v1",
+        "/ip4/0.0.0.0/udp/0/quic-v1"]
+    for i in 0..<probes.len:
+        var bound: datapath_udp.MsQuicUdpBound
+        let res: Result[bool] = datapath_udp.msquicUdpBindInto(bound, strings.CloneStr(probes[i]))
+        if IsErr(res):
+            mediaMoqPublisherLogLine(strutil.Join([" bind-triage ", strings.CloneStr(probes[i]), " -> ", Error(res)], ""))
+        else:
+            mediaMoqPublisherLogLine(strutil.Join([" bind-triage ", strings.CloneStr(probes[i]), " -> ok fd=", IntToStr(bound.fd), " port=", IntToStr(bound.port)], ""))
+            datapath_udp.msquicUdpUnbind(bound.fd)
+
+@exportc("cheng_moq_harmony_publish_serve")
+fn chengMoqHarmonyPublishServe(): int32 =
+    var cache: str = strings.CloneStrRange("/data/storage/el2/base/haps/entry/cache", 0, len("/data/storage/el2/base/haps/entry/cache"))
+    # Fixed port 38000 first: the cross-device fixture bakes sourcePeer 192.168.1.4:38000, so
+    # the Android viewer dials 38000. On devices whose kernel reserves fixed ports (2026-07-23
+    # triage: 38000 AND 38001 both fail EADDRINUSE while port 0 succeeds — a reserved range,
+    # not a stale socket), the fixed bind fails rc=4. Fall back to an ephemeral bind then,
+    # loudly: the real bound port is written to moq_ready.port and announced, so the local
+    # player and any port-learning peer still reach this device. This is NOT the silent
+    # fallback the original comment rejected — the fixed-port failure is logged and the
+    # reported port is the only reachable one on such devices, never hidden.
+    let rc: int32 = mediaMoqPublisherRun(
+        strutil.Join([ strings.CloneStr(cache), "/maitian.mp4"], ""),
+        strutil.Join([ strings.CloneStr(cache), "/maitian_poster.jpg"], ""),
+        strutil.Join([ strings.CloneStr(cache), "/maitian.h264"], ""),
+        strutil.Join([ strings.CloneStr(cache), "/maitian.moqidx"], ""),
+        strutil.Join([ strings.CloneStr(cache), "/maitian.aac"], ""),
+        strutil.Join([ strings.CloneStr(cache), "/maitian.aidx"], ""),
+        true, true, "0.0.0.0", 38000, strutil.Join([ strings.CloneStr(cache), "/moq_ready.port"], ""), 100000, 3600000, "")
+    if rc == 4:
+        chengMoqHarmonyBindTriage()
+        chengMoqHarmonyDialTriage()
+        mediaMoqPublisherLogLine(" media_moq_publisher: fixed port 38000 reserved on this device — falling back to ephemeral bind (real port reported via moq_ready.port + announce)")
+        let rcEphemeral: int32 = mediaMoqPublisherRun(
+            strutil.Join([ strings.CloneStr(cache), "/maitian.mp4"], ""),
+            strutil.Join([ strings.CloneStr(cache), "/maitian_poster.jpg"], ""),
+            strutil.Join([ strings.CloneStr(cache), "/maitian.h264"], ""),
+            strutil.Join([ strings.CloneStr(cache), "/maitian.moqidx"], ""),
+            strutil.Join([ strings.CloneStr(cache), "/maitian.aac"], ""),
+            strutil.Join([ strings.CloneStr(cache), "/maitian.aidx"], ""),
+            true, true, "0.0.0.0", 0, strutil.Join([ strings.CloneStr(cache), "/moq_ready.port"], ""), 100000, 3600000, "")
+        return rcEphemeral
+    return rc
+
+# Dial-triage: the same-process cross-check for the scene-side 20s dial timeout — Mac
+# dialing the SAME Android serve gets PROBE_OK, so if this moq-runtime dial also fails
+# the defect is environment-wide (OHOS app UDP send/recv bridges); if it succeeds the
+# defect is specific to the scene .so client stack. Diagnostic-only, after serve failed.
+fn chengMoqHarmonyDialTriage() =
+    var client = qtransport.InitMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn, "192.168.1.3", 38000, "localhost")
+    if IsErr(dialRes):
+        mediaMoqPublisherLogLine(strutil.Join([" dial-triage 192.168.1.3:38000 -> DIAL_ERR: ", Error(dialRes)], ""))
+        return
+    mediaMoqPublisherLogLine(" dial-triage dial ok, negotiate...")
+    conn = qconn.ConnDeriveStream(conn, 4, 4)
+    let negRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, conn)
+    if IsErr(negRes):
+        mediaMoqPublisherLogLine(strutil.Join([" dial-triage NEG_ERR: ", Error(negRes)], ""))
+        return
+    let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, conn)
+    if IsErr(ackRes):
+        mediaMoqPublisherLogLine(strutil.Join([" dial-triage ACK_ERR: ", Error(ackRes)], ""))
+        return
+    mediaMoqPublisherLogLine(" dial-triage PROBE_OK negotiate acked")
+    qconn.ConnClose(conn)
+    qtransport.Stop(client)
+
+@exportc("cheng_moq_harmony_publish_serve_file")
+fn chengMoqHarmonyPublishServeFile(mp4PathRaw: cstring): int32 =
+    var cache: str = strings.CloneStrRange("/data/storage/el2/base/haps/entry/cache", 0, len("/data/storage/el2/base/haps/entry/cache"))
+    var mp4Path: str
+    if mp4PathRaw != nil:
+        mp4Path = pubcid.PublishCidCStringText(mp4PathRaw)
+    if len(mp4Path) <= 0:
+        mediaMoqPublisherLogLine(" media_moq_publisher: selected media path is empty")
+        return 2
+    return mediaMoqPublisherRun(
+        mp4Path,
+        strutil.Join([ strings.CloneStr(cache), "/maitian_poster.jpg"], ""),
+        "", "",
+        "", "",
+        false, false, "0.0.0.0", 0, strutil.Join([ strings.CloneStr(cache), "/moq_ready.port"], ""), 100000, 3600000,
+        strutil.Join([ strings.CloneStr(cache), "/published_tasks.jsonl"], ""))
+
+# Parameterized publish entry (superset of cheng_moq_harmony_publish_serve_file above):
+# the caller (GUI host adapter) supplies the poster path explicitly — previously the
+# poster was hardcoded to the bundled maitian asset inside the old entry, so publishing
+# any non-maitian video silently served the WRONG poster — and may pass a pre-demuxed
+# video ES pair (esPath + esIndexPath, e.g. Annex-B h264 + .moqidx) so per-frame ES
+# viewers receive es_index_bytes in the announce instead of whole-asset-only. ES pair
+# is optional: both empty = whole-asset; exactly one empty = loud rc=2 (meaningless
+# alone). Added as a NEW export (old symbol/signature untouched) so the adapter ABI
+# never breaks mid-rollout; the adapter's dlsym switches to this symbol.
+@exportc("cheng_moq_harmony_publish_serve_file_ex")
+fn chengMoqHarmonyPublishServeFileEx(mp4PathRaw: cstring, posterPathRaw: cstring,
+                                     esPathRaw: cstring, esIndexPathRaw: cstring): int32 =
+    var cache: str = strings.CloneStrRange("/data/storage/el2/base/haps/entry/cache", 0, len("/data/storage/el2/base/haps/entry/cache"))
+    var mp4Path: str
+    if mp4PathRaw != nil:
+        mp4Path = pubcid.PublishCidCStringText(mp4PathRaw)
+    if len(mp4Path) <= 0:
+        mediaMoqPublisherLogLine(" media_moq_publisher: selected media path is empty")
+        return 2
+    var posterPath: str
+    if posterPathRaw != nil:
+        posterPath = pubcid.PublishCidCStringText(posterPathRaw)
+    if len(posterPath) <= 0:
+        mediaMoqPublisherLogLine(" media_moq_publisher: poster path is empty")
+        return 2
+    var esPath: str
+    if esPathRaw != nil:
+        esPath = pubcid.PublishCidCStringText(esPathRaw)
+    var esIndexPath: str
+    if esIndexPathRaw != nil:
+        esIndexPath = pubcid.PublishCidCStringText(esIndexPathRaw)
+    let hasEsPath: bool = len(esPath) > 0
+    let hasEsIndexPath: bool = len(esIndexPath) > 0
+    if hasEsPath != hasEsIndexPath:
+        mediaMoqPublisherLogLine(" media_moq_publisher: es and es-index required together")
+        return 2
+    return mediaMoqPublisherRun(
+        mp4Path, posterPath, esPath, esIndexPath,
+        "", "",
+        false, hasEsPath, "0.0.0.0", 0, strutil.Join([ strings.CloneStr(cache), "/moq_ready.port"], ""), 100000, 3600000,
+        strutil.Join([ strings.CloneStr(cache), "/published_tasks.jsonl"], ""))
+
+# Fact-first device publish entry (docs/cheng-csg-video-facts-bytes-plan.md §S2.5):
+# 发布=封签事实包。Caller (GUI host adapter) supplies ONLY the pre-demuxed ES pair —
+# the whole-asset mp4/poster ingest is skipped entirely, so ready (and therefore the
+# GUI publish receipt mailbox) fires in ~ms bounded by the index size, never the
+# asset size. Requires a bundled/pre-baked ES pair (HAP rawfiles maitian.*/hgs.*
+# qualify today); gallery videos without a .moqidx stay on the Ex whole-asset entry
+# until device-side demux (E2E plan §S5) produces one in place. NEW export symbol —
+# the Ex entry above stays untouched for ABI compat, same convention as the Ex
+# rollout itself. moq_ready.cid carries the fact bundle's content hash (the sealed
+# manifest IS the published content identity on this path).
+@exportc("cheng_moq_harmony_publish_serve_file_fact_first")
+fn chengMoqHarmonyPublishServeFileFactFirst(esPathRaw: cstring, esIndexPathRaw: cstring): int32 =
+    var esPath: str
+    if esPathRaw != nil:
+        esPath = pubcid.PublishCidCStringText(esPathRaw)
+    var esIndexPath: str
+    if esIndexPathRaw != nil:
+        esIndexPath = pubcid.PublishCidCStringText(esIndexPathRaw)
+    if len(esPath) <= 0 || len(esIndexPath) <= 0:
+        mediaMoqPublisherLogLine(" media_moq_publisher: fact-first requires es and es-index paths")
+        return 2
+    var cache: str = strings.CloneStrRange("/data/storage/el2/base/haps/entry/cache", 0, len("/data/storage/el2/base/haps/entry/cache"))
+    return mediaMoqPublisherFactFirstRun(
+        esPath, esIndexPath,
+        "0.0.0.0", 0, strutil.Join([ strings.CloneStr(cache), "/moq_ready.port"], ""), 100000, 3600000)
+
+# Android startup-period publish entry: symmetric to chengMoqHarmonyPublishServeFile above,
+# but Android has no HAP-sandbox cache path convention — the JNI host bridge extracts the
+# bundled fixture asset to its own app-scoped dir and passes that dir in (cacheDirRaw) instead
+# of a hardcoded HAP path. Same production serve path (mediaMoqPublisherRun) as CLI/Harmony,
+# so the served object identity is the real ingested asset's own cid (no arbitrary-file serve).
+# Android startup own-serve entry: mirrors chengMoqHarmonyPublishServe's six-asset bundled
+# form (the _file variant above serves the bare mp4 only — no ES frame table — so an ES-path
+# viewer gets an announce without es_index_bytes and refuses it; found on-device 2026-07-11,
+# hilog es diag step=4). The JNI shell extracts assets/moq_fixture/hgs.* into the app cache
+# dir it passes here; asset identity is the ingested bytes' own cid, so the peer card's
+# content-addressing check holds as long as the packaged hgs.mp4 matches the fixture bake.
+@exportc("cheng_android_publish_serve_bundled")
+fn chengAndroidPublishServeBundled(cacheDirRaw: cstring): int32 =
+    var cache: str
+    if cacheDirRaw != nil:
+        cache = pubcid.PublishCidCStringText(cacheDirRaw)
+    if len(cache) <= 0:
+        mediaMoqPublisherLogLine(" media_moq_publisher: bundled cache dir is empty")
+        return 2
+    return mediaMoqPublisherRun(
+        strutil.Join([ strings.CloneStr(cache), "/hgs.mp4"], ""),
+        strutil.Join([ strings.CloneStr(cache), "/hgs_poster.jpg"], ""),
+        strutil.Join([ strings.CloneStr(cache), "/hgs.h264"], ""),
+        strutil.Join([ strings.CloneStr(cache), "/hgs.moqidx"], ""),
+        strutil.Join([ strings.CloneStr(cache), "/hgs.aac"], ""),
+        strutil.Join([ strings.CloneStr(cache), "/hgs.aidx"], ""),
+        true, true, "0.0.0.0", 38000, strutil.Join([ strings.CloneStr(cache), "/moq_ready.port"], ""), 100000, 3600000, "")
+
+@exportc("cheng_android_publish_serve_file")
+fn chengAndroidPublishServeFile(mp4PathRaw: cstring, cacheDirRaw: cstring): int32 =
+    var cache: str
+    if cacheDirRaw != nil:
+        cache = pubcid.PublishCidCStringText(cacheDirRaw)
+    if len(cache) <= 0:
+        mediaMoqPublisherLogLine(" media_moq_publisher: android cache dir is empty")
+        return 2
+    var mp4Path: str
+    if mp4PathRaw != nil:
+        mp4Path = pubcid.PublishCidCStringText(mp4PathRaw)
+    if len(mp4Path) <= 0:
+        mediaMoqPublisherLogLine(" media_moq_publisher: selected media path is empty")
+        return 2
+    return mediaMoqPublisherRun(
+        mp4Path,
+        strutil.Join([ strings.CloneStr(cache), "/moq_fixture_poster.jpg"], ""),
+        "", "",
+        "", "",
+        false, false, "0.0.0.0", 38000, strutil.Join([ strings.CloneStr(cache), "/moq_ready.port"], ""), 100000, 3600000, "")

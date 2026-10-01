@@ -1,0 +1,167 @@
+# rwad_bridge_contract.cheng - settlement batch contract core.
+#
+# Pure-function core of the cheng_rwad_bridge contract: batch entries ->
+# aggregated Merkle-Sum root, apply-side receipt validation, and a schema
+# fingerprint for cross-repo hash interlock. Filesystem export/apply shells
+# live with the storage tooling once the owning repo grants access; this
+# module never touches the filesystem.
+#
+# Merkle-Sum tree: leaves are per-account aggregates
+#   leafHash   = sha512("rwad.mst.leaf"  || accountCid || be64(sum))
+#   nodeHash   = sha512("rwad.mst.node"  || leftHash || be64(l+r) || rightHash)
+# The carried sum lets an auditor verify total in/out conservation from the
+# root alone. Odd trailing leaf is promoted unchanged.
+
+import std/system
+import std/rawbytes
+import std/result
+import std/crypto/sha512 as sha512
+import cheng/std/bytes_layout as layout
+import cheng/chain/lsmr_types as lt
+
+const
+    BrgSchemaVersion: int32 = 2
+
+type
+    BridgeEntry =
+        accountCid: layout.FixedBytes32
+        amount: int64
+
+    BridgeReceipt =
+        batchId: Bytes
+        txHash: layout.FixedBytes32
+        chainRoot: layout.FixedBytes32
+        statusFinalized: bool
+
+fn Be64Append(buf: Bytes, offset: int32, v: int64): int32 =
+    var i: int32
+    while i < 8:
+        # arithmetic shift then mask yields the exact two's-complement byte
+        BytesSet(buf, offset + i, Int32((v >> (56 - i * 8)) % 256))
+        i = i + 1
+    return offset + 8
+
+# Aggregate duplicate accounts and compute the Merle-Sum root.
+@borrows
+fn BridgeBatchRoot(entries: BridgeEntry[]): Result[layout.FixedBytes32] =
+    if entries.len == 0:
+        return Err[layout.FixedBytes32]("bridge: empty batch")
+    # sort a copy by accountCid (selection sort, single-variable subscripts)
+    var work: BridgeEntry[]
+    var i: int32
+    while i < entries.len:
+        add(work, entries[i])
+        i = i + 1
+    i = 0
+    while i < work.len:
+        var bestPos: int32 = i
+        var j: int32 = i + 1
+        while j < work.len:
+            if lt.FixedBytes32Less(work[j].accountCid, work[bestPos].accountCid):
+                bestPos = j
+            j = j + 1
+        if bestPos != i:
+            let tmp: BridgeEntry = work[i]
+            work[i] = work[bestPos]
+            work[bestPos] = tmp
+        i = i + 1
+    # merge duplicates in place
+    var aggSums: int64[]
+    var uniq: layout.FixedBytes32[]
+    i = 0
+    while i < work.len:
+        if uniq.len > 0 and layout.FixedBytes32Equal(uniq[uniq.len - 1], work[i].accountCid):
+            aggSums[aggSums.len - 1] = aggSums[aggSums.len - 1] + work[i].amount
+        else:
+            add(uniq, work[i].accountCid)
+            add(aggSums, work[i].amount)
+        i = i + 1
+    # leaves
+    var levelHashes: Bytes[]
+    var levelSums: int64[]
+    i = 0
+    while i < uniq.len:
+        let prefix = BytesFromString("rwad.mst.leaf")
+        let total: int32 = prefix.len + 40
+        var buf = BytesAlloc(total)
+        var k: int32
+        while k < prefix.len:
+            BytesSet(buf, k, BytesGet(prefix, k))
+            k = k + 1
+        let cidBytes = layout.FixedBytes32ToBytes(uniq[i])
+        k = 0
+        while k < 32:
+            BytesSet(buf, prefix.len + k, BytesGet(cidBytes, k))
+            k = k + 1
+        Be64Append(buf, prefix.len + 32, aggSums[i])
+        let d = sha512.Sha512Digest(buf)
+        BytesFree(buf)
+        add(levelHashes, BytesSlice(d, 0, 32))
+        add(levelSums, aggSums[i])
+        i = i + 1
+    # fold pairs upward, sums carried on nodes
+    while levelHashes.len > 1:
+        var nextHashes: Bytes[]
+        var nextSums: int64[]
+        i = 0
+        while i < levelHashes.len:
+            if i + 1 < levelHashes.len:
+                let np = BytesFromString("rwad.mst.node")
+                let total: int32 = np.len + 80
+                var buf = BytesAlloc(total)
+                var k: int32
+                while k < np.len:
+                    BytesSet(buf, k, BytesGet(np, k))
+                    k = k + 1
+                k = 0
+                while k < 32:
+                    BytesSet(buf, np.len + k, BytesGet(levelHashes[i], k))
+                    BytesSet(buf, np.len + 40 + k, BytesGet(levelHashes[i + 1], k))
+                    k = k + 1
+                Be64Append(buf, np.len + 32, levelSums[i])
+                Be64Append(buf, np.len + 72, levelSums[i + 1])
+                let d = sha512.Sha512Digest(buf)
+                BytesFree(buf)
+                add(nextHashes, BytesSlice(d, 0, 32))
+                add(nextSums, levelSums[i] + levelSums[i + 1])
+                i = i + 2
+            else:
+                add(nextHashes, levelHashes[i])
+                add(nextSums, levelSums[i])
+                i = i + 1
+        levelHashes = nextHashes
+        levelSums = nextSums
+    let top = layout.FixedBytes32FromBytes(levelHashes[0])
+    if !top.ok:
+        return Err[layout.FixedBytes32]("bridge: root truncation failed")
+    return Ok[layout.FixedBytes32](top.value)
+
+# Apply side: a receipt finalizes a batch only when the status flag is set,
+# and the on-chain root must equal the locally computed batch root.
+fn BridgeApplyCheck(expectedRoot: layout.FixedBytes32,
+                    receipt: BridgeReceipt): Result[bool] =
+    if !receipt.statusFinalized:
+        return Err[bool]("bridge apply: batch not finalized")
+    if !layout.FixedBytes32Equal(expectedRoot, receipt.chainRoot):
+        return Err[bool]("bridge apply: root drift")
+    return Ok[bool](true)
+
+# Cross-repo interlock: both sides compute this over their shared schema
+# surface; any field or version drift changes the fingerprint.
+fn BridgeContractFingerprint(): layout.FixedBytes32 =
+    let prefix = BytesFromString("rwad.bridge.schema.v")
+    let fields = BytesFromString("batchId|accountCid|amount|txHash|statusFinalized|merkleSumV1")
+    var buf = BytesAlloc(prefix.len + fields.len + 4)
+    var i: int32
+    while i < prefix.len:
+        BytesSet(buf, i, BytesGet(prefix, i))
+        i = i + 1
+    Be64Append(buf, prefix.len, Int64(BrgSchemaVersion))
+    i = 0
+    while i < fields.len:
+        BytesSet(buf, prefix.len + 8 + i, BytesGet(fields, i))
+        i = i + 1
+    let d = sha512.Sha512Digest(buf)
+    BytesFree(buf)
+    let res = layout.FixedBytes32FromBytes(BytesSlice(d, 0, 32))
+    return res.value

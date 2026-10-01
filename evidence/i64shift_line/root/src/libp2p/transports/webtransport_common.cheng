@@ -1,0 +1,249 @@
+# WebTransport handshake/common helpers(minimal).
+
+import std/result
+import std/rawbytes
+import cheng/libp2p/utils/option
+import cheng/libp2p/utils/strings
+import std/strings as stdstrings
+import cheng/http3/frame as h3frame
+import cheng/qpack/min as qpack
+import cheng/quic/core/quic_varint as qvarint
+const
+    http3StreamTypeControl = 0
+    http3StreamTypeQpackEncoder = 0x02
+    http3StreamTypeQpackDecoder = 0x03
+    http3StreamTypeWebtransport = 0x54
+    http3FrameTypeHeaders = 0x01
+    http3FrameTypeSettings = 0x04
+    http3SettingsEnableConnectProtocol = 0x8
+    http3SettingsH3Datagram = 0x33
+    # WT_STREAM signal (draft-ietf-webtrans-http3): reserved HTTP/3 "frame
+    # type" 0x41 that is NOT a real frame (no length field). A client or
+    # server opens a new bidirectional QUIC stream and writes this signal as
+    # the very first bytes: varint(0x41) + varint(sessionId), after which the
+    # rest of the stream is raw WebTransport application data. Session ID is
+    # the QUIC stream ID of the CONNECT request stream (RFC 9000 varint, no
+    # scaling). Distinct from http3StreamTypeWebtransport (0x54), which tags
+    # *unidirectional* WebTransport streams and is a different code path.
+    webtransportBidiStreamSignal: int64 = 0x41
+    webtransportPseudoMethod = ":method"
+    webtransportPseudoProtocol = ":protocol"
+    webtransportPseudoScheme = ":scheme"
+    webtransportPseudoAuthority = ":authority"
+    webtransportPseudoPath = ":path"
+    webtransportPseudoStatus = ":status"
+    webtransportMethodConnect = "CONNECT"
+    webtransportProtocolToken = "webtransport"
+    webtransportSchemeHttps = "https"
+    webtransportStatusOk = "200"
+
+type
+    WebtransportMode = enum
+        wtmServer
+        wtmClient
+
+    WebtransportHandshakeInfo =
+        mode: WebtransportMode
+        authority: str
+        path: str
+        origin: str
+        draft: str
+        maxSessions: int32
+
+    Http3Settings =
+        enableConnectProtocol: bool
+        enableDatagram: bool
+        maxSessions: int32
+
+# SETTINGS_WEBTRANSPORT_MAX_SESSIONS = 0xc671706a (draft-ietf-webtrans-http3)
+# exceeds int32 max (2^31-1). cheng_cold folds a bare hex literal that big to
+# a 32-bit pattern and sign-extends it negative even when the enclosing
+# const/let is declared int64 (found wiring the first real caller -- see
+# design.md), so it is built here from two in-range halves instead of
+# written as one literal.
+fn http3SettingsWebtransportMaxSessionsId(): int64 =
+    return (int64(0xc671) << 16) | int64(0x706a)
+
+fn startsWith(s: str, prefix: str): bool =
+    let plen: int32 = len(prefix)
+    if plen <= 0:
+        return true
+    let slen: int32 = len(s)
+    if slen < plen:
+        return false
+    for i in 0..<plen:
+        if s[i] != prefix[i]:
+            return false
+    return true
+
+fn normaliseAuthority(host: str, port: str): str =
+    if len(host) == 0 || len(port) == 0:
+        return ""
+    if StrContains(host, ":") && ! startsWith(host, "["):
+        return "[" + host + "]:" + port
+    return host + ":" + port
+
+fn normaliseOrigin(authority: str): str =
+    if len(authority) == 0:
+        return ""
+    return "https://" + authority
+
+fn settingsValidationError(settings: Http3Settings): Option[str] =
+    if ! settings.enableConnectProtocol:
+        return Some[str]("remote endpoint did ! enable CONNECT protocol")
+    if ! settings.enableDatagram:
+        return Some[str]("remote endpoint did ! enable HTTP/3 datagrams")
+    if settings.maxSessions == 0:
+        return Some[str]("remote endpoint does ! accept WebTransport sessions")
+    return None[str]()
+
+# Result[bool] bridge for cross-module callers, deliberately re-implementing
+# settingsValidationError's 3 checks instead of delegating to it. cheng_cold
+# tags every `Option[str]` instantiation with the call site's own nominal
+# identity (each of: this module's declared return type, a consumer module's
+# `let` annotation, and a fresh `Some[str](...)` call site all produced
+# mutually-incompatible "kind" tags in isolated repro -- see design.md), so
+# Option[str] cannot safely cross a module boundary or even round-trip
+# through a second call site in this compiler today. Result[bool] has no such
+# fragility anywhere else in this codebase, so real cross-module callers gate
+# on this wrapper instead of settingsValidationError.
+fn settingsIsWebtransportCapable(settings: Http3Settings): Result[bool] =
+    if ! settings.enableConnectProtocol:
+        return Err[bool]("remote endpoint did ! enable CONNECT protocol")
+    if ! settings.enableDatagram:
+        return Err[bool]("remote endpoint did ! enable HTTP/3 datagrams")
+    if settings.maxSessions == 0:
+        return Err[bool]("remote endpoint does ! accept WebTransport sessions")
+    return Ok[bool](true)
+
+# Decodes a real wire-format HTTP/3 SETTINGS frame payload (h3frame.Http3Setting
+# entries, as produced by Http3DecodeSettingsFramePayload off an actual byte
+# stream) into the Http3Settings shape settingsValidationError checks. This is
+# the first real caller wiring the SETTINGS wire format to WebTransport's
+# handshake validation -- prior to this the two were never connected.
+fn Http3SettingsFromEntries(entries: h3frame.Http3Setting[]): Http3Settings =
+    var out: Http3Settings
+    out.enableConnectProtocol = false
+    out.enableDatagram = false
+    out.maxSessions = 0
+    for i in 0..<entries.len:
+        if entries[i].id == int64(http3SettingsEnableConnectProtocol):
+            if entries[i].value != 0:
+                out.enableConnectProtocol = true
+        elif entries[i].id == int64(http3SettingsH3Datagram):
+            if entries[i].value != 0:
+                out.enableDatagram = true
+        elif entries[i].id == http3SettingsWebtransportMaxSessionsId():
+            out.maxSessions = int32(entries[i].value)
+    return out
+
+# ---- Slice 2: Extended CONNECT state machine (RFC 9220 pseudo-headers) ----
+# First real producer/consumer of WebtransportHandshakeInfo (was a
+# zero-consumer struct through slice 1). Client side builds the request
+# field list; server side parses + validates it (including a router-style
+# expectedPath check so a wrong path fails loudly instead of silently
+# accepting any request); server builds the 200 response; client validates
+# it. Wire framing (QPACK literal field lines -> HTTP/3 HEADERS frame) reuses
+# http3/frame.cheng's Http3EncodeHeadersFrame/Http3DecodeHeadersFramePayload,
+# the same production encoder slice 1 wired for SETTINGS.
+
+fn WebtransportBuildConnectRequestFields(authority: str, path: str): qpack.QpackHeaderField[] =
+    var out: qpack.QpackHeaderField[]
+    add(out, qpack.QpackMakeHeaderField(webtransportPseudoMethod, webtransportMethodConnect))
+    add(out, qpack.QpackMakeHeaderField(webtransportPseudoProtocol, webtransportProtocolToken))
+    add(out, qpack.QpackMakeHeaderField(webtransportPseudoScheme, webtransportSchemeHttps))
+    add(out, qpack.QpackMakeHeaderField(webtransportPseudoAuthority, authority))
+    add(out, qpack.QpackMakeHeaderField(webtransportPseudoPath, path))
+    return out
+
+@borrows
+fn webtransportFieldValue(section: qpack.QpackFieldSection, name: str): str =
+    for i in 0..<section.fields.len:
+        if section.fields[i].name == name:
+            return stdstrings.CloneStr(section.fields[i].value)
+    return ""
+
+@borrows
+fn webtransportFieldPresent(section: qpack.QpackFieldSection, name: str): bool =
+    for i in 0..<section.fields.len:
+        if section.fields[i].name == name:
+            return true
+    return false
+
+# Server side: parse + validate an Extended CONNECT request field section
+# into a WebtransportHandshakeInfo. Every rejection reason is a distinct,
+# specific Err string (no generic "invalid request") so callers/tests can
+# assert on the exact cause.
+fn WebtransportParseConnectRequestFields(section: qpack.QpackFieldSection, expectedPath: str): Result[WebtransportHandshakeInfo] =
+    if webtransportFieldValue(section, webtransportPseudoMethod) != webtransportMethodConnect:
+        return Err[WebtransportHandshakeInfo]("webtransport: :method != CONNECT")
+    if ! webtransportFieldPresent(section, webtransportPseudoProtocol):
+        return Err[WebtransportHandshakeInfo]("webtransport: missing :protocol pseudo-header")
+    if webtransportFieldValue(section, webtransportPseudoProtocol) != webtransportProtocolToken:
+        return Err[WebtransportHandshakeInfo]("webtransport: :protocol != webtransport")
+    let authority: str = webtransportFieldValue(section, webtransportPseudoAuthority)
+    if len(authority) == 0:
+        return Err[WebtransportHandshakeInfo]("webtransport: missing :authority")
+    let path: str = webtransportFieldValue(section, webtransportPseudoPath)
+    if len(path) == 0:
+        return Err[WebtransportHandshakeInfo]("webtransport: missing :path")
+    if len(expectedPath) > 0 && path != expectedPath:
+        return Err[WebtransportHandshakeInfo]("webtransport: unexpected :path " + path)
+    var out: WebtransportHandshakeInfo
+    out.mode = wtmServer
+    out.origin = normaliseOrigin(stdstrings.CloneStr(authority))
+    out.authority = authority
+    out.path = path
+    out.draft = ""
+    out.maxSessions = 0
+    return Ok[WebtransportHandshakeInfo](out)
+
+fn WebtransportConnectResponseFields200(): qpack.QpackHeaderField[] =
+    var out: qpack.QpackHeaderField[]
+    add(out, qpack.QpackMakeHeaderField(webtransportPseudoStatus, webtransportStatusOk))
+    add(out, qpack.QpackMakeHeaderField(webtransportPseudoProtocol, webtransportProtocolToken))
+    return out
+
+# Client side: validate the server's response to an Extended CONNECT
+# request -- session is established iff :status == 200.
+fn WebtransportParseConnectResponseFields(section: qpack.QpackFieldSection): Result[bool] =
+    let status: str = webtransportFieldValue(section, webtransportPseudoStatus)
+    if len(status) == 0:
+        return Err[bool]("webtransport: connect response missing :status")
+    if status != webtransportStatusOk:
+        return Err[bool]("webtransport: connect response status " + status + " != 200")
+    return Ok[bool](true)
+
+# ---- WT_STREAM signal (bidirectional WebTransport data streams) ----
+
+type
+    WebtransportStreamSignalDecoded =
+        sessionId: int64
+        next: int32
+
+# Client or server writes this as the very first bytes of a freshly-opened
+# bidirectional QUIC stream to associate it with an established WebTransport
+# session; every byte written after it on that stream is raw application
+# data (not further HTTP/3-framed).
+fn WebtransportEncodeBidiStreamSignal(sessionId: int64): Result[Bytes] =
+    let sigRes: Result[Bytes] = qvarint.quicVarIntEncode(webtransportBidiStreamSignal)
+    if IsErr(sigRes):
+        return Err[Bytes](ErrorText(sigRes))
+    let sidRes: Result[Bytes] = qvarint.quicVarIntEncode(sessionId)
+    if IsErr(sidRes):
+        return Err[Bytes](ErrorText(sidRes))
+    return Ok[Bytes](BytesConcat(Value(sigRes), Value(sidRes)))
+
+fn WebtransportDecodeBidiStreamSignal(data: Bytes, offset: int32): Result[WebtransportStreamSignalDecoded] =
+    let sigRes: Result[qvarint.QuicVarIntDecoded] = qvarint.quicVarIntDecode(data, offset)
+    if IsErr(sigRes):
+        return Err[WebtransportStreamSignalDecoded](ErrorText(sigRes))
+    if Value(sigRes).value != webtransportBidiStreamSignal:
+        return Err[WebtransportStreamSignalDecoded]("webtransport: not a WT_STREAM signal")
+    let sidRes: Result[qvarint.QuicVarIntDecoded] = qvarint.quicVarIntDecode(data, Value(sigRes).next)
+    if IsErr(sidRes):
+        return Err[WebtransportStreamSignalDecoded](ErrorText(sidRes))
+    var out: WebtransportStreamSignalDecoded
+    out.sessionId = Value(sidRes).value
+    out.next = Value(sidRes).next
+    return Ok[WebtransportStreamSignalDecoded](out)

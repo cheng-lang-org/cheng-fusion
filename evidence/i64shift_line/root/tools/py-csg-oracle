@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""CPython oracle helper and legacy Python launcher for py-csg."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import dis
+import importlib.machinery
+import importlib.util
+import json
+import os
+import platform
+import shlex
+import subprocess
+import sys
+import symtable
+import types
+from pathlib import Path
+from typing import Any
+
+_COMMON_PATH = Path(__file__).with_name("lang_csg_common")
+_LOADER = importlib.machinery.SourceFileLoader("lang_csg_common", str(_COMMON_PATH))
+_SPEC = importlib.util.spec_from_loader(_LOADER.name, _LOADER)
+if _SPEC is None:
+    raise SystemExit("error: failed to load lang_csg_common")
+_COMMON = importlib.util.module_from_spec(_SPEC)
+_LOADER.exec_module(_COMMON)
+
+CSG_STANDARD = _COMMON.CSG_STANDARD
+die = _COMMON.die
+rel_display = _COMMON.rel_display
+write_json = _COMMON.write_json
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class EmitFailure(Exception):
+    def __init__(
+        self,
+        step: str,
+        message: str,
+        *,
+        command: list[str] | None = None,
+        returncode: int | None = None,
+        stdout: str = "",
+        stderr: str = "",
+    ):
+        super().__init__(message)
+        self.step = step
+        self.message = message
+        self.command = command or []
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def tail(text: str, limit: int = 4000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def shell_command(parts: list[str]) -> str:
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def run_step(step: str, cmd: list[str], *, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
+    run = subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True, env=os.environ.copy())
+    if run.returncode != 0:
+        raise EmitFailure(
+            step,
+            f"{step} failed with exit {run.returncode}",
+            command=cmd,
+            returncode=run.returncode,
+            stdout=run.stdout,
+            stderr=run.stderr,
+        )
+    return run
+
+
+def host_target() -> str:
+    env_target = os.environ.get("CHENG_CSG_HOST_TARGET") or os.environ.get("CHENG_CSG_LOWER_TARGET")
+    if env_target:
+        return env_target
+    machine = platform.machine().lower()
+    system = platform.system().lower()
+    arch = "arm64" if machine in {"arm64", "aarch64"} else "x86_64" if machine in {"x86_64", "amd64"} else ""
+    if not arch:
+        die(f"unsupported host architecture for Python CSG emit target: {machine}")
+    if system == "darwin":
+        return f"{arch}-apple-darwin"
+    if system == "linux":
+        return f"{arch}-unknown-linux-gnu"
+    die(f"unsupported host system for Python CSG emit target: {system}")
+    return ""
+
+
+def compile_pure_emit(target: str, out_exe: Path, report: Path) -> None:
+    out_exe.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(ROOT / "artifacts" / "backend_driver" / "cheng"),
+        "system-link-exec",
+        f"--root:{ROOT}",
+        f"--in:{ROOT / 'src' / 'core' / 'csg_migration' / 'py_csg_ast_emit.cheng'}",
+        "--emit:exe",
+        f"--target:{target}",
+        f"--out:{out_exe}",
+        f"--report-out:{report}",
+    ]
+    run_step("compile-pure-py-csg-emit", cmd)
+
+
+def module_path(root: Path, entry: str) -> Path:
+    candidate = root / (entry.replace(".", "/") + ".py")
+    if candidate.exists():
+        return candidate.resolve()
+    package_init = root / entry.replace(".", "/") / "__init__.py"
+    if package_init.exists():
+        return package_init.resolve()
+    raise EmitFailure("cpython-oracle", f"missing Python entry module: {entry}")
+
+
+def scan_binary_extensions(root: Path) -> list[Path]:
+    out: list[Path] = []
+    for suffix in ("*.so", "*.pyd"):
+        out.extend(sorted(root.rglob(suffix)))
+    return out
+
+
+def scan_extra_python_modules(root: Path, entry_source: Path) -> list[Path]:
+    entry_resolved = entry_source.resolve()
+    out: list[Path] = []
+    for path in sorted(root.rglob("*.py")):
+        if path.resolve() != entry_resolved:
+            out.append(path)
+    return out
+
+
+def module_name_for_path(root: Path, path: Path) -> str:
+    rel = path.resolve().relative_to(root.resolve())
+    if rel.name == "__init__.py":
+        parts = rel.parent.parts
+    else:
+        parts = rel.with_suffix("").parts
+    if not parts:
+        return "__main__"
+    return ".".join(parts)
+
+
+def stable_instruction_argrepr(instruction: dis.Instruction) -> str:
+    if isinstance(instruction.argval, types.CodeType):
+        return f"<code object {instruction.argval.co_name} line {instruction.argval.co_firstlineno}>"
+    return instruction.argrepr
+
+
+def oracle_expr(node: ast.AST) -> dict[str, Any]:
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool):
+            return {"kind": "Constant", "valueKind": "bool"}
+        if isinstance(node.value, int):
+            return {"kind": "Constant", "valueKind": "int", "intValue": int(node.value)}
+        if isinstance(node.value, str):
+            return {"kind": "Constant", "valueKind": "str", "stringValue": node.value}
+        if node.value is None:
+            return {"kind": "Constant", "valueKind": "none"}
+        return {"kind": "Constant", "valueKind": "other"}
+    if isinstance(node, ast.Name):
+        return {"kind": "Name", "id": node.id}
+    if isinstance(node, ast.Call):
+        return {
+            "kind": "Call",
+            "func": oracle_expr(node.func),
+            "args": [oracle_expr(arg) for arg in node.args],
+            "keywords": [keyword.arg or "" for keyword in node.keywords],
+        }
+    if isinstance(node, ast.BinOp):
+        return {
+            "kind": "BinOp",
+            "op": type(node.op).__name__,
+            "left": oracle_expr(node.left),
+            "right": oracle_expr(node.right),
+        }
+    if isinstance(node, ast.UnaryOp):
+        return {"kind": "UnaryOp", "op": type(node.op).__name__, "operand": oracle_expr(node.operand)}
+    return {"kind": type(node).__name__}
+
+
+def oracle_stmt(node: ast.stmt) -> dict[str, Any]:
+    if isinstance(node, ast.Assign):
+        return {"kind": "Assign", "targets": [oracle_expr(target) for target in node.targets], "value": oracle_expr(node.value)}
+    if isinstance(node, ast.AugAssign):
+        return {
+            "kind": "AugAssign",
+            "target": oracle_expr(node.target),
+            "op": type(node.op).__name__,
+            "value": oracle_expr(node.value),
+        }
+    if isinstance(node, ast.Global):
+        return {"kind": "Global", "names": list(node.names)}
+    if isinstance(node, ast.Expr):
+        return {"kind": "Expr", "value": oracle_expr(node.value)}
+    if isinstance(node, ast.Raise):
+        return {"kind": "Raise", "exc": oracle_expr(node.exc) if node.exc is not None else {"kind": "None"}}
+    if isinstance(node, ast.Return):
+        return {"kind": "Return", "value": oracle_expr(node.value) if node.value is not None else {"kind": "None"}}
+    if isinstance(node, ast.ImportFrom):
+        return {
+            "kind": "ImportFrom",
+            "module": node.module or "",
+            "level": node.level,
+            "names": [alias.name for alias in node.names],
+        }
+    if isinstance(node, ast.Import):
+        return {"kind": "Import", "names": [alias.name for alias in node.names]}
+    return {"kind": type(node).__name__}
+
+
+def oracle_function(node: ast.FunctionDef, module_name: str) -> dict[str, Any]:
+    signature_closed = not (
+        node.decorator_list
+        or node.args.vararg is not None
+        or node.args.kwarg is not None
+        or node.args.defaults
+        or node.args.kw_defaults
+        or node.args.posonlyargs
+        or node.args.kwonlyargs
+    )
+    return {
+        "module": module_name,
+        "name": node.name,
+        "args": [arg.arg for arg in node.args.args],
+        "signatureClosed": signature_closed,
+        "body": [oracle_stmt(stmt) for stmt in node.body],
+    }
+
+
+def oracle_module(root: Path, path: Path, module_name: str) -> dict[str, Any]:
+    source_text = path.read_text(encoding="utf-8")
+    try:
+        tree = ast.parse(source_text, filename=str(path))
+        code = compile(tree, str(path), "exec")
+        symbols = symtable.symtable(source_text, str(path), "exec")
+    except SyntaxError as exc:
+        raise EmitFailure("cpython-oracle", f"CPython rejected {path}: {exc}")
+    instructions = [
+        {
+            "opname": instruction.opname,
+            "argrepr": stable_instruction_argrepr(instruction),
+            "offset": instruction.offset,
+        }
+        for instruction in dis.get_instructions(code)
+    ]
+    return {
+        "module": module_name,
+        "source": str(path),
+        "displayPath": rel_display(root, path),
+        "symbolCount": len(symbols.get_identifiers()),
+        "bytecode": instructions,
+        "functions": [oracle_function(stmt, module_name) for stmt in tree.body if isinstance(stmt, ast.FunctionDef)],
+        "moduleBody": [oracle_stmt(stmt) for stmt in tree.body if not isinstance(stmt, ast.FunctionDef)],
+    }
+
+
+def write_cpython_oracle(root: Path, entry: str, python_version: str, out_path: Path) -> tuple[Path, str]:
+    source = module_path(root, entry)
+    entry_module = module_name_for_path(root, source)
+    module_paths = sorted(root.rglob("*.py"), key=lambda path: rel_display(root, path))
+    modules = [oracle_module(root, path.resolve(), module_name_for_path(root, path.resolve())) for path in module_paths]
+    entry_info = next((item for item in modules if item["source"] == str(source)), None)
+    if entry_info is None:
+        raise EmitFailure("cpython-oracle", f"missing Python entry module in oracle: {entry}")
+    merged_functions: list[dict[str, Any]] = []
+    for item in modules:
+        merged_functions.extend(item["functions"])
+    oracle = {
+        "schema": "python-csg-oracle.v1",
+        "entry": entry,
+        "entryModule": entry_module,
+        "pythonVersion": python_version,
+        "source": str(source),
+        "displayPath": rel_display(root, source),
+        "symbolCount": entry_info["symbolCount"],
+        "bytecode": entry_info["bytecode"],
+        "binaryExtensions": [rel_display(root, path) for path in scan_binary_extensions(root)],
+        "extraPythonModules": [],
+        "unsupportedProjectModules": [],
+        "modules": modules,
+        "functions": merged_functions,
+        "moduleBody": entry_info["moduleBody"],
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(oracle, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    return source, rel_display(root, source)
+
+
+def write_wrapper_failure(report_out: Path, failure: EmitFailure) -> None:
+    report: dict[str, Any] = {
+        "schema": "csg-core.report",
+        "standard": CSG_STANDARD,
+        "dialect": "csg_dialect::python",
+        "toolImplementation": "python-cpython-oracle-launcher",
+        "reportControllerImplementation": "pure-cheng",
+        "extractorImplementation": "pure-cheng-cpython-oracle-json",
+        "extractorOracle": "cpython-ast-symtable-bytecode-json",
+        "pureChengToolchainComplete": False,
+        "fullProjectTranspilationComplete": False,
+        "complete": False,
+        "failedStep": failure.step,
+        "reason": failure.message,
+        "counts": {"factCount": 0, "unsupported": 0, "runtimeRequirements": 0, "externalSymbols": 0},
+        "unsupported": [],
+        "runtimeRequirements": [],
+        "externalSymbols": [],
+        "entryRoots": [],
+    }
+    if failure.command:
+        report["command"] = failure.command
+        report["commandText"] = shell_command(failure.command)
+    if failure.returncode is not None:
+        report["returncode"] = failure.returncode
+    if failure.stdout:
+        report["stdoutTail"] = tail(failure.stdout)
+    if failure.stderr:
+        report["stderrTail"] = tail(failure.stderr)
+    write_json(report_out, report)
+
+
+def cmd_emit(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="py-csg emit")
+    parser.add_argument("--root", required=True)
+    parser.add_argument("--python-version", required=True)
+    parser.add_argument("--entry", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--report-out", required=True)
+    args = parser.parse_args(argv)
+    report_out = Path(args.report_out).resolve()
+    target = host_target()
+    pure_dir = report_out.parent / ".py-csg" / "pure-emit" / target
+    pure_exe = pure_dir / "py-csg-oracle-emit-pure"
+    compile_report = pure_dir / "compile.report.txt"
+    oracle_json = pure_dir / "cpython.oracle.json"
+    try:
+        current = f"{sys.version_info.major}.{sys.version_info.minor}"
+        if args.python_version != current:
+            raise EmitFailure("cpython-oracle", f"requested CPython {args.python_version}, but oracle is running {current}")
+        root = Path(args.root).resolve()
+        if not root.is_dir():
+            raise EmitFailure("cpython-oracle", f"Python root is not a directory: {root}")
+        source, display_path = write_cpython_oracle(root, args.entry, args.python_version, oracle_json)
+        compile_pure_emit(target, pure_exe, compile_report)
+        run_step(
+            "pure-py-csg-oracle-emit",
+            [
+                str(pure_exe),
+                "emit",
+                "--oracle-json",
+                str(oracle_json),
+                "--root",
+                str(root),
+                "--source",
+                str(source),
+                "--display-path",
+                display_path,
+                "--entry",
+                args.entry,
+                "--python-version",
+                args.python_version,
+                "--out",
+                args.out,
+                "--report-out",
+                args.report_out,
+                "--tool-implementation",
+                "python-cpython-oracle-launcher",
+            ],
+        )
+    except EmitFailure as failure:
+        if not report_out.exists():
+            write_wrapper_failure(report_out, failure)
+        print(f"error: py-csg emit failed at {failure.step}: {failure.message}", file=sys.stderr)
+        return failure.returncode or 1
+    return 0
+
+
+def cmd_oracle(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="py-csg-oracle oracle")
+    parser.add_argument("--root", required=True)
+    parser.add_argument("--python-version", required=True)
+    parser.add_argument("--entry", required=True)
+    parser.add_argument("--out", required=True)
+    args = parser.parse_args(argv)
+    try:
+        current = f"{sys.version_info.major}.{sys.version_info.minor}"
+        if args.python_version != current:
+            raise EmitFailure("cpython-oracle", f"requested CPython {args.python_version}, but oracle is running {current}")
+        root = Path(args.root).resolve()
+        if not root.is_dir():
+            raise EmitFailure("cpython-oracle", f"Python root is not a directory: {root}")
+        write_cpython_oracle(root, args.entry, args.python_version, Path(args.out).resolve())
+    except EmitFailure as failure:
+        print(f"error: py-csg oracle failed at {failure.step}: {failure.message}", file=sys.stderr)
+        return failure.returncode or 1
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("error: expected command: oracle|emit", file=sys.stderr)
+        return 2
+    if sys.argv[1] in {"-h", "--help"}:
+        print("usage: py-csg-oracle oracle --root <pkg-root> --python-version <x.y> --entry <module> --out oracle.json")
+        return 0
+    if sys.argv[1] == "oracle":
+        return cmd_oracle(sys.argv[2:])
+    if sys.argv[1] == "emit":
+        return cmd_emit(sys.argv[2:])
+    print("error: expected command: oracle|emit", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

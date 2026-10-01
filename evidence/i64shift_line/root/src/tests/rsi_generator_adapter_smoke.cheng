@@ -1,0 +1,315 @@
+# RSI 生成器适配器冒烟 (批次七): 外部 LLM 提案源 = 回环 HTTP 夹具全链验证。
+# 判定契约 (rc=0 只依赖本进程内回环夹具用例, 不依赖任何外部服务):
+#   case_a 合法提案   : ollama 形态 JSON, content 含 2 行合法三元组 ->
+#                       rc=0, 提案全数入列, 丢弃 0;
+#   case_b 畸形 JSON  : 非 JSON 体 -> 适配器 rc=7 (可判别), 不产出提案;
+#   case_c 越白名单   : 合法行 + 越白名单行 + 非整数垃圾行混合 ->
+#                       仅白名单内提案入列, 其余逐行计数丢弃;
+#   case_d allowCount : 合法提案超出 allowCount -> 溢出部分计数丢弃;
+#   case_e 连接失败   : 无监听端口 -> rc=2 (可判别), 引擎侧跳过语义;
+#   live 探测 (可选)  : 127.0.0.1:11434 连不上如实打 SKIP, 不影响 rc。
+# 夹具 = std/net 回环 TCP 服务线程 (仅测试文件, 非生产路径): 逐请求
+#   排空请求体 (Content-Length 帧) 后回罐头响应, 每用例一线程内串行。
+# 冷链纪律同卷首 lessons: Fmt 拷贝外呼; 单次 Split 上限; var-out Into;
+# 数组字面量内联; 嵌套调用不作实参 (Fmt 拷贝除外); 容器索引先 let。
+import std/result
+import std/strings as strings
+import std/strutils as strutil
+import std/rawbytes as rawbytes
+import std/monotimes as mono
+import std/net/transports/tcp_syscall as tcp
+import std/thread as thread
+import cheng/rsi/generator_adapter as adapter
+
+# --- 回环夹具共享状态 (主线程写 -> 服务线程读, 严格 join 屏障定序) ---
+var gFixPort: int32 = 0
+var gFixReady: int32 = 0
+var gFixBindFail: int32 = 0
+var gFixServeFail: int32 = 0
+var gFixStop: int32 = 0
+var gFixRequests: int32 = 0
+var gFixBody: str = ""
+
+const
+    rsiAdapterSmokeBindBase: int32 = 19314
+    rsiAdapterSmokeBindTries: int32 = 3
+
+# 在 text 中找 "\r\n\r\n" 首现下标 (头界); 未找到 -1。
+fn fixtureFindDoubleCrlf(text: str): int32 =
+    let n: int32 = len(text)
+    var i: int32 = 0
+    while i + 3 < n:
+        if text[i] == '\r':
+            if text[i + 1] == '\n':
+                if text[i + 2] == '\r':
+                    if text[i + 3] == '\n':
+                        return i
+        i = i + 1
+    return -1
+
+# 单请求服务: 读请求直到头界, 按 Content-Length 排空正文, 回 200 罐头。
+# 返回 0 = 完整服务一请求; 非 0 = IO 失败 (夹具自判失败, 不假绿)。
+fn fixtureServeOne(conn: var tcp.TcpConnectionHandle): int32 =
+    var parts: str[]
+    var totalBytes: int32 = 0
+    var headerEnd: int32 = -1
+    var contentLen: int64 = -1
+    var goRead: int32 = 1
+    while goRead == 1:
+        let waitRes: Result[bool] = tcp.TcpConnectionWaitReadable(conn, 5000)
+        if IsErr(waitRes):
+            return 1
+        let recRes: Result[rawbytes.Bytes] = tcp.TcpRecv(conn, 4096)
+        if IsErr(recRes):
+            return 1
+        var chunk: rawbytes.Bytes = Value(recRes)
+        let chunkLen: int32 = rawbytes.BytesLen(chunk)
+        if chunkLen <= 0:
+            return 1
+        let chunkText: str = rawbytes.BytesToString(chunk)
+        add(parts, Fmt"{chunkText}")
+        totalBytes = totalBytes + chunkLen
+        var joined: str = strutil.Join(parts, "")
+        headerEnd = fixtureFindDoubleCrlf(Fmt"{joined}")
+        if headerEnd >= 0:
+            let headText: str = strings.CloneStrRange(Fmt"{joined}", 0,
+                                                      headerEnd)
+            contentLen = adapter.adapterContentLengthOf(Fmt"{headText}")
+            if contentLen < 0:
+                return 1
+            goRead = 0
+    var bodyGot: int64 = int64(totalBytes) - int64(headerEnd + 4)
+    while bodyGot < contentLen:
+        let waitRes2: Result[bool] = tcp.TcpConnectionWaitReadable(conn, 5000)
+        if IsErr(waitRes2):
+            return 1
+        let recRes2: Result[rawbytes.Bytes] = tcp.TcpRecv(conn, 4096)
+        if IsErr(recRes2):
+            return 1
+        var chunk2: rawbytes.Bytes = Value(recRes2)
+        let chunkLen2: int32 = rawbytes.BytesLen(chunk2)
+        if chunkLen2 <= 0:
+            return 1
+        bodyGot = bodyGot + int64(chunkLen2)
+    let bodyLen: int32 = len(gFixBody)
+    let bodyLenText: str = strings.IntToStr(bodyLen)
+    let clLine: str = strutil.Join(["Content-Length: ", Fmt"{bodyLenText}"],
+                                   "")
+    let respHead: str = strutil.Join(["HTTP/1.1 200 OK",
+                                      "Content-Type: application/json",
+                                      Fmt"{clLine}", "Connection: close",
+                                      "", ""], "\r\n")
+    let resp: str = strings.ConcatStr(Fmt"{respHead}", Fmt"{gFixBody}")
+    let respBytes: rawbytes.Bytes = rawbytes.BytesFromString(Fmt"{resp}")
+    let sendRes: Result[int32] = tcp.TcpSend(conn, respBytes)
+    if IsErr(sendRes):
+        return 1
+    return 0
+
+# 夹具服务主体: 绑定 -> 循环 (等连接 -> 排空请求 -> 回罐头 -> 关闭),
+# gFixStop 置位后于用例间隙退出; 任何 IO 失败置 gFixServeFail 并退出。
+fn fixtureServerMain() =
+    var listener: tcp.TcpListenerHandle
+    var bound: int32 = 0
+    var tryIdx: int32 = 0
+    while bound == 0:
+        if tryIdx >= rsiAdapterSmokeBindTries:
+            gFixBindFail = 1
+            gFixReady = 1
+            return
+        let portCand: int32 = rsiAdapterSmokeBindBase + tryIdx
+        let fillRes: Result[bool] = tcp.TcpListen4Fill("127.0.0.1", portCand,
+                                                       listener)
+        if IsErr(fillRes):
+            tryIdx = tryIdx + 1
+        else:
+            bound = 1
+            gFixPort = portCand
+            gFixReady = 1
+    var go: int32 = 1
+    while go == 1:
+        if gFixStop == 1:
+            go = 0
+        else:
+            let waitRes: Result[bool] = tcp.TcpListenerWaitReadable(listener,
+                                                                    15000)
+            if IsErr(waitRes):
+                gFixServeFail = 1
+                go = 0
+            else:
+                let readable: bool = Value(waitRes)
+                if !readable:
+                    continue
+                let accRes: Result[tcp.TcpConnectionHandle] = tcp.TcpAccept(listener)
+                if IsErr(accRes):
+                    gFixServeFail = 1
+                    go = 0
+                else:
+                    var conn: tcp.TcpConnectionHandle = Value(accRes)
+                    let serveRc: int32 = fixtureServeOne(conn)
+                    tcp.TcpClose(conn)
+                    if serveRc != 0:
+                        gFixServeFail = 1
+                        go = 0
+                    else:
+                        gFixRequests = gFixRequests + 1
+    tcp.TcpListenerClose(listener)
+
+# 单用例执行: 调适配器 -> 回填提案数组与丢弃计数 (Into 模式)。
+fn fixtureRunCase(endpoint: str, model: str, tableText: str,
+                  allowCount: int32,
+                  outD: var int32[], outS: var int32[], outP: var int32[],
+                  outDropped: var int32): int32 =
+    return adapter.RsiGeneratorAdapterProposeInto(Fmt"{endpoint}",
+                                                  Fmt"{model}",
+                                                  Fmt"{tableText}",
+                                                  allowCount, outD, outS,
+                                                  outP, outDropped)
+
+fn main(): int32 =
+    echo("rsi_generator_adapter_smoke start")
+    # 夹具线程就绪 (单调钟 3s 帽; 轮询让步仅限测试夹具握手, 非生产路径)。
+    let serverThread = thread.StartFn(fixtureServerMain)
+    let t0: mono.MonoTime = mono.GetMonoTime()
+    let t0ns: int64 = mono.MonoTimeNs(t0)
+    var readySeen: int32 = 0
+    while readySeen == 0:
+        if gFixReady == 1:
+            readySeen = 1
+        else:
+            thread.Yield()
+            var tn: mono.MonoTime = mono.GetMonoTime()
+            let tns: int64 = mono.MonoTimeNs(tn)
+            if tns - t0ns > 3000000000:
+                echo("case_fixture FAIL: server thread not ready in 3s")
+                return 1
+    if gFixBindFail == 1:
+        echo("case_fixture FAIL: bind failed on candidate ports")
+        return 1
+    let endpoint: str = Fmt"http://127.0.0.1:{gFixPort}"
+    echo(Fmt"fixture ready port={gFixPort}")
+
+    # case_a: 合法提案 (ollama chat 形态, content 2 行合法三元组)。
+    gFixBody = "{\"model\":\"smoke-model\",\"created_at\":\"t\",\"message\":{\"role\":\"assistant\",\"content\":\"0 5 2\\n1 3 0\\n\"},\"done\":true}"
+    var aD: int32[]
+    var aS: int32[]
+    var aP: int32[]
+    var aDropped: int32 = 0
+    let aRc: int32 = fixtureRunCase(Fmt"{endpoint}", "smoke-model",
+                                    "0:0:0;1:0:0", 8, aD, aS, aP, aDropped)
+    if aRc != 0:
+        echo(Fmt"case_a FAIL: adapter_rc={aRc} (expected 0)")
+        return 1
+    if aS.len != 2:
+        echo(Fmt"case_a FAIL: proposals={aS.len} (expected 2)")
+        return 1
+    if aDropped != 0:
+        echo(Fmt"case_a FAIL: dropped={aDropped} (expected 0)")
+        return 1
+    let aD0: int32 = aD[0]
+    let aS0: int32 = aS[0]
+    let aP0: int32 = aP[0]
+    let aD1: int32 = aD[1]
+    let aS1: int32 = aS[1]
+    let aP1: int32 = aP[1]
+    if aD0 != 0 || aS0 != 5 || aP0 != 2 || aD1 != 1 || aS1 != 3 || aP1 != 0:
+        echo("case_a FAIL: proposal values mismatch")
+        return 1
+    echo("case_a PASS: valid proposals accepted rc=0 count=2 dropped=0")
+
+    # case_b: 畸形 JSON (HTTP 200 但体非 JSON) -> rc=7 可判别。
+    gFixBody = "oops not json at all"
+    var bD: int32[]
+    var bS: int32[]
+    var bP: int32[]
+    var bDropped: int32 = 0
+    let bRc: int32 = fixtureRunCase(Fmt"{endpoint}", "smoke-model",
+                                    "0:0:0", 8, bD, bS, bP, bDropped)
+    if bRc != 7:
+        echo(Fmt"case_b FAIL: adapter_rc={bRc} (expected 7)")
+        return 1
+    if bS.len != 0 || bDropped != 0:
+        echo(Fmt"case_b FAIL: proposals={bS.len} dropped={bDropped} (expected 0/0)")
+        return 1
+    echo("case_b PASS: malformed json rejected rc=7 no proposals")
+
+    # case_c: 越白名单 + 垃圾行混合, 白名单过滤逐行丢弃计数。
+    #   "1 1 0" 合法; "0 6 0" strategy 越界; "zz top" 非整数;
+    #   "9 9 9" 域越界; "0 5 2" 合法。
+    gFixBody = "{\"model\":\"smoke-model\",\"message\":{\"role\":\"assistant\",\"content\":\"1 1 0\\n0 6 0\\nzz top\\n9 9 9\\n0 5 2\\n\"},\"done\":true}"
+    var cD: int32[]
+    var cS: int32[]
+    var cP: int32[]
+    var cDropped: int32 = 0
+    let cRc: int32 = fixtureRunCase(Fmt"{endpoint}", "smoke-model",
+                                    "0:0:0", 8, cD, cS, cP, cDropped)
+    if cRc != 0:
+        echo(Fmt"case_c FAIL: adapter_rc={cRc} (expected 0)")
+        return 1
+    if cS.len != 2:
+        echo(Fmt"case_c FAIL: proposals={cS.len} (expected 2)")
+        return 1
+    if cDropped != 3:
+        echo(Fmt"case_c FAIL: dropped={cDropped} (expected 3)")
+        return 1
+    let cD0: int32 = cD[0]
+    let cS0: int32 = cS[0]
+    let cD1: int32 = cD[1]
+    let cS1: int32 = cS[1]
+    if cD0 != 1 || cS0 != 1 || cD1 != 0 || cS1 != 5:
+        echo("case_c FAIL: proposal values mismatch")
+        return 1
+    echo("case_c PASS: whitelist filter kept 2 dropped 3")
+
+    # case_d: allowCount 帽 (2 合法提案, 帽 1 -> 入列 1 丢弃 1)。
+    gFixBody = "{\"model\":\"smoke-model\",\"message\":{\"role\":\"assistant\",\"content\":\"0 0 0\\n0 1 0\\n\"},\"done\":true}"
+    var dD: int32[]
+    var dS: int32[]
+    var dP: int32[]
+    var dDropped: int32 = 0
+    let dRc: int32 = fixtureRunCase(Fmt"{endpoint}", "smoke-model",
+                                    "0:0:0", 1, dD, dS, dP, dDropped)
+    if dRc != 0:
+        echo(Fmt"case_d FAIL: adapter_rc={dRc} (expected 0)")
+        return 1
+    if dS.len != 1 || dDropped != 1:
+        echo(Fmt"case_d FAIL: proposals={dS.len} dropped={dDropped} (expected 1/1)")
+        return 1
+    echo("case_d PASS: allowCount cap kept 1 dropped 1")
+
+    # case_e: 连接失败 -> rc=2 (loopback 端口 1 无监听, 确定性拒连)。
+    var eD: int32[]
+    var eS: int32[]
+    var eP: int32[]
+    var eDropped: int32 = 0
+    let eRc: int32 = fixtureRunCase("http://127.0.0.1:1", "smoke-model",
+                                    "0:0:0", 8, eD, eS, eP, eDropped)
+    if eRc != 2:
+        echo(Fmt"case_e FAIL: adapter_rc={eRc} (expected 2)")
+        return 1
+    echo("case_e PASS: connect refused rc=2 skippable")
+
+    # 夹具收尾核对: 4 用例 4 请求, 服务线程零失败; 置停 + join。
+    gFixStop = 1
+    let joined: bool = thread.JoinThread(serverThread)
+    if !joined:
+        echo("case_fixture FAIL: server thread join failed")
+        return 1
+    if gFixServeFail != 0:
+        echo("case_fixture FAIL: server thread reported io failure")
+        return 1
+    if gFixRequests != 4:
+        echo(Fmt"case_fixture FAIL: requests={gFixRequests} (expected 4)")
+        return 1
+
+    # 可选活体探测: 本机 ollama 未启动则如实 SKIP, rc 不受影响。
+    let probeRes: Result[tcp.TcpConnectionHandle] = tcp.TcpConnect4Timeout(
+        "127.0.0.1", 11434, 800)
+    if IsErr(probeRes):
+        echo("live_ollama_probe: SKIP (11434 connect failed, ollama not running)")
+    else:
+        var probeConn: tcp.TcpConnectionHandle = Value(probeRes)
+        tcp.TcpClose(probeConn)
+        echo("live_ollama_probe: ollama reachable on 11434 (informational, rc unaffected)")
+    echo("rsi_generator_adapter_smoke ok")
+    return 0

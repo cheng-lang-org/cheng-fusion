@@ -760,10 +760,11 @@ function parseOrcRow(
     retainCount: uint(row.retainCount, `${label}.retainCount`),
     releaseCount: uint(row.releaseCount, `${label}.releaseCount`),
   };
+  const requiredReleaseCount = out.allocCount + out.retainCount;
   if (out.pathKind !== expectedPath || out.allocCount <= 0n ||
       out.allocCount !== out.freeCount || out.liveCount !== 0n ||
-      out.retainCount !== out.releaseCount) {
-    fail(`${label} ORC alloc/free/live or retain/release is unbalanced`);
+      out.releaseCount !== requiredReleaseCount) {
+    fail(`${label} ORC alloc/free/live or release conservation is unbalanced`);
   }
   if (success) {
     if (out.iterations !== 5000n || out.retainCount !== 5000n) {
@@ -1059,7 +1060,12 @@ export function verifyMemoryReleaseGate(manifestPath: string): MemoryReleaseGate
       row.cgroupEvidenceDirectory,
       `${row.caseId} cgroup directory`,
     );
-    const cgroup = verifyLinuxCgroupEvidenceDirectory(cgroupDir, "workload", row.caseId);
+    const cgroup = verifyLinuxCgroupEvidenceDirectory(
+      cgroupDir,
+      "workload",
+      "memory_release",
+      row.caseId,
+    );
     if (cgroup.receiptSha256 !== row.cgroupReceiptRaw32 ||
         cgroup.stdoutSha256 !== row.releaseReceiptRaw32) {
       fail(`${row.caseId} cgroup/release receipt manifest binding mismatch`);
@@ -1117,6 +1123,7 @@ export function verifyMemoryReleaseGate(manifestPath: string): MemoryReleaseGate
     const finalCgroup = verifyLinuxCgroupEvidenceDirectory(
       cgroupDir,
       "workload",
+      "memory_release",
       `${row.caseId} final`,
     );
     if (finalCgroup.receiptSha256 !== row.cgroupReceiptRaw32 ||

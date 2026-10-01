@@ -1,0 +1,334 @@
+# D5: 训练闭环版本 -> 推理执行器 CID 加载入口。
+#   真实 Qwen3.8 tiny 内步 SGD + token 加权外步合并产生 GlobalVersion;
+#   执行器侧只经 ModelExecutorLoadDiLoCoLinearWeightsFill 从 modelRef CID
+#   加载权重 (仓漂移/秩漂移硬错), greedy generate + 真 softmax NLL 度量;
+#   版本绑定哈希把 versionCid 与生成 token/NLL 锁死, 漂移必不同。
+#   训练前后同 prompt 各 generate/度量一次: NLL 必须下降。
+
+import std/result
+import std/os
+import std/rawbytes as rawbytes
+import std/strings as strings
+import cheng/std/bytes_layout as layout
+import cheng/libp2p/core/types
+import cheng/inference/qwen38_forward as fwd
+import cheng/inference/model_executor as exec
+import cheng/DiLoCo/core/diloco as core
+import cheng/DiLoCo/artifact/store as astore
+import cheng/DiLoCo/train/codec as codec
+import cheng/DiLoCo/train/inner_step as inner
+import cheng/DiLoCo/train/outer_merge as outer
+import cheng/DiLoCo/train/qwen38_inner as q38
+import cheng/DiLoCo/tests/support
+
+const
+    SmokeInnerSteps: int32 = 4
+    SmokeShardBytes: int32 = 64
+    SmokeLrNum: int32 = 1
+    SmokeLrDen: int32 = 64
+    SmokeTargetA: int32 = 7
+    SmokeTargetB: int32 = 21
+
+fn die(msg: str): int32 =
+    echo(msg)
+    return 1
+
+fn pairIds(a: int32, b: int32): int32[] =
+    var ids: int32[]
+    add(ids, a)
+    add(ids, b)
+    return ids
+
+@borrows
+fn putParams(store: var astore.DiLoCoArtifactStore,
+             jobBundleCid: layout.FixedBytes32,
+             values: int32[]): Result[core.DiLoCoArtifactRef] =
+    var packed = rawbytes.EmptyBytes()
+    let packRes = codec.DiLoCoTrainPackI32Fill(packed, values)
+    if IsErr(packRes):
+        return Err[core.DiLoCoArtifactRef](Error(packRes))
+    var artifactRef = core.DiLoCoArtifactRef()
+    let putRes = astore.DiLoCoArtifactStorePutFill(artifactRef, store, jobBundleCid, packed, SmokeShardBytes)
+    if IsErr(putRes):
+        return Err[core.DiLoCoArtifactRef](Error(putRes))
+    return Ok[core.DiLoCoArtifactRef](artifactRef)
+
+fn main(): int32 =
+    let tmpRoot = os.GetEnvDefault("CHENG_TASK_TMPDIR", "")
+    if tmpRoot == "":
+        return die("diloco_version_infer_smoke: CHENG_TASK_TMPDIR missing")
+
+    let planRes = q38.DiLoCoQwen38TinyPinnedPlanBuild()
+    if IsErr(planRes):
+        return die(Error(planRes))
+    let plan = Value(planRes)
+    let wRes = q38.DiLoCoQwen38TinyFrozenWeightsBuild()
+    if IsErr(wRes):
+        return die(Error(wRes))
+    let frozenWeights = Value(wRes)
+
+    let storeDir = tmpRoot + "/diloco-version-infer-artifacts"
+    var store = astore.DiLoCoArtifactStore()
+    let initRes = astore.DiLoCoArtifactStoreInitFill(store, storeDir)
+    if IsErr(initRes):
+        return die(Error(initRes))
+
+    let jobBundleCid = support.DiLoCoTestJobBundleCid("version-infer")
+    var leaderPeer: types.Libp2pPeerId
+    leaderPeer.value = support.DiLoCoTestJobBundleCid("version-infer-leader")
+    var workerPeer: types.Libp2pPeerId
+    workerPeer.value = support.DiLoCoTestJobBundleCid("version-infer-worker")
+
+    var zeros: int32[]
+    let zeroRes = inner.DiLoCoLinearZerosFill(zeros, fwd.Qwen38MiniVocab, fwd.Qwen38MiniHidden)
+    if IsErr(zeroRes):
+        return die(Error(zeroRes))
+    let modelPut = putParams(store, jobBundleCid, zeros)
+    if IsErr(modelPut):
+        return die(Error(modelPut))
+    let optPut = putParams(store, jobBundleCid, zeros)
+    if IsErr(optPut):
+        return die(Error(optPut))
+
+    var state = core.DiLoCoStateInit("diloco.version.infer")
+    var openedJob = core.DiLoCoJob()
+    var genesis = core.DiLoCoGlobalVersion()
+    let openRes = core.DiLoCoOpenJobFill(openedJob,
+                                           genesis,
+                                           state,
+                                           jobBundleCid,
+                                           2,
+                                           SmokeInnerSteps,
+                                           60,
+                                           Value(modelPut),
+                                           Value(optPut))
+    if IsErr(openRes):
+        return die(Error(openRes))
+
+    var cohort = core.DiLoCoCohort()
+    let joinL = core.DiLoCoJoinCohortFill(cohort, state, jobBundleCid, leaderPeer)
+    if IsErr(joinL):
+        return die(Error(joinL))
+    let joinW = core.DiLoCoJoinCohortFill(cohort, state, jobBundleCid, workerPeer)
+    if IsErr(joinW):
+        return die(Error(joinW))
+
+    var leaderLease = core.DiLoCoLease()
+    var workerLease = core.DiLoCoLease()
+    let ll = core.DiLoCoFetchLeaseFill(leaderLease, state, jobBundleCid, leaderPeer)
+    if IsErr(ll):
+        return die(Error(ll))
+    let wl = core.DiLoCoFetchLeaseFill(workerLease, state, jobBundleCid, workerPeer)
+    if IsErr(wl):
+        return die(Error(wl))
+
+    # held-out 样本: 冻结 last-hidden 量化输入 + one-hot 目标
+    var heldXs: int32[]
+    var heldYs: int32[]
+    var heldTargets: int32[]
+    let h0 = q38.DiLoCoQwen38TinyAppendSampleFill(heldXs, heldYs, frozenWeights, plan, pairIds(1, 2), SmokeTargetA)
+    if IsErr(h0):
+        return die(Error(h0))
+    add(heldTargets, SmokeTargetA)
+    let h1 = q38.DiLoCoQwen38TinyAppendSampleFill(heldXs, heldYs, frozenWeights, plan, pairIds(8, 9), SmokeTargetB)
+    if IsErr(h1):
+        return die(Error(h1))
+    add(heldTargets, SmokeTargetB)
+
+    # ---- 训练前: 执行器从 genesis.modelRef CID 加载 ----
+    var baseLoaded: int32[]
+    let baseLoadRes = exec.ModelExecutorLoadDiLoCoLinearWeightsFill(baseLoaded,
+                                                                      store,
+                                                                      genesis.modelRef,
+                                                                      fwd.Qwen38MiniVocab,
+                                                                      fwd.Qwen38MiniHidden)
+    if IsErr(baseLoadRes):
+        return die(Error(baseLoadRes))
+
+    var tokens0: int32[]
+    let greedy0Res = exec.ModelExecutorDiLoCoGreedyFill(tokens0,
+                                                          baseLoaded,
+                                                          heldXs,
+                                                          2,
+                                                          fwd.Qwen38MiniVocab,
+                                                          fwd.Qwen38MiniHidden)
+    if IsErr(greedy0Res):
+        return die(Error(greedy0Res))
+    let nll0Res = q38.DiLoCoQwen38TinyNllMicrosSum(baseLoaded, heldXs, heldTargets, 2,
+                                                     fwd.Qwen38MiniVocab, fwd.Qwen38MiniHidden)
+    if IsErr(nll0Res):
+        return die(Error(nll0Res))
+    let nll0 = Value(nll0Res)
+
+    # ---- 两工人真实内步 SGD (分歧批) ----
+    var xsA: int32[]
+    var ysA: int32[]
+    let a0 = q38.DiLoCoQwen38TinyAppendSampleFill(xsA, ysA, frozenWeights, plan, pairIds(3, 5), SmokeTargetA)
+    if IsErr(a0):
+        return die(Error(a0))
+    let a1 = q38.DiLoCoQwen38TinyAppendSampleFill(xsA, ysA, frozenWeights, plan, pairIds(4, 7), SmokeTargetA)
+    if IsErr(a1):
+        return die(Error(a1))
+    let a2 = q38.DiLoCoQwen38TinyAppendSampleFill(xsA, ysA, frozenWeights, plan, pairIds(5, 9), SmokeTargetA)
+    if IsErr(a2):
+        return die(Error(a2))
+    var xsB: int32[]
+    var ysB: int32[]
+    let b0 = q38.DiLoCoQwen38TinyAppendSampleFill(xsB, ysB, frozenWeights, plan, pairIds(8, 9), SmokeTargetB)
+    if IsErr(b0):
+        return die(Error(b0))
+    let b1 = q38.DiLoCoQwen38TinyAppendSampleFill(xsB, ysB, frozenWeights, plan, pairIds(8, 11), SmokeTargetB)
+    if IsErr(b1):
+        return die(Error(b1))
+    let b2 = q38.DiLoCoQwen38TinyAppendSampleFill(xsB, ysB, frozenWeights, plan, pairIds(9, 11), SmokeTargetB)
+    if IsErr(b2):
+        return die(Error(b2))
+
+    var wA: int32[]
+    var dA: int32[]
+    let innerA = inner.DiLoCoInnerSgdLinearFill(wA, dA, zeros, xsA, ysA, 3, SmokeInnerSteps,
+                                                  fwd.Qwen38MiniVocab, fwd.Qwen38MiniHidden,
+                                                  SmokeLrNum, SmokeLrDen)
+    if IsErr(innerA):
+        return die(Error(innerA))
+    var wB: int32[]
+    var dB: int32[]
+    let innerB = inner.DiLoCoInnerSgdLinearFill(wB, dB, zeros, xsB, ysB, 3, SmokeInnerSteps,
+                                                  fwd.Qwen38MiniVocab, fwd.Qwen38MiniHidden,
+                                                  SmokeLrNum, SmokeLrDen)
+    if IsErr(innerB):
+        return die(Error(innerB))
+
+    var barrier = core.DiLoCoBarrier()
+    let brA = core.DiLoCoReportInnerStepDoneFill(barrier, state, jobBundleCid, leaderPeer)
+    if IsErr(brA):
+        return die(Error(brA))
+    let brB = core.DiLoCoReportInnerStepDoneFill(barrier, state, jobBundleCid, workerPeer)
+    if IsErr(brB):
+        return die(Error(brB))
+
+    let deltaAPut = putParams(store, jobBundleCid, dA)
+    if IsErr(deltaAPut):
+        return die(Error(deltaAPut))
+    let deltaBPut = putParams(store, jobBundleCid, dB)
+    if IsErr(deltaBPut):
+        return die(Error(deltaBPut))
+    let optAPut = putParams(store, jobBundleCid, zeros)
+    if IsErr(optAPut):
+        return die(Error(optAPut))
+    let optBPut = putParams(store, jobBundleCid, zeros)
+    if IsErr(optBPut):
+        return die(Error(optBPut))
+
+    let tokensCount: int32 = 3 * 2 * SmokeInnerSteps
+    var deltaRecA = core.DiLoCoOuterDelta()
+    let subA = core.DiLoCoSubmitOuterDeltaFill(deltaRecA,
+                                                 state,
+                                                 jobBundleCid,
+                                                 leaderLease.baseVersionCid,
+                                                 leaderLease.outerStep,
+                                                 leaderPeer,
+                                                 Value(deltaAPut),
+                                                 Value(optAPut),
+                                                 3,
+                                                 tokensCount,
+                                                 SmokeInnerSteps,
+                                                 tokensCount,
+                                                 1)
+    if IsErr(subA):
+        return die(Error(subA))
+    var deltaRecB = core.DiLoCoOuterDelta()
+    let subB = core.DiLoCoSubmitOuterDeltaFill(deltaRecB,
+                                                 state,
+                                                 jobBundleCid,
+                                                 workerLease.baseVersionCid,
+                                                 workerLease.outerStep,
+                                                 workerPeer,
+                                                 Value(deltaBPut),
+                                                 Value(optBPut),
+                                                 3,
+                                                 tokensCount,
+                                                 SmokeInnerSteps,
+                                                 tokensCount,
+                                                 1)
+    if IsErr(subB):
+        return die(Error(subB))
+
+    var commit = core.DiLoCoMergeCommit()
+    var version = core.DiLoCoGlobalVersion()
+    let mergeRes = outer.DiLoCoOuterMergeAndPublishFill(commit,
+                                                          version,
+                                                          store,
+                                                          state,
+                                                          jobBundleCid,
+                                                          leaderPeer,
+                                                          SmokeShardBytes)
+    if IsErr(mergeRes):
+        return die(Error(mergeRes))
+
+    # ---- 训练后: 执行器从合并版本 CID 加载 + 同 prompt generate/度量 ----
+    var mergedLoaded: int32[]
+    let mergedLoadRes = exec.ModelExecutorLoadDiLoCoLinearWeightsFill(mergedLoaded,
+                                                                        store,
+                                                                        version.modelRef,
+                                                                        fwd.Qwen38MiniVocab,
+                                                                        fwd.Qwen38MiniHidden)
+    if IsErr(mergedLoadRes):
+        return die(Error(mergedLoadRes))
+
+    var tokens1: int32[]
+    let greedy1Res = exec.ModelExecutorDiLoCoGreedyFill(tokens1,
+                                                          mergedLoaded,
+                                                          heldXs,
+                                                          2,
+                                                          fwd.Qwen38MiniVocab,
+                                                          fwd.Qwen38MiniHidden)
+    if IsErr(greedy1Res):
+        return die(Error(greedy1Res))
+    let nll1Res = q38.DiLoCoQwen38TinyNllMicrosSum(mergedLoaded, heldXs, heldTargets, 2,
+                                                     fwd.Qwen38MiniVocab, fwd.Qwen38MiniHidden)
+    if IsErr(nll1Res):
+        return die(Error(nll1Res))
+    let nll1 = Value(nll1Res)
+    if nll1 >= nll0:
+        echo(strings.ConcatStr(" diloco_version_infer_smoke: nll did not fall nll0=",
+                               strings.Int64ToStr(nll0)))
+        echo(strings.ConcatStr("nll1=", strings.Int64ToStr(nll1)))
+        return die("diloco_version_infer_smoke: nll regression")
+
+    # ---- 版本绑定: versionCid 与生成/NLL 锁死, 漂移必不同 ----
+    let bind0 = exec.ModelExecutorDiLoCoVersionBindHash(layout.FixedBytes32Hex(genesis.versionCid), tokens0, nll0)
+    let bind1 = exec.ModelExecutorDiLoCoVersionBindHash(layout.FixedBytes32Hex(version.versionCid), tokens1, nll1)
+    assert(bind0 != bind1, " diloco_version_infer_smoke: version binding must differ")
+    let bindCross = exec.ModelExecutorDiLoCoVersionBindHash(layout.FixedBytes32Hex(genesis.versionCid), tokens1, nll1)
+    assert(bindCross != bind1, " diloco_version_infer_smoke: cid drift must change binding")
+
+    # ---- 秩漂移硬错: 用错误维度加载必须 Err ----
+    var wrongRank: int32[]
+    let wrongRankRes = exec.ModelExecutorLoadDiLoCoLinearWeightsFill(wrongRank,
+                                                                       store,
+                                                                       version.modelRef,
+                                                                       fwd.Qwen38MiniVocab - 1,
+                                                                       fwd.Qwen38MiniHidden)
+    assert(IsErr(wrongRankRes), " diloco_version_infer_smoke: rank drift must fail load")
+
+    # ---- 仓页篡改硬错: 篡改磁盘字节后重载必须 Err ----
+    let victimPath = astore.DiLoCoArtifactStoreBlobPath(storeDir, version.modelRef.blobCid)
+    var victimRead = os.ReadFileBytesResult(victimPath)
+    if IsErr(victimRead):
+        return die(Error(victimRead))
+    var tampered = Value(victimRead)
+    rawbytes.BytesSet(tampered, 4, (rawbytes.BytesGet(tampered, 4) + 1) % 256)
+    let tamperWrite = os.WriteFileBytesResult(victimPath, tampered)
+    if IsErr(tamperWrite):
+        return die(Error(tamperWrite))
+    var tamperedLoad: int32[]
+    let tamperedRes = exec.ModelExecutorLoadDiLoCoLinearWeightsFill(tamperedLoad,
+                                                                      store,
+                                                                      version.modelRef,
+                                                                      fwd.Qwen38MiniVocab,
+                                                                      fwd.Qwen38MiniHidden)
+    assert(IsErr(tamperedRes), " diloco_version_infer_smoke: forged page must fail load")
+
+    echo(" diloco_version_infer_smoke ok")
+    return 0

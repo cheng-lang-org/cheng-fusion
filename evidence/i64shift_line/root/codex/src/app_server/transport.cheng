@@ -1,0 +1,597 @@
+# App server transport layer
+# Connects the exec pipeline to the Codex app-server via HTTP.
+#
+# URL discovery (from CODEX_HOME):
+#   1. Unix socket at $CODEX_HOME/app-server.sock (not yet supported by HTTP transport)
+#   2. Port file at $CODEX_HOME/app-server.port
+#   3. Default http://127.0.0.1:4500
+#
+# Request format: POST to {baseUrl}/{method} with JSON body
+
+import std/os
+import std/strings
+import std/system
+import cheng/codex/config/home
+
+# Direct @importc declarations to avoid cross-module cold-path linker issues.
+# The cold path cannot resolve Cheng function bodies from transitively
+# imported modules, so every external symbol we need is declared here as
+# a direct C import rather than calling through an intermediate module.
+
+@importc("calloc")
+fn httpTransportCalloc(count: int64, size: int64): ptr
+
+@importc("memcpy")
+fn httpTransportMemcpy(dst: ptr, src: ptr, count: int64): ptr
+
+@importc("free")
+fn httpTransportFree(raw: ptr)
+
+@abi_internal
+@importc("ConcatStr")
+fn concatStr(a: str, b: str): str
+
+@abi_internal
+@importc("RustCsgSliceBytes")
+fn sliceBytes(text: str, start: int32, count: int32): str
+
+@ffi_owned_result(free = free)
+@importc("cheng_http_post")
+fn httpRawPostAbi(url: cstring, body: cstring, headers: cstring): owned_cstring
+
+fn httpTransportCString(text: str): cstring =
+    let raw = httpTransportCalloc(int64(text.len) + int64(1), int64(1))
+    if raw == nil:
+        return cstring(nil)
+    if text.len > 0:
+        httpTransportMemcpy(raw, text.data, int64(text.len))
+    return cstring(raw)
+
+fn httpTransportFreeCString(raw: cstring) =
+    if ptr(raw) != nil:
+        httpTransportFree(ptr(raw))
+
+fn httpRawPost(url: str, body: str, headers: str): str =
+    let urlRaw = httpTransportCString(url)
+    let bodyRaw = httpTransportCString(body)
+    let headersRaw = httpTransportCString(headers)
+    let out: str = httpRawPostAbi(urlRaw, bodyRaw, headersRaw)
+    httpTransportFreeCString(urlRaw)
+    httpTransportFreeCString(bodyRaw)
+    httpTransportFreeCString(headersRaw)
+    return out
+
+# Thin string-concat helper (compiler inlines the @importc).
+fn RustCsgCat(a: str, b: str): str =
+    return concatStr(a, b)
+
+type
+    AppServerTransport =
+        baseUrl: str
+        errMsg: str
+
+    # Local HTTP result type, mirrors http.HttpResult.
+    HttpResult =
+        ok: bool
+        statusCode: int32
+        body: str
+        error: str
+
+const
+    AppServerDefaultPort: int32 = 4500
+    AppServerPortFileName: str = "app-server.port"
+
+# ─── Factory ─────────────────────────────────────────────────────────────────
+
+# Create an AppServerTransport with given baseUrl and errMsg.
+fn AppServerNew(baseUrl: str, errMsg: str): AppServerTransport =
+    var t: AppServerTransport
+    t.baseUrl = baseUrl
+    t.errMsg = errMsg
+    return t
+
+# ─── URL discovery ───────────────────────────────────────────────────────────
+
+# Discover app-server URL from CODEX_HOME.
+# Priority: port file > default 127.0.0.1:4500
+fn AppServerConnect(): AppServerTransport =
+    var result: AppServerTransport
+    let codexHome = home.RustCsgFindCodexHome()
+    let codexHomeErr = codexHome.error
+    let codexHomePath = codexHome.path
+    if codexHomeErr != "":
+        result.errMsg = RustCsgCat("codex home error: ", codexHomeErr)
+        return result
+
+    var port: int32
+    port = AppServerDefaultPort
+
+    # Check for port file at $CODEX_HOME/app-server.port
+    let portFilePath = home.RustCsgPathJoinChild(codexHomePath, AppServerPortFileName)
+    let portFileMetadata = home.RustCsgPathMetadataKind(portFilePath)
+    if portFileMetadata > 0:
+        let portFileContent = home.RustCsgReadFile(portFilePath)
+        if strings.Len(portFileContent) > 0:
+            var trimmed: str
+            let pflen: int32 = strings.Len(portFileContent)
+            var startIdx: int32
+            startIdx = 0
+            while startIdx < pflen:
+                if portFileContent[startIdx] == ' ':
+                    startIdx = startIdx + 1
+                elif portFileContent[startIdx] == '\n':
+                    startIdx = startIdx + 1
+                elif portFileContent[startIdx] == '\r':
+                    startIdx = startIdx + 1
+                elif portFileContent[startIdx] == '\t':
+                    startIdx = startIdx + 1
+                else:
+                    break
+            var endIdx: int32
+            endIdx = pflen
+            while endIdx > startIdx:
+                if portFileContent[endIdx - 1] == ' ':
+                    endIdx = endIdx - 1
+                elif portFileContent[endIdx - 1] == '\n':
+                    endIdx = endIdx - 1
+                elif portFileContent[endIdx - 1] == '\r':
+                    endIdx = endIdx - 1
+                elif portFileContent[endIdx - 1] == '\t':
+                    endIdx = endIdx - 1
+                else:
+                    break
+            if endIdx > startIdx:
+                trimmed = sliceBytes(portFileContent, startIdx, endIdx - startIdx)
+                var parsedPort: int32
+                parsedPort = 0
+                var isDigit: bool
+                isDigit = true
+                var pi: int32
+                for pi in pi..<strings.Len(trimmed):
+                    if trimmed[pi] >= '0':
+                        if trimmed[pi] <= '9':
+                            parsedPort = parsedPort * 10 + (int32(trimmed[pi]) - int32('0'))
+                        else:
+                            isDigit = false
+                            break
+                    else:
+                        isDigit = false
+                        break
+                if isDigit:
+                    if parsedPort > 0:
+                        if parsedPort < 65536:
+                            port = parsedPort
+
+    result.baseUrl = RustCsgCat("http://127.0.0.1:", strings.IntToStr(port))
+    return result
+
+# ─── Single request ──────────────────────────────────────────────────────────
+
+# Parse HTTP provider JSON response into HttpResult.
+# Response format (from the pure Cheng HTTP provider):
+#   Success: {"status":200,"body":"..."}
+#   Error:   {"error":"..."}
+fn httpParseResponse(json: str): HttpResult =
+    var result: HttpResult
+    let n: int32 = strings.Len(json)
+    if n == 0:
+        result.error = "http provider returned empty response"
+        return result
+
+    # Check for error: {"error":"..."}
+    if strings.HasPrefix(json, "{\"error\":"):
+        var i: int32 = 9
+        while i < n:
+            if json[i] != '"':
+                i = i + 1
+            else:
+                break
+        i = i + 1
+        let errStart: int32 = i
+        while i < n:
+            if json[i] != '"':
+                i = i + 1
+            else:
+                break
+        result.error = strings.SliceBytes(json, errStart, i - errStart)
+        return result
+
+    # Check for success: {"status":200,"body":"..."}
+    if strings.HasPrefix(json, "{\"status\":"):
+        var i: int32 = 10
+        var code: int32 = 0
+        while i < n:
+            if json[i] >= '0':
+                if json[i] <= '9':
+                    code = code * 10 + (int32(json[i]) - int32('0'))
+                    i = i + 1
+                else:
+                    break
+            else:
+                break
+        result.statusCode = code
+
+        # Find "body": (key)
+        while i < n:
+            if i + 6 < n:
+                if json[i] == '"':
+                    if json[i+1] == 'b':
+                        if json[i+2] == 'o':
+                            if json[i+3] == 'd':
+                                if json[i+4] == 'y':
+                                    if json[i+5] == '"':
+                                        if json[i+6] == ':':
+                                            i = i + 7
+                                            break
+            i = i + 1
+
+        # Skip opening " of body value
+        if i < n:
+            if json[i] == '"':
+                i = i + 1
+                let bodyStart: int32 = i
+                while i < n:
+                    if json[i] == '\\':
+                        i = i + 1
+                        if i < n:
+                            i = i + 1
+                    elif json[i] == '"':
+                        break
+                    else:
+                        i = i + 1
+                let bodyLen: int32 = i - bodyStart
+                if bodyLen > 0:
+                    result.body = strings.SliceBytes(json, bodyStart, bodyLen)
+        result.ok = true
+        return result
+
+    result.error = "unrecognized response from http provider"
+    return result
+
+# Send a JSON-RPC-like request to the app-server.
+# POST to {baseUrl}/{method} with params as JSON body.
+fn AppServerRequest(transport: AppServerTransport, method: str, params: str): HttpResult =
+    var result: HttpResult
+    let trErr = transport.errMsg
+    if trErr != "":
+        result.error = trErr
+        return result
+
+    let trBaseUrl = transport.baseUrl
+    let url = RustCsgCat(RustCsgCat(trBaseUrl, "/"), method)
+    let headers = "[\"Content-Type: application/json\"]"
+    let rawJson = httpRawPost(url, params, headers)
+
+    return httpParseResponse(rawJson)
+
+# ─── JSON array parsing ──────────────────────────────────────────────────────
+
+# Parse a JSON array of objects into individual element strings.
+# Each element is returned as a complete JSON object string (with braces).
+fn RustCsgJsonArrayToObjectArray(arrayJson: str): str[] =
+    var out: str[]
+    var pos: int32
+    pos = 0
+
+    # Skip to opening '['
+    while pos < arrayJson.len:
+        if arrayJson[pos] == '[':
+            break
+        pos = pos + 1
+    if pos >= arrayJson.len:
+        return out
+    pos = pos + 1  # skip '['
+
+    while pos < arrayJson.len:
+        # Skip whitespace
+        while pos < arrayJson.len:
+            if arrayJson[pos] == ' ':
+                pos = pos + 1
+            elif arrayJson[pos] == '\n':
+                pos = pos + 1
+            elif arrayJson[pos] == '\r':
+                pos = pos + 1
+            elif arrayJson[pos] == '\t':
+                pos = pos + 1
+            else:
+                break
+
+        if pos >= arrayJson.len:
+            break
+        if arrayJson[pos] == ']':
+            break
+
+        # Skip commas between elements
+        if arrayJson[pos] == ',':
+            pos = pos + 1
+            continue
+
+        # Extract object tracking brace depth
+        if arrayJson[pos] == '{':
+            var depth: int32 = 1
+            var startPos: int32
+            startPos = pos
+            pos = pos + 1
+            var keepScan: bool
+            keepScan = pos < arrayJson.len
+            if keepScan:
+                keepScan = depth > 0
+            while keepScan:
+                if arrayJson[pos] == '"':
+                    # Skip string content (handle escaped chars)
+                    pos = pos + 1
+                    while pos < arrayJson.len:
+                        if arrayJson[pos] == '\\':
+                            pos = pos + 1
+                        elif arrayJson[pos] == '"':
+                            break
+                        pos = pos + 1
+                elif arrayJson[pos] == '{':
+                    depth = depth + 1
+                elif arrayJson[pos] == '}':
+                    depth = depth - 1
+                pos = pos + 1
+                keepScan = pos < arrayJson.len
+                if keepScan:
+                    keepScan = depth > 0
+            if depth == 0:
+                var element: str
+                element = sliceBytes(arrayJson, startPos, pos - startPos)
+                add(out, element)
+        else:
+            pos = pos + 1
+
+    return out
+
+# ─── Request sequence ────────────────────────────────────────────────────────
+
+# Local JSON helpers (avoid wire.cheng dependency for cold-path linking).
+
+# Find the start of a JSON value for a given key.
+# Searches for `"key":` pattern in the text directly (no string concatenation).
+fn jsonValueStart(text: str, key: str): int32 =
+    var i: int32
+    i = 0
+    while i < text.len:
+        # Look for opening quote of a JSON key
+        if text[i] != '"':
+            i = i + 1
+            continue
+
+        # Found a quote, check if it's followed by the key
+        i = i + 1  # skip opening quote
+        var j: int32
+        j = 0
+        while j < key.len:
+            if i + j >= text.len:
+                i = i + j
+                break
+            if text[i + j] != key[j]:
+                break
+            j = j + 1
+
+        if j < key.len:
+            # Key doesn't match, continue from after opening quote
+            i = i + 1
+            continue
+
+        # Key matched, check for closing quote
+        var p: int32
+        p = i + key.len
+        if p >= text.len:
+            break
+        if text[p] != '"':
+            i = p + 1
+            continue
+
+        # Found "key", now look for ':'
+        p = p + 1  # skip closing quote
+        # Skip spaces
+        while p < text.len:
+            if text[p] == ' ':
+                p = p + 1
+            elif text[p] == '\n':
+                p = p + 1
+            elif text[p] == '\r':
+                p = p + 1
+            elif text[p] == '\t':
+                p = p + 1
+            else:
+                break
+        if p < text.len and text[p] == ':':
+            p = p + 1
+            # Skip spaces after ':'
+            while p < text.len:
+                if text[p] == ' ':
+                    p = p + 1
+                elif text[p] == '\n':
+                    p = p + 1
+                elif text[p] == '\r':
+                    p = p + 1
+                elif text[p] == '\t':
+                    p = p + 1
+                else:
+                    break
+            return p
+
+        # Found "key" but no ':', continue searching
+        i = p + 1
+
+    return -1
+
+# Extract a string field value from JSON by key.
+fn RustCsgJsonFindStr(text: str, key: str): str =
+    let p = jsonValueStart(text, key)
+    if p < 0:
+        return ""
+    if p >= text.len:
+        return ""
+    if text[p] != '"':
+        return ""
+    let valueStart: int32 = p + 1
+    var i: int32
+    i = valueStart
+    while i < text.len:
+        if text[i] == '\\':
+            i = i + 1
+        elif text[i] == '"':
+            return sliceBytes(text, valueStart, i - valueStart)
+        i = i + 1
+    return ""
+
+# Extract a raw JSON value for a given key (object, array, string, number, bool).
+fn RustCsgJsonFindValueRaw(text: str, key: str): str =
+    let p = jsonValueStart(text, key)
+    if p < 0:
+        return ""
+    if p >= text.len:
+        return ""
+    let ch = text[p]
+    var keepScan: bool
+    if ch == '{':
+        var depth: int32 = 1
+        var inStr: bool
+        var i: int32
+        i = p + 1
+        keepScan = i < text.len
+        if keepScan:
+            keepScan = depth > 0
+        while keepScan:
+            if inStr:
+                if text[i] == '\\':
+                    i = i + 1
+                elif text[i] == '"':
+                    inStr = false
+            elif text[i] == '"':
+                inStr = true
+            elif text[i] == '{':
+                depth = depth + 1
+            elif text[i] == '}':
+                depth = depth - 1
+            i = i + 1
+            keepScan = i < text.len
+            if keepScan:
+                keepScan = depth > 0
+        if depth == 0:
+            return sliceBytes(text, p, i - p)
+        return ""
+    if ch == '[':
+        var depth: int32 = 1
+        var inStr: bool
+        var i: int32
+        i = p + 1
+        keepScan = i < text.len
+        if keepScan:
+            keepScan = depth > 0
+        while keepScan:
+            if inStr:
+                if text[i] == '\\':
+                    i = i + 1
+                elif text[i] == '"':
+                    inStr = false
+            elif text[i] == '"':
+                inStr = true
+            elif text[i] == '[':
+                depth = depth + 1
+            elif text[i] == ']':
+                depth = depth - 1
+            i = i + 1
+            keepScan = i < text.len
+            if keepScan:
+                keepScan = depth > 0
+        if depth == 0:
+            return sliceBytes(text, p, i - p)
+        return ""
+    if ch == '"':
+        var i: int32
+        i = p + 1
+        while i < text.len:
+            if text[i] == '\\':
+                i = i + 1
+            elif text[i] == '"':
+                var inner: str
+                inner = sliceBytes(text, p, i - p + 1)
+                return inner
+            i = i + 1
+        return ""
+    # Number or keyword (true/false/null)
+    var i: int32
+    i = p
+    while i < text.len:
+        if text[i] == ',':
+            break
+        if text[i] == '}':
+            break
+        if text[i] == ']':
+            break
+        if text[i] == ' ':
+            break
+        if text[i] == '\n':
+            break
+        if text[i] == '\r':
+            break
+        if text[i] == '\t':
+            break
+        i = i + 1
+    return sliceBytes(text, p, i - p)
+
+# Quote a string as a JSON string value.
+fn RustCsgJsonQuote(value: str): str =
+    var out = "\""
+    var i: int32
+    i = 0
+    while i < value.len:
+        if value[i] == '"':
+            out = RustCsgCat(out, "\\\"")
+        elif value[i] == '\\':
+            out = RustCsgCat(out, "\\\\")
+        elif value[i] == '\n':
+            out = RustCsgCat(out, "\\n")
+        elif value[i] == '\r':
+            out = RustCsgCat(out, "\\r")
+        elif value[i] == '\t':
+            out = RustCsgCat(out, "\\t")
+        else:
+            out = RustCsgCat(out, sliceBytes(value, i, 1))
+        i = i + 1
+    out = RustCsgCat(out, "\"")
+    return out
+
+# Send a full request sequence to the app-server.
+# Parses the requestSequence JSON array and sends each request sequentially.
+# Hard-fails on connection errors.
+# Returns a JSON array of response bodies on success, or {"error":"..."} on failure.
+fn AppServerSend(transport: AppServerTransport, requestSequenceJson: str): str =
+    if transport.errMsg != "":
+        return "[]"
+
+    let requests = RustCsgJsonArrayToObjectArray(requestSequenceJson)
+    var responses: str[]
+
+    var i: int32
+    for i in i..<requests.len:
+        let requestObj = requests[i]
+        let method = RustCsgJsonFindStr(requestObj, "method")
+        let params = RustCsgJsonFindValueRaw(requestObj, "params")
+
+        if method == "":
+            return RustCsgCat(
+                RustCsgCat("{\"error\":\"missing method in request ", strings.IntToStr(i)),
+                "\"}")
+
+        let httpResult = AppServerRequest(transport, method, params)
+        if !httpResult.ok:
+            let httpErr = httpResult.error
+            return RustCsgCat(RustCsgCat("{\"error\":\"", httpErr), "\"}")
+
+        add(responses, httpResult.body)
+
+    # Build JSON response array
+    var out = "["
+    var j: int32
+    for j in j..<responses.len:
+        if j > 0:
+            out = RustCsgCat(out, ",")
+        out = RustCsgCat(out, RustCsgJsonQuote(responses[j]))
+    out = RustCsgCat(out, "]")
+    return out

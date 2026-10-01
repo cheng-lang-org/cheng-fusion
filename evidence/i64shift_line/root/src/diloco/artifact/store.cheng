@@ -1,0 +1,196 @@
+# D1 工件仓: DiLoCoArtifactRef <-> 真字节落盘。blobCid 即落盘页内容哈希键。
+# 生产纪律 (no fallback / let it crash):
+#   - put 幂等: 同字节重写 -> 同 blobCid, 已在页不重写; 已在页与本次字节漂移 = Err。
+#   - 写入复用 cas_store 的 tmp+rename 原子上位; 落盘后立即读回校验 payloadLen+blobCid。
+#   - get miss / 长度漂移 / 哈希漂移 = Err 硬错, 绝不静默兜底回磁盘或返回未校验字节。
+#   - storeHash 口径与 weight_store 一致 (HashStep 524287/113 混合)。
+
+import std/result
+import std/os
+import std/rawbytes as rawbytes
+import cheng/std/bytes_layout as layout
+import cheng/core/tooling/path as chengpath
+import cheng/libp2p/cas_store as cas
+import cheng/DiLoCo/core/diloco as core
+
+const
+    DiLoCoArtifactStoreSchemaText = "cheng.diloco.artifact.store.v1"
+
+type
+    DiLoCoArtifactStoreEntry =
+        blobCid: layout.FixedBytes32
+        payloadLen: int32
+        shardPayloadBytes: int32
+
+    DiLoCoArtifactStore =
+        schema: str
+        rootDir: str
+        entries: DiLoCoArtifactStoreEntry[]
+        storeHash: int64
+
+# ---- hash 口径 (同 weight_store WeightTensorHashStep) ----
+
+fn DiLoCoArtifactStoreHashStep(hashValue: int64, value: int64): int64 =
+    let mixed = hashValue * int64(524287) + value + int64(113)
+    if mixed < int64(0):
+        return int64(0) - mixed
+    return mixed
+
+@borrows
+fn DiLoCoArtifactStoreHashText(hashValue: int64, text: str): int64 =
+    var h = hashValue
+    for i in 0..<len(text):
+        h = DiLoCoArtifactStoreHashStep(h, int64(Int32(text[i])))
+    return h
+
+@borrows
+fn DiLoCoArtifactStoreHashBytes(hashValue: int64, bytes: rawbytes.Bytes): int64 =
+    var h = hashValue
+    for i in 0..<rawbytes.BytesLen(bytes):
+        h = DiLoCoArtifactStoreHashStep(h, int64(rawbytes.BytesGet(bytes, i)))
+    return h
+
+# ---- 磁盘布局路径 (rootDir 显式参数, 无魔法发现) ----
+
+@borrows
+fn DiLoCoArtifactStoreBlobsDir(rootDir: str): str =
+    return rootDir + "/blobs"
+
+@borrows
+fn DiLoCoArtifactStoreBlobPath(rootDir: str, blobCid: layout.FixedBytes32): str =
+    let cidHex = layout.FixedBytes32Hex(blobCid)
+    let shard = chengpath.TextSlice(cidHex, 0, 2)
+    return DiLoCoArtifactStoreBlobsDir(rootDir) + "/" + shard + "/" + cidHex + ".blob"
+
+@borrows
+fn DiLoCoArtifactStoreTmpPath(rootDir: str, blobCid: layout.FixedBytes32): str =
+    let cidHex = layout.FixedBytes32Hex(blobCid)
+    return DiLoCoArtifactStoreBlobsDir(rootDir) + "/tmp/" + cidHex + ".tmp"
+
+# ---- store 生命周期 ----
+
+@borrows
+fn DiLoCoArtifactStoreInitFill(out: var DiLoCoArtifactStore, rootDir: str): Result[bool] =
+    if rootDir == "":
+        return Err[bool](" diloco artifact store: empty root dir")
+    os.MkdirAll(rootDir, 493)
+    os.MkdirAll(DiLoCoArtifactStoreBlobsDir(rootDir), 493)
+    os.MkdirAll(DiLoCoArtifactStoreBlobsDir(rootDir) + "/tmp", 493)
+    out = DiLoCoArtifactStore(schema: DiLoCoArtifactStoreSchemaText, rootDir: rootDir)
+    out.storeHash = DiLoCoArtifactStoreHashText(int64(113), DiLoCoArtifactStoreSchemaText)
+    out.storeHash = DiLoCoArtifactStoreHashText(out.storeHash, rootDir)
+    return Ok[bool](true)
+
+@borrows
+fn DiLoCoArtifactStoreFindEntry(store: DiLoCoArtifactStore,
+                                  blobCid: layout.FixedBytes32): int32 =
+    for i in 0..<store.entries.len:
+        if layout.FixedBytes32Equal(store.entries[i].blobCid, blobCid):
+            return i
+    return -1
+
+fn DiLoCoArtifactStoreRecomputeHash(store: DiLoCoArtifactStore): int64 =
+    var h = DiLoCoArtifactStoreHashText(int64(113), store.schema)
+    h = DiLoCoArtifactStoreHashText(h, store.rootDir)
+    for i in 0..<store.entries.len:
+        h = DiLoCoArtifactStoreHashBytes(h, layout.FixedBytes32ToBytes(store.entries[i].blobCid))
+        h = DiLoCoArtifactStoreHashStep(h, int64(store.entries[i].payloadLen))
+        h = DiLoCoArtifactStoreHashStep(h, int64(store.entries[i].shardPayloadBytes))
+    return h
+
+# ---- 字节 <-> ref 绑定校验 (put 回读与 get 共用) ----
+
+@borrows
+fn DiLoCoArtifactStoreBytesMatchRef(bytes: rawbytes.Bytes,
+                                      artifactRef: core.DiLoCoArtifactRef): Result[bool] =
+    if rawbytes.BytesLen(bytes) != artifactRef.payloadLen:
+        return Err[bool](" diloco artifact store: payload len drift")
+    let actualCid = core.DiLoCoArtifactBytesCid(bytes)
+    if !layout.FixedBytes32Equal(actualCid, artifactRef.blobCid):
+        return Err[bool](" diloco artifact store: blob cid drift")
+    return Ok[bool](true)
+
+# ---- 读: ref -> 与 CID 一致的真字节 ----
+
+@borrows
+fn DiLoCoArtifactStoreReadVerifiedFill(out: var rawbytes.Bytes,
+                                         rootDir: str,
+                                         artifactRef: core.DiLoCoArtifactRef): Result[bool] =
+    let validateRes = core.DiLoCoArtifactRefValidate(artifactRef)
+    if IsErr(validateRes):
+        return Err[bool](Error(validateRes))
+    let blobPath = DiLoCoArtifactStoreBlobPath(rootDir, artifactRef.blobCid)
+    if !os.FileExists(blobPath):
+        return Err[bool](" diloco artifact store: blob miss " + blobPath)
+    var readRes: Result[rawbytes.Bytes] = os.ReadFileBytesResult(blobPath)
+    if IsErr(readRes):
+        return Err[bool](" diloco artifact store: blob read failed " + blobPath)
+    out = Value(readRes)
+    let matchRes = DiLoCoArtifactStoreBytesMatchRef(out, artifactRef)
+    if IsErr(matchRes):
+        return Err[bool](Error(matchRes))
+    return Ok[bool](true)
+
+@borrows
+fn DiLoCoArtifactStoreGetFill(out: var rawbytes.Bytes,
+                                store: DiLoCoArtifactStore,
+                                artifactRef: core.DiLoCoArtifactRef): Result[bool] =
+    return DiLoCoArtifactStoreReadVerifiedFill(out, store.rootDir, artifactRef)
+
+# ---- 写: 真字节 -> ref (blobCid/payloadLen 绑定落盘页) ----
+
+@borrows
+fn DiLoCoArtifactStorePutFill(outRef: var core.DiLoCoArtifactRef,
+                                store: var DiLoCoArtifactStore,
+                                jobBundleCid: layout.FixedBytes32,
+                                payload: rawbytes.Bytes,
+                                shardPayloadBytes: int32): Result[bool] =
+    let fillRes = core.DiLoCoArtifactRefFromBytesFill(outRef,
+                                                        jobBundleCid,
+                                                        payload,
+                                                        shardPayloadBytes,
+                                                        "")
+    if IsErr(fillRes):
+        return Err[bool](Error(fillRes))
+    let cidHex = layout.FixedBytes32Hex(outRef.blobCid)
+    let shardDir = DiLoCoArtifactStoreBlobsDir(store.rootDir) + "/" + chengpath.TextSlice(cidHex, 0, 2)
+    let blobPath = shardDir + "/" + cidHex + ".blob"
+    if os.FileExists(blobPath):
+        # 内容寻址幂等: 已在页必须与本次字节一致, 漂移硬错不覆盖
+        var existRead: Result[rawbytes.Bytes] = os.ReadFileBytesResult(blobPath)
+        if IsErr(existRead):
+            return Err[bool](" diloco artifact store: existing blob unreadable " + blobPath)
+        let existMatch = DiLoCoArtifactStoreBytesMatchRef(Value(existRead), outRef)
+        if IsErr(existMatch):
+            return Err[bool](Error(existMatch))
+    else:
+        os.MkdirAll(shardDir, 493)
+        let writeRes = cas.casWriteBytesAtomic(blobPath,
+                                                 DiLoCoArtifactStoreTmpPath(store.rootDir, outRef.blobCid),
+                                                 payload)
+        if IsErr(writeRes):
+            return Err[bool](Error(writeRes))
+    # 落盘回读: blobCid/payloadLen 必须等于页哈希, 否则硬错
+    var stored = rawbytes.EmptyBytes()
+    let readVerified = DiLoCoArtifactStoreReadVerifiedFill(stored, store.rootDir, outRef)
+    if IsErr(readVerified):
+        return Err[bool](Error(readVerified))
+    if DiLoCoArtifactStoreFindEntry(store, outRef.blobCid) < 0:
+        var entry = DiLoCoArtifactStoreEntry()
+        entry.blobCid = outRef.blobCid
+        entry.payloadLen = outRef.payloadLen
+        entry.shardPayloadBytes = outRef.shardPayloadBytes
+        add(store.entries, entry)
+        store.storeHash = DiLoCoArtifactStoreRecomputeHash(store)
+    return Ok[bool](true)
+
+# ---- 断言: OuterDelta/MergeCommit 引用的 ref 必须能从本仓取出一致字节 ----
+
+@borrows
+fn DiLoCoArtifactStoreRefResolvable(store: DiLoCoArtifactStore,
+                                      artifactRef: core.DiLoCoArtifactRef): Result[bool] =
+    var stored = rawbytes.EmptyBytes()
+    let getRes = DiLoCoArtifactStoreGetFill(stored, store, artifactRef)
+    if IsErr(getRes):
+        return Err[bool](Error(getRes))
+    return Ok[bool](true)

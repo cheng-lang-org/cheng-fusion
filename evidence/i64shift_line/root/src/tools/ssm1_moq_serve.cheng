@@ -1,0 +1,261 @@
+# SSM1 MoQ 段流跨机 serve 端 (M2 双端拆分, opensmoke server 侧调用序列复用;
+# M5 秒开优化线, 逐轮改动见 docs/campaigns/2026-09-06-csg-asset-pipeline/
+# task_m5_transport_opt.md。轮 0 = M2 交付语义重建基线)。
+#
+# 用法: ssm1_moq_serve <ssm1路径> [port]   (port 默认 4443, listen 0.0.0.0)
+#
+# 载包 = StreamManifestParseEx(embedded) 逐字节解析真实 .ssm1 包 (M1 同款
+# 合同); 注册两段 (M2 §2.4: 段写出为服务端权威段长, 不用请求 clamp——
+# CopyRange 的 clamp 边界是整个包文件, 客户端上界请求会涌出 payload 区):
+#   stream4  manifest 全文段 = 包字节 [0, headerLen), headerLen =
+#            首个 payloadOffset (embedded 合同: payload 区起点 = header 尾);
+#   stream8  首关键帧 chunk 段 = 包字节 [kfOffset, kfOffset+kfLen),
+#            kf = NearestKeyframeIndexForTime(0) 定位的首关键帧 chunk。
+# 每连接: accept → 流4/流8 各 negotiate (opensmoke 三步: 客户端
+# ClientSendNegotiate, 服务端扫 AppRecvAvailable 定位数据槽 + ConnFromPipeIdx
+# 构造读端 + ServerNegotiate) → ServerReadRequest → 各 serve 一段 → 打印已
+# 服务段数 → 关连接 → 等下一连接 (串行多连接)。Ctrl-C 退出。
+# 逐字节合同 (轮 2 M5 起): chunk 请求为触发器 (segmentKey 匹配即 serve, fetch
+# 两段请求预发无法预知 kf range); 段内容恒由服务端权威给出 (包内声明 kf
+# range), 逐字节正确性由 fetch 端双断言兜底 (chunkLen == 声明 payloadLen 且
+# sha256 == 声明 cid, 内容寻址自证)。
+import std/cmdline
+import std/os
+import std/parseutils
+import std/strings
+import std/strutils
+import std/rawbytes
+import cheng/quic/connection
+import cheng/quic/multiaddress
+import cheng/quic/msquicruntime
+import cheng/quic/msquictransport_native
+import cheng/quic/native_runtime
+import cheng/libp2p/transports/quic_transport
+import cheng/libp2p/protocols/media/moq_segment_stream
+import cheng/game/assets/stream/manifest
+import cheng/game/assets/import/reader
+
+const
+    ServeDefaultPort = 4443
+    ServeManifestSegmentKey = "ssm1-manifest"
+    ServeKeyframeSegmentKey = "ssm1-keyframe"
+    # native runtime 会话槽游标缺陷绕开 (opensmoke 同款): dial/accept token 恒
+    # 指槽 0, pump 把 app 数据写进 pump 槽, 读前扫描定位。窗口精确收敛到会话槽
+    # 总数 N_SLOTS: 跨进程窗口过宽时 CurSlot*16+idx 越界 gServerAppStream[128]
+    # (M2 实证双端对称 brk 崩溃)。
+    ServeNegotiateBytes = 45
+    ServeScanMaxSpins = 3000
+    ServeSegmentChunkBytes = 65536
+    ServeAcceptBackoffMs = 100
+    # f2 ohos serve 专项 (2026-09-17): accept 切片宽度和空闲判定文本。阻塞
+    # accept (waitMs=-1) 在非阻塞 fd 上是 EAGAIN 忙转 (fb §7 event8×22040
+    # 实证), 半开握手挂死时永无超时零日志; 改有界 AcceptGlobalTimed 切片轮。
+    ServeAcceptSliceMs = 20
+    ServeAcceptIdleText = "msquic: accept timeout"
+    # 轮 1 (M5): 扫描等待事件驱动化——空扫后阻塞在本侧 UDP fd 上等下一个
+    # 数据报 (µs 级唤醒), 到点 (cap) 或唤醒后泵一次再扫; 取代 M2 的 10ms
+    # 步进扫描量化。单角色进程安全 (本进程只有 listener 数据路径)。
+    ServeScanWaitCapMs = 20
+    # 轮 3 (M5): 初始发送窗口 (现役公开 settings 旋钮, 默认 10 包 ≈ 12KB)。
+    # 两段合计 70197B ≈ 58 包 ≤ 64 包: 一次突发窗口内发完, 消除 64KB 段的
+    # 慢启动爬坡。运行时乱序位图预算 160 包 (cwnd cap 192KB), 64 包在界内。
+    ServeInitialWindowPackets: int32 = 64
+
+fn ServeEmit(line: str) =
+    os.Write(os.Get_stdout(), line)
+    os.Write(os.Get_stdout(), "\n")
+    var flushed: int32
+    flushed = os.C_fflush(os.Get_stdout())
+    if flushed != 0:
+        panic("serve_stdout_flush_failed")
+
+# 严格十进制 int32 (可带一个前导 '-')。
+fn ServeParseI32(s: str, out: var int32): bool =
+    out = 0
+    let n = len(s)
+    if n <= 0:
+        return false
+    var start: int32
+    start = 0
+    if s[0] == '-':
+        start = 1
+    if start >= n:
+        return false
+    for i in start..<n:
+        if s[i] < '0' || s[i] > '9':
+            return false
+    return parseutils.ParseInt32(s, out) > 0
+
+# 扫描 AppRecvAvailable 定位数据槽 (opensmoke OpenSmokeWaitReadable)。轮 1
+# (M5): 每候选槽 bind → msquicNativePump(1) → AppRecvAvailable (跨进程无人泵
+# UDP); 空扫后 msquicNativeWaitReadableForSide 阻塞等数据报 (事件驱动, 无
+# 10ms 步进量化), 唤醒/到点后泵一次再扫。
+fn ServeWaitReadable(side: int32, streamId: int64, want: int32): int32 =
+    var spins: int32
+    spins = 0
+    while spins < ServeScanMaxSpins:
+        for k in 0..<native_runtime.N_SLOTS:
+            native_runtime.msquicNativeBindSlotFromPipeIdx(1000001 + k)
+            let pumpRes = native_runtime.msquicNativePump(1)
+            if IsErr(pumpRes):
+                return -1
+            let avail = native_runtime.msquicNativeAppRecvAvailable(side, streamId)
+            if avail >= want:
+                return k
+        native_runtime.msquicNativeWaitReadableForSide(side, ServeScanWaitCapMs)
+        let wakePump = native_runtime.msquicNativePump(1)
+        if IsErr(wakePump):
+            return -1
+        spins = spins + 1
+    return -1
+
+# 单流 negotiate 服务半环: 扫数据槽 → ConnFromPipeIdx 构造读端 → ServerNegotiate。
+fn ServeAcceptStream(listener: var msquictransport_native.MsQuicTransport,
+                     streamId: int64,
+                     serverConn: var connection.Connection): bool =
+    let ks = ServeWaitReadable(1, streamId, ServeNegotiateBytes)
+    if ks < 0:
+        ServeEmit(Fmt"ERR negotiate data slot not found stream={streamId}")
+        return false
+    serverConn = connection.ConnFromPipeIdx(1000001 + ks, 1, streamId, streamId)
+    return IsOk(moq_segment_stream.Libp2pMoqSegmentStreamServerNegotiate(listener,
+        serverConn))
+
+# 服务端权威段长写出: WriteRange(声明 range) + 写侧 shutdown (EOF 语义 =
+# Err("msquic: stream closed"), M2 §1③; 数据不丢, 客户端 drain 据此收尾)。
+fn ServeWriteAuthoritativeRange(serverConn: var connection.Connection,
+                                segmentBytes: rawbytes.Bytes,
+                                offsetBytes: int32,
+                                lengthBytes: int32): bool =
+    let writeRes = moq_segment_stream.Libp2pMoqSegmentStreamServerWriteRange(
+        serverConn, segmentBytes, offsetBytes, lengthBytes, ServeSegmentChunkBytes)
+    if IsErr(writeRes):
+        return false
+    if Value(writeRes) != lengthBytes:
+        return false
+    return IsOk(connection.ConnShutdownWrite(serverConn))
+
+fn main(argc: int32, argv: ptr): int32 =
+    argc
+    argv
+    cmdline.CaptureCmdLine(argc, argv)
+    if cmdline.ParamCount() < 1:
+        ServeEmit("usage: ssm1_moq_serve <ssm1路径> [port]")
+        return 2
+    let packPath = cmdline.ParamStr(1)
+    var port = ServeDefaultPort
+    if cmdline.ParamCount() >= 2:
+        var portArg: str
+        portArg = cmdline.ParamStr(2)
+        if !ServeParseI32(portArg, port) || port <= 0 || port > 65535:
+            ServeEmit("ERR bad_port")
+            return 2
+
+    # === 载包: 有界读 + ParseEx embedded 逐字节解析 ===
+    var fileBytes = rawbytes.EmptyBytes()
+    defer:
+        rawbytes.BytesFree(fileBytes)
+    var bounds = reader.AssetReaderBoundsFor("manifest")
+    bounds.maxBytes = manifest.StreamManifestQuotaMaxBytes()
+    if !reader.AssetReaderLoadBounded(packPath, bounds, fileBytes):
+        ServeEmit(Fmt"ERR pack_load_failed path={packPath}")
+        return 1
+    var m: manifest.StreamManifest
+    if !manifest.StreamManifestParseEmbedded(fileBytes, m):
+        ServeEmit(Fmt"ERR pack_parse_failed path={packPath}")
+        return 1
+    let fileLen = rawbytes.BytesLen(fileBytes)
+    let headerLen = m.payloadOffset[0]
+    let kfIdx = manifest.StreamManifestNearestKeyframeIndexForTime(m, int64(0))
+    if kfIdx < 0:
+        ServeEmit("ERR no_keyframe")
+        return 1
+    var kf: manifest.StreamChunk
+    if !manifest.StreamManifestChunkAt(m, kfIdx, kf):
+        ServeEmit("ERR keyframe_chunk_at_failed")
+        return 1
+    if !kf.isKeyframe:
+        ServeEmit("ERR first_kf_not_keyframe")
+        return 1
+    if kf.payloadOffset > int64(2147483647) - kf.payloadLen:
+        ServeEmit("ERR keyframe_range_past_i32")
+        return 1
+    if headerLen > int64(2147483647):
+        ServeEmit("ERR header_len_past_i32")
+        return 1
+    ServeEmit(Fmt"serve pack={packPath} fileLen={fileLen} chunks={m.chunkCount} headerLen={headerLen} kfChunk={kfIdx} kfRange=[{kf.payloadOffset},{kf.payloadOffset + kf.payloadLen})")
+
+    # === listen 0.0.0.0:port (opensmoke 同款 transport/TLS 合同) ===
+    var settings = msquicruntime.initMsQuicSettings()
+    settings.allowDatagram = true
+    settings.initialWindowPackets = ServeInitialWindowPackets
+    var listener = msquictransport_native.InitMsQuicTransport()
+    if !IsOk(msquictransport_native.setMsQuicTransportSettings(listener, settings)):
+        ServeEmit("ERR listener_settings")
+        return 1
+    if !IsOk(quic_transport.Libp2pQuicConfigureTls(listener)):
+        ServeEmit("ERR listener_tls")
+        return 1
+    let listenAddrRes = quic_transport.Libp2pQuicAddrFromHostPort("0.0.0.0", port)
+    if IsErr(listenAddrRes):
+        ServeEmit(Fmt"ERR listen_addr {ErrorText(listenAddrRes)}")
+        return 1
+    var listenAddr = Value(listenAddrRes)
+    msquictransport_native.start(listener, listenAddr)
+    # 打印配置的监听地址 (端口为显式指定值, 与绑定地址一致; 多地址克隆 API
+    # 收敛后不再克隆 listener.listenAddr 托管字段用于打印)。
+    ServeEmit(Fmt"serve listening /ip4/0.0.0.0/udp/{port}/quic-v1")
+
+    # === 串行 accept 循环: 每连接 serve 两段, 打印已服务段数 ===
+    var connCount: int32
+    connCount = 0
+    var totalServed: int32
+    totalServed = 0
+    for step in 0..<2147483647:
+        # f2 ohos serve 专项: 有界 accept 切片取代阻塞 accept。空闲切片推一次
+        # pump (推进 server flight 重传/握手定时器) 后继续等下一连接; 真错误才
+        # 打印退避。
+        let acceptRes = msquictransport_native.AcceptGlobalTimed(ServeAcceptSliceMs)
+        if IsErr(acceptRes):
+            if ErrorText(acceptRes) == ServeAcceptIdleText:
+                let idlePump = native_runtime.msquicNativePump(1)
+                if IsErr(idlePump):
+                    ServeEmit(Fmt"ERR accept_pump {ErrorText(idlePump)}")
+                continue
+            ServeEmit(Fmt"ERR accept {ErrorText(acceptRes)}")
+            os.sleepMs(ServeAcceptBackoffMs)
+            continue
+        connCount = connCount + 1
+        var serverLegacy = Value(acceptRes)
+
+        var streamServer4: connection.Connection
+        if !ServeAcceptStream(listener, int64(4), streamServer4):
+            connection.ConnClose(serverLegacy)
+            continue
+        var streamServer8: connection.Connection
+        if !ServeAcceptStream(listener, int64(8), streamServer8):
+            connection.ConnClose(serverLegacy)
+            continue
+
+        # 轮 4 (M5): 服务端主动推段——negotiate 完成即写两段 + 写侧 shutdown,
+        # 不再等请求 (M2 §8.3 建议: 省去请求飞行 RTT; 有损链路上请求/响应
+        # 往返再省一次丢包恢复暴露面)。段内容恒为服务端权威 kf range。
+        if !ServeWriteAuthoritativeRange(streamServer4, fileBytes, 0, int32(headerLen)):
+            ServeEmit(Fmt"conn={connCount} ERR manifest_write headerLen={headerLen}")
+            connection.ConnClose(serverLegacy)
+            continue
+
+        # 段 2: 首关键帧 chunk 段 (stream8)——同轮 4 主动推段 (服务端权威
+        # kf range)。逐字节正确性由 fetch 端双断言兜底 (chunkLen == 声明
+        # payloadLen 且 sha256 == 声明 cid, 内容寻址自证)。
+        if !ServeWriteAuthoritativeRange(streamServer8, fileBytes,
+                                         int32(kf.payloadOffset), int32(kf.payloadLen)):
+            ServeEmit(Fmt"conn={connCount} ERR chunk_write kfRange=[{kf.payloadOffset},{kf.payloadLen}]")
+            connection.ConnClose(serverLegacy)
+            continue
+
+        totalServed = totalServed + 2
+        ServeEmit(Fmt"conn={connCount} served=2 totalServed={totalServed} manifest={headerLen}B chunk={kf.payloadLen}B")
+        connection.ConnClose(serverLegacy)
+    msquictransport_native.Stop(listener)
+    return 0

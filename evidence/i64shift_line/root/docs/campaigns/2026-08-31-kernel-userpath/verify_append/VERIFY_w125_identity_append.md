@@ -1,0 +1,32 @@
+# wall125(identity).VERIFY
+
+## wall125(identity) 报告：cold_nested `exact identity schema [freeze] op row=5 managed bind definition is broken` 墙死亡（exact_def_identity.cheng STACK_LOCAL 绑定门第四形 admit：OwnMove+TypedExpr 托管 call-result 绑定载体，decode 主审 typedOwnedCallMirror 逐列镜像 + 判词富化 fail 路径取数）——cold_nested 判词推进至 `system link exec: cannot execute a plan that is not ready … body_kind=regalloc_production_emit_failed fn=_cheng_program_source_entry abort=regalloc_production_emit_failed primary0=primary_object_machine_words_missing`（primary_object_plan/regalloc production emit 域，授权面外→停手完整移交）；ordinary 0/0、call_fixture 0/1、车头 v6 0/0、车头 cold_nested 0/0 pass 零回归；v6 × r2 rc=1 判词与 18:18 wall125(lowering) 线实录同域（ownership ingress FieldStore，v6 线领地只记录）；烤机 2/3 轮。命名注记：patch 名按派发令用 identity_wall125*，共享 VERIFY 的 VERIFY_w125_append.md 已被 18:18 lowering_plan 线占用，本节文件名 VERIFY_w125_identity_append.md。
+
+日期 2026-09-03。授权面=src/core/analysis/exact_def_identity.cheng（唯一改动文件，本臂净 +96/−3）。车头=/tmp/oob_ab/cheng_w125（HEAD 提取件 bootstrap/cheng_cold.c `clang -std=c11 -O2 -I bootstrap`，sha256=cb984b59b9d8992d9f7e059409398914fc0defc848b578e5e1bab7c622f0e09a，w122-w127 系同配方；派发秒级门车头 cheng_now5 同测 rc=0）。进场复现驱动=kernel_driver_final4（21:10 全量树态，含 wall127 freeze 容忍臂）＋ wall127 移交实录逐字复现（rc=1 该判词）；派发所指 kernel_driver_now8 系 08:02 旧树态（先于 wall127），其 cold_nested 判词为旧 consume-candidate 墙，已作废不用。
+
+### 判定与机理（①富化→②定性→③修法，两轮烤机闭合）
+1. **①富化（r1 落树）**：`exactDefIdentityStackLocalBindFactsEmit`（exact_def_identity.cheng，wall117c consume path 取数同款：fail 路径零频、守卫零改动、int32 列投影），STACK_LOCAL 绑定门 fail 分支原判词行后追加全列实况行。op row=5 实况（cold_nested fn=1）：`kind=2(Call) target=0 vds=0 vdo=2(OwnMove) vsr=8 vex=21 vok=1(TypedExpr) voi=8 bos=-1 bod=0(Invalid) bor=-1 sdd=0 sdr=-1 src=-1 car=0 cp1=11 a0=1 ed_place=2(StackLocal) ed_origin=0 slot0: ssto=2 splc=2 sorg=0 tk=3 mg=2(Managed) tid=13 ck=0 lr=0 puc=0`，call 载体 `call=1: c_rs=0 c_rpk=3(SretResult) c_ro=2 c_rex=21 c_rvr=8 c_rbos=-1 c_rbod=0 c_rbor=-1 c_rok=1 c_roi=8 c_msk=0 c_sdd=0 c_sdr=-1 c_car=-1`。归因勘误：wall127 移交注记「op5 TypedExpr 权威/originKind 待考」——reject dump 的 `oid/opk` 两列实为 exactDef sidecar 的 opOriginIds/opPlaceKinds（:66082 格式串），BodyOp 的 valueDefOriginKind=TypedExpr(1) 由本富化实锤。
+2. **②定性（缺臂非禁形）**：op5=fmt 绑定胶水 call 的 sret 托管结果定义（OwnMove+TypedExpr 直定义入 Managed 槽， voi==vsr=8 全戳）。该 def 形已被 decode 主审 OwnMove Call def 权威（body_ir_access `typedOwnedCallMirrorValid` :5322 区联立，call 载体 12 列逐列镜像）证明并放行，cp1=11 由 op10 scope 尾 drop 消费（freeze consume-edge 审计 wall127 臂已放行该消费），car=0 系 cleanup consumeAction 记账非 manual-consume 行号。上游全链（ingress decode/ApplyOwned/final decode/consume-edge audit）对 fn=1 全放行，唯 STACK_LOCAL 绑定门载体白名单三形（CopyLocal 绑定戳 / LoadConst literalRoot / [wall110] OwnPlain+Unmanaged call-root）无 OwnMove+Managed 托管对偶形 → 绑定门缺第四形。夹具合法性由车头 cold_nested compile=0/run=0 `pass` 与上述放行链联立证明。
+3. **③修法（[wall125] managedCallResultRoot 第四形 admit，净 +65/−3）**：绑定门白名单新增托管 call-result 根形，谓词=op CallTag ∧ operands.len==1 界内 ∧ target==slot ∧ ed_origin==slot ∧ OwnMove ∧ TypedExpr ∧ voi==vsr>=0 ∧ vex>=0 ∧ 借主三列/源对全哨兵 ∧ 槽 Managed+tid>=0 ∧ callSequence 载体逐列镜像（resultSlot==vds ∧ resultOwnership==vdo ∧ resultExprNodeIndex==vex ∧ resultValueDefinitionRow==vsr ∧ 借主三列镜像 ∧ resultDefinitionOriginKind/Id 镜像 ∧ call 源对哨兵 ∧ call.consumeActionRow==-1）∧ resultPassKind∈{StackValue,SretResult}——与 decode 主审镜像逐列同形联立自证（超集即拒）。def 行 consumeActionRow 列 decode 主审不约束（consume 义务归 consume-edge 审计），本 admit 同不约束。fail 条件/operand 槽域豁免/source==-1 root 门豁免三处同步扩第四形；任一列不符走原门原判词 fail-closed；无 sentinel 豁免、无计数门放宽、derive 零写；禁提取共享 helper（[wall108r2] 警示同款）。
+4. **域外新墙移交（下一臂，契约边界停手）**：cold_nested × r2 新判词=`system link exec: cannot execute a plan that is not ready reason=typed_ir_contract function=main line=7 reason=missing_call_target code=6 detail=140 primary_missing=3 lowering_missing=0 lowering_fns=2 reachable=2 items=1 words=0 body_kind=regalloc_production_emit_failed fn=_cheng_program_source_entry abort=regalloc_production_emit_failed primary0=primary_object_machine_words_missing lowering0=-`。定性要点：①该阶段在本墙死亡前不可达（freeze 拒臂在先），本 admit 放行的 def 形是 decode 主审已证形，非本臂引入；②车头同输入 0/0 pass 证明程序语义合法；③修面=primary_object_plan/regalloc production emit 域（primary_object_machine_words_missing，工程规范 #7 canonical regalloc 接线域，他线活动领地），全部授权面外。full log：/tmp/oob_ab/w125/cn_w125r2_compile.log。
+
+### 门禁与验收实况（cwd=仓库根；RSS 零抬帽；烤机 2/3 轮）
+| 门 | 结果 |
+|---|---|
+| 秒级门（车头编 exact_def_identity.cheng --emit:obj） | cheng_w125 与 cheng_now5 双车头 r1/r2 两态全 rc=0 |
+| 烤机 r1（富化态，w126 HEAD 脚本+HEAD manifest+隔离 cold_cache） | rc=0，kernel_driver_w125 sha256=583b9a4625e08049ae3ef491da12ca8a3ec03d7cc46516a7d47dcd3fe27f5abe（186104640B） |
+| 烤机 r2（admit 态） | rc=0，kernel_driver_w125r2 sha256=ffb3c50f0d694c88012089deee8c770d52d990b537ab38c8d2798e66eb6a7a5b（186121152B） |
+| cold_nested × r2 | compile rc=2，**本墙判词死亡**（grep bind broken=0 ∧ identity schema=0），推进 regalloc production emit 域新判词（判定 4，移交）；编译未过无 run |
+| ordinary_zero_exit × r2 | compile=0 / run=0 不回归 |
+| zz_call_fixture_w7 × r2 | compile=0 / run=1 契约预期不回归 |
+| zz_v6_w7 × r2（只记录） | compile rc=1，判词=`ownership body ir production: ingress … code=15 site=2 index=9 fn=3 op_kind=15(FieldStore)` 与 18:18 wall125(lowering) 线实录同域（v6 线领地在先，bind broken=0 非本臂回归） |
+| zz_v6_w7 × 车头 | compile=0 / run=0（回归门过） |
+| cold_nested × 车头 | compile=0 / run=0 `cold_nested_fmt_interpolation=pass`（语义参照保持） |
+| 在途租约冲突注记 | 验收窗口遇并行线烤机的 workspace 父租约瞬态冲突（`os atomic tree: parent lease unavailable`），串行重试消；ordinary/call 首轮 rc=2 系租约冲突非判词，已重测如上 |
+
+### 交付与统计
+- **主树**：仅 src/core/analysis/exact_def_identity.cheng；进场 `git diff --stat`（vs HEAD）=+161/−3（含在树 w27/85/87b/91/104/110/w117c hunks），r1 态 +192/−3，离场终态 +257/−6（本臂净 +96/−3 = 富化 +31/0 + admit +65/−3）。未 git commit；src/tests/zz_v6_w7.cheng 等他人资产零触碰；zz_probe_w125.cheng 未创建（定性走判词富化+静态契约链，无需夹具）。
+- **/tmp/oob_ab/identity_wall125.patch**（终态，321 行/19793B，vs HEAD 累积式以当前树态生成，sha256=758af1284e4a8a21bb320282016e5306b6a012c03e7df561dccf7b3c21887142）：head→final 正向字节一致、final→head 反向字节一致、树上真实往返（apply -R→head → apply→final）全过。
+- **/tmp/oob_ab/identity_wall125_r1.patch**（r1 富化态存档，245 行/14994B，sha256=ebf6e51b71a6ca7e606377871f0712f5bde55693402517777816bd7f4ad11497）：head→r1 正向/反向字节一致全过。
+- exact_def_identity.cheng 终态 sha256=ab65e5c9c15f5fc3a6488140ddc296c44e8a7e7fe7056871e5238b7a02db1bb8。
+- 作业目录 /tmp/oob_ab/w125/：edf_head/edf_r1/edf_final 三态字节件、roundtrip2.py 往返验证、accept_r2.sh、烤机/验收/复现全套 log（cn_f4_repro/cn_now8_repro/cn_w125_r1_compile/cn_w125r2_compile/ordinary_w125r2_*/call_w125r2_*/v6_w125r2_compile/v6_head_w125_*/tc*.log）、隔离 cold_cache。

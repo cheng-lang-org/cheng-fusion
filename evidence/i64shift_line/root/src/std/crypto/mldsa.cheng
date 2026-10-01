@@ -1,0 +1,569 @@
+# ML-DSA (FIPS 204) complete signature scheme on top of the polynomial
+# math layer in std/crypto/mldsa_poly:
+#   - KeyGen_internal / Sign_internal / Verify_internal (Algorithms 6/7/8)
+#   - public API with context strings (Algorithms 1/2/3; hedged rnd by
+#     default, caller-injected rnd via MldsaSignWithRnd; no pre-hash
+#     variants)
+#   - SampleInBall                 (Algorithm 29, SHAKE256, full c-tilde)
+#   - w1Encode                     (Algorithm 28)
+#   - HintBitPack / HintBitUnpack  (Algorithms 20/21, omega parameterized;
+#     unpack hard-rejects every non-canonical encoding by returning an
+#     empty array)
+#   - pkEncode/skEncode/sigEncode and decoders (Algorithms 22-27)
+#   - ExpandA / ExpandS / ExpandMask vector level (Algorithms 32/33/34)
+# Vectors of n polynomials are flat int32[] of length n*256; the k x l
+# matrix A_hat is flat, row-major: A_hat[r][s] = RejNTTPoly(rho || s || r)
+# (FIPS 204 Algorithm 32 byte order: column byte s first, then row byte r;
+# calibrated against NIST ACVP ML-DSA-65 vectors). All coefficients stay
+# canonical in [0, q); every modular product goes through MldsaMulMod, so
+# this layer needs no int64 arithmetic at all.
+
+import std/result
+import std/system
+import std/rawbytes
+import std/crypto/sha3
+import std/crypto/mldsa_poly as poly
+import std/crypto/rand
+
+type
+    MldsaParams =
+        tau: int32
+        lambdaBits: int32
+        gamma1: int32
+        gamma2: int32
+        k: int32
+        l: int32
+        eta: int32
+        beta: int32
+        omega: int32
+
+    MldsaKeyPair =
+        pk: Bytes
+        sk: Bytes
+
+# FIPS 204 Table 1 parameter sets.
+fn MldsaParams44(): MldsaParams =
+    var p: MldsaParams
+    p.tau = 39
+    p.lambdaBits = 128
+    p.gamma1 = 131072
+    p.gamma2 = 95232
+    p.k = 4
+    p.l = 4
+    p.eta = 2
+    p.beta = 78
+    p.omega = 80
+    return p
+
+fn MldsaParams65(): MldsaParams =
+    var p: MldsaParams
+    p.tau = 49
+    p.lambdaBits = 192
+    p.gamma1 = 524288
+    p.gamma2 = 261888
+    p.k = 6
+    p.l = 5
+    p.eta = 4
+    p.beta = 196
+    p.omega = 55
+    return p
+
+fn MldsaParams87(): MldsaParams =
+    var p: MldsaParams
+    p.tau = 60
+    p.lambdaBits = 256
+    p.gamma1 = 524288
+    p.gamma2 = 261888
+    p.k = 8
+    p.l = 7
+    p.eta = 2
+    p.beta = 120
+    p.omega = 75
+    return p
+
+# Packed bytes per polynomial: z uses 1 + bitlen(gamma1 - 1) bits.
+fn mldsaZBytesPerPoly(gamma1: int32): int32 =
+    if gamma1 == 131072:
+        return 576
+    return 640
+
+# s1/s2 coefficients in [-eta, eta] use bitlen(2*eta) bits.
+fn mldsaEtaBytesPerPoly(eta: int32): int32 =
+    if eta == 2:
+        return 96
+    return 128
+
+# w1 coefficients in [0, (q-1)/(2*gamma2) - 1].
+fn mldsaW1Max(gamma2: int32): int32 =
+    if gamma2 == 95232:
+        return 43
+    return 15
+
+fn mldsaW1BytesPerPoly(gamma2: int32): int32 =
+    if gamma2 == 95232:
+        return 192
+    return 128
+
+# FIPS 204 key/signature sizes (Table 2).
+fn MldsaPkLen(p: MldsaParams): int32 =
+    return 32 + 320 * p.k
+
+fn MldsaSkLen(p: MldsaParams): int32 =
+    return 128 + (p.k + p.l) * mldsaEtaBytesPerPoly(p.eta) + 416 * p.k
+
+fn MldsaSigLen(p: MldsaParams): int32 =
+    return p.lambdaBits / 4 + p.l * mldsaZBytesPerPoly(p.gamma1) + p.omega + p.k
+
+# Copy polynomial slot i out of a flat vector.
+@borrows
+fn mldsaVecPoly(v: int32[], i: int32): int32[] =
+    var f: int32[]
+    setLen(f, 256)
+    let base: int32 = i * 256
+    for t in 0..<256:
+        f[t] = v[base + t]
+    return f
+
+# Copy polynomial f into slot i of a flat vector.
+@borrows
+fn mldsaVecSetPoly(v: var int32[], i: int32, f: int32[]) =
+    let base: int32 = i * 256
+    for t in 0..<256:
+        v[base + t] = f[t]
+
+@borrows
+fn mldsaVecAdd(a: int32[], b: int32[], n: int32): int32[] =
+    var out: int32[]
+    setLen(out, n * 256)
+    for i in 0..<(n * 256):
+        out[i] = poly.MldsaAddMod(a[i], b[i])
+    return out
+
+@borrows
+fn mldsaVecSub(a: int32[], b: int32[], n: int32): int32[] =
+    var out: int32[]
+    setLen(out, n * 256)
+    for i in 0..<(n * 256):
+        out[i] = poly.MldsaSubMod(a[i], b[i])
+    return out
+
+@borrows
+fn mldsaVecNtt(v: int32[], n: int32): int32[] =
+    var out: int32[]
+    setLen(out, n * 256)
+    for i in 0..<n:
+        mldsaVecSetPoly(out, i, poly.MldsaNtt(mldsaVecPoly(v, i)))
+    return out
+
+@borrows
+fn mldsaVecIntt(v: int32[], n: int32): int32[] =
+    var out: int32[]
+    setLen(out, n * 256)
+    for i in 0..<n:
+        mldsaVecSetPoly(out, i, poly.MldsaIntt(mldsaVecPoly(v, i)))
+    return out
+
+# INTT(cHat o vHat[i]) for every slot (c times a vector, NTT-domain input).
+@borrows
+fn mldsaVecPointwiseIntt(cHat: int32[], vHat: int32[], n: int32): int32[] =
+    var out: int32[]
+    setLen(out, n * 256)
+    for i in 0..<n:
+        mldsaVecSetPoly(out, i, poly.MldsaIntt(poly.MldsaMultiplyNtts(cHat, mldsaVecPoly(vHat, i))))
+    return out
+
+# w[i] = sum_s A_hat[i][s] o vHat[s], staying in the NTT domain.
+@borrows
+fn mldsaMatVecNtt(aHat: int32[], vHat: int32[], k: int32, l: int32): int32[] =
+    var w: int32[]
+    setLen(w, k * 256)
+    for i in 0..<k:
+        var acc: int32[] = poly.MldsaPolyNew()
+        for s in 0..<l:
+            acc = poly.MldsaPolyAdd(acc, poly.MldsaMultiplyNtts(mldsaVecPoly(aHat, i * l + s), mldsaVecPoly(vHat, s)))
+        mldsaVecSetPoly(w, i, acc)
+    return w
+
+fn mldsaAbs(x: int32): int32 =
+    if x < 0:
+        return 0 - x
+    return x
+
+# True iff the centered representative of every coefficient of the
+# n-polynomial vector has absolute value strictly below bound (||.||_inf).
+@borrows
+fn mldsaVecNormBelow(v: int32[], n: int32, bound: int32): bool =
+    for i in 0..<(n * 256):
+        if mldsaAbs(poly.MldsaCentered(v[i])) >= bound:
+            return false
+    return true
+
+# Canonical negation: -x mod q.
+fn mldsaNegMod(x: int32): int32 =
+    Assert(x >= 0 && x < 8380417, "mldsaNegMod: input must be canonical in [0, q)")
+    if x == 0:
+        return 0
+    return 8380417 - x
+
+# FIPS 204 Algorithm 32 (ExpandA): A_hat[r][s] = RejNTTPoly(rho || s || r).
+fn mldsaExpandA(rho: Bytes, k: int32, l: int32): int32[] =
+    Assert(BytesLen(rho) == 32, "mldsaExpandA: rho must be 32 bytes")
+    var a: int32[]
+    setLen(a, k * l * 256)
+    for r in 0..<k:
+        for s in 0..<l:
+            let seed: Bytes = BytesAlloc(34)
+            BytesCopyInto(seed, 0, rho)
+            BytesSet(seed, 32, s)
+            BytesSet(seed, 33, r)
+            mldsaVecSetPoly(a, r * l + s, poly.MldsaRejNttPoly(seed))
+    return a
+
+# FIPS 204 Algorithm 33 (ExpandS) body for index idx (0..l-1 for s1,
+# l..l+k-1 for s2): RejBoundedPoly(rho' || IntegerToBytes(idx, 2)).
+fn mldsaExpandSPoly(rhoPrime: Bytes, idx: int32, eta: int32): int32[] =
+    Assert(BytesLen(rhoPrime) == 64, "mldsaExpandSPoly: rho' must be 64 bytes")
+    let seed: Bytes = BytesAlloc(66)
+    BytesCopyInto(seed, 0, rhoPrime)
+    BytesSet(seed, 64, idx & 255)
+    BytesSet(seed, 65, (idx >> 8) & 255)
+    return poly.MldsaRejBoundedPoly(seed, eta)
+
+# FIPS 204 Algorithm 34 (ExpandMask) body for stream index idx = kappa + r:
+# ExpandMaskPoly(rho'' || IntegerToBytes(idx, 2)).
+fn mldsaExpandMaskAt(rhoPP: Bytes, idx: int32, gamma1: int32): int32[] =
+    Assert(BytesLen(rhoPP) == 64, "mldsaExpandMaskAt: rho'' must be 64 bytes")
+    let seed: Bytes = BytesAlloc(66)
+    BytesCopyInto(seed, 0, rhoPP)
+    BytesSet(seed, 64, idx & 255)
+    BytesSet(seed, 65, (idx >> 8) & 255)
+    return poly.MldsaExpandMaskPoly(seed, gamma1)
+
+# FIPS 204 Algorithm 29 (SampleInBall): polynomial with exactly tau
+# coefficients in {1, q-1} and the rest 0, derived from SHAKE256(c~).
+# The first 8 squeezed bytes provide the tau sign bits (LSB first); the
+# remaining stream drives the Fisher-Yates index rejection sampling. The
+# one-shot SHAKE is re-squeezed with a longer output when the stream runs
+# out (SHAKE outputs are prefix-consistent).
+fn MldsaSampleInBall(cTilde: Bytes, tau: int32): int32[] =
+    Assert(tau >= 1 && tau <= 64, "MldsaSampleInBall: tau must be in [1, 64]")
+    var c: int32[] = poly.MldsaPolyNew()
+    var bufLen: int32 = 136
+    var buf: Bytes = sha3.Shake256Xof(cTilde, bufLen)
+    var signPos: int32
+    var pos: int32 = 8
+    var i: int32 = 256 - tau
+    while i < 256:
+        var j: int32 = -1
+        while j < 0:
+            if pos >= bufLen:
+                bufLen = bufLen + 136
+                buf = sha3.Shake256Xof(cTilde, bufLen)
+            let cand: int32 = BytesGet(buf, pos)
+            pos = pos + 1
+            if cand <= i:
+                j = cand
+        c[i] = c[j]
+        let signBit: int32 = (BytesGet(buf, signPos / 8) >> (signPos % 8)) & 1
+        signPos = signPos + 1
+        if signBit == 1:
+            c[j] = 8380416
+        else:
+            c[j] = 1
+        i = i + 1
+    return c
+
+# FIPS 204 Algorithm 28 (w1Encode): SimpleBitPack every w1 polynomial with
+# b = (q-1)/(2*gamma2) - 1.
+fn MldsaW1Encode(w1: int32[], k: int32, gamma2: int32): Bytes =
+    Assert(w1.len == k * 256, "MldsaW1Encode: vector must have k*256 coefficients")
+    let per: int32 = mldsaW1BytesPerPoly(gamma2)
+    let b: int32 = mldsaW1Max(gamma2)
+    let out: Bytes = BytesAlloc(k * per)
+    for i in 0..<k:
+        BytesCopyInto(out, i * per, poly.MldsaSimpleBitPack(mldsaVecPoly(w1, i), b))
+    return out
+
+# FIPS 204 Algorithm 20 (HintBitPack): pack the k*256 hint bits (at most
+# omega ones) into omega + k bytes.
+fn MldsaHintBitPack(h: int32[], k: int32, omega: int32): Bytes =
+    Assert(h.len == k * 256, "MldsaHintBitPack: vector must have k*256 coefficients")
+    Assert(omega >= 1 && omega <= 255, "MldsaHintBitPack: omega out of range")
+    let y: Bytes = BytesAlloc(omega + k)
+    var index: int32
+    for i in 0..<k:
+        for j in 0..<256:
+            if h[i * 256 + j] == 1:
+                Assert(index < omega, "MldsaHintBitPack: more than omega hint bits set")
+                BytesSet(y, index, j)
+                index = index + 1
+        BytesSet(y, omega + i, index)
+    return y
+
+# FIPS 204 Algorithm 21 (HintBitUnpack): inverse of HintBitPack. Returns an
+# empty array for every non-canonical encoding (counters out of order or
+# above omega, per-polynomial indices not strictly increasing, nonzero
+# padding past the last used slot), as required for strong unforgeability.
+fn MldsaHintBitUnpack(y: Bytes, k: int32, omega: int32): int32[] =
+    Assert(omega >= 1 && omega <= 255, "MldsaHintBitUnpack: omega out of range")
+    Assert(BytesLen(y) == omega + k, "MldsaHintBitUnpack: input must be omega+k bytes")
+    var bad: int32[]
+    var h: int32[]
+    setLen(h, k * 256)
+    var index: int32
+    for i in 0..<k:
+        let bound: int32 = BytesGet(y, omega + i)
+        if bound < index || bound > omega:
+            return bad
+        let first: int32 = index
+        while index < bound:
+            let j: int32 = BytesGet(y, index)
+            if index > first:
+                if BytesGet(y, index - 1) >= j:
+                    return bad
+            h[i * 256 + j] = 1
+            index = index + 1
+    var t: int32 = index
+    while t < omega:
+        if BytesGet(y, t) != 0:
+            return bad
+        t = t + 1
+    return h
+
+# FIPS 204 Algorithm 22 (pkEncode): pk = rho || SimpleBitPack(t1, 2^10 - 1).
+fn mldsaPkEncode(rho: Bytes, t1: int32[], k: int32): Bytes =
+    let pk: Bytes = BytesAlloc(32 + 320 * k)
+    BytesCopyInto(pk, 0, rho)
+    for i in 0..<k:
+        BytesCopyInto(pk, 32 + 320 * i, poly.MldsaSimpleBitPack(mldsaVecPoly(t1, i), 1023))
+    return pk
+
+# FIPS 204 Algorithm 24 (skEncode):
+# sk = rho || K || tr || BitPack(s1) || BitPack(s2) || BitPack(t0).
+fn mldsaSkEncode(p: MldsaParams, rho: Bytes, bigK: Bytes, tr: Bytes,
+                 s1: int32[], s2: int32[], t0: int32[]): Bytes =
+    let etaPer: int32 = mldsaEtaBytesPerPoly(p.eta)
+    let sk: Bytes = BytesAlloc(MldsaSkLen(p))
+    BytesCopyInto(sk, 0, rho)
+    BytesCopyInto(sk, 32, bigK)
+    BytesCopyInto(sk, 64, tr)
+    var off: int32 = 128
+    for i in 0..<p.l:
+        BytesCopyInto(sk, off, poly.MldsaBitPack(mldsaVecPoly(s1, i), p.eta, p.eta))
+        off = off + etaPer
+    for i in 0..<p.k:
+        BytesCopyInto(sk, off, poly.MldsaBitPack(mldsaVecPoly(s2, i), p.eta, p.eta))
+        off = off + etaPer
+    for i in 0..<p.k:
+        BytesCopyInto(sk, off, poly.MldsaBitPack(mldsaVecPoly(t0, i), 4095, 4096))
+        off = off + 416
+    return sk
+
+# FIPS 204 Algorithm 26 (sigEncode):
+# sigma = c~ || BitPack(z, gamma1-1, gamma1) || HintBitPack(h).
+fn mldsaSigEncode(p: MldsaParams, cTilde: Bytes, z: int32[], h: int32[]): Bytes =
+    let zPer: int32 = mldsaZBytesPerPoly(p.gamma1)
+    let sig: Bytes = BytesAlloc(MldsaSigLen(p))
+    BytesCopyInto(sig, 0, cTilde)
+    var off: int32 = p.lambdaBits / 4
+    for i in 0..<p.l:
+        BytesCopyInto(sig, off, poly.MldsaBitPack(mldsaVecPoly(z, i), p.gamma1 - 1, p.gamma1))
+        off = off + zPer
+    BytesCopyInto(sig, off, MldsaHintBitPack(h, p.k, p.omega))
+    return sig
+
+# FIPS 204 Algorithm 6: ML-DSA.KeyGen_internal(xi) -> (pk, sk).
+fn MldsaKeyGenInternal(p: MldsaParams, xi: Bytes): MldsaKeyPair =
+    Assert(BytesLen(xi) == 32, "MldsaKeyGenInternal: xi must be 32 bytes")
+    let seedInput: Bytes = BytesAlloc(34)
+    BytesCopyInto(seedInput, 0, xi)
+    BytesSet(seedInput, 32, p.k)
+    BytesSet(seedInput, 33, p.l)
+    let expanded: Bytes = sha3.Shake256Xof(seedInput, 128)
+    let rho: Bytes = BytesSlice(expanded, 0, 32)
+    let rhoPrime: Bytes = BytesSlice(expanded, 32, 64)
+    let bigK: Bytes = BytesSlice(expanded, 96, 32)
+    let aHat: int32[] = mldsaExpandA(rho, p.k, p.l)
+    var s1: int32[]
+    setLen(s1, p.l * 256)
+    for r in 0..<p.l:
+        mldsaVecSetPoly(s1, r, mldsaExpandSPoly(rhoPrime, r, p.eta))
+    var s2: int32[]
+    setLen(s2, p.k * 256)
+    for r in 0..<p.k:
+        mldsaVecSetPoly(s2, r, mldsaExpandSPoly(rhoPrime, p.l + r, p.eta))
+    # t = INTT(A_hat o NTT(s1)) + s2
+    let t: int32[] = mldsaVecAdd(mldsaVecIntt(mldsaMatVecNtt(aHat, mldsaVecNtt(s1, p.l), p.k, p.l), p.k), s2, p.k)
+    var t1: int32[]
+    setLen(t1, p.k * 256)
+    var t0: int32[]
+    setLen(t0, p.k * 256)
+    for i in 0..<(p.k * 256):
+        t1[i] = poly.MldsaPower2RoundHigh(t[i])
+        t0[i] = poly.MldsaCanonical(poly.MldsaPower2RoundLow(t[i]))
+    let pk: Bytes = mldsaPkEncode(rho, t1, p.k)
+    let tr: Bytes = sha3.Shake256Xof(pk, 64)
+    let sk: Bytes = mldsaSkEncode(p, rho, bigK, tr, s1, s2, t0)
+    var out: MldsaKeyPair
+    out.pk = pk
+    out.sk = sk
+    return out
+
+# FIPS 204 Algorithm 7: ML-DSA.Sign_internal(sk, M', rnd) -> sigma.
+# The commitment-recompute rejection loop is bounded: more than 1000
+# rounds (expected ~4-6) means a broken implementation, so panic.
+fn MldsaSignInternal(p: MldsaParams, sk: Bytes, mPrime: Bytes, rnd: Bytes): Bytes =
+    Assert(BytesLen(sk) == MldsaSkLen(p), "MldsaSignInternal: sk length wrong")
+    Assert(BytesLen(rnd) == 32, "MldsaSignInternal: rnd must be 32 bytes")
+    # skDecode (FIPS 204 Algorithm 25)
+    let rho: Bytes = BytesSlice(sk, 0, 32)
+    let bigK: Bytes = BytesSlice(sk, 32, 32)
+    let tr: Bytes = BytesSlice(sk, 64, 64)
+    let etaPer: int32 = mldsaEtaBytesPerPoly(p.eta)
+    var off: int32 = 128
+    var s1: int32[]
+    setLen(s1, p.l * 256)
+    for i in 0..<p.l:
+        mldsaVecSetPoly(s1, i, poly.MldsaBitUnpack(BytesSlice(sk, off, etaPer), p.eta, p.eta))
+        off = off + etaPer
+    var s2: int32[]
+    setLen(s2, p.k * 256)
+    for i in 0..<p.k:
+        mldsaVecSetPoly(s2, i, poly.MldsaBitUnpack(BytesSlice(sk, off, etaPer), p.eta, p.eta))
+        off = off + etaPer
+    var t0: int32[]
+    setLen(t0, p.k * 256)
+    for i in 0..<p.k:
+        mldsaVecSetPoly(t0, i, poly.MldsaBitUnpack(BytesSlice(sk, off, 416), 4095, 4096))
+        off = off + 416
+    let s1Hat: int32[] = mldsaVecNtt(s1, p.l)
+    let s2Hat: int32[] = mldsaVecNtt(s2, p.k)
+    let t0Hat: int32[] = mldsaVecNtt(t0, p.k)
+    let aHat: int32[] = mldsaExpandA(rho, p.k, p.l)
+    let mu: Bytes = sha3.Shake256Xof(BytesConcat(tr, mPrime), 64)
+    let rhoPP: Bytes = sha3.Shake256Xof(BytesConcat3(bigK, rnd, mu), 64)
+    var kappa: int32
+    var rounds: int32
+    while rounds < 1000:
+        rounds = rounds + 1
+        var y: int32[]
+        setLen(y, p.l * 256)
+        for r in 0..<p.l:
+            mldsaVecSetPoly(y, r, mldsaExpandMaskAt(rhoPP, kappa + r, p.gamma1))
+        kappa = kappa + p.l
+        let w: int32[] = mldsaVecIntt(mldsaMatVecNtt(aHat, mldsaVecNtt(y, p.l), p.k, p.l), p.k)
+        var w1: int32[]
+        setLen(w1, p.k * 256)
+        for i in 0..<(p.k * 256):
+            w1[i] = poly.MldsaHighBits(w[i], p.gamma2)
+        let cTilde: Bytes = sha3.Shake256Xof(BytesConcat(mu, MldsaW1Encode(w1, p.k, p.gamma2)), p.lambdaBits / 4)
+        let cHat: int32[] = poly.MldsaNtt(MldsaSampleInBall(cTilde, p.tau))
+        let cs1: int32[] = mldsaVecPointwiseIntt(cHat, s1Hat, p.l)
+        let cs2: int32[] = mldsaVecPointwiseIntt(cHat, s2Hat, p.k)
+        let z: int32[] = mldsaVecAdd(y, cs1, p.l)
+        let wMinusCs2: int32[] = mldsaVecSub(w, cs2, p.k)
+        var r0Ok: bool = true
+        for i in 0..<(p.k * 256):
+            if mldsaAbs(poly.MldsaLowBits(wMinusCs2[i], p.gamma2)) >= p.gamma2 - p.beta:
+                r0Ok = false
+        if r0Ok && mldsaVecNormBelow(z, p.l, p.gamma1 - p.beta):
+            let ct0: int32[] = mldsaVecPointwiseIntt(cHat, t0Hat, p.k)
+            if mldsaVecNormBelow(ct0, p.k, p.gamma2):
+                # h = MakeHint(-ct0, w - cs2 + ct0)
+                var h: int32[]
+                setLen(h, p.k * 256)
+                var ones: int32
+                for i in 0..<(p.k * 256):
+                    let rr: int32 = poly.MldsaAddMod(wMinusCs2[i], ct0[i])
+                    h[i] = poly.MldsaMakeHint(mldsaNegMod(ct0[i]), rr, p.gamma2)
+                    ones = ones + h[i]
+                if ones <= p.omega:
+                    return mldsaSigEncode(p, cTilde, z, h)
+    Assert(false, "MldsaSignInternal: rejection loop exceeded 1000 rounds")
+    return BytesAlloc(1)
+
+# FIPS 204 Algorithm 8: ML-DSA.Verify_internal(pk, M', sigma) -> bool.
+# Malformed inputs (wrong lengths, non-canonical hint encodings,
+# out-of-range z) return false without crashing.
+fn MldsaVerifyInternal(p: MldsaParams, pk: Bytes, mPrime: Bytes, sig: Bytes): bool =
+    if BytesLen(pk) != MldsaPkLen(p):
+        return false
+    if BytesLen(sig) != MldsaSigLen(p):
+        return false
+    # pkDecode (FIPS 204 Algorithm 23)
+    let rho: Bytes = BytesSlice(pk, 0, 32)
+    var t1: int32[]
+    setLen(t1, p.k * 256)
+    for i in 0..<p.k:
+        mldsaVecSetPoly(t1, i, poly.MldsaSimpleBitUnpack(BytesSlice(pk, 32 + 320 * i, 320), 1023))
+    # sigDecode (FIPS 204 Algorithm 27)
+    let cTildeLen: int32 = p.lambdaBits / 4
+    let cTilde: Bytes = BytesSlice(sig, 0, cTildeLen)
+    let zPer: int32 = mldsaZBytesPerPoly(p.gamma1)
+    var z: int32[]
+    setLen(z, p.l * 256)
+    var off: int32 = cTildeLen
+    for i in 0..<p.l:
+        mldsaVecSetPoly(z, i, poly.MldsaBitUnpack(BytesSlice(sig, off, zPer), p.gamma1 - 1, p.gamma1))
+        off = off + zPer
+    let h: int32[] = MldsaHintBitUnpack(BytesSlice(sig, off, p.omega + p.k), p.k, p.omega)
+    if h.len == 0:
+        return false
+    if !mldsaVecNormBelow(z, p.l, p.gamma1 - p.beta):
+        return false
+    let aHat: int32[] = mldsaExpandA(rho, p.k, p.l)
+    let tr: Bytes = sha3.Shake256Xof(pk, 64)
+    let mu: Bytes = sha3.Shake256Xof(BytesConcat(tr, mPrime), 64)
+    let cHat: int32[] = poly.MldsaNtt(MldsaSampleInBall(cTilde, p.tau))
+    let azHat: int32[] = mldsaMatVecNtt(aHat, mldsaVecNtt(z, p.l), p.k, p.l)
+    var w1: int32[]
+    setLen(w1, p.k * 256)
+    for i in 0..<p.k:
+        # w'_i = INTT(az_i - cHat o NTT(t1_i * 2^d)), then UseHint per coeff.
+        var t1d: int32[] = mldsaVecPoly(t1, i)
+        for j in 0..<256:
+            t1d[j] = poly.MldsaMulMod(t1d[j], 8192)
+        let wApprox: int32[] = poly.MldsaIntt(poly.MldsaPolySub(mldsaVecPoly(azHat, i), poly.MldsaMultiplyNtts(cHat, poly.MldsaNtt(t1d))))
+        for j in 0..<256:
+            w1[i * 256 + j] = poly.MldsaUseHint(h[i * 256 + j], wApprox[j], p.gamma2)
+    let cTilde2: Bytes = sha3.Shake256Xof(BytesConcat(mu, MldsaW1Encode(w1, p.k, p.gamma2)), cTildeLen)
+    return BytesEqual(cTilde, cTilde2)
+
+# M' = IntegerToBytes(0, 1) || IntegerToBytes(|ctx|, 1) || ctx || M
+# (FIPS 204 Algorithms 2/3, pure non-pre-hash domain separation).
+fn mldsaFormatMessage(ctx: Bytes, msg: Bytes): Bytes =
+    Assert(BytesLen(ctx) <= 255, "mldsaFormatMessage: context must be at most 255 bytes")
+    let head: Bytes = BytesAlloc(2)
+    BytesSet(head, 0, 0)
+    BytesSet(head, 1, BytesLen(ctx))
+    return BytesConcat3(head, ctx, msg)
+
+# FIPS 204 Algorithm 1: ML-DSA.KeyGen() with fresh randomness.
+fn MldsaKeyGen(p: MldsaParams): Result[MldsaKeyPair] =
+    let xiRes: Result[Bytes] = rand.randomBytes(32)
+    if IsErr(xiRes):
+        return Err[MldsaKeyPair](Error(xiRes))
+    return Ok[MldsaKeyPair](MldsaKeyGenInternal(p, Value(xiRes)))
+
+# FIPS 204 Algorithm 2 with caller-provided hedge randomness (32 bytes;
+# use 32 zero bytes for the deterministic variant or inject a fixed value
+# in tests).
+fn MldsaSignWithRnd(p: MldsaParams, sk: Bytes, msg: Bytes, ctx: Bytes, rnd: Bytes): Result[Bytes] =
+    if BytesLen(ctx) > 255:
+        return Err[Bytes]("mldsa: context longer than 255 bytes")
+    return Ok[Bytes](MldsaSignInternal(p, sk, mldsaFormatMessage(ctx, msg), rnd))
+
+# FIPS 204 Algorithm 2: hedged signing with fresh randomness.
+fn MldsaSign(p: MldsaParams, sk: Bytes, msg: Bytes, ctx: Bytes): Result[Bytes] =
+    if BytesLen(ctx) > 255:
+        return Err[Bytes]("mldsa: context longer than 255 bytes")
+    let rndRes: Result[Bytes] = rand.randomBytes(32)
+    if IsErr(rndRes):
+        return Err[Bytes](Error(rndRes))
+    return Ok[Bytes](MldsaSignInternal(p, sk, mldsaFormatMessage(ctx, msg), Value(rndRes)))
+
+# FIPS 204 Algorithm 3: verification with context string.
+fn MldsaVerify(p: MldsaParams, pk: Bytes, msg: Bytes, sig: Bytes, ctx: Bytes): bool =
+    if BytesLen(ctx) > 255:
+        return false
+    return MldsaVerifyInternal(p, pk, mldsaFormatMessage(ctx, msg), sig)

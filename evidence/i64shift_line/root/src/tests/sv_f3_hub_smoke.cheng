@@ -1,0 +1,698 @@
+import std/strings
+import std/os
+import std/rawbytes
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/game/csg/schema as csgschema
+import cheng/game/csg/csgworld
+import cheng/game/world3d
+import cheng/game/csg/ball_servo_rigid
+import cheng/game/csg/execution
+import cheng/game/assets/semantic_video/schema as svschema
+import cheng/game/assets/semantic_video/reader
+import cheng/game/assets/semantic_video/validator
+import cheng/game/assets/semantic_video/writer
+import cheng/game/assets/semantic_video/source_index
+import cheng/game/assets/semantic_video/snapshot_codec
+import cheng/game/assets/semantic_video/snapshot_block
+
+# F3 semantic_hub smoke (进程内, 独立复算 hub 行为合同, 不 import hub):
+#   1. hgs 对 (b2_hgs.svblock+hgs_faststart.mp4): footage 验证链全绿;
+#      query [0,200000) matched>0; seek 10000000 → kf_pts=8000000 且
+#      readahead_bytes=454624。
+#   2. f1 对 (f1_ball.svblock+ballbalance.csgworld): verify-snap——共享
+#      确定性驱动重推导三检查点 payload, 资源 CID 绑定 snapshot.worldCid
+#      == manifest resCid[state_payload], SvSnapDecode 前置校验 + 解码
+#      CID 回绑; restore ck-1200 ahead 1000: replayCid==decodedCid==
+#      capture 记录 CID, 续跑逐 tick CID 与直通全等 (replayCidMatch=1)。
+#   3. 合并块 (footage+snapshot 两族资源, .scratch/f3/
+#      chain_hgs_ball.svblock): 构造 → validator PASS → 五段链
+#      (verify-footage/verify-snap/restore/query/seek) 进程内全过。
+#   4. 负例: 损坏源/错配对/未知 ckpt/损坏 payload → 各自结构化拒绝。
+#
+# 时基合同: 快照世界时基 1/240 (snapshot_block), 记录 tick 按 manifest
+# 时基; driveTick = tick*240/tbDen 必须整除。
+
+const
+    SvF3TbDen: int32 = 240                 # = snapshot_block.SvSnapTbDen
+    SvF3HgsPath: str = "src/tests/real_media_assets/hgs_faststart.mp4"
+    SvF3HgsBlockPath: str = "docs/campaigns/2026-09-16-csg-semantic-video-standard/fixtures/b2_hgs.svblock"
+    SvF3F1BlockPath: str = "docs/campaigns/2026-09-16-csg-semantic-video-standard/fixtures/f1_ball.svblock"
+    SvF3WorldPath: str = "artifacts/csg_world_video/csgworld/ballbalance.csgworld"
+    SvF3CombinedPath: str = ".scratch/f3/chain_hgs_ball.svblock"
+    SvF3TotalTicks: int64 = int64(3600)
+
+type
+    SvF3Parsed =
+        ok: bool
+        error: str
+        records: svschema.SvRecords
+
+    SvF3Footage =
+        ok: bool
+        error: str
+        m: svschema.SvManifestRec
+        idx: source_index.SvSourceIndex
+
+    SvF3SnapRec =
+        ckpt: str
+        worldCid: str
+        driveTick: int64
+
+    SvF3SnapPrep =
+        ok: bool
+        error: str
+        recs: SvF3SnapRec[]
+
+    SvF3Direct =
+        ok: bool
+        error: str
+        factsCid: str
+        cids: str[]
+        lengths: int32[]
+        allPayloads: rawbytes.Bytes
+        resCids: str[]
+
+@borrows
+fn SvF3Clone(e: str): str =
+    return strings.CloneStr(e)
+
+# ---- footage 侧 (B3 同形) -----------------------------------------------
+
+@borrows
+fn SvF3LowerBound(idx: source_index.SvSourceIndex, tick: int64): int32 =
+    var lo: int32 = 0
+    var hi: int32 = idx.sampleCount
+    while lo < hi:
+        let mid = (lo + hi) / 2
+        if idx.pts[mid] < tick:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+@borrows
+fn SvF3Query(idx: source_index.SvSourceIndex, t1: int64, t2: int64,
+             outBytes: var int64): int32 =
+    var matched: int32 = 0
+    outBytes = int64(0)
+    var at = SvF3LowerBound(idx, t1)
+    while at < idx.sampleCount && idx.pts[at] < t2:
+        if matched > 0 && idx.pts[at] <= idx.pts[at - 1]:
+            outBytes = int64(-1)
+            return -1
+        outBytes = outBytes + int64(idx.size[at])
+        matched = matched + 1
+        at = at + 1
+    return matched
+
+@borrows
+fn SvF3Seek(idx: source_index.SvSourceIndex, tick: int64,
+            timeEnd: int64, outKfPts: var int64,
+            outBytes: var int64): bool =
+    var target = SvF3LowerBound(idx, tick + int64(1)) - 1
+    if target < 0:
+        return false
+    var kf = target
+    while kf >= 0 && idx.key[kf] != 1:
+        kf = kf - 1
+    if kf < 0:
+        return false
+    outKfPts = idx.pts[kf]
+    var total: int64 = int64(0)
+    for i in kf..target:
+        total = total + int64(idx.size[i])
+    outBytes = total
+    return true
+
+# footage 验证链 (hub 同合同): resType[0]=video_sample/[1]=index +
+# 源 CID + 重建索引 CID 双绑定; 合并块允许尾部 state_payload。
+@borrows
+fn SvF3FootageChain(blockBytes: rawbytes.Bytes,
+                    data: rawbytes.Bytes): SvF3Footage =
+    var out: SvF3Footage
+    var decoded = reader.SvReaderDecode(blockBytes)
+    if !decoded.ok:
+        out.error = SvF3Clone(decoded.error)
+        return out
+    var parsed = reader.SvParseRecords(decoded.lines)
+    if !parsed.ok:
+        out.error = SvF3Clone(parsed.error)
+        return out
+    var validation = validator.SvValidate(blockBytes)
+    if !validation.ok:
+        out.error = SvF3Clone(validation.error)
+        return out
+    if parsed.records.manifests.len != 1:
+        out.error = "sv_ref_duplicate manifest"
+        return out
+    let m = parsed.records.manifests[0]
+    if m.resCid.len < 2 || m.resCid.len != m.resLength.len ||
+       m.resCid.len != m.resType.len:
+        out.error = "sv_cap_arrays_mismatch res"
+        return out
+    if m.resType[0] != "video_sample" || m.resType[1] != "index":
+        out.error = "sv_res_type_mismatch"
+        return out
+    let sourceCid = writer.SvResourceCid(data)
+    if sourceCid != m.resCid[0]:
+        out.error = "sv_cid_malformed source"
+        return out
+    var idx = source_index.SvSourceIndexBuild(data)
+    if !idx.ok:
+        out.error = SvF3Clone(idx.error)
+        return out
+    var indexBytes = source_index.SvSourceIndexEncodeResource(idx)
+    let indexCid = writer.SvResourceCid(indexBytes)
+    if indexCid != m.resCid[1]:
+        out.error = "sv_cid_malformed index"
+        return out
+    out.m = m
+    out.idx = idx
+    out.ok = true
+    return out
+
+# ---- 块解析 + 快照 prep (hub 同合同) ------------------------------------
+
+@borrows
+fn SvF3BlockLoad(blockBytes: rawbytes.Bytes): SvF3Parsed =
+    var out: SvF3Parsed
+    var decoded = reader.SvReaderDecode(blockBytes)
+    if !decoded.ok:
+        out.error = SvF3Clone(decoded.error)
+        return out
+    var parsed = reader.SvParseRecords(decoded.lines)
+    if !parsed.ok:
+        out.error = SvF3Clone(parsed.error)
+        return out
+    var validation = validator.SvValidate(blockBytes)
+    if !validation.ok:
+        out.error = SvF3Clone(validation.error)
+        return out
+    if parsed.records.manifests.len != 1:
+        out.error = "sv_ref_duplicate manifest"
+        return out
+    out.records = parsed.records
+    out.ok = true
+    return out
+
+# 快照记录收集: deps 统一绑 factsCid + worldCid 以 state_payload 身份
+# 出现在 manifest resCid + driveTick 换算 (整除) + 按 driveTick 升序。
+@borrows
+fn SvF3SnapPrep(records: svschema.SvRecords, m: svschema.SvManifestRec,
+                factsCid: str, wantCkpt: str): SvF3SnapPrep =
+    var out: SvF3SnapPrep
+    if records.snapshots.len < 1:
+        out.error = "sv_snap_no_snapshots"
+        return out
+    var spCount: int32 = 0
+    for i in 0..<m.resCid.len:
+        if m.resType[i] == "state_payload":
+            spCount = spCount + 1
+    if spCount != records.snapshots.len:
+        out.error = "sv_cap_arrays_mismatch state_payload"
+        return out
+    var collected: SvF3SnapRec[]
+    var picked: int32 = 0
+    for i in 0..<records.snapshots.len:
+        let s = records.snapshots[i]
+        if wantCkpt.len > 0 && s.ckpt != wantCkpt:
+            continue
+        picked = picked + 1
+        if s.deps.len != 1 || s.deps[0] != factsCid:
+            out.error = strings.ConcatStr("sv_snap_facts_unbound ", s.ckpt)
+            return out
+        var bound: int32 = 0 - 1
+        for j in 0..<m.resCid.len:
+            if m.resCid[j] == s.worldCid && m.resType[j] == "state_payload":
+                bound = j
+        if bound < 0:
+            out.error = strings.ConcatStr("sv_snap_cid_unbound ", s.ckpt)
+            return out
+        let scaled = s.tick * int64(SvF3TbDen)
+        if scaled % int64(m.tbDen) != 0:
+            out.error = strings.ConcatStr("sv_timebase_invalid ", s.ckpt)
+            return out
+        var rec: SvF3SnapRec
+        rec.ckpt = strings.CloneStr(s.ckpt)
+        rec.worldCid = strings.CloneStr(s.worldCid)
+        rec.driveTick = scaled / int64(m.tbDen)
+        add(collected, rec)
+    if wantCkpt.len > 0 && picked == 0:
+        out.error = strings.ConcatStr("sv_snap_ckpt_unknown ", wantCkpt)
+        return out
+    var used: bool[]
+    setLen(used, collected.len)
+    while out.recs.len < collected.len:
+        var best: int32 = 0 - 1
+        for i in 0..<collected.len:
+            if used[i]:
+                continue
+            if best < 0 || collected[i].driveTick < collected[best].driveTick:
+                best = i
+        used[best] = true
+        var rec: SvF3SnapRec
+        rec.ckpt = strings.CloneStr(collected[best].ckpt)
+        rec.worldCid = strings.CloneStr(collected[best].worldCid)
+        rec.driveTick = collected[best].driveTick
+        add(out.recs, rec)
+    out.ok = true
+    return out
+
+# 派生 payload 三重校验: 资源 CID 绑定 (worldCid 字段 = payload 字节
+# sha256, F1 同合同) + SvSnapDecode 前置校验 + 解码世界 CID 对拍采集态
+# (World3dCid 结构哈希域, 与资源 CID 分域)。返回 "" 为过。
+@borrows
+fn SvF3PayloadCheck(encoded: rawbytes.Bytes, worldCid: str,
+                    wantStateCid: str, payloadLen: var int32): str =
+    payloadLen = rawbytes.BytesLen(encoded)
+    let cid = snapshot_block.SvSnapResourceCid(encoded)
+    if cid != worldCid:
+        return "sv_snap_cid_mismatch"
+    var decoded = snapshot_codec.SvSnapDecode(encoded)
+    if !decoded.ok:
+        return strings.ConcatStr("sv_snap_decode ", decoded.error)
+    let decodedCid = world3d.World3dCid(decoded.w)
+    if decodedCid != wantStateCid:
+        return "sv_snap_decode_cid_mismatch"
+    return ""
+
+# ---- 直通驱动 (capture 权威序列, F1 同一体) ------------------------------
+
+# 直通 0..3600: 逐 tick 记 World3dCid; 在 prep.recs 各检查点编码
+# payload (三重校验 vs 记录 CID) 并拼接。drive 从 tick 0 起步。
+@borrows
+fn SvF3DirectRun(facts: csgschema.CsgWorldFacts,
+                 prep: SvF3SnapPrep): SvF3Direct =
+    var out: SvF3Direct
+    var drive = snapshot_block.SvSnapDriveStartFromFacts(facts)
+    if !drive.ok:
+        out.error = strings.ConcatStr("drive ", drive.error)
+        return out
+    out.factsCid = strings.CloneStr(drive.factsCid)
+    add(out.cids, strings.CloneStr(world3d.World3dCid(drive.st.w)))
+    var servo: ball_servo_rigid.BallServoRigidState
+    var buf = layout.ByteBufInit(8192)
+    var next: int32 = 0
+    while next < prep.recs.len && prep.recs[next].driveTick == int64(0):
+        var stateCid0 = world3d.World3dCid(drive.st.w)
+        var sw0 = world3d.World3dClone(drive.st.w)
+        var ss0 = execution.CsgExecutionSnapshot(drive.st)
+        var enc0 = snapshot_codec.SvSnapEncode(sw0, ss0, servo)
+        if !enc0.ok:
+            out.error = strings.ConcatStr("encode0 ", enc0.error)
+            layout.ByteBufFree(buf)
+            return out
+        var len0: int32 = 0
+        let err0 = SvF3PayloadCheck(enc0.bytes, prep.recs[next].worldCid,
+            stateCid0, len0)
+        if err0.len > 0:
+            out.error = strings.ConcatStr("check0 ", err0)
+            layout.ByteBufFree(buf)
+            return out
+        layout.ByteBufAppendBytes(buf, enc0.bytes)
+        add(out.lengths, len0)
+        add(out.resCids, strings.CloneStr(prep.recs[next].worldCid))
+        rawbytes.BytesFree(enc0.bytes)
+        next = next + 1
+    var t: int64 = int64(0)
+    while t < SvF3TotalTicks:
+        if !snapshot_block.SvSnapDriveTick(drive.st, facts):
+            out.error = strings.ConcatStr("tick rejected at ",
+                strings.Int64ToStr(drive.st.w.tick))
+            layout.ByteBufFree(buf)
+            return out
+        t = t + 1
+        add(out.cids, strings.CloneStr(world3d.World3dCid(drive.st.w)))
+        while next < prep.recs.len && prep.recs[next].driveTick == t:
+            var stateCid = world3d.World3dCid(drive.st.w)
+            var sw = world3d.World3dClone(drive.st.w)
+            var ss = execution.CsgExecutionSnapshot(drive.st)
+            var enc = snapshot_codec.SvSnapEncode(sw, ss, servo)
+            if !enc.ok:
+                out.error = strings.ConcatStr("encode ", enc.error)
+                layout.ByteBufFree(buf)
+                return out
+            var len: int32 = 0
+            let err = SvF3PayloadCheck(enc.bytes, prep.recs[next].worldCid,
+                stateCid, len)
+            if err.len > 0:
+                out.error = strings.ConcatStr("check ", err)
+                layout.ByteBufFree(buf)
+                return out
+            layout.ByteBufAppendBytes(buf, enc.bytes)
+            add(out.lengths, len)
+            add(out.resCids, strings.CloneStr(prep.recs[next].worldCid))
+            rawbytes.BytesFree(enc.bytes)
+            next = next + 1
+    if next != prep.recs.len:
+        out.error = "missed targets"
+        layout.ByteBufFree(buf)
+        return out
+    out.allPayloads = layout.ByteBufToBytes(buf)
+    layout.ByteBufFree(buf)
+    out.ok = true
+    return out
+
+# 恢复点: 重放到 rec.driveTick, replayCid 对拍, 派生 payload 绑定 +
+# 解码覆盖, 续跑 ahead tick 与直通 CID 逐 tick 全等。全部 assert。
+@borrows
+fn SvF3RestoreCheck(facts: csgschema.CsgWorldFacts, prep: SvF3SnapPrep,
+                    direct: SvF3Direct, ahead: int32) =
+    let rec = prep.recs[0]
+    var drive = snapshot_block.SvSnapDriveStartFromFacts(facts)
+    assert(drive.ok, " restore drive ok")
+    assert(drive.factsCid == direct.factsCid, " facts cid reproducible")
+    while drive.st.w.tick < rec.driveTick:
+        assert(snapshot_block.SvSnapDriveTick(drive.st, facts),
+            " fast-forward accepted")
+    let replayCid: str = world3d.World3dCid(drive.st.w)
+    assert(replayCid == direct.cids[int32(rec.driveTick)],
+        " replay cid equals pass-through")
+    var servo: ball_servo_rigid.BallServoRigidState
+    var sw = world3d.World3dClone(drive.st.w)
+    var ss = execution.CsgExecutionSnapshot(drive.st)
+    var encoded = snapshot_codec.SvSnapEncode(sw, ss, servo)
+    assert(encoded.ok, " restore payload encode ok")
+    var got: int32 = 0
+    let err = SvF3PayloadCheck(encoded.bytes, rec.worldCid, replayCid, got)
+    assert(err.len == 0, " restore payload bound+decoded: " + err)
+    var restored = snapshot_codec.SvSnapDecode(encoded.bytes)
+    rawbytes.BytesFree(encoded.bytes)
+    assert(restored.ok, " restore payload decode ok")
+    let decodedCid: str = world3d.World3dCid(restored.st.w)
+    assert(decodedCid == replayCid, " replayCidMatch")
+    assert(restored.st.w.tick == rec.driveTick, " payload tick bound")
+    var j: int32 = 0
+    while j < ahead:
+        assert(snapshot_block.SvSnapDriveTick(restored.st, facts),
+            " continuation accepted")
+        j = j + 1
+        let t: int64 = restored.st.w.tick
+        let contCid: str = world3d.World3dCid(restored.st.w)
+        assert(contCid == direct.cids[int32(t)],
+            " continuation cid A/B at tick " + strings.Int64ToStr(t))
+
+# ---- 合并块构建 (footage+snapshot 两族资源, hub chain 的夹具) -----------
+
+@borrows
+fn SvF3ConvTick(tick240: int64, tbDen: int32): int64 =
+    let scaled = tick240 * int64(tbDen)
+    assert(scaled % int64(SvF3TbDen) == 0, " conv exact")
+    return scaled / int64(SvF3TbDen)
+
+@borrows
+fn SvF3BuildCombined(hgsRecords: svschema.SvRecords,
+                     hgsM: svschema.SvManifestRec, factsCid: str,
+                     direct: SvF3Direct, physicsBaseline: str,
+                     outPath: str): bool =
+    assert(hgsM.tbNum == 1, " hgs tbNum 1")
+    assert(hgsRecords.deltas.len == 0 && hgsRecords.corrections.len == 0 &&
+        hgsRecords.receipts.len == 0 && hgsRecords.assertions.len == 0 &&
+        hgsRecords.dependencies.len == 0, " hgs record families as expected")
+    assert(direct.lengths.len == 3, " three checkpoints")
+    var set = writer.SvLineSetInit()
+    # manifest: footage 两资源在前, state_payload 三资源追加; 时基随
+    # footage; 快照 tick 按整除换算进同一时基。
+    var manifest: svschema.SvManifestRec
+    add(manifest.caps, strings.CloneStr(svschema.SvCapCommonCore))
+    add(manifest.caps, strings.CloneStr(svschema.SvCapWorldExecution))
+    manifest.entrySnapshot = strings.CloneStr("ck-1200")
+    add(manifest.resCid, strings.CloneStr(hgsM.resCid[0]))
+    add(manifest.resType, strings.CloneStr("video_sample"))
+    add(manifest.resLength, hgsM.resLength[0])
+    add(manifest.resCid, strings.CloneStr(hgsM.resCid[1]))
+    add(manifest.resType, strings.CloneStr("index"))
+    add(manifest.resLength, hgsM.resLength[1])
+    for i in 0..<direct.lengths.len:
+        add(manifest.resCid, strings.CloneStr(direct.resCids[i]))
+        add(manifest.resType, strings.CloneStr("state_payload"))
+        add(manifest.resLength, int64(direct.lengths[i]))
+    manifest.tbNum = hgsM.tbNum
+    manifest.tbDen = hgsM.tbDen
+    manifest.timeStart = hgsM.timeStart
+    manifest.timeEnd = hgsM.timeEnd
+    # 物理默认行为基线随合并块发射（hub chain 快照臂对拍合同，semantic_hub
+    # verify-snap/restore 单一入口 SvSnapBaselineGuard 同款）。
+    manifest.xPhysicsBaseline = strings.CloneStr(physicsBaseline)
+    let preLine = svschema.SvManifestLine(manifest)
+    manifest.contentId = strings.CloneStr(writer.SvContentCid(preLine))
+    writer.SvAddManifest(set, manifest)
+    # footage 侧实体/观测原样并入 (时基已与 manifest 一致)
+    for i in 0..<hgsRecords.entities.len:
+        writer.SvAddEntity(set, hgsRecords.entities[i])
+    for i in 0..<hgsRecords.observations.len:
+        writer.SvAddObservation(set, hgsRecords.observations[i])
+    # 快照侧实体/观测/断言/快照/依赖/修订 (tick 全部换算)
+    var entity: svschema.SvEntityRec
+    entity.ns = strings.CloneStr("semantic_snapshot@v1")
+    entity.gen = int64(0)
+    entity.num = 1
+    entity.typeVer = strings.CloneStr("state@v1")
+    entity.lifecycle = strings.CloneStr(svschema.SvLifecycleActive)
+    writer.SvAddEntity(set, entity)
+    let entityUid: str = svschema.SvEntityUid(entity)
+    var observation: svschema.SvObservationRec
+    observation.obsId = strings.CloneStr("obs-gen0")
+    observation.sensor = strings.CloneStr("state-capture")
+    observation.srcTrack = strings.CloneStr("sv-f1:0")
+    observation.sourceClass = strings.CloneStr(svschema.SvSourceManual)
+    observation.method = strings.CloneStr("f-loop-capture")
+    observation.tbNum = hgsM.tbNum
+    observation.tbDen = hgsM.tbDen
+    observation.tickStart = int64(0)
+    observation.tickEnd = SvF3ConvTick(int64(3600), hgsM.tbDen)
+    writer.SvAddObservation(set, observation)
+    var gen: int32 = 0
+    while gen < 2:
+        var assertion: svschema.SvAssertionRec
+        if gen == 0:
+            assertion.uid = strings.CloneStr("asv-gen0")
+        else:
+            assertion.uid = strings.CloneStr("asv-gen1")
+        assertion.obj = strings.CloneStr(entityUid)
+        assertion.pred = strings.CloneStr(svschema.SvPredUserOperation)
+        assertion.val = strings.CloneStr("checkpoint capture")
+        assertion.confBp = 10000
+        assertion.confDef = strings.CloneStr("deterministic capture provenance")
+        assertion.rev = gen
+        assertion.sourceClass = strings.CloneStr(svschema.SvSourceManual)
+        assertion.method = strings.CloneStr("f-loop-capture")
+        assertion.tbNum = hgsM.tbNum
+        assertion.tbDen = hgsM.tbDen
+        assertion.tickStart = int64(0)
+        assertion.tickEnd = SvF3ConvTick(int64(3600), hgsM.tbDen)
+        writer.SvAddAssertion(set, assertion)
+        gen = gen + 1
+    for i in 0..<direct.lengths.len:
+        var snap: svschema.SvSnapshotRec
+        snap.branch = strings.CloneStr("main")
+        if i == 0:
+            snap.ckpt = strings.CloneStr("ck-1200")
+            snap.tick = SvF3ConvTick(int64(1200), hgsM.tbDen)
+        elif i == 1:
+            snap.ckpt = strings.CloneStr("ck-2400")
+            snap.tick = SvF3ConvTick(int64(2400), hgsM.tbDen)
+        else:
+            snap.ckpt = strings.CloneStr("ck-3600")
+            snap.tick = SvF3ConvTick(int64(3600), hgsM.tbDen)
+        add(snap.deps, strings.CloneStr(factsCid))
+        snap.worldCid = strings.CloneStr(direct.resCids[i])
+        snap.tbNum = hgsM.tbNum
+        snap.tbDen = hgsM.tbDen
+        writer.SvAddSnapshot(set, snap)
+    var dep: svschema.SvDependencyRec
+    dep.consumer = strings.CloneStr("semantic_player")
+    dep.target = strings.CloneStr(factsCid)
+    dep.targetVer = strings.CloneStr("csgworld.v1")
+    dep.purpose = strings.CloneStr("world_restore")
+    dep.queryBasis = strings.CloneStr("f-loop")
+    writer.SvAddDependency(set, dep)
+    var revision: svschema.SvRevisionRec
+    revision.targetUid = strings.CloneStr("asv-gen1")
+    revision.supersedes = strings.CloneStr("asv-gen0")
+    revision.oldRev = 0
+    revision.newRev = 1
+    revision.publishedTick = SvF3ConvTick(int64(3600), hgsM.tbDen)
+    revision.reason = strings.CloneStr("f-loop provenance rebind")
+    revision.tbNum = hgsM.tbNum
+    revision.tbDen = hgsM.tbDen
+    writer.SvAddRevision(set, revision)
+    # 编码 + 自验证 + 提交
+    var encodedSet = writer.SvWriterEncode(set)
+    if !encodedSet.ok:
+        return false
+    var validation = validator.SvValidate(encodedSet.bytes)
+    if !validation.ok:
+        return false
+    let commitError: str = writer.SvWriterCommit(encodedSet.bytes, outPath)
+    if commitError.len > 0:
+        return false
+    return true
+
+fn main(): int32 =
+    # ---- 1. hgs 对: verify-footage / query / seek -----------------------
+    let hgsBlockResult = os.ReadFileBytesResult(SvF3HgsBlockPath)
+    if result.IsErr(hgsBlockResult):
+        echo(" sv_f3_hub_smoke FAIL: read b2_hgs.svblock")
+        return 1
+    var hgsBlockBytes = result.Value(hgsBlockResult)
+    let hgsFileResult = os.ReadFileBytesResult(SvF3HgsPath)
+    if result.IsErr(hgsFileResult):
+        echo(" sv_f3_hub_smoke FAIL: read hgs_faststart.mp4")
+        return 1
+    var hgsData = result.Value(hgsFileResult)
+    var hf = SvF3FootageChain(hgsBlockBytes, hgsData)
+    assert(hf.ok, " hgs footage chain: " + hf.error)
+    assert(hf.m.resCid.len == 2, " hgs pure footage block res 2")
+    assert(hf.idx.sampleCount == 675, " hgs samples 675")
+    assert(hf.idx.timescale == int32(1000000), " hgs timescale 1e6")
+    var qBytes: int64 = int64(0)
+    let qMatched = SvF3Query(hf.idx, int64(0), int64(200000), qBytes)
+    assert(qMatched > 0, " hgs query [0,200000) matched > 0")
+    assert(qBytes > int64(0), " hgs query bytes > 0")
+    var kfPts: int64 = int64(0)
+    var skBytes: int64 = int64(0)
+    let seekOk = SvF3Seek(hf.idx, int64(10000000), hf.m.timeEnd, kfPts, skBytes)
+    assert(seekOk, " hgs seek 10000000 ok")
+    assert(kfPts == int64(8000000), " hgs seek kf_pts 8000000")
+    assert(skBytes == int64(454624), " hgs seek readahead_bytes 454624")
+    echo(" sv_f3 smoke: hgs verify-footage ok, query [0,200000) matched=" +
+        strings.IntToStr(qMatched) + ", seek 10000000 readahead_bytes=" +
+        strings.Int64ToStr(skBytes))
+
+    # ---- 2. f1 对: verify-snap ------------------------------------------
+    let f1BlockResult = os.ReadFileBytesResult(SvF3F1BlockPath)
+    if result.IsErr(f1BlockResult):
+        echo(" sv_f3_hub_smoke FAIL: read f1_ball.svblock")
+        return 1
+    var f1BlockBytes = result.Value(f1BlockResult)
+    var f1Loaded = SvF3BlockLoad(f1BlockBytes)
+    assert(f1Loaded.ok, " f1 block load: " + f1Loaded.error)
+    let f1M = f1Loaded.records.manifests[0]
+    var facts: csgschema.CsgWorldFacts
+    let embedded: str = csgworld.CsgWorldLoad(SvF3WorldPath, facts)
+    assert(embedded.len > 0, " ballbalance csgworld loads")
+    let factsCid: str = Fmt"{csgschema.CsgWorldFactsCid(facts)}"
+    assert(factsCid == embedded, " facts cid reproducible")
+    # 基线防线（单一入口 SvSnapBaselineGuard，semantic_snapshot CLI restore
+    # 同款调用）：夹具 manifest x-physicsBaseline（录制时物理默认行为指纹，
+    # SvSnapPhysicsBaseline 探针定义）对拍现树探针值。缺键/探针失败/失配 =
+    # 夹具基线过期，先于 payload CID 判定结构化报出，避免裸
+    # sv_snap_cid_mismatch 掩盖"物理默认行为已变、夹具待重录"的真实原因。
+    var f1Guard: str = snapshot_block.SvSnapBaselineGuard(f1M.xPhysicsBaseline, facts)
+    if f1Guard.len > 0:
+        echo(" sv_f3_hub_smoke FAIL: f1 fixture baseline expired " + f1Guard)
+        return 1
+    var prep = SvF3SnapPrep(f1Loaded.records, f1M, factsCid, "")
+    assert(prep.ok, " f1 snap prep: " + prep.error)
+    assert(prep.recs.len == 3, " f1 three checkpoints")
+    assert(prep.recs[0].ckpt == "ck-1200" && prep.recs[1].ckpt == "ck-2400" &&
+        prep.recs[2].ckpt == "ck-3600", " f1 ckpts sorted by driveTick")
+    var direct = SvF3DirectRun(facts, prep)
+    assert(direct.ok, " f1 pass-through run + verify-snap binding: " + direct.error)
+    assert(direct.cids.len == int32(SvF3TotalTicks) + 1, " direct cid per tick")
+    echo(" sv_f3 smoke: f1 verify-snap ok (3 ckpts bound, payloadBytes=" +
+        strings.IntToStr(direct.lengths[0]) + " each)")
+
+    # ---- 3. f1 对: restore ck-1200 ahead 1000 ---------------------------
+    var prepR = SvF3SnapPrep(f1Loaded.records, f1M, factsCid, "ck-1200")
+    assert(prepR.ok && prepR.recs.len == 1, " f1 restore prep ck-1200")
+    SvF3RestoreCheck(facts, prepR, direct, 1000)
+    echo(" sv_f3 smoke: f1 restore ck-1200 ahead 1000 replayCidMatch=1" +
+        " (continuation 1000 ticks all equal pass-through)")
+
+    # ---- 4. 合并块构建 + validator ---------------------------------------
+    var hgsLoaded = SvF3BlockLoad(hgsBlockBytes)
+    assert(hgsLoaded.ok, " hgs block load")
+    let hgsM = hgsLoaded.records.manifests[0]
+    os.MkdirAll(".scratch/f3", 493)
+    var f1Baseline: str = snapshot_block.SvSnapPhysicsBaseline(facts)
+    let built = SvF3BuildCombined(hgsLoaded.records, hgsM, factsCid, direct,
+        f1Baseline, SvF3CombinedPath)
+    assert(built, " combined block built+validated+committed")
+    let cbResult = os.ReadFileBytesResult(SvF3CombinedPath)
+    if result.IsErr(cbResult):
+        echo(" sv_f3_hub_smoke FAIL: read combined block back")
+        return 1
+    var cbBytes = result.Value(cbResult)
+    var cbLoaded = SvF3BlockLoad(cbBytes)
+    assert(cbLoaded.ok, " combined block load: " + cbLoaded.error)
+    let cbM = cbLoaded.records.manifests[0]
+    assert(cbLoaded.records.snapshots.len == 3, " combined snapshots 3")
+    echo(" sv_f3 smoke: combined block ok (blockBytes=" +
+        strings.IntToStr(rawbytes.BytesLen(cbBytes)) + ")")
+
+    # ---- 5. 合并块五段链 (进程内, hub chain 同合同) ----------------------
+    var cf = SvF3FootageChain(cbBytes, hgsData)
+    assert(cf.ok, " combined footage chain: " + cf.error)
+    var cBytes: int64 = int64(0)
+    let cMatched = SvF3Query(cf.idx, int64(4000000), int64(4200000), cBytes)
+    assert(cMatched > 0, " combined query [4e6,4.2e6) matched > 0")
+    var cKfPts: int64 = int64(0)
+    var cSkBytes: int64 = int64(0)
+    assert(SvF3Seek(cf.idx, int64(4000000), cbM.timeEnd, cKfPts, cSkBytes),
+        " combined seek 4000000 ok")
+    assert(cKfPts == int64(4000000), " combined seek lands on keyframe")
+    var cbPrep = SvF3SnapPrep(cbLoaded.records, cbM, factsCid, "")
+    assert(cbPrep.ok, " combined snap prep: " + cbPrep.error)
+    assert(cbPrep.recs[0].driveTick == int64(1200) &&
+        cbPrep.recs[1].driveTick == int64(2400) &&
+        cbPrep.recs[2].driveTick == int64(3600),
+        " combined tick conversion 1e6 -> drive 1200/2400/3600")
+    var cbDirect = SvF3DirectRun(facts, cbPrep)
+    assert(cbDirect.ok, " combined verify-snap drive+binding")
+    var cbPrepR = SvF3SnapPrep(cbLoaded.records, cbM, factsCid, "ck-1200")
+    assert(cbPrepR.ok, " combined restore prep")
+    SvF3RestoreCheck(facts, cbPrepR, cbDirect, 10)
+    echo(" sv_f3 smoke: combined chain segments ok (footage/query/seek/" +
+        "verify-snap/restore)")
+
+    # ---- 6. 负例: 各模式结构化拒绝 ---------------------------------------
+    # (a) 损坏源 → footage 链在 resCid[0] 拒绝
+    var corrupt = rawbytes.BytesSlice(hgsData, int32(0),
+        rawbytes.BytesLen(hgsData))
+    var flipAt: int32 = 0 - 1
+    var i: int32 = 0
+    while i < rawbytes.BytesLen(corrupt):
+        if rawbytes.BytesGet(corrupt, i) != 0:
+            flipAt = i
+            i = rawbytes.BytesLen(corrupt)
+        else:
+            i = i + 1
+    assert(flipAt >= 0, " nonzero byte found")
+    rawbytes.BytesSet(corrupt, flipAt, (rawbytes.BytesGet(corrupt, flipAt) + 1) & 255)
+    let corruptCid = writer.SvResourceCid(corrupt)
+    assert(corruptCid != hf.m.resCid[0], " corrupt source rejected at cid")
+    rawbytes.BytesFree(corrupt)
+    # (b) f1 块当 footage → resType[0] != video_sample 拒绝
+    assert(f1M.resType[0] != "video_sample", " f1-as-footage rejected at resType")
+    # (c) hgs 块当 snap → 无快照记录拒绝
+    assert(hgsLoaded.records.snapshots.len == 0,
+        " hgs-as-snap rejected at no_snapshots")
+    # (d) 未知 ckpt → 结构化拒绝
+    var badPrep = SvF3SnapPrep(f1Loaded.records, f1M, factsCid, "ck-9999")
+    assert(!badPrep.ok, " ck-9999 rejected")
+    # (e) payload 数据翻字节 → 资源 CID 绑定拒绝
+    var offset3600: int32 = direct.lengths[0] + direct.lengths[1]
+    var corruptPayload = rawbytes.BytesSlice(direct.allPayloads, offset3600,
+        direct.lengths[2])
+    let mid: int32 = direct.lengths[2] / 2
+    rawbytes.BytesSet(corruptPayload, mid,
+        (rawbytes.BytesGet(corruptPayload, mid) + 1) & 255)
+    let badCid = snapshot_block.SvSnapResourceCid(corruptPayload)
+    assert(badCid != direct.resCids[2], " flipped payload rejected at cid")
+    rawbytes.BytesFree(corruptPayload)
+    # (f) payload magic 翻字节 → SvSnapDecode 结构化拒绝
+    var corruptMagic = rawbytes.BytesSlice(direct.allPayloads, offset3600,
+        direct.lengths[2])
+    rawbytes.BytesSet(corruptMagic, 2,
+        (rawbytes.BytesGet(corruptMagic, 2) + 1) & 255)
+    var badDecode = snapshot_codec.SvSnapDecode(corruptMagic)
+    assert(!badDecode.ok, " flipped magic rejected by decode")
+    rawbytes.BytesFree(corruptMagic)
+    echo(" sv_f3 smoke: negatives ok (corrupt-source/f1-as-footage/" +
+        "hgs-as-snap/ck-9999/payload-flip/payload-magic)")
+
+    echo(" sv_f3_hub_smoke ok")
+    return 0

@@ -1,0 +1,468 @@
+# Machine-duck-on-ball SURVIVAL probe (the M-c final-acceptance
+# instrument): an independent "5 s survival" verdict line, decoupled from
+# the parallel trim/policy tuning lines. The duck assembly and the ball
+# injection are copied verbatim from microduck_assembly_probe /
+# microduck_ball_probe (same 15-link real-MJCF build, same 14 hinge
+# servos, same real FIBA size-7 ball r = 0.121 m / m = 0.62 kg, same
+# drop-start root pose on the ball top).
+#
+# One run = one servo configuration, selected by argv[1]:
+#   A - dwell servos only (the status-quo baseline; expected to topple at
+#       ~59-163 ticks - the control row).
+#   B - dwell servos + csg/ball_servo_rigid torso servo overlay at the
+#       frozen defaults. Compatibility note: BallServoRigidStateInit takes
+#       the live World3d directly (no ExecutionInit dependency), validates
+#       body kinds and torso-above-ball, and latches armed - the machine
+#       duck assembly satisfies all of it, so the overlay is a legal
+#       pre-step call exactly like microduck_ball_probe caseB.
+#   C - dwell servos + THIS probe's own minimal hip-goal-offset feedback
+#       (independent of every parallel-line channel): each tick, before
+#       the physics step, the mass-weighted duck CoM error against the
+#       ball center drives an integrating offset on BOTH hip-pitch servo
+#       goals, dTheta += k*(com-ball)*dt*gain with k folded into
+#       HipFbGain, clamped to +-HipFbRangeRad (0.05 rad) and the absolute
+#       goals clamped to the MJCF hip range. The error coordinate is the
+#       horizontal CoM-to-ball error along the FACING axis (engine +Y,
+#       the pitch plane the hip-pitch chain actuates; the task's "comX"
+#       notation realized on the axis hip pitch can actually move), and
+#       the goal writes are mirrored (goalL += dTheta, goalR -= dTheta)
+#       per the model sign derivation in csg/ball_servo_rigid.cheng.
+#       HipFbGain = 0.28 rad/(m s) equals, at dt = 1/240, the per-tick
+#       rate of the policy_tuner CEM-best hipTrim operating point
+#       (1/856 per tick per meter) - the proven rate, as a standalone
+#       feedback. The channel freezes (goals held) at the first fall.
+# argv[2] = tick cap (default 5000).
+#
+# Verdict (the M-c bar, exactly as commissioned): survived (head com z >
+# torso com z on every tick) for >= SurviveBarTicks (5000 ticks = 20.8 s
+# at 240 Hz) AND end-of-run ball drift < DriftLimitM (500 mm):
+#   "PASS survival probe mode=<m> stood=<ticks> drift=<mm>"
+# otherwise a data row (a data row is a valid product of this probe):
+#   "DATA survival probe mode=<m> stood=<ticks> drift=<mm> fell=<tick>"
+# stood = ticks strictly before the first fall (the post-topple wreck's
+# head-up oscillation is not survival); fell = first fallen tick, -1 if
+# the duck never fell. Sample lines every 250 ticks (torsoZ / ballDrift /
+# tilt / armed) are buffered and echoed after the loop; the armed column
+# is 1 for mode A (dwell servos never disarm), the torso-servo armed
+# latch for mode B, and the feedback-enabled flag for mode C.
+#
+# Hard contracts (violation = FAIL + nonzero rc, never a data row): zero
+# rejected physics steps and World3dValid at the end. Physics-loop
+# discipline: the tick loop does scalar math only (no str construction,
+# no echo, no allocation); samples buffer into preallocated arrays.
+import std/math as m
+import std/strings as strings
+import cheng/game/world3d
+import cheng/game/physics3d
+import cheng/game/constraints3d
+import cheng/game/csg/joint_motor
+import cheng/game/csg/numerics
+import cheng/game/csg/ball_servo_rigid as bsr
+import std/cmdline
+import cheng/game/csg/microduck_model as mm
+
+const
+    # the M-c bar: 5000 ticks (20.8 s at 240 Hz) survived, end drift < 500 mm
+    SurviveBarTicks: int32 = 5000
+    DriftLimitM: float64 = 0.5
+    DefaultTicks: int32 = 5000
+    MaxTicksParsed: int32 = 200000
+    # buffered sampling: one row every 250 ticks, capacity covers 10000
+    # ticks (beyond that the loop keeps running, sampling just stops)
+    SampleStride: int32 = 250
+    SampleMax: int32 = 41
+    PhysicsTickRateHz: float64 = 240.0
+    # real FIBA size-7 basketball, resting on the ground plane (center z = r)
+    BallCenterX: float64 = 0.0
+    BallCenterY: float64 = 0.85
+    BallCenterZ: float64 = 0.121
+    BallRadiusM: float64 = 0.121
+    BallMassKg: float64 = 0.62
+    # ball top = 2r; the duck root pose stands the sole plane on it
+    DuckRootZ: float64 = 0.275364117885
+    # mode C hip-goal-offset feedback (see header): k*(com-ball)*dt*gain
+    # with k folded in; 0.28 rad/(m s) = the CEM-best effective rate
+    HipFbGain: float64 = 0.28
+    HipFbRangeRad: float64 = 0.05
+    AngleNeutralTolRad: float64 = 0.001
+    AnchorGapTolM: float64 = 0.001
+
+# The four leg pitch hinge-servo constraint indices (filled by buildDuck;
+# mode C drives the hip pair).
+type
+    DuckPitchCons =
+        hipL: int32
+        hipR: int32
+        ankleL: int32
+        ankleR: int32
+
+fn fmtMm(x: float64): str =
+    let scaled: int32 = int32(m.roundFloat(x * 1000.0))
+    var neg: bool = scaled < 0
+    var mag: int32 = scaled
+    if neg:
+        mag = 0 - mag
+    let intPart: int32 = mag / 1000
+    let fracPart: int32 = mag % 1000
+    var outStr: str = ""
+    if neg:
+        outStr = "-"
+    outStr = outStr + strings.IntToStr(intPart) + "." + strings.CloneStrRange(strings.IntToStr(fracPart + 1000), 1, 3)
+    return outStr
+
+# Bisection acos on [-1, 1]: strictly-decreasing cos on [0, pi], fixed 60
+# halvings (deterministic, joint_motor / constraints3d proven shape).
+fn probeAcos(c: float64): float64 =
+    var c2 = c
+    if c2 > 1.0:
+        c2 = 1.0
+    if c2 < 0.0 - 1.0:
+        c2 = 0.0 - 1.0
+    var lo: float64 = 0.0
+    var hi: float64 = m.Pi
+    var i: int32 = 0
+    while i < 60:
+        let mid = (lo + hi) * 0.5
+        if m.cosFloat(mid) > c2:
+            lo = mid
+        else:
+            hi = mid
+        i = i + 1
+    return (lo + hi) * 0.5
+
+# Tilt of a capsule pose's up direction against the vertical, degrees.
+fn upTiltDeg(qx: float64, qy: float64): float64 =
+    let upz = 1.0 - 2.0 * (qx * qx + qy * qy)
+    return probeAcos(upz) * joint_motor.JointMotorDegPerRad
+
+# Park the servo command and goal at the measured standing flexion so tick
+# 0 commands no step change; returns the measured angle.
+fn parkHingeServo(w: var World3d, ci: int32): float64 =
+    let th0 = Constraints3dHingeAngle(w, ci)
+    w.conCmd[ci] = th0
+    w.conGoal[ci] = th0
+    return th0
+
+# One MJCF joint -> one hinge servo from the model table (same
+# construction as microduck_assembly_probe / microduck_ball_probe).
+@borrows
+fn stanceHinge(w: var World3d, mdl: mm.MicroduckModel, jointIdx: int32, refX: float64, refY: float64, refZ: float64, tauMax: float64, omegaRadS: float64): int32 =
+    let jt = mdl.joints[jointIdx]
+    let pl = mdl.links[jt.parentLink]
+    let cl = mdl.links[jt.childLink]
+    var anchAx: float64
+    var anchAy: float64
+    var anchAz: float64
+    mm.MicroduckPointToLocal(pl.axisKind, jt.anchorX, jt.anchorY, jt.anchorZ, pl.cx, pl.cy, pl.cz, anchAx, anchAy, anchAz)
+    var axisAx: float64
+    var axisAy: float64
+    var axisAz: float64
+    mm.MicroduckVecToLocal(pl.axisKind, jt.axisX, jt.axisY, jt.axisZ, axisAx, axisAy, axisAz)
+    var anchBx: float64
+    var anchBy: float64
+    var anchBz: float64
+    mm.MicroduckPointToLocal(cl.axisKind, jt.anchorX, jt.anchorY, jt.anchorZ, cl.cx, cl.cy, cl.cz, anchBx, anchBy, anchBz)
+    var axisBx: float64
+    var axisBy: float64
+    var axisBz: float64
+    mm.MicroduckVecToLocal(cl.axisKind, jt.axisX, jt.axisY, jt.axisZ, axisBx, axisBy, axisBz)
+    let ci = World3dAddHingeJoint(w, jt.parentLink, jt.childLink, world3d.World3dConHingeServo, anchAx, anchAy, anchAz, anchBx, anchBy, anchBz, axisAx, axisAy, axisAz, axisBx, axisBy, axisBz)
+    var refAlX: float64
+    var refAlY: float64
+    var refAlZ: float64
+    mm.MicroduckVecToLocal(pl.axisKind, refX, refY, refZ, refAlX, refAlY, refAlZ)
+    var refBlX: float64
+    var refBlY: float64
+    var refBlZ: float64
+    mm.MicroduckVecToLocal(cl.axisKind, refX, refY, refZ, refBlX, refBlY, refBlZ)
+    World3dSetHingeRefs(w, ci, refAlX, refAlY, refAlZ, refBlX, refBlY, refBlZ)
+    World3dSetHingeServo(w, ci, tauMax, omegaRadS, jt.minRad, jt.maxRad)
+    if Constraints3dJointAnchorGap(w, ci) > AnchorGapTolM:
+        panic("microduck survival: hinge pivot gap at " + jt.name)
+    return ci
+
+# The M6a assembly at root pose (rootX, rootY, rootZ) yaw 0: 15 link
+# capsules at the balanced stance, 14 hinge servos from the model table,
+# every parked servo at its measured stance angle (tick 0 commands no
+# step change). Verbatim from microduck_ball_probe.
+fn buildDuck(w: var World3d, rootX: float64, rootY: float64, rootZ: float64, cons: var DuckPitchCons) =
+    World3dReset(w, int64(931))
+    var mdl: mm.MicroduckModel = mm.MicroduckModelBuild()
+    if mdl.links.len != 15:
+        panic("microduck survival: link count")
+    if mdl.joints.len != 14:
+        panic("microduck survival: joint count")
+    if numerics.CsgAbs(mdl.totalMass - 0.7443611) > 0.000000001:
+        panic("microduck survival: total mass off the MJCF sum")
+    var i: int32 = 0
+    while i < mdl.links.len:
+        let sp = mm.MicroduckLinkSpawnCapsuleStance(mdl, i, rootX, rootY, rootZ, 0.0)
+        let slot = World3dSpawnCapsule(w, sp.px, sp.py, sp.pz, sp.mass, sp.radius, sp.halfLen, sp.qw, sp.qx, sp.qy, sp.qz)
+        if slot != i:
+            panic("microduck survival: link slot mismatch")
+        i = i + 1
+    let omegaRadS = mm.MicroduckServoMaxRateDegS * joint_motor.JointMotorRadPerDeg
+    let tauHip = mm.MicroduckTauMaxHipNm
+    let tauKnee = mm.MicroduckTauMaxKneeNm
+    let tauAnkle = mm.MicroduckTauMaxAnkleNm
+    let tauNeck = mm.MicroduckTauMaxNeckNm
+    let ciHipYawL = stanceHinge(w, mdl, mm.MicroduckJointHipYawL, 0.0, 1.0, 0.0, tauHip, omegaRadS)
+    let ciHipRollL = stanceHinge(w, mdl, mm.MicroduckJointHipRollL, 0.0, 0.0, 0.0 - 1.0, tauHip, omegaRadS)
+    let ciHipPitchL = stanceHinge(w, mdl, mm.MicroduckJointHipPitchL, 0.0, 0.0, 0.0 - 1.0, tauHip, omegaRadS)
+    let ciKneeL = stanceHinge(w, mdl, mm.MicroduckJointKneeL, 0.0, 0.0, 0.0 - 1.0, tauKnee, omegaRadS)
+    let ciAnkleL = stanceHinge(w, mdl, mm.MicroduckJointAnklePitchL, 0.0, 0.0, 0.0 - 1.0, tauAnkle, omegaRadS)
+    let ciHipYawR = stanceHinge(w, mdl, mm.MicroduckJointHipYawR, 0.0, 1.0, 0.0, tauHip, omegaRadS)
+    let ciHipRollR = stanceHinge(w, mdl, mm.MicroduckJointHipRollR, 0.0, 0.0, 0.0 - 1.0, tauHip, omegaRadS)
+    let ciHipPitchR = stanceHinge(w, mdl, mm.MicroduckJointHipPitchR, 0.0, 0.0, 0.0 - 1.0, tauHip, omegaRadS)
+    let ciKneeR = stanceHinge(w, mdl, mm.MicroduckJointKneeR, 0.0, 0.0, 0.0 - 1.0, tauKnee, omegaRadS)
+    let ciAnkleR = stanceHinge(w, mdl, mm.MicroduckJointAnklePitchR, 0.0, 0.0, 0.0 - 1.0, tauAnkle, omegaRadS)
+    let ciNeck = stanceHinge(w, mdl, mm.MicroduckJointNeckPitch, 0.0, 0.0, 1.0, tauNeck, omegaRadS)
+    let ciHeadPitch = stanceHinge(w, mdl, mm.MicroduckJointHeadPitch, 0.0, 0.0, 1.0, tauNeck, omegaRadS)
+    let ciHeadYaw = stanceHinge(w, mdl, mm.MicroduckJointHeadYaw, 0.0, 1.0, 0.0, tauNeck, omegaRadS)
+    let ciHeadRoll = stanceHinge(w, mdl, mm.MicroduckJointHeadRoll, 0.0, 0.0, 1.0, tauNeck, omegaRadS)
+    let th = mm.MicroduckStanceHipRad
+    let thHipL = parkHingeServo(w, ciHipPitchL)
+    let thHipR = parkHingeServo(w, ciHipPitchR)
+    let thKneeL = parkHingeServo(w, ciKneeL)
+    let thKneeR = parkHingeServo(w, ciKneeR)
+    let thAnkleL = parkHingeServo(w, ciAnkleL)
+    let thAnkleR = parkHingeServo(w, ciAnkleR)
+    let thNeck = parkHingeServo(w, ciNeck)
+    parkHingeServo(w, ciHeadPitch)
+    parkHingeServo(w, ciHeadYaw)
+    parkHingeServo(w, ciHeadRoll)
+    parkHingeServo(w, ciHipYawL)
+    parkHingeServo(w, ciHipYawR)
+    parkHingeServo(w, ciHipRollL)
+    parkHingeServo(w, ciHipRollR)
+    cons.hipL = ciHipPitchL
+    cons.hipR = ciHipPitchR
+    cons.ankleL = ciAnkleL
+    cons.ankleR = ciAnkleR
+    # Create-time pose validation (pose-invariant distance checks).
+    if numerics.CsgAbs(thHipL - th) > AngleNeutralTolRad:
+        panic("microduck survival: hip pitch L th0 off the stance")
+    if numerics.CsgAbs(thHipR + th) > AngleNeutralTolRad:
+        panic("microduck survival: hip pitch R th0 off the stance")
+    if numerics.CsgAbs(thAnkleL + th) > AngleNeutralTolRad:
+        panic("microduck survival: ankle L th0 off the stance")
+    if numerics.CsgAbs(thAnkleR - th) > AngleNeutralTolRad:
+        panic("microduck survival: ankle R th0 off the stance")
+    if numerics.CsgAbs(thKneeL) > AngleNeutralTolRad:
+        panic("microduck survival: knee L th0 not neutral")
+    if numerics.CsgAbs(thKneeR) > AngleNeutralTolRad:
+        panic("microduck survival: knee R th0 not neutral")
+    if numerics.CsgAbs(thNeck) > AngleNeutralTolRad:
+        panic("microduck survival: neck th0 not neutral")
+    echo("assembly links=" + strings.IntToStr(mdl.links.len) + " joints=" + strings.IntToStr(mdl.joints.len) + " bodies=" + strings.IntToStr(w.count) + " constraints=" + strings.IntToStr(w.conCount) + " totalMass_x1000=" + strings.Int64ToStr(numerics.CsgQuantMm(mdl.totalMass)))
+    echo("assembly th0_deg hipL=" + fmtMm(thHipL * joint_motor.JointMotorDegPerRad) + " hipR=" + fmtMm(thHipR * joint_motor.JointMotorDegPerRad) + " kneeL=" + fmtMm(thKneeL * joint_motor.JointMotorDegPerRad) + " kneeR=" + fmtMm(thKneeR * joint_motor.JointMotorDegPerRad) + " ankleL=" + fmtMm(thAnkleL * joint_motor.JointMotorDegPerRad) + " ankleR=" + fmtMm(thAnkleR * joint_motor.JointMotorDegPerRad) + " neck=" + fmtMm(thNeck * joint_motor.JointMotorDegPerRad))
+
+# Decimal-only tick-cap parser: empty input, non-digits, zero or an
+# out-of-band value is an illegal form (hard fail, no fallback default).
+fn parseTicks(s: str): int32 =
+    let n: int32 = strings.len(s)
+    if n <= 0:
+        panic("microduck survival: empty tick cap")
+    var acc: int64 = 0
+    var i: int32 = 0
+    while i < n:
+        let ch = s[i]
+        if ch < '0':
+            panic("microduck survival: tick cap has a non-digit")
+        if ch > '9':
+            panic("microduck survival: tick cap has a non-digit")
+        acc = acc * 10 + Int32(ch - '0')
+        if acc > int64(MaxTicksParsed):
+            panic("microduck survival: tick cap over the instrument band")
+        i = i + 1
+    if acc <= 0:
+        panic("microduck survival: tick cap must be positive")
+    return int32(acc)
+
+# One survival episode: identical assembly, identical ball injection and
+# an IDENTICAL measurement loop for every mode (only the pre-step
+# actuation branch differs), so the three rows are directly comparable.
+# Hard contracts: zero rejected steps, world validity. Returns 0 for both
+# PASS and DATA rows (data rows are a valid product); nonzero only on a
+# hard-contract failure.
+fn runSurvival(mode: int32, modeStr: str, totalTicks: int32): int32 =
+    var w: world3d.World3d
+    var cons: DuckPitchCons
+    buildDuck(w, BallCenterX, BallCenterY, DuckRootZ, cons)
+    if w.count != 15:
+        echo("FAIL survival assembly body count mode=" + modeStr)
+        return 1
+    if w.conCount != 14:
+        echo("FAIL survival assembly constraint count mode=" + modeStr)
+        return 1
+    let ballSlot = World3dSpawnBody(w, BallCenterX, BallCenterY, BallCenterZ, BallMassKg, BallRadiusM, world3d.World3dBodyBallRigid)
+    let torsoSlot: int32 = mm.MicroduckLinkTorso
+    let headSlot: int32 = mm.MicroduckLinkHead
+    let ballX0: float64 = w.bodyPx[ballSlot]
+    let ballY0: float64 = w.bodyPy[ballSlot]
+    # mode B actuator: the torso servo at the frozen defaults. The Init
+    # is a pure read of the live world, legal in every mode; only mode B
+    # ticks it (the armed column reports the live latch there).
+    var st: bsr.BallServoRigidState
+    bsr.BallServoRigidStateInit(st, w, ballSlot, torsoSlot, headSlot,
+        bsr.BallServoRigidDefaultK, bsr.BallServoRigidDefaultC,
+        bsr.BallServoRigidDefaultLinCapMps, bsr.BallServoRigidDefaultLinDampCapMps,
+        bsr.BallServoRigidDefaultKAng, bsr.BallServoRigidDefaultCAng,
+        bsr.BallServoRigidDefaultAngCapRadS, bsr.BallServoRigidDefaultAngDampCapRadS,
+        bsr.BallServoRigidDefaultRampTicks)
+    # mode C feedback state: parked goals as bases, the MJCF hip range
+    # from the model table, the offset accumulator starts at 0 so tick 0
+    # commands no step change.
+    var mdl: mm.MicroduckModel = mm.MicroduckModelBuild()
+    let limHipMin = mdl.joints[mm.MicroduckJointHipPitchL].minRad
+    let limHipMax = mdl.joints[mm.MicroduckJointHipPitchL].maxRad
+    let fbBaseL: float64 = w.conGoal[cons.hipL]
+    let fbBaseR: float64 = w.conGoal[cons.hipR]
+    var fbDTheta: float64 = 0.0
+    var fbTicks: int32 = 0
+    var fbOn: int32 = 1
+    if mode == 1:
+        echo("survcfg mode=A dwell_only ticks=" + strings.IntToStr(totalTicks) + " (control: no balance channel)")
+    if mode == 2:
+        echo("survcfg mode=B dwell+torso_servo ticks=" + strings.IntToStr(totalTicks) + " k=" + fmtMm(st.k) + " c=" + fmtMm(st.c) + " kAng=" + fmtMm(st.kAng) + " cAng=" + fmtMm(st.cAng) + " ramp_ticks=" + fmtMm(st.rampTicks) + " offX_mm=" + fmtMm(st.offX * 1000.0) + " offY_mm=" + fmtMm(st.offY * 1000.0) + " offZ_mm=" + fmtMm(st.offZ * 1000.0))
+    if mode == 3:
+        echo("survcfg mode=C dwell+hip_fb ticks=" + strings.IntToStr(totalTicks) + " gain=" + fmtMm(HipFbGain) + " range_mrad=" + strings.IntToStr(int32(HipFbRangeRad * 1000.0)) + " baseL_mrad=" + fmtMm(fbBaseL * 1000.0) + " baseR_mrad=" + fmtMm(fbBaseR * 1000.0) + " com_slots=0.." + strings.IntToStr(ballSlot - 1))
+    # buffered samples (echoed after the loop; physics loop stays scalar)
+    var recTick: int32[]
+    var recTorsoZ: float64[]
+    var recDrift: float64[]
+    var recTilt: float64[]
+    var recArmed: int32[]
+    setLen(recTick, SampleMax)
+    setLen(recTorsoZ, SampleMax)
+    setLen(recDrift, SampleMax)
+    setLen(recTilt, SampleMax)
+    setLen(recArmed, SampleMax)
+    var rejected: int32 = 0
+    var firstRejectTick: int32 = 0 - 1
+    var fallTick: int32 = 0 - 1
+    var aliveTicks: int32 = 0
+    var driftMax: float64 = 0.0
+    var minUpz: float64 = 1.0
+    var ti: int32 = 0
+    var i: int32 = 0
+    let dtTick: float64 = 1.0 / PhysicsTickRateHz
+    while i < totalTicks:
+        # --- per-mode actuation, immediately before the physics step ---
+        if mode == 2:
+            bsr.BallServoRigidTick(st, w)
+        if mode == 3:
+            if fbOn == 1:
+                var mSum: float64 = 0.0
+                var comY: float64 = 0.0
+                var ci: int32 = 0
+                while ci < ballSlot:
+                    let mass: float64 = 1.0 / w.bodyInvMass[ci]
+                    mSum = mSum + mass
+                    comY = comY + mass * w.bodyPy[ci]
+                    ci = ci + 1
+                let eY = comY / mSum - w.bodyPy[ballSlot]
+                var dNew = fbDTheta + eY * dtTick * HipFbGain
+                if dNew > HipFbRangeRad:
+                    dNew = HipFbRangeRad
+                if dNew < 0.0 - HipFbRangeRad:
+                    dNew = 0.0 - HipFbRangeRad
+                fbDTheta = dNew
+                var ghL = fbBaseL + fbDTheta
+                if ghL > limHipMax:
+                    ghL = limHipMax
+                if ghL < limHipMin:
+                    ghL = limHipMin
+                var ghR = fbBaseR - fbDTheta
+                if ghR > limHipMax:
+                    ghR = limHipMax
+                if ghR < limHipMin:
+                    ghR = limHipMin
+                w.conGoal[cons.hipL] = ghL
+                w.conGoal[cons.hipR] = ghR
+                fbTicks = fbTicks + 1
+        var r = physics3d.Physics3dStep(w, "probe:ducksurv")
+        if r.statusCode != physics3d.Physics3dStatusOk:
+            if firstRejectTick < 0:
+                firstRejectTick = i
+            rejected = rejected + 1
+        # --- identical measurement block for every mode ---
+        let dx = w.bodyPx[ballSlot] - ballX0
+        let dy = w.bodyPy[ballSlot] - ballY0
+        let drift = numerics.CsgSqrt(dx * dx + dy * dy)
+        if drift > driftMax:
+            driftMax = drift
+        let tqx = w.bodyQuatX[torsoSlot]
+        let tqy = w.bodyQuatY[torsoSlot]
+        let upz = 1.0 - 2.0 * (tqx * tqx + tqy * tqy)
+        if upz < minUpz:
+            minUpz = upz
+        if w.bodyPz[headSlot] < w.bodyPz[torsoSlot]:
+            if fallTick < 0:
+                fallTick = i
+                fbOn = 0
+        if fallTick < 0:
+            aliveTicks = aliveTicks + 1
+        if i % SampleStride == 0:
+            if ti < SampleMax:
+                var armedCol: int32 = 1
+                if mode == 2:
+                    armedCol = st.armed
+                if mode == 3:
+                    armedCol = fbOn
+                recTick[ti] = i
+                recTorsoZ[ti] = w.bodyPz[torsoSlot]
+                recDrift[ti] = drift
+                recTilt[ti] = upTiltDeg(tqx, tqy)
+                recArmed[ti] = armedCol
+                ti = ti + 1
+        i = i + 1
+    # buffered sample lines out (physics loop is done)
+    var k: int32 = 0
+    while k < ti:
+        echo("surv t=" + strings.IntToStr(recTick[k]) + " mode=" + modeStr + " torsoZ_mm=" + fmtMm(recTorsoZ[k] * 1000.0) + " ballDrift_mm=" + fmtMm(recDrift[k] * 1000.0) + " tilt_deg=" + fmtMm(recTilt[k]) + " armed=" + strings.IntToStr(recArmed[k]))
+        k = k + 1
+    let edx = w.bodyPx[ballSlot] - ballX0
+    let edy = w.bodyPy[ballSlot] - ballY0
+    let driftEnd = numerics.CsgSqrt(edx * edx + edy * edy)
+    let tiltMax = probeAcos(minUpz) * joint_motor.JointMotorDegPerRad
+    echo("survrow mode=" + modeStr + " ticks=" + strings.IntToStr(totalTicks) + " stood=" + strings.IntToStr(aliveTicks) + " fall_tick=" + strings.IntToStr(fallTick) + " driftEnd_mm=" + fmtMm(driftEnd * 1000.0) + " driftMax_mm=" + fmtMm(driftMax * 1000.0) + " tilt_max_deg=" + fmtMm(tiltMax) + " rejected=" + strings.IntToStr(rejected) + " firstRejectTick=" + strings.IntToStr(firstRejectTick) + " fb_ticks=" + strings.IntToStr(fbTicks) + " dTheta_end_mrad=" + fmtMm(fbDTheta * 1000.0) + " servo_armed_end=" + strings.IntToStr(st.armed))
+    if !World3dValid(w):
+        echo("FAIL survival world validity mode=" + modeStr)
+        return 1
+    if rejected != 0:
+        echo("FAIL survival rejected steps mode=" + modeStr + " firstRejectTick=" + strings.IntToStr(firstRejectTick))
+        return 1
+    var pass: bool = fallTick < 0
+    if pass:
+        pass = aliveTicks >= SurviveBarTicks
+    if pass:
+        pass = driftEnd < DriftLimitM
+    if pass:
+        echo("PASS survival probe mode=" + modeStr + " stood=" + strings.IntToStr(aliveTicks) + " drift=" + fmtMm(driftEnd * 1000.0))
+    else:
+        echo("DATA survival probe mode=" + modeStr + " stood=" + strings.IntToStr(aliveTicks) + " drift=" + fmtMm(driftEnd * 1000.0) + " fell=" + strings.IntToStr(fallTick))
+    return 0
+
+fn main(): int32 =
+    # this runtime's paramCount/paramStr include the program name at
+    # index 0: mode lives at paramStr(1), the optional tick cap at
+    # paramStr(2) (present only when paramCount() >= 3)
+    if cmdline.paramCount() < 2:
+        echo("usage: microduck_survival_probe <A|B|C> [maxTicks]")
+        return 2
+    let modeArg: str = cmdline.paramStr(1)
+    var mode: int32 = 0
+    if modeArg == "A":
+        mode = 1
+    if modeArg == "B":
+        mode = 2
+    if modeArg == "C":
+        mode = 3
+    if mode == 0:
+        echo("usage: microduck_survival_probe <A|B|C> [maxTicks] (got " + modeArg + ")")
+        return 2
+    var totalTicks: int32 = DefaultTicks
+    if cmdline.paramCount() >= 3:
+        totalTicks = parseTicks(cmdline.paramStr(2))
+    return runSurvival(mode, modeArg, totalTicks)

@@ -1,0 +1,227 @@
+# S2 live receiver for the fact-first publish seal — docs/cheng-csg-video-facts-bytes-plan.md §S2.
+# Pairs with media_moq_publisher_main --fact-first 1 over real QUIC localhost (two OS
+# processes, real UDP, no pipe shortcut). Fetch lifecycle mirrors the production
+# bridge (WebSceneMediaFetchRemoteObject): FULL dial→negotiate→open→drain→close per
+# object — the publisher's accept loop closes the session when no second client
+# stream is immediately readable (the known multi-request-per-conn gap adjudicated
+# by media_moq_range_fetch_main.cheng), so re-dial per fetch is the production shape.
+#
+# Fact-first open sequence (秒开的接收端形态 — 每一步只用事实，不用整片字节):
+#   1. fetch moq-announce (1024B) → factfirst_manifest_bytes / factfirst_seal_ms /
+#      factfirst_index_cid.
+#      GATE: seal_ms ≤ 1000 — 发布动作与资产大小解耦。
+#   2. fetch moq-factfirst (manifest) → ff.Verify == 0 (CID 重算).
+#   3. facts-only lookups: keyframe table sanity, SnapToKeyframe,
+#      FirstGopByteLen (首帧预算 = keyframe[1].offset - keyframe[0].offset).
+#   4. fetch moq-esindex → sha256 == announce factfirst_index_cid AND == hex of
+#      manifest bytes[40..72) (哈希回执: manifest ↔ 实际服务索引绑定, 与 announce 无关).
+#   5. fetch moq-frame [0, FirstGopByteLen) → BytesLen == budget (GATE: 事实预算 ==
+#      实际首 GOP 字节), with first-byte timing receipt.
+#   6. tamper negative: flip one manifest byte → Verify == 4.
+# Prints one receipt line + "ALL OK"; every failure prints a reason, exits nonzero.
+
+import std/result
+import std/rawbytes
+import std/os
+import std/strutils as strutil
+import std/times
+import std/cmdline as cmdline
+import std/crypto/sha256
+import cheng/quic/connection as qconn
+import cheng/quic/msquictransport_native as qtransport
+import cheng/libp2p/transports/quic_transport as quic_transport
+import cheng/libp2p/protocols/media/moq_segment_stream as moqstream
+import cheng/moq/media_asset_manifest as media
+import cheng/core/runtime/web_scene_media_factfirst as ff
+
+fn mediaCsgFfLog(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+@borrows
+fn mediaCsgFfAnnounceField(text: str, key: str): str =
+    let parts = strutil.Split(text, ' ')
+    var i = 0
+    while i < parts.len:
+        let kv = strutil.Split(parts[i], '=')
+        if kv.len == 2 && kv[0] == key:
+            return strings.CloneStr(kv[1])
+        i = i + 1
+    return ""
+
+fn mediaCsgFfFail(msg: str): int32 =
+    mediaCsgFfLog(strutil.Join(["FAIL: ", msg], ""))
+    return 1
+
+# One full fetch lifecycle: dial → ConnDeriveStream(4,4) → negotiate → object-range
+# open → drain → close (connection + transport on EVERY exit path, mirroring the
+# production bridge fetch).
+@borrows
+fn mediaCsgFfFetchObject(dialHost: str, port: int32, streamId: str, segmentKey: str,
+                         offsetBytes: int32, lengthBytes: int32, chunkBytes: int32,
+                         firstByteMsOut: var int64): Result[rawbytes.Bytes] =
+    var client = qtransport.InitMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn, strings.CloneStr(dialHost), port, "localhost")
+    if IsErr(dialRes):
+        qtransport.Stop(client)
+        return Err[rawbytes.Bytes](Error(dialRes))
+    conn = qconn.ConnDeriveStream(conn, 4, 4)
+    let negotiateRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, conn)
+    if IsErr(negotiateRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return Err[rawbytes.Bytes](Error(negotiateRes))
+    let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, conn)
+    if IsErr(ackRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return Err[rawbytes.Bytes](Error(ackRes))
+    var request: moqstream.Libp2pMoqSegmentStreamRequest
+    request.streamId = strings.CloneStr(streamId)
+    request.segmentKey = strings.CloneStr(segmentKey)
+    request.offsetBytes = offsetBytes
+    request.lengthBytes = lengthBytes
+    request.readChunkBytes = chunkBytes
+    var reader: moqstream.Libp2pMoqSegmentStreamReader
+    let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(conn), request)
+    if IsErr(openRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return Err[rawbytes.Bytes](Error(openRes))
+    var received = rawbytes.EmptyBytes()
+    var first: bool = true
+    while !reader.closed:
+        let chunkRes = moqstream.Libp2pMoqSegmentStreamRead(reader, chunkBytes)
+        if IsErr(chunkRes):
+            moqstream.Libp2pMoqSegmentStreamClose(reader)
+            qconn.ConnClose(conn)
+            qtransport.Stop(client)
+            return Err[rawbytes.Bytes](Error(chunkRes))
+        let chunk = Value(chunkRes)
+        if rawbytes.BytesLen(chunk) <= 0:
+            break
+        if first:
+            firstByteMsOut = times.MonotimeMs()
+            first = false
+        received = moqstream.Libp2pMoqSegmentStreamAppendBytes(received, chunk)
+    moqstream.Libp2pMoqSegmentStreamClose(reader)
+    qconn.ConnClose(conn)
+    qtransport.Stop(client)
+    return Ok[rawbytes.Bytes](received)
+
+fn main(): int32 =
+    let directPort: int32 = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    var dialHostRaw: str
+    let hasDialHost: bool = cmdline.ReadFirstFlagValue("--host", dialHostRaw)
+    let dialHost: str = if hasDialHost: dialHostRaw else: "127.0.0.1"
+    if directPort <= 0:
+        return mediaCsgFfFail("missing --port")
+    let chunkBytes: int32 = 4096
+
+    # 1. announce: the fact bundle's identity + the publisher's seal receipt.
+    var firstByteTmp: int64 = 0
+    let annRes = mediaCsgFfFetchObject(dialHost, directPort, "ff-announce-1", "moq-announce", 0, 1024, 1024, firstByteTmp)
+    if IsErr(annRes):
+        return mediaCsgFfFail(strutil.Join(["announce fetch: ", Error(annRes)], ""))
+    let annText = rawbytes.BytesToString(Value(annRes))
+    let manifestBytesAnn = mediaCsgFfAnnounceField(annText, "factfirst_manifest_bytes")
+    let sealMsAnn = mediaCsgFfAnnounceField(annText, "factfirst_seal_ms")
+    let indexCidAnn = mediaCsgFfAnnounceField(annText, "factfirst_index_cid")
+    let esIndexBytesAnn = mediaCsgFfAnnounceField(annText, "es_index_bytes")
+    var manifestLen: int32
+    var sealMs: int32
+    var esIndexLen: int32
+    let _p1 = cmdline.ParseInt32(manifestBytesAnn, manifestLen)
+    let _p2 = cmdline.ParseInt32(sealMsAnn, sealMs)
+    let _p3 = cmdline.ParseInt32(esIndexBytesAnn, esIndexLen)
+    if manifestLen <= 0 || esIndexLen <= 0:
+        return mediaCsgFfFail(strutil.Join(["announce parse failed manifest_bytes=", manifestBytesAnn, " es_index_bytes=", esIndexBytesAnn], ""))
+    # GATE: 发布动作（封签）≤1000ms，与资产大小解耦。
+    if sealMs > 1000:
+        return mediaCsgFfFail(strutil.Join(["seal_ms=", sealMsAnn, " exceeds 1000ms gate"], ""))
+    if len(indexCidAnn) != 64:
+        return mediaCsgFfFail("announce factfirst_index_cid is not a sha256 hex")
+
+    # 2. manifest fetch + CID recompute.
+    let manRes = mediaCsgFfFetchObject(dialHost, directPort, "ff-manifest-1", "moq-factfirst", 0, manifestLen, chunkBytes, firstByteTmp)
+    if IsErr(manRes):
+        return mediaCsgFfFail(strutil.Join(["manifest fetch: ", Error(manRes)], ""))
+    let manifest = Value(manRes)
+    if rawbytes.BytesLen(manifest) != manifestLen:
+        return mediaCsgFfFail(strutil.Join(["manifest bytes=", IntToStr(rawbytes.BytesLen(manifest)), " want=", IntToStr(manifestLen)], ""))
+    if ff.WebSceneMediaFactFirstVerify(manifest) != 0:
+        return mediaCsgFfFail("manifest CID verification failed")
+    if ff.WebSceneMediaFactFirstManifestLen(ff.WebSceneMediaFactFirstKeyframeCount(manifest)) != manifestLen:
+        return mediaCsgFfFail("manifest length != 104 + 12*keyframeCount")
+
+    # 3. facts-only receiver lookups (no ES bytes touched so far).
+    let kfCount: int32 = ff.WebSceneMediaFactFirstKeyframeCount(manifest)
+    if kfCount < 2:
+        return mediaCsgFfFail(strutil.Join(["keyframeCount=", IntToStr(kfCount), " want >= 2"], ""))
+    if ff.WebSceneMediaFactFirstKeyframeFrame(manifest, 0) != 0:
+        return mediaCsgFfFail("keyframe[0] frame index != 0")
+    let lastFrame: int32 = ff.WebSceneMediaFactFirstKeyframeFrame(manifest, kfCount - 1)
+    let totalFrames: int32 = ff.WebSceneMediaFactFirstFrameCount(manifest)
+    if ff.WebSceneMediaFactFirstSnapToKeyframe(manifest, totalFrames - 1) != lastFrame:
+        return mediaCsgFfFail("SnapToKeyframe(last) did not land on the last keyframe")
+    let budget: int32 = ff.WebSceneMediaFactFirstFirstGopByteLen(manifest)
+    if budget <= 0 || budget != ff.WebSceneMediaFactFirstKeyframeOffset(manifest, 1):
+        return mediaCsgFfFail("FirstGopByteLen != keyframe[1].offset (facts-only budget broken)")
+
+    # 4. served index binding: sha256(moq-esindex bytes) == manifest.esIndexCid AND
+    #    == announce factfirst_index_cid (double hash receipt).
+    let idxRes = mediaCsgFfFetchObject(dialHost, directPort, "ff-esindex-1", "moq-esindex", 0, esIndexLen, chunkBytes, firstByteTmp)
+    if IsErr(idxRes):
+        return mediaCsgFfFail(strutil.Join(["esindex fetch: ", Error(idxRes)], ""))
+    let servedIndex = Value(idxRes)
+    if rawbytes.BytesLen(servedIndex) != esIndexLen:
+        return mediaCsgFfFail(strutil.Join(["esindex bytes=", IntToStr(rawbytes.BytesLen(servedIndex)), " want=", IntToStr(esIndexLen)], ""))
+    let servedIndexCidHex = media.MediaAssetSha256Hex(servedIndex)
+    # manifest.esIndexCid (bytes 40..72) is the RAW sha256 digest of the index —
+    # byte-compare it against the freshly computed digest of the served bytes
+    # (MediaAssetSha256Hex is hash-then-hex, wrong tool for raw digest comparison).
+    let servedDigest = sha256.Sha256Digest(servedIndex)
+    if rawbytes.BytesLen(servedDigest) != 32:
+        return mediaCsgFfFail("served index digest length mismatch")
+    var di: int32 = 0
+    while di < 32:
+        if rawbytes.BytesGet(servedDigest, di) != rawbytes.BytesGet(manifest, 40 + di):
+            return mediaCsgFfFail("served esindex digest != manifest.esIndexCid")
+        di = di + 1
+    if servedIndexCidHex != indexCidAnn:
+        return mediaCsgFfFail("served esindex hash != announce factfirst_index_cid")
+
+    # 5. 秒开 fetch: exactly the facts-only first-GOP budget of moq-frame bytes.
+    let gopStartMs = times.MonotimeMs()
+    var gopFirstByteMs: int64 = 0
+    let gopRes = mediaCsgFfFetchObject(dialHost, directPort, "ff-gop0-1", "moq-frame", 0, budget, chunkBytes, gopFirstByteMs)
+    if IsErr(gopRes):
+        return mediaCsgFfFail(strutil.Join(["first-gop fetch: ", Error(gopRes)], ""))
+    let gopBytes = Value(gopRes)
+    let gopDoneMs = times.MonotimeMs()
+    # GATE: 事实预算 == 实际首 GOP 字节（收到的字节不多不少）。
+    if rawbytes.BytesLen(gopBytes) != budget:
+        return mediaCsgFfFail(strutil.Join(["first-gop bytes=", IntToStr(rawbytes.BytesLen(gopBytes)), " want budget=", IntToStr(budget)], ""))
+
+    # 6. tamper negative on a fetched-manifest copy.
+    var manBad = rawbytes.BytesAlloc(rawbytes.BytesLen(manifest))
+    rawbytes.BytesCopyInto(manBad, 0, manifest)
+    rawbytes.BytesSet(manBad, 76, rawbytes.BytesGet(manBad, 76) ^ 255)
+    if ff.WebSceneMediaFactFirstVerify(manBad) != 4:
+        return mediaCsgFfFail("flipped manifest byte not caught by CID verification")
+
+    let manifestCidHex = media.MediaAssetSha256Hex(manifest)
+    var receipt: str = "media_csg_factfirst_live"
+    receipt = strutil.Join([receipt, " seal_ms=", IntToStr(sealMs)], "")
+    receipt = strutil.Join([receipt, " manifest_bytes=", IntToStr(manifestLen)], "")
+    receipt = strutil.Join([receipt, " keyframes=", IntToStr(kfCount)], "")
+    receipt = strutil.Join([receipt, " frames=", IntToStr(totalFrames)], "")
+    receipt = strutil.Join([receipt, " first_gop_budget=", IntToStr(budget)], "")
+    receipt = strutil.Join([receipt, " first_gop_bytes=", IntToStr(rawbytes.BytesLen(gopBytes))], "")
+    receipt = strutil.Join([receipt, " gop_fetch_ms=", Int64ToStr(gopDoneMs - gopStartMs)], "")
+    receipt = strutil.Join([receipt, " gop_first_byte_ms=", Int64ToStr(gopFirstByteMs - gopStartMs)], "")
+    receipt = strutil.Join([receipt, " manifest_cid=", manifestCidHex], "")
+    receipt = strutil.Join([receipt, " index_cid=", servedIndexCidHex], "")
+    os.WriteLine(os.Get_stdout(), receipt)
+    os.WriteLine(os.Get_stdout(), "ALL OK")
+    return 0

@@ -1,0 +1,166 @@
+# W4 recovery: connection-level / stream-level flow control credit
+# accounting (RFC 9000 Section 4, sender-side simple form).
+#
+# Model (offset watermark, exactly the RFC semantics): dataSent is the
+# highest stream-data offset handed to the wire; every FRESH payload byte
+# deducts credit (conn + stream) through QuicFcOnSent behind the
+# QuicFcAllowSend gate. Retransmissions reuse offsets that are already
+# charged — they bypass the gate and never deduct again. Credit therefore
+# tracks not-yet-replaced data and can never go negative: QuicFcOnSent
+# refuses (returns false, mutating nothing) any send that would exceed a
+# limit, and the gate is checked before the wire.
+#
+# The receive side (peer leg of the event simulator) uses the same module:
+# QuicFcOnDelivered* accumulates consumed bytes and QuicFcConnUpdateNeeded /
+# QuicFcStreamUpdateNeeded propose MAX_DATA / MAX_STREAM_DATA top-ups with a
+# half-window hysteresis ("回补简单版"). A peer that never consumes never
+# tops up — the backpressure scenario stalls exactly at the initial credit.
+#
+# All state is plain scalars and fixed arrays; no clock.
+
+const
+    QuicFcMaxStreams: int32 = 8
+    QuicFcDefaultWindow: int64 = 65536
+
+type
+    QuicFc =
+        maxData: int64
+        dataSent: int64
+        consumed: int64
+        windowSize: int64
+        streamInitial: int64
+        streamIds: int64[QuicFcMaxStreams]
+        streamMax: int64[QuicFcMaxStreams]
+        streamSent: int64[QuicFcMaxStreams]
+        streamConsumed: int64[QuicFcMaxStreams]
+        streamUsed: int32[QuicFcMaxStreams]
+        streamCount: int32
+        blockedConn: int64
+        blockedStream: int64
+        topUpsIssued: int64
+
+fn QuicFcInit(fc: var QuicFc, initialMaxData: int64, initialStreamMax: int64,
+               windowSize: int64) =
+    fc.maxData = initialMaxData
+    fc.dataSent = 0
+    fc.consumed = 0
+    fc.windowSize = windowSize
+    fc.streamInitial = initialStreamMax
+    fc.streamCount = 0
+    fc.blockedConn = 0
+    fc.blockedStream = 0
+    fc.topUpsIssued = 0
+    var i: int32
+    while i < QuicFcMaxStreams:
+        fc.streamUsed[i] = 0
+        fc.streamIds[i] = 0
+        fc.streamMax[i] = 0
+        fc.streamSent[i] = 0
+        fc.streamConsumed[i] = 0
+        i = i + 1
+    # stream 0 is pre-registered with the initially announced credit
+    fc.streamIds[0] = 0
+    fc.streamMax[0] = initialStreamMax
+    fc.streamSent[0] = 0
+    fc.streamConsumed[0] = 0
+    fc.streamUsed[0] = 1
+    fc.streamCount = 1
+
+# Find a stream slot or register it (new streams start with zero credit
+# until the peer announces MAX_STREAM_DATA).
+fn QuicFcStreamIdx(fc: var QuicFc, streamId: int64): int32 =
+    var i: int32
+    while i < fc.streamCount:
+        if fc.streamIds[i] == streamId:
+            return i
+        i = i + 1
+    if fc.streamCount >= QuicFcMaxStreams:
+        return 0 - 1
+    fc.streamIds[fc.streamCount] = streamId
+    fc.streamMax[fc.streamCount] = 0
+    fc.streamSent[fc.streamCount] = 0
+    fc.streamConsumed[fc.streamCount] = 0
+    fc.streamUsed[fc.streamCount] = 1
+    fc.streamCount = fc.streamCount + 1
+    return fc.streamCount - 1
+
+fn QuicFcCreditConn(fc: var QuicFc): int64 =
+    return fc.maxData - fc.dataSent
+
+fn QuicFcCreditStream(fc: var QuicFc, streamId: int64): int64 =
+    let idx: int32 = QuicFcStreamIdx(fc, streamId)
+    if idx < 0:
+        return 0 - 1
+    return fc.streamMax[idx] - fc.streamSent[idx]
+
+fn QuicFcAllowSend(fc: var QuicFc, streamId: int64, n: int64): bool =
+    if n > QuicFcCreditConn(fc):
+        return false
+    let idx: int32 = QuicFcStreamIdx(fc, streamId)
+    if idx < 0:
+        return false
+    if n > fc.streamMax[idx] - fc.streamSent[idx]:
+        return false
+    return true
+
+# Deduct credit for n payload bytes. Returns false (and mutates nothing)
+# when the send would make any credit negative; the driver hard-fails if
+# that is ever reached through the AllowSend gate.
+fn QuicFcOnSent(fc: var QuicFc, streamId: int64, n: int64): bool =
+    if n > fc.maxData - fc.dataSent:
+        fc.blockedConn = fc.blockedConn + 1
+        return false
+    let idx: int32 = QuicFcStreamIdx(fc, streamId)
+    if idx < 0:
+        return false
+    if n > fc.streamMax[idx] - fc.streamSent[idx]:
+        fc.blockedStream = fc.blockedStream + 1
+        return false
+    fc.dataSent = fc.dataSent + n
+    fc.streamSent[idx] = fc.streamSent[idx] + n
+    return true
+
+fn QuicFcOnMaxData(fc: var QuicFc, maximum: int64): bool =
+    if maximum <= fc.maxData:
+        return false
+    fc.maxData = maximum
+    fc.topUpsIssued = fc.topUpsIssued + 1
+    return true
+
+fn QuicFcOnMaxStreamData(fc: var QuicFc, streamId: int64, maximum: int64): bool =
+    let idx: int32 = QuicFcStreamIdx(fc, streamId)
+    if idx < 0:
+        return false
+    if maximum <= fc.streamMax[idx]:
+        return false
+    fc.streamMax[idx] = maximum
+    fc.topUpsIssued = fc.topUpsIssued + 1
+    return true
+
+# Receive side: bytes handed to the application.
+fn QuicFcOnDeliveredConn(fc: var QuicFc, n: int64) =
+    fc.consumed = fc.consumed + n
+
+fn QuicFcOnDeliveredStream(fc: var QuicFc, streamId: int64, n: int64) =
+    let idx: int32 = QuicFcStreamIdx(fc, streamId)
+    if idx >= 0:
+        fc.streamConsumed[idx] = fc.streamConsumed[idx] + n
+
+# Half-window hysteresis: top up once more than half the window is consumed.
+fn QuicFcConnUpdateNeeded(fc: var QuicFc): bool =
+    return fc.consumed + fc.windowSize / 2 > fc.maxData
+
+fn QuicFcConnProposeMax(fc: var QuicFc): int64 =
+    return fc.consumed + fc.windowSize
+
+fn QuicFcStreamUpdateNeeded(fc: var QuicFc, streamId: int64): bool =
+    let idx: int32 = QuicFcStreamIdx(fc, streamId)
+    if idx < 0:
+        return false
+    return fc.streamConsumed[idx] + fc.windowSize / 2 > fc.streamMax[idx]
+
+fn QuicFcStreamProposeMax(fc: var QuicFc, streamId: int64): int64 =
+    let idx: int32 = QuicFcStreamIdx(fc, streamId)
+    if idx < 0:
+        return 0
+    return fc.streamConsumed[idx] + fc.windowSize

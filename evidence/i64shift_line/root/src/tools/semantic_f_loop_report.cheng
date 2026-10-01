@@ -1,0 +1,819 @@
+import std/strings
+import std/os
+import std/rawbytes
+import std/result
+import std/cmdline
+import std/monotimes
+import cheng/game/csg/schema
+import cheng/game/csg/csgworld
+import cheng/game/world3d
+import cheng/game/csg/ball_servo_rigid
+import cheng/game/assets/semantic_video/reader
+import cheng/game/assets/semantic_video/validator
+import cheng/game/assets/semantic_video/writer
+import cheng/game/assets/semantic_video/source_index
+import cheng/game/assets/semantic_video/snapshot_codec
+import cheng/game/assets/semantic_video/snapshot_block
+
+# semantic_f_loop_report (f 闭环 S3): 「f 已接通 vs f 未接通」公平压缩基准
+# 纯计量 CLI。stdout 逐行 k=v；rc=0/1；全部数字来自真实文件与真实恢复，无手填。
+#
+#   f-loop --block <f1_ball.svblock> --world <ballbalance.csgworld>
+#          --res-dir <dir> --film <ball_balance.mp4>
+#          --film-manifest <manifest.txt> [--baseline-ticks 4000] [--echo-ticks]
+#     f 已接通行（ballbalance，born-digital）：像素导出 mp4 vs 状态+检查点
+#     （块 + 全部 payload + 世界定义）。执行与 semantic_snapshot restore
+#     完全相同的代码路径（validate→decode→payload CID 绑定→世界加载→
+#     确定性重放→replayCid 对照→续跑窗口），wall 时间用 std/monotimes 实测；
+#     口径=restore 全链（含每 tick World3dCid 计算，与 CLI 逐 tick echo 同量
+#     计算，仅默认省打印；--echo-ticks 恢复逐行回显）。
+#   footage --block <b2_hgs.svblock> --source <hgs_faststart.mp4>
+#           [--seek-tick 10000000]
+#     f 未接通行（胡广生，存量实拍）：源字节/码率/块字节/热增量/seek 重读
+#     字节（与 semantic_player seek 同一算法：关键帧 GOP 起点到目标样本的
+#     容器级字节下界，无像素解码）。
+#   comparison --f-block --f-world --f-res-dir --film --film-manifest
+#              --footage-block --footage-source [--baseline-ticks]
+#              [--seek-tick]
+#     公平口径声明 + f 行内部同内容比值（mp4_bytes vs f_loop_cold_bytes）；
+#     两行能力不同（f 行恢复世界状态可重演像素，footage 行只能回放像素），
+#     跨行不互除；固定结论三行（附 entry 检查点 restore 实测数字）。
+#
+# 计量口径（全实测，整数运算，禁浮点）：
+# - f_loop_cold_bytes = world_def + 3×payload + block（恢复所需全部依赖）。
+# - f_loop_hot_bytes  = block + entry 检查点 payload（已缓存世界定义与
+#   其余检查点时的实际新增字节）。
+# - mp4_duration_s / bitrate 来自影片 manifest 的 frames/fps（真实文件），
+#   整数拼小数字符串。
+# - restore wall_ms: monotimes 差，3 位小数毫秒。
+
+const
+    SvFlrUsage: str = "usage: semantic_f_loop_report f-loop --block <svblock> --world <csgworld> --res-dir <dir> --film <mp4> --film-manifest <manifest.txt> [--baseline-ticks 4000] [--echo-ticks] | footage --block <svblock> --source <mp4> [--seek-tick 10000000] | comparison --f-block --f-world --f-res-dir --film --film-manifest --footage-block --footage-source [--baseline-ticks] [--seek-tick]"
+
+type
+    SvFlrSnapMeasure =
+        ok: bool
+        branch: str
+        entryCk: str
+        factsCid: str
+        ckptCount: int32
+        ckIds: str[]
+        ckTicks: int64[]
+        ckPayloadBytes: int64[]
+        blockBytes: int64
+        payloadBytes: int64
+        worldBytes: int64
+        coldBytes: int64
+        hotBytes: int64
+        entryPayloadBytes: int64
+
+    SvFlrFilmMeasure =
+        ok: bool
+        mp4Bytes: int64
+        frames: int64
+        fps: int64
+        bitrateKbps: int64
+
+    SvFlrFootageMeasure =
+        ok: bool
+        sourceBytes: int64
+        svblockBytes: int64
+        bitrateKbps: int64
+        durationText: str
+        sampleCount: int32
+        keyframeCount: int32
+        seekTick: int64
+        seekKfPts: int64
+        seekSamples: int32
+        seekBytes: int64
+
+    SvFlrRestoreOut =
+        ok: bool
+        ckptTick: int64
+        replayTicks: int64
+        aheadTicks: int64
+        finalTick: int64
+        replayCidMatch: bool
+        cidsComputed: int32
+        servoBallSlot: int32
+        wallNs: int64
+
+@borrows
+fn SvFlrArg(args: str[], name: str): str =
+    for i in 0..<args.len:
+        if args[i] == name:
+            if i + 1 < args.len:
+                return args[i + 1]
+            return ""
+    return ""
+
+@borrows
+fn SvFlrHasFlag(args: str[], flag: str): bool =
+    for i in 0..<args.len:
+        if args[i] == flag:
+            return true
+    return false
+
+@borrows
+fn SvFlrParseI64(text: str): int64 =
+    var cur: int64 = 0
+    if text.len == 0:
+        return -1
+    for i in 0..<text.len:
+        let c: int32 = int32(text[i])
+        if c >= 48 && c <= 57:
+            cur = cur * 10 + int64(c - 48)
+        else:
+            return -1
+    return cur
+
+@borrows
+fn SvFlrArgI64(args: str[], name: str, fallback: int64): int64 =
+    let text = SvFlrArg(args, name)
+    if text.len == 0:
+        return fallback
+    return SvFlrParseI64(text)
+
+# 整数→"whole.frac6去尾零"，frac 全零保留 1 位（480 帧@24fps → "20.0"，
+# 22500000/1000000 → "22.5"）。全程 int64，禁浮点。
+fn SvFlrFmtSecs(totalTicks: int64, timescale: int64): str =
+    var whole: int64 = totalTicks / timescale
+    var frac: int64 = (totalTicks - whole * timescale) * int64(1000000) /
+        timescale
+    var fracText: str = strings.Int64ToStr(frac)
+    while fracText.len < 6:
+        fracText = strings.ConcatStr("0", fracText)
+    var keep: int32 = fracText.len
+    while keep > 0 && fracText[keep - 1] == '0':
+        keep = keep - 1
+    if keep == 0:
+        keep = 1
+    var outText: str = strings.Int64ToStr(whole)
+    outText = strings.ConcatStr(outText, ".")
+    outText = strings.ConcatStr(outText, strings.SliceBytes(fracText, 0, keep))
+    return outText
+
+# ns → 毫秒，3 位小数（整数拼小数，禁浮点）。
+fn SvFlrFmtMs(ns: int64): str =
+    var whole: int64 = ns / int64(1000000)
+    var frac: int64 = (ns - whole * int64(1000000)) / int64(1000)
+    var fracText: str = strings.Int64ToStr(frac)
+    while fracText.len < 3:
+        fracText = strings.ConcatStr("0", fracText)
+    var outText: str = strings.Int64ToStr(whole)
+    outText = strings.ConcatStr(outText, ".")
+    outText = strings.ConcatStr(outText, fracText)
+    return outText
+
+# 在 key=value 行文本（bytes）中找 key，检查值是否逐字节等于 expect。
+@borrows
+fn SvFlrManifestMatches(data: rawbytes.Bytes, key: str, expect: str): bool =
+    var n: int32 = rawbytes.BytesLen(data)
+    var i: int32 = 0
+    var found: bool = false
+    var matched: bool = false
+    while i < n && !found:
+        var k: int32 = 0
+        var isKey: bool = true
+        while k < key.len:
+            if i + k >= n || rawbytes.BytesGet(data, i + k) != int32(key[k]):
+                isKey = false
+            k = k + 1
+        if isKey && i + k < n && rawbytes.BytesGet(data, i + k) == 61:
+            var j: int32 = i + k + 1
+            var e: int32 = 0
+            var allMatch: bool = true
+            while e < expect.len:
+                if j + e >= n || rawbytes.BytesGet(data, j + e) != int32(expect[e]):
+                    allMatch = false
+                e = e + 1
+            if allMatch:
+                matched = true
+                found = true
+        while i < n && rawbytes.BytesGet(data, i) != 10:
+            i = i + 1
+        i = i + 1
+    return matched
+
+# 在 key=value 行文本（bytes）中找 key，读十进制整数值。
+@borrows
+fn SvFlrManifestInt(data: rawbytes.Bytes, key: str, outValue: var int64): bool =
+    var n: int32 = rawbytes.BytesLen(data)
+    var i: int32 = 0
+    var found: bool = false
+    while i < n && !found:
+        var k: int32 = 0
+        var isKey: bool = true
+        while k < key.len:
+            if i + k >= n || rawbytes.BytesGet(data, i + k) != int32(key[k]):
+                isKey = false
+            k = k + 1
+        if isKey && i + k < n && rawbytes.BytesGet(data, i + k) == 61:
+            var j: int32 = i + k + 1
+            var v: int64 = 0
+            var digits: int32 = 0
+            while j < n && rawbytes.BytesGet(data, j) >= 48 &&
+                  rawbytes.BytesGet(data, j) <= 57:
+                v = v * 10 + int64(rawbytes.BytesGet(data, j) - 48)
+                j = j + 1
+                digits = digits + 1
+            if digits > 0:
+                outValue = v
+                found = true
+        while i < n && rawbytes.BytesGet(data, i) != 10:
+            i = i + 1
+        i = i + 1
+    return found
+
+# 二分下界: 首个 pts >= tick 的样本号（无则 sampleCount）。与
+# semantic_player SvPlLowerBound 同一算法。
+@borrows
+fn SvFlrLowerBound(idx: source_index.SvSourceIndex, tick: int64): int32 =
+    var lo: int32 = 0
+    var hi: int32 = idx.sampleCount
+    while lo < hi:
+        let mid = (lo + hi) / 2
+        if idx.pts[mid] < tick:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+# ---- f 行: 快照块 + 世界定义 + payload 计量（含全部 CID 绑定门） --------
+@borrows
+fn SvFlrSnapshotMeasure(blockPath: str, worldPath: str, resDir: str,
+                        filmManifestPath: str): SvFlrSnapMeasure =
+    var out: SvFlrSnapMeasure
+    let blockResult = os.ReadFileBytesResult(blockPath)
+    if result.IsErr(blockResult):
+        echo("semantic_f_loop_report error: read block failed")
+        return out
+    var blockData = result.Value(blockResult)
+    var validation = validator.SvValidate(blockData)
+    if !validation.ok:
+        echo(strings.ConcatStr("semantic_f_loop_report error: validate ",
+            validation.error))
+        return out
+    var decoded = reader.SvReaderDecode(blockData)
+    if !decoded.ok:
+        echo(strings.ConcatStr("semantic_f_loop_report error: decode ",
+            decoded.error))
+        return out
+    var parsed = reader.SvParseRecords(decoded.lines)
+    if !parsed.ok:
+        echo(strings.ConcatStr("semantic_f_loop_report error: parse ",
+            parsed.error))
+        return out
+    if parsed.records.manifests.len != 1:
+        echo("semantic_f_loop_report error: manifest_count_invalid")
+        return out
+    if parsed.records.snapshots.len < 1:
+        echo("semantic_f_loop_report error: snapshot_count_invalid")
+        return out
+    var manifest = parsed.records.manifests[0]
+    out.entryCk = strings.CloneStr(manifest.entrySnapshot)
+    if out.entryCk.len == 0:
+        echo("semantic_f_loop_report error: entry_snapshot_missing")
+        return out
+    # 世界定义: 文件 = 分发权威; 内嵌 CID 必须与 facts 一致。
+    let worldResult = os.ReadFileBytesResult(worldPath)
+    if result.IsErr(worldResult):
+        echo("semantic_f_loop_report error: read world failed")
+        return out
+    var worldData = result.Value(worldResult)
+    out.worldBytes = int64(rawbytes.BytesLen(worldData))
+    var facts: schema.CsgWorldFacts
+    var embeddedCid: str = csgworld.CsgWorldLoad(worldPath, facts)
+    if embeddedCid.len == 0:
+        echo("semantic_f_loop_report error: csgworld load")
+        return out
+    var factsCid: str = Fmt"{schema.CsgWorldFactsCid(facts)}"
+    if factsCid != embeddedCid:
+        echo("semantic_f_loop_report error: csgworld cid mismatch")
+        return out
+    out.factsCid = strings.CloneStr(factsCid)
+    # 每个检查点: 依赖绑定世界 facts; payload 按 CID 绑定记录。
+    for i in 0..<parsed.records.snapshots.len:
+        let snap = parsed.records.snapshots[i]
+        if snap.deps.len != 1 || snap.deps[0] != factsCid:
+            echo("semantic_f_loop_report error: block dep does not bind this csgworld")
+            return out
+    echo("section=f_snapshot")
+    echo("validator=ok")
+    echo(strings.ConcatStr("factsCid=", out.factsCid))
+    echo(strings.ConcatStr("snapshot_branch=",
+        parsed.records.snapshots[0].branch))
+    var payloadSum: int64 = 0
+    var entryPayload: int64 = -1
+    for i in 0..<parsed.records.snapshots.len:
+        let snap = parsed.records.snapshots[i]
+        var payloadPath: str = resDir + "/" + snap.ckpt + ".payload"
+        var payloadLoad = os.ReadFileBytesResult(payloadPath)
+        if result.IsErr(payloadLoad):
+            echo("semantic_f_loop_report error: read payload: " + payloadPath)
+            return out
+        var payload = result.Value(payloadLoad)
+        var payloadCid: str = writer.SvResourceCid(payload)
+        if payloadCid != snap.worldCid:
+            echo("semantic_f_loop_report error: payload cid mismatch ck=" +
+                snap.ckpt)
+            return out
+        let n: int64 = int64(rawbytes.BytesLen(payload))
+        payloadSum = payloadSum + n
+        if snap.ckpt == out.entryCk:
+            entryPayload = n
+        add(out.ckIds, strings.CloneStr(snap.ckpt))
+        add(out.ckTicks, snap.tick)
+        add(out.ckPayloadBytes, n)
+        var line = strings.ConcatStr("payload ck=", snap.ckpt)
+        line = strings.ConcatStr(line, " tick=")
+        line = strings.ConcatStr(line, strings.Int64ToStr(snap.tick))
+        line = strings.ConcatStr(line, " bytes=")
+        line = strings.ConcatStr(line, strings.Int64ToStr(n))
+        line = strings.ConcatStr(line, " cid_match=ok")
+        echo(line)
+    # 影片 manifest 的 factsCid 必须与世界的 factsCid 逐字节一致
+    # （同一 born-digital 世界的机械证明）。
+    let mfResult = os.ReadFileBytesResult(filmManifestPath)
+    if result.IsErr(mfResult):
+        echo("semantic_f_loop_report error: read film manifest failed")
+        return out
+    var mfBytes = result.Value(mfResult)
+    if !SvFlrManifestMatches(mfBytes, "factsCid", out.factsCid):
+        echo("semantic_f_loop_report error: film factsCid does not match world")
+        return out
+    echo("film_facts_cid_match=ok")
+    out.ckptCount = int32(out.ckIds.len)
+    out.blockBytes = int64(rawbytes.BytesLen(blockData))
+    out.payloadBytes = payloadSum
+    out.entryPayloadBytes = entryPayload
+    out.coldBytes = out.worldBytes + out.payloadBytes + out.blockBytes
+    out.hotBytes = out.blockBytes + out.entryPayloadBytes
+    echo(strings.ConcatStr("snapshot_block_bytes=",
+        strings.Int64ToStr(out.blockBytes)))
+    echo(strings.ConcatStr("snapshot_payload_bytes=",
+        strings.Int64ToStr(out.payloadBytes)))
+    echo(strings.ConcatStr("world_def_bytes=",
+        strings.Int64ToStr(out.worldBytes)))
+    echo(strings.ConcatStr("f_loop_cold_bytes=",
+        strings.Int64ToStr(out.coldBytes)))
+    echo("f_loop_cold_scope=world_def_plus_all_checkpoint_payloads_plus_block")
+    echo(strings.ConcatStr("f_loop_hot_bytes=",
+        strings.Int64ToStr(out.hotBytes)))
+    echo(strings.ConcatStr("f_loop_hot_ck=", out.entryCk))
+    echo("f_loop_hot_scope=block_plus_entry_checkpoint_world_and_other_checkpoints_cached")
+    out.branch = strings.CloneStr(parsed.records.snapshots[0].branch)
+    out.ok = true
+    return out
+
+# ---- f 行: 像素导出影片计量 ---------------------------------------------
+@borrows
+fn SvFlrFilmMeasure(filmPath: str, filmManifestPath: str): SvFlrFilmMeasure =
+    var out: SvFlrFilmMeasure
+    let filmResult = os.ReadFileBytesResult(filmPath)
+    if result.IsErr(filmResult):
+        echo("semantic_f_loop_report error: read film failed")
+        return out
+    var filmBytes = result.Value(filmResult)
+    let mfResult = os.ReadFileBytesResult(filmManifestPath)
+    if result.IsErr(mfResult):
+        echo("semantic_f_loop_report error: read film manifest failed")
+        return out
+    var mfBytes = result.Value(mfResult)
+    var frames: int64 = 0
+    var fps: int64 = 0
+    if !SvFlrManifestInt(mfBytes, "frames", frames):
+        echo("semantic_f_loop_report error: film manifest frames missing")
+        return out
+    if !SvFlrManifestInt(mfBytes, "fps", fps):
+        echo("semantic_f_loop_report error: film manifest fps missing")
+        return out
+    if frames < 1 || fps < 1:
+        echo("semantic_f_loop_report error: film manifest invalid")
+        return out
+    out.mp4Bytes = int64(rawbytes.BytesLen(filmBytes))
+    out.frames = frames
+    out.fps = fps
+    # 口径: floor(mp4_bytes*8*fps/(frames*1000)), 整数除法向下取整。
+    out.bitrateKbps = out.mp4Bytes * int64(8) * fps / (frames * int64(1000))
+    echo("section=f_film")
+    echo(strings.ConcatStr("mp4_bytes=", strings.Int64ToStr(out.mp4Bytes)))
+    echo(strings.ConcatStr("source_film_frame_count=",
+        strings.Int64ToStr(out.frames)))
+    echo(strings.ConcatStr("film_fps=", strings.Int64ToStr(out.fps)))
+    echo(strings.ConcatStr("mp4_duration_s=",
+        SvFlrFmtSecs(frames * int64(1000000) / fps, int64(1000000))))
+    echo(strings.ConcatStr("mp4_bitrate_kbps=",
+        strings.Int64ToStr(out.bitrateKbps)))
+    out.ok = true
+    return out
+
+# ---- f 行: 真实 restore（与 semantic_snapshot restore 同一代码路径）-----
+# wall 时间覆盖: 读块→validate→decode→payload CID 绑定→世界加载→确定性
+# 重放到检查点→payload 解码→replayCid 对照→续跑窗口（每 tick World3dCid
+# 计算, 默认仅省逐行打印）。
+@borrows
+fn SvFlrRestore(blockPath: str, worldPath: str, ckptId: str, ahead: int64,
+                resDir: str, echoTicks: bool): SvFlrRestoreOut =
+    var out: SvFlrRestoreOut
+    var startNs: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    var blockLoad = os.ReadFileBytesResult(blockPath)
+    if result.IsErr(blockLoad):
+        echo("semantic_f_loop_report error: read block failed")
+        return out
+    var blockData = result.Value(blockLoad)
+    var validation = validator.SvValidate(blockData)
+    if !validation.ok:
+        echo(strings.ConcatStr("semantic_f_loop_report error: validate ",
+            validation.error))
+        return out
+    var decoded = reader.SvReaderDecode(blockData)
+    if !decoded.ok:
+        echo(strings.ConcatStr("semantic_f_loop_report error: decode ",
+            decoded.error))
+        return out
+    var parsed = reader.SvParseRecords(decoded.lines)
+    if !parsed.ok:
+        echo(strings.ConcatStr("semantic_f_loop_report error: parse ",
+            parsed.error))
+        return out
+    var snapIdx: int32 = -1
+    for i in 0..<parsed.records.snapshots.len:
+        if parsed.records.snapshots[i].ckpt == ckptId:
+            snapIdx = i
+    if snapIdx < 0:
+        echo("semantic_f_loop_report error: ckpt not in block: " + ckptId)
+        return out
+    let snapTick: int64 = parsed.records.snapshots[snapIdx].tick
+    let snapWorldCid: str = parsed.records.snapshots[snapIdx].worldCid
+    var payloadPath: str = resDir + "/" + ckptId + ".payload"
+    var payloadLoad = os.ReadFileBytesResult(payloadPath)
+    if result.IsErr(payloadLoad):
+        echo("semantic_f_loop_report error: read payload: " + payloadPath)
+        return out
+    var payload = result.Value(payloadLoad)
+    var payloadCid: str = writer.SvResourceCid(payload)
+    if payloadCid != snapWorldCid:
+        echo("semantic_f_loop_report error: payload cid mismatch (corrupt resource)")
+        return out
+    var facts: schema.CsgWorldFacts
+    var embeddedCid: str = csgworld.CsgWorldLoad(worldPath, facts)
+    if embeddedCid.len == 0:
+        echo("semantic_f_loop_report error: csgworld load")
+        return out
+    var factsCid: str = Fmt"{schema.CsgWorldFactsCid(facts)}"
+    if factsCid != embeddedCid:
+        echo("semantic_f_loop_report error: csgworld cid mismatch")
+        return out
+    if parsed.records.snapshots[snapIdx].deps.len != 1 ||
+       parsed.records.snapshots[snapIdx].deps[0] != factsCid:
+        echo("semantic_f_loop_report error: block dep does not bind this csgworld")
+        return out
+    var drive = snapshot_block.SvSnapDriveStartFromFacts(facts)
+    if !drive.ok:
+        echo("semantic_f_loop_report error: drive: " + drive.error)
+        return out
+    var replayCount: int64 = 0
+    while drive.st.w.tick < snapTick:
+        if !snapshot_block.SvSnapDriveTick(drive.st, facts):
+            echo("semantic_f_loop_report error: replay rejected at tick " +
+                strings.Int64ToStr(drive.st.w.tick))
+            return out
+        replayCount = replayCount + 1
+    var replayCid: str = world3d.World3dCid(drive.st.w)
+    var restored = snapshot_codec.SvSnapDecode(payload)
+    if !restored.ok:
+        echo("semantic_f_loop_report error: payload decode: " + restored.error)
+        return out
+    var decodedCid: str = world3d.World3dCid(restored.st.w)
+    if replayCid != decodedCid:
+        echo("semantic_f_loop_report error: replay diverged from payload")
+        return out
+    var servo = restored.servo
+    var cidCount: int32 = 0
+    var j: int64 = 0
+    while j < ahead:
+        if !snapshot_block.SvSnapDriveTick(restored.st, facts):
+            echo("semantic_f_loop_report error: continuation rejected at tick " +
+                strings.Int64ToStr(restored.st.w.tick))
+            return out
+        let t: int64 = restored.st.w.tick
+        let tickCid: str = world3d.World3dCid(restored.st.w)
+        if tickCid.len > 0:
+            cidCount = cidCount + 1
+        if echoTicks:
+            var line = strings.ConcatStr("tick=", strings.Int64ToStr(t))
+            line = strings.ConcatStr(line, " cid=")
+            line = strings.ConcatStr(line, tickCid)
+            echo(line)
+        j = j + 1
+    var endNs: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    out.ok = true
+    out.ckptTick = snapTick
+    out.replayTicks = replayCount
+    out.aheadTicks = ahead
+    out.finalTick = restored.st.w.tick
+    out.replayCidMatch = true
+    out.cidsComputed = cidCount
+    out.servoBallSlot = servo.ballSlot
+    out.wallNs = endNs - startNs
+    var line = strings.ConcatStr("restore ck=", ckptId)
+    line = strings.ConcatStr(line, " ckpt_tick=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(out.ckptTick))
+    line = strings.ConcatStr(line, " replay_ticks=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(out.replayTicks))
+    line = strings.ConcatStr(line, " restore_ticks=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(out.aheadTicks))
+    line = strings.ConcatStr(line, " final_tick=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(out.finalTick))
+    line = strings.ConcatStr(line, " replayCidMatch=1")
+    line = strings.ConcatStr(line, " wall_ms=")
+    line = strings.ConcatStr(line, SvFlrFmtMs(out.wallNs))
+    line = strings.ConcatStr(line, " servo_ball_slot=")
+    line = strings.ConcatStr(line, strings.IntToStr(out.servoBallSlot))
+    echo(line)
+    return out
+
+# ---- footage 行: 存量实拍独立计量（验证链同 pack_report, seek 同 player）-
+@borrows
+fn SvFlrFootageMeasure(blockPath: str, srcPath: str,
+                       seekTick: int64): SvFlrFootageMeasure =
+    var out: SvFlrFootageMeasure
+    let blockResult = os.ReadFileBytesResult(blockPath)
+    if result.IsErr(blockResult):
+        echo("semantic_f_loop_report error: read svblock failed")
+        return out
+    var blockData = result.Value(blockResult)
+    var validation = validator.SvValidate(blockData)
+    if !validation.ok:
+        echo(strings.ConcatStr("semantic_f_loop_report error: validate ",
+            validation.error))
+        return out
+    var decoded = reader.SvReaderDecode(blockData)
+    if !decoded.ok:
+        echo(strings.ConcatStr("semantic_f_loop_report error: decode ",
+            decoded.error))
+        return out
+    var parsed = reader.SvParseRecords(decoded.lines)
+    if !parsed.ok:
+        echo(strings.ConcatStr("semantic_f_loop_report error: parse ",
+            parsed.error))
+        return out
+    if parsed.records.manifests.len != 1:
+        echo("semantic_f_loop_report error: manifest_count_invalid")
+        return out
+    var manifest = parsed.records.manifests[0]
+    if manifest.resCid.len != 2 || manifest.resLength.len != 2:
+        echo("semantic_f_loop_report error: manifest_res_arrays_invalid")
+        return out
+    let sourceResult = os.ReadFileBytesResult(srcPath)
+    if result.IsErr(sourceResult):
+        echo("semantic_f_loop_report error: read source failed")
+        return out
+    var srcData = result.Value(sourceResult)
+    var srcCid = writer.SvResourceCid(srcData)
+    if srcCid != manifest.resCid[0]:
+        echo("semantic_f_loop_report error: source_cid_mismatch")
+        return out
+    var idx = source_index.SvSourceIndexBuild(srcData)
+    if !idx.ok:
+        echo(strings.ConcatStr("semantic_f_loop_report error: index_build ",
+            idx.error))
+        return out
+    var indexBytes = source_index.SvSourceIndexEncodeResource(idx)
+    var idxCid = writer.SvResourceCid(indexBytes)
+    if idxCid != manifest.resCid[1]:
+        echo("semantic_f_loop_report error: index_cid_mismatch")
+        return out
+    let srcLen = int64(rawbytes.BytesLen(srcData))
+    let idxLen = int64(rawbytes.BytesLen(indexBytes))
+    if manifest.resLength[0] != srcLen || manifest.resLength[1] != idxLen:
+        echo("semantic_f_loop_report error: reslength_mismatch")
+        return out
+    if manifest.tbDen <= 0 || manifest.timeEnd <= 0:
+        echo("semantic_f_loop_report error: timescale_invalid")
+        return out
+    echo("section=verification")
+    echo("validator=ok")
+    echo("source_cid_match=ok")
+    echo("index_cid_match=ok")
+    echo("reslength_match=ok")
+    echo("section=footage")
+    out.sourceBytes = srcLen
+    out.svblockBytes = int64(rawbytes.BytesLen(blockData))
+    # 口径: floor(source_bytes*8*timescale/(totalTicks*1000))。
+    out.bitrateKbps = srcLen * int64(8) * int64(manifest.tbDen) /
+        (manifest.timeEnd * int64(1000))
+    out.durationText = SvFlrFmtSecs(manifest.timeEnd, int64(manifest.tbDen))
+    out.sampleCount = idx.sampleCount
+    out.keyframeCount = idx.keyframeCount
+    out.seekTick = seekTick
+    echo(strings.ConcatStr("source_bytes=", strings.Int64ToStr(srcLen)))
+    echo(strings.ConcatStr("duration_sec=", out.durationText))
+    echo(strings.ConcatStr("bitrate_kbps=", strings.Int64ToStr(out.bitrateKbps)))
+    echo(strings.ConcatStr("svblock_bytes=",
+        strings.Int64ToStr(out.svblockBytes)))
+    echo(strings.ConcatStr("hot_transfer_bytes=",
+        strings.Int64ToStr(out.svblockBytes)))
+    echo("hot_transfer_scope=svblock_only_source_already_cached")
+    echo(strings.ConcatStr("sample_count=", strings.IntToStr(idx.sampleCount)))
+    echo(strings.ConcatStr("keyframe_count=", strings.IntToStr(idx.keyframeCount)))
+    # seek: 与 semantic_player seek 同一算法（容器级重读字节下界, 无像素解码）。
+    if seekTick < int64(0) || seekTick >= manifest.timeEnd:
+        echo("semantic_f_loop_report error: sv_tick_out_of_range seek")
+        return out
+    var target = SvFlrLowerBound(idx, seekTick + int64(1)) - 1
+    if target < 0:
+        echo("semantic_f_loop_report error: sv_tick_out_of_range seek")
+        return out
+    var kf = target
+    while kf >= 0 && idx.key[kf] != 1:
+        kf = kf - 1
+    if kf < 0:
+        echo("semantic_f_loop_report error: sv_seek_no_keyframe")
+        return out
+    var readahead: int64 = int64(0)
+    for i in kf..target:
+        readahead = readahead + int64(idx.size[i])
+    out.seekKfPts = idx.pts[kf]
+    out.seekSamples = target - kf + 1
+    out.seekBytes = readahead
+    echo(strings.ConcatStr("seek_tick=", strings.Int64ToStr(seekTick)))
+    echo(strings.ConcatStr("seek_kf_pts=", strings.Int64ToStr(out.seekKfPts)))
+    echo(strings.ConcatStr("seek_readahead_samples=",
+        strings.IntToStr(out.seekSamples)))
+    echo(strings.ConcatStr("seek_readahead_bytes=",
+        strings.Int64ToStr(out.seekBytes)))
+    echo("seek_readahead_scope=container_level_gop_read_lower_bound_no_pixel_decode")
+    out.ok = true
+    return out
+
+# ---- 模式: f-loop --------------------------------------------------------
+@borrows
+fn SvFlrCmdFLoop(args: str[]): int32 =
+    let blockPath = SvFlrArg(args, "--block")
+    let worldPath = SvFlrArg(args, "--world")
+    let resDir = SvFlrArg(args, "--res-dir")
+    let filmPath = SvFlrArg(args, "--film")
+    let filmManifestPath = SvFlrArg(args, "--film-manifest")
+    if blockPath.len == 0 || worldPath.len == 0 || resDir.len == 0 ||
+       filmPath.len == 0 || filmManifestPath.len == 0:
+        echo(SvFlrUsage)
+        return 1
+    let baseline = SvFlrArgI64(args, "--baseline-ticks", 4000)
+    if baseline < 1:
+        echo("semantic_f_loop_report error: bad --baseline-ticks")
+        return 1
+    let echoTicks = SvFlrHasFlag(args, "--echo-ticks")
+    var snap = SvFlrSnapshotMeasure(blockPath, worldPath, resDir,
+        filmManifestPath)
+    if !snap.ok:
+        return 1
+    var film = SvFlrFilmMeasure(filmPath, filmManifestPath)
+    if !film.ok:
+        return 1
+    echo("section=restore")
+    var entryWallNs: int64 = 0
+    var entryAhead: int64 = 0
+    var entrySeen: bool = false
+    var done: int32 = 0
+    var lastTick: int64 = -1
+    while done < snap.ckptCount:
+        var best: int32 = -1
+        for i in 0..<snap.ckptCount:
+            if snap.ckTicks[i] > lastTick:
+                if best < 0 || snap.ckTicks[i] < snap.ckTicks[best]:
+                    best = i
+        let ahead: int64 = baseline - snap.ckTicks[best]
+        if ahead < 1:
+            echo("semantic_f_loop_report error: window_not_positive ck=" +
+                snap.ckIds[best])
+            return 1
+        var r = SvFlrRestore(blockPath, worldPath, snap.ckIds[best], ahead,
+            resDir, echoTicks)
+        if !r.ok:
+            return 1
+        if !entrySeen:
+            entrySeen = true
+            entryWallNs = r.wallNs
+            entryAhead = r.aheadTicks
+        lastTick = snap.ckTicks[best]
+        done = done + 1
+    echo("section=conclusion")
+    echo("conclusion=f_on_replaces_pixels_for_simulable_content")
+    echo("conclusion=footage_keeps_hybrid_representation")
+    var line = strings.ConcatStr(
+        "conclusion=recovery_compute_traded_for_bytes restore_ticks=",
+        strings.Int64ToStr(entryAhead))
+    line = strings.ConcatStr(line, " restore_wall_ms=")
+    line = strings.ConcatStr(line, SvFlrFmtMs(entryWallNs))
+    echo(line)
+    return 0
+
+# ---- 模式: footage --------------------------------------------------------
+@borrows
+fn SvFlrCmdFootage(args: str[]): int32 =
+    let blockPath = SvFlrArg(args, "--block")
+    let srcPath = SvFlrArg(args, "--source")
+    if blockPath.len == 0 || srcPath.len == 0:
+        echo(SvFlrUsage)
+        return 1
+    let seekTick = SvFlrArgI64(args, "--seek-tick", 10000000)
+    if seekTick < 0:
+        echo("semantic_f_loop_report error: bad --seek-tick")
+        return 1
+    var foot = SvFlrFootageMeasure(blockPath, srcPath, seekTick)
+    if !foot.ok:
+        return 1
+    return 0
+
+# ---- 模式: comparison -----------------------------------------------------
+@borrows
+fn SvFlrCmdComparison(args: str[]): int32 =
+    let fBlock = SvFlrArg(args, "--f-block")
+    let fWorld = SvFlrArg(args, "--f-world")
+    let fResDir = SvFlrArg(args, "--f-res-dir")
+    let filmPath = SvFlrArg(args, "--film")
+    let filmManifestPath = SvFlrArg(args, "--film-manifest")
+    let footBlock = SvFlrArg(args, "--footage-block")
+    let footSource = SvFlrArg(args, "--footage-source")
+    if fBlock.len == 0 || fWorld.len == 0 || fResDir.len == 0 ||
+       filmPath.len == 0 || filmManifestPath.len == 0 || footBlock.len == 0 ||
+       footSource.len == 0:
+        echo(SvFlrUsage)
+        return 1
+    let baseline = SvFlrArgI64(args, "--baseline-ticks", 4000)
+    if baseline < 1:
+        echo("semantic_f_loop_report error: bad --baseline-ticks")
+        return 1
+    let seekTick = SvFlrArgI64(args, "--seek-tick", 10000000)
+    if seekTick < 0:
+        echo("semantic_f_loop_report error: bad --seek-tick")
+        return 1
+    var snap = SvFlrSnapshotMeasure(fBlock, fWorld, fResDir, filmManifestPath)
+    if !snap.ok:
+        return 1
+    var film = SvFlrFilmMeasure(filmPath, filmManifestPath)
+    if !film.ok:
+        return 1
+    var entryIdx: int32 = -1
+    for i in 0..<snap.ckptCount:
+        if snap.ckIds[i] == snap.entryCk:
+            entryIdx = i
+    if entryIdx < 0:
+        echo("semantic_f_loop_report error: entry ck not in block")
+        return 1
+    let ahead: int64 = baseline - snap.ckTicks[entryIdx]
+    if ahead < 1:
+        echo("semantic_f_loop_report error: window_not_positive")
+        return 1
+    echo("section=restore")
+    var r = SvFlrRestore(fBlock, fWorld, snap.entryCk, ahead, fResDir, false)
+    if !r.ok:
+        return 1
+    var foot = SvFlrFootageMeasure(footBlock, footSource, seekTick)
+    if !foot.ok:
+        return 1
+    echo("section=comparison")
+    echo("comparison=fair_scope")
+    echo("f_row_capability=world_state_restore_replayable_pixels")
+    echo("footage_row_capability=pixels_playback_only")
+    echo("cross_row_ratio=not_computed")
+    echo("ratio_scope=f_row_internal_same_born_digital_content_only")
+    var ratioLine = strings.ConcatStr("f_loop_ratio_num=",
+        strings.Int64ToStr(film.mp4Bytes))
+    ratioLine = strings.ConcatStr(ratioLine, " den=")
+    ratioLine = strings.ConcatStr(ratioLine, strings.Int64ToStr(snap.coldBytes))
+    echo(ratioLine)
+    echo("ratio_meaning=pixel_export_vs_state_plus_checkpoints_simulable_content_only_not_applicable_to_footage")
+    echo("f_loop_cold_scope=world_def_plus_all_checkpoint_payloads_plus_block")
+    echo("f_loop_hot_scope=block_plus_entry_checkpoint_world_and_other_checkpoints_cached")
+    echo("section=conclusion")
+    echo("conclusion=f_on_replaces_pixels_for_simulable_content")
+    echo("conclusion=footage_keeps_hybrid_representation")
+    var line = strings.ConcatStr(
+        "conclusion=recovery_compute_traded_for_bytes restore_ticks=",
+        strings.Int64ToStr(r.aheadTicks))
+    line = strings.ConcatStr(line, " restore_wall_ms=")
+    line = strings.ConcatStr(line, SvFlrFmtMs(r.wallNs))
+    echo(line)
+    return 0
+
+fn main(): int32 =
+    if cmdline.ParamCount() < 2:
+        echo(SvFlrUsage)
+        return 1
+    let mode = cmdline.ParamStr(1)
+    var args: str[]
+    var i: int32 = 2
+    while i <= cmdline.ParamCount():
+        add(args, strings.CloneStr(cmdline.ParamStr(i)))
+        i = i + 1
+    if mode == "f-loop":
+        return SvFlrCmdFLoop(args)
+    if mode == "footage":
+        return SvFlrCmdFootage(args)
+    if mode == "comparison":
+        return SvFlrCmdComparison(args)
+    echo(SvFlrUsage)
+    return 1

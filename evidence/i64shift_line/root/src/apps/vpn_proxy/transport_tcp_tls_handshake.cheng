@@ -1,0 +1,761 @@
+import std/result
+import std/strings as strings
+import std/rawbytes
+import std/crypto/rand as rand
+import std/times
+import std/tls/x509
+import cheng/quic/tls/handshake13 as hs
+import cheng/quic/tls/policy as policy
+import cheng/quic/tls/tls13
+import cheng/apps/vpn_proxy/transport_tcp_tls_record as rec
+
+type
+    VpnProxyTcpTlsServerFlight =
+        serverHelloRecord: Bytes
+        encryptedHandshakeRecord: Bytes
+
+const
+    VpnProxyTcpTlsForwardAlpnText = "cheng-tcp-tls-forward/1"
+
+# ------------------------------------------------------------------
+# [psk-resume] Server-side session ticket store: 8 slots of PARALLEL
+# SCALARS. Deliberately not an array of structs: element projection
+# var params have unreliable copy-back on aarch64 (campaign rule) --
+# every slot is reached through explicit if/elif dispatch, and every
+# boundary hands over owned byte copies. All mutations run inside the
+# caller's handshake lock (VpnProxyTcpTlsForwardServerBuildFlightInto).
+# ------------------------------------------------------------------
+const
+    vpnTcpTlsTicketSlotCount: int32 = 8
+    vpnTcpTlsTicketLifetimeSec: int64 = 7200
+
+var
+    vpnTcpTlsTicketNextSlot: int32
+    vpnTcpTlsTicketIdentity0: Bytes
+    vpnTcpTlsTicketIdentity1: Bytes
+    vpnTcpTlsTicketIdentity2: Bytes
+    vpnTcpTlsTicketIdentity3: Bytes
+    vpnTcpTlsTicketIdentity4: Bytes
+    vpnTcpTlsTicketIdentity5: Bytes
+    vpnTcpTlsTicketIdentity6: Bytes
+    vpnTcpTlsTicketIdentity7: Bytes
+    vpnTcpTlsTicketPsk0: Bytes
+    vpnTcpTlsTicketPsk1: Bytes
+    vpnTcpTlsTicketPsk2: Bytes
+    vpnTcpTlsTicketPsk3: Bytes
+    vpnTcpTlsTicketPsk4: Bytes
+    vpnTcpTlsTicketPsk5: Bytes
+    vpnTcpTlsTicketPsk6: Bytes
+    vpnTcpTlsTicketPsk7: Bytes
+    vpnTcpTlsTicketCipherId0: int32
+    vpnTcpTlsTicketCipherId1: int32
+    vpnTcpTlsTicketCipherId2: int32
+    vpnTcpTlsTicketCipherId3: int32
+    vpnTcpTlsTicketCipherId4: int32
+    vpnTcpTlsTicketCipherId5: int32
+    vpnTcpTlsTicketCipherId6: int32
+    vpnTcpTlsTicketCipherId7: int32
+
+# ------------------------------------------------------------------
+# [psk-resume] Client-side resume cache: a single SNI slot. The VPN dials
+# exactly one exit host per session, so one slot covers every dial.
+# ------------------------------------------------------------------
+var
+    vpnTcpTlsResumeHave: bool
+    vpnTcpTlsResumeIdentity: Bytes
+    vpnTcpTlsResumePsk: Bytes
+    vpnTcpTlsResumeAgeAdd: int64
+    vpnTcpTlsResumeLifetimeSec: int64
+    vpnTcpTlsResumeCipherId: int32
+    vpnTcpTlsResumeServerName: str
+    vpnTcpTlsResumeReceivedAtMs: int64
+
+fn VpnProxyTcpTlsForwardAlpn(): str =
+    return VpnProxyTcpTlsForwardAlpnText
+
+fn tcpTlsTicketIdentityAt(idx: int32): Bytes =
+    if idx == 0:
+        return vpnTcpTlsTicketIdentity0
+    if idx == 1:
+        return vpnTcpTlsTicketIdentity1
+    if idx == 2:
+        return vpnTcpTlsTicketIdentity2
+    if idx == 3:
+        return vpnTcpTlsTicketIdentity3
+    if idx == 4:
+        return vpnTcpTlsTicketIdentity4
+    if idx == 5:
+        return vpnTcpTlsTicketIdentity5
+    if idx == 6:
+        return vpnTcpTlsTicketIdentity6
+    if idx == 7:
+        return vpnTcpTlsTicketIdentity7
+    return EmptyBytes()
+
+fn tcpTlsTicketPskAt(idx: int32): Bytes =
+    if idx == 0:
+        return vpnTcpTlsTicketPsk0
+    if idx == 1:
+        return vpnTcpTlsTicketPsk1
+    if idx == 2:
+        return vpnTcpTlsTicketPsk2
+    if idx == 3:
+        return vpnTcpTlsTicketPsk3
+    if idx == 4:
+        return vpnTcpTlsTicketPsk4
+    if idx == 5:
+        return vpnTcpTlsTicketPsk5
+    if idx == 6:
+        return vpnTcpTlsTicketPsk6
+    if idx == 7:
+        return vpnTcpTlsTicketPsk7
+    return EmptyBytes()
+
+fn tcpTlsTicketCipherIdAt(idx: int32): int32 =
+    if idx == 0:
+        return vpnTcpTlsTicketCipherId0
+    if idx == 1:
+        return vpnTcpTlsTicketCipherId1
+    if idx == 2:
+        return vpnTcpTlsTicketCipherId2
+    if idx == 3:
+        return vpnTcpTlsTicketCipherId3
+    if idx == 4:
+        return vpnTcpTlsTicketCipherId4
+    if idx == 5:
+        return vpnTcpTlsTicketCipherId5
+    if idx == 6:
+        return vpnTcpTlsTicketCipherId6
+    if idx == 7:
+        return vpnTcpTlsTicketCipherId7
+    return 0
+
+# Stores one ticket (round-robin). Makes owned copies of both blobs so the
+# caller keeps ownership of what it passed in.
+fn tcpTlsTicketStorePut(identity: Bytes, psk: Bytes, cipherId: int32) =
+    if BytesLen(identity) <= 0 || BytesLen(psk) <= 0:
+        return
+    let slot: int32 = vpnTcpTlsTicketNextSlot
+    var nextSlot: int32 = slot + 1
+    if nextSlot >= vpnTcpTlsTicketSlotCount:
+        nextSlot = 0
+    vpnTcpTlsTicketNextSlot = nextSlot
+    if slot == 0:
+        vpnTcpTlsTicketIdentity0 = hs.msquicTls13BytesOwnedCopy(identity)
+        vpnTcpTlsTicketPsk0 = hs.msquicTls13BytesOwnedCopy(psk)
+        vpnTcpTlsTicketCipherId0 = cipherId
+    elif slot == 1:
+        vpnTcpTlsTicketIdentity1 = hs.msquicTls13BytesOwnedCopy(identity)
+        vpnTcpTlsTicketPsk1 = hs.msquicTls13BytesOwnedCopy(psk)
+        vpnTcpTlsTicketCipherId1 = cipherId
+    elif slot == 2:
+        vpnTcpTlsTicketIdentity2 = hs.msquicTls13BytesOwnedCopy(identity)
+        vpnTcpTlsTicketPsk2 = hs.msquicTls13BytesOwnedCopy(psk)
+        vpnTcpTlsTicketCipherId2 = cipherId
+    elif slot == 3:
+        vpnTcpTlsTicketIdentity3 = hs.msquicTls13BytesOwnedCopy(identity)
+        vpnTcpTlsTicketPsk3 = hs.msquicTls13BytesOwnedCopy(psk)
+        vpnTcpTlsTicketCipherId3 = cipherId
+    elif slot == 4:
+        vpnTcpTlsTicketIdentity4 = hs.msquicTls13BytesOwnedCopy(identity)
+        vpnTcpTlsTicketPsk4 = hs.msquicTls13BytesOwnedCopy(psk)
+        vpnTcpTlsTicketCipherId4 = cipherId
+    elif slot == 5:
+        vpnTcpTlsTicketIdentity5 = hs.msquicTls13BytesOwnedCopy(identity)
+        vpnTcpTlsTicketPsk5 = hs.msquicTls13BytesOwnedCopy(psk)
+        vpnTcpTlsTicketCipherId5 = cipherId
+    elif slot == 6:
+        vpnTcpTlsTicketIdentity6 = hs.msquicTls13BytesOwnedCopy(identity)
+        vpnTcpTlsTicketPsk6 = hs.msquicTls13BytesOwnedCopy(psk)
+        vpnTcpTlsTicketCipherId6 = cipherId
+    else:
+        vpnTcpTlsTicketIdentity7 = hs.msquicTls13BytesOwnedCopy(identity)
+        vpnTcpTlsTicketPsk7 = hs.msquicTls13BytesOwnedCopy(psk)
+        vpnTcpTlsTicketCipherId7 = cipherId
+
+fn tcpTlsTicketStoreLookupCipherId(identity: Bytes): int32 =
+    var i: int32
+    while i < vpnTcpTlsTicketSlotCount:
+        let existing: Bytes = tcpTlsTicketIdentityAt(i)
+        if BytesLen(existing) > 0 && BytesLen(existing) == BytesLen(identity):
+            if BytesEqual(existing, identity):
+                return tcpTlsTicketCipherIdAt(i)
+        i = i + 1
+    return 0
+
+# Owned PSK copy for the offered identity; Err when the ticket is unknown.
+fn tcpTlsTicketStoreLookupPsk(identity: Bytes): Result[Bytes] =
+    var i: int32
+    while i < vpnTcpTlsTicketSlotCount:
+        let existing: Bytes = tcpTlsTicketIdentityAt(i)
+        if BytesLen(existing) > 0 && BytesLen(existing) == BytesLen(identity):
+            if BytesEqual(existing, identity):
+                let psk: Bytes = tcpTlsTicketPskAt(i)
+                if BytesLen(psk) > 0:
+                    return Ok[Bytes](hs.msquicTls13BytesOwnedCopy(psk))
+        i = i + 1
+    return Err[Bytes]("tcp-tls-forward: session ticket not found")
+
+fn VpnProxyTcpTlsForwardClientClearResumeTicket() =
+    vpnTcpTlsResumeHave = false
+    vpnTcpTlsResumeIdentity = EmptyBytes()
+    vpnTcpTlsResumePsk = EmptyBytes()
+    vpnTcpTlsResumeServerName = ""
+
+# Copies the ticket received during the just-finished handshake into the
+# client resume cache (owned transfer). Best-effort: a missing ticket keeps
+# the handshake result untouched.
+fn VpnProxyTcpTlsForwardClientStoreResumeTicket(serverName: str): Result[bool] =
+    var ticket: Bytes
+    var psk: Bytes
+    var ageAdd: int64
+    var lifetimeSec: int64
+    var cipherId: int32
+    let expRes: Result[bool] = hs.msquicTls13ClientExportSessionTicketInto(ticket, psk, ageAdd, lifetimeSec, cipherId)
+    if IsErr(expRes):
+        return Ok[bool](true)
+    if BytesLen(ticket) <= 0 || BytesLen(psk) <= 0:
+        BytesFree(ticket)
+        BytesFree(psk)
+        return Ok[bool](true)
+    vpnTcpTlsResumeIdentity = ticket
+    vpnTcpTlsResumePsk = psk
+    vpnTcpTlsResumeAgeAdd = ageAdd
+    vpnTcpTlsResumeLifetimeSec = lifetimeSec
+    vpnTcpTlsResumeCipherId = cipherId
+    vpnTcpTlsResumeServerName = strings.CloneStr(serverName)
+    vpnTcpTlsResumeReceivedAtMs = times.monotimeNs() / int64(1000000)
+    vpnTcpTlsResumeHave = true
+    return Ok[bool](true)
+
+fn tcpTlsRandom32(): Result[Bytes] =
+    var out: Bytes = BytesAlloc(32)
+    if !rand.RandomFill(out):
+        BytesFree(out)
+        return Err[Bytes]("tcp-tls-forward: random fill failed")
+    return Ok[Bytes](out)
+
+@borrows
+fn tcpTlsRecordKeysFromKeyIv(keyIv: tls13.MsQuicTls13KeyIv): Result[rec.VpnProxyTcpTlsRecordKeys] =
+    var out: rec.VpnProxyTcpTlsRecordKeys
+    let fillRes: Result[bool] = tcpTlsRecordKeysFromKeyIvInto(keyIv, out)
+    if IsErr(fillRes):
+        return Err[rec.VpnProxyTcpTlsRecordKeys](ErrorText(fillRes))
+    return Ok[rec.VpnProxyTcpTlsRecordKeys](out)
+
+@borrows
+fn tcpTlsRecordKeysFromKeyIvInto(keyIv: tls13.MsQuicTls13KeyIv,
+                                 out: var rec.VpnProxyTcpTlsRecordKeys): Result[bool] =
+    return rec.VpnProxyTcpTlsRecordInitKeysForCipherCodeInto(keyIv.cipherCode, keyIv.key, keyIv.iv, out)
+
+@borrows
+fn tcpTlsCertificatePublicKey(leafDer: Bytes): Result[Bytes] =
+    var out: Bytes
+    let fillRes: Result[bool] = tcpTlsCertificatePublicKeyInto(leafDer, out)
+    if IsErr(fillRes):
+        return Err[Bytes](ErrorText(fillRes))
+    return Ok[Bytes](out)
+
+@borrows
+fn tcpTlsCertificatePublicKeyInto(leafDer: Bytes, out: var Bytes): Result[bool] =
+    var cert: x509.X509Certificate = x509.initX509Certificate()
+    let parseRes: Result[bool] = x509.x509ParseCertificateInto(cert, leafDer)
+    if IsErr(parseRes):
+        return Err[bool](ErrorText(parseRes))
+    if cert.publicKey.kind == x509.X509KeyEcdsaP256:
+        out = cert.publicKey.ecdsaBytes
+        return Ok[bool](true)
+    out = EmptyBytes()
+    return Ok[bool](true)
+
+fn tcpTlsServerHandshakeSendKeys(): Result[rec.VpnProxyTcpTlsRecordKeys] =
+    let keyIvRes: Result[tls13.MsQuicTls13KeyIv] = hs.msquicTls13SideHandshakeKeyIv(1, true)
+    if IsErr(keyIvRes):
+        return Err[rec.VpnProxyTcpTlsRecordKeys](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIv(Value(keyIvRes))
+
+fn tcpTlsServerHandshakeSendKeysInto(out: var rec.VpnProxyTcpTlsRecordKeys): Result[bool] =
+    var keyIv: tls13.MsQuicTls13KeyIv
+    let keyIvRes: Result[bool] = hs.msquicTls13SideHandshakeKeyIvInto(keyIv, 1, true)
+    if IsErr(keyIvRes):
+        return Err[bool](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIvInto(keyIv, out)
+
+fn tcpTlsServerHandshakeRecvKeys(): Result[rec.VpnProxyTcpTlsRecordKeys] =
+    let keyIvRes: Result[tls13.MsQuicTls13KeyIv] = hs.msquicTls13SideHandshakeKeyIv(1, false)
+    if IsErr(keyIvRes):
+        return Err[rec.VpnProxyTcpTlsRecordKeys](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIv(Value(keyIvRes))
+
+fn tcpTlsServerHandshakeRecvKeysInto(out: var rec.VpnProxyTcpTlsRecordKeys): Result[bool] =
+    var keyIv: tls13.MsQuicTls13KeyIv
+    let keyIvRes: Result[bool] = hs.msquicTls13SideHandshakeKeyIvInto(keyIv, 1, false)
+    if IsErr(keyIvRes):
+        return Err[bool](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIvInto(keyIv, out)
+
+fn tcpTlsClientHandshakeSendKeys(): Result[rec.VpnProxyTcpTlsRecordKeys] =
+    let keyIvRes: Result[tls13.MsQuicTls13KeyIv] = hs.msquicTls13SideHandshakeKeyIv(0, false)
+    if IsErr(keyIvRes):
+        return Err[rec.VpnProxyTcpTlsRecordKeys](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIv(Value(keyIvRes))
+
+fn tcpTlsClientHandshakeRecvKeys(): Result[rec.VpnProxyTcpTlsRecordKeys] =
+    let keyIvRes: Result[tls13.MsQuicTls13KeyIv] = hs.msquicTls13SideHandshakeKeyIv(0, true)
+    if IsErr(keyIvRes):
+        return Err[rec.VpnProxyTcpTlsRecordKeys](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIv(Value(keyIvRes))
+
+@borrows
+fn addClientTrustRootIfPresent(trustRoot0: Bytes): Result[bool] =
+    if BytesLen(trustRoot0) > 0:
+        let rootRes: Result[bool] = hs.msquicTls13ClientAddTrustRoot(trustRoot0)
+        if IsErr(rootRes):
+            return Err[bool](ErrorText(rootRes))
+    return Ok[bool](true)
+
+
+@borrows
+fn VpnProxyTcpTlsForwardClientBuildHello(serverName: str,
+                                         trustRoot0: var Bytes): Result[Bytes] =
+    hs.msquicTls13ResetClientDefault(true)
+    # AES128GCM instead of ChaCha20Poly1305: the x86 exit process hard-crashes
+    # (int3 bounds fail-stop inside chacha20Xor/loadU32LE) when negotiating the
+    # chacha suite with current x86 codegen. AES-GCM also engages AESE/SHA
+    # hardware on arm64 clients. Revisit once x86 chacha codegen is fixed.
+    hs.msquicTls13ClientUseAes128Gcm()
+    hs.msquicTls13ClientSetServerName(serverName)
+    hs.msquicTls13ClientClearTrustRoots()
+    var trustRootClone: Bytes = BytesSlice(trustRoot0, 0, BytesLen(trustRoot0))
+    let trustRes: Result[bool] = addClientTrustRootIfPresent(trustRootClone)
+    if IsErr(trustRes):
+        return Err[Bytes](ErrorText(trustRes))
+    let genRes: Result[bool] = hs.msquicTls13ClientGenerateX25519()
+    if IsErr(genRes):
+        return Err[Bytes](ErrorText(genRes))
+    let clientRandomRes: Result[Bytes] = tcpTlsRandom32()
+    if IsErr(clientRandomRes):
+        return Err[Bytes](ErrorText(clientRandomRes))
+    var clientRandom: Bytes = Value(clientRandomRes)
+    var crCopy: Bytes = BytesSlice(clientRandom, 0, BytesLen(clientRandom))
+    let helloRes: Result[Bytes] = hs.msquicTls13ClientBuildClientHello(crCopy,
+                                                                       VpnProxyTcpTlsForwardAlpnText,
+                                                                       serverName,
+                                                                       EmptyBytes())
+    BytesFree(clientRandom)
+    if IsErr(helloRes):
+        return Err[Bytes](ErrorText(helloRes))
+    var hello: Bytes = Value(helloRes)
+    hs.msquicTls13ClientAppendTranscript(hello)
+    let recordRes: Result[Bytes] = rec.VpnProxyTcpTlsRecordBuildPlain(rec.VpnProxyTcpTlsRecordContentTypeHandshake(), hello)
+    BytesFree(hello)
+    return recordRes
+
+# [psk-resume] Client hello with session resumption: fresh hello when no
+# usable cached ticket, PSK-offering hello otherwise. The pskOffered state
+# pivot lives inside msquicTls13ClientBuildHelloWithPskOffered.
+@borrows
+fn VpnProxyTcpTlsForwardClientBuildHelloMaybeResume(serverName: str,
+                                                    trustRoot0: var Bytes): Result[Bytes] =
+    var nowMs: int64
+    var canResume: bool
+    if vpnTcpTlsResumeHave:
+        if vpnTcpTlsResumeServerName == serverName:
+            nowMs = times.monotimeNs() / int64(1000000)
+            let ageMs: int64 = nowMs - vpnTcpTlsResumeReceivedAtMs
+            let expireMs: int64 = (vpnTcpTlsResumeLifetimeSec * int64(1000)) * int64(9) / int64(10)
+            if ageMs >= 0 && ageMs < expireMs:
+                canResume = true
+    if !canResume:
+        return VpnProxyTcpTlsForwardClientBuildHello(serverName, trustRoot0)
+    hs.msquicTls13ResetClientDefault(true)
+    hs.msquicTls13ClientUseAes128Gcm()
+    hs.msquicTls13ClientSetServerName(serverName)
+    hs.msquicTls13ClientClearTrustRoots()
+    var trustRootClone: Bytes = BytesSlice(trustRoot0, 0, BytesLen(trustRoot0))
+    let trustRes: Result[bool] = addClientTrustRootIfPresent(trustRootClone)
+    if IsErr(trustRes):
+        return Err[Bytes](ErrorText(trustRes))
+    let genRes: Result[bool] = hs.msquicTls13ClientGenerateX25519()
+    if IsErr(genRes):
+        return Err[Bytes](ErrorText(genRes))
+    let clientRandomRes: Result[Bytes] = tcpTlsRandom32()
+    if IsErr(clientRandomRes):
+        return Err[Bytes](ErrorText(clientRandomRes))
+    var clientRandom: Bytes = Value(clientRandomRes)
+    var crCopy: Bytes = BytesSlice(clientRandom, 0, BytesLen(clientRandom))
+    # [psk-resume] owned named locals for every managed byval argument
+    # (shared params / global aggregates cannot re-enter byval formals).
+    var snOwned: str = strings.CloneStr(serverName)
+    var emptyParams: Bytes = EmptyBytes()
+    var identityArg: Bytes = hs.msquicTls13BytesOwnedCopy(vpnTcpTlsResumeIdentity)
+    var pskArg: Bytes = hs.msquicTls13BytesOwnedCopy(vpnTcpTlsResumePsk)
+    let helloRes: Result[Bytes] = hs.msquicTls13ClientBuildHelloWithPskOffered(crCopy,
+                                                                               VpnProxyTcpTlsForwardAlpnText,
+                                                                               snOwned,
+                                                                               emptyParams,
+                                                                               identityArg,
+                                                                               pskArg,
+                                                                               vpnTcpTlsResumeAgeAdd,
+                                                                               vpnTcpTlsResumeReceivedAtMs,
+                                                                               nowMs)
+    BytesFree(identityArg)
+    BytesFree(pskArg)
+    BytesFree(emptyParams)
+    BytesFree(clientRandom)
+    if IsErr(helloRes):
+        return Err[Bytes](ErrorText(helloRes))
+    var hello: Bytes = Value(helloRes)
+    hs.msquicTls13ClientAppendTranscript(hello)
+    let recordRes: Result[Bytes] = rec.VpnProxyTcpTlsRecordBuildPlain(rec.VpnProxyTcpTlsRecordContentTypeHandshake(), hello)
+    BytesFree(hello)
+    return recordRes
+
+@borrows
+fn VpnProxyTcpTlsForwardServerBuildFlight(clientHelloRecord: Bytes,
+                                          serverPolicy: policy.MsQuicTlsPolicy): Result[VpnProxyTcpTlsServerFlight] =
+    var out: VpnProxyTcpTlsServerFlight
+    let fillRes: Result[bool] = VpnProxyTcpTlsForwardServerBuildFlightInto(clientHelloRecord,
+                                                                           serverPolicy,
+                                                                           out)
+    if IsErr(fillRes):
+        return Err[VpnProxyTcpTlsServerFlight](ErrorText(fillRes))
+    return Ok[VpnProxyTcpTlsServerFlight](out)
+
+@borrows
+fn VpnProxyTcpTlsForwardServerBuildFlightInto(clientHelloRecord: Bytes,
+                                              serverPolicy: policy.MsQuicTlsPolicy,
+                                              out: var VpnProxyTcpTlsServerFlight): Result[bool] =
+    hs.msquicTls13ResetServerDefault(false)
+    var parsedHelloRecord: rec.VpnProxyTcpTlsRecordPlain
+    let parsedHelloRecordRes: Result[bool] = rec.VpnProxyTcpTlsRecordParsePlainInto(clientHelloRecord,
+                                                                                    parsedHelloRecord)
+    if IsErr(parsedHelloRecordRes):
+        return Err[bool](ErrorText(parsedHelloRecordRes))
+    if parsedHelloRecord.contentType != rec.VpnProxyTcpTlsRecordContentTypeHandshake():
+        BytesFree(parsedHelloRecord.payload)
+        return Err[bool]("tcp-tls-forward handshake: expected ClientHello record")
+    let feedRes: Result[int32] = hs.msquicTls13SideFeed(1, parsedHelloRecord.payload)
+    if IsErr(feedRes):
+        BytesFree(parsedHelloRecord.payload)
+        return Err[bool](ErrorText(feedRes))
+    let genRes: Result[bool] = hs.msquicTls13ServerGenerateForClientKeyShare()
+    BytesFree(parsedHelloRecord.payload)
+    if IsErr(genRes):
+        return Err[bool](ErrorText(genRes))
+    # [psk-resume] PSK accept decision: offered identity must hit the ticket
+    # store and its binder must verify. On accept the ServerHello carries the
+    # psk-selected extension and both sides derive secrets with the PSK; on
+    # reject this silently degrades to the plain full handshake (same wire).
+    var acceptPsk: bool
+    if hs.msquicTls13ServerPskOffered():
+        var identityOwned: Bytes = hs.msquicTls13ServerPskIdentityOwned()
+        if BytesLen(identityOwned) > 0:
+            let pskLookupRes: Result[Bytes] = tcpTlsTicketStoreLookupPsk(identityOwned)
+            if IsOk(pskLookupRes):
+                var candidatePsk: Bytes = Value(pskLookupRes)
+                let storedCipherId: int32 = tcpTlsTicketStoreLookupCipherId(identityOwned)
+                let binderRes: Result[bool] = hs.msquicTls13ServerVerifyPskBinderWith(candidatePsk, storedCipherId)
+                if IsOk(binderRes):
+                    if Value(binderRes):
+                        let setRes: Result[bool] = hs.msquicTls13ServerSetAcceptedPsk(candidatePsk, storedCipherId)
+                        if IsOk(setRes):
+                            acceptPsk = true
+                BytesFree(candidatePsk)
+        BytesFree(identityOwned)
+    var serverHello: Bytes
+    let serverRandomRes: Result[Bytes] = tcpTlsRandom32()
+    if IsErr(serverRandomRes):
+        return Err[bool](ErrorText(serverRandomRes))
+    var serverRandom: Bytes = Value(serverRandomRes)
+    let shRes: Result[bool] = hs.msquicTls13ServerBuildServerHelloInto(serverHello,
+                                                                       serverRandom,
+                                                                       acceptPsk)
+    BytesFree(serverRandom)
+    if IsErr(shRes):
+        return Err[bool](ErrorText(shRes))
+    hs.msquicTls13ServerAppendTranscript(serverHello)
+    let secRes: Result[bool] = hs.msquicTls13SideComputeHandshakeSecrets(1)
+    if IsErr(secRes):
+        BytesFree(serverHello)
+        return Err[bool](ErrorText(secRes))
+    var ee: Bytes
+    let eeRes: Result[bool] = hs.msquicTls13BuildEncryptedExtensionsInto(ee,
+                                                                         VpnProxyTcpTlsForwardAlpnText,
+                                                                         EmptyBytes())
+    if IsErr(eeRes):
+        BytesFree(serverHello)
+        return Err[bool](ErrorText(eeRes))
+    hs.msquicTls13ServerAppendTranscript(ee)
+    # [psk-resume] a PSK-accepted flight omits Certificate/CertificateVerify
+    # entirely (both sides hash the same flight either way). certMsg/cv stay
+    # empty on that path -- BytesFree(nil-data) is a no-op.
+    var certMsg: Bytes
+    var cv: Bytes
+    if !acceptPsk:
+        let certRes: Result[bool] = hs.msquicTls13BuildCertificateChainInto(certMsg,
+                                                                            serverPolicy.certChainCount,
+                                                                            serverPolicy.certChain0,
+                                                                            serverPolicy.certChain1,
+                                                                            serverPolicy.certChain2,
+                                                                            serverPolicy.certChain3)
+        if IsErr(certRes):
+            BytesFree(serverHello)
+            BytesFree(ee)
+            return Err[bool](ErrorText(certRes))
+        hs.msquicTls13ServerAppendTranscript(certMsg)
+        var publicKey: Bytes
+        let publicKeyRes: Result[bool] = tcpTlsCertificatePublicKeyInto(serverPolicy.certChain0, publicKey)
+        if IsErr(publicKeyRes):
+            BytesFree(serverHello)
+            BytesFree(ee)
+            BytesFree(certMsg)
+            return Err[bool](ErrorText(publicKeyRes))
+        let cvRes: Result[bool] = hs.msquicTls13ServerBuildCertificateVerifyCodeWithPublicInto(cv,
+                                                                                               int32(serverPolicy.certLeafKeyKind),
+                                                                                               publicKey,
+                                                                                               serverPolicy.certPrivateKey,
+                                                                                               true)
+        BytesFree(publicKey)
+        if IsErr(cvRes):
+            BytesFree(serverHello)
+            BytesFree(ee)
+            BytesFree(certMsg)
+            return Err[bool](ErrorText(cvRes))
+        hs.msquicTls13ServerAppendTranscript(cv)
+    var fin: Bytes
+    let finRes: Result[bool] = hs.msquicTls13ServerBuildFinishedInto(fin, true)
+    if IsErr(finRes):
+        BytesFree(serverHello)
+        BytesFree(ee)
+        BytesFree(certMsg)
+        BytesFree(cv)
+        return Err[bool](ErrorText(finRes))
+    hs.msquicTls13ServerAppendTranscript(fin)
+    # [psk-resume] Application (and resumption-master) secrets snapshotted here
+    # over CH..serverFinished so the server can derive the resumption PSK for
+    # the NST below; the client derives identical secrets at its Finished
+    # handling (same transcript content), and the later client-Finished
+    # handling on this side becomes a no-op via applicationSecretsReady.
+    let appNowRes: Result[bool] = hs.msquicTls13ServerComputeApplicationSecretsNow()
+    if IsErr(appNowRes):
+        BytesFree(serverHello)
+        BytesFree(ee)
+        BytesFree(certMsg)
+        BytesFree(cv)
+        BytesFree(fin)
+        return Err[bool](ErrorText(appNowRes))
+    # [ps-resume] Issue one session ticket per handshake and append its wire
+    # message inside this encrypted flight (keeps the two-record shape the
+    # dialer-proxy reader depends on). Best-effort: a ticket failure never
+    # fails the handshake.
+    var nstWire: Bytes
+    var nstTicket: Bytes
+    var nstPsk: Bytes
+    let nstRes: Result[bool] = hs.msquicTls13ServerBuildNewSessionTicketInto(nstWire,
+                                                                            nstTicket,
+                                                                            nstPsk,
+                                                                            vpnTcpTlsTicketLifetimeSec)
+    if IsOk(nstRes):
+        tcpTlsTicketStorePut(nstTicket, nstPsk, hs.msquicTls13ServerCipherSuiteId())
+        BytesFree(nstTicket)
+        BytesFree(nstPsk)
+    var flightPart1: Bytes = BytesConcat(ee, certMsg)
+    var flightPart2: Bytes = BytesConcat(flightPart1, cv)
+    var flightPlain: Bytes = BytesConcat(flightPart2, fin)
+    BytesFree(flightPart1)
+    BytesFree(flightPart2)
+    if IsOk(nstRes):
+        var flightWithNst: Bytes = BytesConcat(flightPlain, nstWire)
+        BytesFree(flightPlain)
+        BytesFree(nstWire)
+        flightPlain = flightWithNst
+    var sendKeys: rec.VpnProxyTcpTlsRecordKeys
+    let sendKeysRes: Result[bool] = tcpTlsServerHandshakeSendKeysInto(sendKeys)
+    if IsErr(sendKeysRes):
+        BytesFree(serverHello)
+        BytesFree(ee)
+        BytesFree(certMsg)
+        BytesFree(cv)
+        BytesFree(fin)
+        BytesFree(flightPlain)
+        return Err[bool](ErrorText(sendKeysRes))
+    var encryptedFlight: Bytes
+    let encryptedFlightRes: Result[bool] = rec.VpnProxyTcpTlsRecordEncryptInto(sendKeys,
+                                                                               rec.VpnProxyTcpTlsRecordContentTypeHandshake(),
+                                                                               flightPlain,
+                                                                               encryptedFlight)
+    rec.VpnProxyTcpTlsRecordKeysFree(sendKeys)
+    if IsErr(encryptedFlightRes):
+        BytesFree(serverHello)
+        BytesFree(ee)
+        BytesFree(certMsg)
+        BytesFree(cv)
+        BytesFree(fin)
+        BytesFree(flightPlain)
+        return Err[bool](ErrorText(encryptedFlightRes))
+    var serverHelloWire: Bytes
+    let shRecordRes: Result[bool] = rec.VpnProxyTcpTlsRecordBuildPlainInto(rec.VpnProxyTcpTlsRecordContentTypeHandshake(),
+                                                                           serverHello,
+                                                                           serverHelloWire)
+    if IsErr(shRecordRes):
+        BytesFree(serverHello)
+        BytesFree(ee)
+        BytesFree(certMsg)
+        BytesFree(cv)
+        BytesFree(fin)
+        BytesFree(flightPlain)
+        BytesFree(encryptedFlight)
+        return Err[bool](ErrorText(shRecordRes))
+    out.serverHelloRecord = serverHelloWire
+    out.encryptedHandshakeRecord = encryptedFlight
+    BytesFree(serverHello)
+    BytesFree(ee)
+    BytesFree(certMsg)
+    BytesFree(cv)
+    BytesFree(fin)
+    BytesFree(flightPlain)
+    return Ok[bool](true)
+
+@borrows
+fn VpnProxyTcpTlsForwardClientProcessServerFlight(serverHelloRecord: Bytes,
+                                                  encryptedFlightRecord: Bytes): Result[Bytes] =
+    var shRecord: rec.VpnProxyTcpTlsRecordPlain
+    let shRecordRes: Result[bool] = rec.VpnProxyTcpTlsRecordParsePlainInto(serverHelloRecord, shRecord)
+    if IsErr(shRecordRes):
+        return Err[Bytes](ErrorText(shRecordRes))
+    if shRecord.contentType != rec.VpnProxyTcpTlsRecordContentTypeHandshake():
+        BytesFree(shRecord.payload)
+        return Err[Bytes]("tcp-tls-forward handshake: expected ServerHello record")
+    let shFeedRes: Result[int32] = hs.msquicTls13SideFeed(0, shRecord.payload)
+    if IsErr(shFeedRes):
+        BytesFree(shRecord.payload)
+        return Err[Bytes](ErrorText(shFeedRes))
+    BytesFree(shRecord.payload)
+    let recvKeysRes: Result[rec.VpnProxyTcpTlsRecordKeys] = tcpTlsClientHandshakeRecvKeys()
+    if IsErr(recvKeysRes):
+        return Err[Bytes](ErrorText(recvKeysRes))
+    var recvKeys: rec.VpnProxyTcpTlsRecordKeys = Value(recvKeysRes)
+    var flightPlain: rec.VpnProxyTcpTlsRecordPlain
+    let flightPlainRes: Result[bool] = rec.VpnProxyTcpTlsRecordDecryptInto(recvKeys,
+                                                                           encryptedFlightRecord,
+                                                                           flightPlain)
+    rec.VpnProxyTcpTlsRecordKeysFree(recvKeys)
+    if IsErr(flightPlainRes):
+        return Err[Bytes](ErrorText(flightPlainRes))
+    if flightPlain.contentType != rec.VpnProxyTcpTlsRecordContentTypeHandshake():
+        BytesFree(flightPlain.payload)
+        return Err[Bytes]("tcp-tls-forward handshake: expected encrypted handshake")
+    let flightFeedRes: Result[int32] = hs.msquicTls13SideFeed(0, flightPlain.payload)
+    if IsErr(flightFeedRes):
+        BytesFree(flightPlain.payload)
+        return Err[Bytes](ErrorText(flightFeedRes))
+    BytesFree(flightPlain.payload)
+    if !hs.msquicTls13ClientFinishedOk():
+        return Err[Bytes]("tcp-tls-forward handshake: server finished not verified")
+    let finRes: Result[Bytes] = hs.msquicTls13ClientBuildFinished(false)
+    if IsErr(finRes):
+        return Err[Bytes](ErrorText(finRes))
+    var fin: Bytes = Value(finRes)
+    let sendKeysRes: Result[rec.VpnProxyTcpTlsRecordKeys] = tcpTlsClientHandshakeSendKeys()
+    if IsErr(sendKeysRes):
+        BytesFree(fin)
+        return Err[Bytes](ErrorText(sendKeysRes))
+    var sendKeys: rec.VpnProxyTcpTlsRecordKeys = Value(sendKeysRes)
+    var out: Bytes
+    let outRes: Result[bool] = rec.VpnProxyTcpTlsRecordEncryptInto(sendKeys,
+                                                                   rec.VpnProxyTcpTlsRecordContentTypeHandshake(),
+                                                                   fin,
+                                                                   out)
+    if IsErr(outRes):
+        rec.VpnProxyTcpTlsRecordKeysFree(sendKeys)
+        BytesFree(fin)
+        return Err[Bytes](ErrorText(outRes))
+    hs.msquicTls13ClientAppendTranscript(fin)
+    rec.VpnProxyTcpTlsRecordKeysFree(sendKeys)
+    BytesFree(fin)
+    return Ok[Bytes](out)
+
+@borrows
+fn VpnProxyTcpTlsForwardServerProcessClientFinished(clientFinishedRecord: Bytes): Result[bool] =
+    var recvKeys: rec.VpnProxyTcpTlsRecordKeys
+    let recvKeysRes: Result[bool] = tcpTlsServerHandshakeRecvKeysInto(recvKeys)
+    if IsErr(recvKeysRes):
+        return Err[bool](ErrorText(recvKeysRes))
+    var plain: rec.VpnProxyTcpTlsRecordPlain
+    let plainRes: Result[bool] = rec.VpnProxyTcpTlsRecordDecryptInto(recvKeys,
+                                                                      clientFinishedRecord,
+                                                                      plain)
+    rec.VpnProxyTcpTlsRecordKeysFree(recvKeys)
+    if IsErr(plainRes):
+        return Err[bool](ErrorText(plainRes))
+    if plain.contentType != rec.VpnProxyTcpTlsRecordContentTypeHandshake():
+        BytesFree(plain.payload)
+        return Err[bool]("tcp-tls-forward handshake: expected client finished handshake")
+    let feedRes: Result[int32] = hs.msquicTls13SideFeed(1, plain.payload)
+    if IsErr(feedRes):
+        BytesFree(plain.payload)
+        return Err[bool](ErrorText(feedRes))
+    BytesFree(plain.payload)
+    if !hs.msquicTls13ServerFinishedOk():
+        return Err[bool]("tcp-tls-forward handshake: client finished not verified")
+    return Ok[bool](true)
+
+fn VpnProxyTcpTlsForwardClientAppSendKeys(): Result[rec.VpnProxyTcpTlsRecordKeys] =
+    let keyIvRes: Result[tls13.MsQuicTls13KeyIv] = hs.msquicTls13SideApplicationKeyIv(0, false)
+    if IsErr(keyIvRes):
+        return Err[rec.VpnProxyTcpTlsRecordKeys](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIv(Value(keyIvRes))
+
+fn VpnProxyTcpTlsForwardClientAppRecvKeys(): Result[rec.VpnProxyTcpTlsRecordKeys] =
+    let keyIvRes: Result[tls13.MsQuicTls13KeyIv] = hs.msquicTls13SideApplicationKeyIv(0, true)
+    if IsErr(keyIvRes):
+        return Err[rec.VpnProxyTcpTlsRecordKeys](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIv(Value(keyIvRes))
+
+fn VpnProxyTcpTlsForwardClientAppSendKeysInto(outKeys: var rec.VpnProxyTcpTlsRecordKeys): Result[bool] =
+    let keyIvRes: Result[tls13.MsQuicTls13KeyIv] = hs.msquicTls13SideApplicationKeyIv(0, false)
+    if IsErr(keyIvRes):
+        return Err[bool](ErrorText(keyIvRes))
+    var keyIv: tls13.MsQuicTls13KeyIv = Value(keyIvRes)
+    return tcpTlsRecordKeysFromKeyIvInto(keyIv, outKeys)
+
+fn VpnProxyTcpTlsForwardClientAppRecvKeysInto(outKeys: var rec.VpnProxyTcpTlsRecordKeys): Result[bool] =
+    let keyIvRes: Result[tls13.MsQuicTls13KeyIv] = hs.msquicTls13SideApplicationKeyIv(0, true)
+    if IsErr(keyIvRes):
+        return Err[bool](ErrorText(keyIvRes))
+    var keyIv: tls13.MsQuicTls13KeyIv = Value(keyIvRes)
+    return tcpTlsRecordKeysFromKeyIvInto(keyIv, outKeys)
+
+fn VpnProxyTcpTlsForwardServerAppSendKeys(): Result[rec.VpnProxyTcpTlsRecordKeys] =
+    let keyIvRes: Result[tls13.MsQuicTls13KeyIv] = hs.msquicTls13SideApplicationKeyIv(1, true)
+    if IsErr(keyIvRes):
+        return Err[rec.VpnProxyTcpTlsRecordKeys](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIv(Value(keyIvRes))
+
+fn VpnProxyTcpTlsForwardServerAppSendKeysInto(out: var rec.VpnProxyTcpTlsRecordKeys): Result[bool] =
+    var keyIv: tls13.MsQuicTls13KeyIv
+    let keyIvRes: Result[bool] = hs.msquicTls13SideApplicationKeyIvInto(keyIv, 1, true)
+    if IsErr(keyIvRes):
+        return Err[bool](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIvInto(keyIv, out)
+
+fn VpnProxyTcpTlsForwardServerAppRecvKeys(): Result[rec.VpnProxyTcpTlsRecordKeys] =
+    let keyIvRes: Result[tls13.MsQuicTls13KeyIv] = hs.msquicTls13SideApplicationKeyIv(1, false)
+    if IsErr(keyIvRes):
+        return Err[rec.VpnProxyTcpTlsRecordKeys](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIv(Value(keyIvRes))
+
+fn VpnProxyTcpTlsForwardServerAppRecvKeysInto(out: var rec.VpnProxyTcpTlsRecordKeys): Result[bool] =
+    var keyIv: tls13.MsQuicTls13KeyIv
+    let keyIvRes: Result[bool] = hs.msquicTls13SideApplicationKeyIvInto(keyIv, 1, false)
+    if IsErr(keyIvRes):
+        return Err[bool](ErrorText(keyIvRes))
+    return tcpTlsRecordKeysFromKeyIvInto(keyIv, out)
+
+# [psk-resume] hs_metrics resume marker passthrough. vpn_proxy_main qualifies
+# calls with tlshs.* and Cheng does not resolve through transitively imported
+# modules, so the handshake13 probe needs this one-line transport wrapper
+# (same shape as every other VpnProxyTcpTlsForward* server helper).
+fn msquicTls13ServerPskAccepted(): bool =
+    return hs.msquicTls13ServerPskAccepted()

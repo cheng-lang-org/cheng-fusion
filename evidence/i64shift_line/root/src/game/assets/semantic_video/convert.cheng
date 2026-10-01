@@ -1,0 +1,184 @@
+import std/strings
+import std/rawbytes
+import cheng/game/assets/import/mp4
+import cheng/game/assets/semantic_video/schema
+import cheng/game/assets/semantic_video/writer
+import cheng/game/assets/semantic_video/validator
+import cheng/game/assets/semantic_video/source_index
+
+# B2 转换管线: 存量 MP4 → CSG 语义视频 v0.1 记录块。
+# 流程: SvSourceIndexBuild → 记录构建 → SvWriterEncode → SvValidate →
+# SvWriterCommit (暂存-rename 原子提交, 规范 §5)。
+# 诚实边界: 识别模型未接线——不产任何 assertion; caps 只声明 common_core
+# (语义描述能力等识别接入后才可声明, 不虚报); 观测全部为 container 级
+# observed, method=stts/stss/stsz/stsc 容器抽取, 可独立复算。
+# 实体编号 (冻结): vide→num=1, audio→num=2; 多视频/多音频轨不可表示,
+# 结构化拒绝。音频观测时长截断换算到 manifest 时间基 (floor), 不虚报
+# 亚 tick 精度; 不足 1 tick 拒绝而非零长记录。
+
+type
+    SvConvertResult =
+        ok: bool
+        error: str
+        factCount: int32
+        contentId: str
+        claimedDirectoryCid: str
+        svblockBytes: int32
+        sampleCount: int32
+        keyframeCount: int32
+        sourceCid: str
+        indexCid: str
+
+@borrows
+fn SvConvert(data: rawbytes.Bytes, outPath: str): SvConvertResult =
+    var out: SvConvertResult
+    var idx = source_index.SvSourceIndexBuild(data)
+    if !idx.ok:
+        out.error = strings.CloneStr(idx.error)
+        return out
+    var info: mp4.AssetMp4Info
+    var mp4Err: str
+    if !mp4.AssetMediaParseMp4(data, info, mp4Err):
+        out.error = strings.ConcatStr("svsrc_mp4_parse ", mp4Err)
+        return out
+    var videoAt: int32 = -1
+    var audioAt: int32 = -1
+    var videoCount: int32 = 0
+    var audioCount: int32 = 0
+    for i in 0..<info.trackCount:
+        if info.tracks[i].handler == mp4.AssetMediaHandlerVide():
+            videoCount = videoCount + 1
+            if videoAt < 0:
+                videoAt = i
+        elif info.tracks[i].handler == mp4.AssetMediaHandlerSoun():
+            audioCount = audioCount + 1
+            if audioAt < 0:
+                audioAt = i
+    if videoCount > 1:
+        out.error = "svsrc_multi_video_track"
+        return out
+    if audioCount > 1:
+        out.error = "svsrc_multi_audio_track"
+        return out
+    let videoTrack = info.tracks[videoAt]
+    let totalTicks = videoTrack.sttsTotalDuration
+
+    # 资源 CID: 源文件字节 + 索引资源字节 (外置资源, 记录块只存 CID)。
+    let sourceCid = writer.SvResourceCid(data)
+    let indexBytes = source_index.SvSourceIndexEncodeResource(idx)
+    let indexCid = writer.SvResourceCid(indexBytes)
+
+    # 音频观测 end tick: 截断换算到视频时间基。
+    var audioEndTick: int64 = int64(-1)
+    if audioAt >= 0:
+        let audioTrack = info.tracks[audioAt]
+        if audioTrack.timebase <= 0:
+            out.error = "svsrc_audio_timescale_invalid"
+            return out
+        if audioTrack.mediaDuration < int64(0):
+            out.error = "svsrc_audio_duration_invalid"
+            return out
+        if audioTrack.mediaDuration >
+           int64(9223372036854775807) / int64(idx.timescale):
+            out.error = "svsrc_audio_tick_overflow"
+            return out
+        audioEndTick = audioTrack.mediaDuration * int64(idx.timescale) /
+            int64(audioTrack.timebase)
+        if audioEndTick <= int64(0):
+            out.error = "svsrc_audio_tick_zero"
+            return out
+
+    var set = writer.SvLineSetInit()
+
+    # manifest: 预提交行 contentId 置空串, 经 SvContentCid 绑定 (规范 §3)。
+    var manifest: schema.SvManifestRec
+    add(manifest.caps, strings.CloneStr(schema.SvCapCommonCore))
+    add(manifest.resCid, strings.CloneStr(sourceCid))
+    add(manifest.resCid, strings.CloneStr(indexCid))
+    add(manifest.resLength, int64(rawbytes.BytesLen(data)))
+    add(manifest.resLength, int64(rawbytes.BytesLen(indexBytes)))
+    add(manifest.resType, strings.CloneStr("video_sample"))
+    add(manifest.resType, strings.CloneStr("index"))
+    manifest.tbNum = 1
+    manifest.tbDen = idx.timescale
+    manifest.timeStart = int64(0)
+    manifest.timeEnd = totalTicks
+    manifest.entrySnapshot = strings.CloneStr("")
+    let preLine = schema.SvManifestLine(manifest)
+    manifest.contentId = writer.SvContentCid(preLine)
+    writer.SvAddManifest(set, manifest)
+
+    # entity: 每条媒体轨一个 (vide→1, audio→2)。
+    for i in 0..<info.trackCount:
+        var entity: schema.SvEntityRec
+        entity.ns = strings.CloneStr("semantic_convert@v1")
+        entity.gen = int64(0)
+        entity.typeVer = strings.CloneStr("mp4-track")
+        entity.lifecycle = strings.CloneStr(schema.SvLifecycleActive)
+        if info.tracks[i].handler == mp4.AssetMediaHandlerVide():
+            entity.num = 1
+            writer.SvAddEntity(set, entity)
+        elif info.tracks[i].handler == mp4.AssetMediaHandlerSoun():
+            entity.num = 2
+            writer.SvAddEntity(set, entity)
+
+    # observation: 视频轨按 GOP 切 (关键帧 i → 下一关键帧, 末段到
+    # totalTicks); 音频轨单条 [0, 截断换算时长)。无 assertion (无识别)。
+    var kfSample: int32[]
+    var si: int32 = 0
+    while si < idx.sampleCount:
+        if idx.key[si] == 1:
+            add(kfSample, si)
+        si = si + 1
+    var g: int32 = 0
+    while g < idx.keyframeCount:
+        var obs: schema.SvObservationRec
+        obs.obsId = strings.ConcatStr("obs-v", strings.IntToStr(g))
+        obs.sensor = strings.CloneStr("container")
+        obs.srcTrack = strings.CloneStr("v:0")
+        obs.sourceClass = strings.CloneStr(schema.SvSourceObserved)
+        obs.method = strings.CloneStr("mp4-stts-stss-stsz-extraction@v1")
+        obs.tbNum = 1
+        obs.tbDen = idx.timescale
+        obs.tickStart = idx.pts[kfSample[g]]
+        if g + 1 < idx.keyframeCount:
+            obs.tickEnd = idx.pts[kfSample[g + 1]]
+        else:
+            obs.tickEnd = totalTicks
+        writer.SvAddObservation(set, obs)
+        g = g + 1
+    if audioAt >= 0:
+        var aobs: schema.SvObservationRec
+        aobs.obsId = strings.CloneStr("obs-a0")
+        aobs.sensor = strings.CloneStr("container")
+        aobs.srcTrack = strings.CloneStr("a:0")
+        aobs.sourceClass = strings.CloneStr(schema.SvSourceObserved)
+        aobs.method = strings.CloneStr("mp4-stts-stss-stsz-extraction@v1")
+        aobs.tbNum = 1
+        aobs.tbDen = idx.timescale
+        aobs.tickStart = int64(0)
+        aobs.tickEnd = audioEndTick
+        writer.SvAddObservation(set, aobs)
+
+    var encoded = writer.SvWriterEncode(set)
+    if !encoded.ok:
+        out.error = strings.CloneStr(encoded.error)
+        return out
+    var validation = validator.SvValidate(encoded.bytes)
+    if !validation.ok:
+        out.error = strings.ConcatStr("sv_validate ", validation.error)
+        return out
+    let commitError = writer.SvWriterCommit(encoded.bytes, outPath)
+    if commitError.len > 0:
+        out.error = strings.ConcatStr("sv_commit ", commitError)
+        return out
+    out.ok = true
+    out.factCount = encoded.factCount
+    out.contentId = strings.CloneStr(manifest.contentId)
+    out.claimedDirectoryCid = strings.CloneStr(encoded.claimedDirectoryCid)
+    out.svblockBytes = rawbytes.BytesLen(encoded.bytes)
+    out.sampleCount = idx.sampleCount
+    out.keyframeCount = idx.keyframeCount
+    out.sourceCid = strings.CloneStr(sourceCid)
+    out.indexCid = strings.CloneStr(indexCid)
+    return out

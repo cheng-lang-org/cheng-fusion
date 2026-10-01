@@ -7,12 +7,12 @@
 // *_true 缺 base、requiresMirror 找不到约定对端、显式 mirror 非双向，或同一 fixture
 // 被配到多个对端，都会在启动第一个编译进程前 hard-fail。mirror pair 不推断两端
 // expectRc 的关系，只要求两格分别命中各自契约，并据此给出 pairVerdict。
-import {accessSync, constants, lstatSync, mkdtempSync, realpathSync, rmSync, statSync} from "node:fs";
+import {accessSync, constants, copyFileSync, lstatSync, mkdtempSync, realpathSync, rmSync, statSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {isAbsolute, join, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {b as defineModuleInitializer} from "./runtime.ts";
-import {createChengTextTool, jsonResult, runChengDriver, takeTrailingText, initChengToolkitModule, zodSchema} from "./cheng_toolkit_m9000.ts";
+import {createChengTextTool, jsonResult, runChengDriver, runPool, takeTrailingText, mkdtempInRootSrc, initChengToolkitModule, zodSchema} from "./cheng_toolkit_m9000.ts";
 
 var chengFixtureMatrixInputSchema, ChengFixtureMatrixTool;
 
@@ -202,7 +202,7 @@ async function compileAndRunCell(driver, driverIndex, fixture, fixtureIndex, roo
   const args = [
     "system-link-exec",
     `--root:${root}`,
-    `--in:${fixture.path}`,
+    "--in:" + (fixture.compilePath || fixture.path),
     "--emit:exe",
     "--link-providers",
     `--target:${TARGET}`,
@@ -314,16 +314,26 @@ var initChengFixtureMatrixModule = defineModuleInitializer(() => {
       const {fixtures, mirrorPairs} = validateAndResolveFixtures(input.fixtures);
       const timeoutMs = Math.round((input.timeoutSec || DEFAULT_TIMEOUT_SEC) * 1000);
       const maxBuffer = input.maxOutputBytes || DEFAULT_MAX_OUTPUT_BYTES;
-      const tempDir = mkdtempSync(join(tmpdir(), "cheng-fixture-matrix-"));
+      const tempDir = mkdtempInRootSrc(root);
       try {
-        const results = [];
-        const cellsByKey = new Map();
+        // fixture 快照进 root/src 内临时目录(冷快照模块身份约束); 报告仍引用用户原路径,
+        // compileAndRunCell 用 fixture.compilePath 编译、用 fixture.path 汇报。
+        for (let index = 0; index < fixtures.length; index++) {
+          const compilePath = join(tempDir, `fixture-${index}.cheng`);
+          copyFileSync(fixtures[index].path, compilePath);
+          fixtures[index] = {...fixtures[index], compilePath};
+        }
+        const cells = [];
         for (let driverIndex = 0; driverIndex < drivers.length; driverIndex++) {
           for (let fixtureIndex = 0; fixtureIndex < fixtures.length; fixtureIndex++) {
-            const result = await compileAndRunCell(drivers[driverIndex], driverIndex, fixtures[fixtureIndex], fixtureIndex, root, tempDir, timeoutMs, maxBuffer);
-            results.push(result);
-            cellsByKey.set(`${driverIndex}:${fixtureIndex}`, result);
+            cells.push({driverIndex, fixtureIndex});
           }
+        }
+        const results = await runPool(cells, ({driverIndex, fixtureIndex}) =>
+          compileAndRunCell(drivers[driverIndex], driverIndex, fixtures[fixtureIndex], fixtureIndex, root, tempDir, timeoutMs, maxBuffer));
+        const cellsByKey = new Map();
+        for (let index = 0; index < cells.length; index++) {
+          cellsByKey.set(`${cells[index].driverIndex}:${cells[index].fixtureIndex}`, results[index]);
         }
         const mirrorReports = buildMirrorReports(mirrorPairs, fixtures, drivers, cellsByKey);
         const summary = {total: results.length, green: 0, red: 0, pairGreen: 0, pairRed: 0};

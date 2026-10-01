@@ -1,0 +1,334 @@
+import std/result
+import std/math as m
+import std/strings
+import std/strutils as strutil
+import cheng/inference/gated_delta_net as gdn
+import cheng/inference/hf_qwen38_graph as hfq
+import cheng/inference/qwen38_hybrid_executor as hx
+import cheng/inference/qwen38_forward as fwd
+
+// Qwen3.8 hybrid mini end-to-end forward smoke.
+// Chain: real Qwen3.8-27B config fixture -> deploy profile -> 64-layer
+// hybrid LayerPlan -> LCG mini weights (mathematical fixture, NOT real
+// model weights) -> embedding/GDN/full-attn/finalNorm/lmHead forward ->
+// greedy token. The mini stack runs the plan's first 4 slots (3 linear +
+// 1 full, interval 4), so the real scheduler cadence drives mini dispatch.
+//
+// Positives: logits shape/finiteness, bitwise determinism + hash equality,
+// greedy id in range, batch-vs-stepwise causality (bitwise + maxdiff),
+// input sensitivity. Negatives >= 5: empty sequence / out-of-range ids /
+// tampered dims / tampered layer split / NaN injection / tampered plan
+// spacing / short output buffer, all hard-failing via Result.
+
+fn qwen38VisionConfigChunk(): str =
+    return strutil.Join([
+        "\"vision_config\":{",
+        "\"deepstack_visual_indexes\":[],",
+        "\"depth\":27,",
+        "\"hidden_act\":\"gelu_pytorch_tanh\",",
+        "\"hidden_size\":1152,",
+        "\"in_channels\":3,",
+        "\"initializer_range\":0.02,",
+        "\"intermediate_size\":4304,",
+        "\"model_type\":\"qwen3_5\",",
+        "\"num_heads\":16,",
+        "\"num_position_embeddings\":2304,",
+        "\"out_hidden_size\":5120,",
+        "\"patch_size\":16,",
+        "\"spatial_merge_size\":2,",
+        "\"temporal_patch_size\":2",
+        "},"
+    ], "")
+
+// Verbatim config fixture from hf_qwen38_config_smoke.cheng (real
+// Qwen/Qwen3.8-27B config.json values, fetched 2026-08-22).
+fn qwen38ConfigJson(): str =
+    var layerItems: str[]
+    for i in 0..<64:
+        var word = "linear_attention"
+        if (i + 1) % 4 == 0:
+            word = "full_attention"
+        add(layerItems, strutil.Join(["\"", share(word), "\""], ""))
+    return strutil.Join([
+        "{",
+        "\"architectures\":[\"Qwen3_5ForConditionalGeneration\"],",
+        "\"image_token_id\":248056,",
+        "\"language_model_only\":false,",
+        "\"model_type\":\"qwen3_5\",",
+        "\"text_config\":{",
+        "\"attention_bias\":false,",
+        "\"attention_dropout\":0.0,",
+        "\"attn_output_gate\":true,",
+        "\"bos_token_id\":248044,",
+        "\"dtype\":\"bfloat16\",",
+        "\"eos_token_id\":248044,",
+        "\"full_attention_interval\":4,",
+        "\"head_dim\":256,",
+        "\"hidden_act\":\"silu\",",
+        "\"hidden_size\":5120,",
+        "\"initializer_range\":0.02,",
+        "\"intermediate_size\":17408,",
+        "\"layer_types\":[", strutil.Join(layerItems, ","), "],",
+        "\"linear_conv_kernel_dim\":4,",
+        "\"linear_key_head_dim\":128,",
+        "\"linear_num_key_heads\":16,",
+        "\"linear_num_value_heads\":48,",
+        "\"linear_value_head_dim\":128,",
+        "\"mamba_ssm_dtype\":\"float32\",",
+        "\"max_position_embeddings\":262144,",
+        "\"model_type\":\"qwen3_5_text\",",
+        "\"mtp_num_hidden_layers\":1,\"mtp_use_dedicated_embeddings\":false,",
+        "\"num_attention_heads\":24,",
+        "\"num_hidden_layers\":64,",
+        "\"num_key_value_heads\":4,",
+        "\"output_gate_type\":\"swish\",",
+        "\"pad_token_id\":null,",
+        "\"partial_rotary_factor\":0.25,",
+        "\"rms_norm_eps\":1e-06,",
+        "\"rope_parameters\":{\"mrope_interleaved\":true,\"mrope_section\":[11,11,10],\"partial_rotary_factor\":0.25,\"rope_theta\":10000000,\"rope_type\":\"default\"},",
+        "\"tie_word_embeddings\":false,",
+        "\"use_cache\":true,",
+        "\"vocab_size\":248320,",
+        "\"transformers_version\":\"5.8.0.dev0\",",
+        "\"video_token_id\":248057,",
+        qwen38VisionConfigChunk(),
+        "\"vision_end_token_id\":248054,",
+        "\"vision_start_token_id\":248053",
+        "}"
+    ], "")
+
+fn splitHi(v: int64): int32 =
+    var t: int64 = v
+    if t < int64(0):
+        t = int64(0) - t
+    return int32(t / int64(1000000))
+
+fn splitLo(v: int64): int32 =
+    var t: int64 = v
+    if t < int64(0):
+        t = int64(0) - t
+    return int32(t % int64(1000000))
+
+fn signedPrefix(v: int64): str =
+    if v < int64(0):
+        return "-"
+    return ""
+
+fn boolWord(b: bool): str =
+    if b:
+        return "1"
+    return "0"
+
+fn f64ScaledDigits(value: float64, scalePow: int32): int64 =
+    var scaled: float64 = value
+    for i in 0..<scalePow:
+        scaled = scaled * 10.0
+    return int64(scaled)
+
+fn echoF64(label: str, value: float64, scalePow: int32) =
+    let d = f64ScaledDigits(value, scalePow)
+    echo(strutil.Join([label, signedPrefix(d), strings.IntToStr(splitHi(d)), ".",
+                       strings.IntToStr(splitLo(d)), "e-", strings.IntToStr(scalePow)], ""))
+
+fn echoI64(label: str, value: int64) =
+    echo(strutil.Join([label, signedPrefix(value), strings.IntToStr(splitHi(value)),
+                       strings.IntToStr(splitLo(value))], ""))
+
+@borrows
+fn logitsAllFinite(values: float64[]): bool =
+    for i in 0..<values.len:
+        let bitsRes = gdn.GdnDecomposeF64(values[i])
+        if IsErr(bitsRes):
+            return false
+    return true
+
+fn main(): int32 =
+    let vocab = fwd.Qwen38MiniVocab
+
+    // --- chain: real config -> profile -> 64-layer plan ---
+    let configJson = qwen38ConfigJson()
+    let profileRes = hfq.HfQwen38DeployProfileFromConfig(hfq.HfQwen38RepoId, share(configJson))
+    assert(IsOk(profileRes), "q38 fwd smoke: deploy profile from real config")
+    let profile = Value(profileRes)
+    let planRes = hx.Qwen38HybridLayerPlanBuild(profile)
+    assert(IsOk(planRes), "q38 fwd smoke: hybrid layer plan build")
+    let plan = Value(planRes)
+    assert(plan.layerCount == 64 && plan.fullAttentionInterval == 4,
+           "q38 fwd smoke: plan pinned shape")
+    assert(!plan.isFullAttention[0] && !plan.isFullAttention[1] &&
+           !plan.isFullAttention[2] && plan.isFullAttention[3],
+           "q38 fwd smoke: mini prefix rhythm 3 linear + 1 full")
+
+    // --- mini weights (LCG fixture) ---
+    let weightsRes = fwd.Qwen38MiniWeightsBuild(int64(2026082301))
+    assert(IsOk(weightsRes), "q38 fwd smoke: mini weights build")
+    let weights = Value(weightsRes)
+    assert(IsOk(fwd.Qwen38MiniWeightsValidate(weights)),
+           "q38 fwd smoke: mini weights validate")
+    echo(strutil.Join(["q38_fwd_smoke: plan_layers=", strings.IntToStr(plan.layerCount),
+                       " mini_layers=", strings.IntToStr(fwd.Qwen38MiniLayerCount),
+                       " vocab=", strings.IntToStr(vocab),
+                       " hidden=", strings.IntToStr(fwd.Qwen38MiniHidden)], ""))
+
+    // --- single-token forward: shape + finiteness ---
+    var outA: float64[]
+    for i in 0..<vocab:
+        add(outA, 0.0)
+    var idsSingle: int32[]
+    add(idsSingle, 7)
+    let fwdOkA = fwd.Qwen38MiniForwardLogitsFill(outA, weights, plan, idsSingle)
+    assert(IsOk(fwdOkA), "q38 fwd smoke: single token forward")
+    assert(outA.len == vocab, "q38 fwd smoke: logits shape")
+    assert(logitsAllFinite(outA), "q38 fwd smoke: logits finite")
+    echoF64("q38_fwd_smoke: single_logits_v0=", outA[0], 15)
+    echoF64("q38_fwd_smoke: single_logits_vlast=", outA[vocab - 1], 15)
+
+    // --- determinism: same input twice -> bitwise equal + hash equal ---
+    var outB: float64[]
+    for i in 0..<vocab:
+        add(outB, 0.0)
+    let fwdokB = fwd.Qwen38MiniForwardLogitsFill(outB, weights, plan, idsSingle)
+    assert(IsOk(fwdokB), "q38 fwd smoke: repeat forward")
+    let detEq = gdn.GatedDeltaNetArraysBitEqual(outA, outB)
+    assert(IsOk(detEq) && Value(detEq), "q38 fwd smoke: repeat forward bitwise equal")
+    let hashARes = fwd.Qwen38FwdHashF64With(int64(5150), outA)
+    let hashBRes = fwd.Qwen38FwdHashF64With(int64(5150), outB)
+    assert(IsOk(hashARes) && IsOk(hashBRes) && Value(hashARes) == Value(hashBRes),
+           "q38 fwd smoke: repeat forward hash equal")
+    echo(strutil.Join(["q38_fwd_smoke: deterministic_bit_equal=",
+                       boolWord(Value(detEq))], ""))
+    echoI64("q38_fwd_smoke: single_logits_hash=", Value(hashARes))
+
+    // --- greedy step: bounded token id ---
+    let greedyRes = fwd.Qwen38MiniGreedyStep(weights, plan, idsSingle)
+    assert(IsOk(greedyRes), "q38 fwd smoke: greedy step")
+    let greedyId = Value(greedyRes)
+    assert(greedyId >= 0 && greedyId < vocab, "q38 fwd smoke: greedy id in range")
+    echo(strutil.Join(["q38_fwd_smoke: greedy_id=", strings.IntToStr(greedyId)], ""))
+
+    // --- causality: batch [a,b] last-position logits == stepwise push a then b ---
+    var idsPair: int32[]
+    add(idsPair, 11)
+    add(idsPair, 23)
+    var outBatch: float64[]
+    for i in 0..<vocab:
+        add(outBatch, 0.0)
+    let batchOk = fwd.Qwen38MiniForwardLogitsFill(outBatch, weights, plan, idsPair)
+    assert(IsOk(batchOk), "q38 fwd smoke: two token batch forward")
+    var ctxState: float64[]
+    var ctxK: float64[]
+    var ctxV: float64[]
+    var ctxRQ: float64[]
+    var ctxRK: float64[]
+    var ctxRV: float64[]
+    let bufOk = fwd.Qwen38MiniDecodeBuffersInit(ctxState, ctxK, ctxV, ctxRQ,
+                                                ctxRK, ctxRV, weights)
+    assert(IsOk(bufOk), "q38 fwd smoke: decode buffers init")
+    var stepPos: int32 = 0
+    var logitStep0: float64[]
+    var logitStep1: float64[]
+    for i in 0..<vocab:
+        add(logitStep0, 0.0)
+        add(logitStep1, 0.0)
+    let push0 = fwd.Qwen38MiniPushToken(stepPos, ctxState, ctxK, ctxV, ctxRQ,
+                                        ctxRK, ctxRV, weights, plan, 11, logitStep0)
+    assert(IsOk(push0), "q38 fwd smoke: stepwise push token0")
+    let push1 = fwd.Qwen38MiniPushToken(stepPos, ctxState, ctxK, ctxV, ctxRQ,
+                                        ctxRK, ctxRV, weights, plan, 23, logitStep1)
+    assert(IsOk(push1), "q38 fwd smoke: stepwise push token1")
+    let causEq = gdn.GatedDeltaNetArraysBitEqual(outBatch, logitStep1)
+    assert(IsOk(causEq) && Value(causEq), "q38 fwd smoke: causality bitwise equal")
+    let causDiffRes = gdn.GatedDeltaNetMaxAbsDiff(outBatch, logitStep1)
+    assert(IsOk(causDiffRes), "q38 fwd smoke: causality diff run")
+    let causDiff = Value(causDiffRes)
+    echoF64("q38_fwd_smoke: causal_batch_vs_stepwise_maxdiff=", causDiff, 21)
+    let hashBatchRes = fwd.Qwen38FwdHashF64With(int64(5150), outBatch)
+    let hashStepRes = fwd.Qwen38FwdHashF64With(int64(5150), logitStep1)
+    assert(Value(hashBatchRes) == Value(hashStepRes), "q38 fwd smoke: causality hash equal")
+    echoI64("q38_fwd_smoke: causal_last_logits_hash=", Value(hashBatchRes))
+    echoF64("q38_fwd_smoke: causal_last_logits_v0=", outBatch[0], 15)
+
+    // --- sensitivity: different input token must change the logits ---
+    var idsOther: int32[]
+    add(idsOther, 8)
+    var outC: float64[]
+    for i in 0..<vocab:
+        add(outC, 0.0)
+    let fwdOkC = fwd.Qwen38MiniForwardLogitsFill(outC, weights, plan, idsOther)
+    assert(IsOk(fwdOkC), "q38 fwd smoke: other token forward")
+    let sensEq = gdn.GatedDeltaNetArraysBitEqual(outA, outC)
+    assert(IsOk(sensEq) && !Value(sensEq), "q38 fwd smoke: different token changes logits")
+    echo(strutil.Join(["q38_fwd_smoke: token_change_flips_logits=",
+                       boolWord(!Value(sensEq))], ""))
+
+    // --- negatives on raw inputs (>= 5 hard fails total across phases) ---
+    var outShort: float64[]
+    for i in 0..<(vocab - 1):
+        add(outShort, 0.0)
+    assert(IsErr(fwd.Qwen38MiniForwardLogitsFill(outA, weights, plan, [])),
+           "q38 fwd smoke: empty sequence negative")
+    assert(IsErr(fwd.Qwen38MiniGreedyStep(weights, plan, [])),
+           "q38 fwd smoke: greedy empty sequence negative")
+    var idsOob: int32[]
+    add(idsOob, vocab)
+    let oobRes = fwd.Qwen38MiniForwardLogitsFill(outA, weights, plan, idsOob)
+    assert(IsErr(oobRes) && Error(oobRes) == "qwen38 forward: token id range",
+           "q38 fwd smoke: out of range id negative")
+    var idsNeg: int32[]
+    add(idsNeg, 0 - 1)
+    assert(IsErr(fwd.Qwen38MiniForwardLogitsFill(outA, weights, plan, idsNeg)),
+           "q38 fwd smoke: negative id negative")
+    assert(IsErr(fwd.Qwen38MiniForwardLogitsFill(outShort, weights, plan, idsSingle)),
+           "q38 fwd smoke: short logits buffer negative")
+
+    // --- weight tampering negatives (struct copy moves; probe takes over) ---
+    var wp = weights
+    wp.hiddenSize = 25
+    let hTamperHash = fwd.Qwen38MiniWeightsHash(wp)
+    assert(IsOk(hTamperHash), "q38 fwd smoke: tamper hash run")
+    wp.weightsHash = Value(hTamperHash)
+    assert(IsErr(fwd.Qwen38MiniWeightsValidate(wp)),
+           "q38 fwd smoke: tampered hidden size rejected")
+    wp.hiddenSize = fwd.Qwen38MiniHidden
+    wp.weightsHash = Value(hTamperHash)
+    wp.weightsHash = Value(fwd.Qwen38MiniWeightsHash(wp))
+    assert(IsOk(fwd.Qwen38MiniWeightsValidate(wp)),
+           "q38 fwd smoke: hidden size restored")
+
+    wp.layerCount = 5
+    wp.weightsHash = Value(fwd.Qwen38MiniWeightsHash(wp))
+    assert(IsErr(fwd.Qwen38MiniWeightsValidate(wp)),
+           "q38 fwd smoke: tampered layer count rejected")
+    wp.layerCount = fwd.Qwen38MiniLayerCount
+    wp.weightsHash = Value(fwd.Qwen38MiniWeightsHash(wp))
+    assert(IsOk(fwd.Qwen38MiniWeightsValidate(wp)),
+           "q38 fwd smoke: layer count restored")
+
+    let nanVal = m.Sqrt(0.0 - 1.0)
+    wp.embedding[0] = nanVal
+    assert(IsErr(fwd.Qwen38MiniWeightsValidate(wp)),
+           "q38 fwd smoke: nan embedding rejected by validate")
+    let nanFwdRes = fwd.Qwen38MiniForwardLogitsFill(outA, wp, plan, idsSingle)
+    assert(IsErr(nanFwdRes), "q38 fwd smoke: nan embedding rejected by forward")
+    wp.embedding[0] = 0.0
+    wp.weightsHash = Value(fwd.Qwen38MiniWeightsHash(wp))
+    assert(IsOk(fwd.Qwen38MiniWeightsValidate(wp)),
+           "q38 fwd smoke: nan repaired")
+
+    // --- plan tampering negative: full-layer spacing is contract-enforced ---
+    var pp = plan
+    pp.isFullAttention[3] = false
+    pp.planHash = hx.Qwen38HybridLayerPlanHash(pp)
+    let spacingRes = fwd.Qwen38MiniForwardLogitsFill(outA, wp, pp, idsSingle)
+    assert(IsErr(spacingRes) &&
+           Error(spacingRes) == "qwen38 hybrid executor plan: full layer spacing",
+           "q38 fwd smoke: tampered plan spacing rejected")
+    pp.isFullAttention[3] = true
+    pp.planHash = hx.Qwen38HybridLayerPlanHash(pp)
+    let restoredRes = fwd.Qwen38MiniForwardLogitsFill(outA, wp, pp, idsSingle)
+    assert(IsOk(restoredRes), "q38 fwd smoke: plan restored forward")
+    let greedyFinal = fwd.Qwen38MiniGreedyStep(wp, pp, idsSingle)
+    assert(IsOk(greedyFinal), "q38 fwd smoke: greedy on restored pair")
+
+    echo(" qwen38_forward_smoke ok")
+    return 0

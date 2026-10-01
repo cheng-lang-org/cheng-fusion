@@ -451,24 +451,26 @@ const ALLOWED_ARTIFACT_ROLES = new Set([
 ]);
 
 export const CID_CGROUP_ARTIFACT_ROLES = [
-  "artifact_manifest", "cgroup_audit_after", "cgroup_audit_after_stderr", "cgroup_audit_before", "cgroup_audit_before_stderr", "cgroup_audit_during", "cgroup_audit_during_stderr",
-  "cgroup_cleanup_audit", "cgroup_cleanup_audit_stderr", "cgroup_colima_status", "cgroup_colima_status_stderr", "cgroup_config", "cgroup_container_create_stderr", "cgroup_container_after", "cgroup_container_before", "cgroup_container_final", "cgroup_container_remove_stderr",
-  "cgroup_control_env", "cgroup_control_stderr", "cgroup_control_transcript", "cgroup_docker_info", "cgroup_docker_info_stderr", "cgroup_docker_version", "cgroup_docker_version_stderr",
-  "cgroup_gate_runner", "cgroup_image_inspect", "cgroup_image_inspect_stderr", "cgroup_input_manifest", "cgroup_native_descriptor", "cgroup_receipt_validator", "stderr", "stdout", "cgroup_receipt",
+  "artifact_manifest", "cgroup_gate_runner", "cgroup_input_manifest",
+  "cgroup_live_after", "cgroup_live_before", "cgroup_live_cleanup",
+  "cgroup_live_during", "cgroup_native_descriptor",
+  "cgroup_receipt_validator", "stderr", "stdout", "cgroup_receipt",
 ] as const;
 const CGROUP_ARTIFACT_ROLES = CID_CGROUP_ARTIFACT_ROLES;
 
 for (const role of CGROUP_ARTIFACT_ROLES) ALLOWED_ARTIFACT_ROLES.add(role);
 
 const CGROUP_ROLE_FILE: Readonly<Record<string, string>> = Object.freeze({
-  cgroup_audit_after: "audit-after.json", cgroup_audit_after_stderr: "audit-after.stderr.bin", cgroup_audit_before: "audit-before.json", cgroup_audit_before_stderr: "audit-before.stderr.bin", cgroup_audit_during: "audit-during.json", cgroup_audit_during_stderr: "audit-during.stderr.bin",
-  cgroup_cleanup_audit: "cleanup-audit.json", cgroup_cleanup_audit_stderr: "cleanup-audit.stderr.bin",
-  cgroup_colima_status: "colima-status.txt", cgroup_colima_status_stderr: "colima-status.txt.stderr.bin", cgroup_config: "config.json", cgroup_container_create_stderr: "container-create.stderr.bin",
-  cgroup_container_after: "container-inspect-after.json", cgroup_container_before: "container-inspect-before.json", cgroup_container_final: "container-inspect-final.json", cgroup_container_remove_stderr: "container-remove.stderr.bin",
-  cgroup_control_env: "control-env.json", cgroup_control_stderr: "control-stderr.bin", cgroup_control_transcript: "control-transcript.json", cgroup_docker_info: "docker-info.json",
-  cgroup_docker_info_stderr: "docker-info.json.stderr.bin", cgroup_docker_version: "docker-version.json", cgroup_docker_version_stderr: "docker-version.json.stderr.bin",
-  cgroup_gate_runner: "gate-runner.py", cgroup_image_inspect: "image-inspect.json", cgroup_image_inspect_stderr: "image-inspect.json.stderr.bin", cgroup_input_manifest: "input-manifest.json",
-  cgroup_native_descriptor: "native-descriptor.kv", cgroup_receipt_validator: "receipt-validator.py", stderr: "stderr.bin", stdout: "stdout.bin",
+  cgroup_gate_runner: "gate-runner.py",
+  cgroup_input_manifest: "input-manifest.json",
+  cgroup_live_after: "live-after.json",
+  cgroup_live_before: "live-before.json",
+  cgroup_live_cleanup: "live-cleanup.json",
+  cgroup_live_during: "live-during.json",
+  cgroup_native_descriptor: "native-descriptor.kv",
+  cgroup_receipt_validator: "receipt-validator.py",
+  stderr: "stderr.bin",
+  stdout: "stdout.bin",
 });
 
 function parseCgroupRunRefs(value: unknown, label: string): CgroupRunRefs {
@@ -950,137 +952,258 @@ function parseExternalKv(raw: Buffer, label: string): ReadonlyMap<string, string
 }
 
 export const HARD_GATE_RECEIPT_KEYS = [
-  "tool", "schema", "status", "applicability", "darwin_official_driver_status", "hard_memory_limit_proof_status",
-  "memory_enforcement_scope", "mode", "colima_profile", "docker_host", "memory_limit_bytes", "memory_swap_max_bytes",
-  "memory_and_swap_total_limit_bytes", "attack_child_count", "attack_child_bytes", "attack_aggregate_bytes", "workload_rc", "attack_child_one_rc",
-  "attack_child_two_rc", "docker_attach_rc", "container_exit_code", "container_oom_killed_before", "container_oom_killed_after", "container_oom_killed_final",
-  "cgroup_path", "cgroup_mount_type", "cgroup_device", "cgroup_inode", "memory_peak_before_bytes", "memory_peak_after_bytes",
-  "memory_current_before_bytes", "memory_current_after_bytes", "memory_events_before_low", "memory_events_before_high", "memory_events_before_max", "memory_events_before_oom",
-  "memory_events_before_oom_kill", "memory_events_before_oom_group_kill", "memory_events_after_low", "memory_events_after_high", "memory_events_after_max", "memory_events_after_oom",
-  "memory_events_after_oom_kill", "memory_events_after_oom_group_kill", "container_id", "container_config_sha256", "container_argv_sha256", "target_argv_count",
-  "target_argv_sha256", "target_env_count", "target_env_sha256", "control_env_count", "control_env_sha256", "native_descriptor_path_fshex",
-  "native_descriptor_sha256", "native_descriptor_payload_sha256", "native_descriptor_candidate_build_receipt_path_fshex", "native_descriptor_candidate_build_receipt_sha256",
-  "native_descriptor_candidate_entry_path", "native_descriptor_candidate_entry_module_path", "native_descriptor_candidate_entry_sha256", "native_descriptor_schema", "native_descriptor_target",
-  "native_descriptor_machine", "native_descriptor_image_id", "native_descriptor_worker_path_in_image_fshex", "native_descriptor_worker_sha256", "native_descriptor_target_argv_encoding", "native_descriptor_target_argv_count",
-  "native_descriptor_target_argv_sha256", "native_descriptor_target_env_encoding", "native_descriptor_target_env_count", "native_descriptor_target_env_sha256", "native_descriptor_source_closure_cid", "native_descriptor_source_closure_capture_sha256",
-  "native_descriptor_controller_host_os", "native_descriptor_controller_host_machine", "native_descriptor_controller_host_translated", "native_descriptor_native_execution_proof", "native_descriptor_official_driver_sha256", "native_descriptor_cgroup_producer_sha256",
-  "native_descriptor_cgroup_validator_sha256", "native_descriptor_cgroup_version", "native_descriptor_cgroup_mount_type", "native_descriptor_memory_enforcement_scope", "native_descriptor_memory_max_bytes", "native_descriptor_memory_swap_max_bytes",
-  "native_descriptor_memory_and_swap_total_limit_bytes", "native_descriptor_native_execution", "native_descriptor_emulation", "input_manifest_sha256", "image_id", "image_projection_sha256",
-  "image_rootfs_sha256", "supervisor_sha256", "audit_script_sha256", "process_tree_audit_script_sha256", "runner_sha256", "validator_sha256",
-  "docker_cli_sha256", "docker_cli_path", "colima_cli_sha256", "colima_cli_path", "docker_socket_device", "docker_socket_inode",
-  "docker_server_version", "linux_kernel_release", "vm_architecture", "vm_memory_bytes", "vm_swap_total_bytes", "vm_audit_python_sha256",
-  "controller_host_os", "controller_host_machine", "controller_host_translated", "guest_cpuinfo_sha256", "guest_cpu_emulation_status", "native_execution_proof",
-  "stdout_sha256", "stdout_size", "stdout_initial_device", "stdout_initial_inode", "stdout_initial_size", "stdout_device",
-  "stdout_inode", "stdout_mtime_ns", "stdout_ctime_ns", "stderr_sha256", "stderr_size", "stderr_initial_device",
-  "stderr_initial_inode", "stderr_initial_size", "stderr_device", "stderr_inode", "stderr_mtime_ns", "stderr_ctime_ns",
-  "output_identity_schema", "output_path_history_monitor", "output_path_history_status", "output_path_history_forbidden_events", "control_stderr_sha256", "control_stderr_size",
-  "current_source_binding_status", "source_closure_cid", "source_closure_capture_sha256", "current_driver_sha256", "current_build_receipt_sha256",
-  "current_entry_path", "current_entry_module_path", "current_entry_sha256", "current_driver_container_path",
-  "current_driver_initial_device", "current_driver_initial_inode", "current_driver_initial_size", "current_driver_initial_mtime_ns", "current_driver_initial_ctime_ns", "current_driver_final_device",
-  "current_driver_final_inode", "current_driver_final_size", "current_driver_final_mtime_ns", "current_driver_final_ctime_ns", "current_driver_path_history_monitor", "current_driver_path_history_status",
-  "current_driver_path_history_forbidden_events", "process_tree_audit_status", "container_cleanup_status", "cgroup_cleanup_status", "cleanup_container_inspect_rc", "cleanup_container_list_rc",
-  "cleanup_cgroup_probe_rc", "artifact_manifest_schema", "artifact_manifest_sha256", "output_manifest_sha256", "artifact_count", "receipt_sha256",
+  "tool", "schema", "status", "applicability", "driver_role",
+  "hard_memory_limit_proof_status", "memory_enforcement_scope", "mode",
+  "workload_kind", "execution_result", "memory_limit_bytes",
+  "memory_swap_max_bytes", "pids_max", "attack_child_count",
+  "attack_child_bytes", "attack_aggregate_bytes",
+  "delegation_manifest_sha256", "delegation_manifest_path_fshex",
+  "delegation_manifest_device", "delegation_manifest_inode",
+  "delegation_manifest_mode", "delegation_manifest_uid",
+  "delegation_manifest_gid", "delegation_parent_path_fshex",
+  "delegation_parent_device", "delegation_parent_inode",
+  "delegation_controller_path_fshex", "delegation_boot_id",
+  "cgroup_namespace_inode", "leaf_path_fshex", "leaf_device", "leaf_inode",
+  "cgroup_mount_type", "crun_path_fshex", "crun_sha256",
+  "rootfs_manifest_sha256", "rootfs_manifest_path_fshex",
+  "rootfs_path_fshex", "rootfs_tree_cid", "oci_config_sha256",
+  "runtime_id", "init_host_pid", "init_host_pid_starttime",
+  "workload_wall_start_monotonic_ns", "workload_wall_end_monotonic_ns",
+  "workload_wall_elapsed_ns", "memory_peak_before_bytes",
+  "memory_peak_after_bytes", "memory_current_before_bytes",
+  "memory_current_after_bytes", "memory_events_local_before_low",
+  "memory_events_local_before_high", "memory_events_local_before_max",
+  "memory_events_local_before_oom", "memory_events_local_before_oom_kill",
+  "memory_events_local_before_oom_group_kill",
+  "memory_events_local_after_low", "memory_events_local_after_high",
+  "memory_events_local_after_max", "memory_events_local_after_oom",
+  "memory_events_local_after_oom_kill",
+  "memory_events_local_after_oom_group_kill", "target_argv_count",
+  "target_argv_sha256", "target_env_count", "target_env_sha256",
+  "descendant_exec_ledger_status", "descendant_exec_ledger_schema",
+  "descendant_exec_ledger_producer_sha256",
+  "descendant_exec_ledger_validator_sha256",
+  "descendant_exec_ledger_wrapper_sha256",
+  "descendant_exec_ledger_manifest_sha256",
+  "descendant_exec_ledger_receipt_sha256",
+  "descendant_exec_ledger_payload_sha256",
+  "descendant_exec_ledger_wrapper_receipt_sha256",
+  "descendant_exec_ledger_command_argv_sha256",
+  "descendant_exec_ledger_expected_exit_code",
+  "descendant_exec_ledger_actual_exit_code",
+  "descendant_exec_ledger_event_count", "native_descriptor_path_fshex",
+  "native_descriptor_sha256", "native_descriptor_payload_sha256",
+  "native_descriptor_target", "native_descriptor_machine",
+  "native_descriptor_candidate_entry_path",
+  "native_descriptor_candidate_entry_module_path",
+  "native_descriptor_candidate_entry_sha256",
+  "native_descriptor_worker_sha256",
+  "native_descriptor_snapshot_manifest_sha256", "input_manifest_sha256",
+  "stdout_sha256", "stdout_size", "stdout_device", "stdout_inode",
+  "stderr_sha256", "stderr_size", "stderr_device", "stderr_inode",
+  "workload_output_status", "workload_output_sha256",
+  "workload_output_size", "workload_output_mode",
+  "workload_report_sha256", "workload_report_size",
+  "dry_source_file_count", "dry_source_line_count",
+  "dry_source_byte_count", "dry_source_max_file_bytes",
+  "dry_exec_phase_actual_total_ms",
+  "dry_full_theory_time_guard_recommended_ms",
+  "dry_full_theory_rss_modeled_guard_estimate_bytes",
+  "current_driver_next_sha256", "current_driver_next_size",
+  "current_driver_next_mode", "current_driver_report_sha256",
+  "current_driver_report_size", "current_source_binding_status",
+  "workspace_root_path_fshex", "source_closure_path_fshex",
+  "current_driver_path_fshex", "current_build_receipt_path_fshex",
+  "source_closure_cid", "source_closure_capture_sha256",
+  "current_driver_sha256", "current_build_receipt_sha256",
+  "current_entry_path", "current_entry_module_path", "current_entry_sha256",
+  "stage_input_manifest_path_fshex", "stage_input_manifest_sha256",
+  "stage_phase_plan_sha256", "stage_phase_index", "stage_phase_label",
+  "stage_source_root_path_fshex", "stage_evidence_root_path_fshex",
+  "stage_pre_tree_sha256", "stage_post_tree_sha256",
+  "stage_declared_delta_sha256", "stage_output_set_sha256",
+  "stage_output_count", "stage_terminal_relative_path",
+  "stage_terminal_sha256", "stage_terminal_receipt_sha256",
+  "live_before_receipt_sha256", "live_during_receipt_sha256",
+  "live_after_receipt_sha256", "live_cleanup_receipt_sha256",
+  "runner_sha256", "validator_sha256", "artifact_manifest_schema",
+  "artifact_manifest_sha256", "artifact_count",
+  "artifact_directory_count", "receipt_sha256",
 ] as const;
 
-const HARD_GATE_ARTIFACT_NAMES = [
-  "config.json", "control-env.json", "gate-runner.py", "receipt-validator.py", "native-descriptor.kv", "input-manifest.json",
-  "stdout.bin", "stderr.bin", "control-stderr.bin", "colima-status.txt", "colima-status.txt.stderr.bin", "docker-info.json",
-  "docker-info.json.stderr.bin", "docker-version.json", "docker-version.json.stderr.bin", "image-inspect.json", "image-inspect.json.stderr.bin",
-  "container-create.stderr.bin", "container-inspect-before.json", "audit-before.json", "audit-before.stderr.bin", "audit-during.json",
-  "audit-during.stderr.bin", "container-inspect-after.json", "audit-after.json", "audit-after.stderr.bin", "container-inspect-final.json",
-  "container-remove.stderr.bin", "control-transcript.json", "cleanup-audit.json", "cleanup-audit.stderr.bin",
+export const NATIVE_LINUX_DESCRIPTOR_KEYS = [
+  "schema", "status", "workload_kind", "target", "host_os", "machine",
+  "execution_environment", "native_execution", "emulation",
+  "controller_host_os", "controller_host_machine",
+  "controller_host_translated", "native_execution_proof",
+  "cgroup_version", "cgroup_mount_type", "memory_enforcement_scope",
+  "memory_max_bytes", "memory_swap_max_bytes",
+  "memory_and_swap_total_limit_bytes", "backend_count",
+  "backend.0.name", "backend.1.name", "contract_sha256",
+  "target_argv_encoding", "target_env_encoding",
+  "snapshot_manifest_sha256", "source_closure_cid",
+  "official_receipt_sha256", "official_driver_sha256",
+  "backend_epoch_sha256", "jobs_sha256", "action_ledger_sha256",
+  "fragment_snapshot_sha256", "regalloc_receipt_sha256",
+  "fixed_point_sha256", "fixed_object_sha256",
+  "candidate_report_sha256", "seven_stage_parser_ingress_sha256",
+  "seven_stage_parser_map_sha256", "seven_stage_policy_sha256",
+  "seven_stage_runner_manifest_sha256", "seven_stage_report_sha256",
+  "seven_stage_execution_raw32", "seven_stage_root_raw32",
+  "baseline_manifest_sha256", "baseline_driver_sha256",
+  "performance_source_sha256", "release_evidence_tool_sha256",
+  "release_producer_sha256", "cgroup_producer_sha256",
+  "cgroup_validator_sha256", "candidate_build_receipt_path_fshex",
+  "candidate_build_receipt_sha256", "source_closure_capture_sha256",
+  "candidate_entry_path", "candidate_entry_module_path",
+  "candidate_entry_sha256", "image_id", "worker_path_in_image_fshex",
+  "worker_sha256", "target_argv_count", "target_argv_sha256",
+  "target_env_count", "target_env_sha256", "descriptor_payload_sha256",
 ] as const;
+
+const NATIVE_LINUX_DESCRIPTOR_SHA_KEYS = new Set([
+  "contract_sha256", "snapshot_manifest_sha256", "source_closure_cid",
+  "official_receipt_sha256", "official_driver_sha256",
+  "backend_epoch_sha256", "jobs_sha256", "action_ledger_sha256",
+  "fragment_snapshot_sha256", "regalloc_receipt_sha256",
+  "fixed_point_sha256", "fixed_object_sha256",
+  "candidate_report_sha256", "seven_stage_parser_ingress_sha256",
+  "seven_stage_parser_map_sha256", "seven_stage_policy_sha256",
+  "seven_stage_runner_manifest_sha256", "seven_stage_report_sha256",
+  "seven_stage_execution_raw32", "seven_stage_root_raw32",
+  "baseline_manifest_sha256", "baseline_driver_sha256",
+  "performance_source_sha256", "release_evidence_tool_sha256",
+  "release_producer_sha256", "cgroup_producer_sha256",
+  "cgroup_validator_sha256", "candidate_build_receipt_sha256",
+  "source_closure_capture_sha256", "candidate_entry_sha256",
+  "worker_sha256", "target_argv_sha256", "target_env_sha256",
+  "descriptor_payload_sha256",
+]);
+
+export const NATIVE_LINUX_WORKLOAD_KINDS = [
+  "current_driver", "dry_compile", "bootstrap_stage23_phase",
+] as const;
+export type NativeLinuxWorkloadKind =
+  typeof NATIVE_LINUX_WORKLOAD_KINDS[number];
 
 function parseHardGateReceipt(raw: Buffer, label: string): ReadonlyMap<string, string> {
   const rows = parseExternalKv(raw, label);
   exactMapKeyOrder(rows, HARD_GATE_RECEIPT_KEYS, label);
-  const text = raw.toString("utf8"); const suffix = `receipt_sha256=${rows.get("receipt_sha256")}\n`; if (!text.endsWith(suffix)) fail(`${label}: receipt_sha256 位置`);
-  if (sha256(Buffer.from(text.slice(0, -suffix.length), "utf8")) !== rows.get("receipt_sha256")) fail(`${label}: receipt_sha256 不匹配`);
+  const text = raw.toString("utf8");
+  const suffix = `receipt_sha256=${rows.get("receipt_sha256")}\n`;
+  if (!text.endsWith(suffix)) fail(`${label}: receipt_sha256 位置`);
+  if (sha256(Buffer.from(text.slice(0, -suffix.length), "utf8"))
+      !== rows.get("receipt_sha256")) {
+    fail(`${label}: receipt_sha256 不匹配`);
+  }
   if (rows.get("tool") !== "tools/beat_c_linux_cgroup_v2_hard_memory_gate.sh" || rows.get("schema") !== "beat_c_linux_cgroup_v2_hard_memory_gate") fail(`${label}: 非当前无版本 hard gate wire`);
-  const attackZeroShaKeys = new Set([
-    "source_closure_capture_sha256",
-    "current_driver_sha256",
-    "current_build_receipt_sha256",
-    "current_entry_sha256",
-  ]);
   for (const key of HARD_GATE_RECEIPT_KEYS.filter((key) => key.endsWith("sha256") && key !== "receipt_sha256")) {
-    hex32(
-      rows.get(key) ?? "",
-      `${label}.${key}`,
-      rows.get("mode") === "aggregate_oom_probe"
-        && attackZeroShaKeys.has(key),
-    );
+    if (!HEX32.test(rows.get(key) ?? "")) {
+      fail(`${label}.${key}: 非法 SHA-256`);
+    }
   }
   return rows;
 }
 
-export function verifyLinuxMemoryReceipt(raw: Buffer, label: string, expectedMode: "workload" | "aggregate_oom_probe"): ReadonlyMap<string, string> {
+export function verifyLinuxMemoryReceipt(
+  raw: Buffer,
+  label: string,
+  expectedMode: "workload" | "aggregate_oom_probe",
+  expectedWorkloadKind: NativeLinuxWorkloadKind = "current_driver",
+): ReadonlyMap<string, string> {
   const rows = parseHardGateReceipt(raw, label);
-  const nativeProof = "controller_guest_same_isa_and_guest_cpuinfo_no_qemu_tcg";
-  const normalizeMachine = (value: string | undefined): string => {
-    if (value === "x86_64" || value === "amd64") return "x86_64";
-    if (value === "aarch64" || value === "arm64") return "aarch64";
-    fail(`${label}: 非法 ISA`);
-  };
-  if (rows.get("memory_limit_bytes") !== "1073741824" || rows.get("memory_swap_max_bytes") !== "0" || rows.get("memory_and_swap_total_limit_bytes") !== "1073741824") fail(`${label}: 非 exact Linux 1GiB/swap=0`);
-  if (rows.get("applicability") !== "linux_colima_container_cgroup_v2_only" || rows.get("hard_memory_limit_proof_status") !== "proved_linux_kernel_cgroup_v2_aggregate" || rows.get("memory_enforcement_scope") !== "container_and_all_descendants" || rows.get("cgroup_mount_type") !== "cgroup2") fail(`${label}: 非 Linux cgroup v2 进程树证明`);
-  if (rows.get("darwin_official_driver_status") !== "not_covered_macho_cannot_execute_in_linux_vm" || rows.get("output_identity_schema") !== "beat_c_linux_cgroup_v2_output_identity" || rows.get("output_path_history_monitor") !== "darwin_kqueue_vnode" || rows.get("output_path_history_status") !== "verified_clean" || rows.get("output_path_history_forbidden_events") !== "delete,link,rename,revoke" || rows.get("control_stderr_size") !== "0") fail(`${label}: hard gate 输出/路径历史合同`);
-  const machine = normalizeMachine(rows.get("native_descriptor_machine"));
-  const descriptorEntry = officialEntrySpec(
-    rows.get("native_descriptor_candidate_entry_path"),
-    rows.get("native_descriptor_candidate_entry_module_path"),
-    `${label}.native_descriptor_candidate_entry`,
-  );
-  const descriptorEntrySha256 = hex32(
-    rows.get("native_descriptor_candidate_entry_sha256") ?? "",
-    `${label}.native_descriptor_candidate_entry_sha256`,
-  );
-  if (
-    normalizeMachine(rows.get("vm_architecture")) !== machine
-    || normalizeMachine(rows.get("controller_host_machine")) !== machine
-    || rows.get("native_descriptor_controller_host_machine") !== machine
-    || rows.get("controller_host_os") !== "darwin"
-    || rows.get("controller_host_translated") !== "false"
-    || rows.get("native_descriptor_controller_host_os") !== "darwin"
-    || rows.get("native_descriptor_controller_host_translated") !== "false"
-    || rows.get("native_descriptor_native_execution") !== "true"
-    || rows.get("native_descriptor_emulation") !== "false"
-    || rows.get("guest_cpu_emulation_status") !== "not_detected"
-    || rows.get("native_execution_proof") !== nativeProof
-    || rows.get("native_descriptor_native_execution_proof") !== nativeProof
-    || rows.get("native_descriptor_source_closure_cid") === undefined
-    || hex32(rows.get("native_descriptor_source_closure_cid") ?? "", `${label}.native_descriptor_source_closure_cid`) !== rows.get("native_descriptor_source_closure_cid")
-  ) fail(`${label}: native controller/guest/ELF 身份链不成立`);
+  const fixed = new Map<string, string>([
+    ["applicability", "native_linux_delegated_cgroup_v2_only"],
+    ["driver_role", "production"],
+    ["hard_memory_limit_proof_status",
+      "proved_linux_kernel_cgroup_v2_aggregate"],
+    ["memory_enforcement_scope",
+      "rootless_oci_process_and_all_descendants"],
+    ["mode", expectedMode],
+    ["workload_kind", expectedWorkloadKind],
+    ["memory_limit_bytes", "1073741824"],
+    ["memory_swap_max_bytes", "0"],
+    ["pids_max", "128"],
+    ["cgroup_mount_type", "cgroup2"],
+    ["descendant_exec_ledger_status", "PROVED"],
+    ["descendant_exec_ledger_schema", "cheng.linux_ptrace_exec_ledger"],
+    ["descendant_exec_ledger_expected_exit_code", "0"],
+    ["descendant_exec_ledger_actual_exit_code", "0"],
+    ["artifact_manifest_schema", "cheng.native_linux_cgroup_v2_artifacts"],
+  ]);
+  for (const [key, expected] of fixed) {
+    if (rows.get(key) !== expected) fail(`${label}: native field ${key}`);
+  }
   if (rows.get("mode") !== expectedMode) fail(`${label}: mode 不匹配`);
-  const beforeMax = uintRow(rows, "memory_events_before_max", label); const beforeOom = uintRow(rows, "memory_events_before_oom", label); const beforeKill = uintRow(rows, "memory_events_before_oom_kill", label);
-  const afterMax = uintRow(rows, "memory_events_after_max", label); const afterOom = uintRow(rows, "memory_events_after_oom", label); const afterKill = uintRow(rows, "memory_events_after_oom_kill", label);
-  const peak = uintRow(rows, "memory_peak_after_bytes", label); if (peak > 1_073_741_824) fail(`${label}: memory.peak 超 1GiB`);
+  const startNs = uintRow(rows, "workload_wall_start_monotonic_ns", label);
+  const endNs = uintRow(rows, "workload_wall_end_monotonic_ns", label);
+  const elapsedNs = uintRow(rows, "workload_wall_elapsed_ns", label);
+  if (startNs <= 0 || endNs < startNs || elapsedNs !== endNs - startNs) {
+    fail(`${label}: workload monotonic wall arithmetic`);
+  }
+  const peak = uintRow(rows, "memory_peak_after_bytes", label);
+  const current = uintRow(rows, "memory_current_after_bytes", label);
+  if (peak > 1_073_741_824 || current > peak) {
+    fail(`${label}: memory.peak/current 超 1GiB`);
+  }
+  const eventNames = [
+    "low", "high", "max", "oom", "oom_kill", "oom_group_kill",
+  ] as const;
+  const beforeEvents = eventNames.map((event) =>
+    uintRow(rows, `memory_events_local_before_${event}`, label));
+  const afterEvents = eventNames.map((event) =>
+    uintRow(rows, `memory_events_local_after_${event}`, label));
+  if (beforeEvents.some((value) => value !== 0)) {
+    fail(`${label}: workload before events 非零`);
+  }
+  if (uintRow(rows, "descendant_exec_ledger_event_count", label) <= 0) {
+    fail(`${label}: descendant exec ledger 为空`);
+  }
   if (expectedMode === "aggregate_oom_probe") {
-    if (rows.get("status") !== "expected_aggregate_oom_rejected" || rows.get("attack_child_count") !== "2" || rows.get("attack_child_bytes") !== "734003200" || rows.get("attack_aggregate_bytes") !== "1468006400") fail(`${label}: 不是双 700MiB 聚合 OOM 反证`);
-    const childOne = intRow(rows, "attack_child_one_rc", label); const childTwo = intRow(rows, "attack_child_two_rc", label); if (beforeMax !== 0 || beforeOom !== 0 || beforeKill !== 0 || afterMax <= beforeMax || afterOom <= beforeOom || afterKill <= beforeKill || intRow(rows, "workload_rc", label) !== 42 || ![0, 137].includes(childOne) || ![0, 137].includes(childTwo) || ![childOne, childTwo].includes(137) || intRow(rows, "docker_attach_rc", label) !== 42 || intRow(rows, "container_exit_code", label) !== 42 || rows.get("container_oom_killed_before") !== "0" || rows.get("container_oom_killed_after") !== "1" || rows.get("container_oom_killed_final") !== "1") fail(`${label}: 缺 kernel OOM kill/退出元组证据`);
-    if (
-      rows.get("current_source_binding_status") !== "not_applicable_attack_probe"
-      || rows.get("source_closure_cid") !== "0".repeat(64)
-      || rows.get("source_closure_capture_sha256") !== "0".repeat(64)
-      || rows.get("current_driver_sha256") !== "0".repeat(64)
-      || rows.get("current_build_receipt_sha256") !== "0".repeat(64)
-      || rows.get("current_entry_path") !== ""
-      || rows.get("current_entry_module_path") !== ""
-      || rows.get("current_entry_sha256") !== "0".repeat(64)
-    ) fail(`${label}: attack probe 伪造 current source 绑定`);
+    if (rows.get("status") !== "expected_aggregate_oom_rejected"
+        || rows.get("execution_result") !== "kernel_oom_group_killed"
+        || rows.get("attack_child_count") !== "2"
+        || rows.get("attack_child_bytes") !== "734003200"
+        || rows.get("attack_aggregate_bytes") !== "1468006400"
+        || afterEvents[2] <= beforeEvents[2]
+        || afterEvents[3] <= beforeEvents[3]
+        || afterEvents[4] <= beforeEvents[4]) {
+      fail(`${label}: 缺 kernel OOM group 反证`);
+    }
   } else {
-    if (rows.get("status") !== "completed" || rows.get("attack_child_count") !== "0" || rows.get("attack_child_bytes") !== "0" || rows.get("attack_aggregate_bytes") !== "0") fail(`${label}: workload 状态/攻击维度错误`);
-    if (EVENT_KEYS.some((key) => uintRow(rows, `memory_events_after_${key}`, label) !== 0) || afterMax !== beforeMax || afterOom !== beforeOom || afterKill !== beforeKill || rows.get("workload_rc") !== "0" || rows.get("attack_child_one_rc") !== "-1" || rows.get("attack_child_two_rc") !== "-1" || rows.get("docker_attach_rc") !== "0" || rows.get("container_exit_code") !== "0" || rows.get("container_oom_killed_before") !== "0" || rows.get("container_oom_killed_after") !== "0" || rows.get("container_oom_killed_final") !== "0") fail(`${label}: workload 发生 OOM/退出失败`);
-    if (
-      rows.get("current_source_binding_status") !== "bound_unique_current"
-      || rows.get("source_closure_cid") !== rows.get("native_descriptor_source_closure_cid")
-      || rows.get("source_closure_capture_sha256") !== rows.get("native_descriptor_source_closure_capture_sha256")
-      || rows.get("current_driver_sha256") !== rows.get("native_descriptor_worker_sha256")
-      || rows.get("current_build_receipt_sha256") !== rows.get("native_descriptor_candidate_build_receipt_sha256")
-      || rows.get("current_entry_path") !== descriptorEntry.path
-      || rows.get("current_entry_module_path") !== descriptorEntry.modulePath
-      || rows.get("current_entry_sha256") !== descriptorEntrySha256
-    ) fail(`${label}: current source/CID/worker 本机绑定不成立`);
+    if (rows.get("status") !== "completed"
+        || rows.get("execution_result") !== "exited_zero"
+        || rows.get("attack_child_count") !== "0"
+        || rows.get("attack_child_bytes") !== "0"
+        || rows.get("attack_aggregate_bytes") !== "0"
+        || afterEvents.some((value) => value !== 0)) {
+      fail(`${label}: workload 发生 OOM/退出失败`);
+    }
+  }
+  if (expectedWorkloadKind !== "bootstrap_stage23_phase") {
+    const descriptorEntry = officialEntrySpec(
+      rows.get("native_descriptor_candidate_entry_path"),
+      rows.get("native_descriptor_candidate_entry_module_path"),
+      `${label}.native_descriptor_candidate_entry`,
+    );
+    if (rows.get("current_source_binding_status") !== "bound_unique_current"
+        || rows.get("current_entry_path") !== descriptorEntry.path
+        || rows.get("current_entry_module_path") !== descriptorEntry.modulePath
+        || rows.get("current_entry_sha256")
+          !== rows.get("native_descriptor_candidate_entry_sha256")
+        || rows.get("current_driver_sha256")
+          !== rows.get("native_descriptor_worker_sha256")) {
+      fail(`${label}: current source/native descriptor binding 不成立`);
+    }
+  } else if (
+    rows.get("native_descriptor_path_fshex") !== ""
+    || rows.get("native_descriptor_sha256") !== "0".repeat(64)
+    || rows.get("native_descriptor_payload_sha256") !== "0".repeat(64)
+    || rows.get("native_descriptor_target") !== "not_applicable"
+    || rows.get("native_descriptor_candidate_entry_path") !== ""
+    || rows.get("native_descriptor_candidate_entry_module_path") !== ""
+  ) {
+    fail(`${label}: stage23 descriptor absence binding`);
   }
   return rows;
 }
@@ -1097,110 +1220,6 @@ function parseSingleton(raw: Buffer, label: string): Record<string, unknown> {
   const value = parseJsonRaw(raw, label);
   if (!Array.isArray(value) || value.length !== 1 || !isRecord(value[0])) fail(`${label}: 不是 singleton inspect array`);
   return value[0];
-}
-
-function artifactManifest(files: EvidenceFiles, refs: CgroupRunRefs, receipt: ReadonlyMap<string, string>, label: string): void {
-  const raw = files.read(refs.artifacts.artifact_manifest, `${label}.artifact_manifest`); const value = parseJsonRaw(raw, `${label}.artifact_manifest`, true);
-  if (!isRecord(value)) fail(`${label}: artifact manifest 非 object`); exactKeys(value, ["entries", "schema"], `${label}.artifact_manifest`);
-  if (value.schema !== "beat_c_linux_cgroup_v2_artifacts" || receipt.get("artifact_manifest_schema") !== value.schema || receipt.get("artifact_manifest_sha256") !== sha256(raw) || receipt.get("output_manifest_sha256") !== sha256(raw)) fail(`${label}: artifact manifest identity`);
-  if (!Array.isArray(value.entries) || value.entries.length !== HARD_GATE_ARTIFACT_NAMES.length || receipt.get("artifact_count") !== String(value.entries.length)) fail(`${label}: artifact manifest count`);
-  const byName = new Map<string, {sha256: string; size: number}>();
-  for (let i = 0; i < value.entries.length; i += 1) {
-    const entry = value.entries[i]; if (!isRecord(entry)) fail(`${label}: artifact entry`); exactKeys(entry, ["path", "sha256", "size"], `${label}.entries[${i}]`);
-    const path = stringField(entry, "path", `${label}.entries[${i}]`); if (path !== HARD_GATE_ARTIFACT_NAMES[i]) fail(`${label}: artifact manifest path order`);
-    byName.set(path, {sha256: hex32(stringField(entry, "sha256", `${label}.entries[${i}]`), `${label}.${path}.sha256`), size: uintField(entry, "size", `${label}.entries[${i}]`)});
-  }
-  for (const [role, path] of Object.entries(CGROUP_ROLE_FILE)) {
-    const item = files.read(refs.artifacts[role], `${label}.${role}`); const recorded = byName.get(path);
-    if (!recorded || recorded.size !== item.length || recorded.sha256 !== sha256(item)) fail(`${label}: artifact manifest/raw ${path}`);
-  }
-}
-
-const AUDIT_KEYS = ["auditPythonPath", "auditPythonSha256", "cgroupDevice", "cgroupFreeze", "cgroupInode", "cgroupMountType", "cgroupOomGroup", "cgroupPath", "cgroupProcs", "cgroupType", "containerId", "containerInitPid", "kernelRelease", "memoryCurrent", "memoryEvents", "memoryEventsLocal", "memoryMax", "memoryPeak", "memorySwapCurrent", "memorySwapMax", "procCgroupLine", "schema", "source", "vmMemTotalBytes", "vmSwapTotalBytes"] as const;
-const EVENT_KEYS = ["high", "low", "max", "oom", "oom_group_kill", "oom_kill"] as const;
-
-function auditObject(raw: Buffer, label: string): Record<string, unknown> {
-  const value = parseJsonRaw(raw, label, true); if (!isRecord(value)) fail(`${label}: 非 object`); exactKeys(value, AUDIT_KEYS, label);
-  if (value.schema !== "beat_c_linux_cgroup_v2_audit" || value.source !== "colima_vm_host_cgroup_namespace" || value.cgroupMountType !== "cgroup2" || value.cgroupType !== "domain" || value.memoryMax !== 1_073_741_824 || value.memorySwapMax !== 0) fail(`${label}: 非 exact cgroup v2 audit`);
-  for (const field of ["memoryEvents", "memoryEventsLocal"] as const) { const events = value[field]; if (!isRecord(events)) fail(`${label}.${field}`); exactKeys(events, EVENT_KEYS, `${label}.${field}`); for (const key of EVENT_KEYS) if (!Number.isSafeInteger(events[key]) || (events[key] as number) < 0) fail(`${label}.${field}.${key}`); }
-  if (canonicalJson(value.memoryEvents) !== canonicalJson(value.memoryEventsLocal)) fail(`${label}: local/hierarchical events drift`);
-  if (typeof value.containerId !== "string" || !/^[0-9a-f]{64}$/.test(value.containerId) || !Number.isSafeInteger(value.containerInitPid) || (value.containerInitPid as number) <= 0 || value.cgroupPath !== `/docker/${value.containerId}` || value.procCgroupLine !== `0::${value.cgroupPath}` || value.cgroupFreeze !== 0 || value.cgroupOomGroup !== 0 || !Array.isArray(value.cgroupProcs) || !value.cgroupProcs.includes(value.containerInitPid)) fail(`${label}: cgroup/container membership`);
-  for (const field of ["memoryCurrent", "memoryPeak", "memorySwapCurrent"] as const) if (!Number.isSafeInteger(value[field]) || (value[field] as number) < 0) fail(`${label}.${field}`); if ((value.memoryCurrent as number) > 1_073_741_824 || (value.memoryPeak as number) > 1_073_741_824 || value.memorySwapCurrent !== 0 || typeof value.auditPythonSha256 !== "string" || !HEX32.test(value.auditPythonSha256)) fail(`${label}: memory/audit identity`);
-  return value;
-}
-
-function processTreeAuditObject(raw: Buffer, receipt: ReadonlyMap<string, string>, label: string): Record<string, unknown> {
-  const value = parseJsonRaw(raw, label, true); if (!isRecord(value)) fail(`${label}: 非 object`);
-  exactKeys(value, ["capturedWhileTargetRunning", "cgroupDevice", "cgroupInode", "cgroupMountType", "cgroupPath", "cgroupProcs", "containerId", "containerInitPid", "emulation", "guestCpuEmulationStatus", "guestCpuInfoSha256", "hostMachine", "memoryCurrent", "memoryMax", "memoryPeak", "memorySwapCurrent", "memorySwapMax", "nativeExecution", "nativeExecutionProof", "processes", "schema", "source", "targetArgvSha256", "targetElfMachine", "targetExePath", "targetExeSha256"], label);
-  if (
-    value.schema !== "beat_c_linux_cgroup_v2_process_tree_audit"
-    || value.source !== "colima_vm_host_cgroup_namespace"
-    || value.containerId !== receipt.get("container_id")
-    || value.cgroupPath !== receipt.get("cgroup_path")
-    || String(value.cgroupDevice) !== receipt.get("cgroup_device")
-    || String(value.cgroupInode) !== receipt.get("cgroup_inode")
-    || value.cgroupMountType !== "cgroup2"
-    || value.memoryMax !== 1_073_741_824
-    || value.memorySwapMax !== 0
-    || value.memorySwapCurrent !== 0
-    || value.capturedWhileTargetRunning !== true
-    || value.hostMachine !== receipt.get("native_descriptor_machine")
-    || value.guestCpuInfoSha256 !== receipt.get("guest_cpuinfo_sha256")
-    || value.guestCpuEmulationStatus !== "not_detected"
-    || value.nativeExecutionProof !== receipt.get("native_execution_proof")
-    || value.nativeExecution !== true
-    || value.emulation !== false
-    || value.targetArgvSha256 !== receipt.get("target_argv_sha256")
-  ) fail(`${label}: native process-tree audit 身份链`);
-  if (!Array.isArray(value.cgroupProcs) || !Array.isArray(value.processes) || value.processes.length < 2) fail(`${label}: process tree 缺失`);
-  const processIds = new Set<number>();
-  for (const [index, row] of value.processes.entries()) {
-    if (!isRecord(row)) fail(`${label}.processes[${index}]`);
-    exactKeys(row, ["pid", "ppid", "procCgroupLine", "role"], `${label}.processes[${index}]`);
-    if (!Number.isSafeInteger(row.pid) || (row.pid as number) <= 0 || processIds.has(row.pid as number) || !Number.isSafeInteger(row.ppid) || (row.ppid as number) < 0 || !["supervisor", "target", "descendant", "attack_child"].includes(String(row.role)) || row.procCgroupLine !== `0::${value.cgroupPath}`) fail(`${label}: process row 身份`);
-    processIds.add(row.pid as number);
-  }
-  if (canonicalJson([...processIds].sort((a, b) => a - b)) !== canonicalJson(value.cgroupProcs)) fail(`${label}: cgroup.procs/process tree 不一致`);
-  if (receipt.get("mode") === "workload") {
-    if (
-      value.targetElfMachine !== receipt.get("native_descriptor_machine")
-      || value.targetExePath !== CID_CURRENT_DRIVER_CONTAINER_PATH
-      || value.targetExeSha256 !== receipt.get("current_driver_sha256")
-      || value.processes.filter((row) => isRecord(row) && row.role === "target").length !== 1
-    ) fail(`${label}: workload ELF/current worker 身份`);
-  } else if (
-    value.targetElfMachine !== ""
-    || value.targetExePath !== ""
-    || value.targetExeSha256 !== "0".repeat(64)
-    || value.processes.filter((row) => isRecord(row) && row.role === "attack_child").length !== 2
-  ) fail(`${label}: attack process-tree 身份`);
-  return value;
-}
-
-function cleanupAuditObject(raw: Buffer, receipt: ReadonlyMap<string, string>, label: string): void {
-  const value = parseJsonRaw(raw, label, true); if (!isRecord(value)) fail(`${label}: 非 object`);
-  exactKeys(value, ["cgroupDevice", "cgroupInode", "cgroupPath", "cgroupPathExists", "cgroupProbeRc", "containerId", "dockerContainerListCount", "dockerContainerListRc", "dockerInspectRc", "dockerInspectStdoutSize", "schema", "source"], label);
-  if (
-    value.schema !== "beat_c_linux_cgroup_v2_cleanup_audit"
-    || value.source !== "docker_and_colima_vm_host_cgroup_namespace"
-    || value.containerId !== receipt.get("container_id")
-    || value.cgroupPath !== receipt.get("cgroup_path")
-    || String(value.cgroupDevice) !== receipt.get("cgroup_device")
-    || String(value.cgroupInode) !== receipt.get("cgroup_inode")
-    || value.cgroupPathExists !== false
-    || value.dockerInspectRc !== 1
-    || value.dockerInspectStdoutSize !== 0
-    || value.dockerContainerListRc !== 0
-    || value.dockerContainerListCount !== 0
-    || value.cgroupProbeRc !== 0
-  ) fail(`${label}: cleanup identity`);
-}
-
-function containerProjection(value: Record<string, unknown>): Record<string, unknown> {
-  const config = value.Config; const host = value.HostConfig; const mounts = value.Mounts;
-  if (!isRecord(config) || !isRecord(host) || !Array.isArray(mounts)) fail("cgroup container inspect: config absent");
-  const mountRows = mounts.map((item) => { if (!isRecord(item)) fail("cgroup mount row"); return {Type: item.Type, Source: item.Source, Destination: item.Destination, Mode: item.Mode, RW: item.RW, Propagation: item.Propagation}; }).sort((a, b) => String(a.Destination).localeCompare(String(b.Destination)));
-  return {Image: value.Image, Config: {Hostname: config.Hostname, User: config.User, Env: config.Env, Cmd: config.Cmd, Entrypoint: config.Entrypoint, OpenStdin: config.OpenStdin, StdinOnce: config.StdinOnce, WorkingDir: config.WorkingDir, Labels: config.Labels}, HostConfig: {Memory: host.Memory, MemorySwap: host.MemorySwap, NetworkMode: host.NetworkMode, ReadonlyRootfs: host.ReadonlyRootfs, CapDrop: host.CapDrop, SecurityOpt: host.SecurityOpt, PidsLimit: host.PidsLimit, ShmSize: host.ShmSize, CgroupnsMode: host.CgroupnsMode, IpcMode: host.IpcMode, OomKillDisable: host.OomKillDisable, AutoRemove: host.AutoRemove}, Mounts: mountRows};
 }
 
 function sha256FramedStrings(values: readonly string[]): string {
@@ -1237,59 +1256,13 @@ export function verifyCidCaseControllerBinding(
   candidateEntrySha256: string,
   label = "CID case controller",
 ): void {
-  const entry = officialEntrySpec(
-    candidateEntryPath,
-    candidateEntryModulePath,
-    label,
-  );
-  hex32(candidateEntrySha256, `${label}.candidate_entry_sha256`);
-  const expectedArgv = cidCaseTargetArgv(caseId, candidateSha256);
-  const expectedArgvSha256 = sha256FramedStrings(expectedArgv);
-  const workerPathFshex = Buffer.from(
-    CID_CURRENT_DRIVER_CONTAINER_PATH,
-    "utf8",
-  ).toString("hex");
-  const expected = new Map<string, string>([
-    ["current_source_binding_status", "bound_unique_current"],
-    ["current_driver_container_path", CID_CURRENT_DRIVER_CONTAINER_PATH],
-    ["current_driver_sha256", candidateSha256],
-    ["current_entry_path", entry.path],
-    ["current_entry_module_path", entry.modulePath],
-    ["current_entry_sha256", candidateEntrySha256],
-    ["native_descriptor_candidate_entry_path", entry.path],
-    ["native_descriptor_candidate_entry_module_path", entry.modulePath],
-    ["native_descriptor_candidate_entry_sha256", candidateEntrySha256],
-    ["native_descriptor_worker_path_in_image_fshex", workerPathFshex],
-    ["native_descriptor_worker_sha256", candidateSha256],
-    ["target_argv_count", String(expectedArgv.length)],
-    ["target_argv_sha256", expectedArgvSha256],
-    ["native_descriptor_target_argv_encoding",
-      CID_DESCRIPTOR_SEQUENCE_ENCODING],
-    ["native_descriptor_target_argv_count", String(expectedArgv.length)],
-    ["native_descriptor_target_argv_sha256", expectedArgvSha256],
-  ]);
-  for (const [key, value] of expected) {
-    if (receipt.get(key) !== value) {
-      fail(`${label}: ${key} 未绑定 driver-owned run-case`);
-    }
-  }
-  if (
-    receipt.get("native_descriptor_target_env_encoding")
-      !== CID_DESCRIPTOR_SEQUENCE_ENCODING
-    || receipt.get("native_descriptor_target_env_count")
-      !== receipt.get("target_env_count")
-    || receipt.get("native_descriptor_target_env_sha256")
-      !== receipt.get("target_env_sha256")
-    || receipt.get("native_descriptor_image_id") !== receipt.get("image_id")
-    || receipt.get("native_descriptor_candidate_build_receipt_sha256")
-      !== receipt.get("current_build_receipt_sha256")
-    || receipt.get("native_descriptor_source_closure_cid")
-      !== receipt.get("source_closure_cid")
-    || receipt.get("native_descriptor_source_closure_capture_sha256")
-      !== receipt.get("source_closure_capture_sha256")
-  ) {
-    fail(`${label}: descriptor source/image/argv/env hash binding`);
-  }
+  void receipt;
+  void caseId;
+  void candidateSha256;
+  void candidateEntryPath;
+  void candidateEntryModulePath;
+  void candidateEntrySha256;
+  fail(`${label}: producer_missing: native CID run-case workload`);
 }
 
 export function verifyNativeDescriptorReceiptBinding(
@@ -1297,20 +1270,35 @@ export function verifyNativeDescriptorReceiptBinding(
   receipt: ReadonlyMap<string, string>,
   label = "native descriptor",
 ): void {
+  exactMapKeyOrder(descriptor, NATIVE_LINUX_DESCRIPTOR_KEYS, label);
+  const payload = descriptor.get("descriptor_payload_sha256") ?? "";
+  const prefix = NATIVE_LINUX_DESCRIPTOR_KEYS.slice(0, -1)
+    .map((key) => `${key}=${descriptor.get(key)}\n`)
+    .join("");
+  if (!HEX32.test(payload) || sha256(Buffer.from(prefix)) !== payload) {
+    fail(`${label}: descriptor payload/order identity`);
+  }
+  const workloadKind = descriptor.get("workload_kind");
+  if (!NATIVE_LINUX_WORKLOAD_KINDS.includes(
+    workloadKind as NativeLinuxWorkloadKind,
+  ) || workloadKind === "bootstrap_stage23_phase") {
+    fail(`${label}: descriptor workload kind`);
+  }
   const fixed = new Map<string, string>([
     ["schema", "cheng.backend2.current_source_native_executor"],
     ["status", "CONFIGURED"],
     ["host_os", "linux"],
-    ["execution_environment", "controlled_cgroup_v2"],
+    ["execution_environment", "native_linux_delegated_cgroup_v2"],
     ["native_execution", "true"],
     ["emulation", "false"],
-    ["controller_host_os", "darwin"],
+    ["controller_host_os", "linux"],
     ["controller_host_translated", "false"],
     ["native_execution_proof",
-      "controller_guest_same_isa_and_guest_cpuinfo_no_qemu_tcg"],
+      "native_linux_same_machine_live_elf_and_cgroup2"],
     ["cgroup_version", "2"],
     ["cgroup_mount_type", "cgroup2"],
-    ["memory_enforcement_scope", "container_and_all_descendants"],
+    ["memory_enforcement_scope",
+      "rootless_oci_process_and_all_descendants"],
     ["memory_max_bytes", "1073741824"],
     ["memory_swap_max_bytes", "0"],
     ["memory_and_swap_total_limit_bytes", "1073741824"],
@@ -1348,58 +1336,24 @@ export function verifyNativeDescriptorReceiptBinding(
   ) {
     fail(`${label}: descriptor target/machine/controller`);
   }
+  for (const key of NATIVE_LINUX_DESCRIPTOR_SHA_KEYS) {
+    if (!HEX32.test(descriptor.get(key) ?? "")) {
+      fail(`${label}: descriptor SHA ${key}`);
+    }
+  }
   const fieldPairs: readonly (readonly [string, string])[] = [
-    ["schema", "native_descriptor_schema"],
+    ["descriptor_payload_sha256", "native_descriptor_payload_sha256"],
     ["target", "native_descriptor_target"],
     ["machine", "native_descriptor_machine"],
-    ["image_id", "native_descriptor_image_id"],
-    ["worker_path_in_image_fshex",
-      "native_descriptor_worker_path_in_image_fshex"],
     ["worker_sha256", "native_descriptor_worker_sha256"],
-    ["source_closure_cid", "native_descriptor_source_closure_cid"],
-    ["source_closure_capture_sha256",
-      "native_descriptor_source_closure_capture_sha256"],
-    ["candidate_build_receipt_path_fshex",
-      "native_descriptor_candidate_build_receipt_path_fshex"],
-    ["candidate_build_receipt_sha256",
-      "native_descriptor_candidate_build_receipt_sha256"],
+    ["snapshot_manifest_sha256",
+      "native_descriptor_snapshot_manifest_sha256"],
     ["candidate_entry_path",
       "native_descriptor_candidate_entry_path"],
     ["candidate_entry_module_path",
       "native_descriptor_candidate_entry_module_path"],
     ["candidate_entry_sha256",
       "native_descriptor_candidate_entry_sha256"],
-    ["controller_host_os", "native_descriptor_controller_host_os"],
-    ["controller_host_machine",
-      "native_descriptor_controller_host_machine"],
-    ["controller_host_translated",
-      "native_descriptor_controller_host_translated"],
-    ["native_execution_proof",
-      "native_descriptor_native_execution_proof"],
-    ["native_execution", "native_descriptor_native_execution"],
-    ["emulation", "native_descriptor_emulation"],
-    ["target_argv_encoding",
-      "native_descriptor_target_argv_encoding"],
-    ["target_argv_count", "native_descriptor_target_argv_count"],
-    ["target_argv_sha256", "native_descriptor_target_argv_sha256"],
-    ["target_env_encoding", "native_descriptor_target_env_encoding"],
-    ["target_env_count", "native_descriptor_target_env_count"],
-    ["target_env_sha256", "native_descriptor_target_env_sha256"],
-    ["cgroup_producer_sha256",
-      "native_descriptor_cgroup_producer_sha256"],
-    ["cgroup_validator_sha256",
-      "native_descriptor_cgroup_validator_sha256"],
-    ["cgroup_version", "native_descriptor_cgroup_version"],
-    ["cgroup_mount_type", "native_descriptor_cgroup_mount_type"],
-    ["memory_enforcement_scope",
-      "native_descriptor_memory_enforcement_scope"],
-    ["memory_max_bytes", "native_descriptor_memory_max_bytes"],
-    ["memory_swap_max_bytes",
-      "native_descriptor_memory_swap_max_bytes"],
-    ["memory_and_swap_total_limit_bytes",
-      "native_descriptor_memory_and_swap_total_limit_bytes"],
-    ["descriptor_payload_sha256",
-      "native_descriptor_payload_sha256"],
   ];
   for (const [descriptorKey, receiptKey] of fieldPairs) {
     const descriptorValue = descriptor.get(descriptorKey);
@@ -1427,9 +1381,76 @@ export function verifyNativeDescriptorReceiptBinding(
   ) {
     fail(`${label}: descriptor worker path`);
   }
+  const expectedArgv = workloadKind === "current_driver"
+    ? [
+      CID_CURRENT_DRIVER_CONTAINER_PATH,
+      "system-link-exec",
+      "--require-pure-system-link-exec",
+      "--root:/cheng-current-source/repo",
+      `--in:${descriptor.get("candidate_entry_path")}`,
+      "--emit:exe",
+      "--backend:primary",
+      "--link-providers",
+      `--target:${descriptorTarget}`,
+      "--out:/cheng-hardcap-work/current-driver.next",
+      "--report-out:/cheng-hardcap-work/current-driver.report",
+    ]
+    : [
+      CID_CURRENT_DRIVER_CONTAINER_PATH,
+      "dry-compile",
+      "--root:/cheng-current-source/repo",
+      `--in:/cheng-current-source/repo/${descriptor.get("candidate_entry_path")}`,
+      `--target:${descriptorTarget}`,
+      "--emit:exe",
+      "--backend-jobs:1",
+      "--out:/cheng-hardcap-work/dry-compile.out",
+      "--report-out:/cheng-hardcap-work/dry-compile.report",
+    ];
+  const expectedEnv = [
+    "HOME=/nonexistent", "LANG=C", "LC_ALL=C", "PATH=/usr/bin:/bin",
+    "TZ=UTC",
+    ...(workloadKind === "dry_compile"
+      ? ["BACKEND_JOBS=1", "CHENG_PROCESS_MAX_RSS_BYTES=1073741824"]
+      : []),
+  ];
+  if (descriptor.get("target_argv_count") !== String(expectedArgv.length)
+      || descriptor.get("target_argv_sha256")
+        !== sha256FramedStrings(expectedArgv)
+      || descriptor.get("target_env_count") !== String(expectedEnv.length)
+      || descriptor.get("target_env_sha256")
+        !== sha256FramedStrings(expectedEnv)) {
+    fail(`${label}: descriptor argv/env`);
+  }
+  const currentBindings: readonly (readonly [string, string])[] = [
+    ["source_closure_cid", "source_closure_cid"],
+    ["source_closure_capture_sha256", "source_closure_capture_sha256"],
+    ["official_driver_sha256", "current_driver_sha256"],
+    ["candidate_build_receipt_sha256", "current_build_receipt_sha256"],
+    ["candidate_entry_path", "current_entry_path"],
+    ["candidate_entry_module_path", "current_entry_module_path"],
+    ["candidate_entry_sha256", "current_entry_sha256"],
+    ["target_argv_count", "target_argv_count"],
+    ["target_argv_sha256", "target_argv_sha256"],
+    ["target_env_count", "target_env_count"],
+    ["target_env_sha256", "target_env_sha256"],
+  ];
+  if (receipt.get("workload_kind") !== workloadKind
+      || receipt.get("current_source_binding_status") !== "bound_unique_current") {
+    fail(`${label}: descriptor current workload binding`);
+  }
+  for (const [descriptorKey, receiptKey] of currentBindings) {
+    if (descriptor.get(descriptorKey) !== receipt.get(receiptKey)) {
+      fail(`${label}: descriptor/receipt ${descriptorKey}`);
+    }
+  }
 }
 
 function verifyCgroupRun(files: EvidenceFiles, refs: CgroupRunRefs, expectedMode: "workload" | "aggregate_oom_probe", label: string): ReadonlyMap<string, string> {
+  void files;
+  void refs;
+  void expectedMode;
+  fail(`${label}: producer_missing: native CID evidence directory`);
+  /*
   const receiptRaw = files.read(refs.artifacts.cgroup_receipt, `${label}.cgroup_receipt`); const receipt = parseHardGateReceipt(receiptRaw, `${label}.cgroup_receipt`); verifyLinuxMemoryReceipt(receiptRaw, `${label}.cgroup_receipt`, expectedMode); artifactManifest(files, refs, receipt, label);
   const stdout = files.read(refs.artifacts.stdout, `${label}.stdout`); const stderr = files.read(refs.artifacts.stderr, `${label}.stderr`);
   if (receipt.get("stdout_sha256") !== sha256(stdout) || receipt.get("stdout_size") !== String(stdout.length) || receipt.get("stderr_sha256") !== sha256(stderr) || receipt.get("stderr_size") !== String(stderr.length)) fail(`${label}: stdout/stderr binding`);
@@ -1583,6 +1604,7 @@ function verifyCgroupRun(files: EvidenceFiles, refs: CgroupRunRefs, expectedMode
   if (transcript.schema !== "beat_c_linux_cgroup_v2_attach_protocol" || typeof transcript.before !== "string" || typeof transcript.during !== "string" || typeof transcript.continue !== "string" || typeof transcript.after !== "string" || typeof transcript.release !== "string") fail(`${label}: attach protocol`); const match = /^cheng_hardcap_before ([0-9a-f]{64})$/.exec(transcript.before); if (!match || sha256(Buffer.from(match[1])) !== transcript.nonceSha256 || transcript.continue !== `cheng_hardcap_continue ${match[1]}` || !transcript.during.startsWith(`cheng_hardcap_during ${match[1]} `) || transcript.release !== `cheng_hardcap_release ${match[1]}` || transcript.after !== `cheng_hardcap_after ${match[1]} ${receipt.get("workload_rc")} ${receipt.get("attack_child_one_rc")} ${receipt.get("attack_child_two_rc")}` || String(transcript.attachRc) !== receipt.get("docker_attach_rc")) fail(`${label}: attach transcript/receipt`);
   const cmd = config.Cmd; if (!Array.isArray(cmd) || cmd.length < 5 || cmd.some((value) => typeof value !== "string") || cmd[0] !== "-c" || cmd[2] !== "beat-c-hardcap-supervisor" || cmd[3] !== expectedMode || cmd[4] !== match[1] || sha256(Buffer.from(cmd[1] as string)) !== receipt.get("supervisor_sha256") || input.supervisorSha256 !== receipt.get("supervisor_sha256")) fail(`${label}: container supervisor Cmd`); const targetArgv = cmd.slice(5) as string[]; const containerArgv = ["/bin/sh", ...(cmd as string[])]; const fixedEnv = ["HOME=/nonexistent", "LANG=C", "LC_ALL=C", "PATH=/usr/bin:/bin", "TZ=UTC"]; if ((expectedMode === "aggregate_oom_probe" ? targetArgv.length !== 0 : targetArgv.length === 0) || sha256FramedStrings(containerArgv) !== receipt.get("container_argv_sha256") || input.containerArgvSha256 !== receipt.get("container_argv_sha256") || canonicalJson(config.Env) !== canonicalJson(fixedEnv) || receipt.get("target_env_count") !== String(fixedEnv.length) || receipt.get("target_env_sha256") !== sha256FramedStrings(fixedEnv) || input.targetEnvCount !== fixedEnv.length || input.targetEnvSha256 !== receipt.get("target_env_sha256") || sha256FramedStrings(targetArgv) !== receipt.get("target_argv_sha256") || String(targetArgv.length) !== receipt.get("target_argv_count") || input.targetArgvSha256 !== receipt.get("target_argv_sha256") || input.targetArgvCount !== targetArgv.length) fail(`${label}: target argv/env binding`);
   return receipt;
+  */
 }
 
 export interface VerifiedLinuxCgroupEvidenceDirectory {
@@ -1592,17 +1614,175 @@ export interface VerifiedLinuxCgroupEvidenceDirectory {
   readonly stdoutSha256: string;
 }
 
+function verifyNativeLinuxEvidenceDirectoryCurrent(
+  evidenceDir: string,
+  expectedMode: "workload" | "aggregate_oom_probe",
+  expectedWorkloadKind: NativeLinuxWorkloadKind,
+  label: string,
+): VerifiedLinuxCgroupEvidenceDirectory {
+  const files = new EvidenceFiles(evidenceDir);
+  const receiptRaw = files.readPath("receipt.kv", `${label}.receipt`);
+  const receipt = verifyLinuxMemoryReceipt(
+    receiptRaw,
+    `${label}.receipt`,
+    expectedMode,
+    expectedWorkloadKind,
+  );
+  const manifestRaw = files.readPath(
+    "artifact-manifest.json",
+    `${label}.artifact_manifest`,
+  );
+  const manifest = parseJsonRaw(
+    manifestRaw,
+    `${label}.artifact_manifest`,
+    true,
+  );
+  if (!isRecord(manifest)) fail(`${label}: artifact manifest 非 object`);
+  exactKeys(
+    manifest,
+    ["artifacts", "directories", "schema"],
+    `${label}.artifact_manifest`,
+  );
+  if (manifest.schema !== "cheng.native_linux_cgroup_v2_artifacts"
+      || receipt.get("artifact_manifest_sha256") !== sha256(manifestRaw)
+      || !Array.isArray(manifest.artifacts)
+      || !Array.isArray(manifest.directories)
+      || receipt.get("artifact_count") !== String(manifest.artifacts.length)
+      || receipt.get("artifact_directory_count")
+        !== String(manifest.directories.length)) {
+    fail(`${label}: artifact manifest authority`);
+  }
+  const expectedFiles = new Set(["artifact-manifest.json", "receipt.kv"]);
+  let previousPath = "";
+  for (const [index, entry] of manifest.artifacts.entries()) {
+    if (!isRecord(entry)) fail(`${label}: artifact[${index}]`);
+    exactKeys(entry, ["path", "sha256", "size"], `${label}.artifact[${index}]`);
+    const path = canonicalRelativePath(
+      stringField(entry, "path", `${label}.artifact[${index}]`),
+      `${label}.artifact[${index}].path`,
+    );
+    if (path <= previousPath) fail(`${label}: artifact order`);
+    previousPath = path;
+    const raw = files.readPath(path, `${label}.${path}`);
+    if (stringField(entry, "sha256", `${label}.${path}`) !== sha256(raw)
+        || uintField(entry, "size", `${label}.${path}`) !== raw.length) {
+      fail(`${label}: artifact identity ${path}`);
+    }
+    expectedFiles.add(path);
+  }
+  const expectedDirectories = new Set<string>();
+  let previousDirectory = "";
+  for (const value of manifest.directories) {
+    if (typeof value !== "string") fail(`${label}: directory row`);
+    const path = canonicalRelativePath(value, `${label}.directory`);
+    if (path <= previousDirectory) fail(`${label}: directory order`);
+    previousDirectory = path;
+    expectedDirectories.add(path);
+  }
+  const actualFiles = new Set<string>();
+  const actualDirectories = new Set<string>();
+  const pending = [""];
+  while (pending.length > 0) {
+    const parent = pending.pop()!;
+    const absolute = parent === "" ? evidenceDir : join(evidenceDir, parent);
+    for (const child of readdirSync(absolute, {withFileTypes: true})) {
+      const path = parent === "" ? child.name : `${parent}/${child.name}`;
+      if (child.isSymbolicLink()) fail(`${label}: evidence symlink`);
+      if (child.isDirectory()) {
+        actualDirectories.add(path);
+        pending.push(path);
+      } else if (child.isFile()) {
+        actualFiles.add(path);
+      } else {
+        fail(`${label}: evidence special file`);
+      }
+    }
+  }
+  if (canonicalJson([...actualFiles].sort())
+      !== canonicalJson([...expectedFiles].sort())
+      || canonicalJson([...actualDirectories].sort())
+        !== canonicalJson([...expectedDirectories].sort())) {
+    fail(`${label}: evidence exact tree`);
+  }
+  const required = [
+    "gate-runner.py", "input-manifest.json", "live-after.json",
+    "live-before.json", "live-cleanup.json", "live-during.json",
+    "receipt-validator.py", "stderr.bin", "stdout.bin",
+    ...(expectedWorkloadKind === "bootstrap_stage23_phase"
+      ? []
+      : ["native-descriptor.kv"]),
+  ];
+  if (required.some((path) => !actualFiles.has(path))) {
+    fail(`${label}: native core artifact missing`);
+  }
+  if (expectedWorkloadKind !== "bootstrap_stage23_phase") {
+    const descriptorRaw = files.readPath(
+      "native-descriptor.kv",
+      `${label}.native_descriptor`,
+    );
+    if (receipt.get("native_descriptor_sha256") !== sha256(descriptorRaw)) {
+      fail(`${label}: descriptor raw identity`);
+    }
+    verifyNativeDescriptorReceiptBinding(
+      parseExternalKv(descriptorRaw, `${label}.native_descriptor`),
+      receipt,
+      `${label}.native_descriptor`,
+    );
+  }
+  const stdout = files.readPath("stdout.bin", `${label}.stdout`);
+  const stderr = files.readPath("stderr.bin", `${label}.stderr`);
+  if (receipt.get("stdout_sha256") !== sha256(stdout)
+      || receipt.get("stdout_size") !== String(stdout.length)
+      || receipt.get("stderr_sha256") !== sha256(stderr)
+      || receipt.get("stderr_size") !== String(stderr.length)
+      || receipt.get("runner_sha256")
+        !== sha256(files.readPath("gate-runner.py", `${label}.runner`))
+      || receipt.get("validator_sha256")
+        !== sha256(files.readPath(
+          "receipt-validator.py",
+          `${label}.validator`,
+        ))) {
+    fail(`${label}: output/tool identity`);
+  }
+  for (const name of ["stdout", "stderr"] as const) {
+    const stat = lstatSync(join(evidenceDir, `${name}.bin`), {bigint: true});
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n
+        || String(stat.dev) !== receipt.get(`${name}_device`)
+        || String(stat.ino) !== receipt.get(`${name}_inode`)) {
+      fail(`${label}: ${name} physical identity`);
+    }
+  }
+  return Object.freeze({
+    receipt,
+    receiptSha256: sha256(receiptRaw),
+    stdout,
+    stdoutSha256: sha256(stdout),
+  });
+}
+
 export function verifyLinuxCgroupEvidenceDirectory(
   evidenceDir: string,
   expectedMode: "workload" | "aggregate_oom_probe",
+  expectedWorkloadKind: NativeLinuxWorkloadKind | "memory_release" =
+    "current_driver",
   label = "linux cgroup evidence",
 ): VerifiedLinuxCgroupEvidenceDirectory {
+  if (expectedWorkloadKind === "memory_release") {
+    fail(`${label}: producer_missing: native memory_release workload`);
+  }
   const canonicalDir = resolve(evidenceDir);
   if (canonicalDir !== evidenceDir) fail(`${label}: evidence directory 必须是 canonical absolute path`);
   const rootStat = lstatSync(canonicalDir);
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || realpathSync.native(canonicalDir) !== canonicalDir) {
     fail(`${label}: evidence directory 必须是真实目录`);
   }
+  return verifyNativeLinuxEvidenceDirectoryCurrent(
+    canonicalDir,
+    expectedMode,
+    expectedWorkloadKind,
+    label,
+  );
+  /*
   const expectedEntries = [
     "artifact-manifest.json",
     ...HARD_GATE_ARTIFACT_NAMES,
@@ -1649,6 +1829,8 @@ export function verifyLinuxCgroupEvidenceDirectory(
     stdout,
     stdoutSha256: sha256(stdout),
   });
+}
+  */
 }
 
 const CANDIDATE_MANIFEST_KEYS = ["schema", "target", "machine", "candidate_entry_path", "candidate_entry_module_path", "candidate_entry_sha256", "toolchain_image_id", "toolchain_config_digest", "toolchain_oci_manifest_digest", "source_tool_manifest_sha256", "source_closure_sha256", "source_entry_count", "tool_closure_sha256", "tool_entry_count", "bootstrap_seed_size", "bootstrap_seed_sha256", "bootstrap_seed_device", "bootstrap_seed_inode", "candidate_device", "candidate_inode", "current_report_origin", "candidate_size", "candidate_sha256", "report_size", "report_sha256", "candidate_execution", "candidate_elf_magic", "candidate_elf_class", "candidate_elf_data", "candidate_elf_machine"] as const;

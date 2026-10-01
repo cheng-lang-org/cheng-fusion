@@ -1,0 +1,333 @@
+import std/strings
+import std/os
+import std/rawbytes
+import std/cmdline
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/game/csg/schema
+import cheng/game/csg/csgworld
+import cheng/game/world3d
+import cheng/game/csg/ball_servo_rigid
+import cheng/game/assets/semantic_video/snapshot_codec
+import cheng/game/assets/semantic_video/snapshot_block
+import cheng/game/assets/semantic_video/reader
+import cheng/game/assets/semantic_video/validator
+import cheng/game/assets/semantic_video/writer
+
+# semantic_snapshot (F1): capture/restore CLI over the sv-snap.v1 payload
+# codec and the v0.1 snapshot semantic block.
+#
+#   capture --ticks <t1,t2,...> --out <path.svblock> --res-dir <dir> --world <scene.csgworld>
+#     Loads the .csgworld facts (the distribution authority — capture and
+#     restore MUST share it; producer-raw floats differ from the quantized
+#     file round-trip below the CID but not below the dynamics), then runs
+#     the deterministic episode (build -> inject ->
+#     setParams -> setBallMode -> tick), snapshots the proven checkpoint
+#     primitive at the requested ticks, writes each state_payload resource
+#     to <res-dir>/ck-<tick>.payload and the record block to --out.
+#   restore --block <path.svblock> --world <scene.csgworld> --ckpt ck-<t>
+#           --ahead <n> --res-dir <dir>
+#     Validates the block, binds the resource by CID, reloads the world
+#     facts, replays the shared drive to the checkpoint tick (replay CID
+#     must equal the decoded payload CID), overwrites state from the
+#     payload and continues n ticks, echoing tick=<t> cid=<World3dCid>.
+
+const
+    SvSnapCliUsage: str = "usage: semantic_snapshot capture --ticks <t1,t2,...> --out <block.svblock> --res-dir <dir> --world <scene.csgworld> | restore --block <block.svblock> --world <scene.csgworld> --ckpt ck-<t> --ahead <n> --res-dir <dir>"
+
+@borrows
+fn SvSnapCliArg(args: str[], name: str): str =
+    for i in 0..<args.len:
+        if args[i] == name:
+            if i + 1 < args.len:
+                return args[i + 1]
+            return ""
+    return ""
+
+@borrows
+fn SvSnapCliParseTicks(text: str, out: var int64[]): bool =
+    var cur: int64 = 0
+    var seen: int32 = 0
+    for i in 0..<text.len:
+        let c: int32 = int32(text[i])
+        if c == 44:
+            if seen == 0:
+                return false
+            add(out, cur)
+            cur = 0
+            seen = 0
+        elif c >= 48 && c <= 57:
+            cur = cur * 10 + int64(c - 48)
+            seen = seen + 1
+        else:
+            return false
+    if seen == 0:
+        return false
+    add(out, cur)
+    return true
+
+@borrows
+fn SvSnapCliParseI64(text: str): int64 =
+    var cur: int64 = 0
+    for i in 0..<text.len:
+        let c: int32 = int32(text[i])
+        if c >= 48 && c <= 57:
+            cur = cur * 10 + int64(c - 48)
+        else:
+            return -1
+    return cur
+
+@borrows
+fn SvSnapCliCapture(ticksArg: str, outPath: str, resDir: str, worldPath: str): int32 =
+    var targets: int64[]
+    if !SvSnapCliParseTicks(ticksArg, targets):
+        echo("FAIL bad --ticks")
+        return 1
+    for i in 0..<targets.len:
+        if i > 0 && targets[i] <= targets[i - 1]:
+            echo("FAIL --ticks not ascending")
+            return 1
+    # the .csgworld file is the distribution authority: capture drives from
+    # the loaded facts so the restore replay (same loader, same drive) cannot
+    # diverge from the captured checkpoints
+    var facts: schema.CsgWorldFacts
+    var embeddedCid: str = csgworld.CsgWorldLoad(worldPath, facts)
+    if embeddedCid.len == 0:
+        echo("FAIL csgworld load")
+        return 1
+    var factsCid: str = Fmt"{schema.CsgWorldFactsCid(facts)}"
+    if factsCid != embeddedCid:
+        echo("FAIL csgworld cid mismatch")
+        return 1
+    # physics-default-behavior baseline (manifest x-physicsBaseline): the
+    # recorded fingerprint lets consumers report "fixture baseline expired"
+    # structurally instead of a bare snapshot CID mismatch when the physics
+    # defaults change after recording
+    var physicsBaseline: str = snapshot_block.SvSnapPhysicsBaseline(facts)
+    if physicsBaseline.len == 0:
+        echo("FAIL physics baseline probe")
+        return 1
+    var drive = snapshot_block.SvSnapDriveStartFromFacts(facts)
+    if !drive.ok:
+        echo("FAIL drive: " + drive.error)
+        return 1
+    var servo: ball_servo_rigid.BallServoRigidState
+    var buf = layout.ByteBufInit(4096)
+    var lengths: int32[]
+    var resCids: str[]
+    var worldCids: str[]
+    var targetIdx: int32 = 0
+    while drive.st.w.tick < targets[targets.len - 1]:
+        if !snapshot_block.SvSnapDriveTick(drive.st, facts):
+            echo("FAIL physics rejected at tick " + strings.Int64ToStr(drive.st.w.tick))
+            layout.ByteBufFree(buf)
+            return 1
+        let t: int64 = drive.st.w.tick
+        if targetIdx < targets.len && t == targets[targetIdx]:
+            var sw = world3d.World3dClone(drive.st.w)
+            var ss = execution.CsgExecutionSnapshot(drive.st)
+            var encoded = snapshot_codec.SvSnapEncode(sw, ss, servo)
+            if !encoded.ok:
+                echo("FAIL encode: " + encoded.error)
+                layout.ByteBufFree(buf)
+                return 1
+            layout.ByteBufAppendBytes(buf, encoded.bytes)
+            add(lengths, rawbytes.BytesLen(encoded.bytes))
+            add(resCids, strings.CloneStr(snapshot_block.SvSnapResourceCid(encoded.bytes)))
+            add(worldCids, strings.CloneStr(world3d.World3dCid(sw)))
+            rawbytes.BytesFree(encoded.bytes)
+            targetIdx = targetIdx + 1
+    if targetIdx != targets.len:
+        echo("FAIL internal: missed targets")
+        layout.ByteBufFree(buf)
+        return 1
+    var payloadBytes = layout.ByteBufToBytes(buf)
+    layout.ByteBufFree(buf)
+    # write the state_payload resources (CID-bound, the b2/b3 media model)
+    os.MkdirAll(resDir, 493)
+    var offset: int32 = 0
+    for i in 0..<targets.len:
+        var slice = rawbytes.BytesSlice(payloadBytes, offset, lengths[i])
+        var resPath: str = resDir + "/" + snapshot_block.SvSnapCkptId(targets[i]) + ".payload"
+        var wrote = os.WriteFileBytesResult(resPath, slice)
+        if result.IsErr(wrote) || !result.Value(wrote):
+            echo("FAIL write payload: " + resPath)
+            return 1
+        rawbytes.BytesFree(slice)
+        offset = offset + lengths[i]
+    var built = snapshot_block.SvSnapshotBlockBuildWithBaseline(drive.factsCid, targets, lengths, payloadBytes, physicsBaseline, outPath)
+    rawbytes.BytesFree(payloadBytes)
+    if !built.ok:
+        echo("FAIL block: " + built.error)
+        return 1
+    var ticksEcho: str = ""
+    for i in 0..<targets.len:
+        if i > 0:
+            ticksEcho = ticksEcho + ","
+        ticksEcho = ticksEcho + strings.Int64ToStr(targets[i])
+    echo("mode=capture")
+    echo("ticks=" + ticksEcho)
+    echo("world=" + worldPath)
+    echo("factsCid=" + drive.factsCid)
+    echo("physicsBaseline=" + physicsBaseline)
+    for i in 0..<targets.len:
+        echo("ckpt=" + snapshot_block.SvSnapCkptId(targets[i])
+            + " tick=" + strings.Int64ToStr(targets[i])
+            + " payloadBytes=" + strings.IntToStr(lengths[i])
+            + " worldCid=" + resCids[i]
+            + " cid=" + worldCids[i])
+    echo("factCount=" + strings.IntToStr(built.factCount))
+    echo("contentId=" + built.contentId)
+    echo("dirCid=" + built.dirCid)
+    echo("blockBytes=" + strings.Int64ToStr(built.blockBytes))
+    echo("block=" + outPath)
+    return 0
+
+@borrows
+fn SvSnapCliRestore(blockPath: str, worldPath: str, ckptId: str,
+                    ahead: int32, resDir: str): int32 =
+    var blockLoad = os.ReadFileBytesResult(blockPath)
+    if result.IsErr(blockLoad):
+        echo("FAIL read block")
+        return 1
+    var blockBytes = result.Value(blockLoad)
+    var validation = validator.SvValidate(blockBytes)
+    if !validation.ok:
+        echo("FAIL validate: " + validation.error)
+        return 1
+    var decoded = reader.SvReaderDecode(blockBytes)
+    if !decoded.ok:
+        echo("FAIL decode: " + decoded.error)
+        return 1
+    var parsed = reader.SvParseRecords(decoded.lines)
+    if !parsed.ok:
+        echo("FAIL parse: " + parsed.error)
+        return 1
+    var snapIdx: int32 = -1
+    for i in 0..<parsed.records.snapshots.len:
+        if parsed.records.snapshots[i].ckpt == ckptId:
+            snapIdx = i
+    if snapIdx < 0:
+        echo("FAIL ckpt not in block: " + ckptId)
+        return 1
+    let snapTick: int64 = parsed.records.snapshots[snapIdx].tick
+    let snapWorldCid: str = parsed.records.snapshots[snapIdx].worldCid
+    # facts: load .csgworld, verify embedded CID, bind to the block dep.
+    # 装载先于 payload CID 判定：基线防线（下）需要 facts 做探针，并把
+    # 「夹具基线过期」前置到一切 payload/replay CID 失配之前（smoke 装载
+    # 段同款顺序）。
+    var facts: schema.CsgWorldFacts
+    var embeddedCid: str = csgworld.CsgWorldLoad(worldPath, facts)
+    if embeddedCid.len == 0:
+        echo("FAIL csgworld load")
+        return 1
+    var factsCid: str = Fmt"{schema.CsgWorldFactsCid(facts)}"
+    if factsCid != embeddedCid:
+        echo("FAIL csgworld cid mismatch")
+        return 1
+    if parsed.records.snapshots[snapIdx].deps.len != 1 || parsed.records.snapshots[snapIdx].deps[0] != factsCid:
+        echo("FAIL block dep does not bind this csgworld")
+        return 1
+    # 基线防线（单一入口 SvSnapBaselineGuard，smoke 装载段同款）：对拍
+    # manifest x-physicsBaseline 与现树探针值；缺键/探针失败/失配统一结构化
+    # 报「夹具基线过期（物理默认行为已变，请重录）」rc=1，先于 payload CID
+    # 判定，不再裸撞 payload/replay CID mismatch。SvValidate 已保证恰好一条
+    # manifest（0 条 = sv_missing_required_field，多条 = sv_ref_duplicate），
+    # 取 [0] 安全。
+    var baselineGuard: str = snapshot_block.SvSnapBaselineGuard(
+        parsed.records.manifests[0].xPhysicsBaseline, facts)
+    if baselineGuard.len > 0:
+        echo("FAIL fixture baseline expired " + baselineGuard)
+        return 1
+    let payloadPath: str = resDir + "/" + ckptId + ".payload"
+    var payloadLoad = os.ReadFileBytesResult(payloadPath)
+    if result.IsErr(payloadLoad):
+        echo("FAIL read payload: " + payloadPath)
+        return 1
+    var payload = result.Value(payloadLoad)
+    var payloadCid: str = writer.SvResourceCid(payload)
+    if payloadCid != snapWorldCid:
+        echo("FAIL payload cid mismatch (corrupt resource)")
+        return 1
+    var drive = snapshot_block.SvSnapDriveStartFromFacts(facts)
+    if !drive.ok:
+        echo("FAIL drive: " + drive.error)
+        return 1
+    while drive.st.w.tick < snapTick:
+        if !snapshot_block.SvSnapDriveTick(drive.st, facts):
+            echo("FAIL replay rejected at tick " + strings.Int64ToStr(drive.st.w.tick))
+            return 1
+    var replayCid: str = world3d.World3dCid(drive.st.w)
+    var restored = snapshot_codec.SvSnapDecode(payload)
+    if !restored.ok:
+        echo("FAIL payload decode: " + restored.error)
+        return 1
+    var decodedCid: str = world3d.World3dCid(restored.st.w)
+    echo("mode=restore")
+    echo("ckpt=" + ckptId + " tick=" + strings.Int64ToStr(snapTick))
+    echo("factsCid=" + factsCid)
+    echo("replayCid=" + replayCid)
+    echo("decodedCid=" + decodedCid)
+    if replayCid != decodedCid:
+        echo("FAIL replay diverged from payload")
+        return 1
+    echo("replayCidMatch=1")
+    # continue on the checkpoint payload state; per-tick CID echo
+    var servo = restored.servo
+    var j: int32 = 0
+    while j < ahead:
+        if !snapshot_block.SvSnapDriveTick(restored.st, facts):
+            echo("FAIL continuation rejected at tick " + strings.Int64ToStr(restored.st.w.tick))
+            return 1
+        let t: int64 = restored.st.w.tick
+        echo("tick=" + strings.Int64ToStr(t) + " cid=" + world3d.World3dCid(restored.st.w))
+        j = j + 1
+    echo("finalTick=" + strings.Int64ToStr(restored.st.w.tick))
+    echo("servoBallSlot=" + strings.IntToStr(servo.ballSlot))
+    echo("restore=ok")
+    return 0
+
+@borrows
+fn SvSnapCliDispatchCapture(args: str[]): int32 =
+    let ticksArg = SvSnapCliArg(args, "--ticks")
+    let outPath = SvSnapCliArg(args, "--out")
+    let resDir = SvSnapCliArg(args, "--res-dir")
+    let worldPath = SvSnapCliArg(args, "--world")
+    if ticksArg.len == 0 || outPath.len == 0 || resDir.len == 0 || worldPath.len == 0:
+        echo(SvSnapCliUsage)
+        return 1
+    return SvSnapCliCapture(ticksArg, outPath, resDir, worldPath)
+
+@borrows
+fn SvSnapCliDispatchRestore(args: str[]): int32 =
+    let blockPath = SvSnapCliArg(args, "--block")
+    let worldPath = SvSnapCliArg(args, "--world")
+    let ckptId = SvSnapCliArg(args, "--ckpt")
+    let aheadText = SvSnapCliArg(args, "--ahead")
+    let resDir = SvSnapCliArg(args, "--res-dir")
+    if blockPath.len == 0 || worldPath.len == 0 || ckptId.len == 0 ||
+       resDir.len == 0 || aheadText.len == 0:
+        echo(SvSnapCliUsage)
+        return 1
+    let ahead64: int64 = SvSnapCliParseI64(aheadText)
+    if ahead64 < 0:
+        echo("FAIL bad --ahead")
+        return 1
+    return SvSnapCliRestore(blockPath, worldPath, ckptId, int32(ahead64), resDir)
+
+fn main(): int32 =
+    if cmdline.ParamCount() < 2:
+        echo(SvSnapCliUsage)
+        return 1
+    let mode = cmdline.ParamStr(1)
+    var args: str[]
+    var i: int32 = 2
+    while i <= cmdline.ParamCount():
+        add(args, strings.CloneStr(cmdline.ParamStr(i)))
+        i = i + 1
+    if mode == "capture":
+        return SvSnapCliDispatchCapture(args)
+    if mode == "restore":
+        return SvSnapCliDispatchRestore(args)
+    echo(SvSnapCliUsage)
+    return 1

@@ -1,0 +1,278 @@
+import std/result
+import std/os
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/hf_model_graph as hfgraph
+import cheng/inference/weight_store as ws
+import cheng/inference/weight_binding as wb
+import cheng/inference/model_executor as mexec
+import cheng/inference/distributed_engine as engine
+
+# 小优引擎里程碑A 片9: "真 safetensors 磁盘文件 -> WeightSafetensorsLoadGraphFilePath
+# 真解码 -> dense HF 形状执行器 -> DistributedGenerateGreedyDenseTransformerTokens
+# 生成" 端到端桥接冒烟。
+#
+# 与片8 (model_executor_dense_hf_shape_golden_ref_main.cheng) 的边界: 片8 的
+# HF 形状图权重张量由 sutTakeStream+TensorFromDataFill 直接在内存构造, 全程
+# 不涉及任何 rawbytes 序列化或磁盘 I/O, 从不调用 WeightSafetensorsLoadGraphFile
+# 系列函数 -- op 派发数学已被片8 三方位手工锚证实正确, 但"safetensors 磁盘
+# 字节 -> 真解码 -> 这套 HF 形状执行器"这条链路此前从未被任何测试跑过一次。
+# 本文件只补这条链路的贯通性 + 数据真实传导性证明, 不重复片8 的数值级手工
+# 锚 (逐算子中间张量断言), 因为解码后的具体数值是否与手算完全吻合不是本片
+# 目标 -- 桥接是否非摆设才是。
+#
+# 真 Qwen 权重文件本机不存在 (已核实: 无 Qwen*.safetensors, 仅
+# ~/.paddlex/official_models/PaddleOCR-VL-1.5/model.safetensors 无关模型),
+# 用与片8 完全同款的极小 qwen2 config 作合成小文件。真权重路径靠函数签名
+# 本身留空: WeightSafetensorsLoadGraphFilePath 接受任意 path/graph/peerIds/
+# scale, 换真 Qwen 文件时代码零改动; 真文件体量 (~1GB/218分片/约4.94亿元素)
+# 的物化/流式解码是独立的下一课题, 本片明确不碰 (progress.md 已有前人记录:
+# "GLM5.2 的超大 tensor 仍需要 device streaming/mmap decode, 不应该经
+# Bytes -> TensorQ 全量物化")。
+
+fn bridgeConfigJson(): str =
+    return strutil.Join([
+        "{",
+        "\"architectures\":[\"Qwen2ForCausalLM\"],",
+        "\"model_type\":\"qwen2\",",
+        "\"vocab_size\":6,",
+        "\"hidden_size\":8,",
+        "\"num_hidden_layers\":2,",
+        "\"num_attention_heads\":4,",
+        "\"num_key_value_heads\":2,",
+        "\"intermediate_size\":6,",
+        "\"tie_word_embeddings\":false,",
+        "\"rope_theta\":10000.0",
+        "}"
+    ], "")
+
+fn writeU64LE(buf: var rawbytes.Bytes, offset: int32, value: int64) =
+    rawbytes.BytesSet(buf, offset, int32(value & int64(255)))
+    rawbytes.BytesSet(buf, offset + 1, int32((value >> 8) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 2, int32((value >> 16) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 3, int32((value >> 24) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 4, int32((value >> 32) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 5, int32((value >> 40) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 6, int32((value >> 48) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 7, int32((value >> 56) & int64(255)))
+
+fn writeF16LE(buf: var rawbytes.Bytes, offset: int32, raw: int32) =
+    rawbytes.BytesSet(buf, offset, raw & 255)
+    rawbytes.BytesSet(buf, offset + 1, (raw >> 8) & 255)
+
+# Same six-value F16 bit-pattern cycle as weight_safetensors_manifest_smoke.cheng's
+# safetensorsF16RawAt (1.0,-1.0,0.5,0.0,2.0,-2.0 scaled by 1000 -> 1000,-1000,
+# 500,0,2000,-2000): magnitude already manually verified safe against overflow
+# in that file, reused here for the same reason.
+#
+# elementIndex==0 (embedding[token=0][dim=0], the exact byte the mutation
+# sentinel below flips) is special-cased to raw=0x44ff (exponent 17, mantissa
+# low byte = 0xff, decodes to ~4996 at scale 1000) instead of the plain-cycle
+# 0x3c00 (~1000): a mod-256 "+1" mutation on a 0xff low byte wraps to 0x00,
+# dropping the decoded value to ~4000 -- a ~996-unit swing, not a 1-ULP nudge.
+# This is still the exact same "first tensor, first byte, +1" mutation the
+# smoke performs -- only the fixture's own value choice at that one element is
+# engineered (still within the manifest_smoke-verified-safe magnitude range)
+# so the flip is large enough to cross an argmax decision boundary instead of
+# being absorbed by downstream fixed-point rounding / hardmax self-attention
+# dominance (empirically verified below to actually flip the greedy output).
+fn bridgeF16RawAt(elementIndex: int32): int32 =
+    if elementIndex == 0:
+        return 0x44ff
+    let slot = elementIndex % 6
+    if slot == 0:
+        return 0x3c00
+    if slot == 1:
+        return 0xbc00
+    if slot == 2:
+        return 0x3800
+    if slot == 3:
+        return 0x0000
+    if slot == 4:
+        return 0x4000
+    return 0xc000
+
+@borrows
+fn bridgeShapeJson(shape: int32[]): str =
+    var parts: str[]
+    for i in 0..<shape.len:
+        add(parts, strings.IntToStr(shape[i]))
+    return strutil.Join(["[", strutil.Join(parts, ","), "]"], "")
+
+@borrows
+fn bridgeTotalDataBytes(graph: mg.ModelGraph): int64 =
+    var total: int64
+    for i in 0..<graph.weights.len:
+        total = total + graph.weights[i].sizeBytes
+    return total
+
+@borrows
+fn bridgeHeader(graph: mg.ModelGraph): str =
+    var parts: str[]
+    var cursor: int64
+    for i in 0..<graph.weights.len:
+        let start = cursor
+        let end = cursor + graph.weights[i].sizeBytes
+        add(parts, strutil.Join([
+            "\"",
+            strings.CloneStr(graph.weights[i].tensorName),
+            "\":{\"dtype\":\"F16\",\"shape\":",
+            bridgeShapeJson(graph.weights[i].shape),
+            ",\"data_offsets\":[",
+            strings.Int64ToStr(start),
+            ",",
+            strings.Int64ToStr(end),
+            "]}"
+        ], ""))
+        cursor = cursor + graph.weights[i].sizeBytes
+    return strutil.Join(["{", strutil.Join(parts, ","), "}"], "")
+
+# Serialize the whole HF-shape graph into a real safetensors byte buffer: 8-byte
+# little-endian header length, JSON header (all weights are dtype fp16, matching
+# hfgraph.HfModelGraphBuildDenseTransformerFromConfig(..., kir.KernelDtypeFp16, ...)),
+# then the raw F16 tensor data cycling through bridgeF16RawAt in tensor order.
+@borrows
+fn bridgeSerializeGraph(graph: mg.ModelGraph): rawbytes.Bytes =
+    let header = bridgeHeader(graph)
+    let headerBytes = rawbytes.BytesFromString(header)
+    let totalData = int32(bridgeTotalDataBytes(graph))
+    let outLen = 8 + rawbytes.BytesLen(headerBytes) + totalData
+    var out = rawbytes.BytesAlloc(outLen)
+    writeU64LE(out, 0, int64(rawbytes.BytesLen(headerBytes)))
+    rawbytes.BytesCopyInto(out, 8, headerBytes)
+    let dataBase = 8 + rawbytes.BytesLen(headerBytes)
+    var cursor: int32
+    var elementOrdinal: int32
+    for i in 0..<graph.weights.len:
+        let tensorBytes = int32(graph.weights[i].sizeBytes)
+        var j: int32
+        while j < tensorBytes:
+            writeF16LE(out, dataBase + cursor + j, bridgeF16RawAt(elementOrdinal))
+            j = j + 2
+            elementOrdinal = elementOrdinal + 1
+        cursor = cursor + tensorBytes
+    return out
+
+fn bridgePeerIds(count: int32): str[] =
+    var peers: str[]
+    for i in 0..<count:
+        add(peers, strutil.Join(["peer:dense-hf-shape-bridge:", strings.IntToStr(i)], ""))
+    return peers
+
+@borrows
+fn bridgeTokensToString(tokens: int32[]): str =
+    var parts: str[]
+    for i in 0..<tokens.len:
+        add(parts, strings.IntToStr(tokens[i]))
+    return strutil.Join(parts, ",")
+
+@borrows
+fn bridgeTokensEqual(a: int32[], b: int32[]): bool =
+    if a.len != b.len:
+        return false
+    for i in 0..<a.len:
+        if a[i] != b[i]:
+            return false
+    return true
+
+# The core reusable pipeline: write real safetensors bytes to disk at `path`,
+# load them back through the official WeightSafetensorsLoadGraphFilePath decode
+# entry point, bind the resulting payload hashes, run the dense-HF-shape
+# executor validation gate, then run a real greedy generate loop and return the
+# resulting token ids. Every step hard-fails via assert on the first Err.
+@borrows
+fn bridgeRunPipeline(path: str,
+                     fileBytes: rawbytes.Bytes,
+                     graph: mg.ModelGraph,
+                     peerIds: str[],
+                     promptTokenIds: infer.TensorQ): int32[] =
+    if os.FileExists(path):
+        assert(os.RemoveFile(path), " weight safetensors dense hf shape bridge smoke: remove old file")
+    var writeBytes = fileBytes
+    let writeOk = os.WriteFileBytesResult(path, writeBytes)
+    assert(IsOk(writeOk), " weight safetensors dense hf shape bridge smoke: write file")
+
+    let expectWeights = graph.weights.len
+    let loaded = ws.WeightSafetensorsLoadGraphFilePath(path, graph, peerIds, 1000)
+    assert(IsOk(loaded), " weight safetensors dense hf shape bridge smoke: load graph file path")
+    let loadResult = Value(loaded)
+    assert(loadResult.store.payloads.len == expectWeights,
+           " weight safetensors dense hf shape bridge smoke: loaded payload count")
+
+    var hashes: int64[]
+    for i in 0..<loadResult.store.payloads.len:
+        assert(loadResult.store.payloads[i].tensorName == graph.weights[i].tensorName,
+               " weight safetensors dense hf shape bridge smoke: payload order")
+        add(hashes, loadResult.store.payloads[i].payloadHash)
+    let boundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(graph, hashes)
+    assert(IsOk(boundGraphRes), " weight safetensors dense hf shape bridge smoke: bind expected payload hashes")
+    let boundGraph = Value(boundGraphRes)
+
+    assert(IsOk(wb.WeightBindingValidate(loadResult.bindings, boundGraph)),
+           " weight safetensors dense hf shape bridge smoke: weight bindings validate")
+    assert(IsOk(ws.WeightTensorValidateStore(loadResult.store, loadResult.bindings, boundGraph)),
+           " weight safetensors dense hf shape bridge smoke: weight store validate")
+
+    let graphGateRes = mexec.ModelExecutorValidateDenseTransformerGraph(boundGraph, loadResult.bindings, loadResult.store)
+    assert(IsOk(graphGateRes) && Value(graphGateRes) == true,
+           " weight safetensors dense hf shape bridge smoke: dense transformer graph gate")
+
+    let generatedRes = engine.DistributedGenerateGreedyDenseTransformerTokens(
+        boundGraph, loadResult.bindings, loadResult.store, promptTokenIds, 3, -1)
+    assert(IsOk(generatedRes), " weight safetensors dense hf shape bridge smoke: greedy generate")
+    return Value(generatedRes).data
+
+fn main(): int32 =
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        bridgeConfigJson(),
+        "cid:model:dense-hf-shape-safetensors-bridge",
+        kir.KernelDtypeFp16,
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsOk(graphRes), " weight safetensors dense hf shape bridge smoke: build graph")
+    let graph = Value(graphRes)
+    assert(IsOk(mg.ModelGraphValidate(graph)), " weight safetensors dense hf shape bridge smoke: graph valid")
+    assert(graph.weights.len == 21 && graph.ops.len == 19,
+           " weight safetensors dense hf shape bridge smoke: graph inventory matches slice8 fixture")
+
+    let peerIds = bridgePeerIds(graph.weights.len)
+    assert(peerIds.len == 21, " weight safetensors dense hf shape bridge smoke: peer id count")
+
+    # Prompt's LAST token is 0 (the token whose embedding row0 carries the
+    # mutation sentinel's byte): the greedy generate loop's very first decoded
+    # token is argmax'd from that last row, which is driven directly by that
+    # row's own embedding lookup, so the mutation is guaranteed to be visible
+    # in the very first step's logits (verified empirically below), not just
+    # diluted through the model's self-attention-dominant hardmax retrieval.
+    var promptTokenIds: infer.TensorQ
+    let promptOk = infer.TensorFromDataFill(promptTokenIds, [3], 1, [2, 1, 0])
+    assert(IsOk(promptOk), " weight safetensors dense hf shape bridge smoke: prompt tensor build")
+
+    let originalBytes = bridgeSerializeGraph(graph)
+    let path1 = "/tmp/cheng_weight_safetensors_dense_hf_shape_bridge_smoke.safetensors"
+    let tokens1 = bridgeRunPipeline(path1, originalBytes, graph, peerIds, promptTokenIds)
+    echo(strutil.Join(["generated tokens (original): ", bridgeTokensToString(tokens1)], ""))
+    echo(" weight_safetensors_dense_hf_shape_bridge_smoke ok")
+
+    # --- mutation sentinel: flip the first byte of the first tensor's payload
+    # and prove the generated tokens actually change. If they don't, the bridge
+    # is decorative, not a real data path -- hard fail, no silent pass. ---
+    var mutatedBytes = rawbytes.BytesSlice(originalBytes, 0, rawbytes.BytesLen(originalBytes))
+    let headerLenRes = ws.WeightSafetensorsHeaderLength(mutatedBytes)
+    assert(IsOk(headerLenRes), " weight safetensors dense hf shape bridge smoke: mutation header length")
+    let dataBase = 8 + Value(headerLenRes)
+    let oldByte = rawbytes.BytesGet(mutatedBytes, dataBase)
+    rawbytes.BytesSet(mutatedBytes, dataBase, (oldByte + 1) % 256)
+
+    let path2 = "/tmp/cheng_weight_safetensors_dense_hf_shape_bridge_smoke_mutated.safetensors"
+    let tokens2 = bridgeRunPipeline(path2, mutatedBytes, graph, peerIds, promptTokenIds)
+    echo(strutil.Join(["generated tokens (mutated):  ", bridgeTokensToString(tokens2)], ""))
+
+    assert(!bridgeTokensEqual(tokens1, tokens2),
+           " weight safetensors dense hf shape bridge smoke: mutation sentinel must change generated tokens")
+
+    return 0

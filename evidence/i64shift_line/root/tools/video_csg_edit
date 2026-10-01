@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+SCHEMA = "cheng.video.csg.edit.v1"
+MARKER = "video_csg_edit ok"
+DEFAULT_CHUNK_BYTES = 256 * 1024
+
+
+def canonical_json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_text(text):
+    h = hashlib.sha256()
+    h.update(text.encode("utf-8"))
+    return h.hexdigest()
+
+
+def sha256_bytes(data):
+    h = hashlib.sha256()
+    h.update(data)
+    return h.hexdigest()
+
+
+def fail(code, message, **fields):
+    payload = {"ok": False, "code": code, "message": message}
+    payload.update(fields)
+    print(canonical_json(payload), file=sys.stderr)
+    raise SystemExit(2)
+
+
+def run_capture(argv, code):
+    proc = subprocess.run(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        fail(
+            code,
+            "command failed",
+            argv=argv,
+            exit_code=proc.returncode,
+            stderr=proc.stderr[-4000:],
+        )
+    return proc.stdout
+
+
+def run_json(argv, code):
+    text = run_capture(argv, code)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        fail(code, "command did not return JSON", argv=argv, error=str(exc), stdout=text[:4000])
+
+
+def require_readable_file(path):
+    if not path.exists():
+        fail("input_missing", "input file does not exist", path=str(path))
+    if not path.is_file():
+        fail("input_not_file", "input path is not a regular file", path=str(path))
+    try:
+        with path.open("rb") as handle:
+            handle.read(1)
+    except OSError as exc:
+        fail("input_not_readable", "input file is not readable", path=str(path), error=str(exc))
+
+
+def file_digest_and_chunks(path, chunk_bytes):
+    size = 0
+    chunks = []
+    file_hash = hashlib.sha256()
+    offset = 0
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(chunk_bytes)
+            if not block:
+                break
+            block_hash = sha256_bytes(block)
+            file_hash.update(block)
+            block_len = len(block)
+            chunks.append(
+                {
+                    "chunk_index": len(chunks),
+                    "byte_offset": offset,
+                    "byte_length": block_len,
+                    "sha256": block_hash,
+                }
+            )
+            offset += block_len
+            size += block_len
+    if size <= 0:
+        fail("input_empty", "input file is empty", path=str(path))
+    return size, file_hash.hexdigest(), chunks
+
+
+def parse_decimal_ms(value):
+    if value is None or value == "N/A" or value == "":
+        return 0
+    try:
+        seconds = float(value)
+    except ValueError:
+        return 0
+    if seconds < 0:
+        return 0
+    return int(round(seconds * 1000.0))
+
+
+def stream_duration_ms(stream, fallback_ms):
+    duration = parse_decimal_ms(stream.get("duration"))
+    if duration > 0:
+        return duration
+    return fallback_ms
+
+
+def ffprobe(path):
+    return run_json(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_format",
+            "-show_streams",
+            "-print_format",
+            "json",
+            str(path),
+        ],
+        "ffprobe_failed",
+    )
+
+
+def make_fact(kind, payload):
+    body = {"kind": kind, "schema": SCHEMA}
+    body.update(payload)
+    fact_hash = sha256_text(canonical_json(body))
+    body["id"] = f"{kind}:sha256:{fact_hash}"
+    return body
+
+
+def facts_root_hash(facts):
+    lines = "".join(canonical_json(fact) + "\n" for fact in facts)
+    return sha256_text(lines)
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+
+def write_csgc(path, facts):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    root = Path(__file__).resolve().parents[1]
+    bridge = root / "tools" / "write_csgc_facts.mjs"
+    proc = subprocess.run(
+        ["node", str(bridge), "--out", str(path)],
+        input=json.dumps(facts, ensure_ascii=False, sort_keys=True),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        fail(
+            "csgc_write_failed",
+            "CSGC binary writer failed",
+            out=str(path),
+            stderr=proc.stderr[-4000:],
+        )
+    try:
+        stats = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        fail("csgc_write_failed", "CSGC writer returned invalid JSON", error=str(exc), stdout=proc.stdout[:4000])
+    if not path.exists() or path.stat().st_size <= 64:
+        fail("csgc_write_failed", "CSGC writer did not produce a valid binary file", out=str(path))
+    return stats
+
+
+def find_primary_video_stream(probe):
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") == "video":
+            return stream
+    fail("no_video_stream", "input has no video stream")
+
+
+def build_source_facts(input_path, chunk_bytes):
+    require_readable_file(input_path)
+    size, source_sha, chunks = file_digest_and_chunks(input_path, chunk_bytes)
+    probe = ffprobe(input_path)
+    fmt = probe.get("format", {})
+    duration_ms = parse_decimal_ms(fmt.get("duration"))
+    video_stream = find_primary_video_stream(probe)
+    asset_id = f"csg.video.asset.sha256:{source_sha}"
+    source_path_hash = sha256_text(str(input_path.resolve()))
+
+    facts = [
+        make_fact(
+            "csg.media.video.asset",
+            {
+                "asset_id": asset_id,
+                "source_path_hash": source_path_hash,
+                "source_sha256": source_sha,
+                "byte_length": size,
+                "container": fmt.get("format_name", ""),
+                "duration_ms": duration_ms,
+                "bit_rate": int(fmt.get("bit_rate", "0") or "0"),
+                "chunk_bytes": chunk_bytes,
+                "chunk_count": len(chunks),
+            },
+        )
+    ]
+
+    for stream in probe.get("streams", []):
+        codec_type = stream.get("codec_type", "")
+        if codec_type == "video":
+            facts.append(
+                make_fact(
+                    "csg.media.video.track",
+                    {
+                        "asset_id": asset_id,
+                        "stream_index": int(stream.get("index", 0)),
+                        "codec": stream.get("codec_name", ""),
+                        "profile": stream.get("profile", ""),
+                        "width": int(stream.get("width", 0) or 0),
+                        "height": int(stream.get("height", 0) or 0),
+                        "pix_fmt": stream.get("pix_fmt", ""),
+                        "r_frame_rate": stream.get("r_frame_rate", ""),
+                        "avg_frame_rate": stream.get("avg_frame_rate", ""),
+                        "time_base": stream.get("time_base", ""),
+                        "duration_ms": stream_duration_ms(stream, duration_ms),
+                        "nb_frames": stream.get("nb_frames", ""),
+                    },
+                )
+            )
+        elif codec_type == "audio":
+            facts.append(
+                make_fact(
+                    "csg.media.audio.track",
+                    {
+                        "asset_id": asset_id,
+                        "stream_index": int(stream.get("index", 0)),
+                        "codec": stream.get("codec_name", ""),
+                        "sample_rate": int(stream.get("sample_rate", 0) or 0),
+                        "channels": int(stream.get("channels", 0) or 0),
+                        "channel_layout": stream.get("channel_layout", ""),
+                        "time_base": stream.get("time_base", ""),
+                        "duration_ms": stream_duration_ms(stream, duration_ms),
+                    },
+                )
+            )
+
+    for chunk in chunks:
+        payload = dict(chunk)
+        payload["asset_id"] = asset_id
+        facts.append(make_fact("csg.media.video.chunk", payload))
+
+    return {
+        "asset_id": asset_id,
+        "source_sha256": source_sha,
+        "source_path_hash": source_path_hash,
+        "byte_length": size,
+        "duration_ms": duration_ms,
+        "video_width": int(video_stream.get("width", 0) or 0),
+        "video_height": int(video_stream.get("height", 0) or 0),
+        "facts": facts,
+        "probe": probe,
+    }
+
+
+def choose_end_ms(duration_ms, requested_start_ms, requested_end_ms):
+    if requested_end_ms > 0:
+        return requested_end_ms
+    if duration_ms > 0:
+        return min(duration_ms, requested_start_ms + 3000)
+    return requested_start_ms + 3000
+
+
+def validate_edit_window(start_ms, end_ms, duration_ms):
+    if start_ms < 0:
+        fail("bad_edit_window", "start-ms must be non-negative", start_ms=start_ms)
+    if end_ms <= start_ms:
+        fail("bad_edit_window", "end-ms must be greater than start-ms", start_ms=start_ms, end_ms=end_ms)
+    if duration_ms > 0 and end_ms > duration_ms:
+        fail(
+            "bad_edit_window",
+            "end-ms exceeds source duration",
+            start_ms=start_ms,
+            end_ms=end_ms,
+            duration_ms=duration_ms,
+        )
+
+
+def seconds_text(ms):
+    return f"{ms / 1000.0:.3f}"
+
+
+def build_edit_plan(source, start_ms, end_ms):
+    source_facts_hash = facts_root_hash(source["facts"])
+    edit_ms = end_ms - start_ms
+    intent = make_fact(
+        "csg.media.video.edit_intent",
+        {
+            "asset_id": source["asset_id"],
+            "operation": "trim",
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "intent_text": f"trim source video to [{start_ms},{end_ms}) ms",
+        },
+    )
+    policy = make_fact(
+        "csg.media.video.edit_policy",
+        {
+            "asset_id": source["asset_id"],
+            "allowed_source_sha256": source["source_sha256"],
+            "allowed_operation": "trim",
+            "max_output_duration_ms": edit_ms,
+            "requires_source_hash_match": True,
+            "requires_probe_before_execute": True,
+            "requires_probe_after_execute": True,
+        },
+    )
+    plan_payload = {
+        "asset_id": source["asset_id"],
+        "operation": "trim",
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "duration_ms": edit_ms,
+        "source_facts_hash": source_facts_hash,
+        "intent_hash": intent["id"].split(":")[-1],
+        "policy_hash": policy["id"].split(":")[-1],
+        "source_sha256": source["source_sha256"],
+        "executor": "ffmpeg",
+        "argv_contract": [
+            "ffmpeg",
+            "-ss",
+            seconds_text(start_ms),
+            "-i",
+            "<source>",
+            "-t",
+            seconds_text(edit_ms),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            "<output>",
+        ],
+    }
+    plan = make_fact("csg.media.video.edit_plan", plan_payload)
+    action = make_fact(
+        "csg.media.video.certified_edit_action",
+        {
+            "asset_id": source["asset_id"],
+            "plan_hash": plan["id"].split(":")[-1],
+            "intent_hash": intent["id"].split(":")[-1],
+            "policy_hash": policy["id"].split(":")[-1],
+            "source_facts_hash": source_facts_hash,
+            "payload_hash": sha256_text(canonical_json(plan_payload["argv_contract"])),
+            "complete": True,
+        },
+    )
+    return [intent, policy, plan, action], plan, action
+
+
+def execute_plan(input_path, output_path, start_ms, end_ms):
+    edit_ms = end_ms - start_ms
+    argv = [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-ss",
+        seconds_text(start_ms),
+        "-i",
+        str(input_path),
+        "-t",
+        seconds_text(edit_ms),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if proc.returncode != 0:
+        fail("ffmpeg_edit_failed", "ffmpeg edit failed", argv=argv, stderr=proc.stderr[-4000:])
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        fail("output_missing", "ffmpeg did not produce a non-empty output", output=str(output_path))
+    return argv, proc.stderr
+
+
+def build_receipt(source, output_path, plan, action, argv, stderr_tail):
+    output_size, output_sha, output_chunks = file_digest_and_chunks(output_path, DEFAULT_CHUNK_BYTES)
+    output_probe = ffprobe(output_path)
+    output_duration_ms = parse_decimal_ms(output_probe.get("format", {}).get("duration"))
+    expected_duration_ms = int(plan["duration_ms"])
+    if output_duration_ms <= 0:
+        fail("output_probe_invalid", "edited output duration is missing", output=str(output_path))
+    if output_duration_ms > expected_duration_ms + 350:
+        fail(
+            "output_duration_drift",
+            "edited output is longer than certified duration",
+            output_duration_ms=output_duration_ms,
+            expected_duration_ms=expected_duration_ms,
+        )
+    receipt = make_fact(
+        "csg.media.video.edit_receipt",
+        {
+            "asset_id": source["asset_id"],
+            "plan_hash": plan["id"].split(":")[-1],
+            "certified_action_hash": action["id"].split(":")[-1],
+            "output_sha256": output_sha,
+            "output_byte_length": output_size,
+            "output_duration_ms": output_duration_ms,
+            "output_chunk_count": len(output_chunks),
+            "argv_hash": sha256_text(canonical_json(argv)),
+            "executor_stderr_tail_hash": sha256_text(stderr_tail[-4000:]),
+            "status": "validated",
+        },
+    )
+    output_asset = make_fact(
+        "csg.media.video.derived_asset",
+        {
+            "parent_asset_id": source["asset_id"],
+            "parent_sha256": source["source_sha256"],
+            "derived_sha256": output_sha,
+            "edit_receipt_hash": receipt["id"].split(":")[-1],
+            "operation": "trim",
+            "byte_length": output_size,
+            "duration_ms": output_duration_ms,
+        },
+    )
+    return receipt, output_asset, output_probe
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="CSG-certify and execute a video edit.")
+    parser.add_argument("--input", required=True, help="Source video path.")
+    parser.add_argument("--out-dir", required=True, help="Output directory.")
+    parser.add_argument("--start-ms", type=int, default=0, help="Trim start in milliseconds.")
+    parser.add_argument("--end-ms", type=int, default=0, help="Trim end in milliseconds. Default: min(start+3000, duration).")
+    parser.add_argument("--chunk-bytes", type=int, default=DEFAULT_CHUNK_BYTES, help="Source chunk size for CSG chunk facts.")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.chunk_bytes <= 0:
+        fail("bad_chunk_size", "chunk-bytes must be positive", chunk_bytes=args.chunk_bytes)
+    input_path = Path(args.input)
+    out_dir = Path(args.out_dir)
+    output_path = out_dir / "edited.mp4"
+
+    source = build_source_facts(input_path, args.chunk_bytes)
+    end_ms = choose_end_ms(source["duration_ms"], args.start_ms, args.end_ms)
+    validate_edit_window(args.start_ms, end_ms, source["duration_ms"])
+    edit_facts, plan, action = build_edit_plan(source, args.start_ms, end_ms)
+
+    source_csgc = out_dir / "source.csgc"
+    edit_plan_csgc = out_dir / "edit_plan.csgc"
+    all_csgc = out_dir / "video_edit.csgc"
+    source_csgc_stats = write_csgc(source_csgc, source["facts"])
+    edit_plan_csgc_stats = write_csgc(edit_plan_csgc, edit_facts)
+    argv, stderr_tail = execute_plan(input_path, output_path, args.start_ms, end_ms)
+    receipt, output_asset, output_probe = build_receipt(source, output_path, plan, action, argv, stderr_tail)
+    all_facts = source["facts"] + edit_facts + [receipt, output_asset]
+    all_csgc_stats = write_csgc(all_csgc, all_facts)
+
+    proof = {
+        "ok": True,
+        "marker": MARKER,
+        "schema": SCHEMA,
+        "input_path_hash": source["source_path_hash"],
+        "source_sha256": source["source_sha256"],
+        "source_byte_length": source["byte_length"],
+        "source_duration_ms": source["duration_ms"],
+        "edit_start_ms": args.start_ms,
+        "edit_end_ms": end_ms,
+        "plan_hash": plan["id"].split(":")[-1],
+        "certified_action_hash": action["id"].split(":")[-1],
+        "output_path": str(output_path),
+        "output_sha256": receipt["output_sha256"],
+        "output_byte_length": receipt["output_byte_length"],
+        "output_duration_ms": receipt["output_duration_ms"],
+        "source_facts_csgc": str(source_csgc),
+        "edit_plan_facts_csgc": str(edit_plan_csgc),
+        "all_facts_csgc": str(all_csgc),
+        "source_csgc": source_csgc_stats,
+        "edit_plan_csgc": edit_plan_csgc_stats,
+        "all_csgc": all_csgc_stats,
+        "ffmpeg_argv_hash": receipt["argv_hash"],
+        "source_probe": source["probe"],
+        "output_probe": output_probe,
+    }
+    write_json(out_dir / "proof.json", proof)
+    print(canonical_json({"ok": True, "marker": MARKER, "proof": str(out_dir / "proof.json")}))
+
+
+if __name__ == "__main__":
+    main()

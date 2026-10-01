@@ -1,0 +1,1528 @@
+# Execution engine (B3) + motion controller (C2).
+#
+# The execution loop is the only writer of world state after
+# materialization. Per authority tick, in frozen order:
+#   1. activate actions whose startTick == tick (grasp/release)
+#   2. run rate-capped actuator targets (arm pull-in, leg push-out)
+#   3. grasp-held re-derivation (tension path to anchor)
+#   4. one Physics3dStep; a rejected step records an event and the tick
+#      does not advance (physics3d rolls the world back)
+# Semantic grasp success is derived (constraint + tension path), never
+# asserted by logging: "grasp held" is a query, not a state bit.
+import cheng/game/csg/schema
+import cheng/game/world3d
+import cheng/game/physics3d
+import cheng/game/rope3d
+import std/strings as strings
+import cheng/game/csg/numerics
+import std/math as m
+
+const
+    CsgExecutionSchema = "cheng.game.csg.execution.v1"
+    CsgExecEventCap = 256
+    CsgExecEventGraspOk = 1
+    CsgExecEventGraspFailed = 2
+    CsgExecEventReleased = 3
+    CsgExecEventStepRejected = 4
+    CsgExecEventSupportRemoved = 5
+    CsgExecEventGraspLost = 6
+    CsgExecEventFootstepDone = 7
+    CsgExecImplMarker = "physics3d.v1|exact-ballistic|xpbd64+refine|contacts-e0-friction|dt=1-240|residual-10mm"
+    CsgExecForceSource = "csg-actuators:capped-forces"
+    CsgExecGraspReachM = 0.55
+    CsgExecGraspLostGraceTicks = 5
+    # Balance v1 (free-walk worlds): PD upright servo + capture stepping.
+    # The gate is the facts action table: free-walk worlds (playground,
+    # skeleton) carry no scripted actions; climb/walk/journey do and must
+    # stay byte-identical. CsgBalanceEnabled is the master kill switch.
+    CsgBalanceEnabled = 1
+    CsgBalanceGain = 0.50
+    CsgBalanceDamp = 0.030
+    CsgBalanceCorrCapMps = 1.0
+    CsgCaptureSpeedMps = 0.40
+    CsgCaptureStepLenM = 0.15
+    CsgCaptureSteps = 2
+    CsgCaptureLeadTicks = 30
+    CsgCaptureWindowTicks = 270
+    CsgCaptureRate = 0.80
+    CsgCapturePlantM = 0.02
+    # Balance ball-top mode (per-state opt-in via CsgBalanceSetBallMode):
+    # the servo reference frame moves from the world/foot-midpoint onto
+    # the rolling ball, so the controller holds the mass-weighted figure
+    # CoM over the ball center. The v1 world-frame servo pumped the pair
+    # every tick (B1: ball driven into a 275.9 m steady 4.75 m/s roll) —
+    # the root cause is the frame, not the gain: in the ball frame the
+    # common drift mode (ball + figure riding together) has zero spring
+    # error and zero relative velocity, so the servo does no work on it
+    # at ANY gain. Torso gain therefore keeps the v1 magnitude: the
+    # release transient alone drops the figure ~95 mm onto the curved
+    # surface, and weaker settings were measured failing to catch it.
+    # The proven configuration pairs the torso spring/damper with a
+    # zero-gain foot spring and an absolute-frame foot damper (the
+    # scrape brake: riding feet dragged backward against the rolling is
+    # the one channel that bleeds the pair's common rolling mode; a
+    # strong foot POSITION spring against the rolling surface instead
+    # acts as a spin motor and accelerates the ball). Capture stepping
+    # is structurally off in this mode, and the servo is latch-disarmed
+    # once the figure leaves the recoverable basin (kicks from a
+    # toppled/tangled/airborne state are unphysical actuation that
+    # pumps the pair without bound).
+    CsgBalanceBallGain = 0.50
+    CsgBalanceBallFootGain = 0.0
+    CsgBalanceBallDamp = 0.25
+    CsgBalanceBallTorsoCapMps = 0.25
+    CsgBalanceBallCorrCapMps = 0.40
+    # Soft-start ramp: after CsgBalanceSetBallMode the spring term eases
+    # in linearly over this many ticks while the damping term runs at
+    # full strength (it is the dissipative part and absorbs the release
+    # drop). A full-strength spring through the ~95 mm release-drop
+    # impact injects a one-sided reaction impulse into the ball that
+    # leaves the pair rolling (measured: ~0.75 m/s residual common-mode
+    # velocity, drift growing linearly forever); the ramp cuts the
+    # impulse at the source.
+    CsgBalanceBallRampTicks: float64 = 240.0
+    # Per-tick cap of the relative-velocity damper kick. The damper is
+    # the dissipative term, but uncapped it reaches tens of m/s^2 at the
+    # swing peaks and its contact-path reaction measurably pumps the
+    # pair's swing instead of bleeding it.
+    CsgBalanceBallDampCapMps = 0.30
+    # Vertical arming band (half-width): the pelvis must stay within this
+    # slack of its standing height above the ball center (ball radius +
+    # the frozen pelvis-above-support offset). Outside the band the
+    # figure is squashed against the ball, wrapped around it, or flying
+    # — none of these are balance states the servo may actuate.
+    CsgBalanceBallZBandM = 0.25
+    # Servo arming envelope: the ball-frame servo actuates only while the
+    # figure is still inside its recoverable basin — upright and with the
+    # mass-weighted CoM within this radius of the ball center. Leaving
+    # the basin latches the servo off for the rest of the episode: past
+    # that point velocity kicks are not control (the engine applies dv
+    # with no contact reaction), they are unphysical free actuation that
+    # pumps the ball-figure pair without bound (measured: a tangled,
+    # head-high state re-passing a bare topple gate accelerated the pair
+    # at a constant ~36 m/s^2 to kilometers of drift).
+    CsgBalanceBallServoRangeM = 0.60
+    # Contact-gated Coulomb rolling resistance (ball-top mode, per-state
+    # opt-in via CsgBalanceSetBallRollResist; 0.0 = off, the N1 behavior
+    # bit-for-bit). N2 measurements settled the creep mechanics:
+    #   - a 10 mm spring deadband moved the stand equilibrium UP
+    #     (263 -> 302 mm/s): the spring error is not noise, it is the
+    #     tracking lag of a chase loop;
+    #   - viscous rolling resistance 0.012/tick moved the equilibrium
+    #     down only to 187 mm/s, and removing the foot brake exploded it
+    #     to 620 mm/s — the brake is the main sink, not the pump;
+    #   - the chase: the ball-frame spring drives the figure toward a
+    #     target that recedes with the rolling ball, the feet friction
+    #     converts that drive into forward roll, and the faster-receding
+    #     ball regenerates the lag (measured: CoM 46 mm behind the ball
+    #     center at a 620 mm/s roll). Speed-proportional sinks cannot
+    #     collapse the resulting pump.
+    # The pair-level sink is Coulomb rolling resistance: a roughly
+    # constant deceleration torque (sole and ground deformation under
+    # the rider), applied as one common fraction (1 - a0*dt/speed,
+    # floored at 0) on the ball's v and omega so the v/omega rolling
+    # ratio survives exactly and friction never fights the decay with
+    # slip. a0 = 8 m/s^2 held the residual creep at 4.7 mm/s; the floor
+    # is set by the standing LEAN the loop maintains, which is what the
+    # trim below removes. No figure contact, no effect: a ball rolling
+    # free never enters this module (the rigid-ball pure-roll cases live
+    # in physics3d).
+    CsgBalanceBallRollResistMps2 = 8.0
+    # Lean trim (ball-top mode, per-state opt-in via
+    # CsgBalanceSetBallTrim; 0.0 = off): the pump's amplitude is the
+    # standing lean — the frozen enable-time stance offset is not the
+    # true loaded balance point over the sphere, so the servo holds a
+    # persistent CoM offset and its correction keeps feeding the chase.
+    # A slow leak-free integrator trims the pelvis target horizontally
+    # toward the measured CoM (per tick: trim -= trimRate * comErr,
+    # clamped to +-CsgBalanceBallTrimRangeM), so the target converges to
+    # the loaded balance point, the lean and with it the pump collapse,
+    # and the Coulomb term parks the pair. The fast PD loop is untouched;
+    # trimRate = 1/1200 gives a ~5 s integration period, slow enough to
+    # average over the articulation swing that rectified the earlier
+    # live-CoM experiment into drift.
+    CsgBalanceBallTrimRate = 0.0008333333333333334
+    CsgBalanceBallTrimRangeM = 0.12
+    # contact gate slack: the settle geometry hangs the feet a
+    # documented 12 mm off the sphere (the release contact gap), so
+    # "in contact" is distance(foot, ball) <= rSum + this margin
+    CsgBalanceBallContactSlackM = 0.020
+    # User lean offset cap (game surface, CsgBalanceSetUserLean): the
+    # ball-frame servo's pelvis balance target may be shifted horizontally
+    # by at most this many meters (positive = +x) — the player's CoM
+    # steering input while riding the ball. The clamp is applied at the
+    # setter; the Init default 0.0 is the exact legacy servo target.
+    CsgBalanceUserLeanRangeM = 0.15
+
+type
+    CsgExecutionState =
+        w: world3d.World3d
+        mpPartCount: int32
+        mpPartSlot: int32[]
+        mpRopeNodeCount: int32
+        mpRopeNodeSlot: int32[]
+        handGraspCon: int32[]
+        graspNodeOfHand: int32[]
+        jointOfPart: int32[]
+        jointPeerSlot: int32[]
+        legConOfPart: int32[]
+        legPushing: int32[]
+        eventTick: int64[]
+        eventKind: int32[]
+        eventArg: int32[]
+        eventCount: int32
+        rejectedCount: int32
+        graspOkCount: int32
+        graspFailCount: int32
+        releaseCount: int32
+        graspLostCount: int32
+        lostGrace: int32[]
+        chainCid: str
+        stepCount: int64
+        footCon: int32[]
+        footAnchor: int32[]
+        footDone: int32[]
+        dynFootStart: int32
+        dynFootPart: int32[]
+        dynFootX: float64[]
+        dynFootY: float64[]
+        dynFootZ: float64[]
+        dynFootStartTick: int64[]
+        dynFootEndTick: int64[]
+        dynFootRate: float64[]
+        dynFootPlantLen: float64[]
+        anchorFreeSlot: int32[]
+        footConFree: int32[]
+        balOn: int32
+        balPelvisSlot: int32
+        balChestSlot: int32
+        balHeadSlot: int32
+        balFootLSlot: int32
+        balFootRSlot: int32
+        balChestOffX: float64
+        balChestOffY: float64
+        balChestOffZ: float64
+        balHeadOffX: float64
+        balHeadOffY: float64
+        balHeadOffZ: float64
+        balPelvisOffX: float64
+        balPelvisOffY: float64
+        balPelvisOffZ: float64
+        balCaptures: int32
+        balGain: float64
+        balDamp: float64
+        balCorrCapMps: float64
+        balCaptureSpeedMps: float64
+        balCaptureStepLenM: float64
+        balCaptureSteps: float64
+        balCaptureLeadTicks: float64
+        balCaptureWindowTicks: float64
+        balBallMode: int32
+        balBallSlot: int32
+        balBallArmed: int32
+        balBallEnableTick: int64
+        balBallRadius: float64
+        balBallFootLOffX: float64
+        balBallFootLOffY: float64
+        balBallFootLOffZ: float64
+        balBallFootROffX: float64
+        balBallFootROffY: float64
+        balBallFootROffZ: float64
+        balBallPelvisOffX: float64
+        balBallPelvisOffY: float64
+        balBallGain: float64
+        balBallFootGain: float64
+        balBallTorsoCapMps: float64
+        balBallDamp: float64
+        balBallCorrCapMps: float64
+        balBallRollResist: float64
+        balBallTrim: float64
+        balBallTrimX: float64
+        balBallTrimY: float64
+        balBallUserLeanX: float64
+
+fn CsgExecutionAddEvent(st: var CsgExecutionState, tick: int64, kind: int32, arg: int32) =
+    if st.eventCount >= CsgExecEventCap:
+        panic("csg execution: event capacity exceeded")
+    add(st.eventTick, tick)
+    add(st.eventKind, kind)
+    add(st.eventArg, arg)
+    st.eventCount = st.eventCount + 1
+
+# Per-state balance parameter injection (trainer surface): overrides this
+# state's live controller parameters after Init. float64 throughout; the
+# integer-consumed fields (capture steps / lead ticks / window ticks, half
+# window = window/2) are truncated at their use sites. States that never
+# call it keep the frozen constants Init copied, so default behavior is
+# bit-for-bit unchanged, and per-state injection keeps parallel episodes
+# isolated (no process-wide mutable configuration).
+fn CsgBalanceSetParams(st: var CsgExecutionState,
+                       gain: float64,
+                       damp: float64,
+                       corrCapMps: float64,
+                       captureSpeedMps: float64,
+                       captureStepLenM: float64,
+                       captureSteps: float64,
+                       captureLeadTicks: float64,
+                       captureWindowTicks: float64) =
+    st.balGain = gain
+    st.balDamp = damp
+    st.balCorrCapMps = corrCapMps
+    st.balCaptureSpeedMps = captureSpeedMps
+    st.balCaptureStepLenM = captureStepLenM
+    st.balCaptureSteps = captureSteps
+    st.balCaptureLeadTicks = captureLeadTicks
+    st.balCaptureWindowTicks = captureWindowTicks
+
+# Ball-top balance mode (per-state opt-in, the CsgBalanceSetParams
+# precedent): retarget the live balance servo onto the rolling ball.
+# ballSlot must be a World3dBodyBallRigid already spawned in this
+# state's world and radius its sphere radius (the facts chain cannot
+# express a ball body, so the caller spawns it execution-side before
+# Init and passes slot + radius here after Init). Enabling arms the
+# ball-frame servo: the pelvis balance target is the point that holds
+# the live mass-weighted figure CoM over the ball center (horizontal,
+# from the ball), the standing height rides the ball surface under the
+# live foot midpoint (vertical, geometric anchor); chest/head keep
+# their v1 pelvis-relative offsets. gain/damp/corrCapMps are this
+# state's live ball-frame servo parameters. States that never call this
+# run the v1 controller bit-for-bit, so the six scene CID contracts are
+# untouched.
+fn CsgBalanceSetBallMode(st: var CsgExecutionState,
+                         ballSlot: int32,
+                         radius: float64,
+                         gain: float64,
+                         footGain: float64,
+                         damp: float64,
+                         torsoCapMps: float64,
+                         corrCapMps: float64) =
+    if ballSlot < 0 || ballSlot >= st.w.bodyKind.len:
+        panic("csg execution: ball mode slot out of range")
+    if st.w.bodyKind[ballSlot] != world3d.World3dBodyBallRigid:
+        panic("csg execution: ball mode slot is not a ball rigid body")
+    if radius <= 0.0:
+        panic("csg execution: ball mode radius must be positive")
+    if st.balOn == 0:
+        panic("csg execution: ball mode requires the balance servo (empty action table)")
+    st.balBallMode = 1
+    st.balBallSlot = ballSlot
+    st.balBallArmed = 1
+    st.balBallEnableTick = st.w.tick
+    st.balBallRadius = radius
+    st.balBallFootGain = footGain
+    # freeze each foot's slot on the sphere: keep the enable-time
+    # horizontal offset from the ball center, but project z onto the
+    # sphere surface (the hang pose floats the feet ~95 mm above their
+    # surface slots; anchoring to the hang slots would arrest the feet
+    # mid-drop and then constantly unload them). The anchors hold the
+    # stance at its apex position on the sphere — the rolling surface
+    # cannot carry the feet down the flank and off the ball.
+    st.balBallFootLOffX = st.w.bodyPx[st.balFootLSlot] - st.w.bodyPx[ballSlot]
+    st.balBallFootLOffY = st.w.bodyPy[st.balFootLSlot] - st.w.bodyPy[ballSlot]
+    st.balBallFootROffX = st.w.bodyPx[st.balFootRSlot] - st.w.bodyPx[ballSlot]
+    st.balBallFootROffY = st.w.bodyPy[st.balFootRSlot] - st.w.bodyPy[ballSlot]
+    var loff2: float64 = st.balBallRadius * st.balBallRadius - st.balBallFootLOffX * st.balBallFootLOffX - st.balBallFootLOffY * st.balBallFootLOffY
+    if loff2 < 0.0:
+        loff2 = 0.0
+    st.balBallFootLOffZ = numerics.CsgSqrt(loff2)
+    var roff2: float64 = st.balBallRadius * st.balBallRadius - st.balBallFootROffX * st.balBallFootROffX - st.balBallFootROffY * st.balBallFootROffY
+    if roff2 < 0.0:
+        roff2 = 0.0
+    st.balBallFootROffZ = numerics.CsgSqrt(roff2)
+    # pelvis rides its enable-time horizontal offset from the ball
+    # center (frozen, not CoM-corrected: a live CoM loop feeds the
+    # articulation swing back into the balance target and rectifies it
+    # into drift; the frozen stance already puts the CoM over the ball)
+    st.balBallPelvisOffX = st.w.bodyPx[st.balPelvisSlot] - st.w.bodyPx[ballSlot]
+    st.balBallPelvisOffY = st.w.bodyPy[st.balPelvisSlot] - st.w.bodyPy[ballSlot]
+    st.balBallGain = gain
+    st.balBallTorsoCapMps = torsoCapMps
+    st.balBallDamp = damp
+    st.balBallCorrCapMps = corrCapMps
+
+# Contact-gated Coulomb rolling resistance strength (per-state opt-in,
+# the CsgBalanceSetParams precedent): while a foot is in contact with
+# the sphere, the ball's v and omega are decayed by the constant
+# deceleration resistMps2 (mechanism and rate rationale at
+# CsgBalanceBallRollResistMps2). 0.0 (the Init default) disables it, so
+# states that never call this keep the N1 behavior bit-for-bit.
+fn CsgBalanceSetBallRollResist(st: var CsgExecutionState,
+                               resistMps2: float64) =
+    if resistMps2 < 0.0:
+        panic("csg execution: ball mode roll resist must be non-negative")
+    st.balBallRollResist = resistMps2
+
+# Lean trim integrator (per-state opt-in, the CsgBalanceSetParams
+# precedent): rate in per-tick-per-meter units; the mechanics and
+# calibration rationale live at CsgBalanceBallTrimRate. 0.0 (the Init
+# default) keeps the frozen N1 target exactly.
+fn CsgBalanceSetBallTrim(st: var CsgExecutionState,
+                         trimRate: float64) =
+    if trimRate < 0.0:
+        panic("csg execution: ball mode trim rate must be non-negative")
+    st.balBallTrim = trimRate
+
+# User lean offset (game surface, the CsgBalanceSetParams precedent):
+# shifts the ball-frame servo's pelvis balance target horizontally by
+# leanX meters (positive = +x), clamped to +-CsgBalanceUserLeanRangeM
+# at the setter. The player's CoM steering while riding the ball: the
+# leaned CoM biases the foot-ball friction so the pair rolls toward the
+# lean, and releasing it lets the servo pull the figure back over the
+# ball center. 0.0 (the Init default) is the exact legacy target, so
+# states that never call this are untouched; the offset only acts while
+# the ball-frame servo runs, and snapshot branches carry it like every
+# other ball-mode field.
+fn CsgBalanceSetUserLean(st: var CsgExecutionState,
+                         leanX: float64) =
+    if leanX > CsgBalanceUserLeanRangeM:
+        st.balBallUserLeanX = CsgBalanceUserLeanRangeM
+    elif leanX < 0.0 - CsgBalanceUserLeanRangeM:
+        st.balBallUserLeanX = 0.0 - CsgBalanceUserLeanRangeM
+    else:
+        st.balBallUserLeanX = leanX
+
+@borrows
+fn CsgExecutionPartSlot(st: CsgExecutionState, part: int32): int32 =
+    if part < 0 || part >= st.mpPartCount:
+        return -1
+    return st.mpPartSlot[part]
+
+@borrows
+fn CsgExecutionRopeNodeSlot(st: CsgExecutionState, node: int32): int32 =
+    if node < 0 || node >= st.mpRopeNodeCount:
+        return -1
+    return st.mpRopeNodeSlot[node]
+
+# Derived semantic predicate: hand is "grasping" only while its constraint
+# is active AND the tension path from the grasped node to the anchor lives.
+@borrows
+fn CsgExecutionGraspHeld(st: CsgExecutionState, part: int32): bool =
+    if part < 0 || part >= st.mpPartCount:
+        return false
+    let ci = st.handGraspCon[part]
+    if ci < 0:
+        return false
+    if st.w.conActive[ci] != 1:
+        return false
+    let nodeSlot = st.graspNodeOfHand[part]
+    if nodeSlot < 0:
+        return false
+    return World3dRopePathToAnchor(st.w, nodeSlot)
+
+@borrows
+fn CsgExecutionInit(st: var CsgExecutionState,
+                    facts: schema.CsgWorldFacts,
+                    w: world3d.World3d,
+                    partSlot: int32[],
+                    ropeNodeSlot: int32[]) =
+    st.w = World3dClone(w)
+    st.mpPartCount = partSlot.len
+    setLen(st.mpPartSlot, 0)
+    var i: int32 = 0
+    while i < partSlot.len:
+        add(st.mpPartSlot, partSlot[i])
+        i = i + 1
+    st.mpRopeNodeCount = ropeNodeSlot.len
+    setLen(st.mpRopeNodeSlot, 0)
+    i = 0
+    while i < ropeNodeSlot.len:
+        add(st.mpRopeNodeSlot, ropeNodeSlot[i])
+        i = i + 1
+    setLen(st.handGraspCon, 0)
+    setLen(st.graspNodeOfHand, 0)
+    setLen(st.lostGrace, 0)
+    setLen(st.legConOfPart, 0)
+    setLen(st.jointOfPart, 0)
+    setLen(st.legPushing, 0)
+    setLen(st.footCon, 0)
+    setLen(st.footAnchor, 0)
+    setLen(st.footDone, 0)
+    i = 0
+    while i < st.mpPartCount:
+        add(st.handGraspCon, -1)
+        add(st.graspNodeOfHand, -1)
+        add(st.lostGrace, 0)
+        add(st.legConOfPart, -1)
+        add(st.jointOfPart, -1)
+        add(st.legPushing, 0)
+        i = i + 1
+    i = 0
+    while i < facts.stepPart.len:
+        add(st.footCon, -1)
+        add(st.footAnchor, -1)
+        add(st.footDone, 0)
+        i = i + 1
+    # dynamic step queue: footCon[dynFootStart..] are runtime-injected
+    # footsteps appended after the static facts segment; empty at Init
+    st.dynFootStart = st.footCon.len
+    setLen(st.dynFootPart, 0)
+    setLen(st.dynFootX, 0)
+    setLen(st.dynFootY, 0)
+    setLen(st.dynFootZ, 0)
+    setLen(st.dynFootStartTick, 0)
+    setLen(st.dynFootEndTick, 0)
+    setLen(st.dynFootRate, 0)
+    setLen(st.dynFootPlantLen, 0)
+    # dynamic anchor recycling: released dynamic-queue anchor body slots
+    # and StepPull constraint slots return to these free lists and are
+    # rewritten in place by the next injected footstep, so a long session
+    # of capture/JUMP gaits never grows the world body count past the
+    # live-anchor peak (the World3d 64-body capacity stays unreachable)
+    setLen(st.anchorFreeSlot, 0)
+    setLen(st.footConFree, 0)
+    # leg + arm joint lookup: joint whose endpoints are (pelvis, foot) or
+    # (chest, hand). Joints were materialized first, so world constraint
+    # index == facts joint index.
+    setLen(st.jointPeerSlot, 0)
+    var ji: int32 = 0
+    while ji < facts.jointA.len:
+        add(st.jointPeerSlot, -1)
+        ji = ji + 1
+    ji = 0
+    while ji < facts.jointA.len:
+        let aPart = facts.jointA[ji]
+        let bPart = facts.jointB[ji]
+        let aRole = facts.partRole[aPart]
+        let bRole = facts.partRole[bPart]
+        if aRole == schema.CsgRolePelvis && bRole == schema.CsgRoleFootL:
+            st.legConOfPart[bPart] = ji
+        if aRole == schema.CsgRolePelvis && bRole == schema.CsgRoleFootR:
+            st.legConOfPart[bPart] = ji
+        if bRole == schema.CsgRolePelvis && aRole == schema.CsgRoleFootL:
+            st.legConOfPart[aPart] = ji
+        if bRole == schema.CsgRolePelvis && aRole == schema.CsgRoleFootR:
+            st.legConOfPart[aPart] = ji
+        if aRole == schema.CsgRoleChest && bRole == schema.CsgRoleHandL:
+            st.jointOfPart[bPart] = ji
+        if aRole == schema.CsgRoleChest && bRole == schema.CsgRoleHandR:
+            st.jointOfPart[bPart] = ji
+        if bRole == schema.CsgRoleChest && aRole == schema.CsgRoleHandL:
+            st.jointOfPart[aPart] = ji
+        if bRole == schema.CsgRoleChest && aRole == schema.CsgRoleHandR:
+            st.jointOfPart[aPart] = ji
+        # peer slot: the torso endpoint (chest or pelvis) of this joint
+        let aIsTorso: bool = aRole == schema.CsgRoleChest || aRole == schema.CsgRolePelvis
+        if aIsTorso:
+            st.jointPeerSlot[ji] = st.mpPartSlot[aPart]
+        else:
+            st.jointPeerSlot[ji] = st.mpPartSlot[bPart]
+        ji = ji + 1
+    st.eventCount = 0
+    setLen(st.eventTick, 0)
+    setLen(st.eventKind, 0)
+    setLen(st.eventArg, 0)
+    st.rejectedCount = 0
+    st.graspOkCount = 0
+    st.graspFailCount = 0
+    st.releaseCount = 0
+    st.graspLostCount = 0
+    st.chainCid = strings.Sha256("csg-execution-chain|" + CsgExecImplMarker)
+    st.stepCount = int64(0)
+    # balance v1: off until the free-walk gate proves the standing pose
+    st.balOn = 0
+    st.balPelvisSlot = -1
+    st.balChestSlot = -1
+    st.balHeadSlot = -1
+    st.balFootLSlot = -1
+    st.balFootRSlot = -1
+    st.balChestOffX = 0.0
+    st.balChestOffY = 0.0
+    st.balChestOffZ = 0.0
+    st.balHeadOffX = 0.0
+    st.balHeadOffY = 0.0
+    st.balHeadOffZ = 0.0
+    st.balPelvisOffX = 0.0
+    st.balPelvisOffY = 0.0
+    st.balPelvisOffZ = 0.0
+    st.balCaptures = 0
+    # live balance parameters: Init copies the frozen constants — a world
+    # that never calls CsgBalanceSetParams behaves bit-for-bit as before
+    # (climb/walk/journey never call it: their gate is the action table)
+    st.balGain = CsgBalanceGain
+    st.balDamp = CsgBalanceDamp
+    st.balCorrCapMps = CsgBalanceCorrCapMps
+    st.balCaptureSpeedMps = CsgCaptureSpeedMps
+    st.balCaptureStepLenM = CsgCaptureStepLenM
+    st.balCaptureSteps = float64(CsgCaptureSteps)
+    st.balCaptureLeadTicks = float64(CsgCaptureLeadTicks)
+    st.balCaptureWindowTicks = float64(CsgCaptureWindowTicks)
+    # ball-top mode: off by default — a state that never calls
+    # CsgBalanceSetBallMode runs the v1 controller bit-for-bit
+    st.balBallMode = 0
+    st.balBallSlot = -1
+    st.balBallArmed = 0
+    st.balBallEnableTick = int64(0)
+    st.balBallRadius = 0.0
+    st.balBallFootLOffX = 0.0
+    st.balBallFootLOffY = 0.0
+    st.balBallFootLOffZ = 0.0
+    st.balBallFootROffX = 0.0
+    st.balBallFootROffY = 0.0
+    st.balBallFootROffZ = 0.0
+    st.balBallPelvisOffX = 0.0
+    st.balBallPelvisOffY = 0.0
+    st.balBallGain = 0.0
+    st.balBallFootGain = 0.0
+    st.balBallDamp = 0.0
+    st.balBallCorrCapMps = 0.0
+    st.balBallTorsoCapMps = 0.0
+    st.balBallRollResist = 0.0
+    st.balBallTrim = 0.0
+    st.balBallTrimX = 0.0
+    st.balBallTrimY = 0.0
+    st.balBallUserLeanX = 0.0
+    # free-walk gate: exactly the worlds with an empty action table.
+    # The desired upright pose is the standing pelvis->head direction,
+    # frozen here as the initial pelvis->chest / pelvis->head offsets;
+    # the pelvis itself is referenced to the foot support midpoint
+    # (point feet give no ankle torque, so CoM-over-base must be
+    # actuated at the pelvis).
+    if CsgBalanceEnabled == 1 && facts.actionKind.len == 0:
+        var pelvisPart: int32 = -1
+        var chestPart: int32 = -1
+        var headPart: int32 = -1
+        var footLPart: int32 = -1
+        var footRPart: int32 = -1
+        var pi: int32 = 0
+        while pi < facts.partRole.len:
+            if facts.partRole[pi] == schema.CsgRolePelvis:
+                pelvisPart = pi
+            if facts.partRole[pi] == schema.CsgRoleChest:
+                chestPart = pi
+            if facts.partRole[pi] == schema.CsgRoleHead:
+                headPart = pi
+            if facts.partRole[pi] == schema.CsgRoleFootL:
+                footLPart = pi
+            if facts.partRole[pi] == schema.CsgRoleFootR:
+                footRPart = pi
+            pi = pi + 1
+        if pelvisPart >= 0 && chestPart >= 0 && headPart >= 0 && footLPart >= 0 && footRPart >= 0:
+            st.balPelvisSlot = st.mpPartSlot[pelvisPart]
+            st.balChestSlot = st.mpPartSlot[chestPart]
+            st.balHeadSlot = st.mpPartSlot[headPart]
+            st.balFootLSlot = st.mpPartSlot[footLPart]
+            st.balFootRSlot = st.mpPartSlot[footRPart]
+            st.balChestOffX = st.w.bodyPx[st.balChestSlot] - st.w.bodyPx[st.balPelvisSlot]
+            st.balChestOffY = st.w.bodyPy[st.balChestSlot] - st.w.bodyPy[st.balPelvisSlot]
+            st.balChestOffZ = st.w.bodyPz[st.balChestSlot] - st.w.bodyPz[st.balPelvisSlot]
+            st.balHeadOffX = st.w.bodyPx[st.balHeadSlot] - st.w.bodyPx[st.balPelvisSlot]
+            st.balHeadOffY = st.w.bodyPy[st.balHeadSlot] - st.w.bodyPy[st.balPelvisSlot]
+            st.balHeadOffZ = st.w.bodyPz[st.balHeadSlot] - st.w.bodyPz[st.balPelvisSlot]
+            let midX: float64 = 0.5 * (st.w.bodyPx[st.balFootLSlot] + st.w.bodyPx[st.balFootRSlot])
+            let midY: float64 = 0.5 * (st.w.bodyPy[st.balFootLSlot] + st.w.bodyPy[st.balFootRSlot])
+            let midZ: float64 = 0.5 * (st.w.bodyPz[st.balFootLSlot] + st.w.bodyPz[st.balFootRSlot])
+            st.balPelvisOffX = st.w.bodyPx[st.balPelvisSlot] - midX
+            st.balPelvisOffY = st.w.bodyPy[st.balPelvisSlot] - midY
+            st.balPelvisOffZ = st.w.bodyPz[st.balPelvisSlot] - midZ
+            st.balOn = 1
+
+# Runtime step injection (game v0.2 behavior layer): append one footstep
+# to the dynamic queue while the world is running. The step joins the
+# exact static-footstep semantics on its startTick (anchor spawn + StepPull
+# winch at the current foot distance, bounded-rate contraction to
+# plantLen, release at endTick). Slots footCon/footAnchor/footDone are
+# appended so indices past dynFootStart address queued steps.
+@borrows
+fn CsgExecutionQueueStep(st: var CsgExecutionState,
+                         part: int32,
+                         x: float64,
+                         y: float64,
+                         z: float64,
+                         startTick: int64,
+                         endTick: int64,
+                         rate: float64,
+                         plantLen: float64) =
+    add(st.dynFootPart, part)
+    add(st.dynFootX, x)
+    add(st.dynFootY, y)
+    add(st.dynFootZ, z)
+    add(st.dynFootStartTick, startTick)
+    add(st.dynFootEndTick, endTick)
+    add(st.dynFootRate, rate)
+    add(st.dynFootPlantLen, plantLen)
+    add(st.footCon, -1)
+    add(st.footAnchor, -1)
+    add(st.footDone, 0)
+
+# Queue a full WALK <N> STEPS gait on the live world: N alternating
+# shuffling footsteps with the exact static-walk semantics (0.25 m pair
+# landings, 270-tick windows on a 135-tick half cycle, rate 0.80,
+# plant 0.02) continuing from the current mean foot position. In ball-top
+# mode the landings retarget onto the ball apex slots instead (see the
+# ballWalk branch below; ground worlds keep the exact ground semantics).
+# Returns 0, or -1 when the facts carry no foot parts (caller must fail
+# loudly).
+@borrows
+fn CsgExecutionQueueWalk(st: var CsgExecutionState,
+                         facts: schema.CsgWorldFacts,
+                         steps: int32): int32 =
+    var footL: int32 = -1
+    var footR: int32 = -1
+    var pi: int32 = 0
+    while pi < facts.partRole.len:
+        if facts.partRole[pi] == schema.CsgRoleFootL:
+            footL = pi
+        if facts.partRole[pi] == schema.CsgRoleFootR:
+            footR = pi
+        pi = pi + 1
+    if footL < 0 || footR < 0:
+        return -1
+    let slotL: int32 = CsgExecutionPartSlot(st, footL)
+    let slotR: int32 = CsgExecutionPartSlot(st, footR)
+    var laneX: float64 = (st.w.bodyPx[slotL] + st.w.bodyPx[slotR]) * 0.5
+    let footY: float64 = (st.w.bodyPy[slotL] + st.w.bodyPy[slotR]) * 0.5
+    let footZ: float64 = (st.w.bodyPz[slotL] + st.w.bodyPz[slotR]) * 0.5
+    var feet: int32[] = [footR, footL]
+    var sideX: float64[] = [-0.10, 0.10]
+    let lead: int64 = st.w.tick + int64(30)
+    var sTick: int64 = lead
+    # Ball-top mode: landings are the frozen surface-projected apex slots
+    # raised by the foot radius (the natural foot-center contact height)
+    # and no ground lane is advanced — walking on a rolling ball means
+    # shuffling on its apex. The ground lane semantics (+0.25 m per pair
+    # at the queue-time foot height) would winch the rider down the
+    # flank: measured, the figure is dragged off the apex and topples
+    # mid-gait (ball_balance_probe caseD, fall tick 932).
+    let ballWalk: bool = st.balBallMode != 0 && st.balBallSlot >= 0
+    let bSlot: int32 = st.balBallSlot
+    var k: int32
+    while k < steps:
+        var landX: float64
+        var landY: float64
+        var landZ: float64
+        if ballWalk:
+            if k % 2 == 0:
+                landX = st.w.bodyPx[bSlot] + st.balBallFootROffX
+                landY = st.w.bodyPy[bSlot] + st.balBallFootROffY
+                landZ = st.w.bodyPz[bSlot] + st.balBallFootROffZ + st.w.bodyRadius[st.balFootRSlot]
+            else:
+                landX = st.w.bodyPx[bSlot] + st.balBallFootLOffX
+                landY = st.w.bodyPy[bSlot] + st.balBallFootLOffY
+                landZ = st.w.bodyPz[bSlot] + st.balBallFootLOffZ + st.w.bodyRadius[st.balFootLSlot]
+        else:
+            landX = laneX + sideX[k % 2]
+            landY = footY
+            landZ = footZ
+        CsgExecutionQueueStep(st, feet[k % 2], landX, landY, landZ,
+            sTick, sTick + int64(270), 0.80, 0.02)
+        if !ballWalk && k % 2 == 1:
+            laneX = laneX + 0.25
+        sTick = sTick + int64(135)
+        k = k + 1
+    return 0
+
+# Balance v1 upright servo, one torso point: a clamped velocity kick
+# toward a desired position, with a viscous damping term -c*v against
+# spring oscillation. The kick magnitude is clamped so a violent error
+# can never inject an explosion. Pure velocity edit: no constraint, no
+# force, no allocation — the Verlet-PBD rebuild in the authority step
+# inherits it as real displacement.
+fn CsgExecutionBalanceKickTo(st: var CsgExecutionState,
+                             slot: int32,
+                             wantX: float64,
+                             wantY: float64,
+                             wantZ: float64) =
+    let dvx = st.balGain * (wantX - st.w.bodyPx[slot]) - st.balDamp * st.w.bodyVx[slot]
+    let dvy = st.balGain * (wantY - st.w.bodyPy[slot]) - st.balDamp * st.w.bodyVy[slot]
+    let dvz = st.balGain * (wantZ - st.w.bodyPz[slot]) - st.balDamp * st.w.bodyVz[slot]
+    let dvMag = numerics.CsgSqrt(dvx * dvx + dvy * dvy + dvz * dvz)
+    if dvMag > st.balCorrCapMps:
+        let scale = st.balCorrCapMps / dvMag
+        st.w.bodyVx[slot] = st.w.bodyVx[slot] + dvx * scale
+        st.w.bodyVy[slot] = st.w.bodyVy[slot] + dvy * scale
+        st.w.bodyVz[slot] = st.w.bodyVz[slot] + dvz * scale
+    else:
+        st.w.bodyVx[slot] = st.w.bodyVx[slot] + dvx
+        st.w.bodyVy[slot] = st.w.bodyVy[slot] + dvy
+        st.w.bodyVz[slot] = st.w.bodyVz[slot] + dvz
+
+# Balance v1 upright servo, whole figure: the pelvis toward its
+# standing offset from the live foot-support midpoint (hold the CoM
+# over the base and hold the standing height through the leg rods),
+# chest + head toward their standing pelvis-relative offsets (the
+# initial pelvis->head direction riding the live pelvis position).
+fn CsgExecutionBalanceServo(st: var CsgExecutionState) =
+    let midX: float64 = 0.5 * (st.w.bodyPx[st.balFootLSlot] + st.w.bodyPx[st.balFootRSlot])
+    let midY: float64 = 0.5 * (st.w.bodyPy[st.balFootLSlot] + st.w.bodyPy[st.balFootRSlot])
+    let midZ: float64 = 0.5 * (st.w.bodyPz[st.balFootLSlot] + st.w.bodyPz[st.balFootRSlot])
+    CsgExecutionBalanceKickTo(st, st.balPelvisSlot,
+        midX + st.balPelvisOffX, midY + st.balPelvisOffY, midZ + st.balPelvisOffZ)
+    CsgExecutionBalanceKickTo(st, st.balChestSlot,
+        st.w.bodyPx[st.balPelvisSlot] + st.balChestOffX,
+        st.w.bodyPy[st.balPelvisSlot] + st.balChestOffY,
+        st.w.bodyPz[st.balPelvisSlot] + st.balChestOffZ)
+    CsgExecutionBalanceKickTo(st, st.balHeadSlot,
+        st.w.bodyPx[st.balPelvisSlot] + st.balHeadOffX,
+        st.w.bodyPy[st.balPelvisSlot] + st.balHeadOffY,
+        st.w.bodyPz[st.balPelvisSlot] + st.balHeadOffZ)
+
+# Ball-frame velocity kick: the v1 clamped kick retargeted by the ball
+# servo. The spring term is bounded by capMps and eased by springScale
+# (soft-start); the damper term acts along (v_point - vRef) with its
+# own bound dampCapMps. Both bounds are contact-path safety, not
+# dynamics: without them a single tick can request tens of m/s^2, and
+# the resulting friction impulses at the foot-ball and ball-ground
+# contacts measurably pump the pair's swing instead of bleeding it.
+fn CsgExecutionBalanceKickToBall(st: var CsgExecutionState,
+                                 slot: int32,
+                                 gain: float64,
+                                 capMps: float64,
+                                 damp: float64,
+                                 dampCapMps: float64,
+                                 springScale: float64,
+                                 vRefX: float64,
+                                 vRefY: float64,
+                                 vRefZ: float64,
+                                 wantX: float64,
+                                 wantY: float64,
+                                 wantZ: float64) =
+    var sx = gain * springScale * (wantX - st.w.bodyPx[slot])
+    var sy = gain * springScale * (wantY - st.w.bodyPy[slot])
+    var sz = gain * springScale * (wantZ - st.w.bodyPz[slot])
+    let sMag = numerics.CsgSqrt(sx * sx + sy * sy + sz * sz)
+    if sMag > capMps:
+        let scale = capMps / sMag
+        sx = sx * scale
+        sy = sy * scale
+        sz = sz * scale
+    # damper against the caller's reference velocity (ball center for
+    # the torso points, world zero for the feet scrape brake), capped at
+    # its own bound: the term is dissipative along (v_point - v_ref),
+    # but uncapped it reaches tens of m/s^2 at swing peaks, and that
+    # violent contact-path force measurably pumps the pair's swing
+    var dxv = 0.0 - damp * (st.w.bodyVx[slot] - vRefX)
+    var dyv = 0.0 - damp * (st.w.bodyVy[slot] - vRefY)
+    var dzv = 0.0 - damp * (st.w.bodyVz[slot] - vRefZ)
+    let dMag = numerics.CsgSqrt(dxv * dxv + dyv * dyv + dzv * dzv)
+    if dMag > dampCapMps:
+        let dscale = dampCapMps / dMag
+        dxv = dxv * dscale
+        dyv = dyv * dscale
+        dzv = dzv * dscale
+    st.w.bodyVx[slot] = st.w.bodyVx[slot] + sx + dxv
+    st.w.bodyVy[slot] = st.w.bodyVy[slot] + sy + dyv
+    st.w.bodyVz[slot] = st.w.bodyVz[slot] + sz + dzv
+
+# Contact-gated Coulomb rolling resistance for the ball-top mode (the
+# pair-level sink; mechanism and rate rationale at
+# CsgBalanceBallRollResistMps2). Gate: at least one foot within contact
+# slack of the sphere — no figure contact, zero effect. The ball's v and
+# omega are scaled by one common fraction (1 - a0*dt/speed, floored at
+# 0) so the rolling ratio survives the decay exactly.
+fn CsgExecutionBallRollingResistance(st: var CsgExecutionState) =
+    if st.balBallRollResist <= 0.0:
+        return
+    let bSlot: int32 = st.balBallSlot
+    var inContact: bool = false
+    if st.balFootLSlot >= 0:
+        let dx = st.w.bodyPx[st.balFootLSlot] - st.w.bodyPx[bSlot]
+        let dy = st.w.bodyPy[st.balFootLSlot] - st.w.bodyPy[bSlot]
+        let dz = st.w.bodyPz[st.balFootLSlot] - st.w.bodyPz[bSlot]
+        let rSum = st.balBallRadius + st.w.bodyRadius[st.balFootLSlot] + CsgBalanceBallContactSlackM
+        if dx * dx + dy * dy + dz * dz <= rSum * rSum:
+            inContact = true
+    if !inContact && st.balFootRSlot >= 0:
+        let dx = st.w.bodyPx[st.balFootRSlot] - st.w.bodyPx[bSlot]
+        let dy = st.w.bodyPy[st.balFootRSlot] - st.w.bodyPy[bSlot]
+        let dz = st.w.bodyPz[st.balFootRSlot] - st.w.bodyPz[bSlot]
+        let rSum = st.balBallRadius + st.w.bodyRadius[st.balFootRSlot] + CsgBalanceBallContactSlackM
+        if dx * dx + dy * dy + dz * dz <= rSum * rSum:
+            inContact = true
+    if !inContact:
+        return
+    let dv: float64 = st.balBallRollResist * (1.0 / 240.0)
+    let speed: float64 = numerics.CsgSqrt(st.w.bodyVx[bSlot] * st.w.bodyVx[bSlot] + st.w.bodyVy[bSlot] * st.w.bodyVy[bSlot] + st.w.bodyVz[bSlot] * st.w.bodyVz[bSlot])
+    if speed > dv:
+        let keep: float64 = 1.0 - dv / speed
+        st.w.bodyVx[bSlot] = st.w.bodyVx[bSlot] * keep
+        st.w.bodyVy[bSlot] = st.w.bodyVy[bSlot] * keep
+        st.w.bodyVz[bSlot] = st.w.bodyVz[bSlot] * keep
+        st.w.bodyAngVx[bSlot] = st.w.bodyAngVx[bSlot] * keep
+        st.w.bodyAngVy[bSlot] = st.w.bodyAngVy[bSlot] * keep
+        st.w.bodyAngVz[bSlot] = st.w.bodyAngVz[bSlot] * keep
+    else:
+        st.w.bodyVx[bSlot] = 0.0
+        st.w.bodyVy[bSlot] = 0.0
+        st.w.bodyVz[bSlot] = 0.0
+        st.w.bodyAngVx[bSlot] = 0.0
+        st.w.bodyAngVy[bSlot] = 0.0
+        st.w.bodyAngVz[bSlot] = 0.0
+
+# Balance ball-top servo: same clamped velocity-kick actuator as v1,
+# reference frame moved onto the rolling ball.
+#   - Pelvis target: its frozen horizontal offset from the ball center
+#     (the frozen apex stance already puts the mass-weighted figure CoM
+#     over the ball center; a live CoM target loop fed the articulation
+#     swing back into the balance target and rectified it into drift),
+#     standing height rides the live foot-support midpoint (v1
+#     semantics).
+#   - Feet targets: their surface-projected apex slots in the ball
+#     center frame (the stance contact points cannot be carried down
+#     the flank by the rolling surface).
+#   - Chest/head targets: the v1 frozen pelvis-relative offsets (upright
+#     pose hold).
+#   - Damping: velocity relative to the ball center, per-tick capped.
+# Dissipation contract: in the ball frame this is a damped spring
+# toward a frame-fixed target. The pair's common drift mode (ball +
+# figure translating together, frozen arrangement) has zero spring
+# error and zero relative velocity, so the servo does no work on the
+# drift — the structural fix for the v1 surf pump (B1: 275.9 m roll).
+fn CsgExecutionBalanceServoBall(st: var CsgExecutionState) =
+    # arming envelope: the servo actuates only while the rider is still
+    # inside its recoverable basin — upright, mass-weighted CoM within
+    # CsgBalanceBallServoRangeM of the ball center, and the pelvis within
+    # a vertical band around its standing height above the ball. Leaving
+    # the basin latches the servo off for the rest of the episode (kicks
+    # from a toppled/tangled/airborne state are unphysical actuation
+    # that pumps the pair without bound).
+    if st.balBallArmed == 0:
+        return
+    if st.w.bodyPz[st.balHeadSlot] < st.w.bodyPz[st.balPelvisSlot]:
+        st.balBallArmed = 0
+        return
+    let bSlot: int32 = st.balBallSlot
+    let pelvisAboveBall: float64 = st.w.bodyPz[st.balPelvisSlot] - st.w.bodyPz[bSlot]
+    let standZ: float64 = st.balBallRadius + st.balPelvisOffZ
+    if pelvisAboveBall > standZ + CsgBalanceBallZBandM:
+        st.balBallArmed = 0
+        return
+    if pelvisAboveBall < standZ - CsgBalanceBallZBandM:
+        st.balBallArmed = 0
+        return
+    var mSum: float64 = 0.0
+    var comX: float64 = 0.0
+    var comY: float64 = 0.0
+    var pi: int32 = 0
+    while pi < st.mpPartCount:
+        let slot: int32 = st.mpPartSlot[pi]
+        let mass: float64 = 1.0 / st.w.bodyInvMass[slot]
+        mSum = mSum + mass
+        comX = comX + mass * st.w.bodyPx[slot]
+        comY = comY + mass * st.w.bodyPy[slot]
+        pi = pi + 1
+    comX = comX / mSum
+    comY = comY / mSum
+    # damper reference = the ball center velocity (feet at rest in the
+    # non-rotating center frame receive no kick). Damping the figure
+    # against the pair CoM was measured destabilizing: it drags the
+    # figure toward the swinging ball instead of holding the balance
+    # frame.
+    let vRefX: float64 = st.w.bodyVx[bSlot]
+    let vRefY: float64 = st.w.bodyVy[bSlot]
+    let vRefZ: float64 = st.w.bodyVz[bSlot]
+    let comErrX = comX - st.w.bodyPx[bSlot]
+    let comErrY = comY - st.w.bodyPy[bSlot]
+    if comErrX * comErrX + comErrY * comErrY > CsgBalanceBallServoRangeM * CsgBalanceBallServoRangeM:
+        st.balBallArmed = 0
+        return
+    # Lean trim (zero-creep configuration): the slow integrator walks the
+    # pelvis target horizontally toward the measured CoM so the frozen
+    # stance offset converges to the true loaded balance point and the
+    # chase pump's amplitude — the standing lean — collapses. See
+    # CsgBalanceBallTrimRate. Disabled (and the accumulated trim held)
+    # when the per-state trim rate is 0.0, the N1 default.
+    if st.balBallTrim > 0.0:
+        var trimX = st.balBallTrimX - st.balBallTrim * comErrX
+        if trimX > CsgBalanceBallTrimRangeM:
+            trimX = CsgBalanceBallTrimRangeM
+        if trimX < 0.0 - CsgBalanceBallTrimRangeM:
+            trimX = 0.0 - CsgBalanceBallTrimRangeM
+        st.balBallTrimX = trimX
+        var trimY = st.balBallTrimY - st.balBallTrim * comErrY
+        if trimY > CsgBalanceBallTrimRangeM:
+            trimY = CsgBalanceBallTrimRangeM
+        if trimY < 0.0 - CsgBalanceBallTrimRangeM:
+            trimY = 0.0 - CsgBalanceBallTrimRangeM
+        st.balBallTrimY = trimY
+    # soft-start for the torso spring only: it eases in over
+    # CsgBalanceBallRampTicks from mode enable so the release-drop
+    # transient is absorbed by the (always full-strength, dissipative)
+    # damper instead of a hard spring. The feet anchors skip the ramp —
+    # they are the contact-point stabilization and must hold from the
+    # landing itself.
+    let age: float64 = float64(st.w.tick - st.balBallEnableTick)
+    var torsoSpringScale: float64 = 1.0
+    if age < CsgBalanceBallRampTicks:
+        torsoSpringScale = age / CsgBalanceBallRampTicks
+    # vertical reference = the live foot-support midpoint (v1 semantics:
+    # standing height above wherever the feet actually are). Unlike a
+    # ball-surface projection this has zero spring error while the
+    # figure hangs in the air (no preload slam onto the ball at
+    # release) and zero error mid-flight (no puppet hover); the arming
+    # band is what keeps the servo honest about standing on the ball.
+    # horizontal reference = the ball center (balance)
+    let midZ: float64 = 0.5 * (st.w.bodyPz[st.balFootLSlot] + st.w.bodyPz[st.balFootRSlot])
+    let targetZ: float64 = midZ + st.balPelvisOffZ
+    CsgExecutionBalanceKickToBall(st, st.balPelvisSlot, st.balBallGain, st.balBallTorsoCapMps, st.balBallDamp, CsgBalanceBallDampCapMps, torsoSpringScale, vRefX, vRefY, vRefZ,
+        st.w.bodyPx[bSlot] + st.balBallPelvisOffX + st.balBallUserLeanX + st.balBallTrimX,
+        st.w.bodyPy[bSlot] + st.balBallPelvisOffY + st.balBallTrimY,
+        targetZ)
+    # feet hold their surface-projected apex slots, weakly (a strong pin
+    # fights the rolling surface and acts as a spin motor), and their
+    # damper references the WORLD, not the ball: a riding foot moves
+    # with the ball, so an absolute-frame damper drags backward against
+    # the rolling — the scrape brake. This is the only channel that
+    # bleeds the pair's common rolling mode (relative damping is blind
+    # to it: figure and ball move together there).
+    CsgExecutionBalanceKickToBall(st, st.balFootLSlot, st.balBallFootGain, st.balBallCorrCapMps, st.balBallDamp, CsgBalanceBallDampCapMps, 1.0, 0.0, 0.0, 0.0,
+        st.w.bodyPx[bSlot] + st.balBallFootLOffX,
+        st.w.bodyPy[bSlot] + st.balBallFootLOffY,
+        st.w.bodyPz[bSlot] + st.balBallFootLOffZ)
+    CsgExecutionBalanceKickToBall(st, st.balFootRSlot, st.balBallFootGain, st.balBallCorrCapMps, st.balBallDamp, CsgBalanceBallDampCapMps, 1.0, 0.0, 0.0, 0.0,
+        st.w.bodyPx[bSlot] + st.balBallFootROffX,
+        st.w.bodyPy[bSlot] + st.balBallFootROffY,
+        st.w.bodyPz[bSlot] + st.balBallFootROffZ)
+    CsgExecutionBalanceKickToBall(st, st.balChestSlot, st.balBallGain, st.balBallTorsoCapMps, st.balBallDamp, CsgBalanceBallDampCapMps, torsoSpringScale, vRefX, vRefY, vRefZ,
+        st.w.bodyPx[st.balPelvisSlot] + st.balChestOffX,
+        st.w.bodyPy[st.balPelvisSlot] + st.balChestOffY,
+        st.w.bodyPz[st.balPelvisSlot] + st.balChestOffZ)
+    CsgExecutionBalanceKickToBall(st, st.balHeadSlot, st.balBallGain, st.balBallTorsoCapMps, st.balBallDamp, CsgBalanceBallDampCapMps, torsoSpringScale, vRefX, vRefY, vRefZ,
+        st.w.bodyPx[st.balPelvisSlot] + st.balHeadOffX,
+        st.w.bodyPy[st.balPelvisSlot] + st.balHeadOffY,
+        st.w.bodyPz[st.balPelvisSlot] + st.balHeadOffZ)
+
+# Balance v1 capture stepping: while standing (every footstep slot,
+# static and dynamic, finished), a mass-weighted torso-CoM horizontal
+# speed above the trigger injects one 2-step gait along the velocity
+# direction with the exact walk-queue footstep semantics (landings =
+# live foot position + velocity direction x capture length, 270-tick
+# windows on the 135-tick half cycle, rate 0.80, plant 0.02). While the
+# queue drains no further injection happens, so a velocity back under
+# the trigger simply stops the reflex. Returns the queued step count.
+@borrows
+fn CsgExecutionBalanceCapture(st: var CsgExecutionState,
+                              facts: schema.CsgWorldFacts): int32 =
+    var si: int32 = 0
+    while si < st.footCon.len:
+        if st.footDone[si] != 2:
+            return 0
+        si = si + 1
+    let mPelvis = 1.0 / st.w.bodyInvMass[st.balPelvisSlot]
+    let mChest = 1.0 / st.w.bodyInvMass[st.balChestSlot]
+    let mHead = 1.0 / st.w.bodyInvMass[st.balHeadSlot]
+    let mSum = mPelvis + mChest + mHead
+    let comVx = (mPelvis * st.w.bodyVx[st.balPelvisSlot] + mChest * st.w.bodyVx[st.balChestSlot] + mHead * st.w.bodyVx[st.balHeadSlot]) / mSum
+    let comVy = (mPelvis * st.w.bodyVy[st.balPelvisSlot] + mChest * st.w.bodyVy[st.balChestSlot] + mHead * st.w.bodyVy[st.balHeadSlot]) / mSum
+    let speed2 = comVx * comVx + comVy * comVy
+    if speed2 <= st.balCaptureSpeedMps * st.balCaptureSpeedMps:
+        return 0
+    let speed = numerics.CsgSqrt(speed2)
+    let dirX = comVx / speed
+    let dirY = comVy / speed
+    var footL: int32 = -1
+    var footR: int32 = -1
+    var pi: int32 = 0
+    while pi < facts.partRole.len:
+        if facts.partRole[pi] == schema.CsgRoleFootL:
+            footL = pi
+        if facts.partRole[pi] == schema.CsgRoleFootR:
+            footR = pi
+        pi = pi + 1
+    if footL < 0 || footR < 0:
+        return 0
+    let slotL: int32 = CsgExecutionPartSlot(st, footL)
+    let slotR: int32 = CsgExecutionPartSlot(st, footR)
+    let lead: int64 = st.w.tick + int64(st.balCaptureLeadTicks)
+    let windowTicks: int64 = int64(st.balCaptureWindowTicks)
+    let halfTicks: int64 = int64(st.balCaptureWindowTicks * 0.5)
+    let stepLenM: float64 = st.balCaptureStepLenM
+    CsgExecutionQueueStep(st, footR,
+        st.w.bodyPx[slotR] + dirX * stepLenM,
+        st.w.bodyPy[slotR] + dirY * stepLenM,
+        st.w.bodyPz[slotR],
+        lead, lead + windowTicks, CsgCaptureRate, CsgCapturePlantM)
+    CsgExecutionQueueStep(st, footL,
+        st.w.bodyPx[slotL] + dirX * stepLenM,
+        st.w.bodyPy[slotL] + dirY * stepLenM,
+        st.w.bodyPz[slotL],
+        lead + halfTicks, lead + halfTicks + windowTicks,
+        CsgCaptureRate, CsgCapturePlantM)
+    return int32(int64(st.balCaptureSteps))
+
+@borrows
+fn CsgExecutionTryGrasp(st: var CsgExecutionState,
+                        facts: schema.CsgWorldFacts,
+                        actionIdx: int32) =
+    let tick = facts.actionStartTick[actionIdx]
+    let part = facts.actionPart[actionIdx]
+    let node = facts.actionTargetNode[actionIdx]
+    let handSlot = CsgExecutionPartSlot(st, part)
+    let nodeSlot = CsgExecutionRopeNodeSlot(st, node)
+    var failed: bool = false
+    var dist: float64 = 0.0
+    # a rejected step leaves the tick unchanged; retries must not duplicate
+    # the constraint (a hand holds at most one node at a time)
+    if st.handGraspCon[part] >= 0:
+        return
+    if st.w.ropeActive == 0:
+        failed = true
+    if nodeSlot < 0 || handSlot < 0:
+        failed = true
+    if !failed:
+        let dx = st.w.bodyPx[nodeSlot] - st.w.bodyPx[handSlot]
+        let dy = st.w.bodyPy[nodeSlot] - st.w.bodyPy[handSlot]
+        let dz = st.w.bodyPz[nodeSlot] - st.w.bodyPz[handSlot]
+        dist = numerics.CsgSqrt(dx * dx + dy * dy + dz * dz)
+        if dist > CsgExecGraspReachM:
+            failed = true
+    if failed:
+        st.graspFailCount = st.graspFailCount + 1
+        CsgExecutionAddEvent(st, tick, CsgExecEventGraspFailed, part)
+        return
+    let ci = World3dAddConstraint(st.w, handSlot, nodeSlot, dist, world3d.World3dConGrasp)
+    st.handGraspCon[part] = ci
+    st.graspNodeOfHand[part] = nodeSlot
+    st.lostGrace[part] = 0
+    st.graspOkCount = st.graspOkCount + 1
+    CsgExecutionAddEvent(st, tick, CsgExecEventGraspOk, part)
+
+@borrows
+# Reach variant of TryGrasp: attaches regardless of the grasp radius (the
+# climber's reach is realized by the arm strut extending), still refusing
+# duplicates, dead rope and invalid slots.
+@borrows
+fn CsgExecutionTryGraspForced(st: var CsgExecutionState,
+                              facts: schema.CsgWorldFacts,
+                              actionIdx: int32) =
+    let tick = facts.actionStartTick[actionIdx]
+    let part = facts.actionPart[actionIdx]
+    let node = facts.actionTargetNode[actionIdx]
+    let handSlot = CsgExecutionPartSlot(st, part)
+    let nodeSlot = CsgExecutionRopeNodeSlot(st, node)
+    if st.handGraspCon[part] >= 0:
+        return
+    if st.w.ropeActive == 0:
+        st.graspFailCount = st.graspFailCount + 1
+        CsgExecutionAddEvent(st, tick, CsgExecEventGraspFailed, part)
+        return
+    if nodeSlot < 0 || handSlot < 0:
+        st.graspFailCount = st.graspFailCount + 1
+        CsgExecutionAddEvent(st, tick, CsgExecEventGraspFailed, part)
+        return
+    let dx = st.w.bodyPx[nodeSlot] - st.w.bodyPx[handSlot]
+    let dy = st.w.bodyPy[nodeSlot] - st.w.bodyPy[handSlot]
+    let dz = st.w.bodyPz[nodeSlot] - st.w.bodyPz[handSlot]
+    let dist = numerics.CsgSqrt(dx * dx + dy * dy + dz * dz)
+    let ci = World3dAddConstraint(st.w, handSlot, nodeSlot, dist, world3d.World3dConGrasp)
+    st.handGraspCon[part] = ci
+    st.graspNodeOfHand[part] = nodeSlot
+    st.lostGrace[part] = 0
+    st.graspOkCount = st.graspOkCount + 1
+    CsgExecutionAddEvent(st, tick, CsgExecEventGraspOk, part)
+
+@borrows
+fn CsgExecutionRelease(st: var CsgExecutionState,
+                       facts: schema.CsgWorldFacts,
+                       actionIdx: int32) =
+    let tick = facts.actionStartTick[actionIdx]
+    let part = facts.actionPart[actionIdx]
+    let ci = st.handGraspCon[part]
+    if ci >= 0:
+        st.w.conActive[ci] = 0
+        st.handGraspCon[part] = -1
+        st.graspNodeOfHand[part] = -1
+        st.releaseCount = st.releaseCount + 1
+        CsgExecutionAddEvent(st, tick, CsgExecEventReleased, part)
+
+# Grasp window end == open hand. Only the constraint created by this exact
+# action window is released (guard: the hand must hold the action's node).
+@borrows
+fn CsgExecutionReleaseAtEnd(st: var CsgExecutionState,
+                            facts: schema.CsgWorldFacts,
+                            actionIdx: int32) =
+    let tick = facts.actionEndTick[actionIdx]
+    let part = facts.actionPart[actionIdx]
+    let node = facts.actionTargetNode[actionIdx]
+    let nodeSlot = CsgExecutionRopeNodeSlot(st, node)
+    let ci = st.handGraspCon[part]
+    if ci < 0:
+        return
+    if st.graspNodeOfHand[part] != nodeSlot:
+        return
+    st.w.conActive[ci] = 0
+    st.handGraspCon[part] = -1
+    st.graspNodeOfHand[part] = -1
+    st.releaseCount = st.releaseCount + 1
+    CsgExecutionAddEvent(st, tick, CsgExecEventReleased, part)
+
+# Semantic removal of the rope (intervention op): rope segments and grasp
+# constraints die, rope nodes freeze, and every held hand loses its hold.
+fn CsgExecutionRemoveSupport(st: var CsgExecutionState, tick: int64) =
+    rope3d.Rope3dRemoveFromWorld(st.w)
+    var part: int32 = 0
+    while part < st.mpPartCount:
+        let ci = st.handGraspCon[part]
+        if ci >= 0:
+            st.w.conActive[ci] = 0
+            st.handGraspCon[part] = -1
+            st.graspNodeOfHand[part] = -1
+        part = part + 1
+    CsgExecutionAddEvent(st, tick, CsgExecEventSupportRemoved, 0)
+
+# One scripted footstep slot (shared by the static facts segment and the
+# dynamic queue): spawn the landing anchor at startTick and winch the foot
+# toward it with a bounded-rate target, plant until endTick, then
+# deactivate. The pelvis is dragged by the leg length constraints —
+# dynamics decides the body pose throughout.
+fn CsgExecutionRunFootstep(st: var CsgExecutionState,
+                           si: int32,
+                           footPart: int32,
+                           landX: float64,
+                           landY: float64,
+                           landZ: float64,
+                           startTick: int64,
+                           endTick: int64,
+                           rate: float64,
+                           plantLen: float64) =
+    let tick = st.w.tick
+    let dt: float64 = 1.0 / 240.0
+    if tick == startTick:
+        let footSlot0 = CsgExecutionPartSlot(st, footPart)
+        var anchorSlot: int32
+        if si >= st.dynFootStart && st.anchorFreeSlot.len > 0:
+            # dynamic-queue recycling: a released anchor's body slot is
+            # rewritten in place, field-for-field identical to what
+            # World3dSpawnBody would produce (fresh entity id from
+            # nextEntityId, bumped generation, cleared velocity/angular/
+            # force columns, static invMass 0, anchor kind) — the reused
+            # slot is a brand-new body and w.count never grows past the
+            # live-anchor peak. Static-facts footsteps always spawn fresh,
+            # so climb/walk/journey semantics stay byte-identical.
+            if st.w.nextEntityId >= world3d.World3dGenerationOverflow:
+                panic("world3d: entity id generation overflow")
+            anchorSlot = st.anchorFreeSlot[st.anchorFreeSlot.len - 1]
+            setLen(st.anchorFreeSlot, st.anchorFreeSlot.len - 1)
+            st.w.entityIds[anchorSlot] = st.w.nextEntityId
+            st.w.nextEntityId = st.w.nextEntityId + 1
+            st.w.generations[anchorSlot] = st.w.generations[anchorSlot] + 1
+            st.w.bodyPx[anchorSlot] = landX
+            st.w.bodyPy[anchorSlot] = landY
+            st.w.bodyPz[anchorSlot] = landZ
+            st.w.bodyVx[anchorSlot] = 0.0
+            st.w.bodyVy[anchorSlot] = 0.0
+            st.w.bodyVz[anchorSlot] = 0.0
+            st.w.bodyInvMass[anchorSlot] = 0.0
+            st.w.bodyRadius[anchorSlot] = 0.03
+            st.w.bodyKind[anchorSlot] = world3d.World3dBodyAnchor
+            st.w.bodyAngVx[anchorSlot] = 0.0
+            st.w.bodyAngVy[anchorSlot] = 0.0
+            st.w.bodyAngVz[anchorSlot] = 0.0
+            st.w.bodyFx[anchorSlot] = 0.0
+            st.w.bodyFy[anchorSlot] = 0.0
+            st.w.bodyFz[anchorSlot] = 0.0
+        else:
+            anchorSlot = world3d.World3dSpawnBody(st.w,
+                landX, landY, landZ,
+                0.0, 0.03, world3d.World3dBodyAnchor)
+        let dx0 = st.w.bodyPx[anchorSlot] - st.w.bodyPx[footSlot0]
+        let dy0 = st.w.bodyPy[anchorSlot] - st.w.bodyPy[footSlot0]
+        let dz0 = st.w.bodyPz[anchorSlot] - st.w.bodyPz[footSlot0]
+        let dist0 = numerics.CsgSqrt(dx0 * dx0 + dy0 * dy0 + dz0 * dz0)
+        var ciNew: int32
+        if si >= st.dynFootStart && st.footConFree.len > 0:
+            # dynamic-queue recycling: the released StepPull slot is
+            # rewritten in place, field-for-field identical to what
+            # World3dAddConstraint would produce (endpoints, rest = spawn
+            # distance, target = rest, kind, active)
+            ciNew = st.footConFree[st.footConFree.len - 1]
+            setLen(st.footConFree, st.footConFree.len - 1)
+            st.w.conA[ciNew] = footSlot0
+            st.w.conB[ciNew] = anchorSlot
+            st.w.conRest[ciNew] = dist0
+            st.w.conTarget[ciNew] = dist0
+            st.w.conKind[ciNew] = world3d.World3dConStepPull
+            st.w.conActive[ciNew] = 1
+        else:
+            ciNew = world3d.World3dAddConstraint(st.w, footSlot0, anchorSlot, dist0, world3d.World3dConStepPull)
+        st.footCon[si] = ciNew
+        st.footAnchor[si] = anchorSlot
+        st.footDone[si] = 1
+    if st.footDone[si] == 1:
+        let ci = st.footCon[si]
+        if tick >= endTick:
+            st.w.conActive[ci] = 0
+            st.footDone[si] = 2
+            if si >= st.dynFootStart:
+                # dynamic-queue recycling: the anchor body slot and the
+                # StepPull constraint slot return to the free lists for
+                # the next injected footstep
+                add(st.anchorFreeSlot, st.footAnchor[si])
+                add(st.footConFree, ci)
+            CsgExecutionAddEvent(st, tick, CsgExecEventFootstepDone, footPart)
+        else:
+            # Winch floor = min(plantLen, spawn distance): a station anchor
+            # born on the part itself (dist0 < plantLen) must hold the part
+            # at its station point. Raising the target above the spawn
+            # distance turns the bilateral StepPull into a full-diff push
+            # away from the anchor — the zero-length megaprojection kick.
+            # Normal winch steps (dist0 >= plantLen) keep the exact
+            # plantLen floor; only the dist0 < plantLen branch changes.
+            let floorLen = m.minFloat(plantLen, st.w.conRest[ci])
+            let newTarget = st.w.conTarget[ci] - rate * dt
+            if newTarget < floorLen:
+                st.w.conTarget[ci] = floorLen
+            else:
+                st.w.conTarget[ci] = newTarget
+
+# One authority tick. Returns the step receipt; the caller chains CIDs.
+@borrows
+fn CsgExecutionTick(st: var CsgExecutionState,
+                    facts: schema.CsgWorldFacts): physics3d.Physics3dStepReceipt =
+    let tick = st.w.tick
+    let dt: float64 = 1.0 / 240.0
+    # 1. activations; a grasp window ending == release (open hand)
+    var ai: int32 = 0
+    while ai < facts.actionKind.len:
+        if facts.actionStartTick[ai] == tick:
+            let kind = facts.actionKind[ai]
+            if kind == schema.CsgActionGrasp:
+                CsgExecutionTryGrasp(st, facts, ai)
+            if kind == schema.CsgActionRelease:
+                CsgExecutionRelease(st, facts, ai)
+        if (facts.actionKind[ai] == schema.CsgActionGrasp || facts.actionKind[ai] == schema.CsgActionReach) && facts.actionEndTick[ai] == tick:
+            CsgExecutionReleaseAtEnd(st, facts, ai)
+        ai = ai + 1
+    # 2. rate-capped joint servo targets (actuator model: bounded-rate
+    #    muscle set-points; the solver holds each joint at target length)
+    ai = 0
+    var si: int32 = 0
+    while ai < facts.actionKind.len:
+        let kind = facts.actionKind[ai]
+        let part = facts.actionPart[ai]
+        let startT = facts.actionStartTick[ai]
+        let endT = facts.actionEndTick[ai]
+        if kind == schema.CsgActionArmPull:
+            # winch: shorten the hand's grasp target (ascender climb);
+            # simultaneously pay out every other held grasp so the rope
+            # slides through unweighted ascenders instead of locking
+            let ci = st.handGraspCon[part]
+            if ci >= 0 && st.w.conActive[ci] == 1 && tick >= startT && tick <= endT:
+                let newTarget = st.w.conTarget[ci] - facts.actionRateLimit[ai] * dt
+                if newTarget < facts.actionMinLen[ai]:
+                    st.w.conTarget[ci] = facts.actionMinLen[ai]
+                else:
+                    st.w.conTarget[ci] = newTarget
+        if kind == schema.CsgActionReach:
+            # reach = attach the free hand to its target node at startTick;
+            # the constraint solver does the pulling (winch model)
+            if tick == startT:
+                CsgExecutionTryGraspForced(st, facts, ai)
+        if kind == schema.CsgActionLegPush:
+            let ci = st.legConOfPart[part]
+            if ci >= 0:
+                if tick >= startT && tick <= endT:
+                    let newTarget = st.w.conTarget[ci] + facts.actionRateLimit[ai] * dt
+                    if newTarget > facts.actionMaxLen[ai]:
+                        st.w.conTarget[ci] = facts.actionMaxLen[ai]
+                    else:
+                        st.w.conTarget[ci] = newTarget
+                if tick > endT:
+                    let back = st.w.conTarget[ci] - facts.actionRateLimit[ai] * dt
+                    if back <= st.w.conRest[ci]:
+                        st.w.conTarget[ci] = st.w.conRest[ci]
+                    else:
+                        st.w.conTarget[ci] = back
+        ai = ai + 1
+    # 2.5 scripted footsteps: static facts segment first (frozen order),
+    # then the runtime-injected dynamic queue segment — identical
+    # footstep semantics on both (CsgExecutionRunFootstep).
+    si = 0
+    while si < facts.stepPart.len:
+        CsgExecutionRunFootstep(st, si,
+            facts.stepPart[si], facts.stepX[si], facts.stepY[si], facts.stepZ[si],
+            facts.stepStartTick[si], facts.stepEndTick[si],
+            facts.stepRate[si], facts.stepPlantLen[si])
+        si = si + 1
+    si = st.dynFootStart
+    while si < st.footCon.len:
+        let di: int32 = si - st.dynFootStart
+        CsgExecutionRunFootstep(st, si,
+            st.dynFootPart[di], st.dynFootX[di], st.dynFootY[di], st.dynFootZ[di],
+            st.dynFootStartTick[di], st.dynFootEndTick[di],
+            st.dynFootRate[di], st.dynFootPlantLen[di])
+        si = si + 1
+    # 2.6 balance v1 (free-walk worlds only — empty action table): the
+    # PD upright servo runs every tick; capture stepping only fires
+    # while standing. Scripted-action worlds never enter this branch,
+    # so climb/walk/journey stay byte-identical. Ball-top mode replaces
+    # both: the ball-frame servo runs while the figure is still upright
+    # (kicks after a topple are unphysical actuation that punts the
+    # ball), capture stepping is structurally off (no ground to step
+    # onto).
+    if st.balOn != 0:
+        if st.balBallMode != 0:
+            CsgExecutionBallRollingResistance(st)
+            CsgExecutionBalanceServoBall(st)
+        else:
+            CsgExecutionBalanceServo(st)
+            if CsgExecutionBalanceCapture(st, facts) > 0:
+                st.balCaptures = st.balCaptures + 1
+    # 3. grasp-held re-derivation with grace window
+    var part: int32 = 0
+    while part < st.mpPartCount:
+        let ci = st.handGraspCon[part]
+        if ci >= 0 && st.w.conActive[ci] == 1:
+            let nodeSlot = st.graspNodeOfHand[part]
+            if nodeSlot < 0 || !World3dRopePathToAnchor(st.w, nodeSlot):
+                st.lostGrace[part] = st.lostGrace[part] + 1
+                if st.lostGrace[part] > CsgExecGraspLostGraceTicks:
+                    st.w.conActive[ci] = 0
+                    st.handGraspCon[part] = -1
+                    st.graspNodeOfHand[part] = -1
+                    st.graspLostCount = st.graspLostCount + 1
+                    CsgExecutionAddEvent(st, tick, CsgExecEventGraspLost, part)
+            else:
+                st.lostGrace[part] = 0
+        part = part + 1
+    # 4. authority physics step
+    var receipt = physics3d.Physics3dStep(st.w, CsgExecForceSource)
+    if receipt.statusCode != physics3d.Physics3dStatusOk:
+        st.rejectedCount = st.rejectedCount + 1
+        CsgExecutionAddEvent(st, tick, CsgExecEventStepRejected, receipt.statusCode)
+    let prevChain: str = Fmt"{st.chainCid}"
+    st.chainCid = strings.Sha256(prevChain + receipt.receiptCid)
+    st.stepCount = st.stepCount + int64(1)
+    return receipt
+
+@borrows
+fn CsgExecutionEventKindAt(st: CsgExecutionState, idx: int32): int32 =
+    if idx < 0 || idx >= st.eventCount:
+        return -1
+    return st.eventKind[idx]
+
+@borrows
+fn CsgExecutionEventTickAt(st: CsgExecutionState, idx: int32): int64 =
+    if idx < 0 || idx >= st.eventCount:
+        return int64(-1)
+    return st.eventTick[idx]
+
+# Checkpoint snapshot for intervention derivation (E2): deep copy of the
+# live state including the world clone. The snapshot continues its own
+# branch from this tick.
+@borrows
+fn CsgExecutionSnapshot(st: CsgExecutionState): CsgExecutionState =
+    var out: CsgExecutionState
+    out.w = World3dClone(st.w)
+    out.mpPartCount = st.mpPartCount
+    setLen(out.mpPartSlot, 0)
+    out.mpRopeNodeCount = st.mpRopeNodeCount
+    setLen(out.mpRopeNodeSlot, 0)
+    setLen(out.handGraspCon, 0)
+    setLen(out.graspNodeOfHand, 0)
+    setLen(out.legConOfPart, 0)
+    setLen(out.jointOfPart, 0)
+    setLen(out.jointPeerSlot, 0)
+    setLen(out.legPushing, 0)
+    setLen(out.lostGrace, 0)
+    var i: int32 = 0
+    while i < st.mpPartCount:
+        add(out.mpPartSlot, st.mpPartSlot[i])
+        add(out.handGraspCon, st.handGraspCon[i])
+        add(out.graspNodeOfHand, st.graspNodeOfHand[i])
+        add(out.legConOfPart, st.legConOfPart[i])
+        add(out.jointOfPart, st.jointOfPart[i])
+        add(out.legPushing, st.legPushing[i])
+        add(out.lostGrace, st.lostGrace[i])
+        i = i + 1
+    i = 0
+    while i < st.mpRopeNodeCount:
+        add(out.mpRopeNodeSlot, st.mpRopeNodeSlot[i])
+        i = i + 1
+    i = 0
+    while i < st.footCon.len:
+        add(out.footCon, st.footCon[i])
+        add(out.footAnchor, st.footAnchor[i])
+        add(out.footDone, st.footDone[i])
+        i = i + 1
+    # dynamic step queue deep copy: parameters AND the segment origin,
+    # so a snapshot branch keeps stepping identically after the cut
+    out.dynFootStart = st.dynFootStart
+    i = 0
+    while i < st.dynFootPart.len:
+        add(out.dynFootPart, st.dynFootPart[i])
+        add(out.dynFootX, st.dynFootX[i])
+        add(out.dynFootY, st.dynFootY[i])
+        add(out.dynFootZ, st.dynFootZ[i])
+        add(out.dynFootStartTick, st.dynFootStartTick[i])
+        add(out.dynFootEndTick, st.dynFootEndTick[i])
+        add(out.dynFootRate, st.dynFootRate[i])
+        add(out.dynFootPlantLen, st.dynFootPlantLen[i])
+        i = i + 1
+    # dynamic anchor recycling free lists ride the snapshot so a branch
+    # keeps reusing the same released slots
+    i = 0
+    while i < st.anchorFreeSlot.len:
+        add(out.anchorFreeSlot, st.anchorFreeSlot[i])
+        i = i + 1
+    i = 0
+    while i < st.footConFree.len:
+        add(out.footConFree, st.footConFree[i])
+        i = i + 1
+    i = 0
+    while i < st.jointPeerSlot.len:
+        add(out.jointPeerSlot, st.jointPeerSlot[i])
+        i = i + 1
+    # balance v1 state: the pose offsets and slots ride the snapshot so
+    # a branch keeps its controller; the capture counter restarts
+    out.balOn = st.balOn
+    out.balPelvisSlot = st.balPelvisSlot
+    out.balChestSlot = st.balChestSlot
+    out.balHeadSlot = st.balHeadSlot
+    out.balFootLSlot = st.balFootLSlot
+    out.balFootRSlot = st.balFootRSlot
+    out.balChestOffX = st.balChestOffX
+    out.balChestOffY = st.balChestOffY
+    out.balChestOffZ = st.balChestOffZ
+    out.balHeadOffX = st.balHeadOffX
+    out.balHeadOffY = st.balHeadOffY
+    out.balHeadOffZ = st.balHeadOffZ
+    out.balPelvisOffX = st.balPelvisOffX
+    out.balPelvisOffY = st.balPelvisOffY
+    out.balPelvisOffZ = st.balPelvisOffZ
+    out.balCaptures = 0
+    # live balance parameters ride the snapshot: a branch keeps its
+    # controller configuration exactly
+    out.balGain = st.balGain
+    out.balDamp = st.balDamp
+    out.balCorrCapMps = st.balCorrCapMps
+    out.balCaptureSpeedMps = st.balCaptureSpeedMps
+    out.balCaptureStepLenM = st.balCaptureStepLenM
+    out.balCaptureSteps = st.balCaptureSteps
+    out.balCaptureLeadTicks = st.balCaptureLeadTicks
+    out.balCaptureWindowTicks = st.balCaptureWindowTicks
+    # ball-top mode rides the snapshot: a branch keeps its controller
+    out.balBallMode = st.balBallMode
+    out.balBallSlot = st.balBallSlot
+    out.balBallArmed = st.balBallArmed
+    out.balBallEnableTick = st.balBallEnableTick
+    out.balBallRadius = st.balBallRadius
+    out.balBallFootLOffX = st.balBallFootLOffX
+    out.balBallFootLOffY = st.balBallFootLOffY
+    out.balBallFootLOffZ = st.balBallFootLOffZ
+    out.balBallFootROffX = st.balBallFootROffX
+    out.balBallFootROffY = st.balBallFootROffY
+    out.balBallFootROffZ = st.balBallFootROffZ
+    out.balBallPelvisOffX = st.balBallPelvisOffX
+    out.balBallPelvisOffY = st.balBallPelvisOffY
+    out.balBallGain = st.balBallGain
+    out.balBallFootGain = st.balBallFootGain
+    out.balBallDamp = st.balBallDamp
+    out.balBallCorrCapMps = st.balBallCorrCapMps
+    out.balBallTorsoCapMps = st.balBallTorsoCapMps
+    out.balBallRollResist = st.balBallRollResist
+    out.balBallTrim = st.balBallTrim
+    out.balBallTrimX = st.balBallTrimX
+    out.balBallTrimY = st.balBallTrimY
+    out.balBallUserLeanX = st.balBallUserLeanX
+    out.eventCount = 0
+    setLen(out.eventTick, 0)
+    setLen(out.eventKind, 0)
+    setLen(out.eventArg, 0)
+    out.rejectedCount = 0
+    out.graspOkCount = 0
+    out.graspFailCount = 0
+    out.releaseCount = 0
+    out.graspLostCount = 0
+    out.chainCid = Fmt"{st.chainCid}"
+    out.stepCount = st.stepCount
+    return out

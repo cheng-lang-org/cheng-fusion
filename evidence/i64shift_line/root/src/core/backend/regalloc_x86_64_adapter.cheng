@@ -1,0 +1,2373 @@
+import cheng/core/ir/core_types as coreir
+import cheng/core/ir/body_ir_access as bodyaccess
+import cheng/core/backend/regalloc_single_pass as alloc
+import cheng/core/backend/codegen_contract as carrier
+import cheng/core/lang/typed_expr as texpr
+import cheng/std/bytes_layout as layout
+import std/strings
+
+# Canonical Linux x86_64 machine adapter.
+#
+# The production artifact carrier predates the second architecture and still
+# has AArch64 in its type names. This module uses only the architecture-neutral
+# fields of that frozen carrier: packed function words, action-owned fragments,
+# ABI ingress rows and exact effect bits. It never calls another emitter.
+#
+# Admitted surface:
+#   * scalar I32/I64/Ptr parameters in SysV register arguments;
+#   * LoadConst, scalar CopyLocal/LoadLocal/StoreLocal;
+#   * add/sub/mul/and/or/xor and integer comparisons;
+#   * internal direct calls with exact SysV register/stack arguments,
+#     scalar/void or caller-owned sret results and exact PC-relative
+#     relocation identity;
+#   * frozen Br/Cbr CFG, source-adjacent edge trampolines and rel32 fixups;
+#   * register parallel-copy cycles through proved reserved SysV r11;
+#   * scalar return;
+#   * proved callee-saved registers and call-site spill/reload slots.
+#
+# Indirect/importc (including variadic C) surfaces hard-fail at the first
+# exact action/op identity.  The sole indirect-call admission is the canonical
+# forwarded-entry-sret bridge, whose hidden result register and two explicit
+# pointer arguments are proved by frozen BodyIR actions.
+
+const
+    RegallocX64RecipeErrorNone = 0
+    RegallocX64RecipeErrorPlan = 1
+    RegallocX64RecipeErrorBody = 2
+    RegallocX64RecipeErrorAction = 3
+    RegallocX64RecipeErrorEncoding = 4
+    RegallocX64RecipeErrorUnsupported = 5
+
+    RegallocX64Rax = 0
+    RegallocX64Rdx = 2
+    RegallocX64Rbx = 3
+    RegallocX64Rsp = 4
+    RegallocX64Rbp = 5
+    RegallocX64Rsi = 6
+    RegallocX64Rdi = 7
+    RegallocX64R11 = 11
+    RegallocX64R12 = 12
+    RegallocX64R15 = 15
+
+type
+    RegallocX64BranchFixup =
+        fragmentIndex: int32 = -1
+        sourceBlock: int32 = -1
+        targetBlock: int32 = -1
+        branchOrdinal: int32 = -1
+        branchByteOffset: int32 = -1
+        immediateByteOffset: int32 = -1
+
+fn regallocX64Fail(
+        out: var carrier.RegallocA64FunctionRecipes,
+        code: int32,
+        detail: int32) =
+    out.valid = false
+    out.errorCode = code
+    out.errorDetail = detail
+
+fn regallocX64FragmentInit(): carrier.RegallocA64MachineFragment =
+    var out: carrier.RegallocA64MachineFragment
+    out.ownerOrdinal = -1
+    out.actionConsumerOrdinal = -1
+    out.siteIndex = -1
+    out.blockIndex = -1
+    out.edgeIndex = -1
+    out.ingressIndex = -1
+    out.sourceBlock = -1
+    out.targetBlock = -1
+    out.valueId = -1
+    out.encoderEventStart = -1
+    out.trampolineWordStart = -1
+    out.trampolineTargetBlock = -1
+    out.trampolineTargetWordStart = -1
+    return out
+
+fn regallocX64AppendByte(bytes: var int32[], value: int32) =
+    add(bytes, value & 255)
+
+fn regallocX64AppendU32(bytes: var int32[], value: int32) =
+    regallocX64AppendByte(bytes, value)
+    regallocX64AppendByte(bytes, value >> 8)
+    regallocX64AppendByte(bytes, value >> 16)
+    regallocX64AppendByte(bytes, value >> 24)
+
+fn regallocX64AppendU64Chunks(
+        bytes: var int32[],
+        chunks: var int32[]) =
+    for chunkIndex in 0..<4:
+        let chunk = chunks[chunkIndex] & 65535
+        regallocX64AppendByte(bytes, chunk)
+        regallocX64AppendByte(bytes, chunk >> 8)
+
+fn regallocX64AppendRex(
+        bytes: var int32[],
+        wide: bool,
+        regField: int32,
+        rmField: int32,
+        force: bool) =
+    var value = 0x40
+    if wide:
+        value = value | 8
+    if regField >= 8:
+        value = value | 4
+    if rmField >= 8:
+        value = value | 1
+    if force || value != 0x40:
+        regallocX64AppendByte(bytes, value)
+
+fn regallocX64ModRm(regField: int32, rmField: int32): int32 =
+    return 0xC0 | ((regField & 7) << 3) | (rmField & 7)
+
+fn regallocX64AppendMove(
+        bytes: var int32[],
+        targetReg: int32,
+        sourceReg: int32,
+        wide: bool): bool =
+    if targetReg < 0 || targetReg > 15 ||
+       sourceReg < 0 || sourceReg > 15:
+        return false
+    regallocX64AppendRex(
+        bytes, wide, sourceReg, targetReg, false)
+    regallocX64AppendByte(bytes, 0x89)
+    regallocX64AppendByte(
+        bytes, regallocX64ModRm(sourceReg, targetReg))
+    return true
+
+fn regallocX64AppendImmediate(
+        bytes: var int32[],
+        targetReg: int32,
+        op: var coreir.BodyOp): bool =
+    if targetReg < 0 || targetReg > 15 ||
+       (op.operands.len != 2 && op.operands.len != 5):
+        return false
+    let kind = op.operands[0]
+    if kind != coreir.LocalI32Tag &&
+       kind != coreir.LocalI64Tag &&
+       kind != coreir.LocalPtrTag:
+        return false
+    if kind == coreir.LocalI32Tag:
+        if op.operands.len != 2:
+            return false
+        regallocX64AppendRex(
+            bytes, false, -1, targetReg, targetReg >= 8)
+        regallocX64AppendByte(bytes, 0xB8 + (targetReg & 7))
+        regallocX64AppendU32(bytes, op.operands[1])
+        return true
+    regallocX64AppendRex(bytes, true, -1, targetReg, true)
+    regallocX64AppendByte(bytes, 0xB8 + (targetReg & 7))
+    if op.operands.len == 5:
+        var chunks: int32[]
+        for chunkIndex in 1..<5:
+            add(chunks, op.operands[chunkIndex])
+        regallocX64AppendU64Chunks(bytes, chunks)
+        return true
+    regallocX64AppendU32(bytes, op.operands[1])
+    var high = 0
+    if op.operands[1] < 0:
+        high = -1
+    regallocX64AppendU32(bytes, high)
+    return true
+
+@borrows
+fn regallocX64OperandReg(
+        table: var bodyaccess.BodyIrAccessTable,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        opIndex: int32,
+        operandIndex: int32): int32 =
+    if opIndex < 0 || opIndex >= table.opFactStarts.len:
+        return -1
+    let start = table.opFactStarts[opIndex]
+    let count = table.opFactCounts[opIndex]
+    if start < 0 || count < 0 || start > table.facts.len - count:
+        return -1
+    for factIndex in start..<(start + count):
+        let fact = table.facts[factIndex]
+        if fact.kind == bodyaccess.BodyIrAccessFactUse &&
+           fact.operandIndex == operandIndex:
+            if factIndex < 0 || factIndex >= plan.operandRegByFact.len:
+                return -1
+            return plan.operandRegByFact[factIndex]
+    return -1
+
+@borrows
+fn regallocX64TermOperandReg(
+        table: var bodyaccess.BodyIrAccessTable,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        termIndex: int32,
+        operandIndex: int32): int32 =
+    if termIndex < 0 || termIndex >= table.termFactStarts.len:
+        return -1
+    let start = table.termFactStarts[termIndex]
+    let count = table.termFactCounts[termIndex]
+    if start < 0 || count < 0 || start > table.facts.len - count:
+        return -1
+    for factIndex in start..<(start + count):
+        let fact = table.facts[factIndex]
+        if fact.kind == bodyaccess.BodyIrAccessFactUse &&
+           fact.operandIndex == operandIndex:
+            if factIndex < 0 || factIndex >= plan.operandRegByFact.len:
+                return -1
+            return plan.operandRegByFact[factIndex]
+    return -1
+
+fn regallocX64SetPackedByte(
+        words: var int32[],
+        byteOffset: int32,
+        value: int32): bool =
+    if byteOffset < 0 || byteOffset >= words.len * 4 ||
+       value < 0 || value > 255:
+        return false
+    let wordIndex = byteOffset / 4
+    let byteInWord = byteOffset % 4
+    let word = uint32(words[wordIndex])
+    var rebuilt: uint32
+    for index in 0..<4:
+        var byteValue =
+            int32((word >> uint32(index * 8)) & uint32(255))
+        if index == byteInWord:
+            byteValue = value
+        rebuilt = rebuilt |
+                  (uint32(byteValue) << uint32(index * 8))
+    words[wordIndex] = int32(rebuilt)
+    return true
+
+fn regallocX64PatchRel32(
+        words: var int32[],
+        immediateByteOffset: int32,
+        targetByteOffset: int32): bool =
+    if immediateByteOffset < 0 ||
+       immediateByteOffset > words.len * 4 - 4 ||
+       targetByteOffset < 0 ||
+       targetByteOffset >= words.len * 4:
+        return false
+    let delta = int64(targetByteOffset) -
+                (int64(immediateByteOffset) + int64(4))
+    if delta < int64(-2147483648) ||
+       delta > int64(2147483647):
+        return false
+    let encoded = int32(delta)
+    for byteIndex in 0..<4:
+        if !regallocX64SetPackedByte(
+               words,
+               immediateByteOffset + byteIndex,
+               (encoded >> (byteIndex * 8)) & 255):
+            return false
+    return true
+
+@borrows
+fn regallocX64ScalarKind(kind: int32): bool =
+    return kind == coreir.LocalI32Tag ||
+           kind == coreir.LocalI64Tag ||
+           kind == coreir.LocalPtrTag
+
+@borrows
+fn regallocX64CanonicalScalarSlotWidth(
+        bodyIR: var coreir.BodyIR,
+        slotIndex: int32): int32 =
+    if slotIndex < 0 || slotIndex >= bodyIR.localSlots.len:
+        return 0
+    let slot = bodyIR.localSlots[slotIndex]
+    if !regallocX64ScalarKind(slot.typeKind):
+        return 0
+    # Canonical allocator ingress has already admitted the immutable
+    # typeKind/sizeBytes/alignBytes tuple.  The target adapter consumes that
+    # physical width; it must not reconstruct it from typeKind.
+    return slot.sizeBytes
+
+@borrows
+fn regallocX64CanonicalValueWidth(
+        bodyIR: var coreir.BodyIR,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        valueId: int32): int32 =
+    if valueId < 0 ||
+       valueId >= plan.valueSlotIndices.len ||
+       valueId >= plan.valueTypeKinds.len:
+        return 0
+    let slotIndex = plan.valueSlotIndices[valueId]
+    if slotIndex < 0 ||
+       slotIndex >= bodyIR.localSlots.len ||
+       bodyIR.localSlots[slotIndex].typeKind !=
+           plan.valueTypeKinds[valueId]:
+        return 0
+    return regallocX64CanonicalScalarSlotWidth(
+        bodyIR, slotIndex)
+
+@borrows
+fn regallocX64SretKind(kind: int32): bool =
+    return kind == coreir.LocalAggregateTag ||
+           kind == coreir.LocalStrTag
+
+@borrows
+fn regallocX64CallArgTypeIs(
+        bodyIR: var coreir.BodyIR,
+        call: coreir.CallOp,
+        argIndex: int32,
+        typeKind: int32): bool =
+    if argIndex < 0 || argIndex >= call.argSlots.len:
+        return false
+    let slotIndex = call.argSlots[argIndex]
+    return slotIndex >= 0 &&
+           slotIndex < bodyIR.localSlots.len &&
+           bodyIR.localSlots[slotIndex].typeKind == typeKind
+
+@borrows
+fn regallocX64ForwardEntrySretCallSupported(
+        bodyIR: var coreir.BodyIR,
+        callOrdinal: int32): bool =
+    if callOrdinal < 0 ||
+       callOrdinal >= bodyIR.callSequence.len ||
+       bodyIR.callTargetDomainKinds.len != bodyIR.callSequence.len ||
+       bodyIR.callTargetRows.len != bodyIR.callSequence.len ||
+       bodyIR.callTargetInterfaceCids.len != bodyIR.callSequence.len ||
+       bodyIR.callTargetDomainKinds[callOrdinal] < 0 ||
+       bodyIR.callTargetRows[callOrdinal] < 0 ||
+       !coreir.BodyIRTypeArenaArtifactCidValid(
+           bodyIR.callTargetInterfaceCids[callOrdinal]):
+        return false
+    let call = bodyIR.callSequence[callOrdinal]
+    return bodyIR.entryIsCAbi &&
+           call.targetSymbol ==
+               "cheng_call_ptr_sret_agg1_raw" &&
+           len(call.targetSourcePath) == 0 &&
+           !call.targetIsImportc &&
+           call.inlineF64FromIntKind == 0 &&
+           call.resultSlot == -1 &&
+           call.resultExprNodeIndex == -1 &&
+           call.resultValueDefinitionRow == -1 &&
+           call.resultPassKind ==
+               coreir.BodyCallPassForwardEntrySretTag &&
+           call.argSlots.len == 2 &&
+           call.argPassKinds.len == 2 &&
+           call.argAbiSizes.len == 2 &&
+           call.argPassKinds[0] ==
+               coreir.BodyCallPassStackValueTag &&
+           call.argPassKinds[1] ==
+               coreir.BodyCallPassStackValueTag &&
+           call.argAbiSizes[0] == 8 &&
+           call.argAbiSizes[1] == 8 &&
+           regallocX64CallArgTypeIs(
+               bodyIR, call, 0, coreir.LocalPtrTag) &&
+           regallocX64CallArgTypeIs(
+               bodyIR, call, 1, coreir.LocalPtrTag)
+
+@borrows
+fn regallocX64DirectCallSupported(
+        bodyIR: var coreir.BodyIR,
+        callOrdinal: int32): bool =
+    if callOrdinal < 0 ||
+       callOrdinal >= bodyIR.callSequence.len:
+        return false
+    let call = bodyIR.callSequence[callOrdinal]
+    if len(call.targetSymbol) <= 0 ||
+       len(call.targetSourcePath) <= 0 ||
+       call.targetIsImportc ||
+       call.inlineF64FromIntKind != 0 ||
+       call.argPassKinds.len != call.argSlots.len ||
+       call.argAbiSizes.len != call.argSlots.len:
+        return false
+    for argIndex in 0..<call.argSlots.len:
+        let slotIndex = call.argSlots[argIndex]
+        if slotIndex < 0 ||
+           slotIndex >= bodyIR.localSlots.len ||
+           !regallocX64ScalarKind(
+               bodyIR.localSlots[slotIndex].typeKind) ||
+           call.argPassKinds[argIndex] !=
+               coreir.BodyCallPassStackValueTag:
+            return false
+        let expectedSize =
+            regallocX64CanonicalScalarSlotWidth(
+                bodyIR, slotIndex)
+        if expectedSize <= 0:
+            return false
+        if call.argAbiSizes[argIndex] != expectedSize:
+            return false
+    if call.resultPassKind == coreir.BodyCallPassStackValueTag:
+        if call.resultSlot < 0:
+            return call.resultSlot == -1
+        return call.resultSlot < bodyIR.localSlots.len &&
+               regallocX64ScalarKind(
+                   bodyIR.localSlots[call.resultSlot].typeKind)
+    if call.resultPassKind != coreir.BodyCallPassSretResultTag ||
+       call.resultSlot < 0 ||
+       call.resultSlot >= bodyIR.localSlots.len:
+        return false
+    let result = bodyIR.localSlots[call.resultSlot]
+    return regallocX64SretKind(result.typeKind) &&
+           result.sizeBytes > 0 && result.alignBytes > 0
+
+@borrows
+fn regallocX64CallSupported(
+        bodyIR: var coreir.BodyIR,
+        callOrdinal: int32): bool =
+    return regallocX64DirectCallSupported(
+               bodyIR, callOrdinal) ||
+           regallocX64ForwardEntrySretCallSupported(
+               bodyIR, callOrdinal)
+
+@borrows
+fn regallocX64SretForwardActionValid(
+        plan: var alloc.RegallocSinglePassValuePlan,
+        callOrdinal: int32): bool =
+    var matchCount: int32
+    for actionIndex in 0..<plan.actions.len:
+        let action = plan.actions[actionIndex]
+        if action.kind != alloc.RegallocValueActionSretForward:
+            continue
+        if action.callOrdinal != callOrdinal ||
+           action.fixedKind !=
+               bodyaccess.BodyIrAccessFixedSretForward ||
+           action.passKind !=
+               coreir.BodyCallPassForwardEntrySretTag ||
+           action.semanticKind != coreir.BodyOpCallTag ||
+           action.semanticRegister != RegallocX64Rdi ||
+           action.semanticRegister !=
+               plan.constraints.fixedSretReg ||
+           alloc.RegallocSinglePassValueActionBindingKind(
+               action.kind) !=
+               alloc.RegallocValueBindingStructural:
+            return false
+        matchCount = matchCount + 1
+    return matchCount == 1
+
+@borrows
+fn regallocX64CallOutgoingFrame(
+        table: var bodyaccess.BodyIrAccessTable,
+        callOrdinal: int32): int32 =
+    if callOrdinal < 0 ||
+       callOrdinal >= table.callFactStarts.len ||
+       callOrdinal >= table.callFactCounts.len:
+        return -1
+    let start = table.callFactStarts[callOrdinal]
+    let count = table.callFactCounts[callOrdinal]
+    if start < 0 || count <= 0 ||
+       start > table.facts.len - count:
+        return -1
+    var frameBytes: int32
+    for factIndex in start..<(start + count):
+        let fact = table.facts[factIndex]
+        if fact.fixedKind ==
+               bodyaccess.BodyIrAccessFixedCallArg &&
+           fact.outgoingStackFrameBytes > frameBytes:
+            frameBytes = fact.outgoingStackFrameBytes
+    return frameBytes
+
+fn regallocX64AppendCall(
+        bytes: var int32[],
+        relocs: var carrier.RegallocA64ActionReloc[],
+        bodyIR: var coreir.BodyIR,
+        table: var bodyaccess.BodyIrAccessTable,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        action: var alloc.RegallocValueAction): bool =
+    if action.kind != alloc.RegallocValueActionCallClobber ||
+       action.opIndex < 0 ||
+       action.opIndex >= bodyIR.ops.len ||
+       action.factIndex < 0 ||
+       action.factIndex >= table.facts.len ||
+       action.factIndex >= plan.accessFactBlockIndices.len ||
+       action.factIndex >= plan.accessFactOpIndices.len ||
+       action.factIndex >= plan.accessFactTermIndices.len ||
+       !regallocX64CallSupported(
+           bodyIR, action.callOrdinal):
+        return false
+    let fact = table.facts[action.factIndex]
+    if fact.kind != bodyaccess.BodyIrAccessFactClobber ||
+       fact.clobberKind != bodyaccess.BodyIrAccessClobberCallAbi ||
+       fact.callOrdinal != action.callOrdinal ||
+       fact.siteKind != bodyaccess.BodyIrAccessSiteOp ||
+       fact.siteIndex != action.opIndex ||
+       plan.accessFactBlockIndices[action.factIndex] !=
+           action.blockIndex ||
+       plan.accessFactOpIndices[action.factIndex] != action.opIndex ||
+       plan.accessFactTermIndices[action.factIndex] != -1:
+        return false
+    let op = bodyIR.ops[action.opIndex]
+    if op.kind != coreir.BodyOpCallTag ||
+       op.operands.len != 1 ||
+       op.operands[0] != action.callOrdinal:
+        return false
+    let call = bodyIR.callSequence[action.callOrdinal]
+    let outgoingFrame = regallocX64CallOutgoingFrame(
+        table, action.callOrdinal)
+    if outgoingFrame < 0:
+        return false
+    if regallocX64ForwardEntrySretCallSupported(
+           bodyIR, action.callOrdinal):
+        if outgoingFrame != 0 ||
+           !regallocX64SretForwardActionValid(
+               plan, action.callOrdinal) ||
+           !regallocX64AppendMove(
+               bytes, RegallocX64R11,
+               RegallocX64Rsi, true) ||
+           !regallocX64AppendMove(
+               bytes, RegallocX64Rsi,
+               RegallocX64Rdx, true):
+            return false
+        regallocX64AppendByte(bytes, 0x41)
+        regallocX64AppendByte(bytes, 0xFF)
+        regallocX64AppendByte(bytes, 0xD3)
+        return true
+    regallocX64AppendByte(bytes, 0xE8)
+    let immediateOffset = bytes.len
+    regallocX64AppendU32(bytes, 0)
+    var reloc: carrier.RegallocA64ActionReloc
+    reloc.kind = carrier.RegallocMachineRelocPcRel32
+    reloc.wordIndex = immediateOffset / 4
+    reloc.byteOffset = immediateOffset
+    reloc.callOrdinal = action.callOrdinal
+    reloc.opIndex = action.opIndex
+    reloc.subIndex = -1
+    reloc.targetDomain =
+        bodyIR.callTargetDomainKinds[action.callOrdinal]
+    reloc.targetRow = bodyIR.callTargetRows[action.callOrdinal]
+    reloc.targetInterfaceCid = layout.FixedBytes32Copy(
+        bodyIR.callTargetInterfaceCids[action.callOrdinal])
+    reloc.targetSymbol = strings.CloneStr(call.targetSymbol)
+    add(relocs, share(reloc))
+    if !regallocX64AppendStackAdjust(
+           bytes, outgoingFrame, false):
+        return false
+    return true
+
+fn regallocX64AppendBinOp(
+        bytes: var int32[],
+        bodyIR: var coreir.BodyIR,
+        table: var bodyaccess.BodyIrAccessTable,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        action: var alloc.RegallocValueAction,
+        targetReg: int32): bool =
+    if action.opIndex < 0 || action.opIndex >= bodyIR.ops.len:
+        return false
+    let op = bodyIR.ops[action.opIndex]
+    if op.operands.len != 4:
+        return false
+    let kind = op.operands[0]
+    if !regallocX64ScalarKind(kind) ||
+       op.operands[2] < 0 ||
+       op.operands[2] >= bodyIR.localSlots.len ||
+       op.operands[3] < 0 ||
+       op.operands[3] >= bodyIR.localSlots.len ||
+       bodyIR.localSlots[op.operands[2]].typeKind != kind ||
+       bodyIR.localSlots[op.operands[3]].typeKind != kind:
+        return false
+    let lhs = regallocX64OperandReg(
+        table, plan, action.opIndex, 2)
+    let rhs = regallocX64OperandReg(
+        table, plan, action.opIndex, 3)
+    if lhs < 0 || rhs < 0:
+        return false
+    let opKind = op.operands[1]
+    let commutative =
+        opKind == int32(texpr.TypedExprIrOpI32Add) ||
+        opKind == int32(texpr.TypedExprIrOpI64Add) ||
+        opKind == int32(texpr.TypedExprIrOpI32Mul) ||
+        opKind == int32(texpr.TypedExprIrOpI64Mul) ||
+        opKind == int32(texpr.TypedExprIrOpI32BitAnd) ||
+        opKind == int32(texpr.TypedExprIrOpI64BitAnd) ||
+        opKind == int32(texpr.TypedExprIrOpI32BitOr) ||
+        opKind == int32(texpr.TypedExprIrOpI64BitOr) ||
+        opKind == int32(texpr.TypedExprIrOpI32BitXor) ||
+        opKind == int32(texpr.TypedExprIrOpI64BitXor)
+    var left = lhs
+    var right = rhs
+    if targetReg == rhs && targetReg != lhs:
+        if !commutative:
+            return false
+        left = rhs
+        right = lhs
+    if targetReg != left &&
+       !regallocX64AppendMove(
+           bytes, targetReg, left, kind != coreir.LocalI32Tag):
+        return false
+    let wide = kind != coreir.LocalI32Tag
+    if opKind == int32(texpr.TypedExprIrOpI32Add) ||
+       opKind == int32(texpr.TypedExprIrOpI64Add):
+        regallocX64AppendRex(bytes, wide, right, targetReg, false)
+        regallocX64AppendByte(bytes, 0x01)
+    elif opKind == int32(texpr.TypedExprIrOpI32Sub) ||
+         opKind == int32(texpr.TypedExprIrOpI64Sub):
+        regallocX64AppendRex(bytes, wide, right, targetReg, false)
+        regallocX64AppendByte(bytes, 0x29)
+    elif opKind == int32(texpr.TypedExprIrOpI32Mul) ||
+         opKind == int32(texpr.TypedExprIrOpI64Mul):
+        regallocX64AppendRex(bytes, wide, targetReg, right, false)
+        regallocX64AppendByte(bytes, 0x0F)
+        regallocX64AppendByte(bytes, 0xAF)
+        regallocX64AppendByte(
+            bytes, regallocX64ModRm(targetReg, right))
+        return true
+    elif opKind == int32(texpr.TypedExprIrOpI32BitAnd) ||
+         opKind == int32(texpr.TypedExprIrOpI64BitAnd):
+        regallocX64AppendRex(bytes, wide, right, targetReg, false)
+        regallocX64AppendByte(bytes, 0x21)
+    elif opKind == int32(texpr.TypedExprIrOpI32BitOr) ||
+         opKind == int32(texpr.TypedExprIrOpI64BitOr):
+        regallocX64AppendRex(bytes, wide, right, targetReg, false)
+        regallocX64AppendByte(bytes, 0x09)
+    elif opKind == int32(texpr.TypedExprIrOpI32BitXor) ||
+         opKind == int32(texpr.TypedExprIrOpI64BitXor):
+        regallocX64AppendRex(bytes, wide, right, targetReg, false)
+        regallocX64AppendByte(bytes, 0x31)
+    else:
+        return false
+    regallocX64AppendByte(
+        bytes, regallocX64ModRm(right, targetReg))
+    return true
+
+fn regallocX64ConditionCode(kind: int32): int32 =
+    if kind == coreir.BodyCondI32EqTag ||
+       kind == coreir.BodyCondI64EqTag:
+        return 4
+    if kind == coreir.BodyCondI32NeTag ||
+       kind == coreir.BodyCondI64NeTag:
+        return 5
+    if kind == coreir.BodyCondI32LtTag ||
+       kind == coreir.BodyCondI64LtTag:
+        return 12
+    if kind == coreir.BodyCondI32LeTag ||
+       kind == coreir.BodyCondI64LeTag:
+        return 14
+    if kind == coreir.BodyCondI32GtTag ||
+       kind == coreir.BodyCondI64GtTag:
+        return 15
+    if kind == coreir.BodyCondI32GeTag ||
+       kind == coreir.BodyCondI64GeTag:
+        return 13
+    return -1
+
+fn regallocX64AppendCmp(
+        bytes: var int32[],
+        bodyIR: var coreir.BodyIR,
+        table: var bodyaccess.BodyIrAccessTable,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        action: var alloc.RegallocValueAction,
+        targetReg: int32): bool =
+    if action.opIndex < 0 || action.opIndex >= bodyIR.ops.len:
+        return false
+    let op = bodyIR.ops[action.opIndex]
+    if op.operands.len != 3:
+        return false
+    let condition = regallocX64ConditionCode(op.operands[0])
+    let lhsSlot = op.operands[1]
+    let rhsSlot = op.operands[2]
+    if condition < 0 || lhsSlot < 0 ||
+       lhsSlot >= bodyIR.localSlots.len || rhsSlot < 0 ||
+       rhsSlot >= bodyIR.localSlots.len:
+        return false
+    let lhsKind = bodyIR.localSlots[lhsSlot].typeKind
+    if !regallocX64ScalarKind(lhsKind) ||
+       bodyIR.localSlots[rhsSlot].typeKind != lhsKind:
+        return false
+    let lhs = regallocX64OperandReg(
+        table, plan, action.opIndex, 1)
+    let rhs = regallocX64OperandReg(
+        table, plan, action.opIndex, 2)
+    if lhs < 0 || rhs < 0 || targetReg < 0 || targetReg > 15:
+        return false
+    regallocX64AppendRex(
+        bytes, lhsKind != coreir.LocalI32Tag, rhs, lhs, false)
+    regallocX64AppendByte(bytes, 0x39)
+    regallocX64AppendByte(bytes, regallocX64ModRm(rhs, lhs))
+    regallocX64AppendRex(
+        bytes, false, -1, targetReg, true)
+    regallocX64AppendByte(bytes, 0x0F)
+    regallocX64AppendByte(bytes, 0x90 + condition)
+    regallocX64AppendByte(
+        bytes, regallocX64ModRm(0, targetReg))
+    regallocX64AppendRex(
+        bytes, false, targetReg, targetReg, targetReg >= 8)
+    regallocX64AppendByte(bytes, 0x0F)
+    regallocX64AppendByte(bytes, 0xB6)
+    regallocX64AppendByte(
+        bytes, regallocX64ModRm(targetReg, targetReg))
+    return true
+
+fn regallocX64AppendProducer(
+        bytes: var int32[],
+        bodyIR: var coreir.BodyIR,
+        table: var bodyaccess.BodyIrAccessTable,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        action: var alloc.RegallocValueAction): bool =
+    if action.opIndex < 0 || action.opIndex >= bodyIR.ops.len ||
+       action.targetReg < 0:
+        return false
+    var op = bodyIR.ops[action.opIndex]
+    if op.kind == coreir.BodyOpLoadConstTag:
+        return regallocX64AppendImmediate(
+            bytes, action.targetReg, op)
+    if op.kind == coreir.BodyOpBinOpTag:
+        return regallocX64AppendBinOp(
+            bytes, bodyIR, table, plan, action, action.targetReg)
+    if op.kind == coreir.BodyOpCmpTag:
+        return regallocX64AppendCmp(
+            bytes, bodyIR, table, plan, action, action.targetReg)
+    if op.kind == coreir.BodyOpCopyLocalTag ||
+       op.kind == coreir.BodyOpLoadLocalTag ||
+       op.kind == coreir.BodyOpStoreLocalTag:
+        if op.operands.len != 1 || op.operands[0] < 0 ||
+           op.operands[0] >= bodyIR.localSlots.len ||
+           op.target < 0 || op.target >= bodyIR.localSlots.len:
+            return false
+        let kind = bodyIR.localSlots[op.operands[0]].typeKind
+        if !regallocX64ScalarKind(kind) ||
+           bodyIR.localSlots[op.target].typeKind != kind:
+            return false
+        let sourceWidth =
+            regallocX64CanonicalScalarSlotWidth(
+                bodyIR, op.operands[0])
+        let targetWidth =
+            regallocX64CanonicalScalarSlotWidth(
+                bodyIR, op.target)
+        if sourceWidth <= 0 || sourceWidth != targetWidth:
+            return false
+        let sourceReg = regallocX64OperandReg(
+            table, plan, action.opIndex, 0)
+        return regallocX64AppendMove(
+            bytes, action.targetReg, sourceReg,
+            sourceWidth == 8)
+    return false
+
+fn regallocX64AppendActionBytes(
+        bytes: var int32[],
+        relocs: var carrier.RegallocA64ActionReloc[],
+        bodyIR: var coreir.BodyIR,
+        table: var bodyaccess.BodyIrAccessTable,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        out: var carrier.RegallocA64FunctionRecipes,
+        action: var alloc.RegallocValueAction): bool =
+    if action.kind == alloc.RegallocValueActionEntryReload:
+        if action.fixedOrdinal < 0 ||
+           action.valueId < 0 ||
+           action.valueId >= plan.valueTypeKinds.len ||
+           !regallocX64ScalarKind(
+               plan.valueTypeKinds[action.valueId]):
+            return false
+        var fixedArgShift: int32
+        if out.hasSretReturn:
+            fixedArgShift = 1
+        let registerArgCount =
+            plan.constraints.fixedArgRegs.len - fixedArgShift
+        let width = regallocX64CanonicalValueWidth(
+            bodyIR, plan, action.valueId)
+        if width <= 0:
+            return false
+        if action.fixedOrdinal < registerArgCount:
+            let expectedReg =
+                plan.constraints.fixedArgRegs[
+                    action.fixedOrdinal + fixedArgShift]
+            if action.sourceLocation !=
+                   alloc.RegallocValueLocationRegister ||
+               action.sourceReg != expectedReg ||
+               action.semanticRegister != expectedReg:
+                return false
+            return regallocX64AppendMove(
+                bytes, action.targetReg, action.sourceReg,
+                width == 8)
+        if action.sourceLocation !=
+               alloc.RegallocValueLocationStack ||
+           action.sourceReg >= 0:
+            return false
+        return regallocX64AppendBaseAccess(
+            bytes, action.targetReg, RegallocX64Rbp,
+            16 + (action.fixedOrdinal - registerArgCount) * 8,
+            width, true)
+    if action.kind == alloc.RegallocValueActionBindDef:
+        return regallocX64AppendProducer(
+            bytes, bodyIR, table, plan, action)
+    if action.kind == alloc.RegallocValueActionMoveFixed ||
+       action.kind == alloc.RegallocValueActionBindFixedResult:
+        var expectedTarget = RegallocX64Rax
+        if action.kind == alloc.RegallocValueActionMoveFixed &&
+           action.fixedKind ==
+               bodyaccess.BodyIrAccessFixedCallArg:
+            if action.fixedOrdinal < 0 ||
+               action.callOrdinal < 0 ||
+               action.factIndex < 0 ||
+               action.factIndex >=
+                   plan.accessFactRegisters.len ||
+               !regallocX64CallSupported(
+                   bodyIR, action.callOrdinal):
+                return false
+            expectedTarget =
+                plan.accessFactRegisters[action.factIndex]
+        elif action.kind ==
+               alloc.RegallocValueActionBindFixedResult:
+            if action.fixedKind !=
+                   bodyaccess.BodyIrAccessFixedCallResult ||
+               action.sourceReg != RegallocX64Rax:
+                return false
+            expectedTarget = action.targetReg
+        elif action.fixedKind !=
+               bodyaccess.BodyIrAccessFixedReturnValue:
+            return false
+        if action.targetReg != expectedTarget ||
+           action.valueId < 0 ||
+           action.valueId >= plan.valueTypeKinds.len ||
+           !regallocX64ScalarKind(
+               plan.valueTypeKinds[action.valueId]):
+            return false
+        let width = regallocX64CanonicalValueWidth(
+            bodyIR, plan, action.valueId)
+        if width <= 0:
+            return false
+        return regallocX64AppendMove(
+            bytes, action.targetReg, action.sourceReg,
+            width == 8)
+    if action.kind == alloc.RegallocValueActionLoadFixed:
+        if action.fixedKind !=
+               bodyaccess.BodyIrAccessFixedCallArg ||
+           action.sourceLocation !=
+               alloc.RegallocValueLocationStack ||
+           action.targetLocation !=
+               alloc.RegallocValueLocationRegister ||
+           action.sourceReg >= 0 ||
+           action.callOrdinal < 0 ||
+           action.factIndex < 0 ||
+           action.factIndex >=
+               plan.accessFactRegisters.len ||
+           action.targetReg !=
+               plan.accessFactRegisters[action.factIndex] ||
+           action.valueId < 0 ||
+           action.valueId >= plan.valueSlotIndices.len ||
+           action.valueId >= plan.valueClasses.len ||
+           action.valueId >= plan.valueMemoryHomes.len ||
+           action.valueId >= plan.valueAssignedRegs.len ||
+           action.valueId >= plan.valueTypeKinds.len ||
+           plan.valueClasses[action.valueId] !=
+               alloc.RegallocValueClassAddressHome ||
+           !plan.valueMemoryHomes[action.valueId] ||
+           plan.valueAssignedRegs[action.valueId] >= 0 ||
+           !regallocX64ScalarKind(
+               plan.valueTypeKinds[action.valueId]) ||
+           !regallocX64CallSupported(
+               bodyIR, action.callOrdinal):
+            return false
+        let slotIndex =
+            plan.valueSlotIndices[action.valueId]
+        if slotIndex < 0 ||
+           slotIndex >= bodyIR.localSlots.len ||
+           slotIndex >= out.localStackOffsets.len ||
+           out.localStackOffsets[slotIndex] == 0:
+            return false
+        let width = regallocX64CanonicalValueWidth(
+            bodyIR, plan, action.valueId)
+        if width <= 0:
+            return false
+        if action.abiSizeBytes != width:
+            return false
+        return regallocX64AppendBaseAccess(
+            bytes, action.targetReg, RegallocX64Rbp,
+            out.localStackOffsets[slotIndex], width, true)
+    if action.kind == alloc.RegallocValueActionSpillCall ||
+       action.kind == alloc.RegallocValueActionReloadCall:
+        if action.valueId < 0 ||
+           action.valueId >= plan.valueTypeKinds.len ||
+           action.valueId >= plan.valueSlotIndices.len ||
+           !regallocX64ScalarKind(
+               plan.valueTypeKinds[action.valueId]):
+            return false
+        let slotIndex = plan.valueSlotIndices[action.valueId]
+        let displacement = regallocX64StackSlotDisp(
+            out, slotIndex)
+        let width = regallocX64CanonicalValueWidth(
+            bodyIR, plan, action.valueId)
+        if width <= 0:
+            return false
+        if action.kind == alloc.RegallocValueActionSpillCall:
+            return action.sourceReg >= 0 &&
+                   regallocX64AppendStackAccess(
+                       bytes, action.sourceReg, displacement,
+                       width,
+                       false)
+        return action.targetReg >= 0 &&
+               regallocX64AppendStackAccess(
+                   bytes, action.targetReg, displacement,
+                   width,
+                   true)
+    if action.kind == alloc.RegallocValueActionEdgeParallelCopy ||
+       action.kind == alloc.RegallocValueActionParallelScratchSave ||
+       action.kind == alloc.RegallocValueActionParallelScratchRestore:
+        if action.sourceLocation !=
+               alloc.RegallocValueLocationRegister ||
+           action.targetLocation !=
+               alloc.RegallocValueLocationRegister ||
+           action.sourceReg < 0 || action.targetReg < 0 ||
+           action.valueId < 0 ||
+           action.valueId >= plan.valueTypeKinds.len ||
+           action.otherValueId < 0 ||
+           action.otherValueId >= plan.valueTypeKinds.len ||
+           plan.valueTypeKinds[action.valueId] !=
+               plan.valueTypeKinds[action.otherValueId] ||
+           !regallocX64ScalarKind(
+               plan.valueTypeKinds[action.valueId]):
+            return false
+        let scratch = plan.constraints.parallelCopyScratchReg
+        if scratch != RegallocX64R11 ||
+           action.scratchReg >= 0 &&
+               action.scratchReg != scratch:
+            return false
+        if action.kind ==
+               alloc.RegallocValueActionParallelScratchSave:
+            if action.targetReg != scratch ||
+               action.scratchReg != scratch ||
+               action.relatedActionOrdinal >= 0:
+                return false
+        elif action.kind ==
+                 alloc.RegallocValueActionParallelScratchRestore:
+            if action.sourceReg != scratch ||
+               action.scratchReg != scratch ||
+               action.relatedActionOrdinal < 0 ||
+               action.relatedActionOrdinal >= action.consumerOrdinal ||
+               plan.actions[action.relatedActionOrdinal].kind !=
+                   alloc.RegallocValueActionParallelScratchSave:
+                return false
+        elif action.scratchReg >= 0:
+            return false
+        let sourceWidth = regallocX64CanonicalValueWidth(
+            bodyIR, plan, action.valueId)
+        let targetWidth = regallocX64CanonicalValueWidth(
+            bodyIR, plan, action.otherValueId)
+        if sourceWidth <= 0 || sourceWidth != targetWidth:
+            return false
+        return regallocX64AppendMove(
+            bytes, action.targetReg, action.sourceReg,
+            sourceWidth == 8)
+    if action.kind == alloc.RegallocValueActionCallClobber:
+        return regallocX64AppendCall(
+            bytes, relocs, bodyIR, table, plan, action)
+    if action.kind == alloc.RegallocValueActionAddressFixed:
+        if action.fixedKind !=
+               bodyaccess.BodyIrAccessFixedSretResult ||
+           action.targetReg != RegallocX64Rdi ||
+           action.callOrdinal < 0 ||
+           !regallocX64DirectCallSupported(
+               bodyIR, action.callOrdinal):
+            return false
+        let slotIndex = action.encodedValue
+        if slotIndex < 0 ||
+           slotIndex >= bodyIR.localSlots.len ||
+           slotIndex >= out.localStackOffsets.len ||
+           !regallocX64SretKind(
+               bodyIR.localSlots[slotIndex].typeKind) ||
+           out.localStackOffsets[slotIndex] >= 0:
+            return false
+        return regallocX64AppendLea(
+            bytes, RegallocX64Rdi, RegallocX64Rbp,
+            out.localStackOffsets[slotIndex])
+    if action.kind == alloc.RegallocValueActionStoreStackArg:
+        if action.callOrdinal < 0 ||
+           !regallocX64DirectCallSupported(
+               bodyIR, action.callOrdinal) ||
+           action.outgoingStackArgIndex < 0 ||
+           action.outgoingStackByteOffset < 0 ||
+           action.outgoingStackByteWidth != 8 ||
+           action.outgoingStackFrameBytes <= 0:
+            return false
+        if action.outgoingStackArgIndex == 0:
+            if !regallocX64AppendStackAdjust(
+                   bytes, action.outgoingStackFrameBytes, true):
+                return false
+        var sourceReg = action.sourceReg
+        if action.sourceLocation ==
+               alloc.RegallocValueLocationStack:
+            if action.valueId < 0 ||
+               action.valueId >= plan.valueSlotIndices.len:
+                return false
+            let slotIndex =
+                plan.valueSlotIndices[action.valueId]
+            if slotIndex < 0 ||
+               slotIndex >= bodyIR.localSlots.len ||
+               !regallocX64ScalarKind(
+                   bodyIR.localSlots[slotIndex].typeKind):
+                return false
+            let sourceWidth =
+                regallocX64CanonicalScalarSlotWidth(
+                    bodyIR, slotIndex)
+            if sourceWidth <= 0:
+                return false
+            sourceReg = RegallocX64R11
+            if !regallocX64AppendStackAccess(
+                   bytes, sourceReg,
+                   regallocX64StackSlotDisp(out, slotIndex),
+                   sourceWidth, true):
+                return false
+        elif action.sourceLocation ==
+                 alloc.RegallocValueLocationRegister:
+            if sourceReg < 0 || sourceReg > 15:
+                return false
+        else:
+            return false
+        return regallocX64AppendBaseAccess(
+            bytes, sourceReg, RegallocX64Rsp,
+            action.outgoingStackByteOffset,
+            action.outgoingStackByteWidth, false)
+    if action.kind == alloc.RegallocValueActionStoreSretReturn:
+        if !out.hasSretReturn ||
+           action.targetReg != RegallocX64Rdi ||
+           action.valueId < 0 ||
+           action.valueId >= plan.valueSlotIndices.len ||
+           out.returnBufferSaveOffset >= 0:
+            return false
+        let slotIndex = plan.valueSlotIndices[action.valueId]
+        if slotIndex < 0 ||
+           slotIndex >= bodyIR.localSlots.len ||
+           slotIndex >= out.localStackOffsets.len ||
+           !regallocX64SretKind(
+               bodyIR.localSlots[slotIndex].typeKind) ||
+           out.localStackOffsets[slotIndex] >= 0 ||
+           !regallocX64AppendStackAccess(
+               bytes, RegallocX64Rdi,
+               out.returnBufferSaveOffset, 8, true) ||
+           !regallocX64AppendAggregateCopy(
+               bytes, out.localStackOffsets[slotIndex],
+               RegallocX64Rdi,
+               bodyIR.localSlots[slotIndex].sizeBytes):
+            return false
+        return regallocX64AppendMove(
+            bytes, RegallocX64Rax,
+            RegallocX64Rdi, true)
+    return false
+
+fn regallocX64BytesToWords(
+        bytes: var int32[],
+        words: var int32[]): bool =
+    if bytes.len <= 0:
+        return false
+    while bytes.len % 4 != 0:
+        regallocX64AppendByte(bytes, 0x90)
+    for byteIndex in 0..<bytes.len:
+        if bytes[byteIndex] < 0 || bytes[byteIndex] > 255:
+            return false
+    var index: int32
+    while index < bytes.len:
+        let word = uint32(bytes[index]) |
+                   (uint32(bytes[index + 1]) << uint32(8)) |
+                   (uint32(bytes[index + 2]) << uint32(16)) |
+                   (uint32(bytes[index + 3]) << uint32(24))
+        add(words, int32(word))
+        index = index + 4
+    return true
+
+fn regallocX64AppendFragment(
+        out: var carrier.RegallocA64FunctionRecipes,
+        bytes: var int32[],
+        fragment: var carrier.RegallocA64MachineFragment): bool =
+    var words: int32[]
+    if !regallocX64BytesToWords(bytes, words):
+        return false
+    fragment.wordStart = out.functionWords.len
+    fragment.wordCount = words.len
+    for wordIndex in 0..<words.len:
+        add(out.functionWords, words[wordIndex])
+    add(out.machineFragments, share(fragment))
+    return true
+
+@borrows
+fn regallocX64CalleeSavedReg(reg: int32): bool =
+    return reg == RegallocX64Rbx ||
+           (reg >= RegallocX64R12 && reg <= RegallocX64R15)
+
+fn regallocX64AppendPush(bytes: var int32[], reg: int32): bool =
+    if !regallocX64CalleeSavedReg(reg):
+        return false
+    if reg >= 8:
+        regallocX64AppendByte(bytes, 0x41)
+    regallocX64AppendByte(bytes, 0x50 + (reg & 7))
+    return true
+
+fn regallocX64AppendPop(bytes: var int32[], reg: int32): bool =
+    if !regallocX64CalleeSavedReg(reg):
+        return false
+    if reg >= 8:
+        regallocX64AppendByte(bytes, 0x41)
+    regallocX64AppendByte(bytes, 0x58 + (reg & 7))
+    return true
+
+fn regallocX64AppendStackAdjust(
+        bytes: var int32[],
+        byteCount: int32,
+        subtract: bool): bool =
+    if byteCount < 0:
+        return false
+    if byteCount == 0:
+        return true
+    regallocX64AppendByte(bytes, 0x48)
+    if byteCount <= 127:
+        regallocX64AppendByte(bytes, 0x83)
+        var extension: int32
+        if subtract:
+            extension = 5
+        regallocX64AppendByte(
+            bytes, regallocX64ModRm(extension, 4))
+        regallocX64AppendByte(bytes, byteCount)
+        return true
+    regallocX64AppendByte(bytes, 0x81)
+    var extension: int32
+    if subtract:
+        extension = 5
+    regallocX64AppendByte(
+        bytes, regallocX64ModRm(extension, 4))
+    regallocX64AppendU32(bytes, byteCount)
+    return true
+
+@borrows
+fn regallocX64Align(value: int32, alignment: int32): int32 =
+    if value < 0 || alignment <= 0:
+        return -1
+    let remainder = value % alignment
+    if remainder == 0:
+        return value
+    let delta = alignment - remainder
+    if value > 2147483647 - delta:
+        return -1
+    return value + delta
+
+@borrows
+fn regallocX64ParamIndex(slot: coreir.LocalSlot): int32 =
+    if slot.stackOffset >= 0:
+        return -1
+    return 0 - 1 - slot.stackOffset
+
+@borrows
+fn regallocX64EntryValueForSlot(
+        plan: var alloc.RegallocSinglePassValuePlan,
+        slotIndex: int32): int32 =
+    var found: int32 = -1
+    for valueId in 0..<plan.valueSlotIndices.len:
+        if valueId >= plan.valueDefIsEntry.len ||
+           !plan.valueDefIsEntry[valueId] ||
+           plan.valueSlotIndices[valueId] != slotIndex:
+            continue
+        if found >= 0:
+            return -2
+        found = valueId
+    return found
+
+@borrows
+fn regallocX64AddressHomeValueSupported(
+        bodyIR: var coreir.BodyIR,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        valueId: int32): bool =
+    if valueId < 0 ||
+       valueId >= plan.valueSlotIndices.len ||
+       valueId >= plan.valueTypeKinds.len ||
+       valueId >= plan.valueClasses.len ||
+       valueId >= plan.valueMemoryHomes.len ||
+       valueId >= plan.valueAssignedRegs.len ||
+       valueId >= plan.valueDefIsEntry.len ||
+       plan.valueClasses[valueId] !=
+           alloc.RegallocValueClassAddressHome ||
+       !plan.valueMemoryHomes[valueId] ||
+       plan.valueAssignedRegs[valueId] >= 0 ||
+       !plan.valueDefIsEntry[valueId] ||
+       !regallocX64ScalarKind(
+           plan.valueTypeKinds[valueId]):
+        return false
+    let slotIndex = plan.valueSlotIndices[valueId]
+    if slotIndex < 0 ||
+       slotIndex >= bodyIR.localSlots.len:
+        return false
+    let slot = bodyIR.localSlots[slotIndex]
+    if regallocX64ParamIndex(slot) < 0:
+        return false
+    var loadCount: int32
+    for actionIndex in 0..<plan.actions.len:
+        let action = plan.actions[actionIndex]
+        if action.valueId != valueId:
+            continue
+        if alloc.RegallocSinglePassValueActionBindingKind(
+               action.kind) ==
+               alloc.RegallocValueBindingStructural:
+            continue
+        if action.kind != alloc.RegallocValueActionLoadFixed ||
+           action.fixedKind !=
+               bodyaccess.BodyIrAccessFixedCallArg ||
+           action.sourceLocation !=
+               alloc.RegallocValueLocationStack ||
+           action.targetLocation !=
+               alloc.RegallocValueLocationRegister ||
+           action.sourceReg >= 0 ||
+           action.callOrdinal < 0 ||
+           !regallocX64CallSupported(
+               bodyIR, action.callOrdinal):
+            return false
+        loadCount = loadCount + 1
+    return loadCount > 0
+
+@borrows
+fn regallocX64StackSlotDisp(
+        out: var carrier.RegallocA64FunctionRecipes,
+        slotIndex: int32): int32 =
+    if slotIndex < 0 ||
+       slotIndex >= out.localStackOffsets.len:
+        return 0
+    return out.localStackOffsets[slotIndex]
+
+fn regallocX64AppendBaseAccess(
+        bytes: var int32[],
+        reg: int32,
+        baseReg: int32,
+        displacement: int32,
+        width: int32,
+        load: bool): bool =
+    if reg < 0 || reg > 15 ||
+       baseReg < 0 || baseReg > 15 ||
+       (width != 1 && width != 4 && width != 8):
+        return false
+    let wide = width == 8
+    regallocX64AppendRex(
+        bytes, wide, reg, baseReg,
+        width == 1 && !load && reg >= 4)
+    if load:
+        if width == 1:
+            regallocX64AppendByte(bytes, 0x0F)
+            regallocX64AppendByte(bytes, 0xB6)
+        else:
+            regallocX64AppendByte(bytes, 0x8B)
+    else:
+        if width == 1:
+            regallocX64AppendByte(bytes, 0x88)
+        else:
+            regallocX64AppendByte(bytes, 0x89)
+    if displacement >= -128 && displacement <= 127:
+        regallocX64AppendByte(bytes,
+            0x40 | ((reg & 7) << 3) | (baseReg & 7))
+        if (baseReg & 7) == 4:
+            regallocX64AppendByte(bytes, 0x24)
+        regallocX64AppendByte(bytes, displacement)
+    else:
+        regallocX64AppendByte(bytes,
+            0x80 | ((reg & 7) << 3) | (baseReg & 7))
+        if (baseReg & 7) == 4:
+            regallocX64AppendByte(bytes, 0x24)
+        regallocX64AppendU32(bytes, displacement)
+    return true
+
+fn regallocX64AppendStackAccess(
+        bytes: var int32[],
+        reg: int32,
+        displacement: int32,
+        width: int32,
+        load: bool): bool =
+    return displacement != 0 &&
+           regallocX64AppendBaseAccess(
+               bytes, reg, RegallocX64Rbp,
+               displacement, width, load)
+
+fn regallocX64AppendLea(
+        bytes: var int32[],
+        targetReg: int32,
+        baseReg: int32,
+        displacement: int32): bool =
+    if targetReg < 0 || targetReg > 15 ||
+       baseReg < 0 || baseReg > 15:
+        return false
+    regallocX64AppendRex(
+        bytes, true, targetReg, baseReg, true)
+    regallocX64AppendByte(bytes, 0x8D)
+    if displacement >= -128 && displacement <= 127:
+        regallocX64AppendByte(bytes,
+            0x40 | ((targetReg & 7) << 3) | (baseReg & 7))
+        if (baseReg & 7) == 4:
+            regallocX64AppendByte(bytes, 0x24)
+        regallocX64AppendByte(bytes, displacement)
+    else:
+        regallocX64AppendByte(bytes,
+            0x80 | ((targetReg & 7) << 3) | (baseReg & 7))
+        if (baseReg & 7) == 4:
+            regallocX64AppendByte(bytes, 0x24)
+        regallocX64AppendU32(bytes, displacement)
+    return true
+
+fn regallocX64AppendAggregateCopy(
+        bytes: var int32[],
+        sourceDisp: int32,
+        targetReg: int32,
+        byteCount: int32): bool =
+    if sourceDisp >= 0 || targetReg < 0 ||
+       targetReg > 15 || byteCount <= 0:
+        return false
+    var copied: int32
+    while copied < byteCount:
+        var width: int32 = 1
+        if byteCount - copied >= 8:
+            width = 8
+        elif byteCount - copied >= 4:
+            width = 4
+        if !regallocX64AppendBaseAccess(
+               bytes, RegallocX64R11, RegallocX64Rbp,
+               sourceDisp + copied, width, true) ||
+           !regallocX64AppendBaseAccess(
+               bytes, RegallocX64R11, targetReg,
+               copied, width, false):
+            return false
+        copied = copied + width
+    return true
+
+fn regallocX64BuildPrologue(
+        bodyIR: var coreir.BodyIR,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        out: var carrier.RegallocA64FunctionRecipes): bool =
+    var bytes: int32[]
+    regallocX64AppendByte(bytes, 0x55)
+    regallocX64AppendByte(bytes, 0x48)
+    regallocX64AppendByte(bytes, 0x89)
+    regallocX64AppendByte(bytes, 0xE5)
+    for reg in 0..<16:
+        if (plan.usedCalleeMask & (int64(1) << reg)) == 0:
+            continue
+        if !regallocX64AppendPush(bytes, reg):
+            return false
+        add(out.calleeSavedRegs, reg)
+        add(out.calleeSavedOffsets, out.calleeSavedRegs.len * 8)
+    let calleeBytes = out.calleeSavedRegs.len * 8
+    var bodyStackBytes = calleeBytes
+    var fixedArgShift: int32
+    if out.hasSretReturn:
+        fixedArgShift = 1
+    let registerArgCount =
+        plan.constraints.fixedArgRegs.len - fixedArgShift
+    if registerArgCount < 0:
+        return false
+    var parameterCount: int32
+    for slotIndex in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[slotIndex]
+        let paramIndex = regallocX64ParamIndex(slot)
+        if paramIndex >= 0:
+            if paramIndex == 2147483647:
+                return false
+            if paramIndex + 1 > parameterCount:
+                parameterCount = paramIndex + 1
+    var parameterSlotIndices: int32[]
+    setLen(parameterSlotIndices, parameterCount)
+    for paramIndex in 0..<parameterCount:
+        parameterSlotIndices[paramIndex] = -1
+    for slotIndex in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[slotIndex]
+        let paramIndex = regallocX64ParamIndex(slot)
+        if paramIndex < 0:
+            continue
+        if parameterSlotIndices[paramIndex] >= 0:
+            return false
+        parameterSlotIndices[paramIndex] = slotIndex
+    var parameterNeedsHome: bool[]
+    setLen(parameterNeedsHome, parameterCount)
+    for paramIndex in 0..<parameterCount:
+        let slotIndex = parameterSlotIndices[paramIndex]
+        if slotIndex < 0 ||
+           slotIndex >= bodyIR.localSlots.len:
+            return false
+        let slot = bodyIR.localSlots[slotIndex]
+        let valueId =
+            regallocX64EntryValueForSlot(plan, slotIndex)
+        if valueId < 0 ||
+           valueId >= plan.valueMemoryHomes.len ||
+           slot.sizeBytes <= 0 || slot.alignBytes <= 0 ||
+           !regallocX64ScalarKind(slot.typeKind):
+            return false
+        let width =
+            regallocX64CanonicalScalarSlotWidth(
+                bodyIR, slotIndex)
+        if width <= 0:
+            return false
+        add(out.parameterValueIds, valueId)
+        add(out.parameterWidths, width)
+        add(out.parameterHomeOffsets, -1)
+        parameterNeedsHome[paramIndex] =
+            plan.valueMemoryHomes[valueId]
+        if paramIndex < registerArgCount &&
+           parameterNeedsHome[paramIndex]:
+            bodyStackBytes = regallocX64Align(
+                bodyStackBytes, slot.alignBytes)
+            if bodyStackBytes < 0 ||
+               bodyStackBytes >
+                   2147483647 - slot.sizeBytes:
+                return false
+            bodyStackBytes = bodyStackBytes + slot.sizeBytes
+            out.parameterHomeOffsets[paramIndex] =
+                0 - bodyStackBytes
+        elif paramIndex >= registerArgCount:
+            out.parameterHomeOffsets[paramIndex] =
+                16 + (paramIndex - registerArgCount) * 8
+    out.returnBufferSaveOffset = -1
+    if out.hasSretReturn:
+        bodyStackBytes = regallocX64Align(bodyStackBytes, 8)
+        if bodyStackBytes < 0 ||
+           bodyStackBytes > 2147483647 - 8:
+            return false
+        bodyStackBytes = bodyStackBytes + 8
+        out.returnBufferSaveOffset = 0 - bodyStackBytes
+    let ingressStackBytes =
+        bodyStackBytes - calleeBytes
+    if ingressStackBytes < 0:
+        return false
+    for slotIndex in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[slotIndex]
+        if slot.sizeBytes <= 0 || slot.alignBytes <= 0:
+            return false
+        let paramIndex = regallocX64ParamIndex(slot)
+        if paramIndex >= 0:
+            if paramIndex >= parameterCount:
+                return false
+            add(out.localStackOffsets,
+                out.parameterHomeOffsets[paramIndex])
+            continue
+        bodyStackBytes = regallocX64Align(
+            bodyStackBytes, slot.alignBytes)
+        if bodyStackBytes < 0 ||
+           bodyStackBytes > 2147483647 - slot.sizeBytes:
+            return false
+        bodyStackBytes = bodyStackBytes + slot.sizeBytes
+        add(out.localStackOffsets, 0 - bodyStackBytes)
+    if bodyStackBytes < calleeBytes:
+        return false
+    bodyStackBytes = bodyStackBytes - calleeBytes
+    # SysV enters with rsp % 16 == 8.  The body and every direct call site
+    # observe rsp % 16 == 0.
+    if (calleeBytes + bodyStackBytes) % 16 != 0:
+        bodyStackBytes = bodyStackBytes + 8
+    if !regallocX64AppendStackAdjust(
+           bytes, bodyStackBytes, true):
+        return false
+    var parameterIngressByteStarts: int32[]
+    var parameterIngressByteEnds: int32[]
+    setLen(parameterIngressByteStarts, parameterCount)
+    setLen(parameterIngressByteEnds, parameterCount)
+    for paramIndex in 0..<parameterCount:
+        parameterIngressByteStarts[paramIndex] = -1
+        parameterIngressByteEnds[paramIndex] = -1
+        if paramIndex >= registerArgCount ||
+           !parameterNeedsHome[paramIndex]:
+            continue
+        let homeOffset =
+            out.parameterHomeOffsets[paramIndex]
+        if homeOffset >= 0:
+            return false
+        parameterIngressByteStarts[paramIndex] = bytes.len
+        if !regallocX64AppendStackAccess(
+               bytes,
+               plan.constraints.fixedArgRegs[
+                   paramIndex + fixedArgShift],
+               homeOffset,
+               out.parameterWidths[paramIndex], false):
+            return false
+        parameterIngressByteEnds[paramIndex] = bytes.len
+    var sretIngressByteStart: int32 = -1
+    var sretIngressByteEnd: int32 = -1
+    if out.hasSretReturn:
+        sretIngressByteStart = bytes.len
+        if !regallocX64AppendStackAccess(
+               bytes, RegallocX64Rdi,
+               out.returnBufferSaveOffset, 8, false):
+            return false
+        sretIngressByteEnd = bytes.len
+    out.frameBytes = 8 + calleeBytes + bodyStackBytes
+    out.calleeRegionEnd = 8 + calleeBytes
+    out.ingressRegionStart = out.calleeRegionEnd
+    out.ingressRegionSize = ingressStackBytes
+    out.bodyRegionStart =
+        out.ingressRegionStart + out.ingressRegionSize
+    var fragment = regallocX64FragmentInit()
+    fragment.ownerKind =
+        carrier.RegallocA64FragmentOwnerFramePrologue
+    fragment.ownerOrdinal = 0
+    fragment.siteKind = bodyaccess.BodyIrAccessSiteEntry
+    fragment.siteIndex = -1
+    if !regallocX64AppendFragment(out, bytes, fragment):
+        return false
+    if out.hasSretReturn:
+        let fragmentIndex = out.machineFragments.len - 1
+        let wordStart =
+            out.machineFragments[fragmentIndex].wordStart +
+            sretIngressByteStart / 4
+        let wordEnd =
+            out.machineFragments[fragmentIndex].wordStart +
+            (sretIngressByteEnd + 3) / 4
+        add(out.abiIngressRegs, RegallocX64Rdi)
+        add(out.abiIngressOffsets, out.returnBufferSaveOffset)
+        add(out.abiIngressParamOrdinals, -1)
+        add(out.abiIngressValueIds, -1)
+        add(out.abiIngressWidths, 8)
+        add(out.abiIngressWordIndices, wordStart)
+        add(out.abiIngressWordCounts, wordEnd - wordStart)
+    for paramIndex in 0..<parameterCount:
+        let slotIndex = parameterSlotIndices[paramIndex]
+        if slotIndex < 0 ||
+           slotIndex >= bodyIR.localSlots.len ||
+           slotIndex >= out.localStackOffsets.len:
+            return false
+        let valueId =
+            regallocX64EntryValueForSlot(plan, slotIndex)
+        if valueId < 0:
+            return false
+        if paramIndex < registerArgCount:
+            if !parameterNeedsHome[paramIndex]:
+                continue
+            let byteStart =
+                parameterIngressByteStarts[paramIndex]
+            let byteEnd =
+                parameterIngressByteEnds[paramIndex]
+            if byteStart < 0 || byteEnd <= byteStart:
+                return false
+            let fragmentIndex =
+                out.machineFragments.len - 1
+            add(out.abiIngressRegs,
+                plan.constraints.fixedArgRegs[
+                    paramIndex + fixedArgShift])
+            add(out.abiIngressOffsets,
+                out.parameterHomeOffsets[paramIndex])
+            add(out.abiIngressParamOrdinals, paramIndex)
+            add(out.abiIngressValueIds, valueId)
+            add(out.abiIngressWidths,
+                out.parameterWidths[paramIndex])
+            add(out.abiIngressWordIndices,
+                out.machineFragments[fragmentIndex].wordStart +
+                byteStart / 4)
+            add(out.abiIngressWordCounts,
+                (byteEnd + 3) / 4 - byteStart / 4)
+            continue
+        add(out.abiIngressRegs, -1)
+        add(out.abiIngressOffsets,
+            out.localStackOffsets[slotIndex])
+        add(out.abiIngressParamOrdinals, paramIndex)
+        add(out.abiIngressValueIds, valueId)
+        add(out.abiIngressWidths,
+            out.parameterWidths[paramIndex])
+        add(out.abiIngressWordIndices,
+            out.functionWords.len)
+        add(out.abiIngressWordCounts, 0)
+    return true
+
+fn regallocX64AppendEpilogue(
+        out: var carrier.RegallocA64FunctionRecipes,
+        bytes: var int32[]): bool =
+    let pushedBytes = (1 + out.calleeSavedRegs.len) * 8
+    if out.frameBytes < pushedBytes ||
+       !regallocX64AppendStackAdjust(
+           bytes, out.frameBytes - pushedBytes, false):
+        return false
+    var index = out.calleeSavedRegs.len
+    while index > 0:
+        index = index - 1
+        if !regallocX64AppendPop(
+               bytes, out.calleeSavedRegs[index]):
+            return false
+    regallocX64AppendByte(bytes, 0x5D)
+    regallocX64AppendByte(bytes, 0xC3)
+    return true
+
+fn regallocX64BuildBlockEmissionOrder(
+        bodyIR: var coreir.BodyIR,
+        plan: var alloc.RegallocSinglePassValuePlan): int32[] =
+    var out: int32[]
+    var emitted: bool[]
+    setLen(emitted, bodyIR.blocks.len)
+    while true:
+        var selected: int32 = -1
+        var selectedPosition: int32 = 2147483647
+        for blockIndex in 0..<bodyIR.blocks.len:
+            if emitted[blockIndex] ||
+               blockIndex >= plan.blockEntryPositions.len ||
+               plan.blockEntryPositions[blockIndex] < 0:
+                continue
+            let position = plan.blockEntryPositions[blockIndex]
+            if position < selectedPosition ||
+               position == selectedPosition &&
+                   (selected < 0 || blockIndex < selected):
+                selected = blockIndex
+                selectedPosition = position
+        if selected < 0:
+            break
+        emitted[selected] = true
+        add(out, selected)
+    return out
+
+@borrows
+fn regallocX64FindEdge(
+        plan: var alloc.RegallocSinglePassValuePlan,
+        sourceBlock: int32,
+        targetBlock: int32): int32 =
+    for edgeIndex in 0..<plan.edgeSourceBlocks.len:
+        if edgeIndex < plan.edgeTargetBlocks.len &&
+           plan.edgeSourceBlocks[edgeIndex] == sourceBlock &&
+           plan.edgeTargetBlocks[edgeIndex] == targetBlock:
+            return edgeIndex
+    return -1
+
+@borrows
+fn regallocX64ActionMatches(
+        action: alloc.RegallocValueAction,
+        placement: int32,
+        blockIndex: int32,
+        opIndex: int32,
+        termIndex: int32,
+        edgeIndex: int32): bool =
+    if action.placement != placement:
+        return false
+    if blockIndex >= 0 && action.blockIndex != blockIndex:
+        return false
+    if opIndex >= 0 && action.opIndex != opIndex:
+        return false
+    if termIndex >= 0 && action.termIndex != termIndex:
+        return false
+    if edgeIndex >= 0 && action.edgeIndex != edgeIndex:
+        return false
+    return true
+
+@borrows
+fn regallocX64EdgeHasMachineActions(
+        plan: var alloc.RegallocSinglePassValuePlan,
+        edgeIndex: int32): bool =
+    for actionIndex in 0..<plan.actions.len:
+        if plan.actions[actionIndex].placement ==
+               alloc.RegallocValuePlacementEdge &&
+           plan.actions[actionIndex].edgeIndex == edgeIndex &&
+           alloc.RegallocSinglePassValueActionBindingKind(
+               plan.actions[actionIndex].kind) ==
+               alloc.RegallocValueBindingMachine:
+            return true
+    return false
+
+fn regallocX64AppendTermFragment(
+        bodyIR: var coreir.BodyIR,
+        table: var bodyaccess.BodyIrAccessTable,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        out: var carrier.RegallocA64FunctionRecipes,
+        blockIndex: int32,
+        termIndex: int32,
+        fixups: var RegallocX64BranchFixup[]): bool =
+    if blockIndex < 0 || blockIndex >= bodyIR.blocks.len ||
+       termIndex < 0 || termIndex >= bodyIR.terms.len:
+        return false
+    let term = bodyIR.terms[termIndex]
+    var bytes: int32[]
+    var localBranchBytes: int32[]
+    var localImmediateBytes: int32[]
+    var targetBlocks: int32[]
+    if term.kind == coreir.BodyTermReturnTag:
+        if !regallocX64AppendEpilogue(out, bytes):
+            return false
+    elif term.kind == coreir.BodyTermBrTag:
+        if term.trueBlock < 0 ||
+           term.trueBlock >= bodyIR.blocks.len:
+            return false
+        add(localBranchBytes, bytes.len)
+        regallocX64AppendByte(bytes, 0xE9)
+        add(localImmediateBytes, bytes.len)
+        regallocX64AppendU32(bytes, 0)
+        add(targetBlocks, term.trueBlock)
+    elif term.kind == coreir.BodyTermCbrTag:
+        if term.trueBlock < 0 ||
+           term.trueBlock >= bodyIR.blocks.len ||
+           term.falseBlock < 0 ||
+           term.falseBlock >= bodyIR.blocks.len:
+            return false
+        var lhsSlot = term.lhsSlot
+        if lhsSlot < 0:
+            lhsSlot = term.resultSlot
+        if lhsSlot < 0 || lhsSlot >= bodyIR.localSlots.len ||
+           !regallocX64ScalarKind(
+               bodyIR.localSlots[lhsSlot].typeKind):
+            return false
+        let lhsKind = bodyIR.localSlots[lhsSlot].typeKind
+        let lhsReg = regallocX64TermOperandReg(
+            table, plan, termIndex, 0)
+        if lhsReg < 0 || lhsReg > 15:
+            return false
+        var condition: int32 = -1
+        if term.conditionKind == coreir.BodyCondLocalNonZeroTag ||
+           term.conditionKind == coreir.BodyCondLocalZeroTag:
+            if term.rhsSlot >= 0 || term.operands.len != 0:
+                return false
+            regallocX64AppendRex(
+                bytes, lhsKind != coreir.LocalI32Tag,
+                lhsReg, lhsReg, false)
+            regallocX64AppendByte(bytes, 0x85)
+            regallocX64AppendByte(
+                bytes, regallocX64ModRm(lhsReg, lhsReg))
+            condition = 5
+            if term.conditionKind ==
+                   coreir.BodyCondLocalZeroTag:
+                condition = 4
+        else:
+            condition =
+                regallocX64ConditionCode(term.conditionKind)
+            if condition < 0:
+                return false
+            if term.rhsSlot >= 0:
+                if term.rhsSlot >= bodyIR.localSlots.len ||
+                   bodyIR.localSlots[term.rhsSlot].typeKind !=
+                       lhsKind ||
+                   term.operands.len != 0:
+                    return false
+                let rhsReg = regallocX64TermOperandReg(
+                    table, plan, termIndex, 1)
+                if rhsReg < 0 || rhsReg > 15:
+                    return false
+                regallocX64AppendRex(
+                    bytes, lhsKind != coreir.LocalI32Tag,
+                    rhsReg, lhsReg, false)
+                regallocX64AppendByte(bytes, 0x39)
+                regallocX64AppendByte(
+                    bytes, regallocX64ModRm(rhsReg, lhsReg))
+            else:
+                var rhsValue: int32
+                if term.operands.len == 1:
+                    rhsValue = term.operands[0]
+                elif term.operands.len != 0:
+                    return false
+                regallocX64AppendRex(
+                    bytes, lhsKind != coreir.LocalI32Tag,
+                    7, lhsReg, false)
+                regallocX64AppendByte(bytes, 0x81)
+                regallocX64AppendByte(
+                    bytes, regallocX64ModRm(7, lhsReg))
+                regallocX64AppendU32(bytes, rhsValue)
+        add(localBranchBytes, bytes.len)
+        regallocX64AppendByte(bytes, 0x0F)
+        regallocX64AppendByte(bytes, 0x80 + condition)
+        add(localImmediateBytes, bytes.len)
+        regallocX64AppendU32(bytes, 0)
+        add(targetBlocks, term.trueBlock)
+        add(localBranchBytes, bytes.len)
+        regallocX64AppendByte(bytes, 0xE9)
+        add(localImmediateBytes, bytes.len)
+        regallocX64AppendU32(bytes, 0)
+        add(targetBlocks, term.falseBlock)
+    else:
+        return false
+    var fragment = regallocX64FragmentInit()
+    fragment.ownerKind =
+        carrier.RegallocA64FragmentOwnerTerm
+    fragment.ownerOrdinal = termIndex
+    fragment.siteKind = bodyaccess.BodyIrAccessSiteTerm
+    fragment.siteIndex = termIndex
+    fragment.blockIndex = blockIndex
+    fragment.irKind = term.kind
+    if !regallocX64AppendFragment(out, bytes, fragment):
+        return false
+    let fragmentIndex = out.machineFragments.len - 1
+    var appended = out.machineFragments[fragmentIndex]
+    out.termWordStarts[termIndex] = appended.wordStart
+    out.termWordCounts[termIndex] = appended.wordCount
+    for branchIndex in 0..<localBranchBytes.len:
+        let branchByte =
+            appended.wordStart * 4 +
+            localBranchBytes[branchIndex]
+        let immediateByte =
+            appended.wordStart * 4 +
+            localImmediateBytes[branchIndex]
+        add(appended.branchWordIndices, branchByte / 4)
+        add(appended.branchByteOffsets, branchByte)
+        add(appended.branchTargetBlocks,
+            targetBlocks[branchIndex])
+        var fixup: RegallocX64BranchFixup
+        fixup.fragmentIndex = fragmentIndex
+        fixup.sourceBlock = blockIndex
+        fixup.targetBlock = targetBlocks[branchIndex]
+        fixup.branchOrdinal = branchIndex
+        fixup.branchByteOffset = branchByte
+        fixup.immediateByteOffset = immediateByte
+        add(fixups, fixup)
+    out.machineFragments[fragmentIndex] = appended
+    return true
+
+fn regallocX64AppendEdgeTrampoline(
+        bodyIR: var coreir.BodyIR,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        out: var carrier.RegallocA64FunctionRecipes,
+        edgeIndex: int32,
+        fixups: var RegallocX64BranchFixup[]): bool =
+    if edgeIndex < 0 ||
+       edgeIndex >= plan.edgeSourceBlocks.len ||
+       edgeIndex >= plan.edgeTargetBlocks.len:
+        return false
+    let sourceBlock = plan.edgeSourceBlocks[edgeIndex]
+    let targetBlock = plan.edgeTargetBlocks[edgeIndex]
+    if sourceBlock < 0 || sourceBlock >= bodyIR.blocks.len ||
+       targetBlock < 0 || targetBlock >= bodyIR.blocks.len:
+        return false
+    var bytes: int32[]
+    let branchLocalByte = bytes.len
+    regallocX64AppendByte(bytes, 0xE9)
+    let immediateLocalByte = bytes.len
+    regallocX64AppendU32(bytes, 0)
+    var fragment = regallocX64FragmentInit()
+    fragment.ownerKind =
+        carrier.RegallocA64FragmentOwnerEdgeTrampoline
+    fragment.ownerOrdinal = edgeIndex
+    fragment.siteKind = bodyaccess.BodyIrAccessSiteTerm
+    fragment.siteIndex = bodyIR.blocks[sourceBlock].termIndex
+    fragment.blockIndex = sourceBlock
+    fragment.edgeIndex = edgeIndex
+    fragment.sourceBlock = sourceBlock
+    fragment.targetBlock = targetBlock
+    for actionIndex in 0..<plan.actions.len:
+        if plan.actions[actionIndex].placement ==
+               alloc.RegallocValuePlacementEdge &&
+           plan.actions[actionIndex].edgeIndex == edgeIndex &&
+           plan.actions[actionIndex].requiresEdgeSplit:
+            fragment.requiresEdgeSplit = true
+    if !regallocX64AppendFragment(out, bytes, fragment):
+        return false
+    let fragmentIndex = out.machineFragments.len - 1
+    var appended = out.machineFragments[fragmentIndex]
+    let branchByte =
+        appended.wordStart * 4 + branchLocalByte
+    let immediateByte =
+        appended.wordStart * 4 + immediateLocalByte
+    add(appended.branchWordIndices, branchByte / 4)
+    add(appended.branchByteOffsets, branchByte)
+    add(appended.branchTargetBlocks, targetBlock)
+    appended.trampolineWordStart =
+        out.edgeSplitWordStarts[edgeIndex]
+    appended.trampolineTargetBlock = targetBlock
+    var fixup: RegallocX64BranchFixup
+    fixup.fragmentIndex = fragmentIndex
+    fixup.sourceBlock = -1
+    fixup.targetBlock = targetBlock
+    fixup.branchOrdinal = 0
+    fixup.branchByteOffset = branchByte
+    fixup.immediateByteOffset = immediateByte
+    add(fixups, fixup)
+    out.machineFragments[fragmentIndex] = appended
+    return true
+
+fn regallocX64PatchBranches(
+        plan: var alloc.RegallocSinglePassValuePlan,
+        out: var carrier.RegallocA64FunctionRecipes,
+        fixups: var RegallocX64BranchFixup[]): bool =
+    for fixupIndex in 0..<fixups.len:
+        let fixup = fixups[fixupIndex]
+        if fixup.fragmentIndex < 0 ||
+           fixup.fragmentIndex >= out.machineFragments.len ||
+           fixup.targetBlock < 0 ||
+           fixup.targetBlock >= out.blockWordStarts.len ||
+           out.blockWordStarts[fixup.targetBlock] < 0:
+            return false
+        var targetWord = out.blockWordStarts[fixup.targetBlock]
+        if fixup.sourceBlock >= 0:
+            let edgeIndex = regallocX64FindEdge(
+                plan, fixup.sourceBlock, fixup.targetBlock)
+            if edgeIndex < 0:
+                return false
+            if edgeIndex < out.edgeSplitWordStarts.len &&
+               out.edgeSplitWordStarts[edgeIndex] >= 0:
+                targetWord = out.edgeSplitWordStarts[edgeIndex]
+        let targetByte = targetWord * 4
+        if !regallocX64PatchRel32(
+               out.functionWords,
+               fixup.immediateByteOffset,
+               targetByte):
+            return false
+        var fragment =
+            out.machineFragments[fixup.fragmentIndex]
+        if fixup.branchOrdinal < 0 ||
+           fixup.branchOrdinal >=
+               fragment.branchByteOffsets.len ||
+           fragment.branchTargetByteOffsets.len !=
+               fixup.branchOrdinal ||
+           fragment.branchTargetBlocks[
+               fixup.branchOrdinal] != fixup.targetBlock:
+            return false
+        add(fragment.branchTargetWordStarts, targetWord)
+        add(fragment.branchTargetByteOffsets, targetByte)
+        if fragment.ownerKind ==
+               carrier.RegallocA64FragmentOwnerEdgeTrampoline:
+            fragment.trampolineTargetWordStart = targetWord
+        out.machineFragments[fixup.fragmentIndex] = fragment
+    return true
+
+fn regallocX64AppendAction(
+        bodyIR: var coreir.BodyIR,
+        table: var bodyaccess.BodyIrAccessTable,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        out: var carrier.RegallocA64FunctionRecipes,
+        actionIndex: int32,
+        opOwned: var bool[]): bool =
+    if actionIndex < 0 || actionIndex >= plan.actions.len ||
+       actionIndex >= out.actionWordStarts.len ||
+       out.actionWordStarts[actionIndex] >= 0:
+        return false
+    var action = plan.actions[actionIndex]
+    let bindingKind =
+        alloc.RegallocSinglePassValueActionBindingKind(action.kind)
+    if bindingKind == alloc.RegallocValueBindingStructural:
+        if action.kind == alloc.RegallocValueActionCoalescedCopy &&
+           action.opIndex >= 0 &&
+           action.opIndex < opOwned.len:
+            opOwned[action.opIndex] = true
+        out.actionWordStarts[actionIndex] =
+            out.functionWords.len
+        return true
+    if bindingKind != alloc.RegallocValueBindingMachine:
+        return false
+    var bytes: int32[]
+    var fragmentRelocs: carrier.RegallocA64ActionReloc[]
+    if !regallocX64AppendActionBytes(
+           bytes, fragmentRelocs, bodyIR, table, plan,
+           out, action):
+        return false
+    var fragment = regallocX64FragmentInit()
+    fragment.ownerKind =
+        carrier.RegallocA64FragmentOwnerAction
+    if action.placement ==
+           alloc.RegallocValuePlacementEdge:
+        fragment.ownerKind =
+            carrier.RegallocA64FragmentOwnerEdge
+    fragment.ownerOrdinal = actionIndex
+    fragment.actionConsumerOrdinal = actionIndex
+    fragment.blockIndex = action.blockIndex
+    fragment.siteIndex = action.opIndex
+    fragment.siteKind = bodyaccess.BodyIrAccessSiteOp
+    if action.placement ==
+           alloc.RegallocValuePlacementEdge:
+        if action.blockIndex < 0 ||
+           action.blockIndex >= bodyIR.blocks.len:
+            return false
+        fragment.siteKind = bodyaccess.BodyIrAccessSiteTerm
+        fragment.siteIndex =
+            bodyIR.blocks[action.blockIndex].termIndex
+    elif action.termIndex >= 0:
+        fragment.siteKind = bodyaccess.BodyIrAccessSiteTerm
+        fragment.siteIndex = action.termIndex
+    elif action.opIndex < 0:
+        fragment.siteKind = bodyaccess.BodyIrAccessSiteEntry
+        fragment.siteIndex = -1
+    fragment.edgeIndex = action.edgeIndex
+    fragment.sourceBlock = action.sourceBlock
+    fragment.targetBlock = action.targetBlock
+    fragment.requiresEdgeSplit = action.requiresEdgeSplit
+    fragment.valueId = action.valueId
+    fragment.irKind = action.kind
+    if action.targetReg >= 0:
+        add(fragment.writtenRegs, action.targetReg)
+    if action.kind == alloc.RegallocValueActionSpillCall:
+        fragment.effectMask = fragment.effectMask |
+                              carrier.RegallocA64EffectSpStore
+    elif action.kind == alloc.RegallocValueActionReloadCall:
+        fragment.effectMask = fragment.effectMask |
+                              carrier.RegallocA64EffectSpLoad
+    elif action.kind == alloc.RegallocValueActionCallClobber:
+        fragment.effectMask = fragment.effectMask |
+                              carrier.RegallocA64EffectCall
+        for clobberIndex in 0..<
+                plan.constraints.callClobberRegs.len:
+            add(fragment.writtenRegs,
+                plan.constraints.callClobberRegs[clobberIndex])
+        if regallocX64CallOutgoingFrame(
+               table, action.callOrdinal) > 0:
+            add(fragment.writtenRegs, RegallocX64Rsp)
+    elif action.kind == alloc.RegallocValueActionStoreStackArg:
+        fragment.effectMask = fragment.effectMask |
+                              carrier.RegallocA64EffectSpStore
+        if action.outgoingStackArgIndex == 0:
+            add(fragment.writtenRegs, RegallocX64Rsp)
+        if action.sourceLocation ==
+               alloc.RegallocValueLocationStack:
+            add(fragment.writtenRegs, RegallocX64R11)
+    elif action.kind == alloc.RegallocValueActionStoreSretReturn:
+        fragment.effectMask = fragment.effectMask |
+                              carrier.RegallocA64EffectSpLoad |
+                              carrier.RegallocA64EffectSpStore
+        add(fragment.writtenRegs, RegallocX64R11)
+        add(fragment.writtenRegs, RegallocX64Rax)
+    if !regallocX64AppendFragment(out, bytes, fragment):
+        return false
+    let fragmentIndex = out.machineFragments.len - 1
+    var appended = out.machineFragments[fragmentIndex]
+    for relocIndex in 0..<fragmentRelocs.len:
+        var reloc = fragmentRelocs[relocIndex]
+        reloc.byteOffset =
+            appended.wordStart * 4 + reloc.byteOffset
+        reloc.wordIndex = reloc.byteOffset / 4
+        add(out.functionRelocs, share(reloc))
+        add(appended.relocs, share(reloc))
+    let appendedWordStart = appended.wordStart
+    let appendedWordCount = appended.wordCount
+    out.machineFragments[fragmentIndex] = appended
+    out.actionWordStarts[actionIndex] = appendedWordStart
+    out.actionWordCounts[actionIndex] = appendedWordCount
+    if action.opIndex >= 0 && action.opIndex < opOwned.len:
+        opOwned[action.opIndex] = true
+        if out.opWordStarts[action.opIndex] < 0:
+            out.opWordStarts[action.opIndex] = appendedWordStart
+        out.opWordCounts[action.opIndex] =
+            out.opWordCounts[action.opIndex] +
+            appendedWordCount
+    if action.kind == alloc.RegallocValueActionEntryReload:
+        let ingressIndex = out.abiIngressRegs.len
+        add(out.abiIngressRegs, action.sourceReg)
+        var ingressOffset: int32 = -1
+        if action.sourceLocation ==
+               alloc.RegallocValueLocationStack:
+            var fixedArgShift: int32
+            if out.hasSretReturn:
+                fixedArgShift = 1
+            let registerArgCount =
+                plan.constraints.fixedArgRegs.len - fixedArgShift
+            ingressOffset =
+                16 + (action.fixedOrdinal - registerArgCount) * 8
+        add(out.abiIngressOffsets, ingressOffset)
+        add(out.abiIngressParamOrdinals, action.fixedOrdinal)
+        add(out.abiIngressValueIds, action.valueId)
+        let width = regallocX64CanonicalValueWidth(
+            bodyIR, plan, action.valueId)
+        if width <= 0:
+            return false
+        add(out.abiIngressWidths, width)
+        add(out.abiIngressWordIndices, appendedWordStart)
+        add(out.abiIngressWordCounts, appendedWordCount)
+        var ingressFragment =
+            out.machineFragments[fragmentIndex]
+        ingressFragment.ownerKind =
+            carrier.RegallocA64FragmentOwnerAbiIngress
+        ingressFragment.ingressIndex = ingressIndex
+        out.machineFragments[fragmentIndex] = ingressFragment
+    return true
+
+fn regallocX64AppendMatchingActions(
+        bodyIR: var coreir.BodyIR,
+        table: var bodyaccess.BodyIrAccessTable,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        out: var carrier.RegallocA64FunctionRecipes,
+        placement: int32,
+        blockIndex: int32,
+        opIndex: int32,
+        termIndex: int32,
+        edgeIndex: int32,
+        opOwned: var bool[]): bool =
+    for actionIndex in 0..<plan.actions.len:
+        let action = plan.actions[actionIndex]
+        if regallocX64ActionMatches(
+               action, placement,
+               blockIndex, opIndex, termIndex, edgeIndex) &&
+           !regallocX64AppendAction(
+               bodyIR, table, plan, out,
+               actionIndex, opOwned):
+            return false
+    return true
+
+@borrows
+fn regallocX64BodyOpSupported(
+        bodyIR: var coreir.BodyIR,
+        opIndex: int32): bool =
+    if opIndex < 0 || opIndex >= bodyIR.ops.len:
+        return false
+    let op = bodyIR.ops[opIndex]
+    if op.kind == coreir.BodyOpLoadConstTag:
+        return op.target >= 0 &&
+               op.target < bodyIR.localSlots.len &&
+               regallocX64ScalarKind(
+                   bodyIR.localSlots[op.target].typeKind)
+    if op.kind == coreir.BodyOpCopyLocalTag ||
+       op.kind == coreir.BodyOpLoadLocalTag ||
+       op.kind == coreir.BodyOpStoreLocalTag:
+        return op.operands.len == 1
+    if op.kind == coreir.BodyOpBinOpTag ||
+       op.kind == coreir.BodyOpCmpTag:
+        return true
+    if op.kind == coreir.BodyOpCallTag:
+        return op.operands.len == 1 &&
+               regallocX64CallSupported(
+                   bodyIR, op.operands[0])
+    return false
+
+fn RegallocX64PrepareFunctionActionRecipes(
+        bodyIR: var coreir.BodyIR,
+        plan: var alloc.RegallocSinglePassValuePlan):
+        carrier.RegallocA64FunctionRecipes =
+    var out: carrier.RegallocA64FunctionRecipes
+    out.valid = true
+    out.errorDetail = -1
+    out.machineXlen = 64
+    if !alloc.RegallocSinglePassValuePlanValidate(plan) ||
+       plan.finalized || plan.emissionSymbolBound ||
+       plan.nextIssueOrdinal != 0 || plan.nextAckOrdinal != 0 ||
+       !alloc.RegallocSinglePassValuePlanMatchesBodyIrIngress(
+           bodyIR, plan):
+        regallocX64Fail(
+            out, RegallocX64RecipeErrorPlan, plan.errorDetail)
+        return out
+    if plan.constraints.fixedSretReg != RegallocX64Rdi ||
+       plan.constraints.parallelCopyScratchReg != RegallocX64R11 ||
+       bodyIR.blocks.len <= 0 ||
+       bodyIR.terms.len <= 0 ||
+       plan.edgeSourceBlocks.len != plan.edgeTargetBlocks.len ||
+       plan.edgeSourceBlocks.len != plan.edgeActionStarts.len ||
+       plan.edgeSourceBlocks.len != plan.edgeActionCounts.len:
+        regallocX64Fail(
+            out, RegallocX64RecipeErrorUnsupported, -1)
+        return out
+    for callOrdinal in 0..<bodyIR.callSequence.len:
+        if !regallocX64CallSupported(
+               bodyIR, callOrdinal):
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorUnsupported,
+                callOrdinal)
+            return out
+    var table = bodyaccess.BodyIrAccessDecode(bodyIR)
+    if !table.valid:
+        regallocX64Fail(
+            out, RegallocX64RecipeErrorBody,
+            table.errorSiteIndex)
+        return out
+    var sretMemorySlots: bool[]
+    setLen(sretMemorySlots, bodyIR.localSlots.len)
+    var stackArgValues: bool[]
+    setLen(stackArgValues, plan.valueClasses.len)
+    for actionIndex in 0..<plan.actions.len:
+        let action = plan.actions[actionIndex]
+        if action.outgoingStackFrameBytes >
+               out.outgoingStackBytes:
+            out.outgoingStackBytes =
+                action.outgoingStackFrameBytes
+        if action.kind ==
+               alloc.RegallocValueActionStoreSretReturn ||
+           action.kind ==
+               alloc.RegallocValueActionSretForward:
+            out.hasSretReturn = true
+        if action.kind ==
+               alloc.RegallocValueActionStoreStackArg &&
+           action.sourceLocation ==
+               alloc.RegallocValueLocationStack &&
+           action.valueId >= 0 &&
+           action.valueId < stackArgValues.len:
+            stackArgValues[action.valueId] = true
+        var slotIndex: int32 = -1
+        if action.kind ==
+               alloc.RegallocValueActionAddressFixed:
+            slotIndex = action.encodedValue
+        elif (action.kind ==
+                  alloc.RegallocValueActionBindSretResult ||
+              action.kind ==
+                  alloc.RegallocValueActionStoreSretReturn) &&
+             action.valueId >= 0 &&
+             action.valueId < plan.valueSlotIndices.len:
+            slotIndex = plan.valueSlotIndices[action.valueId]
+        if slotIndex >= 0 &&
+           slotIndex < sretMemorySlots.len:
+            sretMemorySlots[slotIndex] = true
+    for slotIndex in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[slotIndex]
+        if !regallocX64ScalarKind(slot.typeKind) &&
+           (!regallocX64SretKind(slot.typeKind) ||
+            !sretMemorySlots[slotIndex]):
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorUnsupported, slotIndex)
+            return out
+    for valueIndex in 0..<plan.valueClasses.len:
+        let slotIndex = plan.valueSlotIndices[valueIndex]
+        let sretMemoryValue =
+            slotIndex >= 0 &&
+            slotIndex < sretMemorySlots.len &&
+            sretMemorySlots[slotIndex] &&
+            regallocX64SretKind(
+                plan.valueTypeKinds[valueIndex]) &&
+            plan.valueClasses[valueIndex] ==
+                alloc.RegallocValueClassStack &&
+            plan.valueMemoryHomes[valueIndex] &&
+            plan.valueAssignedRegs[valueIndex] < 0
+        let scalarStackArgValue =
+            stackArgValues[valueIndex] &&
+            regallocX64ScalarKind(
+                plan.valueTypeKinds[valueIndex]) &&
+            (plan.valueClasses[valueIndex] ==
+                 alloc.RegallocValueClassStack ||
+             plan.valueClasses[valueIndex] ==
+                 alloc.RegallocValueClassGpr) &&
+            plan.valueAssignedRegs[valueIndex] < 0
+        let addressHomeValue =
+            regallocX64AddressHomeValueSupported(
+                bodyIR, plan, valueIndex)
+        if !sretMemoryValue && !scalarStackArgValue &&
+           !addressHomeValue &&
+           (plan.valueClasses[valueIndex] ==
+                alloc.RegallocValueClassStack ||
+            plan.valueClasses[valueIndex] ==
+                alloc.RegallocValueClassAddressHome ||
+            plan.valueMemoryHomes[valueIndex] ||
+            (plan.valueClasses[valueIndex] ==
+                 alloc.RegallocValueClassGpr &&
+             plan.valueAssignedRegs[valueIndex] < 0)):
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorUnsupported, valueIndex)
+            return out
+    for opIndex in 0..<bodyIR.ops.len:
+        if !regallocX64BodyOpSupported(bodyIR, opIndex):
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorUnsupported, opIndex)
+            return out
+        out.bodyOpKindMask =
+            out.bodyOpKindMask | (int64(1) << bodyIR.ops[opIndex].kind)
+    for termIndex in 0..<bodyIR.terms.len:
+        let term = bodyIR.terms[termIndex]
+        if term.kind != coreir.BodyTermReturnTag &&
+           term.kind != coreir.BodyTermBrTag &&
+           term.kind != coreir.BodyTermCbrTag:
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorUnsupported,
+                termIndex)
+            return out
+    setLen(out.actionWordStarts, plan.actions.len)
+    setLen(out.actionWordCounts, plan.actions.len)
+    for actionIndex in 0..<plan.actions.len:
+        out.actionWordStarts[actionIndex] = -1
+    setLen(out.opWordStarts, bodyIR.ops.len)
+    setLen(out.opWordCounts, bodyIR.ops.len)
+    for opIndex in 0..<bodyIR.ops.len:
+        out.opWordStarts[opIndex] = -1
+    setLen(out.termWordStarts, bodyIR.terms.len)
+    setLen(out.termWordCounts, bodyIR.terms.len)
+    for termIndex in 0..<bodyIR.terms.len:
+        out.termWordStarts[termIndex] = -1
+    setLen(out.blockWordStarts, bodyIR.blocks.len)
+    for blockIndex in 0..<bodyIR.blocks.len:
+        out.blockWordStarts[blockIndex] = -1
+    setLen(out.edgeSplitWordStarts, plan.edgeSourceBlocks.len)
+    for edgeIndex in 0..<plan.edgeSourceBlocks.len:
+        out.edgeSplitWordStarts[edgeIndex] = -1
+    out.blockEmissionOrder =
+        regallocX64BuildBlockEmissionOrder(bodyIR, plan)
+    out.reachableBlockCount = out.blockEmissionOrder.len
+    if out.reachableBlockCount <= 0:
+        regallocX64Fail(
+            out, RegallocX64RecipeErrorBody, -1)
+        return out
+    if !regallocX64BuildPrologue(bodyIR, plan, out):
+        regallocX64Fail(
+            out, RegallocX64RecipeErrorEncoding, -1)
+        return out
+    var opOwned: bool[]
+    setLen(opOwned, bodyIR.ops.len)
+    if !regallocX64AppendMatchingActions(
+           bodyIR, table, plan, out,
+           alloc.RegallocValuePlacementFunctionEntry,
+           -1, -1, -1, -1, opOwned):
+        regallocX64Fail(
+            out, RegallocX64RecipeErrorAction, -1)
+        return out
+    var opReachable: bool[]
+    setLen(opReachable, bodyIR.ops.len)
+    var fixups: RegallocX64BranchFixup[]
+    for scheduleIndex in 0..<out.blockEmissionOrder.len:
+        let blockIndex = out.blockEmissionOrder[scheduleIndex]
+        if blockIndex < 0 || blockIndex >= bodyIR.blocks.len:
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorBody, blockIndex)
+            return out
+        let block = bodyIR.blocks[blockIndex]
+        if block.opStart < 0 || block.opCount < 0 ||
+           block.opStart > bodyIR.ops.len - block.opCount ||
+           block.termIndex < 0 ||
+           block.termIndex >= bodyIR.terms.len:
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorBody, blockIndex)
+            return out
+        out.blockWordStarts[blockIndex] =
+            out.functionWords.len
+        if !regallocX64AppendMatchingActions(
+               bodyIR, table, plan, out,
+               alloc.RegallocValuePlacementBlockEntry,
+               blockIndex, -1, -1, -1, opOwned):
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorAction, blockIndex)
+            return out
+        for opIndex in block.opStart..<
+                (block.opStart + block.opCount):
+            opReachable[opIndex] = true
+            if !regallocX64AppendMatchingActions(
+                   bodyIR, table, plan, out,
+                   alloc.RegallocValuePlacementBeforeOp,
+                   blockIndex, opIndex, -1, -1, opOwned) ||
+               !regallocX64AppendMatchingActions(
+                   bodyIR, table, plan, out,
+                   alloc.RegallocValuePlacementAfterOp,
+                   blockIndex, opIndex, -1, -1, opOwned):
+                regallocX64Fail(
+                    out, RegallocX64RecipeErrorAction, opIndex)
+                return out
+        if !regallocX64AppendMatchingActions(
+               bodyIR, table, plan, out,
+               alloc.RegallocValuePlacementBlockExit,
+               blockIndex, -1, -1, -1, opOwned):
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorAction, blockIndex)
+            return out
+        let termIndex = block.termIndex
+        if !regallocX64AppendMatchingActions(
+               bodyIR, table, plan, out,
+               alloc.RegallocValuePlacementBeforeTerm,
+               blockIndex, -1, termIndex, -1, opOwned) ||
+           !regallocX64AppendTermFragment(
+               bodyIR, table, plan, out,
+               blockIndex, termIndex, fixups) ||
+           !regallocX64AppendMatchingActions(
+               bodyIR, table, plan, out,
+               alloc.RegallocValuePlacementAfterTerm,
+               blockIndex, -1, termIndex, -1, opOwned):
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorEncoding, termIndex)
+            return out
+        for edgeIndex in 0..<plan.edgeSourceBlocks.len:
+            if plan.edgeSourceBlocks[edgeIndex] != blockIndex ||
+               !regallocX64EdgeHasMachineActions(
+                   plan, edgeIndex):
+                continue
+            out.edgeSplitWordStarts[edgeIndex] =
+                out.functionWords.len
+            if !regallocX64AppendMatchingActions(
+                   bodyIR, table, plan, out,
+                   alloc.RegallocValuePlacementEdge,
+                   blockIndex, -1, -1, edgeIndex, opOwned) ||
+               !regallocX64AppendEdgeTrampoline(
+                   bodyIR, plan, out, edgeIndex, fixups):
+                regallocX64Fail(
+                    out, RegallocX64RecipeErrorAction, edgeIndex)
+                return out
+    for actionIndex in 0..<plan.actions.len:
+        if out.actionWordStarts[actionIndex] >= 0:
+            continue
+        if alloc.RegallocSinglePassValueActionBindingKind(
+               plan.actions[actionIndex].kind) !=
+               alloc.RegallocValueBindingStructural:
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorAction, actionIndex)
+            return out
+        out.actionWordStarts[actionIndex] =
+            out.functionWords.len
+    for opIndex in 0..<opOwned.len:
+        if opReachable[opIndex] && !opOwned[opIndex]:
+            regallocX64Fail(
+                out, RegallocX64RecipeErrorAction, opIndex)
+            return out
+    if !regallocX64PatchBranches(plan, out, fixups):
+        regallocX64Fail(
+            out, RegallocX64RecipeErrorEncoding, -1)
+        return out
+    out.valid = out.functionWords.len > 0 &&
+                out.machineFragments.len > 0
+    if !out.valid:
+        regallocX64Fail(
+            out, RegallocX64RecipeErrorEncoding, -1)
+    return out
+
+# B1（2026-08-25）：契约单元派发注册（蓝图 3.2）。本 impl 仅承载 x86_64 单元
+# 的 recipe 准备入口；派发协议其余列（symbolName/encoder authority/projection
+# 两列）对本单元不生效，参数面由契约统一签名冻结。
+
+fn RegallocX64CodegenUnitPrepareFunctionRecipes(
+        bodyIR: var coreir.BodyIR,
+        plan: var alloc.RegallocSinglePassValuePlan,
+        symbolName: str,
+        encoderSourceRow: int32,
+        encoderSourceCid: layout.FixedBytes32,
+        slotDataSymbols: var str[],
+        cstringDataSymbols: var str[]): carrier.RegallocA64FunctionRecipes =
+    return RegallocX64PrepareFunctionActionRecipes(
+        bodyIR, plan)
+
+fn RegallocX64CodegenUnitRegister(): bool =
+    return carrier.CodegenUnitRegisterPrepareRecipes(
+        carrier.CodegenUnitX64,
+        RegallocX64CodegenUnitPrepareFunctionRecipes)

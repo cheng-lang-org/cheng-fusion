@@ -1,7 +1,16 @@
 #!/usr/bin/env bun
 import assert from "node:assert/strict";
 import {createHash} from "node:crypto";
-import {copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync} from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import {tmpdir} from "node:os";
 import {dirname, join} from "node:path";
 import {handleMcpRequest} from "../src/cheng_fusion_mcp_server_m9009.ts";
@@ -16,7 +25,14 @@ import {
   auditSemanticSnapshotStructure,
   composePublishedCandidateExecutionReceipt,
   captureSemanticSnapshotAuditInputs,
+  cleanupPublishedCandidateNextPathAuthority,
+  createPublishedCandidateNextPathAuthority,
+  publishedCandidateNextEnvironment,
   runSemanticSnapshotAudit,
+  semanticSnapshotProductionClosureOuterAuditCid,
+  semanticSnapshotPublishedCandidateReceiptBindingCid,
+  validatePublishedCandidateNextPathAuthority,
+  verifyPublishedCandidateNextArtifactBindings,
   verifyPublishedCandidateGateStdout,
   verifySemanticSnapshotAuditInputs,
 } from "../src/cheng_semantic_snapshot_audit.ts";
@@ -62,8 +78,59 @@ function injectBeforeNextFunction(source:string, functionName:string, statement:
   return `${source.slice(0, end)}\n    ${statement}\n${source.slice(end)}`;
 }
 
+function replaceExactlyOnce(
+  source:string,
+  needle:string,
+  replacement:string,
+  label:string,
+) {
+  assert.notEqual(needle, replacement, `${label} replacement is unchanged`);
+  assert.equal(
+    source.split(needle).length - 1,
+    1,
+    `${label} mutation target is not unique`,
+  );
+  return source.replace(needle, replacement);
+}
+
 function digest(raw:Buffer|string) {
   return createHash("sha256").update(raw).digest("hex");
+}
+
+function stdoutEntry(rawText:string) {
+  const raw = Buffer.from(rawText, "utf8");
+  return {raw, sha256: digest(raw), bytes: raw.length};
+}
+
+function frameCidPart(value:string|number|boolean) {
+  const raw = Buffer.from(String(value), "utf8");
+  const size = Buffer.allocUnsafe(4);
+  size.writeUInt32BE(raw.length, 0);
+  return [size, raw];
+}
+
+function executionReceiptCid(receipt:any) {
+  const parts = [
+    "cheng.semantic_snapshot.published_candidate_execution_receipt",
+    receipt.sourceSetCid,
+    receipt.runtimeReceiptCid,
+    receipt.routingReceiptCid,
+    receipt.sourceVersion,
+    receipt.documentCount,
+    receipt.openDocumentCount,
+    receipt.compilerSha256,
+    receipt.formalSpecSha256,
+    receipt.sourceClosureCid,
+    receipt.objectSha256,
+    receipt.bindingReceiptCid,
+    receipt.queryProjectionCid,
+    receipt.openDocumentUniverseCid,
+    receipt.snapshotPayloadCid,
+    receipt.stdoutSha256,
+  ];
+  const hash = createHash("sha256");
+  for (const framed of parts.flatMap(frameCidPart)) hash.update(framed);
+  return hash.digest("hex");
 }
 
 console.log("[A] production sources satisfy the independent structural audit");
@@ -71,6 +138,9 @@ const baselineStructure = auditSemanticSnapshotStructure(coreSource, productionS
 assert.equal(baselineStructure.status, "pass");
 assert.match(baselineStructure.receiptCid, /^[0-9a-f]{64}$/);
 const compilerInputs = captureSemanticSnapshotAuditInputs(CHENG_ROOT);
+assert.equal(
+  compilerInputs.byPath.get("docs/cheng-formal-spec.md")?.role,
+  "formal_language_spec");
 assert.equal(auditColdCompilerIncludeClosure(compilerInputs).status, "pass");
 await assert.rejects(
   runSemanticSnapshotAudit(CHENG_ROOT, "atomic_publish", 120, true),
@@ -78,6 +148,101 @@ await assert.rejects(
 await assert.rejects(
   runSemanticSnapshotAudit(CHENG_ROOT, "production_closure", 120, true),
   /timeoutSeconds must be at least 1230/);
+
+console.log("[A1] published candidate NEXT paths have one exact private authority");
+{
+  const authority = createPublishedCandidateNextPathAuthority();
+  try {
+    const env = publishedCandidateNextEnvironment(authority, {
+      PATH: "/usr/bin:/bin",
+    });
+    assert.equal(
+      validatePublishedCandidateNextPathAuthority(
+        authority, env, false).length,
+      0,
+    );
+    const envNames = [
+      "CHENG_LSP_PUBLISHED_BINDING_NEXT",
+      "CHENG_LSP_PUBLISHED_QUERY_PROJECTION_NEXT",
+      "CHENG_LSP_PUBLISHED_OPEN_DOCUMENT_UNIVERSE_NEXT",
+      "CHENG_LSP_PUBLISHED_SNAPSHOT_NEXT",
+    ];
+    const paths = envNames.map((name) => env[name]);
+    assert.equal(new Set(paths).size, 4);
+
+    const missingEnv = {...env};
+    delete missingEnv[envNames[0]];
+    assert.throws(
+      () => validatePublishedCandidateNextPathAuthority(
+        authority, missingEnv, false),
+      /environment authority set invalid/);
+
+    const swappedEnv = {...env};
+    [swappedEnv[envNames[0]], swappedEnv[envNames[1]]] =
+      [swappedEnv[envNames[1]], swappedEnv[envNames[0]]];
+    assert.throws(
+      () => validatePublishedCandidateNextPathAuthority(
+        authority, swappedEnv, false),
+      /path authority invalid/);
+
+    assert.throws(
+      () => publishedCandidateNextEnvironment(authority, {
+        CHENG_LSP_PUBLISHED_LEGACY_NEXT: "/tmp/legacy.next",
+      }),
+      /extra authority/);
+
+    for (let index = 0; index < 3; index += 1) {
+      writeFileSync(paths[index], `published-next-${index}\n`);
+    }
+    assert.throws(
+      () => validatePublishedCandidateNextPathAuthority(
+        authority, env, true),
+      /artifact path set invalid/);
+
+    writeFileSync(paths[3], "published-next-3\n");
+    const extraPath = join(authority.root, "unexpected.next");
+    writeFileSync(extraPath, "unexpected\n");
+    assert.throws(
+      () => validatePublishedCandidateNextPathAuthority(
+        authority, env, true),
+      /artifact path set invalid/);
+    rmSync(extraPath);
+
+    const entries = validatePublishedCandidateNextPathAuthority(
+      authority, env, true);
+    const byRole = new Map(entries.map((entry) => [
+      entry.role,
+      entry.sha256,
+    ]));
+    const runtimeReceipt = {
+      bindingReceiptCid: byRole.get("published_binding_next"),
+      queryProjectionCid:
+        byRole.get("published_query_projection_next"),
+      openDocumentUniverseCid:
+        byRole.get("published_open_document_universe_next"),
+      snapshotPayloadCid: byRole.get("published_snapshot_next"),
+    };
+    assert.doesNotThrow(() =>
+      verifyPublishedCandidateNextArtifactBindings(
+        entries, runtimeReceipt));
+    assert.throws(
+      () => verifyPublishedCandidateNextArtifactBindings(entries, {
+        ...runtimeReceipt,
+        bindingReceiptCid: runtimeReceipt.queryProjectionCid,
+      }),
+      /artifact CID drift/);
+
+    const replacement = `${paths[0]}.replacement`;
+    copyFileSync(paths[0], replacement);
+    renameSync(replacement, paths[0]);
+    assert.throws(
+      () => validatePublishedCandidateNextPathAuthority(
+        authority, env, true, entries),
+      /artifact identity drift/);
+  } finally {
+    cleanupPublishedCandidateNextPathAuthority(authority);
+  }
+}
 
 console.log("[A2] production closure proves exact contracts without hiding real publication blockers");
 const closure = auditSemanticSnapshotProductionClosure(closureSources);
@@ -117,18 +282,28 @@ const gateSource = readFileSync(
 assert.equal(auditPublishedCandidateGateRouting(
   gateSource,
   compilerInputs.byPath.get("tools/beat_c_process_group_guard.sh")!.sha256).status, "pass");
+const gateWithoutFormalSpecClosure = gateSource.replace(
+  "src bootstrap cheng-package.toml cheng.lock.toml \\\n    docs/cheng-formal-spec.md",
+  "src bootstrap cheng-package.toml cheng.lock.toml");
+assert.notEqual(gateWithoutFormalSpecClosure, gateSource);
+assert.throws(
+  () => auditPublishedCandidateGateRouting(
+    gateWithoutFormalSpecClosure,
+    compilerInputs.byPath.get("tools/beat_c_process_group_guard.sh")!.sha256),
+  /published candidate gate routing missing: src bootstrap cheng-package.toml cheng.lock.toml docs\/cheng-formal-spec\.md/);
 const publishedGateText = [
   "lsp_multifile_exact_snapshot_acceptance_gate_status=pass",
   `source_sha256=${compilerInputs.byPath.get("src/tests/lsp_multifile_exact_snapshot_acceptance_smoke.cheng")!.sha256}`,
   `gate_sha256=${compilerInputs.byPath.get(SEMANTIC_SNAPSHOT_PUBLISHED_CANDIDATE_GATE_PATH)!.sha256}`,
   `compiler_sha256=${"1".repeat(64)}`,
   `compiler_source_sha256=${compilerInputs.byPath.get("bootstrap/cheng_cold.c")!.sha256}`,
+  `formal_spec_sha256=${compilerInputs.byPath.get("docs/cheng-formal-spec.md")!.sha256}`,
   `lsp_module_sha256=${compilerInputs.byPath.get("src/core/tooling/lsp_server.cheng")!.sha256}`,
   `query_projection_module_sha256=${compilerInputs.byPath.get("src/core/tooling/semantic_snapshot_query_projection.cheng")!.sha256}`,
   `compiler_csg_module_sha256=${compilerInputs.byPath.get("src/core/tooling/compiler_csg.cheng")!.sha256}`,
   `source_closure_cid=${"2".repeat(64)}`,
   `object_sha256=${"3".repeat(64)}`,
-  `lsp_multifile_exact_snapshot_acceptance_status=pass published=1 source_version=6 documents=3 open_documents=3 binding_receipt=${"4".repeat(64)} query_projection=${"5".repeat(64)} open_document_universe=${"7".repeat(64)}`,
+  `lsp_multifile_exact_snapshot_acceptance_status=pass published=1 source_version=6 documents=3 open_documents=3 binding_receipt=${"4".repeat(64)} query_projection=${"5".repeat(64)} open_document_universe=${"7".repeat(64)} snapshot_payload=${"8".repeat(64)}`,
 ].join("\n") + "\n";
 const publishedGateRaw = Buffer.from(publishedGateText, "utf8");
 const publishedStdoutReceipt = verifyPublishedCandidateGateStdout(
@@ -137,6 +312,10 @@ const publishedStdoutReceipt = verifyPublishedCandidateGateStdout(
   "6".repeat(64));
 assert.equal(publishedStdoutReceipt.status, "validated");
 assert.equal(publishedStdoutReceipt.sourceVersion, 6);
+assert.equal(publishedStdoutReceipt.snapshotPayloadCid, "8".repeat(64));
+assert.equal(
+  publishedStdoutReceipt.formalSpecSha256,
+  compilerInputs.byPath.get("docs/cheng-formal-spec.md")!.sha256);
 const publishedReceipt = composePublishedCandidateExecutionReceipt(
   publishedStdoutReceipt,
   auditPublishedCandidateGateRouting(
@@ -146,7 +325,91 @@ const publishedReceipt = composePublishedCandidateExecutionReceipt(
 const closureWithPublishedReceipt = auditSemanticSnapshotProductionClosure(
   closureSources, publishedReceipt);
 assert.equal(closureWithPublishedReceipt.observations.publishedCandidateEvidence, true);
+assert.equal(
+  closureWithPublishedReceipt.observations
+    .publishedCandidateGateProvenanceExact,
+  false);
 assert.ok(!closureWithPublishedReceipt.blockers.includes("no_published_candidate_evidence"));
+assert.equal(executionReceiptCid(publishedReceipt), publishedReceipt.receiptCid);
+const productionClosureWithSyntheticReceipt =
+  auditSemanticSnapshotProductionClosure(
+    closureSources, publishedReceipt, true);
+assert.equal(
+  productionClosureWithSyntheticReceipt.observations
+    .publishedCandidateEvidence,
+  false);
+assert.ok(productionClosureWithSyntheticReceipt.blockers.includes(
+  "no_published_candidate_evidence"));
+assert.notEqual(
+  productionClosureWithSyntheticReceipt.receiptCid,
+  closureWithPublishedReceipt.receiptCid);
+const changedRuntimePayloadReceipt = {
+  ...publishedStdoutReceipt,
+  snapshotPayloadCid: "a".repeat(64),
+};
+assert.throws(
+  () => composePublishedCandidateExecutionReceipt(
+    changedRuntimePayloadReceipt,
+    auditPublishedCandidateGateRouting(
+      gateSource,
+      compilerInputs.byPath.get("tools/beat_c_process_group_guard.sh")!.sha256),
+    "6".repeat(64)),
+  /runtime receipt CID does not bind its complete authority/);
+const executionWithoutSnapshotPayload = {...publishedReceipt};
+delete executionWithoutSnapshotPayload.snapshotPayloadCid;
+assert.equal(auditSemanticSnapshotProductionClosure(
+  closureSources,
+  executionWithoutSnapshotPayload).observations.publishedCandidateEvidence,
+false);
+const changedExecutionPayloadReceipt = {
+  ...publishedReceipt,
+  snapshotPayloadCid: "a".repeat(64),
+};
+changedExecutionPayloadReceipt.receiptCid =
+  executionReceiptCid(changedExecutionPayloadReceipt);
+const changedExecutionPayloadClosure = auditSemanticSnapshotProductionClosure(
+  closureSources, changedExecutionPayloadReceipt);
+assert.equal(
+  changedExecutionPayloadClosure.observations.publishedCandidateEvidence,
+  false);
+assert.ok(changedExecutionPayloadClosure.blockers.includes(
+  "no_published_candidate_evidence"));
+const publishedCandidatePresenceVariants = [
+  null,
+  {receiptCid: ""},
+  {receiptCid: "0".repeat(64)},
+  {status: "pass", receiptCid: "9".repeat(64)},
+  publishedReceipt,
+];
+const publishedCandidateBindingCids =
+  publishedCandidatePresenceVariants.map((receipt) =>
+    semanticSnapshotPublishedCandidateReceiptBindingCid(receipt));
+assert.equal(
+  new Set(publishedCandidateBindingCids).size,
+  publishedCandidatePresenceVariants.length);
+const publishedCandidateClosureCids =
+  publishedCandidatePresenceVariants.map((receipt) =>
+    auditSemanticSnapshotProductionClosure(
+      closureSources, receipt).receiptCid);
+assert.equal(
+  new Set(publishedCandidateClosureCids).size,
+  publishedCandidatePresenceVariants.length);
+const publishedCandidateOuterAuditCids =
+  publishedCandidatePresenceVariants.map((receipt) =>
+    semanticSnapshotProductionClosureOuterAuditCid(
+      "1".repeat(64),
+      "2".repeat(64),
+      "3".repeat(64),
+      "4".repeat(64),
+      receipt));
+assert.equal(
+  new Set(publishedCandidateOuterAuditCids).size,
+  publishedCandidatePresenceVariants.length);
+assert.equal(auditSemanticSnapshotProductionClosure(
+  closureSources,
+  {...publishedReceipt, formalSpecSha256: undefined})
+  .observations.publishedCandidateEvidence,
+false);
 assert.equal(auditSemanticSnapshotProductionClosure(
   closureSources,
   {status: "pass", receiptCid: "9".repeat(64)}).observations.publishedCandidateEvidence,
@@ -155,12 +418,41 @@ assert.throws(() => verifyPublishedCandidateGateStdout(
   {raw: Buffer.from(publishedGateText.replace("published=1", "published=0")), sha256: "7".repeat(64), bytes: publishedGateRaw.length},
   compilerInputs,
   "6".repeat(64)), /runtime publication receipt is malformed/);
+const missingSnapshotPayloadText = publishedGateText.replace(
+  ` snapshot_payload=${"8".repeat(64)}`, "");
+assert.notEqual(missingSnapshotPayloadText, publishedGateText);
+assert.throws(() => verifyPublishedCandidateGateStdout(
+  stdoutEntry(missingSnapshotPayloadText),
+  compilerInputs,
+  "6".repeat(64)), /runtime publication receipt is malformed/);
+const aliasedSnapshotPayloadText = publishedGateText.replace(
+  `snapshot_payload=${"8".repeat(64)}`,
+  `snapshot_payload=${"4".repeat(64)}`);
+assert.notEqual(aliasedSnapshotPayloadText, publishedGateText);
+assert.throws(() => verifyPublishedCandidateGateStdout(
+  stdoutEntry(aliasedSnapshotPayloadText),
+  compilerInputs,
+  "6".repeat(64)), /publication identities are empty or aliased/);
+const legacySnapshotPayloadFieldText = publishedGateText.replace(
+  `snapshot_payload=${"8".repeat(64)}`,
+  `snapshot_payload=${"8".repeat(64)} snapshot_payload_cid=${"9".repeat(64)}`);
+assert.notEqual(legacySnapshotPayloadFieldText, publishedGateText);
+assert.throws(() => verifyPublishedCandidateGateStdout(
+  stdoutEntry(legacySnapshotPayloadFieldText),
+  compilerInputs,
+  "6".repeat(64)), /runtime publication receipt is malformed/);
 assert.throws(() => verifyPublishedCandidateGateStdout(
   {raw: Buffer.from(publishedGateText.replace(
     `lsp_module_sha256=${compilerInputs.byPath.get("src/core/tooling/lsp_server.cheng")!.sha256}`,
     `lsp_module_sha256=${"8".repeat(64)}`)), sha256: "7".repeat(64), bytes: publishedGateRaw.length},
   compilerInputs,
   "6".repeat(64)), /lsp_module_sha256 is not bound/);
+assert.throws(() => verifyPublishedCandidateGateStdout(
+  {raw: Buffer.from(publishedGateText.replace(
+    `formal_spec_sha256=${compilerInputs.byPath.get("docs/cheng-formal-spec.md")!.sha256}`,
+    `formal_spec_sha256=${"8".repeat(64)}`)), sha256: "7".repeat(64), bytes: publishedGateRaw.length},
+  compilerInputs,
+  "6".repeat(64)), /formal_spec_sha256 is not bound/);
 assert.throws(() => verifyPublishedCandidateGateStdout(
   {raw: Buffer.from(`${publishedGateText}extra=field\n`), sha256: "7".repeat(64), bytes: publishedGateRaw.length + 12},
   compilerInputs,
@@ -239,6 +531,49 @@ assert.ok(auditSemanticSnapshotProductionClosure({
   lspVersionIsolationSmokeSource: sixQueryMutation,
 }).blockers.includes("lsp_missing_uncompleted_version_six_query_rejection"));
 
+for (const uriName of ["uriMain", "uriHelper"]) {
+  const immutablePublishedFixtureUriMutation =
+    lspVersionIsolationSmokeSource.replace(
+      `    var ${uriName} =`, `    let ${uriName} =`);
+  assert.notEqual(
+    immutablePublishedFixtureUriMutation,
+    lspVersionIsolationSmokeSource);
+  assert.ok(auditSemanticSnapshotProductionClosure({
+    ...closureSources,
+    lspVersionIsolationSmokeSource:
+      immutablePublishedFixtureUriMutation,
+  }).blockers.includes(
+    "published_candidate_fixture_not_exact_multifile"));
+}
+
+const coexistingImmutablePublishedFixtureUriMutation =
+  `${lspVersionIsolationSmokeSource}
+fn LegacyPublishedFixtureUriBindings(): bool =
+    let uriMain = "legacy-main"
+    let uriHelper = "legacy-helper"
+    return len(uriMain) + len(uriHelper) > 0
+`;
+assert.ok(auditSemanticSnapshotProductionClosure({
+  ...closureSources,
+  lspVersionIsolationSmokeSource:
+    coexistingImmutablePublishedFixtureUriMutation,
+}).blockers.includes(
+  "published_candidate_fixture_not_exact_multifile"));
+
+const duplicateMutablePublishedFixtureUriMutation =
+  `${lspVersionIsolationSmokeSource}
+fn DuplicatePublishedFixtureUriBindings(): bool =
+    var uriMain = "duplicate-main"
+    var uriHelper = "duplicate-helper"
+    return len(uriMain) + len(uriHelper) > 0
+`;
+assert.ok(auditSemanticSnapshotProductionClosure({
+  ...closureSources,
+  lspVersionIsolationSmokeSource:
+    duplicateMutablePublishedFixtureUriMutation,
+}).blockers.includes(
+  "published_candidate_fixture_not_exact_multifile"));
+
 const machoMutation = machoObjectWriterSource.replace(
   '"__debug_info"', '"__debug_fake"');
 assert.notEqual(machoMutation, machoObjectWriterSource);
@@ -272,6 +607,88 @@ assert.ok(auditSemanticSnapshotProductionClosure({
 }).blockers.includes(
   "schema_missing_exact_reference_owner_source_function_target_kind_binding"));
 
+let exactReferenceRelationMutationCount = 0;
+const exactReferenceRelationMutations = [
+  replaceExactlyOnce(
+    schemaSource,
+    "snapshot.symbols.functionIds[ownerSymbol] != ownerFunction",
+    "snapshot.symbols.functionIds[ownerSymbol] == ownerFunction",
+    "reference owner Symbol/function relation",
+  ),
+  replaceExactlyOnce(
+    schemaSource,
+    "snapshot.symbols.symbolKinds[ownerSymbol] !=\n"
+      + "                CsgCompilerSymbolModule",
+    "snapshot.symbols.symbolKinds[ownerSymbol] !=\n"
+      + "                CsgCompilerSymbolType",
+    "reference owner module kind",
+  ),
+  replaceExactlyOnce(
+    schemaSource,
+    "snapshot.symbols.symbolKinds[ownerSymbol] !=\n"
+      + "                CsgCompilerSymbolType",
+    "snapshot.symbols.symbolKinds[ownerSymbol] !=\n"
+      + "                CsgCompilerSymbolModule",
+    "reference owner type kind",
+  ),
+  replaceExactlyOnce(
+    schemaSource,
+    "snapshot.symbols.symbolKinds[ownerSymbol] !=\n"
+      + "                CsgCompilerSymbolFunction",
+    "snapshot.symbols.symbolKinds[ownerSymbol] !=\n"
+      + "                CsgCompilerSymbolType",
+    "reference owner function kind",
+  ),
+  replaceExactlyOnce(
+    schemaSource,
+    "referenceKind == CsgCompilerReferenceCall &&\n"
+      + "            snapshot.symbols.symbolKinds[target] !=\n"
+      + "                CsgCompilerSymbolFunction",
+    "referenceKind == CsgCompilerReferenceCall &&\n"
+      + "            snapshot.symbols.symbolKinds[target] !=\n"
+      + "                CsgCompilerSymbolType",
+    "call reference target kind",
+  ),
+  replaceExactlyOnce(
+    schemaSource,
+    "referenceKind == CsgCompilerReferenceType &&\n"
+      + "            snapshot.symbols.symbolKinds[target] != "
+      + "CsgCompilerSymbolType",
+    "referenceKind == CsgCompilerReferenceType &&\n"
+      + "            snapshot.symbols.symbolKinds[target] != "
+      + "CsgCompilerSymbolFunction",
+    "type reference target kind",
+  ),
+  replaceExactlyOnce(
+    schemaSource,
+    "referenceKind == CsgCompilerReferenceImport &&\n"
+      + "            snapshot.symbols.symbolKinds[target] !=\n"
+      + "                CsgCompilerSymbolModule",
+    "referenceKind == CsgCompilerReferenceImport &&\n"
+      + "            snapshot.symbols.symbolKinds[target] !=\n"
+      + "                CsgCompilerSymbolType",
+    "import reference target kind",
+  ),
+  replaceExactlyOnce(
+    schemaSource,
+    "snapshot.references.ownerSymbolIds[reference] !=\n"
+      + "               snapshot.functions.symbolIds[caller]",
+    "snapshot.references.ownerSymbolIds[reference] !=\n"
+      + "               snapshot.references.targetSymbolIds[reference]",
+    "call reference owner Symbol link",
+  ),
+];
+for (const mutation of exactReferenceRelationMutations) {
+  const mutationAudit = auditSemanticSnapshotProductionClosure({
+    ...closureSources,
+    schemaSource: mutation,
+  });
+  assert.ok(mutationAudit.blockers.includes(
+    "schema_missing_exact_reference_owner_source_function_target_kind_binding"));
+  exactReferenceRelationMutationCount++;
+}
+assert.equal(exactReferenceRelationMutationCount, 8);
+
 const referenceCargoMutation = cargoSource.replace(
   "snapshot.references.ownerSymbolIds)\n    csgCompilerCargoAppend(out, \",\\\"referenceKinds\\\":\")",
   "snapshot.references.ownerFunctionIds)\n    csgCompilerCargoAppend(out, \",\\\"referenceKinds\\\":\")");
@@ -280,6 +697,29 @@ assert.ok(auditSemanticSnapshotProductionClosure({
   ...closureSources,
   cargoSource: referenceCargoMutation,
 }).blockers.includes("cargo_missing_exact_reference_owner_symbol_binding"));
+
+let cargoExecutableSpoofMutationCount = 0;
+for (const cargoSpoofMutation of [
+  injectBeforeNextFunction(
+    referenceCargoMutation,
+    "csgCompilerCargoReferencesLine",
+    "# csgCompilerCargoAppendIntArray("
+      + "out, snapshot.references.ownerSymbolIds)",
+  ),
+  injectBeforeNextFunction(
+    referenceCargoMutation,
+    "csgCompilerCargoReferencesLine",
+    "let cargoExecutableSpoof = "
+      + "\"csgCompilerCargoAppendIntArray("
+      + "out, snapshot.references.ownerSymbolIds)\"",
+  ),
+]) {
+  assert.ok(auditSemanticSnapshotProductionClosure({
+    ...closureSources,
+    cargoSource: cargoSpoofMutation,
+  }).blockers.includes("cargo_missing_exact_reference_owner_symbol_binding"));
+  cargoExecutableSpoofMutationCount++;
+}
 
 const referenceBuilderRemapMutation = builderSource.replace(
   "newByOld[tables.references.ownerSymbolIds[row]]",
@@ -291,13 +731,93 @@ assert.ok(auditSemanticSnapshotProductionClosure({
 }).blockers.includes("builder_missing_exact_reference_owner_symbol_remap"));
 
 const referenceCargoDecodeMutation = cargoValidatorSource.replace(
-  'lines[16], "ownerSymbolIds",\n           facts.referenceOwnerSymbolIds, err)',
-  'lines[16], "ownerSymbolIds",\n           facts.referenceOwnerFunctionIds, err)');
+  'lines[16], "ownerSymbolIds",\n           facts.snapshot.references.ownerSymbolIds, err)',
+  'lines[16], "ownerSymbolIds",\n           facts.snapshot.references.ownerFunctionIds, err)');
 assert.notEqual(referenceCargoDecodeMutation, cargoValidatorSource);
 assert.ok(auditSemanticSnapshotProductionClosure({
   ...closureSources,
   cargoValidatorSource: referenceCargoDecodeMutation,
 }).blockers.includes("cargo_missing_exact_reference_owner_symbol_binding"));
+
+for (const cargoDecodeSpoofMutation of [
+  injectBeforeNextFunction(
+    referenceCargoDecodeMutation,
+    "csgCompilerWireDecodeInto",
+    "# csgCompilerWireIntArrayField("
+      + "lines[16], \"ownerSymbolIds\", "
+      + "facts.snapshot.references.ownerSymbolIds, err)",
+  ),
+  injectBeforeNextFunction(
+    referenceCargoDecodeMutation,
+    "csgCompilerWireDecodeInto",
+    "let cargoDecodeExecutableSpoof = "
+      + "\"csgCompilerWireIntArrayField("
+      + "lines[16], ownerSymbolIds, "
+      + "facts.snapshot.references.ownerSymbolIds, err)\"",
+  ),
+]) {
+  assert.ok(auditSemanticSnapshotProductionClosure({
+    ...closureSources,
+    cargoValidatorSource: cargoDecodeSpoofMutation,
+  }).blockers.includes("cargo_missing_exact_reference_owner_symbol_binding"));
+  cargoExecutableSpoofMutationCount++;
+}
+
+const referenceCargoLegacyDecodeMutation = cargoValidatorSource
+  .replace("facts.snapshot.references.sourceIds", "facts.referenceSourceIds")
+  .replace("facts.snapshot.references.spanIds", "facts.referenceSpanIds")
+  .replace("facts.snapshot.references.ownerFunctionIds", "facts.referenceOwnerFunctionIds")
+  .replace("facts.snapshot.references.ownerSymbolIds", "facts.referenceOwnerSymbolIds")
+  .replace("facts.snapshot.references.targetSymbolIds", "facts.referenceTargetSymbolIds")
+  .replace("facts.snapshot.references.referenceKinds", "facts.referenceKinds");
+assert.notEqual(referenceCargoLegacyDecodeMutation, cargoValidatorSource);
+assert.ok(auditSemanticSnapshotProductionClosure({
+  ...closureSources,
+  cargoValidatorSource: referenceCargoLegacyDecodeMutation,
+}).blockers.includes("cargo_missing_exact_reference_owner_symbol_binding"));
+
+for (const legacyBinding of [
+  "facts.referenceSourceIds",
+  "facts.referenceSpanIds",
+  "facts.referenceOwnerFunctionIds",
+  "facts.referenceOwnerSymbolIds",
+  "facts.referenceTargetSymbolIds",
+  "facts.referenceKinds",
+]) {
+  const referenceCargoLegacyCoexistMutation = injectBeforeNextFunction(
+    cargoValidatorSource,
+    "csgCompilerWireDecodeInto",
+    `let legacyReferenceBinding = ${legacyBinding}`);
+  assert.notEqual(referenceCargoLegacyCoexistMutation, cargoValidatorSource);
+  assert.ok(auditSemanticSnapshotProductionClosure({
+    ...closureSources,
+    cargoValidatorSource: referenceCargoLegacyCoexistMutation,
+  }).blockers.includes("cargo_missing_exact_reference_owner_symbol_binding"));
+}
+
+const referenceCargoLegacyOutsideDecoderMutation =
+  `${cargoValidatorSource}
+fn LegacyReferenceCargoReadOutsideDecoder(
+        facts: var CsgCoreChengCompilerWireFacts): int32 =
+    return facts.referenceOwnerSymbolIds.len
+`;
+assert.ok(auditSemanticSnapshotProductionClosure({
+  ...closureSources,
+  cargoValidatorSource: referenceCargoLegacyOutsideDecoderMutation,
+}).blockers.includes("cargo_missing_exact_reference_owner_symbol_binding"));
+cargoExecutableSpoofMutationCount++;
+assert.equal(cargoExecutableSpoofMutationCount, 5);
+
+const referenceCargoLegacyCommentOnlyMutation = injectBeforeNextFunction(
+  cargoValidatorSource,
+  "csgCompilerWireDecodeInto",
+  "# legacy schema text is not executable: facts.referenceOwnerSymbolIds");
+assert.deepEqual(
+  auditSemanticSnapshotProductionClosure({
+    ...closureSources,
+    cargoValidatorSource: referenceCargoLegacyCommentOnlyMutation,
+  }).blockers,
+  auditSemanticSnapshotProductionClosure(closureSources).blockers);
 
 const referenceCompilerFactMutation = compilerFactsSource.replace(
   "let ownerSymbolId = snapshot.references.ownerSymbolIds[row]",
@@ -308,6 +828,67 @@ assert.ok(auditSemanticSnapshotProductionClosure({
   compilerFactsSource: referenceCompilerFactMutation,
 }).blockers.includes(
   "compiler_fact_missing_exact_reference_owner_symbol_projection"));
+
+for (const referenceCidOwnershipMutation of [
+  compilerFactsSource.replace(
+    "reference.ownerSymbolCid =\n"
+      + "        layout.FixedBytes32Copy(\n"
+      + "            snapshot.symbols.symbolCids[ownerSymbolId])",
+    "reference.ownerSymbolCid =\n"
+      + "        snapshot.symbols.symbolCids[ownerSymbolId]"),
+  compilerFactsSource.replace(
+    "snapshot.symbols.symbolCids[ownerSymbolId])",
+    "snapshot.symbols.symbolCids[target])"),
+  compilerFactsSource.replace(
+    "snapshot.symbols.declKeyCids[ownerSymbolId])",
+    "snapshot.symbols.declKeyCids[target])"),
+  compilerFactsSource.replace(
+    "snapshot.symbols.symbolCids[target])",
+    "snapshot.symbols.symbolCids[ownerSymbolId])"),
+  compilerFactsSource.replace(
+    "reference.targetDeclKeyCid =\n"
+      + "        layout.FixedBytes32Copy(snapshot.symbols.declKeyCids[target])\n",
+    ""),
+]) {
+  assert.notEqual(referenceCidOwnershipMutation, compilerFactsSource);
+  assert.ok(auditSemanticSnapshotProductionClosure({
+    ...closureSources,
+    compilerFactsSource: referenceCidOwnershipMutation,
+  }).blockers.includes(
+    "compiler_fact_missing_exact_reference_owner_symbol_projection"));
+}
+
+const referenceTargetDeclIdentityMutation = compilerFactsSource.replace(
+  "reference.targetDeclId = snapshot.symbols.declIds[target]",
+  "reference.targetDeclId = snapshot.symbols.declIds[ownerSymbolId]");
+assert.notEqual(referenceTargetDeclIdentityMutation, compilerFactsSource);
+assert.ok(auditSemanticSnapshotProductionClosure({
+  ...closureSources,
+  compilerFactsSource: referenceTargetDeclIdentityMutation,
+}).blockers.includes(
+  "compiler_fact_missing_exact_reference_owner_symbol_projection"));
+
+const referenceDisplayOwnershipMutation = compilerFactsSource.replace(
+  "system.SystemToStringStr(snapshot.texts[targetNameTextId])",
+  "snapshot.texts[targetNameTextId]");
+assert.notEqual(referenceDisplayOwnershipMutation, compilerFactsSource);
+assert.ok(auditSemanticSnapshotProductionClosure({
+  ...closureSources,
+  compilerFactsSource: referenceDisplayOwnershipMutation,
+}).blockers.includes(
+  "compiler_fact_missing_exact_reference_owner_symbol_projection"));
+
+const compilerReferenceTextIdentityMutation = compilerFactsSource.replace(
+  "    reference.ownerFunctionId = ownerFunctionId",
+  "    let targetNameIdentity = snapshot.texts[\n"
+    + "        snapshot.symbols.nameTextIds[target]]\n"
+    + "    let arity = 1\n"
+    + "    reference.ownerFunctionId = ownerFunctionId");
+assert.notEqual(compilerReferenceTextIdentityMutation, compilerFactsSource);
+assert.ok(auditSemanticSnapshotProductionClosure({
+  ...closureSources,
+  compilerFactsSource: compilerReferenceTextIdentityMutation,
+}).blockers.includes("reference_identity_uses_text_or_name_arity"));
 
 const referenceLspMutation = lspSource.replace(
   "ownerSymbolIdOut = compilerFact.referenceFact.ownerSymbolId",
@@ -405,4 +986,8 @@ try {
   rmSync(fixtureRoot, {recursive: true, force: true});
 }
 
-console.log("item30 semantic snapshot audit mutations: PASS");
+console.log(
+  "item30 semantic snapshot audit mutations: PASS "
+    + `exact_reference_relations=${exactReferenceRelationMutationCount} `
+    + `cargo_executable_scope=${cargoExecutableSpoofMutationCount}`,
+);

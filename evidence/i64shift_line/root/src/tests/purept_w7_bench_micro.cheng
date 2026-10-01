@@ -1,0 +1,394 @@
+# purept_w7_bench_micro.cheng — W7 micro baseline + tuning A/B driver (pure Cheng).
+#
+# Measures, back-to-back in one process (same-window relative comparison
+# discipline), the campaign's five crypto primitives:
+#   AES-128-GCM seal / open (16 KiB stream payload + 1280 B QUIC packet payload)
+#   SHA-256 (16 KiB + 1280 B single-shot digest)
+#   HKDF-SHA256 (extract+expand, 32 B OKM)
+#   X25519 (full Diffie-Hellman scalar multiplication)
+#   Ed25519 (sign, verify)
+#
+# Protocol per bench: 2 warmup ops, then ROUNDS rounds x OPS ops, wall time per
+# round via monotimes; reported = median round, ns/op and derived throughput.
+# open benches include one payload memcpy per op (fresh-ciphertext semantics);
+# a memcpy16k calibration line is emitted for that overhead.
+# Result-handling forms follow the W1 drivers' stage3-proven idioms
+# (inferred let + .ok/.value, Value() on Result[Bytes], key.roundKeys into
+# the raw AES-GCM entry points).
+#
+# Output lines: "W7BENCH <name> ..." — parse-friendly, deterministic order.
+# Exit code: 0 = all ops healthy, 1 = any crypto op errored.
+
+import std/system
+import std/result
+import std/rawbytes
+import std/strings
+import std/seqs
+import std/monotimes
+import std/crypto/aesgcm as gcm
+import std/crypto/sha256
+import std/crypto/hkdf
+import std/crypto/curve25519
+import cheng/libp2p/crypto/ed25519/ed25519 as w1ed
+
+const W7_ROUNDS = 11
+const SEAL16_OPS = 6
+const OPEN16_OPS = 6
+const SEAL1280_OPS = 48
+const OPEN1280_OPS = 48
+const SHA16K_OPS = 48
+const SHA1280_OPS = 256
+const HKDF_OPS = 256
+const MEMCPY_OPS = 64
+const X25519_OPS = 3
+const EDSIGN_OPS = 2
+const EDVERIFY_OPS = 1
+
+const W7_KEY_HEX = "000102030405060708090a0b0c0d0e0f"
+const W7_NONCE_HEX = "0beefacedeadcafe00000001"
+const W7_AAD_TEXT = "w7-aad-12b!"
+
+fn w7NowNs(): int64 =
+    return monotimes.MonoTimeNs(monotimes.GetMonoTime())
+
+# Selection sort over a small fixed round-time buffer; returns the median.
+fn w7MedianNs(rs: var int64[]): int64 =
+    var i: int32
+    while i < len(rs):
+        var j: int32 = i + 1
+        while j < len(rs):
+            if rs[j] < rs[i]:
+                let tmp: int64 = rs[i]
+                rs[i] = rs[j]
+                rs[j] = tmp
+            j = j + 1
+        i = i + 1
+    return rs[len(rs) / 2]
+
+fn w7EmitBytes(name: str, payloadBytes: int32, ops: int32, medianRoundNs: int64) =
+    let nsPerOp: int64 = medianRoundNs / int64(ops)
+    let totalBytes: int64 = int64(payloadBytes) * int64(ops)
+    let bps: int64 = (totalBytes * int64(1000000000)) / medianRoundNs
+    echo("W7BENCH " + name + " payload_bytes=" + IntToStr(payloadBytes) +
+         " ops_per_round=" + IntToStr(ops) +
+         " median_round_ns=" + int64ToStr(medianRoundNs) +
+         " ns_per_op=" + int64ToStr(nsPerOp) +
+         " throughput_Bps=" + int64ToStr(bps))
+
+fn w7EmitOps(name: str, ops: int32, medianRoundNs: int64) =
+    let nsPerOp: int64 = medianRoundNs / int64(ops)
+    let opsPerSec: int64 = (int64(ops) * int64(1000000000)) / medianRoundNs
+    echo("W7BENCH " + name + " ops_per_round=" + IntToStr(ops) +
+         " median_round_ns=" + int64ToStr(medianRoundNs) +
+         " ns_per_op=" + int64ToStr(nsPerOp) +
+         " ops_per_sec=" + int64ToStr(opsPerSec))
+
+fn w7FillPattern(dst: Bytes) =
+    var x: int32 = 123456789
+    var i: int32
+    while i < BytesLen(dst):
+        x = x * 1103515245 + 12345
+        BytesSet(dst, i, (x >> 16) & 255)
+        i = i + 1
+
+fn main(): int32 =
+    echo("W7BENCH-BEGIN purept_w7_bench_micro")
+
+    # ---------- shared setup ----------
+    let keyBytes: Bytes = BytesFromHex(W7_KEY_HEX)
+    let nonceView: Bytes = BytesFromHex(W7_NONCE_HEX)
+    let aadView: Bytes = BytesFromString(W7_AAD_TEXT)
+    var keyRes: Result[gcm.AesGcmKey] = gcm.intoAesGcmKey(keyBytes)
+    if IsErr(keyRes):
+        echo("W7BENCH keysetup FAIL " + ErrorText(keyRes))
+        return 1
+    var key: gcm.AesGcmKey = Value(keyRes)
+    let keyRounds: int32 = key.rounds
+    # managed-aggregate field read goes through a view rebuild (stage3 contract,
+    # see purept_w1aead.md §3.2: plain field take lacks exact owned source).
+    let keyMat: Bytes = BytesSlice(key.roundKeys, 0, BytesLen(key.roundKeys))
+
+    var failCount: int32 = 0
+    var sink: int32
+
+    # ---------- AES-128-GCM seal 16 KiB ----------
+    var plain16k: Bytes = BytesAlloc(16384)
+    w7FillPattern(plain16k)
+    var sealWork: Bytes = BytesAlloc(16384)
+    BytesCopyInto(sealWork, 0, plain16k)
+    var ct16k: Bytes = BytesAlloc(16384)
+    BytesCopyInto(ct16k, 0, plain16k)
+    var tag0: Bytes
+    let s0: Result[bool] = gcm.aesGcmEncryptRaw(keyRounds, keyMat, nonceView, tag0, ct16k, aadView)
+    if IsErr(s0):
+        echo("W7BENCH seal16k setup FAIL " + ErrorText(s0))
+        return 1
+    # one roundtrip sanity before timing: decrypt(seal(p)) == p
+    var rtWork: Bytes = BytesAlloc(16384)
+    BytesCopyInto(rtWork, 0, ct16k)
+    let rtRes: Result[bool] = gcm.aesGcmDecryptRaw(keyRounds, keyMat, nonceView, tag0, rtWork, aadView)
+    if IsErr(rtRes):
+        echo("W7BENCH seal16k roundtrip FAIL " + ErrorText(rtRes))
+        return 1
+    if !BytesEqual(rtWork, plain16k):
+        echo("W7BENCH seal16k roundtrip MISMATCH")
+        return 1
+    BytesFree(rtWork)
+    let tagView: Bytes = BytesSlice(tag0, 0, BytesLen(tag0))
+    var seal16: int64[]
+    setLen(seal16, W7_ROUNDS)
+    var wu: int32
+    while wu < 2:
+        let e0: Result[bool] = gcm.aesGcmEncryptRaw(keyRounds, keyMat, nonceView, tag0, sealWork, aadView)
+        if IsErr(e0):
+            echo("W7BENCH seal16k op FAIL " + ErrorText(e0))
+            return 1
+        wu = wu + 1
+    var r: int32
+    while r < W7_ROUNDS:
+        let t0 = monotimes.GetMonoTime()
+        var k: int32
+        while k < SEAL16_OPS:
+            let e: Result[bool] = gcm.aesGcmEncryptRaw(keyRounds, keyMat, nonceView, tag0, sealWork, aadView)
+            if IsErr(e):
+                echo("W7BENCH seal16k op FAIL " + ErrorText(e))
+                return 1
+            k = k + 1
+        seal16[r] = w7NowNs() - monotimes.MonoTimeNs(t0)
+        r = r + 1
+    w7EmitBytes("aead128_seal_16k", 16384, SEAL16_OPS, w7MedianNs(seal16))
+    sink = sink + BytesGet(sealWork, r % 16384)
+
+    # ---------- AES-128-GCM open 16 KiB (fresh copy per op) ----------
+    var openWork: Bytes = BytesAlloc(16384)
+    var open16: int64[]
+    setLen(open16, W7_ROUNDS)
+    BytesCopyInto(openWork, 0, ct16k)
+    let dWu: Result[bool] = gcm.aesGcmDecryptRaw(keyRounds, keyMat, nonceView, tagView, openWork, aadView)
+    if IsErr(dWu):
+        echo("W7BENCH open16k warmup FAIL " + ErrorText(dWu))
+        return 1
+    r = 0
+    while r < W7_ROUNDS:
+        let t0 = monotimes.GetMonoTime()
+        var k: int32
+        while k < OPEN16_OPS:
+            BytesCopyInto(openWork, 0, ct16k)
+            let d: Result[bool] = gcm.aesGcmDecryptRaw(keyRounds, keyMat, nonceView, tagView, openWork, aadView)
+            if IsErr(d):
+                echo("W7BENCH open16k op FAIL " + ErrorText(d))
+                return 1
+            k = k + 1
+        open16[r] = w7NowNs() - monotimes.MonoTimeNs(t0)
+        r = r + 1
+    w7EmitBytes("aead128_open_16k", 16384, OPEN16_OPS, w7MedianNs(open16))
+    sink = sink + BytesGet(openWork, 7)
+
+    # ---------- memcpy16k calibration (open benches carry one copy per op) ----------
+    var mc: int64[]
+    setLen(mc, W7_ROUNDS)
+    r = 0
+    while r < W7_ROUNDS:
+        let t0 = monotimes.GetMonoTime()
+        var k: int32
+        while k < MEMCPY_OPS:
+            BytesCopyInto(openWork, 0, ct16k)
+            k = k + 1
+        mc[r] = w7NowNs() - monotimes.MonoTimeNs(t0)
+        r = r + 1
+    w7EmitBytes("memcpy16k", 16384, MEMCPY_OPS, w7MedianNs(mc))
+
+    # ---------- AES-128-GCM seal/open 1280 B (QUIC packet size) ----------
+    var plain1280: Bytes = BytesAlloc(1280)
+    w7FillPattern(plain1280)
+    var sealWork2: Bytes = BytesAlloc(1280)
+    BytesCopyInto(sealWork2, 0, plain1280)
+    var ct1280: Bytes = BytesAlloc(1280)
+    BytesCopyInto(ct1280, 0, plain1280)
+    var tag1: Bytes
+    let s1: Result[bool] = gcm.aesGcmEncryptRaw(keyRounds, keyMat, nonceView, tag1, ct1280, aadView)
+    if IsErr(s1):
+        echo("W7BENCH seal1280 setup FAIL " + ErrorText(s1))
+        return 1
+    let tagView2: Bytes = BytesSlice(tag1, 0, BytesLen(tag1))
+    var openWork2: Bytes = BytesAlloc(1280)
+    var seal1280: int64[]
+    var open1280: int64[]
+    setLen(seal1280, W7_ROUNDS)
+    setLen(open1280, W7_ROUNDS)
+    wu = 0
+    while wu < 2:
+        let e1: Result[bool] = gcm.aesGcmEncryptRaw(keyRounds, keyMat, nonceView, tag1, sealWork2, aadView)
+        if IsErr(e1):
+            echo("W7BENCH seal1280 op FAIL " + ErrorText(e1))
+            return 1
+        BytesCopyInto(openWork2, 0, ct1280)
+        let d1: Result[bool] = gcm.aesGcmDecryptRaw(keyRounds, keyMat, nonceView, tagView2, openWork2, aadView)
+        if IsErr(d1):
+            echo("W7BENCH open1280 warmup FAIL " + ErrorText(d1))
+            return 1
+        wu = wu + 1
+    r = 0
+    while r < W7_ROUNDS:
+        let tA = monotimes.GetMonoTime()
+        var k: int32
+        while k < SEAL1280_OPS:
+            let e: Result[bool] = gcm.aesGcmEncryptRaw(keyRounds, keyMat, nonceView, tag1, sealWork2, aadView)
+            if IsErr(e):
+                echo("W7BENCH seal1280 op FAIL " + ErrorText(e))
+                return 1
+            k = k + 1
+        seal1280[r] = w7NowNs() - monotimes.MonoTimeNs(tA)
+        let tB = monotimes.GetMonoTime()
+        k = 0
+        while k < OPEN1280_OPS:
+            BytesCopyInto(openWork2, 0, ct1280)
+            let d: Result[bool] = gcm.aesGcmDecryptRaw(keyRounds, keyMat, nonceView, tagView2, openWork2, aadView)
+            if IsErr(d):
+                echo("W7BENCH open1280 op FAIL " + ErrorText(d))
+                return 1
+            k = k + 1
+        open1280[r] = w7NowNs() - monotimes.MonoTimeNs(tB)
+        r = r + 1
+    w7EmitBytes("aead128_seal_1280", 1280, SEAL1280_OPS, w7MedianNs(seal1280))
+    w7EmitBytes("aead128_open_1280", 1280, OPEN1280_OPS, w7MedianNs(open1280))
+    sink = sink + BytesGet(sealWork2, 5) + BytesGet(openWork2, 5)
+
+    # ---------- SHA-256 ----------
+    var shaIn: Bytes = BytesAlloc(16384)
+    w7FillPattern(shaIn)
+    var sha16: int64[]
+    setLen(sha16, W7_ROUNDS)
+    wu = 0
+    while wu < 2:
+        let dg0: Bytes = sha256.Sha256Digest(shaIn)
+        sink = sink + BytesGet(dg0, 0)
+        wu = wu + 1
+    r = 0
+    while r < W7_ROUNDS:
+        let t0 = monotimes.GetMonoTime()
+        var k: int32
+        while k < SHA16K_OPS:
+            let dg: Bytes = sha256.Sha256Digest(shaIn)
+            sink = sink + BytesGet(dg, k & 31)
+            k = k + 1
+        sha16[r] = w7NowNs() - monotimes.MonoTimeNs(t0)
+        r = r + 1
+    w7EmitBytes("sha256_16k", 16384, SHA16K_OPS, w7MedianNs(sha16))
+
+    var shaIn2: Bytes = BytesAlloc(1280)
+    w7FillPattern(shaIn2)
+    var sha1280: int64[]
+    setLen(sha1280, W7_ROUNDS)
+    r = 0
+    while r < W7_ROUNDS:
+        let t0 = monotimes.GetMonoTime()
+        var k: int32
+        while k < SHA1280_OPS:
+            let dg: Bytes = sha256.Sha256Digest(shaIn2)
+            sink = sink + BytesGet(dg, k & 31)
+            k = k + 1
+        sha1280[r] = w7NowNs() - monotimes.MonoTimeNs(t0)
+        r = r + 1
+    w7EmitBytes("sha256_1280", 1280, SHA1280_OPS, w7MedianNs(sha1280))
+
+    # ---------- HKDF-SHA256 (extract+expand, 32 B OKM) ----------
+    let ikm: Bytes = BytesFromHex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")
+    let salt: Bytes = BytesFromHex("000102030405060708090a0b0c")
+    let info: Bytes = BytesFromHex("f0f1f2f3f4f5f6f7f8f9")
+    var hk: int64[]
+    setLen(hk, W7_ROUNDS)
+    r = 0
+    while r < W7_ROUNDS:
+        let t0 = monotimes.GetMonoTime()
+        var k: int32
+        while k < HKDF_OPS:
+            let okmRes = hkdf.hkdfSha256(ikm, salt, info, 32)
+            if !okmRes.ok:
+                echo("W7BENCH hkdf op FAIL")
+                return 1
+            sink = sink + BytesGet(okmRes.value, 0)
+            k = k + 1
+        hk[r] = w7NowNs() - monotimes.MonoTimeNs(t0)
+        r = r + 1
+    w7EmitOps("hkdf_sha256", HKDF_OPS, w7MedianNs(hk))
+
+    # ---------- X25519 (full DH: scalar mult against peer public) ----------
+    let xPriv: Bytes = BytesFromHex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    let xPub: Bytes = BytesFromHex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+    var xx: int64[]
+    setLen(xx, W7_ROUNDS)
+    var xWarm: Result[Bytes] = curve25519.curve25519SharedKey(xPriv, xPub)
+    if IsErr(xWarm):
+        echo("W7BENCH x25519 warmup FAIL")
+        return 1
+    # RFC 7748 section 6.1 shared-secret sanity on the timed path's inputs.
+    # Result[Bytes] payloads leave the Result via BytesTake (W3a proven form).
+    var xShared: Bytes = BytesTake(xWarm.value)
+    let xWant: Bytes = BytesFromHex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+    if !BytesEqual(xShared, xWant):
+        echo("W7BENCH x25519 shared key MISMATCH")
+        return 1
+    sink = sink + BytesGet(xShared, 0)
+    r = 0
+    while r < W7_ROUNDS:
+        let t0 = monotimes.GetMonoTime()
+        var k: int32
+        while k < X25519_OPS:
+            var skRes: Result[Bytes] = curve25519.curve25519SharedKey(xPriv, xPub)
+            if IsErr(skRes):
+                echo("W7BENCH x25519 op FAIL")
+                return 1
+            var shared: Bytes = BytesTake(skRes.value)
+            sink = sink + BytesGet(shared, k & 31)
+            k = k + 1
+        xx[r] = w7NowNs() - monotimes.MonoTimeNs(t0)
+        r = r + 1
+    w7EmitOps("x25519_dh", X25519_OPS, w7MedianNs(xx))
+
+    # ---------- Ed25519 sign + verify ----------
+    let edSeed: Bytes = BytesFromHex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    let kp = w1ed.keyPairFromSeedEpoch(edSeed, 1)
+    if !kp.ok:
+        echo("W7BENCH ed25519 keypair FAIL")
+        return 1
+    let edPub: Bytes = kp.value.publicKey.data
+    let edPriv: Bytes = kp.value.privateKey.data
+    let edMsg: Bytes = BytesFromString("cheng-w7-bench-ed25519-message-0123456789")
+    let sgWu = w1ed.signEd25519RawEpoch(edPriv, edMsg, 1)
+    if !sgWu.ok:
+        echo("W7BENCH ed25519 sign warmup FAIL")
+        return 1
+    if !w1ed.verifyEd25519Epoch(edPub, edMsg, sgWu.value, 1):
+        echo("W7BENCH ed25519 verify warmup FAIL")
+        return 1
+    var es: int64[]
+    var ev: int64[]
+    setLen(es, W7_ROUNDS)
+    setLen(ev, W7_ROUNDS)
+    r = 0
+    while r < W7_ROUNDS:
+        let t0 = monotimes.GetMonoTime()
+        var k: int32
+        while k < EDSIGN_OPS:
+            let sg = w1ed.signEd25519RawEpoch(edPriv, edMsg, 1)
+            if !sg.ok:
+                echo("W7BENCH ed25519 sign op FAIL")
+                return 1
+            sink = sink + BytesGet(sg.value, 0)
+            k = k + 1
+        es[r] = w7NowNs() - monotimes.MonoTimeNs(t0)
+        let t1 = monotimes.GetMonoTime()
+        var v: int32
+        while v < EDVERIFY_OPS:
+            if !w1ed.verifyEd25519Epoch(edPub, edMsg, sgWu.value, 1):
+                echo("W7BENCH ed25519 verify op FAIL")
+                return 1
+            v = v + 1
+        ev[r] = w7NowNs() - monotimes.MonoTimeNs(t1)
+        r = r + 1
+    w7EmitOps("ed25519_sign", EDSIGN_OPS, w7MedianNs(es))
+    w7EmitOps("ed25519_verify", EDVERIFY_OPS, w7MedianNs(ev))
+
+    echo("W7BENCH-END all_ok sink=" + IntToStr(sink) + " fails=" + IntToStr(failCount))
+    return 0

@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import socket
+import threading
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+EMAIL = "fresh@163.com"
+ACCOUNT_ID = "workspace_fresh"
+W3C_ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
+
+NO_CALLBACK_SCENARIOS = {
+    "mail163_credentials_error",
+    "mail163_selector_success_no_callback",
+}
+
+
+def b64url_json(payload):
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def id_token():
+    return ".".join(
+        [
+            b64url_json({"alg": "none", "typ": "JWT"}),
+            b64url_json({"email": EMAIL, "https://api.openai.com/auth": {"chatgpt_account_id": ACCOUNT_ID}}),
+            "sig",
+        ]
+    )
+
+
+class SharedState:
+    def __init__(self, log_path, scenario_path):
+        self.log_path = log_path
+        self.scenario_path = scenario_path
+        self.lock = threading.Lock()
+        self.current_scenario = "ok"
+        self.auth_url = ""
+        self.auth_navigation_count = 0
+        self.callback_states = set()
+        self.reset_browser_flow()
+
+    def reset_browser_flow(self):
+        self.current_handle = "main-handle"
+        self.current_url = "about:blank"
+        self.mail_logged_in = False
+        self.verification_submitted = False
+        self.pending_verification_submit = False
+        self.mail_login_error = False
+
+    def log(self, payload):
+        with self.lock:
+            with open(self.log_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    def scenario(self):
+        if not self.scenario_path:
+            return "ok"
+        try:
+            with open(self.scenario_path, "r", encoding="utf-8") as handle:
+                value = handle.read().strip()
+        except FileNotFoundError:
+            return "ok"
+        scenario = value or "ok"
+        with self.lock:
+            if scenario != self.current_scenario:
+                self.current_scenario = scenario
+                self.auth_navigation_count = 0
+                self.reset_browser_flow()
+        return scenario
+
+    def mark_auth_navigation(self):
+        with self.lock:
+            self.auth_navigation_count += 1
+            return self.auth_navigation_count
+
+    def set_url(self, url):
+        with self.lock:
+            if "mail.163.com" in url and self.mail_logged_in:
+                self.current_url = "https://mail.163.com/js6/main.jsp?sid=fake"
+                return
+            self.current_url = url
+
+    def set_mail_logged_in(self):
+        with self.lock:
+            self.mail_logged_in = True
+            self.current_url = "https://mail.163.com/js6/main.jsp?sid=fake"
+
+    def mark_verification_submitted(self):
+        with self.lock:
+            self.pending_verification_submit = False
+            self.verification_submitted = True
+            self.current_url = "https://auth.openai.com/authorize/consent"
+
+    def mark_verification_code_filled(self):
+        with self.lock:
+            self.pending_verification_submit = True
+
+    def click_element(self, element_id):
+        with self.lock:
+            if element_id == "verification-submit" or self.pending_verification_submit:
+                self.pending_verification_submit = False
+                self.verification_submitted = True
+                self.current_url = "https://auth.openai.com/authorize/consent"
+
+    def mark_consent_clicked(self):
+        with self.lock:
+            self.verification_submitted = True
+            self.current_url = "https://chatgpt.com/"
+
+    def switch_window(self, handle):
+        with self.lock:
+            self.current_handle = handle
+            if handle == "main-handle" and self.current_url.startswith("https://mail.163.com"):
+                self.current_url = "https://auth.openai.com/start"
+
+    def current_page_state(self):
+        with self.lock:
+            if self.current_url.startswith("https://mail.163.com"):
+                body = "账号或密码错误" if self.mail_login_error else "OpenAI verification code 123456"
+                return {
+                    "url": self.current_url,
+                    "title": "163 Mail",
+                    "bodyText": body,
+                }
+            if (
+                self.current_scenario == "openai_auth_error_retry"
+                and self.auth_navigation_count <= 2
+                and not self.verification_submitted
+                and self.current_url.startswith("http")
+            ):
+                return {
+                    "url": "https://auth.openai.com/error",
+                    "title": "Authentication Error",
+                    "bodyText": "There was an error during verification",
+                }
+            if self.current_url.startswith("https://chatgpt.com/"):
+                return {
+                    "url": self.current_url,
+                    "title": "ChatGPT",
+                    "bodyText": "Codex connected",
+                }
+            return {
+                "url": self.current_url or "https://auth.openai.com/start",
+                "title": "OpenAI",
+                "bodyText": "Sign in to Codex",
+            }
+
+    def current_context_text(self):
+        return self.current_page_state()["bodyText"]
+
+
+def element_ref(identifier):
+    return {W3C_ELEMENT_KEY: identifier, "ELEMENT": identifier}
+
+
+def script_args(payload):
+    args = payload.get("args")
+    return args if isinstance(args, list) else []
+
+
+def selectors_include(selectors, needles):
+    return any(needle in selectors for needle in needles)
+
+
+def selectors_include_openai_submit(selectors):
+    return selectors_include(
+        selectors,
+        [
+            "button[type='submit']",
+            "input[type='submit']",
+            "#identifierNext",
+            "#identifierNext button",
+            "#identifierNext [role='button']",
+            "#passwordNext",
+            "#passwordNext button",
+            "#passwordNext [role='button']",
+        ],
+    )
+
+
+def observe_script(state, script, args):
+    kind = ""
+    selectors = args[0] if args and isinstance(args[0], list) else []
+    texts = args[1] if len(args) > 1 and isinstance(args[1], list) else []
+    if texts and ("账号登录" in texts or "密码登录" in texts):
+        kind = "mail163_switch_account_login"
+    elif selectors_include(
+        selectors,
+        [
+            "#loginDiv iframe",
+            "iframe[id^='x-URS-iframe']",
+            "iframe[src*='dl.reg.163.com']",
+            "iframe[src*='passport']",
+        ],
+    ):
+        kind = "mail163_login_frame"
+    elif selectors_include(selectors, [".dlemail", "input[placeholder*='账号']", "input[placeholder*='帐号']"]):
+        kind = "mail163_email_selectors"
+    elif selectors_include(selectors, [".dlpwd", "input[placeholder*='密码']"]):
+        kind = "mail163_password_selectors"
+    elif selectors_include(selectors, ["#dologin"]):
+        kind = "mail163_submit_selectors"
+    elif selectors_include(selectors, ["input[name='code']", "input[id*='code']", "input[placeholder*='验证码']"]):
+        if len(args) > 1:
+            kind = "openai_verification_code_submit"
+        else:
+            kind = "openai_verification_code_probe"
+    elif texts and ("Continue" in texts or "Allow" in texts or "Authorize" in texts):
+        kind = "openai_consent_click"
+    elif "uniqueCodes" in script or "codes=[]" in script:
+        kind = "mail163_extract_codes"
+    elif "const keywords=['openai'" in script or "const keywords = [" in script:
+        kind = "mail163_open_latest_mail"
+    if kind:
+        state.log(
+            {
+                "event": "webdriver_script",
+                "kind": kind,
+                "selectors": selectors,
+                "texts": texts,
+            }
+        )
+    return kind
+
+
+def write_json(handler, status, payload):
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    handler.close_connection = True
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Connection", "close")
+    handler.send_header("Content-Length", str(len(raw)))
+    handler.end_headers()
+    handler.wfile.write(raw)
+    handler.wfile.flush()
+    try:
+        handler.connection.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+
+
+def read_body(handler):
+    length = int(handler.headers.get("Content-Length", "0") or "0")
+    return handler.rfile.read(length).decode("utf-8", "replace")
+
+
+def token_payload(access_token="tok_fresh", refresh_token="refresh_fresh"):
+    return {
+        "id_token": id_token(),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "account_id": ACCOUNT_ID,
+        "chatgpt_account_id": ACCOUNT_ID,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+
+
+def usage_payload():
+    return {
+        "plan_type": "plus",
+        "rate_limit": {
+            "primary_window": {
+                "used_percent": 27,
+                "limit_window_seconds": 18000,
+                "reset_at": 1780233600,
+            },
+            "secondary_window": {
+                "used_percent": 9,
+                "limit_window_seconds": 604800,
+                "reset_at": 1780838400,
+            },
+        },
+        "credits": {"has_credits": True, "unlimited": False, "balance": 12},
+        "additional_rate_limits": [],
+        "rate_limit_reached_type": None,
+    }
+
+
+def start_callback_thread(state, auth_url):
+    parsed = urllib.parse.urlparse(auth_url)
+    query = urllib.parse.parse_qs(parsed.query)
+    redirect_uri = query.get("redirect_uri", [""])[0]
+    callback_state = query.get("state", [""])[0]
+    if not redirect_uri or not callback_state:
+        return
+    with state.lock:
+        if callback_state in state.callback_states:
+            return
+        state.callback_states.add(callback_state)
+
+    def run():
+        callback = f"{redirect_uri}?code=fake-auth-code&state={urllib.parse.quote(callback_state, safe='')}"
+        state.log({"event": "oauth_callback", "url": callback})
+        try:
+            urllib.request.urlopen(callback, timeout=60).read()
+        except Exception as exc:
+            state.log({"event": "oauth_callback_error", "error": str(exc)})
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+
+def make_backend_handler(state):
+    class BackendHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def do_GET(self):
+            state.log({"server": "backend", "method": "GET", "path": self.path})
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/api/codex/usage":
+                auth = self.headers.get("Authorization", "")
+                account = self.headers.get("ChatGPT-Account-Id", "")
+                if "tok_fresh" not in auth or account != ACCOUNT_ID:
+                    write_json(self, 401, {"error": "unauthorized"})
+                    return
+                write_json(self, 200, usage_payload())
+                return
+            if path == "/oauth/authorize":
+                write_json(self, 200, {"ok": True})
+                return
+            write_json(self, 404, {"error": self.path})
+
+        def do_POST(self):
+            body = read_body(self)
+            state.log({"server": "backend", "method": "POST", "path": self.path, "body": body})
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/oauth/token":
+                if "refresh_permanent" in body:
+                    write_json(self, 400, {"error": "invalid_grant"})
+                    return
+                if "refresh_force_fresh" in body:
+                    write_json(self, 200, token_payload("tok_stale_after_refresh", "refresh_force_fresh"))
+                    return
+                write_json(self, 200, token_payload())
+                return
+            write_json(self, 404, {"error": self.path})
+
+    return BackendHandler
+
+
+def make_webdriver_handler(state):
+    class WebDriverHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def do_GET(self):
+            state.log({"server": "webdriver", "method": "GET", "path": self.path})
+            if self.path == "/status":
+                write_json(self, 200, {"value": {"ready": True, "message": "ok"}})
+                return
+            if self.path == "/session/session-123/window":
+                write_json(self, 200, {"value": state.current_handle})
+                return
+            write_json(self, 404, {"value": {"error": "unknown command", "message": self.path}})
+
+        def do_POST(self):
+            body = read_body(self)
+            state.log({"server": "webdriver", "method": "POST", "path": self.path, "body": body})
+            scenario = state.scenario()
+            if self.path == "/session":
+                state.reset_browser_flow()
+                if scenario == "webdriver_session_create_error":
+                    write_json(
+                        self,
+                        500,
+                        {
+                            "value": {
+                                "error": "session not created",
+                                "message": "fresh-login session denied",
+                            }
+                        },
+                    )
+                    return
+                write_json(self, 200, {"value": {"sessionId": "session-123", "capabilities": {}}})
+                return
+            if self.path == "/session/session-123/url":
+                try:
+                    url = json.loads(body).get("url", "")
+                except Exception:
+                    url = ""
+                if scenario == "webdriver_navigate_error":
+                    write_json(
+                        self,
+                        500,
+                        {
+                            "value": {
+                                "error": "unknown error",
+                                "message": "fresh-login navigation denied",
+                            }
+                        },
+                    )
+                    return
+                if "/oauth/authorize" in url:
+                    state.auth_url = url
+                    auth_navigation_count = state.mark_auth_navigation()
+                    suppress_callback = (
+                        scenario == "openai_auth_error_retry" and auth_navigation_count <= 2
+                    )
+                    if scenario not in NO_CALLBACK_SCENARIOS and not suppress_callback:
+                        start_callback_thread(state, url)
+                state.set_url(url)
+                write_json(self, 200, {"value": None})
+                return
+            if self.path == "/session/session-123/window/new":
+                write_json(self, 200, {"value": {"handle": "mail-handle"}})
+                return
+            if self.path == "/session/session-123/window":
+                try:
+                    handle = json.loads(body).get("handle", "")
+                except Exception:
+                    handle = ""
+                if handle:
+                    state.switch_window(handle)
+                write_json(self, 200, {"value": None})
+                return
+            if self.path == "/session/session-123/frame":
+                write_json(self, 200, {"value": None})
+                return
+            if self.path.startswith("/session/session-123/element/") and self.path.endswith("/click"):
+                element_id = urllib.parse.unquote(
+                    self.path.split("/element/", 1)[1].rsplit("/click", 1)[0]
+                )
+                state.click_element(element_id)
+                write_json(self, 200, {"value": None})
+                return
+            if self.path == "/session/session-123/execute/sync":
+                try:
+                    payload = json.loads(body)
+                except Exception:
+                    payload = {}
+                script = payload.get("script", "")
+                args = script_args(payload)
+                selectors = args[0] if args and isinstance(args[0], list) else []
+                kind = observe_script(state, script, args)
+                if scenario == "mail163_credentials_error" and kind == "mail163_submit_selectors":
+                    state.mail_login_error = True
+                    state.set_mail_logged_in()
+                    write_json(self, 200, {"value": {"status": "clicked"}})
+                    return
+                if kind == "mail163_open_latest_mail":
+                    write_json(self, 200, {"value": {"status": "clicked"}})
+                    return
+                if scenario == "mail163_selector_success_no_callback" and kind == "openai_consent_click":
+                    write_json(
+                        self,
+                        500,
+                        {
+                            "value": {
+                                "error": "unknown error",
+                                "message": "fresh-login selector parity stop after 163 success",
+                            }
+                        },
+                    )
+                    return
+                if "return{url:window.location.href" in script or "bodyText:" in script:
+                    write_json(self, 200, {"value": state.current_page_state()})
+                    return
+                if "document.body?.innerText" in script and "return{url:" not in script:
+                    write_json(self, 200, {"value": state.current_context_text()})
+                    return
+                if "return window.location.href" in script:
+                    write_json(self, 200, {"value": state.current_page_state()["url"]})
+                    return
+                if "return true" in script and "querySelectorAll" in script:
+                    if kind == "openai_verification_code_probe" and state.verification_submitted:
+                        write_json(self, 200, {"value": False})
+                        return
+                    write_json(self, 200, {"value": True})
+                    return
+                if "for(const s of selectors)" in script and "return el" in script:
+                    if kind == "mail163_login_frame":
+                        write_json(self, 200, {"value": element_ref("login-frame")})
+                        return
+                    if kind == "openai_verification_code_probe":
+                        value = None if state.verification_submitted else element_ref("verification-code")
+                        write_json(self, 200, {"value": value})
+                        return
+                    if selectors_include_openai_submit(selectors):
+                        element_id = "verification-submit" if state.pending_verification_submit else "openai-submit"
+                        write_json(self, 200, {"value": element_ref(element_id)})
+                        return
+                    write_json(self, 200, {"value": None})
+                    return
+                if "const selectors=arguments[0];for(const s of selectors)" in script and "return null" in script:
+                    if kind == "mail163_login_frame":
+                        write_json(self, 200, {"value": element_ref("login-frame")})
+                        return
+                    write_json(self, 200, {"value": None})
+                    return
+                if kind == "mail163_extract_codes":
+                    write_json(self, 200, {"value": ["123456"] if state.mail_logged_in else []})
+                    return
+                if "return {status:'submitted'" in script:
+                    if kind == "openai_verification_code_submit":
+                        state.mark_verification_submitted()
+                    write_json(self, 200, {"value": {"status": "submitted"}})
+                    return
+                if "return {status:'filled'" in script:
+                    if kind == "openai_verification_code_submit":
+                        state.mark_verification_code_filled()
+                    write_json(self, 200, {"value": {"status": "filled"}})
+                    return
+                if "return {status:'clicked'" in script:
+                    if kind == "mail163_submit_selectors":
+                        state.set_mail_logged_in()
+                    elif kind == "openai_consent_click":
+                        state.mark_consent_clicked()
+                    write_json(self, 200, {"value": {"status": "clicked", "text": "Continue"}})
+                    return
+                if "document.querySelector(selectors" in script:
+                    write_json(self, 200, {"value": None})
+                    return
+                write_json(self, 200, {"value": {"status": "done"}})
+                return
+            write_json(self, 404, {"value": {"error": "unknown command", "message": self.path}})
+
+        def do_DELETE(self):
+            state.log({"server": "webdriver", "method": "DELETE", "path": self.path})
+            if self.path == "/session/session-123":
+                write_json(self, 200, {"value": None})
+                return
+            write_json(self, 404, {"value": {"error": "unknown command", "message": self.path}})
+
+    return WebDriverHandler
+
+
+def serve(server):
+    server.serve_forever()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend-port-file", required=True)
+    parser.add_argument("--webdriver-port-file", required=True)
+    parser.add_argument("--log", required=True)
+    parser.add_argument("--scenario-file")
+    args = parser.parse_args()
+
+    state = SharedState(args.log, args.scenario_file)
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), make_backend_handler(state))
+    webdriver = ThreadingHTTPServer(("127.0.0.1", 0), make_webdriver_handler(state))
+
+    with open(args.backend_port_file, "w", encoding="utf-8") as handle:
+        handle.write(str(backend.server_port))
+    with open(args.webdriver_port_file, "w", encoding="utf-8") as handle:
+        handle.write(str(webdriver.server_port))
+
+    threading.Thread(target=serve, args=(backend,), daemon=True).start()
+    serve(webdriver)
+
+
+if __name__ == "__main__":
+    main()

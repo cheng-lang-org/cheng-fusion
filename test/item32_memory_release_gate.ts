@@ -16,6 +16,7 @@ import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {
   HARD_GATE_RECEIPT_KEYS,
+  verifyLinuxCgroupEvidenceDirectory,
   verifyLinuxMemoryReceipt,
 } from "../src/cheng_cid_identity_chain_evidence.ts";
 import {
@@ -38,10 +39,7 @@ import {
   runMemoryReleaseGateAudit,
 } from "../src/cheng_memory_release_gate_audit.ts";
 import {handleMcpRequest} from "../src/cheng_fusion_mcp_server_m9009.ts";
-import {
-  getChengFusionToolManifest,
-  initChengFusionToolRegistryModule,
-} from "../src/cheng_fusion_tool_registry.ts";
+import {getChengFusionToolManifest} from "../src/cheng_fusion_tool_registry.ts";
 
 const CLI = fileURLToPath(
   new URL("../tools/memory_release_gate_verify.ts", import.meta.url),
@@ -178,7 +176,7 @@ function releaseProjection(
     iterations: row.outcome === "success" ? "5000" : "1",
     liveCount: "0",
     pathKind,
-    releaseCount: row.outcome === "success" ? "5000" : "0",
+    releaseCount: row.outcome === "success" ? "5001" : "1",
     retainCount: row.outcome === "success" ? "5000" : "0",
   }));
   const expected = {
@@ -264,8 +262,9 @@ const success = releaseProjection(CHENG_MEMORY_RELEASE_REQUIRED_CASES[0]!);
 function receiptMutation(
   mutate: (projection: Record<string, any>) => void,
   recomputeStateMachineCids = true,
+  base = success,
 ): Buffer {
-  const projection = structuredClone(success.projection) as Record<string, any>;
+  const projection = structuredClone(base.projection) as Record<string, any>;
   mutate(projection);
   if (projection.driverReceipt !== undefined) {
     if (recomputeStateMachineCids) {
@@ -290,6 +289,22 @@ function receiptMutation(
   }
   return selfHashedJson(projection, "receiptSha256");
 }
+
+const failureWithRetain = releaseProjection(
+  CHENG_MEMORY_RELEASE_REQUIRED_CASES.find(
+    (row) => row.outcome === "failure_matrix",
+  )!,
+);
+assert.equal(
+  verifyMemoryReleaseReceipt(
+    receiptMutation((value) => {
+      value.driverReceipt.orcRows[0].retainCount = "2";
+      value.driverReceipt.orcRows[0].releaseCount = "3";
+    }, true, failureWithRetain),
+    failureWithRetain.expected,
+  ).caseId,
+  failureWithRetain.expected.caseId,
+);
 
 function runnerReceiptMutation(
   mutate: (projection: Record<string, any>) => void,
@@ -370,6 +385,65 @@ assert.throws(
     success.expected,
   ),
   /ORC alloc\/free\/live/,
+);
+assert.throws(
+  () => verifyMemoryReleaseReceipt(
+    receiptMutation((value) => {
+      value.driverReceipt.orcRows[0].releaseCount = "5000";
+    }),
+    success.expected,
+  ),
+  /release conservation/,
+);
+assert.throws(
+  () => verifyMemoryReleaseReceipt(
+    receiptMutation((value) => {
+      value.driverReceipt.orcRows[0].allocCount = "2";
+      value.driverReceipt.orcRows[0].freeCount = "2";
+      value.driverReceipt.orcRows[0].releaseCount = "5001";
+    }),
+    success.expected,
+  ),
+  /release conservation/,
+);
+assert.throws(
+  () => verifyMemoryReleaseReceipt(
+    receiptMutation((value) => {
+      value.driverReceipt.orcRows[0].allocCount = "2";
+      value.driverReceipt.orcRows[0].freeCount = "2";
+      value.driverReceipt.orcRows[0].releaseCount = "5003";
+    }),
+    success.expected,
+  ),
+  /release conservation/,
+);
+assert.throws(
+  () => verifyMemoryReleaseReceipt(
+    receiptMutation((value) => {
+      value.driverReceipt.orcRows[0].liveCount = "1";
+    }),
+    success.expected,
+  ),
+  /ORC alloc\/free\/live/,
+);
+assert.throws(
+  () => verifyMemoryReleaseReceipt(
+    receiptMutation((value) => {
+      value.driverReceipt.orcRows[0].retainCount = "4999";
+      value.driverReceipt.orcRows[0].releaseCount = "5000";
+    }),
+    success.expected,
+  ),
+  /5000-iteration/,
+);
+const twoAllocSuccess = receiptMutation((value) => {
+  value.driverReceipt.orcRows[0].allocCount = "2";
+  value.driverReceipt.orcRows[0].freeCount = "2";
+  value.driverReceipt.orcRows[0].releaseCount = "5002";
+});
+assert.equal(
+  verifyMemoryReleaseReceipt(twoAllocSuccess, success.expected).caseId,
+  success.expected.caseId,
 );
 assert.throws(
   () => verifyMemoryReleaseReceipt(
@@ -477,57 +551,51 @@ function hardGateReceipt(stdout: Buffer): Buffer {
     tool: "tools/beat_c_linux_cgroup_v2_hard_memory_gate.sh",
     schema: "beat_c_linux_cgroup_v2_hard_memory_gate",
     status: "completed",
-    applicability: "linux_colima_container_cgroup_v2_only",
-    darwin_official_driver_status:
-      "not_covered_macho_cannot_execute_in_linux_vm",
+    applicability: "native_linux_delegated_cgroup_v2_only",
+    driver_role: "production",
     hard_memory_limit_proof_status:
       "proved_linux_kernel_cgroup_v2_aggregate",
-    memory_enforcement_scope: "container_and_all_descendants",
+    memory_enforcement_scope: "rootless_oci_process_and_all_descendants",
     mode: "workload",
+    workload_kind: "current_driver",
+    execution_result: "exited_zero",
     memory_limit_bytes: "1073741824",
     memory_swap_max_bytes: "0",
-    memory_and_swap_total_limit_bytes: "1073741824",
+    pids_max: "128",
     attack_child_count: "0",
     attack_child_bytes: "0",
     attack_aggregate_bytes: "0",
-    workload_rc: "0",
-    attack_child_one_rc: "-1",
-    attack_child_two_rc: "-1",
-    docker_attach_rc: "0",
-    container_exit_code: "0",
-    container_oom_killed_before: "0",
-    container_oom_killed_after: "0",
-    container_oom_killed_final: "0",
     cgroup_mount_type: "cgroup2",
     native_descriptor_machine: "x86_64",
-    native_descriptor_controller_host_os: "darwin",
-    native_descriptor_controller_host_machine: "x86_64",
-    native_descriptor_controller_host_translated: "false",
-    native_descriptor_native_execution: "true",
-    native_descriptor_emulation: "false",
-    native_descriptor_native_execution_proof:
-      "controller_guest_same_isa_and_guest_cpuinfo_no_qemu_tcg",
-    controller_host_os: "darwin",
-    controller_host_machine: "x86_64",
-    controller_host_translated: "false",
-    vm_architecture: "x86_64",
-    guest_cpu_emulation_status: "not_detected",
-    native_execution_proof:
-      "controller_guest_same_isa_and_guest_cpuinfo_no_qemu_tcg",
-    native_descriptor_source_closure_cid: hash,
+    native_descriptor_candidate_entry_path:
+      "src/core/tooling/backend_driver_dispatch_min.cheng",
+    native_descriptor_candidate_entry_module_path:
+      "cheng/core/tooling/backend_driver_dispatch_min",
+    current_entry_path:
+      "src/core/tooling/backend_driver_dispatch_min.cheng",
+    current_entry_module_path:
+      "cheng/core/tooling/backend_driver_dispatch_min",
     source_closure_cid: hash,
     current_source_binding_status: "bound_unique_current",
+    current_entry_sha256: hash,
+    native_descriptor_candidate_entry_sha256: hash,
+    current_driver_sha256: hash,
+    native_descriptor_worker_sha256: hash,
+    workload_wall_start_monotonic_ns: "1",
+    workload_wall_end_monotonic_ns: "2",
+    workload_wall_elapsed_ns: "1",
     memory_peak_after_bytes: "4096",
+    memory_current_after_bytes: "2048",
+    descendant_exec_ledger_status: "PROVED",
+    descendant_exec_ledger_schema: "cheng.linux_ptrace_exec_ledger",
+    descendant_exec_ledger_expected_exit_code: "0",
+    descendant_exec_ledger_actual_exit_code: "0",
+    descendant_exec_ledger_event_count: "1",
+    artifact_manifest_schema: "cheng.native_linux_cgroup_v2_artifacts",
     stdout_sha256: sha256(stdout),
     stdout_size: String(stdout.length),
     stderr_sha256: sha256(Buffer.alloc(0)),
     stderr_size: "0",
-    output_identity_schema: "beat_c_linux_cgroup_v2_output_identity",
-    output_path_history_monitor: "darwin_kqueue_vnode",
-    output_path_history_status: "verified_clean",
-    output_path_history_forbidden_events: "delete,link,rename,revoke",
-    control_stderr_sha256: sha256(Buffer.alloc(0)),
-    control_stderr_size: "0",
   });
   for (const key of [
     "low",
@@ -537,8 +605,8 @@ function hardGateReceipt(stdout: Buffer): Buffer {
     "oom_kill",
     "oom_group_kill",
   ]) {
-    values[`memory_events_before_${key}`] = "0";
-    values[`memory_events_after_${key}`] = "0";
+    values[`memory_events_local_before_${key}`] = "0";
+    values[`memory_events_local_after_${key}`] = "0";
   }
   const prefix = HARD_GATE_RECEIPT_KEYS.slice(0, -1)
     .map((key) => `${key}=${values[key]}`)
@@ -560,6 +628,15 @@ const hardRows = verifyLinuxMemoryReceipt(
 );
 assert.equal(hardRows.get("memory_limit_bytes"), "1073741824");
 assert.equal(hardRows.get("memory_swap_max_bytes"), "0");
+assert.throws(
+  () => verifyLinuxCgroupEvidenceDirectory(
+    "/native-memory-release-producer-is-absent",
+    "workload",
+    "memory_release",
+    "memory release producer",
+  ),
+  /producer_missing: native memory_release workload/,
+);
 function hardReceiptMutation(
   raw: Buffer,
   key: string,
@@ -591,7 +668,7 @@ assert.throws(
     "userspace poll mutant",
     "workload",
   ),
-  /Linux cgroup v2/,
+  /native field/,
 );
 assert.throws(
   () => verifyLinuxMemoryReceipt(
@@ -599,32 +676,33 @@ assert.throws(
     "swap mutant",
     "workload",
   ),
-  /swap=0/,
+  /native field/,
 );
 assert.throws(
   () => verifyLinuxMemoryReceipt(
-    hardReceiptMutation(hardReceipt, "controller_host_machine", "aarch64"),
-    "cross ISA controller mutant",
+    hardReceiptMutation(hardReceipt, "applicability",
+      "linux_colima_container_cgroup_v2_only"),
+    "old applicability mutant",
     "workload",
   ),
-  /身份链/,
+  /native field/,
 );
 assert.throws(
   () => verifyLinuxMemoryReceipt(
     hardReceiptMutation(
       hardReceipt,
-      "guest_cpu_emulation_status",
-      "qemu_tcg",
+      "memory_enforcement_scope",
+      "container_and_all_descendants",
     ),
     "QEMU TCG mutant",
     "workload",
   ),
-  /身份链/,
+  /native field/,
 );
 assert.throws(
   () => verifyLinuxMemoryReceipt(
-    hardReceiptMutation(hardReceipt, "source_closure_cid", sha256("other")),
-    "portable source CID mutant",
+    hardReceiptMutation(hardReceipt, "current_driver_sha256", sha256("other")),
+    "current driver identity mutant",
     "workload",
   ),
   /current source/,
@@ -713,7 +791,6 @@ try {
   rmSync(pathMutationRoot, {recursive: true});
 }
 
-initChengFusionToolRegistryModule();
 const registry = getChengFusionToolManifest();
 assert.equal(registry.schema, "cheng_fusion_tool_registry");
 assert.equal(

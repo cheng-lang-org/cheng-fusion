@@ -1,0 +1,354 @@
+# Synccast media core(fragmentation, reassembly, jitter, optional E2EE).
+
+import cheng/libp2p/utils/result
+import cheng/libp2p/utils/bytes
+import cheng/libp2p/crypto/chacha20poly1305
+import cheng/libp2p/protocols/synccast/datagram
+const
+    synccastMaxFragments = 64
+    synccastMaxReassembly = 32
+    synccastMaxJitterFrames = 64
+    synccastCryptoKeySize = 32
+    synccastCryptoNonceSize = 12
+    synccastCryptoTagSize = 16
+
+type
+    SynccastFrame =
+        header: SynccastDatagramHeader
+        payload: Bytes
+
+    SynccastFragmentList =
+        items: Bytes[synccastMaxFragments]
+        count: int32
+
+    SynccastReassemblyEntry =
+        active: bool
+        sessionId: int64
+        trackId: int32
+        frameId: int32
+        fragCount: int32
+        recvCount: int32
+        firstAtUs: int64
+        lastAtUs: int64
+        frags: Bytes[synccastMaxFragments]
+
+    SynccastReassembly =
+        maxAgeUs: int64
+        entries: SynccastReassemblyEntry[synccastMaxReassembly]
+
+    SynccastJitterBuffer =
+        targetLatencyUs: int64
+        count: int32
+        frames: SynccastFrame[synccastMaxJitterFrames]
+        lastArrivalUs: int64
+        lastPtsUs: int64
+        jitterMs: int32
+        dropped: int64
+        delivered: int64
+
+    SynccastStatsState =
+        framesReceived: int64
+        framesDropped: int64
+        jitterMs: int32
+        bufferMs: int32
+        e2eMs: int32
+
+    SynccastCryptoContext =
+        enabled: bool
+        key: Bytes
+
+fn synccastInitFragments(): Bytes[synccastMaxFragments] =
+    var out: Bytes[synccastMaxFragments]
+    for i in 0..<synccastMaxFragments:
+        out[i] = EmptyBytes()
+    return out
+
+fn synccastInitFragmentList(): SynccastFragmentList =
+    var out: SynccastFragmentList
+    out.items = synccastInitFragments()
+    out.count = 0
+    return out
+
+fn synccastInitReassemblyEntries(): SynccastReassemblyEntry[synccastMaxReassembly] =
+    var out: SynccastReassemblyEntry[synccastMaxReassembly]
+    for i in 0..<synccastMaxReassembly:
+        out[i].active = false
+        out[i].frags = synccastInitFragments()
+    return out
+
+fn synccastInitJitterFrames(): SynccastFrame[synccastMaxJitterFrames] =
+    var out: SynccastFrame[synccastMaxJitterFrames]
+    for i in 0..<synccastMaxJitterFrames:
+        out[i] = SynccastFrame(header: initSynccastDatagramHeader(), payload: EmptyBytes())
+    return out
+
+fn initSynccastReassembly(maxAgeUs: int64): SynccastReassembly =
+    SynccastReassembly(maxAgeUs: maxAgeUs, entries: synccastInitReassemblyEntries())
+
+fn initSynccastJitterBuffer(targetLatencyUs: int64): SynccastJitterBuffer =
+    SynccastJitterBuffer(targetLatencyUs: targetLatencyUs, count: 0, frames: synccastInitJitterFrames(), lastArrivalUs: 0, lastPtsUs: 0, jitterMs: 0, dropped: 0, delivered: 0)
+
+fn initSynccastCryptoContext(key: Bytes): SynccastCryptoContext =
+    SynccastCryptoContext(enabled: BytesLen(key) == synccastCryptoKeySize, key: key)
+
+fn synccastStatsLossPermille(stats: SynccastStatsState): int32 =
+    let total: int64 = stats.framesReceived + stats.framesDropped
+    if total <= 0:
+        return 0
+    return int32((stats.framesDropped * 1000) / total)
+
+fn synccastReassemblyDropExpired(reasm: var SynccastReassembly, nowUs: int64): int32 =
+    if nowUs <= 0 || reasm.maxAgeUs <= 0:
+        return 0
+    var dropped: int32
+    for i in 0..<synccastMaxReassembly:
+        if reasm.entries[i].active && nowUs - reasm.entries[i].firstAtUs > reasm.maxAgeUs:
+            reasm.entries[i].active = false
+            reasm.entries[i].recvCount = 0
+            reasm.entries[i].fragCount = 0
+            reasm.entries[i].frags = synccastInitFragments()
+            dropped = dropped + 1
+    return dropped
+
+fn synccastReassemblyFind(reasm: var SynccastReassembly, sessionId: int64, trackId: int32, frameId: int32): int32 =
+    for i in 0..<synccastMaxReassembly:
+        if reasm.entries[i].active && reasm.entries[i].sessionId == sessionId && reasm.entries[i].trackId == trackId && reasm.entries[i].frameId == frameId:
+            return i
+    return -1
+
+fn synccastReassemblyAlloc(reasm: var SynccastReassembly, sessionId: int64, trackId: int32, frameId: int32, fragCount: int32, nowUs: int64): int32 =
+    for i in 0..<synccastMaxReassembly:
+        if ! reasm.entries[i].active:
+            var entry: SynccastReassemblyEntry
+            entry.active = true
+            entry.sessionId = sessionId
+            entry.trackId = trackId
+            entry.frameId = frameId
+            entry.fragCount = fragCount
+            entry.recvCount = 0
+            entry.firstAtUs = nowUs
+            entry.lastAtUs = nowUs
+            entry.frags = synccastInitFragments()
+            reasm.entries[i] = entry
+            return i
+    var oldestIdx: int32
+    var oldestAt: int64 = reasm.entries[0].firstAtUs
+    for i in 1..<synccastMaxReassembly:
+        if reasm.entries[i].firstAtUs < oldestAt:
+            oldestAt = reasm.entries[i].firstAtUs
+            oldestIdx = i
+    var entry: SynccastReassemblyEntry
+    entry.active = true
+    entry.sessionId = sessionId
+    entry.trackId = trackId
+    entry.frameId = frameId
+    entry.fragCount = fragCount
+    entry.recvCount = 0
+    entry.firstAtUs = nowUs
+    entry.lastAtUs = nowUs
+    entry.frags = synccastInitFragments()
+    reasm.entries[oldestIdx] = entry
+    return oldestIdx
+
+fn synccastReassemblyPush(reasm: var SynccastReassembly, header: SynccastDatagramHeader, payload: Bytes, nowUs: int64): Result[SynccastFrame] =
+    if header.fragCount <= 1:
+        return Ok[SynccastFrame](SynccastFrame(header: header, payload: payload))
+    if header.fragCount > synccastMaxFragments || header.fragIdx < 0 || header.fragIdx >= header.fragCount:
+        return Err[SynccastFrame]("synccast: invalid fragment")
+    synccastReassemblyDropExpired(reasm, nowUs)
+    let existing: int32 = synccastReassemblyFind(reasm, header.sessionId, header.trackId, header.frameId)
+    let idx: int32 = if existing >= 0: existing else: synccastReassemblyAlloc(reasm, header.sessionId, header.trackId, header.frameId, header.fragCount, nowUs)
+    var entry: SynccastReassemblyEntry = reasm.entries[idx]
+    if entry.fragCount != header.fragCount:
+        entry.fragCount = header.fragCount
+        entry.recvCount = 0
+        entry.frags = synccastInitFragments()
+    if BytesLen(entry.frags[header.fragIdx]) <= 0:
+        entry.frags[header.fragIdx] = payload
+        entry.recvCount = entry.recvCount + 1
+        entry.lastAtUs = nowUs
+    reasm.entries[idx] = entry
+    if entry.recvCount < entry.fragCount:
+        return Err[SynccastFrame]("synccast: pending")
+    var out: Bytes = EmptyBytes()
+    for i in 0..<entry.fragCount:
+        if BytesLen(entry.frags[i]) <= 0:
+            return Err[SynccastFrame]("synccast: incomplete frame")
+        if BytesLen(out) <= 0:
+            out = entry.frags[i]
+        else:
+            out = BytesConcat(out, entry.frags[i])
+    reasm.entries[idx].active = false
+    return Ok[SynccastFrame](SynccastFrame(header: header, payload: out))
+
+fn synccastJitterInsert(buf: var SynccastJitterBuffer, frame: SynccastFrame): bool =
+    if buf.count >= synccastMaxJitterFrames:
+        var oldestIdx: int32
+        var oldestPts: int64 = buf.frames[0].header.ptsUs
+        for i in 1..<buf.count:
+            let pts: int64 = buf.frames[i].header.ptsUs
+            if pts < oldestPts:
+                oldestPts = pts
+                oldestIdx = i
+        if frame.header.ptsUs <= oldestPts:
+            buf.dropped = buf.dropped + 1
+            return false
+        for i in oldestIdx..<buf.count - 1:
+            buf.frames[i] = buf.frames[i + 1]
+        buf.count = buf.count - 1
+    var insertAt: int32 = buf.count
+    for scanInsertAt in 0..<buf.count:
+        if buf.frames[scanInsertAt].header.ptsUs > frame.header.ptsUs:
+            insertAt = scanInsertAt
+            break
+    var j: int32 = buf.count
+    let loop_start_j_12 = j
+    for loop_rev_j_12 in 0..(loop_start_j_12 - (insertAt)):
+        j = loop_start_j_12 - loop_rev_j_12
+        if ! (j > insertAt):
+            break
+        buf.frames[j] = buf.frames[j - 1]
+    buf.frames[insertAt] = frame
+    buf.count = buf.count + 1
+    return true
+
+fn synccastJitterPush(buf: var SynccastJitterBuffer, frame: SynccastFrame, nowUs: int64): bool =
+    if buf.lastArrivalUs > 0 && buf.lastPtsUs > 0:
+        let arrivalDelta: int64 = nowUs - buf.lastArrivalUs
+        let ptsDelta: int64 = frame.header.ptsUs - buf.lastPtsUs
+        let diffUs: int64 = if arrivalDelta > ptsDelta: arrivalDelta - ptsDelta else: ptsDelta - arrivalDelta
+        let diffMs: int32 = int32(diffUs / 1000)
+        buf.jitterMs = (buf.jitterMs * 7 + diffMs) / 8
+    buf.lastArrivalUs = nowUs
+    buf.lastPtsUs = frame.header.ptsUs
+    return synccastJitterInsert(buf, frame)
+
+fn synccastJitterPop(buf: var SynccastJitterBuffer, nowUs: int64): Result[SynccastFrame] =
+    if buf.count <= 0:
+        return Err[SynccastFrame]("synccast: jitter empty")
+    var deadlineUs: int64
+    if buf.targetLatencyUs > 0 && nowUs > buf.targetLatencyUs:
+        deadlineUs = nowUs - buf.targetLatencyUs
+    if buf.frames[0].header.ptsUs <= deadlineUs || buf.targetLatencyUs <= 0:
+        let frame: SynccastFrame = buf.frames[0]
+        for i in 0..<buf.count - 1:
+            buf.frames[i] = buf.frames[i + 1]
+        buf.count = buf.count - 1
+        buf.delivered = buf.delivered + 1
+        return Ok[SynccastFrame](frame)
+    return Err[SynccastFrame]("synccast: jitter hold")
+
+fn synccastUpdateStats(stats: var SynccastStatsState, jitter: SynccastJitterBuffer, frame: SynccastFrame, nowUs: int64) =
+    stats.framesReceived = stats.framesReceived + 1
+    stats.jitterMs = jitter.jitterMs
+    if jitter.targetLatencyUs > 0:
+        stats.bufferMs = int32(jitter.targetLatencyUs / 1000)
+    if frame.header.captureTsUs > 0 && nowUs >= frame.header.captureTsUs:
+        let e2eMs: int32 = int32((nowUs - frame.header.captureTsUs) / 1000)
+        if stats.e2eMs <= 0:
+            stats.e2eMs = e2eMs
+        else:
+            stats.e2eMs = (stats.e2eMs * 7 + e2eMs) / 8
+
+fn synccastStatsDrop(stats: var SynccastStatsState, count: int32) =
+    if count <= 0:
+        return
+    stats.framesDropped = stats.framesDropped + int64(count)
+
+fn synccastEncodeDatagramHeaderSafe(h: SynccastDatagramHeader): Bytes =
+    return encodeSynccastDatagramHeader(h)
+
+fn synccastBuildNonce(header: SynccastDatagramHeader): Bytes =
+    let nonce: Bytes = BytesAlloc(synccastCryptoNonceSize)
+    writeU16LE(nonce, 0, header.keyId)
+    writeU16LE(nonce, 2, header.layerId)
+    writeU32LE(nonce, 4, header.trackId)
+    writeU32LE(nonce, 8, header.seq)
+    return nonce
+
+fn synccastEncryptPayload(ctx: SynccastCryptoContext, header: SynccastDatagramHeader, payload: Bytes): Result[Bytes] =
+    if !ctx.enabled:
+        return Ok[Bytes](payload)
+    let keyRes: Result[ChaChaPolyKey] = intoChaChaPolyKey(ctx.key)
+    if IsErr(keyRes):
+        return Err[Bytes](Error(keyRes))
+    let nonceBytes: Bytes = synccastBuildNonce(header)
+    let nonceRes: Result[ChaChaPolyNonce] = intoChaChaPolyNonce(nonceBytes)
+    if IsErr(nonceRes):
+        return Err[Bytes](Error(nonceRes))
+    let aad: Bytes = encodeSynccastDatagramHeader(header)
+    let out: Bytes = BytesSlice(payload, 0, BytesLen(payload))
+    var tag: ChaChaPolyTag
+    let encRes: Result[bool] = encrypt(Value(keyRes), Value(nonceRes), tag, out, aad)
+    if IsErr(encRes):
+        return Err[Bytes](Error(encRes))
+    if BytesLen(tag.data) != synccastCryptoTagSize:
+        return Err[Bytes]("synccast: invalid crypto tag size")
+    return Ok[Bytes](BytesConcat(out, tag.data))
+
+fn synccastDecryptPayload(ctx: SynccastCryptoContext, header: SynccastDatagramHeader, payload: Bytes): Result[Bytes] =
+    if !ctx.enabled:
+        return Ok[Bytes](payload)
+    if BytesLen(payload) < synccastCryptoTagSize:
+        return Err[Bytes]("synccast: ciphertext too small")
+    let keyRes: Result[ChaChaPolyKey] = intoChaChaPolyKey(ctx.key)
+    if IsErr(keyRes):
+        return Err[Bytes](Error(keyRes))
+    let nonceBytes: Bytes = synccastBuildNonce(header)
+    let nonceRes: Result[ChaChaPolyNonce] = intoChaChaPolyNonce(nonceBytes)
+    if IsErr(nonceRes):
+        return Err[Bytes](Error(nonceRes))
+    let total: int32 = BytesLen(payload)
+    let cipherLen: int32 = total - synccastCryptoTagSize
+    let cipher: Bytes = BytesSlice(payload, 0, cipherLen)
+    let tagBytes: Bytes = BytesSliceView(payload, cipherLen, synccastCryptoTagSize)
+    let tagRes: Result[ChaChaPolyTag] = intoChaChaPolyTag(tagBytes)
+    if IsErr(tagRes):
+        return Err[Bytes](Error(tagRes))
+    let aad: Bytes = encodeSynccastDatagramHeader(header)
+    let decRes: Result[bool] = decrypt(Value(keyRes), Value(nonceRes), Value(tagRes), cipher, aad)
+    if IsErr(decRes):
+        return Err[Bytes](Error(decRes))
+    return Ok[Bytes](cipher)
+
+fn synccastFragmentFrame(header: SynccastDatagramHeader, payload: Bytes, maxPayload: int32): SynccastFragmentList =
+    var out: SynccastFragmentList = synccastInitFragmentList()
+    let total: int32 = BytesLen(payload)
+    if total <= 0:
+        var h: SynccastDatagramHeader = header
+        h.fragIdx = 0
+        h.fragCount = 1
+        h.flags = h.flags | synccastFlagEndOfFrame
+        let head: Bytes = synccastEncodeDatagramHeaderSafe(h)
+        out.items[0] = BytesConcat(head, EmptyBytes())
+        out.count = 1
+        return out
+    let chunk: int32 = if maxPayload > 0: maxPayload else: total
+    if total <= chunk:
+        var h: SynccastDatagramHeader = header
+        h.fragIdx = 0
+        h.fragCount = 1
+        h.flags = h.flags | synccastFlagEndOfFrame
+        let head: Bytes = synccastEncodeDatagramHeaderSafe(h)
+        out.items[0] = BytesConcat(head, payload)
+        out.count = 1
+        return out
+    var count: int32 = total / chunk
+    if total % chunk != 0:
+        count = count + 1
+    if count > synccastMaxFragments:
+        count = synccastMaxFragments
+    for i in 0..<count:
+        let start: int32 = i * chunk
+        let size: int32 = if start + chunk <= total: chunk else: total - start
+        var h: SynccastDatagramHeader = header
+        h.fragIdx = i
+        h.fragCount = count
+        h.seq = header.seq + i
+        if i == count - 1:
+            h.flags = h.flags | synccastFlagEndOfFrame
+        let head: Bytes = synccastEncodeDatagramHeaderSafe(h)
+        let part: Bytes = BytesSlice(payload, start, size)
+        out.items[i] = BytesConcat(head, part)
+    out.count = count
+    return out

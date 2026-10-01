@@ -1,0 +1,388 @@
+# D6 训练外步进 DePIN 结算 smoke。
+# 正例来自 D4 Qwen3.8 tiny 真闭环 (冻结 GDN + i32 lm_head SGD + token 加权外合并),
+# eval 指标 = held-out softmax NLL 的 DepinDiLoCoTrainEvalNllHash; 无 mock。
+# 负例: tokenCount / versionCid / schema / evalMetricHash 漂移 -> Validate 硬错;
+#       不同 versionCid / outerStep / NLL 的记录哈希必须不同。
+
+import std/result
+import std/os
+import std/rawbytes as rawbytes
+import std/strings as strings
+import cheng/std/bytes_layout as layout
+import cheng/libp2p/core/types
+import cheng/libp2p/protocols/depin/inference_settlement as settle
+import cheng/inference/qwen38_forward as fwd
+import cheng/DiLoCo/core/diloco as core
+import cheng/DiLoCo/artifact/store as astore
+import cheng/DiLoCo/train/codec as codec
+import cheng/DiLoCo/train/inner_step as inner
+import cheng/DiLoCo/train/outer_merge as outer
+import cheng/DiLoCo/train/qwen38_inner as q38
+import cheng/DiLoCo/tests/support
+
+const
+    SmokeInnerSteps: int32 = 4
+    SmokeShardBytes: int32 = 64
+    SmokeLrNum: int32 = 1
+    SmokeLrDen: int32 = 64
+    SmokeSeqLen: int32 = 2
+    SmokeTargetA: int32 = 7
+    SmokeTargetB: int32 = 21
+
+fn die(msg: str): int32 =
+    echo(msg)
+    return 1
+
+fn pairIds(a: int32, b: int32): int32[] =
+    var ids: int32[]
+    add(ids, a)
+    add(ids, b)
+    return ids
+
+@borrows
+fn cloneRecord(source: settle.DepinDiLoCoTrainRecord): settle.DepinDiLoCoTrainRecord =
+    var out = settle.DepinDiLoCoTrainRecord(
+        schema: strings.CloneStr(source.schema),
+        jobBundleCidHex: strings.CloneStr(source.jobBundleCidHex),
+        versionCidHex: strings.CloneStr(source.versionCidHex),
+        outerStep: source.outerStep,
+        tokenCountSum: source.tokenCountSum,
+        evalMetricHash: source.evalMetricHash,
+        recordedAtNs: source.recordedAtNs,
+        recordHash: source.recordHash)
+    return out
+
+@borrows
+fn putParams(store: var astore.DiLoCoArtifactStore,
+             jobBundleCid: layout.FixedBytes32,
+             values: int32[]): Result[core.DiLoCoArtifactRef] =
+    var packed = rawbytes.EmptyBytes()
+    let packRes = codec.DiLoCoTrainPackI32Fill(packed, values)
+    if IsErr(packRes):
+        return Err[core.DiLoCoArtifactRef](Error(packRes))
+    var artifactRef = core.DiLoCoArtifactRef()
+    let putRes = astore.DiLoCoArtifactStorePutFill(artifactRef, store, jobBundleCid, packed, SmokeShardBytes)
+    if IsErr(putRes):
+        return Err[core.DiLoCoArtifactRef](Error(putRes))
+    return Ok[core.DiLoCoArtifactRef](artifactRef)
+
+@borrows
+fn loadParams(store: astore.DiLoCoArtifactStore,
+              artifactRef: core.DiLoCoArtifactRef): Result[int32[]] =
+    var bytes = rawbytes.EmptyBytes()
+    let getRes = astore.DiLoCoArtifactStoreGetFill(bytes, store, artifactRef)
+    if IsErr(getRes):
+        return Err[int32[]](Error(getRes))
+    var values: int32[]
+    let unpackRes = codec.DiLoCoTrainUnpackI32Fill(values, bytes)
+    if IsErr(unpackRes):
+        return Err[int32[]](Error(unpackRes))
+    return Ok[int32[]](values)
+
+fn main(): int32 =
+    let tmpRoot = os.GetEnvDefault("CHENG_TASK_TMPDIR", "")
+    if tmpRoot == "":
+        return die("diloco_train_settle_smoke: CHENG_TASK_TMPDIR missing")
+
+    let zeroNll = settle.DepinDiLoCoTrainEvalNllHash(int64(0))
+    if !IsErr(zeroNll):
+        return die("diloco_train_settle_smoke: zero nll hash must fail")
+
+    let planRes = q38.DiLoCoQwen38TinyPinnedPlanBuild()
+    if IsErr(planRes):
+        return die(Error(planRes))
+    let plan = Value(planRes)
+    let wRes = q38.DiLoCoQwen38TinyFrozenWeightsBuild()
+    if IsErr(wRes):
+        return die(Error(wRes))
+    let weights = Value(wRes)
+
+    let storeDir = tmpRoot + "/diloco-settle-artifacts"
+    var store = astore.DiLoCoArtifactStore()
+    let initRes = astore.DiLoCoArtifactStoreInitFill(store, storeDir)
+    if IsErr(initRes):
+        return die(Error(initRes))
+
+    let jobBundleCid = support.DiLoCoTestJobBundleCid("qwen38-tiny-settle")
+    var leaderPeer: types.Libp2pPeerId
+    leaderPeer.value = support.DiLoCoTestJobBundleCid("qwen38-tiny-settle-leader")
+    var workerPeer: types.Libp2pPeerId
+    workerPeer.value = support.DiLoCoTestJobBundleCid("qwen38-tiny-settle-worker")
+    if types.Libp2pPeerIdEqual(leaderPeer, workerPeer):
+        return die("diloco_train_settle_smoke: peer ids collided")
+
+    var zeros: int32[]
+    let zeroRes = inner.DiLoCoLinearZerosFill(zeros, fwd.Qwen38MiniVocab, fwd.Qwen38MiniHidden)
+    if IsErr(zeroRes):
+        return die(Error(zeroRes))
+    let modelPut = putParams(store, jobBundleCid, zeros)
+    if IsErr(modelPut):
+        return die(Error(modelPut))
+    let optPut = putParams(store, jobBundleCid, zeros)
+    if IsErr(optPut):
+        return die(Error(optPut))
+
+    var state = core.DiLoCoStateInit("diloco.train.settle")
+    var openedJob = core.DiLoCoJob()
+    var genesis = core.DiLoCoGlobalVersion()
+    let openRes = core.DiLoCoOpenJobFill(openedJob,
+                                           genesis,
+                                           state,
+                                           jobBundleCid,
+                                           2,
+                                           SmokeInnerSteps,
+                                           60,
+                                           Value(modelPut),
+                                           Value(optPut))
+    if IsErr(openRes):
+        return die(Error(openRes))
+
+    var cohort = core.DiLoCoCohort()
+    let joinL = core.DiLoCoJoinCohortFill(cohort, state, jobBundleCid, leaderPeer)
+    if IsErr(joinL):
+        return die(Error(joinL))
+    let joinW = core.DiLoCoJoinCohortFill(cohort, state, jobBundleCid, workerPeer)
+    if IsErr(joinW):
+        return die(Error(joinW))
+    if cohort.fixedMemberCount != 2 || !state.jobs[0].sealed:
+        return die("diloco_train_settle_smoke: cohort not sealed")
+
+    var leaderLease = core.DiLoCoLease()
+    var workerLease = core.DiLoCoLease()
+    let ll = core.DiLoCoFetchLeaseFill(leaderLease, state, jobBundleCid, leaderPeer)
+    if IsErr(ll):
+        return die(Error(ll))
+    let wl = core.DiLoCoFetchLeaseFill(workerLease, state, jobBundleCid, workerPeer)
+    if IsErr(wl):
+        return die(Error(wl))
+
+    var baseW: int32[]
+    let baseLoad = loadParams(store, genesis.modelRef)
+    if IsErr(baseLoad):
+        return die(Error(baseLoad))
+    baseW = Value(baseLoad)
+
+    var xsA: int32[]
+    var ysA: int32[]
+    let a0 = q38.DiLoCoQwen38TinyAppendSampleFill(xsA, ysA, weights, plan, pairIds(1, 2), SmokeTargetA)
+    if IsErr(a0):
+        return die(Error(a0))
+    let a1 = q38.DiLoCoQwen38TinyAppendSampleFill(xsA, ysA, weights, plan, pairIds(1, 4), SmokeTargetA)
+    if IsErr(a1):
+        return die(Error(a1))
+    let a2 = q38.DiLoCoQwen38TinyAppendSampleFill(xsA, ysA, weights, plan, pairIds(2, 4), SmokeTargetA)
+    if IsErr(a2):
+        return die(Error(a2))
+
+    var xsB: int32[]
+    var ysB: int32[]
+    let b0 = q38.DiLoCoQwen38TinyAppendSampleFill(xsB, ysB, weights, plan, pairIds(8, 9), SmokeTargetB)
+    if IsErr(b0):
+        return die(Error(b0))
+    let b1 = q38.DiLoCoQwen38TinyAppendSampleFill(xsB, ysB, weights, plan, pairIds(8, 11), SmokeTargetB)
+    if IsErr(b1):
+        return die(Error(b1))
+    let b2 = q38.DiLoCoQwen38TinyAppendSampleFill(xsB, ysB, weights, plan, pairIds(9, 11), SmokeTargetB)
+    if IsErr(b2):
+        return die(Error(b2))
+
+    var heldXs: int32[]
+    var heldYs: int32[]
+    var heldTargets: int32[]
+    let h0 = q38.DiLoCoQwen38TinyAppendSampleFill(heldXs, heldYs, weights, plan, pairIds(1, 2), SmokeTargetA)
+    if IsErr(h0):
+        return die(Error(h0))
+    add(heldTargets, SmokeTargetA)
+    let h1 = q38.DiLoCoQwen38TinyAppendSampleFill(heldXs, heldYs, weights, plan, pairIds(8, 9), SmokeTargetB)
+    if IsErr(h1):
+        return die(Error(h1))
+    add(heldTargets, SmokeTargetB)
+
+    let nll0Res = q38.DiLoCoQwen38TinyNllMicrosSum(baseW, heldXs, heldTargets, 2,
+                                                    fwd.Qwen38MiniVocab, fwd.Qwen38MiniHidden)
+    if IsErr(nll0Res):
+        return die(Error(nll0Res))
+    let nll0 = Value(nll0Res)
+
+    var wA: int32[]
+    var dA: int32[]
+    let innerA = inner.DiLoCoInnerSgdLinearFill(wA, dA, baseW, xsA, ysA, 3, SmokeInnerSteps,
+                                                 fwd.Qwen38MiniVocab, fwd.Qwen38MiniHidden,
+                                                 SmokeLrNum, SmokeLrDen)
+    if IsErr(innerA):
+        return die(Error(innerA))
+    var wB: int32[]
+    var dB: int32[]
+    let innerB = inner.DiLoCoInnerSgdLinearFill(wB, dB, baseW, xsB, ysB, 3, SmokeInnerSteps,
+                                                 fwd.Qwen38MiniVocab, fwd.Qwen38MiniHidden,
+                                                 SmokeLrNum, SmokeLrDen)
+    if IsErr(innerB):
+        return die(Error(innerB))
+
+    var barrier = core.DiLoCoBarrier()
+    let brA = core.DiLoCoReportInnerStepDoneFill(barrier, state, jobBundleCid, leaderPeer)
+    if IsErr(brA):
+        return die(Error(brA))
+    let brB = core.DiLoCoReportInnerStepDoneFill(barrier, state, jobBundleCid, workerPeer)
+    if IsErr(brB):
+        return die(Error(brB))
+    if !barrier.sealed:
+        return die("diloco_train_settle_smoke: barrier not sealed")
+
+    let deltaAPut = putParams(store, jobBundleCid, dA)
+    if IsErr(deltaAPut):
+        return die(Error(deltaAPut))
+    let deltaBPut = putParams(store, jobBundleCid, dB)
+    if IsErr(deltaBPut):
+        return die(Error(deltaBPut))
+    let optAPut = putParams(store, jobBundleCid, zeros)
+    if IsErr(optAPut):
+        return die(Error(optAPut))
+    let optBPut = putParams(store, jobBundleCid, zeros)
+    if IsErr(optBPut):
+        return die(Error(optBPut))
+
+    let tokensA: int32 = 3 * SmokeSeqLen * SmokeInnerSteps
+    let tokensB: int32 = 3 * SmokeSeqLen * SmokeInnerSteps
+    var deltaRecA = core.DiLoCoOuterDelta()
+    let subA = core.DiLoCoSubmitOuterDeltaFill(deltaRecA,
+                                                 state,
+                                                 jobBundleCid,
+                                                 leaderLease.baseVersionCid,
+                                                 leaderLease.outerStep,
+                                                 leaderPeer,
+                                                 Value(deltaAPut),
+                                                 Value(optAPut),
+                                                 3,
+                                                 tokensA,
+                                                 SmokeInnerSteps,
+                                                 tokensA,
+                                                 1)
+    if IsErr(subA):
+        return die(Error(subA))
+    var deltaRecB = core.DiLoCoOuterDelta()
+    let subB = core.DiLoCoSubmitOuterDeltaFill(deltaRecB,
+                                                 state,
+                                                 jobBundleCid,
+                                                 workerLease.baseVersionCid,
+                                                 workerLease.outerStep,
+                                                 workerPeer,
+                                                 Value(deltaBPut),
+                                                 Value(optBPut),
+                                                 3,
+                                                 tokensB,
+                                                 SmokeInnerSteps,
+                                                 tokensB,
+                                                 1)
+    if IsErr(subB):
+        return die(Error(subB))
+
+    var commit = core.DiLoCoMergeCommit()
+    var version = core.DiLoCoGlobalVersion()
+    let mergeRes = outer.DiLoCoOuterMergeAndPublishFill(commit,
+                                                          version,
+                                                          store,
+                                                          state,
+                                                          jobBundleCid,
+                                                          leaderPeer,
+                                                          SmokeShardBytes)
+    if IsErr(mergeRes):
+        return die(Error(mergeRes))
+    if layout.FixedBytes32Equal(version.versionCid, genesis.versionCid):
+        return die("diloco_train_settle_smoke: versionCid did not change")
+
+    let mergedLoad = loadParams(store, version.modelRef)
+    if IsErr(mergedLoad):
+        return die(Error(mergedLoad))
+    let nll1Res = q38.DiLoCoQwen38TinyNllMicrosSum(Value(mergedLoad), heldXs, heldTargets, 2,
+                                                    fwd.Qwen38MiniVocab, fwd.Qwen38MiniHidden)
+    if IsErr(nll1Res):
+        return die(Error(nll1Res))
+    let nll1 = Value(nll1Res)
+    if nll1 >= nll0:
+        return die("diloco_train_settle_smoke: nll did not fall")
+
+    let nll0HashRes = settle.DepinDiLoCoTrainEvalNllHash(nll0)
+    if IsErr(nll0HashRes):
+        return die(Error(nll0HashRes))
+    let nll1HashRes = settle.DepinDiLoCoTrainEvalNllHash(nll1)
+    if IsErr(nll1HashRes):
+        return die(Error(nll1HashRes))
+    let nll0Hash = Value(nll0HashRes)
+    let evalMetricHash = Value(nll1HashRes)
+    if evalMetricHash == nll0Hash:
+        return die("diloco_train_settle_smoke: nll hash did not change")
+
+    let recordBuildRes = settle.DepinDiLoCoTrainRecordBuild(
+        layout.FixedBytes32Hex(jobBundleCid),
+        layout.FixedBytes32Hex(version.versionCid),
+        version.committedOuterStep,
+        int64(tokensA + tokensB),
+        evalMetricHash,
+        int64(1724000000000000000))
+    if IsErr(recordBuildRes):
+        return die(Error(recordBuildRes))
+    let record = Value(recordBuildRes)
+    let validateOk = settle.DepinDiLoCoTrainRecordValidate(record)
+    assert(validateOk.ok, " diloco train settle smoke: positive validate")
+
+    var driftTokens = cloneRecord(record)
+    driftTokens.tokenCountSum = record.tokenCountSum + 1
+    let driftTokensRes = settle.DepinDiLoCoTrainRecordValidate(driftTokens)
+    assert(IsErr(driftTokensRes), " diloco train settle smoke: token drift must fail")
+
+    var driftVersion = cloneRecord(record)
+    driftVersion.versionCidHex = strings.ConcatStr(record.versionCidHex, "f")
+    let driftVersionRes = settle.DepinDiLoCoTrainRecordValidate(driftVersion)
+    assert(IsErr(driftVersionRes), " diloco train settle smoke: version cid drift must fail")
+
+    var driftSchema = cloneRecord(record)
+    driftSchema.schema = "cheng.depin.diloco_train_settlement.v0"
+    let driftSchemaRes = settle.DepinDiLoCoTrainRecordValidate(driftSchema)
+    assert(IsErr(driftSchemaRes), " diloco train settle smoke: schema drift must fail")
+
+    var driftNll = cloneRecord(record)
+    driftNll.evalMetricHash = nll0Hash
+    let driftNllRes = settle.DepinDiLoCoTrainRecordValidate(driftNll)
+    assert(IsErr(driftNllRes), " diloco train settle smoke: nll hash drift must fail")
+
+    let altBuildRes = settle.DepinDiLoCoTrainRecordBuild(
+        layout.FixedBytes32Hex(jobBundleCid),
+        layout.FixedBytes32Hex(genesis.versionCid),
+        version.committedOuterStep,
+        int64(tokensA + tokensB),
+        evalMetricHash,
+        int64(1724000000000000000))
+    if IsErr(altBuildRes):
+        return die(Error(altBuildRes))
+    assert(Value(altBuildRes).recordHash != record.recordHash,
+        " diloco train settle smoke: version cid changes record hash")
+    let stepAltBuildRes = settle.DepinDiLoCoTrainRecordBuild(
+        layout.FixedBytes32Hex(jobBundleCid),
+        layout.FixedBytes32Hex(version.versionCid),
+        version.committedOuterStep + 1,
+        int64(tokensA + tokensB),
+        evalMetricHash,
+        int64(1724000000000000000))
+    if IsErr(stepAltBuildRes):
+        return die(Error(stepAltBuildRes))
+    assert(Value(stepAltBuildRes).recordHash != record.recordHash,
+        " diloco train settle smoke: outer step changes record hash")
+    let nllAltBuildRes = settle.DepinDiLoCoTrainRecordBuild(
+        layout.FixedBytes32Hex(jobBundleCid),
+        layout.FixedBytes32Hex(version.versionCid),
+        version.committedOuterStep,
+        int64(tokensA + tokensB),
+        nll0Hash,
+        int64(1724000000000000000))
+    if IsErr(nllAltBuildRes):
+        return die(Error(nllAltBuildRes))
+    assert(Value(nllAltBuildRes).recordHash != record.recordHash,
+        " diloco train settle smoke: nll hash changes record hash")
+
+    echo(strings.ConcatStr("diloco_train_settle_smoke nll0_micros=",
+                           strings.IntToStr(int32(nll0))))
+    echo(strings.ConcatStr("diloco_train_settle_smoke nll1_micros=",
+                           strings.IntToStr(int32(nll1))))
+    echo(" diloco_train_settle_smoke ok")
+    return 0

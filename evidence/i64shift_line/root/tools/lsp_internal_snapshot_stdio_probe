@@ -1,0 +1,1706 @@
+#!/usr/bin/env python3
+"""Drive the production LSP stdio path through one exact overlay snapshot."""
+
+from __future__ import annotations
+
+import json
+import hashlib
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import textwrap
+
+
+ZERO_CID = "0" * 64
+RECEIPT_CID_FIELDS = (
+    "chengSemanticSnapshotCid",
+    "chengBindingReceiptCid",
+    "chengCsgRootCid",
+    "chengQueryProjectionCid",
+    "chengQueryIndexCid",
+    "chengOpenDocumentUniverseCid",
+    "chengDeclarationTableCid",
+    "chengCompilerFactProjectionCid",
+)
+FAILURE_CID_FIELDS = (
+    "chengFailureDiagnosticRootCid",
+    "chengFailureCargoCid",
+    "chengFailureAdmissionReceiptCid",
+    "chengFailureParserDiagnosticAuthorityRootCid",
+)
+RECEIPT_FIELDS = (
+    "chengSourceVersion",
+    *RECEIPT_CID_FIELDS,
+    "chengSnapshotRejected",
+    *FAILURE_CID_FIELDS,
+)
+KNOWN_CHENG_FIELDS = frozenset(
+    {
+        *RECEIPT_FIELDS,
+        "chengDeclId",
+        "chengDeclKeyCid",
+        "chengDiagnosticId",
+        "chengDocumentCid",
+        "chengProducerKind",
+        "chengSpanId",
+        "chengSymbolCid",
+        "chengSymbolId",
+        "chengSymbolKind",
+        "chengTargetDeclId",
+        "chengTargetDeclKeyCid",
+        "chengTargetSymbolCid",
+        "chengTargetSymbolId",
+        "chengTypeId",
+    }
+)
+BINDING_SCHEMA = "cheng.lsp_internal_snapshot_stdio_probe.binding"
+BINDING_FILE_KEYS = frozenset(("path", "sha256"))
+BINDING_KEYS = frozenset(
+    (
+        "schema",
+        "entryExecutable",
+        "officialCompiler",
+        "compilerSource",
+        "entrySource",
+        "parserSource",
+        "lspServerSource",
+        "materializerSource",
+        "grammarSource",
+        "compilerCsgSource",
+        "exportSurfaceSource",
+        "toolchain",
+        "sourceToolManifest",
+        "entryBuildCommandCid",
+    )
+)
+MAX_BINDING_BYTES = 64 * 1024
+MAX_PINNED_FILE_BYTES = 1024 * 1024 * 1024
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+def canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def unique_json_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RuntimeError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def stable_file_sha256(
+    raw_path: str,
+    label: str,
+    *,
+    executable: bool = False,
+    single_link: bool = True,
+    max_bytes: int = MAX_PINNED_FILE_BYTES,
+) -> tuple[str, int]:
+    path = Path(raw_path)
+    require(path.is_absolute(), f"{label} path is not absolute")
+    canonical = path.resolve(strict=True)
+    require(canonical == path, f"{label} path is not canonical")
+    before = path.lstat()
+    require(
+        not path.is_symlink()
+        and path.is_file()
+        and (before.st_nlink == 1 or not single_link)
+        and 0 < before.st_size <= max_bytes,
+        f"{label} is not a bounded regular single-link file",
+    )
+    if executable:
+        require(before.st_mode & 0o111 != 0, f"{label} is not executable")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_nlink,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        require(
+            identity
+            == (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ),
+            f"{label} changed before open",
+        )
+        digest = hashlib.sha256()
+        observed = 0
+        while observed < opened.st_size:
+            chunk = os.read(descriptor, min(1024 * 1024, opened.st_size - observed))
+            require(bool(chunk), f"{label} truncated while hashing")
+            digest.update(chunk)
+            observed += len(chunk)
+        descriptor_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = path.lstat()
+    require(
+        identity
+        == (
+            descriptor_after.st_dev,
+            descriptor_after.st_ino,
+            descriptor_after.st_mode,
+            descriptor_after.st_nlink,
+            descriptor_after.st_size,
+            descriptor_after.st_mtime_ns,
+            descriptor_after.st_ctime_ns,
+        )
+        == (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ),
+        f"{label} changed while hashing",
+    )
+    return digest.hexdigest(), observed
+
+
+def load_binding(
+    binding_path_raw: str,
+    executable: Path,
+) -> tuple[dict[str, object], str]:
+    binding_path = Path(binding_path_raw)
+    require(binding_path.is_absolute(), "binding path is not absolute")
+    binding_sha, binding_size = stable_file_sha256(
+        str(binding_path),
+        "stdio binding",
+        max_bytes=MAX_BINDING_BYTES,
+    )
+    raw = binding_path.read_bytes()
+    require(len(raw) == binding_size, "stdio binding size drift")
+    require(
+        hashlib.sha256(raw).hexdigest() == binding_sha,
+        "stdio binding bytes changed after stable hash",
+    )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("stdio binding is not UTF-8") from error
+    require(
+        text.endswith("\n") and "\r" not in text and "\n" not in text[:-1],
+        "stdio binding must be one LF-terminated JSON line",
+    )
+    try:
+        binding_document = json.loads(
+            text[:-1],
+            object_pairs_hook=unique_json_object,
+        )
+    except (json.JSONDecodeError, RuntimeError) as error:
+        raise RuntimeError(f"stdio binding JSON is invalid: {error}") from error
+    require(
+        isinstance(binding_document, dict),
+        "stdio binding is not an object",
+    )
+    require(
+        set(binding_document) == BINDING_KEYS,
+        "stdio binding field set drift",
+    )
+    require(
+        binding_document.get("schema") == BINDING_SCHEMA,
+        "stdio binding schema drift",
+    )
+    require(
+        is_cid(binding_document.get("entryBuildCommandCid")),
+        "stdio binding entry build command CID invalid",
+    )
+    for field in sorted(BINDING_KEYS - {"schema", "entryBuildCommandCid"}):
+        pin = binding_document[field]
+        require(
+            isinstance(pin, dict) and set(pin) == BINDING_FILE_KEYS,
+            f"stdio binding {field} pin shape drift",
+        )
+        path = pin.get("path")
+        expected_sha = pin.get("sha256")
+        require(
+            isinstance(path, str)
+            and isinstance(expected_sha, str)
+            and is_cid(expected_sha),
+            f"stdio binding {field} pin invalid",
+        )
+        observed_sha, _ = stable_file_sha256(
+            path,
+            f"stdio binding {field}",
+            executable=field in ("entryExecutable", "officialCompiler", "toolchain"),
+            single_link=field != "toolchain",
+        )
+        require(observed_sha == expected_sha, f"stdio binding {field} hash drift")
+    require(
+        Path(binding_document["entryExecutable"]["path"]) == executable,
+        "stdio binding entry executable path split",
+    )
+    require(
+        f"{canonical_json(binding_document)}\n" == text,
+        "stdio binding is not canonical JSON",
+    )
+    return binding_document, binding_sha
+
+
+def frame(message: dict[str, object]) -> bytes:
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    return f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+
+
+def parse_frames(raw: bytes) -> list[dict[str, object]]:
+    messages: list[dict[str, object]] = []
+    cursor = 0
+    while cursor < len(raw):
+        header_end = raw.find(b"\r\n\r\n", cursor)
+        if header_end < 0:
+            raise RuntimeError(f"truncated response header at {cursor}")
+        header_fields: dict[bytes, bytes] = {}
+        for line in raw[cursor:header_end].split(b"\r\n"):
+            key, separator, value = line.partition(b":")
+            if not separator:
+                raise RuntimeError("response header line has no colon")
+            normalized = key.strip().lower()
+            if normalized in header_fields:
+                raise RuntimeError(
+                    "duplicate response header: "
+                    + normalized.decode("ascii", errors="replace")
+                )
+            header_fields[normalized] = value.strip()
+        if b"content-length" not in header_fields:
+            raise RuntimeError("response has no Content-Length")
+        length_raw = header_fields[b"content-length"]
+        if (
+            not length_raw
+            or any(byte not in b"0123456789" for byte in length_raw)
+            or (len(length_raw) > 1 and length_raw.startswith(b"0"))
+        ):
+            raise RuntimeError("response Content-Length is not canonical")
+        length = int(length_raw)
+        if length <= 0 or length > MAX_RESPONSE_BYTES:
+            raise RuntimeError("response Content-Length exceeds its bound")
+        body_start = header_end + 4
+        body_end = body_start + length
+        if body_end > len(raw):
+            raise RuntimeError("truncated response body")
+        try:
+            value = json.loads(
+                raw[body_start:body_end],
+                object_pairs_hook=unique_json_object,
+            )
+        except (json.JSONDecodeError, RuntimeError) as error:
+            raise RuntimeError(f"response JSON is invalid: {error}") from error
+        if not isinstance(value, dict):
+            raise RuntimeError("response body is not an object")
+        messages.append(value)
+        cursor = body_end
+    return messages
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise RuntimeError(message)
+
+
+def is_cid(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value != "0" * 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def is_exact_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def exact_receipt_fingerprint(
+    response: dict[str, object], operation: str
+) -> tuple[object, ...]:
+    require(
+        response.get("chengSourceVersion") == 2,
+        f"{operation} source version drift",
+    )
+    for field in RECEIPT_CID_FIELDS:
+        require(is_cid(response.get(field)), f"{operation} {field} missing")
+    require(
+        response.get("chengSnapshotRejected") is False,
+        f"{operation} used a rejected snapshot",
+    )
+    for field in FAILURE_CID_FIELDS:
+        require(
+            response.get(field) == ZERO_CID,
+            f"{operation} success retained nonzero {field}",
+        )
+    return tuple(response.get(field) for field in RECEIPT_FIELDS)
+
+
+def result_receipt_rows(value: object) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    if isinstance(value, dict):
+        present = [field for field in RECEIPT_FIELDS if field in value]
+        if present:
+            require(
+                len(present) == len(RECEIPT_FIELDS),
+                "partial nested semantic receipt: " + ",".join(present),
+            )
+            rows.append(value)
+        for child in value.values():
+            rows.extend(result_receipt_rows(child))
+    elif isinstance(value, list):
+        for child in value:
+            rows.extend(result_receipt_rows(child))
+    return rows
+
+
+def exact_response_map(
+    responses: list[dict[str, object]],
+) -> dict[int, dict[str, object]]:
+    require(len(responses) == 9, f"response count drift: {len(responses)}")
+    for row in responses:
+        require(row.get("jsonrpc") == "2.0", "response jsonrpc drift")
+        require("id" in row, "response without id")
+        field_set = set(row)
+        if "result" in row:
+            require(
+                field_set == {"jsonrpc", "id", "result"},
+                "success response top-level field set drift",
+            )
+        elif "error" in row:
+            require(
+                field_set == {"jsonrpc", "id", "error"},
+                "error response top-level field set drift",
+            )
+        else:
+            raise RuntimeError("response has neither result nor error")
+        validate_known_cheng_fields(row)
+    response_id_values = [row["id"] for row in responses]
+    require(
+        all(is_exact_int(value) for value in response_id_values),
+        "response id is not an exact integer",
+    )
+    require(
+        len(response_id_values) == len(set(response_id_values)),
+        "duplicate response id",
+    )
+    require(
+        set(response_id_values) == {1, 10, 11, 12, 13, 14, 15, 16, 17},
+        f"response id set drift: {response_id_values}",
+    )
+    return {int(row["id"]): row for row in responses}
+
+
+def validate_known_cheng_fields(value: object) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            require(isinstance(key, str), "response object key is not text")
+            if key.startswith("cheng"):
+                require(key in KNOWN_CHENG_FIELDS, f"unknown Cheng field: {key}")
+            validate_known_cheng_fields(child)
+    elif isinstance(value, list):
+        for child in value:
+            validate_known_cheng_fields(child)
+
+
+def fixture_cid(label: str) -> str:
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def admission_binding_cid(
+    admission_receipt: str,
+    probe_fingerprint: str,
+    query_fingerprint: str,
+) -> str:
+    for label, value in (
+        ("admission receipt", admission_receipt),
+        ("probe fingerprint", probe_fingerprint),
+        ("query fingerprint", query_fingerprint),
+    ):
+        require(is_cid(value), f"{label} is not an exact nonzero CID")
+    return hashlib.sha256(
+        (
+            "cheng.lsp_internal_snapshot_stdio_probe.admission.binding\0"
+            + admission_receipt
+            + probe_fingerprint
+            + query_fingerprint
+        ).encode("ascii")
+    ).hexdigest()
+
+
+def self_test() -> int:
+    receipt: dict[str, object] = {
+        "chengSourceVersion": 2,
+        **{
+            field: fixture_cid(field)
+            for field in RECEIPT_CID_FIELDS
+        },
+        "chengSnapshotRejected": False,
+        **{field: ZERO_CID for field in FAILURE_CID_FIELDS},
+    }
+    expected = (
+        2,
+        *(fixture_cid(field) for field in RECEIPT_CID_FIELDS),
+        False,
+        *(ZERO_CID for _ in FAILURE_CID_FIELDS),
+    )
+    require(
+        exact_receipt_fingerprint(dict(receipt), "self-test-copy") == expected,
+        "equal receipt fingerprint drift",
+    )
+    mutations: list[dict[str, object]] = []
+    for field, value in (
+        ("chengSourceVersion", 3),
+        ("chengSemanticSnapshotCid", ZERO_CID),
+        ("chengSnapshotRejected", True),
+        ("chengFailureCargoCid", fixture_cid("failure")),
+    ):
+        candidate = dict(receipt)
+        candidate[field] = value
+        mutations.append(candidate)
+    for index, candidate in enumerate(mutations):
+        try:
+            exact_receipt_fingerprint(candidate, f"mutation-{index}")
+        except RuntimeError:
+            continue
+        raise RuntimeError(f"receipt mutation accepted: {index}")
+    partial = {"chengSourceVersion": 2}
+    try:
+        result_receipt_rows({"result": partial})
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("partial nested receipt accepted")
+    response_fixture = [
+        {"jsonrpc": "2.0", "id": response_id, "result": None}
+        for response_id in (1, 10, 11, 12, 13, 14, 15, 16, 17)
+    ]
+    exact_response_map(response_fixture)
+    error_response_fixture = [
+        *response_fixture[:-1],
+        {
+            "jsonrpc": "2.0",
+            "id": 17,
+            "error": {"code": -32603, "message": "synthetic"},
+        },
+    ]
+    exact_response_map(error_response_fixture)
+    response_mutations = (
+        [
+            *response_fixture[:-1],
+            {"jsonrpc": "2.0", "id": 16, "result": None},
+        ],
+        [
+            *response_fixture[:-1],
+            {"jsonrpc": "2.1", "id": 17, "result": None},
+        ],
+        [
+            *response_fixture[:-1],
+            {"jsonrpc": "2.0", "result": None},
+        ],
+        [
+            *response_fixture[:-1],
+            {
+                "jsonrpc": "2.0",
+                "id": 17,
+                "result": {"chengUnknownCompatibility": fixture_cid("unknown")},
+            },
+        ],
+        [
+            *response_fixture[:-1],
+            {"jsonrpc": "2.0", "id": "17", "result": None},
+        ],
+        [
+            *response_fixture[:-1],
+            {
+                "jsonrpc": "2.0",
+                "id": 17,
+                "result": None,
+                "unexpectedTopLevel": True,
+            },
+        ],
+        [
+            *response_fixture[:-1],
+            {
+                "jsonrpc": "2.0",
+                "id": 17,
+                "result": None,
+                "error": {"code": -32603, "message": "ambiguous"},
+            },
+        ],
+    )
+    for mutation_index, mutation in enumerate(response_mutations):
+        try:
+            exact_response_map(mutation)
+        except RuntimeError:
+            continue
+        raise RuntimeError(
+            f"response mutation accepted: {mutation_index}"
+        )
+    duplicate_json = (
+        b'{"jsonrpc":"2.0","id":1,"id":2,"result":null}'
+    )
+    duplicate_frame = (
+        f"Content-Length: {len(duplicate_json)}\r\n\r\n".encode("ascii")
+        + duplicate_json
+    )
+    try:
+        parse_frames(duplicate_frame)
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("duplicate JSON response key accepted")
+    main_path_mutations = self_test_main_path()
+    print("lsp_internal_snapshot_stdio_probe_self_test_mutations_rejected=13")
+    print(
+        "lsp_internal_snapshot_stdio_probe_"
+        f"main_path_mutations_rejected={main_path_mutations}"
+    )
+    return 0
+
+
+def self_test_main_path() -> int:
+    probe_path = Path(__file__).resolve(strict=True)
+    python_executable = Path(sys.executable).resolve(strict=True)
+    probe_source = probe_path.read_text(encoding="utf-8")
+    fake_source = (
+        f"#!{python_executable}\n"
+        + textwrap.dedent(
+            r'''
+            import hashlib
+            import json
+            import os
+            import sys
+
+
+            def cid(label):
+                return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+            def parse_frames(raw):
+                messages = []
+                cursor = 0
+                while cursor < len(raw):
+                    header_end = raw.index(b"\r\n\r\n", cursor)
+                    header = raw[cursor:header_end].decode("ascii")
+                    length = int(header.split(":", 1)[1].strip())
+                    body_start = header_end + 4
+                    body_end = body_start + length
+                    messages.append(json.loads(raw[body_start:body_end]))
+                    cursor = body_end
+                return messages
+
+
+            def frame(message):
+                body = json.dumps(
+                    message, separators=(",", ":")
+                ).encode("utf-8")
+                return (
+                    f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                    + body
+                )
+
+
+            raw = sys.stdin.buffer.read()
+            arguments = sys.argv[1:]
+            if not raw:
+                if any(
+                    argument
+                    == "--compiler-csg-root-cid=" + "0" * 64
+                    for argument in arguments
+                ):
+                    sys.stderr.write("zero identity CID compiler-csg-root-cid\n")
+                elif "--compiler-world-channel=nightly" in arguments:
+                    sys.stderr.write("unsupported channel\n")
+                elif any(
+                    argument
+                    == "--compiler-source-bundle-cid=" + "0" * 64
+                    for argument in arguments
+                ):
+                    sys.stderr.write(
+                        "zero identity CID compiler-source-bundle-cid\n"
+                    )
+                elif any(
+                    argument.startswith("--compiler-migration-proof-cid=")
+                    and argument != "--compiler-migration-proof-cid=" + "0" * 64
+                    for argument in arguments
+                ):
+                    sys.stderr.write(
+                        "stable compiler proof/mirror pair incomplete\n"
+                    )
+                elif any(
+                    argument.startswith("--forbidden-identity-arg=")
+                    for argument in arguments
+                ):
+                    sys.stderr.write("invalid identity argument count\n")
+                else:
+                    sys.stderr.write("unexpected empty synthetic request\n")
+                raise SystemExit(1)
+
+            requests = parse_frames(raw)
+            helper_uri = ""
+            main_uri = ""
+            for request in requests:
+                if request.get("method") != "cheng/configureCompilerSource":
+                    continue
+                params = request["params"]
+                if params["entry"]:
+                    main_uri = params["uri"]
+                else:
+                    helper_uri = params["uri"]
+            if not helper_uri or not main_uri:
+                sys.stderr.write("synthetic source configuration missing\n")
+                raise SystemExit(1)
+
+            zero = "0" * 64
+            receipt = {
+                "chengSourceVersion": 2,
+                "chengSemanticSnapshotCid": cid("snapshot"),
+                "chengBindingReceiptCid": cid("binding"),
+                "chengCsgRootCid": cid("csg"),
+                "chengQueryProjectionCid": cid("query-projection"),
+                "chengQueryIndexCid": cid("query-index"),
+                "chengOpenDocumentUniverseCid": cid("open-documents"),
+                "chengDeclarationTableCid": cid("declarations"),
+                "chengCompilerFactProjectionCid": cid("compiler-facts"),
+                "chengSnapshotRejected": False,
+                "chengFailureDiagnosticRootCid": zero,
+                "chengFailureCargoCid": zero,
+                "chengFailureAdmissionReceiptCid": zero,
+                "chengFailureParserDiagnosticAuthorityRootCid": zero,
+            }
+
+
+            def decorate(payload):
+                result = dict(receipt)
+                result.update(payload)
+                return result
+
+
+            definition = decorate(
+                {
+                    "uri": helper_uri,
+                    "chengTargetSymbolId": 1,
+                    "chengTargetSymbolCid": cid("target-symbol"),
+                }
+            )
+            references = [
+                decorate(
+                    {
+                        "uri": helper_uri,
+                        "chengTargetSymbolId": 1,
+                        "chengTargetSymbolCid": cid("target-symbol"),
+                    }
+                ),
+                decorate(
+                    {
+                        "uri": main_uri,
+                        "chengTargetSymbolId": 1,
+                        "chengTargetSymbolCid": cid("target-symbol"),
+                    }
+                ),
+            ]
+            rename = decorate(
+                {
+                    "documentChanges": [
+                        {
+                            "textDocument": {
+                                "uri": helper_uri,
+                                "version": 2,
+                            },
+                            "edits": [
+                                decorate(
+                                    {
+                                        "newText": "Renamed",
+                                        "chengSymbolId": 1,
+                                        "chengSymbolCid": cid("symbol"),
+                                    }
+                                )
+                            ],
+                        },
+                        {
+                            "textDocument": {
+                                "uri": main_uri,
+                                "version": 2,
+                            },
+                            "edits": [
+                                decorate(
+                                    {
+                                        "newText": "Renamed",
+                                        "chengSymbolId": 1,
+                                        "chengSymbolCid": cid("symbol"),
+                                    }
+                                )
+                            ],
+                        },
+                    ]
+                }
+            )
+            hover = decorate(
+                {
+                    "contents": {
+                        "kind": "plaintext",
+                        "value": "fn Answer(): int32",
+                    },
+                    "chengSymbolId": 1,
+                    "chengSymbolCid": cid("symbol"),
+                }
+            )
+            completion = decorate(
+                {
+                    "items": [
+                        {
+                            "label": "Answer",
+                            "data": decorate(
+                                {
+                                    "symbolId": 1,
+                                    "symbolCid": cid("symbol"),
+                                }
+                            ),
+                        }
+                    ]
+                }
+            )
+            diagnostics = decorate(
+                {
+                    "kind": "full",
+                    "resultId": receipt["chengSemanticSnapshotCid"],
+                    "items": [],
+                }
+            )
+            metrics = {
+                "candidateAttemptCount": 2,
+                "candidateRejectedCount": 1,
+                "candidatePublishedCount": 1,
+                "candidateAdmissionMissingFactBitmap": 0,
+                "currentSourceVersion": 2,
+                "publishedSourceVersion": 2,
+                "explicitSourceFileReadCount": 2,
+                "explicitSourceFileReadBytes": (
+                    2 * len(b"disk bytes must never feed CompilerCSG\n")
+                ),
+                "queryAttemptCount": 6,
+                "definitionQueryCount": 1,
+                "referencesQueryCount": 1,
+                "renameQueryCount": 1,
+                "hoverQueryCount": 1,
+                "completionQueryCount": 1,
+                "diagnosticsQueryCount": 1,
+                "candidateAdmissionReceiptCid": cid("admission"),
+                "candidateAdmissionCompletedStageBitmap": 28,
+                "parserBuildObserved": True,
+                "compilerCsgBuildObserved": True,
+                "compilerSnapshotBuilderAttemptCount": 2,
+                "candidateBlockedReason": "",
+            }
+            results = {
+                1: {},
+                10: definition,
+                11: references,
+                12: rename,
+                13: hover,
+                14: completion,
+                15: diagnostics,
+                16: metrics,
+                17: None,
+            }
+            responses = [
+                {"jsonrpc": "2.0", "id": response_id, "result": result}
+                for response_id, result in results.items()
+            ]
+            if os.getenv("CHENG_LSP_FAKE_UNKNOWN_TOP_LEVEL") == "1":
+                responses[1]["unexpectedTopLevel"] = True
+            sys.stdout.buffer.write(
+                b"".join(frame(response) for response in responses)
+            )
+            '''
+        ).lstrip()
+    )
+
+    def file_pin(path: Path) -> dict[str, str]:
+        return {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    def write_binding(path: Path, executable: Path) -> None:
+        binding_document = {
+            "schema": BINDING_SCHEMA,
+            "entryExecutable": file_pin(executable),
+            "officialCompiler": file_pin(executable),
+            "compilerSource": file_pin(probe_path),
+            "entrySource": file_pin(probe_path),
+            "parserSource": file_pin(probe_path),
+            "lspServerSource": file_pin(probe_path),
+            "materializerSource": file_pin(probe_path),
+            "grammarSource": file_pin(probe_path),
+            "compilerCsgSource": file_pin(probe_path),
+            "exportSurfaceSource": file_pin(probe_path),
+            "toolchain": file_pin(executable),
+            "sourceToolManifest": file_pin(probe_path),
+            "entryBuildCommandCid": fixture_cid("self-test-entry-command"),
+        }
+        path.write_text(
+            f"{canonical_json(binding_document)}\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o400)
+
+    summary_re = re.compile(
+        r"^lsp_internal_snapshot_stdio_probe: ok "
+        r"candidate_attempt=([1-9][0-9]*) parser_observed=1 csg_observed=1 "
+        r"builder_attempt=([1-9][0-9]*) published=1 missing_fact_bitmap=0 "
+        r"semantic_queries=5 explicit_source_file_reads=2 "
+        r"entry_executable=([0-9a-f]{64}) "
+        r"probe_fingerprint=([0-9a-f]{64}) "
+        r"query_fingerprint=([0-9a-f]{64}) "
+        r"admission_receipt=([0-9a-f]{64}) "
+        r"admission_binding_receipt=([0-9a-f]{64})$"
+    )
+
+    def run_probe(
+        script: Path,
+        executable: Path,
+        binding: Path,
+        *,
+        unknown_top_level: bool = False,
+    ) -> subprocess.CompletedProcess[bytes]:
+        environment = os.environ.copy()
+        if unknown_top_level:
+            environment["CHENG_LSP_FAKE_UNKNOWN_TOP_LEVEL"] = "1"
+        else:
+            environment.pop("CHENG_LSP_FAKE_UNKNOWN_TOP_LEVEL", None)
+        return subprocess.run(
+            [
+                str(python_executable),
+                str(script),
+                str(executable),
+                str(binding),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=30,
+            check=False,
+        )
+
+    def summary_match(completed: subprocess.CompletedProcess[bytes]) -> re.Match[str]:
+        require(
+            completed.returncode == 0,
+            "synthetic main path failed: "
+            + completed.stderr.decode(errors="replace"),
+        )
+        stdout = completed.stdout.decode("ascii")
+        require(
+            stdout.endswith("\n") and "\n" not in stdout[:-1],
+            "synthetic main path output is not one LF-terminated line",
+        )
+        match = summary_re.fullmatch(stdout[:-1])
+        require(match is not None, "synthetic main path summary drift")
+        return match
+
+    with tempfile.TemporaryDirectory(
+        prefix="cheng-lsp-probe-main-self-test."
+    ) as raw_root:
+        root = Path(raw_root).resolve(strict=True)
+        fake_lsp = root / "fake-lsp"
+        fake_lsp.write_text(fake_source, encoding="utf-8")
+        fake_lsp.chmod(0o700)
+        binding_path = root / "binding.json"
+        write_binding(binding_path, fake_lsp)
+
+        positive = run_probe(probe_path, fake_lsp, binding_path)
+        positive_match = summary_match(positive)
+        expected_positive_binding = hashlib.sha256(
+            (
+                "cheng.lsp_internal_snapshot_stdio_probe.admission.binding\0"
+                + positive_match.group(6)
+                + positive_match.group(4)
+                + positive_match.group(5)
+            ).encode("ascii")
+        ).hexdigest()
+        require(
+            positive_match.group(7) == expected_positive_binding,
+            "positive main path admission binding split",
+        )
+
+        unknown = run_probe(
+            probe_path,
+            fake_lsp,
+            binding_path,
+            unknown_top_level=True,
+        )
+        require(
+            unknown.returncode != 0
+            and b"success response top-level field set drift" in unknown.stderr,
+            "unknown top-level response field mutant survived main path",
+        )
+
+        main_start = probe_source.index("\ndef main() -> int:")
+        main_end = probe_source.index("\n\nif __name__ == \"__main__\":", main_start)
+        main_source = probe_source[main_start:main_end]
+        shadow_token = "\n        workspace_binding = {\n"
+        require(
+            main_source.count(shadow_token) == 1,
+            "workspace binding authority token missing or duplicate",
+        )
+        shadow_mutant = root / "probe-shadow-mutant.py"
+        shadow_main = main_source.replace(
+            shadow_token,
+            "\n        binding = {\n",
+            1,
+        )
+        workspace_consumer = "\n                    **workspace_binding,\n"
+        require(
+            shadow_main.count(workspace_consumer) == 2,
+            "workspace binding consumer count drift",
+        )
+        shadow_main = shadow_main.replace(
+            workspace_consumer,
+            "\n                    **binding,\n",
+        )
+        require(
+            shadow_main.count("exact_binding") >= 2,
+            "exact binding authority consumer count drift",
+        )
+        shadow_main = shadow_main.replace("exact_binding", "binding")
+        shadow_mutant.write_text(
+            probe_source[:main_start] + shadow_main + probe_source[main_end:],
+            encoding="utf-8",
+        )
+        shadow = run_probe(shadow_mutant, fake_lsp, binding_path)
+        require(
+            shadow.returncode != 0
+            and b"KeyError: 'sourceToolManifest'" in shadow.stderr,
+            "binding shadow mutant did not execute its main-path failure: "
+            + shadow.stderr.decode(errors="replace"),
+        )
+
+        function_start = probe_source.index("def admission_binding_cid(")
+        function_end = probe_source.index("\n\ndef self_test()", function_start)
+        admission_function = probe_source[function_start:function_end]
+        admission_domain = (
+            "cheng.lsp_internal_snapshot_stdio_probe.admission.binding\\0"
+        )
+        require(
+            admission_function.count(admission_domain) == 1,
+            "admission binding domain missing or duplicate",
+        )
+        admission_mutant = root / "probe-admission-mutant.py"
+        admission_mutant.write_text(
+            (
+                probe_source[:function_start]
+                + admission_function.replace(
+                    admission_domain,
+                    "cheng.lsp_internal_snapshot_stdio_probe.admission.mutant\\0",
+                    1,
+                )
+                + probe_source[function_end:]
+            ),
+            encoding="utf-8",
+        )
+        mutated_admission = run_probe(
+            admission_mutant,
+            fake_lsp,
+            binding_path,
+        )
+        mutated_match = summary_match(mutated_admission)
+        independently_expected = hashlib.sha256(
+            (
+                "cheng.lsp_internal_snapshot_stdio_probe.admission.binding\0"
+                + mutated_match.group(6)
+                + mutated_match.group(4)
+                + mutated_match.group(5)
+            ).encode("ascii")
+        ).hexdigest()
+        require(
+            mutated_match.group(7) != independently_expected,
+            "admission binding hash mutant escaped independent oracle",
+        )
+    return 3
+
+
+def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
+        return self_test()
+    if len(sys.argv) != 3:
+        raise RuntimeError(
+            "expected LSP executable path and exact binding JSON path"
+        )
+    executable = Path(sys.argv[1]).resolve(strict=True)
+    exact_binding, binding_sha256 = load_binding(sys.argv[2], executable)
+    with tempfile.TemporaryDirectory(prefix="cheng-lsp-stdio-overlay.") as raw_root:
+        root = Path(raw_root)
+        source_root = root / "src"
+        source_root.mkdir(mode=0o700)
+        main_path = source_root / "main.cheng"
+        helper_path = source_root / "helper.cheng"
+        package_text = 'package_id = "pkg://pkg"\nmodule_prefix = "pkg"\n'
+        (root / "cheng-package.toml").write_text(
+            package_text,
+            encoding="utf-8",
+        )
+        main_path.write_text(
+            "disk bytes must never feed CompilerCSG\n", encoding="utf-8"
+        )
+        helper_path.write_text(
+            "disk bytes must never feed CompilerCSG\n", encoding="utf-8"
+        )
+        main_text = (
+            "import pkg/helper as helper\n\n"
+            "fn Main(): int32 =\n"
+            "    return helper.Answer()\n"
+        )
+        helper_text = "fn Answer(): int32 =\n    return 7\n"
+        main_uri = main_path.as_uri()
+        helper_uri = helper_path.as_uri()
+        workspace = str(root)
+        workspace_binding = {
+            "workspaceRoot": workspace,
+            "packageRoot": workspace,
+            "packageId": "pkg",
+            "targetTriple": "arm64-apple-darwin",
+        }
+        messages: list[dict[str, object]] = [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "processId": None,
+                    "rootUri": root.as_uri(),
+                    "capabilities": {},
+                },
+            },
+            {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "method": "cheng/configureCompilerSource",
+                "params": {
+                    **workspace_binding,
+                    "uri": helper_uri,
+                    "sourcePath": str(helper_path),
+                    "modulePath": "pkg/helper",
+                    "entry": False,
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "method": "cheng/configureCompilerSource",
+                "params": {
+                    **workspace_binding,
+                    "uri": main_uri,
+                    "sourcePath": str(main_path),
+                    "modulePath": "pkg/main",
+                    "entry": True,
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": helper_uri,
+                        "languageId": "cheng",
+                        "version": 1,
+                        "text": helper_text,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": main_uri,
+                        "languageId": "cheng",
+                        "version": 1,
+                        "text": main_text,
+                    }
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {"uri": main_uri},
+                    "position": {"line": 3, "character": 18},
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "textDocument/references",
+                "params": {
+                    "textDocument": {"uri": main_uri},
+                    "position": {"line": 3, "character": 18},
+                    "context": {"includeDeclaration": True},
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "textDocument/rename",
+                "params": {
+                    "textDocument": {"uri": main_uri},
+                    "position": {"line": 3, "character": 18},
+                    "newName": "Renamed",
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": {"uri": main_uri},
+                    "position": {"line": 3, "character": 18},
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 14,
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {"uri": main_uri},
+                    "position": {"line": 3, "character": 18},
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "textDocument/diagnostic",
+                "params": {"textDocument": {"uri": main_uri}},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 16,
+                "method": "cheng/snapshotMetrics",
+                "params": {},
+            },
+            {"jsonrpc": "2.0", "id": 17, "method": "shutdown", "params": {}},
+            {"jsonrpc": "2.0", "method": "exit", "params": {}},
+        ]
+        compiler_args = [
+            "--compiler-case-id=lsp-stdio-probe",
+            "--compiler-world-channel=stable",
+            "--compiler-target-triple=arm64-apple-darwin",
+            "--compiler-source-bundle-cid="
+            + exact_binding["sourceToolManifest"]["sha256"],
+            "--compiler-csg-root-cid="
+            + exact_binding["compilerCsgSource"]["sha256"],
+            "--compiler-export-surface-cid="
+            + exact_binding["exportSurfaceSource"]["sha256"],
+            f"--compiler-migration-proof-cid={'0' * 64}",
+            "--compiler-materializer-cid="
+            + exact_binding["materializerSource"]["sha256"],
+            "--compiler-grammar-cid="
+            + exact_binding["grammarSource"]["sha256"],
+            "--compiler-source-closure-cid="
+            + exact_binding["sourceToolManifest"]["sha256"],
+            "--compiler-driver-cid="
+            + exact_binding["officialCompiler"]["sha256"],
+            "--compiler-toolchain-cid="
+            + exact_binding["toolchain"]["sha256"],
+            "--compiler-command-cid="
+            + exact_binding["entryBuildCommandCid"],
+        ]
+        request_bytes = b"".join(frame(message) for message in messages)
+        probe_fingerprint = hashlib.sha256(
+            (
+                "cheng.lsp_internal_snapshot_stdio_probe.fingerprint\0"
+                + canonical_json(
+                    {
+                        "bindingSha256": binding_sha256,
+                        "entryExecutableSha256":
+                            exact_binding["entryExecutable"]["sha256"],
+                        "compilerArguments": compiler_args,
+                        "requestTranscriptSha256": hashlib.sha256(
+                            request_bytes
+                        ).hexdigest(),
+                        "packageSha256": hashlib.sha256(
+                            package_text.encode("utf-8")
+                        ).hexdigest(),
+                        "sources": [
+                            {
+                                "entry": False,
+                                "modulePath": "pkg/helper",
+                                "sourcePath": str(helper_path),
+                                "sourceSha256": hashlib.sha256(
+                                    helper_text.encode("utf-8")
+                                ).hexdigest(),
+                            },
+                            {
+                                "entry": True,
+                                "modulePath": "pkg/main",
+                                "sourcePath": str(main_path),
+                                "sourceSha256": hashlib.sha256(
+                                    main_text.encode("utf-8")
+                                ).hexdigest(),
+                            },
+                        ],
+                    }
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        completed = subprocess.run(
+            [str(executable), *compiler_args],
+            input=request_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+        require(
+            completed.returncode == 0,
+            f"LSP exited {completed.returncode}: {completed.stderr.decode(errors='replace')}",
+        )
+        startup_attacks = {
+            "csg_root": (
+                "compiler-csg-root-cid",
+                "0" * 64,
+                "zero identity CID compiler-csg-root-cid",
+            ),
+            "channel": (
+                "compiler-world-channel",
+                "nightly",
+                "unsupported channel",
+            ),
+            "source_bundle": (
+                "compiler-source-bundle-cid",
+                "0" * 64,
+                "zero identity CID compiler-source-bundle-cid",
+            ),
+            "migration_proof": (
+                "compiler-migration-proof-cid",
+                fixture_cid("unbound-migration-proof"),
+                "stable compiler proof/mirror pair incomplete",
+            ),
+        }
+        for attack_name, (argument_name, value, expected_error) in startup_attacks.items():
+            prefix = f"--{argument_name}="
+            attacked_args = [
+                f"{prefix}{value}" if argument.startswith(prefix) else argument
+                for argument in compiler_args
+            ]
+            attacked = subprocess.run(
+                [str(executable), *attacked_args],
+                input=b"",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+            attacked_stderr = attacked.stderr.decode(errors="replace")
+            require(
+                attacked.returncode != 0 and expected_error in attacked_stderr,
+                f"startup attack {attack_name} did not hard-fail "
+                f"rc={attacked.returncode} stderr={attacked_stderr}",
+            )
+        extra_argument_attack = subprocess.run(
+            [str(executable), *compiler_args,
+             "--forbidden-identity-arg=" + fixture_cid("forbidden")],
+            input=b"",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+        extra_argument_stderr = extra_argument_attack.stderr.decode(errors="replace")
+        require(
+            extra_argument_attack.returncode != 0 and
+            "invalid identity argument count" in extra_argument_stderr,
+            "startup extra identity argument did not hard-fail "
+            f"rc={extra_argument_attack.returncode} stderr={extra_argument_stderr}",
+        )
+        responses = parse_frames(completed.stdout)
+        by_id = exact_response_map(responses)
+        response_ids = sorted(str(response_id) for response_id in by_id)
+        for request_id, operation in ((1, "initialize"), (17, "shutdown")):
+            response = by_id[request_id]
+            require(
+                "error" not in response and "result" in response,
+                f"{operation} response failed",
+            )
+        canonical_fingerprints: list[tuple[object, ...]] = []
+        semantic_requests = {
+            10: "definition",
+            11: "references",
+            12: "rename",
+            13: "hover",
+            14: "completion",
+        }
+        for request_id, operation in semantic_requests.items():
+            response = by_id.get(request_id)
+            require(
+                isinstance(response, dict),
+                f"{operation} response missing ids={response_ids} "
+                f"responses={json.dumps(responses, sort_keys=True, separators=(',', ':'))} "
+                f"stderr={completed.stderr.decode(errors='replace')}",
+            )
+            require(
+                "error" not in response and "result" in response,
+                f"{operation} did not return a published result "
+                f"response={json.dumps(response, sort_keys=True, separators=(',', ':'))} "
+                f"stderr={completed.stderr.decode(errors='replace')}",
+            )
+            result = response["result"]
+            nested_receipts = result_receipt_rows(result)
+            require(
+                bool(nested_receipts),
+                f"{operation} result has no recursive receipt",
+            )
+            operation_fingerprint = exact_receipt_fingerprint(
+                nested_receipts[0],
+                f"{operation}.result[0]",
+            )
+            canonical_fingerprints.append(operation_fingerprint)
+            for nested_index, nested_receipt in enumerate(nested_receipts):
+                require(
+                    exact_receipt_fingerprint(
+                        nested_receipt, f"{operation}.result[{nested_index}]"
+                    )
+                    == operation_fingerprint,
+                    f"{operation} nested receipt fingerprint split",
+                )
+            if operation == "definition":
+                require(
+                    isinstance(result, dict)
+                    and result.get("uri") == helper_uri
+                    and is_exact_int(result.get("chengTargetSymbolId"))
+                    and result["chengTargetSymbolId"] >= 0
+                    and is_cid(result.get("chengTargetSymbolCid")),
+                    "definition exact target missing",
+                )
+                require(
+                    exact_receipt_fingerprint(
+                        result, "definition.result"
+                    )
+                    == operation_fingerprint,
+                    "definition result receipt split",
+                )
+            elif operation == "references":
+                require(
+                    isinstance(result, list)
+                    and len(result) == 2
+                    and all(
+                        isinstance(row, dict)
+                        and row.get("uri") in (helper_uri, main_uri)
+                        and is_exact_int(row.get("chengTargetSymbolId"))
+                        and row["chengTargetSymbolId"] >= 0
+                        and is_cid(row.get("chengTargetSymbolCid"))
+                        for row in result
+                    )
+                    and sorted(
+                        row.get("uri")
+                        for row in result
+                        if isinstance(row, dict)
+                    )
+                    == sorted((helper_uri, main_uri)),
+                    "references exact targets missing",
+                )
+                for index, row in enumerate(result):
+                    require(
+                        exact_receipt_fingerprint(
+                            row, f"references.result[{index}]"
+                        )
+                        == operation_fingerprint,
+                        "reference row receipt split",
+                    )
+            elif operation == "rename":
+                document_changes = (
+                    result.get("documentChanges")
+                    if isinstance(result, dict)
+                    else None
+                )
+                require(
+                    isinstance(document_changes, list)
+                    and len(document_changes) == 2
+                    and all(
+                        isinstance(change, dict)
+                        and isinstance(change.get("textDocument"), dict)
+                        and change["textDocument"].get("uri")
+                        in (helper_uri, main_uri)
+                        and is_exact_int(
+                            change["textDocument"].get("version")
+                        )
+                        and isinstance(change.get("edits"), list)
+                        and change["edits"]
+                        and all(
+                            isinstance(edit, dict)
+                            and edit.get("newText") == "Renamed"
+                            and is_exact_int(edit.get("chengSymbolId"))
+                            and edit["chengSymbolId"] >= 0
+                            and is_cid(edit.get("chengSymbolCid"))
+                            for edit in change["edits"]
+                        )
+                        for change in document_changes
+                    )
+                    and sorted(
+                        change["textDocument"]["uri"]
+                        for change in document_changes
+                    )
+                    == sorted((helper_uri, main_uri)),
+                    "rename exact edits missing",
+                )
+                require(
+                    exact_receipt_fingerprint(result, "rename.result")
+                    == operation_fingerprint,
+                    "rename result receipt split",
+                )
+                for change_index, change in enumerate(document_changes):
+                    for edit_index, edit in enumerate(change["edits"]):
+                        require(
+                            exact_receipt_fingerprint(
+                                edit,
+                                "rename.result"
+                                f"[{change_index}].edit[{edit_index}]",
+                            )
+                            == operation_fingerprint,
+                            "rename edit receipt split",
+                        )
+            elif operation == "hover":
+                contents = (
+                    result.get("contents")
+                    if isinstance(result, dict)
+                    else None
+                )
+                require(
+                    isinstance(contents, dict)
+                    and contents.get("kind") == "plaintext"
+                    and isinstance(contents.get("value"), str)
+                    and "Answer" in contents["value"]
+                    and is_exact_int(result.get("chengSymbolId"))
+                    and result["chengSymbolId"] >= 0
+                    and is_cid(result.get("chengSymbolCid")),
+                    "hover exact symbol missing",
+                )
+                require(
+                    exact_receipt_fingerprint(result, "hover.result")
+                    == operation_fingerprint,
+                    "hover result receipt split",
+                )
+            elif operation == "completion":
+                items = result.get("items") if isinstance(result, dict) else None
+                require(
+                    isinstance(items, list)
+                    and items
+                    and all(
+                        isinstance(item, dict)
+                        and isinstance(item.get("data"), dict)
+                        for item in items
+                    )
+                    and any(
+                        isinstance(item, dict)
+                        and item.get("label") == "Answer"
+                        and isinstance(item.get("data"), dict)
+                        and is_exact_int(item["data"].get("symbolId"))
+                        and item["data"]["symbolId"] >= 0
+                        and is_cid(item["data"].get("symbolCid"))
+                        for item in items
+                    ),
+                    "completion exact symbol missing",
+                )
+                require(
+                    exact_receipt_fingerprint(result, "completion.result")
+                    == operation_fingerprint,
+                    "completion result receipt split",
+                )
+                for index, item in enumerate(items):
+                    require(
+                        exact_receipt_fingerprint(
+                            item["data"], f"completion.item[{index}].data"
+                        )
+                        == operation_fingerprint,
+                        "completion item receipt split",
+                    )
+        diagnostics_response = by_id.get(15)
+        require(isinstance(diagnostics_response, dict), "diagnostics response missing")
+        require(
+            "error" not in diagnostics_response,
+            "published diagnostics returned an error",
+        )
+        diagnostics_result = diagnostics_response.get("result")
+        require(isinstance(diagnostics_result, dict), "diagnostics result missing")
+        nested_diagnostics_receipts = result_receipt_rows(diagnostics_result)
+        require(
+            bool(nested_diagnostics_receipts),
+            "diagnostics result has no recursive receipt",
+        )
+        diagnostics_fingerprint = exact_receipt_fingerprint(
+            nested_diagnostics_receipts[0],
+            "diagnostics.result[0]",
+        )
+        canonical_fingerprints.append(diagnostics_fingerprint)
+        for nested_index, nested_receipt in enumerate(
+            nested_diagnostics_receipts
+        ):
+            require(
+                exact_receipt_fingerprint(
+                    nested_receipt, f"diagnostics.result[{nested_index}]"
+                )
+                == diagnostics_fingerprint,
+                "diagnostics nested receipt fingerprint split",
+            )
+        diagnostic_items = diagnostics_result.get("items")
+        require(
+            diagnostics_result.get("kind") == "full"
+            and is_cid(diagnostics_result.get("resultId"))
+            and diagnostics_result.get("resultId")
+            == diagnostics_result.get("chengSemanticSnapshotCid")
+            and isinstance(diagnostic_items, list),
+            "published diagnostics payload missing",
+        )
+        require(
+            diagnostics_result.get("chengSnapshotRejected") is False,
+            "published diagnostics receipt missing",
+        )
+        require(
+            exact_receipt_fingerprint(
+                diagnostics_result, "diagnostics.result"
+            )
+            == diagnostics_fingerprint,
+            "diagnostics result receipt split",
+        )
+        for index, diagnostic_item in enumerate(diagnostic_items):
+            require(
+                isinstance(diagnostic_item, dict)
+                and exact_receipt_fingerprint(
+                    diagnostic_item, f"diagnostics.item[{index}]"
+                )
+                == diagnostics_fingerprint,
+                "diagnostics item receipt split",
+            )
+        metrics_response = by_id.get(16)
+        require(isinstance(metrics_response, dict), "metrics response missing")
+        require(
+            "error" not in metrics_response and "result" in metrics_response,
+            "metrics response failed",
+        )
+        metrics = metrics_response.get("result")
+        require(isinstance(metrics, dict), "metrics result missing")
+        expected = {
+            "candidateAttemptCount": 2,
+            "candidateRejectedCount": 1,
+            "candidatePublishedCount": 1,
+            "candidateAdmissionMissingFactBitmap": 0,
+            "currentSourceVersion": 2,
+            "publishedSourceVersion": 2,
+            "explicitSourceFileReadCount": 2,
+            "explicitSourceFileReadBytes": 2
+            * len("disk bytes must never feed CompilerCSG\n".encode("utf-8")),
+            "queryAttemptCount": 6,
+            "definitionQueryCount": 1,
+            "referencesQueryCount": 1,
+            "renameQueryCount": 1,
+            "hoverQueryCount": 1,
+            "completionQueryCount": 1,
+            "diagnosticsQueryCount": 1,
+        }
+        for field, value in expected.items():
+            require(
+                is_exact_int(metrics.get(field)) and metrics.get(field) == value,
+                f"metric {field} drift",
+            )
+        require(
+            is_cid(metrics.get("candidateAdmissionReceiptCid")),
+            "candidate admission receipt CID missing",
+        )
+        require(
+            metrics.get("candidateAdmissionCompletedStageBitmap") == 28
+            and is_exact_int(
+                metrics.get("candidateAdmissionCompletedStageBitmap")
+            ),
+            "candidate admission completed stage bitmap drift",
+        )
+        diagnostic = json.dumps(metrics, sort_keys=True, separators=(",", ":"))
+        stderr = completed.stderr.decode(errors="replace")
+        require(
+            metrics.get("parserBuildObserved") is True,
+            f"parser build not observed metrics={diagnostic} stderr={stderr}",
+        )
+        require(
+            metrics.get("compilerCsgBuildObserved") is True,
+            f"CompilerCSG build not observed metrics={diagnostic} stderr={stderr}",
+        )
+        builder_attempt = metrics.get("compilerSnapshotBuilderAttemptCount")
+        require(
+            is_exact_int(builder_attempt) and builder_attempt > 0,
+            "compiler snapshot builder attempt not observed",
+        )
+        blocked = metrics.get("candidateBlockedReason")
+        require(
+            isinstance(blocked, str) and blocked == "",
+            "published candidate retained a blocked reason",
+        )
+        require(
+            len(set(canonical_fingerprints)) == 1,
+            "semantic query fingerprint split",
+        )
+        canonical_query_fingerprint = hashlib.sha256(
+            canonical_json(
+                [list(fingerprint) for fingerprint in canonical_fingerprints]
+            ).encode("utf-8")
+        ).hexdigest()
+        admission_receipt = metrics["candidateAdmissionReceiptCid"]
+        admission_binding_receipt = admission_binding_cid(
+            admission_receipt,
+            probe_fingerprint,
+            canonical_query_fingerprint,
+        )
+        binding_after, binding_sha256_after = load_binding(
+            sys.argv[2],
+            executable,
+        )
+        require(
+            binding_sha256_after == binding_sha256
+            and canonical_json(binding_after) == canonical_json(exact_binding),
+            "stdio binding or pinned child closure changed during probe",
+        )
+        print(
+            "lsp_internal_snapshot_stdio_probe: ok "
+            f"candidate_attempt={metrics['candidateAttemptCount']} "
+            "parser_observed=1 csg_observed=1 "
+            f"builder_attempt={builder_attempt} published=1 "
+            "missing_fact_bitmap=0 semantic_queries=5 "
+            "explicit_source_file_reads=2 "
+            f"entry_executable={exact_binding['entryExecutable']['sha256']} "
+            f"probe_fingerprint={probe_fingerprint} "
+            f"query_fingerprint={canonical_query_fingerprint} "
+            f"admission_receipt={admission_receipt} "
+            f"admission_binding_receipt={admission_binding_receipt}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        sys.stderr.write(f"lsp_internal_snapshot_stdio_probe_error={error}\n")
+        raise SystemExit(1)

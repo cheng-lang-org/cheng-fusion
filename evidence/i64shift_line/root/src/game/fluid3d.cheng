@@ -1,0 +1,503 @@
+# fluid3d: deterministic 3D ink-in-water particle engine (墨滴入水流体).
+# Production model: particles advected through a procedural divergence-free
+# 3D flow field — a sinking plume base field plus the curl of a 3-component
+# integer lattice noise potential — with concentration-conserving diffusion
+# (radius grows, alpha decays). Standard film/game ink-in-water approach,
+# fully deterministic in int32/int64 fixed-point (positions Q8 px), receipt-
+# fingerprinted per step (same replay discipline as physics2d).
+#
+# Coordinates: x right, y down (screen), z toward the viewer (weak
+# perspective applied by the renderer via Fluid3dProject*).
+#
+# Lifecycle phases (engine-owned):
+#   1 falling   — the drop falls ballistically toward the water surface
+#   2 bloom     — impact: plume particles emitted over a few ticks + ring wave
+#   3 diffuse   — 3D curl-noise advection, tendril child spawns, diffusion
+#   4 done      — all concentration faded
+
+const
+    Fluid3dCapacity = 512
+    Fluid3dQ = 256
+    Fluid3dStatusOk = 1
+    Fluid3dStatusInvalidConfig = 2
+    Fluid3dSchema = 0x46554944
+    Fluid3dPhaseFalling = 1
+    Fluid3dPhaseBloom = 2
+    Fluid3dPhaseDiffuse = 3
+    Fluid3dPhaseDone = 4
+    Fluid3dNoiseCellPx = 20
+    Fluid3dBloomTicks = 26
+    Fluid3dFocalPx = 620
+
+type
+    Fluid3dWorld =
+        count: int32
+        phase: int32
+        tick: int32
+        seed: int32
+        dropX: int32
+        dropY: int32
+        impactX: int32
+        impactTick: int32
+        ringAge: int32
+        posX: int32[]
+        posY: int32[]
+        posZ: int32[]
+        velX: int32[]
+        velY: int32[]
+        velZ: int32[]
+        alpha: int32[]
+        radiusQ8: int32[]
+        bornTick: int32[]
+
+    Fluid3dConfig =
+        dropStartXPx: int32
+        dropStartYPx: int32
+        dropSpeedQ8: int32
+        dropRadiusPx: int32
+        waterLineYPx: int32
+        minXPx: int32
+        maxXPx: int32
+        maxYPx: int32
+        depthRangePx: int32
+        plumeSinkQ8: int32
+        swirlAmpQ8: int32
+        spreadQ8: int32
+        diffuseRadiusGrowQ8: int32
+        alphaDecayNum: int32
+        alphaDecayDen: int32
+        tendrilEvery: int32
+        endAlpha: int32
+
+    Fluid3dStepReceipt =
+        schema: int32
+        tick: int32
+        dtMs: int32
+        statusCode: int32
+        phase: int32
+        liveCount: int32
+        worldFingerprint: int32
+        receiptFingerprint: int32
+
+fn fluidMix(hash: int32, value: int32): int32 =
+    var mixed = hash * 31 + value
+    if mixed < 0:
+        mixed = 0 - mixed
+    return mixed
+
+fn fluidAbs(value: int32): int32 =
+    if value < 0:
+        return 0 - value
+    return value
+
+# Deterministic 3D lattice noise in [-256, 256].
+fn fluidLatticeNoise(seed: int32, ix: int32, iy: int32, iz: int32, layer: int32): int32 =
+    var h = fluidMix(seed, layer * 8191)
+    h = fluidMix(h, ix * 73856093)
+    h = fluidMix(h, iy * 19349663)
+    h = fluidMix(h, iz * 83492791)
+    return (h % 513) - 256
+
+fn fluidFloorDiv(value: int32, divisor: int32): int32 =
+    var q = value / divisor
+    if value < 0 && q * divisor != value:
+        q = q - 1
+    return q
+
+# Trilinear-interpolated potential component at a Q8 position.
+fn fluidPotentialAt(seed: int32, xQ8: int32, yQ8: int32, zQ8: int32, layer: int32): int32 =
+    let cellQ8 = Fluid3dNoiseCellPx * Fluid3dQ
+    let cx = fluidFloorDiv(xQ8, cellQ8)
+    let cy = fluidFloorDiv(yQ8, cellQ8)
+    let cz = fluidFloorDiv(zQ8, cellQ8)
+    let fx = (xQ8 - cx * cellQ8) * Fluid3dQ / cellQ8
+    let fy = (yQ8 - cy * cellQ8) * Fluid3dQ / cellQ8
+    let fz = (zQ8 - cz * cellQ8) * Fluid3dQ / cellQ8
+    let n000 = fluidLatticeNoise(seed, cx, cy, cz, layer)
+    let n100 = fluidLatticeNoise(seed, cx + 1, cy, cz, layer)
+    let n010 = fluidLatticeNoise(seed, cx, cy + 1, cz, layer)
+    let n110 = fluidLatticeNoise(seed, cx + 1, cy + 1, cz, layer)
+    let n001 = fluidLatticeNoise(seed, cx, cy, cz + 1, layer)
+    let n101 = fluidLatticeNoise(seed, cx + 1, cy, cz + 1, layer)
+    let n011 = fluidLatticeNoise(seed, cx, cy + 1, cz + 1, layer)
+    let n111 = fluidLatticeNoise(seed, cx + 1, cy + 1, cz + 1, layer)
+    let t00 = n000 * (Fluid3dQ - fx) + n100 * fx
+    let t10 = n010 * (Fluid3dQ - fx) + n110 * fx
+    let t01 = n001 * (Fluid3dQ - fx) + n101 * fx
+    let t11 = n011 * (Fluid3dQ - fx) + n111 * fx
+    let front = (t00 * (Fluid3dQ - fy) + t10 * fy) / Fluid3dQ
+    let back = (t01 * (Fluid3dQ - fy) + t11 * fy) / Fluid3dQ
+    return (front * (Fluid3dQ - fz) + back * fz) / (Fluid3dQ * Fluid3dQ)
+
+# Divergence-free swirl: v = curl(psi), psi = (layer 1, layer 2, layer 3).
+fn fluidCurlX(seed: int32, x: int32, y: int32, z: int32): int32 =
+    let d = 7 * Fluid3dQ
+    let dP3dy = fluidPotentialAt(seed, x, y + d, z, 3) - fluidPotentialAt(seed, x, y - d, z, 3)
+    let dP2dz = fluidPotentialAt(seed, x, y, z + d, 2) - fluidPotentialAt(seed, x, y, z - d, 2)
+    let d2 = 13 * Fluid3dQ
+    let o2 = fluidPotentialAt(seed, x * 2, y * 2 + d2, z * 2, 7) - fluidPotentialAt(seed, x * 2, y * 2 - d2, z * 2, 7)
+    return dP3dy - dP2dz + o2 / 2
+
+fn fluidCurlY(seed: int32, x: int32, y: int32, z: int32): int32 =
+    let d = 7 * Fluid3dQ
+    let dP1dz = fluidPotentialAt(seed, x, y, z + d, 1) - fluidPotentialAt(seed, x, y, z - d, 1)
+    let dP3dx = fluidPotentialAt(seed, x + d, y, z, 3) - fluidPotentialAt(seed, x - d, y, z, 3)
+    let d2 = 13 * Fluid3dQ
+    let o2 = fluidPotentialAt(seed, x * 2, y * 2, z * 2 + d2, 8) - fluidPotentialAt(seed, x * 2, y * 2, z * 2 - d2, 8)
+    return dP1dz - dP3dx + o2 / 2
+
+fn fluidCurlZ(seed: int32, x: int32, y: int32, z: int32): int32 =
+    let d = 7 * Fluid3dQ
+    let dP2dx = fluidPotentialAt(seed, x + d, y, z, 2) - fluidPotentialAt(seed, x - d, y, z, 2)
+    let dP1dy = fluidPotentialAt(seed, x, y + d, z, 1) - fluidPotentialAt(seed, x, y - d, z, 1)
+    let d2 = 13 * Fluid3dQ
+    let o2 = fluidPotentialAt(seed, x * 2 + d2, y * 2, z * 2, 9) - fluidPotentialAt(seed, x * 2 - d2, y * 2, z * 2, 9)
+    return dP2dx - dP1dy + o2 / 2
+
+@borrows
+fn Fluid3dConfigValid(cfg: var Fluid3dConfig): bool =
+    if cfg.dropRadiusPx <= 0 || cfg.dropSpeedQ8 <= 0:
+        return false
+    if cfg.waterLineYPx <= cfg.dropStartYPx:
+        return false
+    if cfg.maxXPx <= cfg.minXPx || cfg.maxYPx <= cfg.waterLineYPx:
+        return false
+    if cfg.depthRangePx <= 0:
+        return false
+    if cfg.alphaDecayDen <= 0 || cfg.alphaDecayNum <= 0 || cfg.alphaDecayNum >= cfg.alphaDecayDen:
+        return false
+    if cfg.tendrilEvery <= 0:
+        return false
+    return true
+
+fn Fluid3dInkDropInit(cfg: var Fluid3dConfig, seed: int32): Fluid3dWorld =
+    var world: Fluid3dWorld
+    world.count = 0
+    world.phase = Fluid3dPhaseFalling
+    world.tick = 0
+    world.seed = seed
+    world.dropX = cfg.dropStartXPx * Fluid3dQ
+    world.dropY = cfg.dropStartYPx * Fluid3dQ
+    world.impactX = 0
+    world.impactTick = 0
+    world.ringAge = 0 - 1
+    world.posX = []
+    world.posY = []
+    world.posZ = []
+    world.velX = []
+    world.velY = []
+    world.velZ = []
+    world.alpha = []
+    world.radiusQ8 = []
+    world.bornTick = []
+    return world
+
+fn fluidSpawn(world: var Fluid3dWorld,
+              xQ8: int32,
+              yQ8: int32,
+              zQ8: int32,
+              vxQ8: int32,
+              vyQ8: int32,
+              vzQ8: int32,
+              alpha: int32,
+              radiusPx: int32) =
+    if world.count >= Fluid3dCapacity:
+        return
+    add(world.posX, xQ8)
+    add(world.posY, yQ8)
+    add(world.posZ, zQ8)
+    add(world.velX, vxQ8)
+    add(world.velY, vyQ8)
+    add(world.velZ, vzQ8)
+    add(world.alpha, alpha)
+    add(world.radiusQ8, radiusPx * Fluid3dQ)
+    add(world.bornTick, world.tick)
+    world.count = world.count + 1
+
+# Impact composition (墨滴入水骨架): a coherent sinking jet — large dark head
+# particles tracking a descending front, a trailing trunk column, a vortex
+# ring rolling around the head once it slows, and diagonal branch wisps.
+# All offsets/velocities in px scaled to Q8; fully hash-deterministic.
+fn fluidEmitBloom(world: var Fluid3dWorld, cfg: Fluid3dConfig, wave: int32) =
+    let baseX = world.impactX
+    let waterQ8 = cfg.waterLineYPx * Fluid3dQ
+    # head front descends fast then decelerates
+    var headDepthPx = wave * 9
+    if wave > 14:
+        headDepthPx = 14 * 9 + (wave - 14) * 4
+    let headY = waterQ8 + headDepthPx * Fluid3dQ
+    var noise = fluidMix(world.seed, wave * 977)
+    let wander = ((noise % 33) - 16) * Fluid3dQ / 2
+    let headX = baseX + wander * wave / 8
+
+    # 1. head: a few large, dark, fast particles at the front
+    var i = 0
+    while i < 3:
+        noise = fluidMix(noise, i * 131 + 7)
+        let hx = headX + (((noise % 33) - 16) * Fluid3dQ) / 8
+        noise = fluidMix(noise, 11)
+        let hz = (((noise % 33) - 16) * Fluid3dQ) / 10
+        noise = fluidMix(noise, 13)
+        let hvy = (300 + (noise % 81)) * Fluid3dQ / 1
+        noise = fluidMix(noise, 17)
+        let hvx = (((noise % 41) - 20) * Fluid3dQ) / 2
+        fluidSpawn(world, hx, headY, hz, hvx, hvy / 4, 0, 92 + (noise % 14), 11 + (noise % 5))
+        i = i + 1
+
+    # 2. trunk: small particles strung between surface and head (the jet column)
+    i = 0
+    while i < 4:
+        noise = fluidMix(noise, i * 211 + 29)
+        let fracPermille = 120 + (noise % 760)
+        let ty = waterQ8 + (headDepthPx * fracPermille * Fluid3dQ) / 1000
+        noise = fluidMix(noise, 31)
+        let tx = baseX + (wander * fracPermille) / 1000 + (((noise % 25) - 12) * Fluid3dQ) / 10
+        noise = fluidMix(noise, 37)
+        let tz = (((noise % 25) - 12) * Fluid3dQ) / 12
+        noise = fluidMix(noise, 41)
+        let tvy = (60 + (noise % 61)) * Fluid3dQ
+        fluidSpawn(world, tx, ty, tz, 0, tvy / 4, 0, 55 + (noise % 26), 4 + (noise % 4))
+        i = i + 1
+
+    # 3. vortex ring: once the head slows, particles roll around it (torus cap)
+    if wave > 12:
+        let ringRadius = (6 + (wave - 12) * 2) * Fluid3dQ
+        i = 0
+        while i < 4:
+            noise = fluidMix(noise, i * 311 + 43)
+            let angleStep = (i * 140 + wave * 23) % 360
+            # coarse integer circle via octant lerp (deterministic)
+            var ca = 0
+            var sa = 0
+            if angleStep < 90:
+                ca = 256 - (angleStep * 256) / 90
+                sa = (angleStep * 256) / 90
+            elif angleStep < 180:
+                ca = 0 - ((angleStep - 90) * 256) / 90
+                sa = 256 - ((angleStep - 90) * 256) / 90
+            elif angleStep < 270:
+                ca = 0 - (256 - ((angleStep - 180) * 256) / 90)
+                sa = 0 - ((angleStep - 180) * 256) / 90
+            else:
+                ca = ((angleStep - 270) * 256) / 90
+                sa = 0 - (256 - ((angleStep - 270) * 256) / 90)
+            let rx = headX + (ringRadius * ca) / 256
+            let rz = (ringRadius * sa) / 320
+            let ry = headY - 6 * Fluid3dQ
+            # tangential + slight outward velocity rolls the ring
+            let tvx = (0 - sa) * 70 / 256 * Fluid3dQ / 4 + (ca * 40) / 256 * Fluid3dQ / 4
+            let tvz = (ca * 70) / 256 * Fluid3dQ / 4
+            noise = fluidMix(noise, 47)
+            fluidSpawn(world, rx, ry, rz, tvx, (20 + (noise % 41)) * Fluid3dQ / 4, tvz, 62 + (noise % 26), 6 + (noise % 4))
+            i = i + 1
+
+    # 4. branch wisps: short diagonal chains budding off the trunk
+    if wave == 9 || wave == 16 || wave == 22:
+        noise = fluidMix(noise, wave * 53)
+        var sideSign = 1
+        if noise % 2 == 1:
+            sideSign = 0 - 1
+        let branchY = waterQ8 + (headDepthPx * (300 + (noise % 400)) * Fluid3dQ) / 1000
+        var k = 0
+        while k < 5:
+            noise = fluidMix(noise, k * 61 + 5)
+            let bx = baseX + sideSign * (6 + k * 7) * Fluid3dQ + (((noise % 17) - 8) * Fluid3dQ) / 8
+            let by = branchY + k * 5 * Fluid3dQ
+            let bz = (((noise % 21) - 10) * Fluid3dQ) / 10
+            let bvx = sideSign * (40 + k * 12) * Fluid3dQ / 4
+            let bvy = (30 + k * 8) * Fluid3dQ / 4
+            fluidSpawn(world, bx, by, bz, bvx, bvy, 0, 46 - k * 5 + (noise % 11), 4 + (5 - k) / 2)
+            k = k + 1
+
+@borrows
+fn fluidWorldFingerprint(world: Fluid3dWorld): int32 =
+    var hash = 2166136261
+    if hash < 0:
+        hash = 0 - hash
+    hash = fluidMix(hash, world.phase)
+    hash = fluidMix(hash, world.dropY)
+    var i = 0
+    while i < world.count:
+        hash = fluidMix(hash, world.posX[i])
+        hash = fluidMix(hash, world.posY[i])
+        hash = fluidMix(hash, world.posZ[i])
+        hash = fluidMix(hash, world.alpha[i])
+        hash = fluidMix(hash, world.radiusQ8[i])
+        i = i + 1
+    return hash
+
+@borrows
+fn fluidReceiptFingerprint(receipt: Fluid3dStepReceipt): int32 =
+    var hash = 7
+    hash = fluidMix(hash, receipt.schema)
+    hash = fluidMix(hash, receipt.tick)
+    hash = fluidMix(hash, receipt.dtMs)
+    hash = fluidMix(hash, receipt.statusCode)
+    hash = fluidMix(hash, receipt.phase)
+    hash = fluidMix(hash, receipt.liveCount)
+    hash = fluidMix(hash, receipt.worldFingerprint)
+    return hash
+
+fn Fluid3dStep(world: var Fluid3dWorld,
+               dtMs: int32,
+               cfg: var Fluid3dConfig): Fluid3dStepReceipt =
+    var receipt: Fluid3dStepReceipt
+    receipt.schema = Fluid3dSchema
+    receipt.dtMs = dtMs
+    receipt.statusCode = Fluid3dStatusOk
+    if !Fluid3dConfigValid(cfg):
+        receipt.statusCode = Fluid3dStatusInvalidConfig
+        receipt.tick = world.tick
+        receipt.phase = world.phase
+        receipt.worldFingerprint = fluidWorldFingerprint(world)
+        receipt.receiptFingerprint = fluidReceiptFingerprint(receipt)
+        return receipt
+    world.tick = world.tick + 1
+
+    if world.phase == Fluid3dPhaseFalling:
+        world.dropY = world.dropY + (cfg.dropSpeedQ8 * dtMs) / 1000
+        if world.dropY >= cfg.waterLineYPx * Fluid3dQ:
+            world.phase = Fluid3dPhaseBloom
+            world.impactX = world.dropX
+            world.impactTick = world.tick
+            world.ringAge = 0
+
+    elif world.phase == Fluid3dPhaseBloom:
+        let wave = world.tick - world.impactTick
+        fluidEmitBloom(world, cfg, wave)
+        if wave >= Fluid3dBloomTicks:
+            world.phase = Fluid3dPhaseDiffuse
+
+    if world.phase == Fluid3dPhaseBloom || world.phase == Fluid3dPhaseDiffuse:
+        if world.ringAge >= 0:
+            world.ringAge = world.ringAge + 1
+
+        if world.phase == Fluid3dPhaseDiffuse && world.tick % cfg.tendrilEvery == 0 && world.count > 0:
+          var bud = 0
+          while bud < 2:
+            var pick = fluidMix(world.seed, world.tick * 397 + bud * 7919) % world.count
+            if world.alpha[pick] > 35:
+                var noise = fluidMix(world.seed, world.tick * 631 + pick)
+                let vx = (((noise % 121) - 60) * Fluid3dQ) / 2
+                noise = fluidMix(noise, 29)
+                let vz = (((noise % 121) - 60) * Fluid3dQ) / 2
+                noise = fluidMix(noise, 31)
+                let vy = ((noise % 121) * Fluid3dQ) / 3
+                fluidSpawn(world,
+                           world.posX[pick],
+                           world.posY[pick],
+                           world.posZ[pick],
+                           vx,
+                           vy,
+                           vz,
+                           (world.alpha[pick] * 7) / 8,
+                           world.radiusQ8[pick] / (3 * Fluid3dQ) + 2)
+            bud = bud + 1
+
+        let waterQ8 = cfg.waterLineYPx * Fluid3dQ
+        let minXQ8 = cfg.minXPx * Fluid3dQ
+        let maxXQ8 = cfg.maxXPx * Fluid3dQ
+        let maxYQ8 = cfg.maxYPx * Fluid3dQ
+        let depthQ8 = cfg.depthRangePx * Fluid3dQ
+        var liveCount = 0
+        var i = 0
+        while i < world.count:
+            if world.alpha[i] > 0:
+                let age = world.tick - world.bornTick[i]
+                let sinkHash = 50 + fluidMix(world.seed, i * 911) % 101
+                var fieldVy = (cfg.plumeSinkQ8 * sinkHash) / 100
+                if age > 28:
+                    fieldVy = (fieldVy * 28) / age
+                var fieldVx = 0
+                var fieldVz = 0
+                let depthBelow = world.posY[i] - waterQ8
+                if depthBelow < 24 * Fluid3dQ:
+                    # near the surface the cloud rolls outward (radial in XZ)
+                    if world.posX[i] >= world.impactX:
+                        fieldVx = cfg.spreadQ8
+                    else:
+                        fieldVx = 0 - cfg.spreadQ8
+                    if world.posZ[i] >= 0:
+                        fieldVz = cfg.spreadQ8 / 2
+                    else:
+                        fieldVz = 0 - cfg.spreadQ8 / 2
+                let swirlX = (fluidCurlX(world.seed, world.posX[i], world.posY[i], world.posZ[i]) * cfg.swirlAmpQ8) / 512
+                let swirlY = (fluidCurlY(world.seed, world.posX[i], world.posY[i], world.posZ[i]) * cfg.swirlAmpQ8) / 512
+                let swirlZ = (fluidCurlZ(world.seed, world.posX[i], world.posY[i], world.posZ[i]) * cfg.swirlAmpQ8) / 512
+                world.velX[i] = (world.velX[i] * 15 + (fieldVx + swirlX) * 1) / 16
+                world.velY[i] = (world.velY[i] * 15 + (fieldVy + swirlY) * 1) / 16
+                world.velZ[i] = (world.velZ[i] * 15 + (fieldVz + swirlZ) * 1) / 16
+                var px = world.posX[i] + (world.velX[i] * dtMs) / 1000
+                var py = world.posY[i] + (world.velY[i] * dtMs) / 1000
+                var pz = world.posZ[i] + (world.velZ[i] * dtMs) / 1000
+                if px < minXQ8:
+                    px = minXQ8
+                if px > maxXQ8:
+                    px = maxXQ8
+                if py < waterQ8:
+                    py = waterQ8
+                if py > maxYQ8:
+                    py = maxYQ8
+                if pz < 0 - depthQ8:
+                    pz = 0 - depthQ8
+                if pz > depthQ8:
+                    pz = depthQ8
+                world.posX[i] = px
+                world.posY[i] = py
+                world.posZ[i] = pz
+                world.radiusQ8[i] = world.radiusQ8[i] + cfg.diffuseRadiusGrowQ8
+                world.alpha[i] = (world.alpha[i] * cfg.alphaDecayNum) / cfg.alphaDecayDen
+                if world.alpha[i] > cfg.endAlpha:
+                    liveCount = liveCount + 1
+            i = i + 1
+
+        if world.phase == Fluid3dPhaseDiffuse && liveCount == 0:
+            world.phase = Fluid3dPhaseDone
+        receipt.liveCount = liveCount
+
+    receipt.tick = world.tick
+    receipt.phase = world.phase
+    receipt.worldFingerprint = fluidWorldFingerprint(world)
+    receipt.receiptFingerprint = fluidReceiptFingerprint(receipt)
+    return receipt
+
+@borrows
+fn Fluid3dReceiptValid(receipt: Fluid3dStepReceipt): bool =
+    if receipt.statusCode != Fluid3dStatusOk:
+        return false
+    if receipt.receiptFingerprint != fluidReceiptFingerprint(receipt):
+        return false
+    return true
+
+@borrows
+fn Fluid3dRequireValid(receipt: Fluid3dStepReceipt) =
+    if !Fluid3dReceiptValid(receipt):
+        panic("fluid3d: invalid step receipt")
+
+@borrows
+fn Fluid3dPhaseOf(world: Fluid3dWorld): int32 =
+    return world.phase
+
+@borrows
+fn Fluid3dDropXPx(world: Fluid3dWorld): int32 =
+    return world.dropX / Fluid3dQ
+
+@borrows
+fn Fluid3dDropYPx(world: Fluid3dWorld): int32 =
+    return world.dropY / Fluid3dQ
+
+@borrows
+fn Fluid3dRingAge(world: Fluid3dWorld): int32 =
+    return world.ringAge
+
+# Weak-perspective projection around a pivot: scale = f / (f + z).
+fn Fluid3dProjectScalePermille(zQ8: int32): int32 =
+    let zPx = zQ8 / Fluid3dQ
+    let denom = Fluid3dFocalPx + zPx
+    if denom <= 1:
+        return 1000
+    return (Fluid3dFocalPx * 1000) / denom
+
+fn Fluid3dProjectAxis(valueQ8: int32, pivotPx: int32, scalePermille: int32): int32 =
+    let valuePx = valueQ8 / Fluid3dQ
+    return pivotPx + ((valuePx - pivotPx) * scalePermille) / 1000

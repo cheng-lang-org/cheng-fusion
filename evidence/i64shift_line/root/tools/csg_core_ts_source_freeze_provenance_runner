@@ -1,0 +1,3681 @@
+#!/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I
+"""Guarded TS source -> active dist -> frozen dist provenance transaction."""
+
+from __future__ import annotations
+
+import ctypes
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import pwd
+import secrets
+import select
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+SCHEMA = "csg_core_ts_source_freeze_provenance"
+GENERATION_SCHEMA = f"{SCHEMA}.generation"
+POINTER_SCHEMA = f"{SCHEMA}.current_pointer"
+RUNNER_NAME = "csg_core_ts_source_freeze_provenance_runner"
+GATE_NAME = "csg_core_ts_source_freeze_provenance_gate.sh"
+NODE_RELATIVE_PATH = pathlib.Path(".nvm/versions/node/v24.10.0/bin/node")
+ATOMIC_PYTHON_BIN = pathlib.Path("/usr/bin/python3")
+PYTHON_BIN = pathlib.Path(
+    "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/"
+    "Python3.framework/Versions/3.9/bin/python3.9"
+)
+MANIFEST_FD_PATH = "/dev/fd/10"
+FREEZE_MANIFEST = "freeze-manifest.json"
+GENERATION_STORE = ".csg-ts-source-freeze-generations"
+GENERATION_OBJECTS = "objects"
+GENERATION_CURRENT = "current"
+GENERATION_LOCK = "writer.lock"
+GENERATION_CLI = "csg-generation-cli"
+READ_SIZE = 1024 * 1024
+
+EXPECTED_KEYS = (
+    "atomic_python_sha256",
+    "atomic_sha256",
+    "freeze_sha256",
+    "generation_cli_sha256",
+    "guard_runtime_sha256",
+    "guard_sha256",
+    "node_modules_tree_sha256",
+    "node_sha256",
+    "python_sha256",
+    "runner_sha256",
+    "tsc_sha256",
+    "typescript_tree_sha256",
+)
+
+
+class ProvenanceError(RuntimeError):
+    pass
+
+
+def fail(reason: str) -> None:
+    raise ProvenanceError(reason)
+
+
+def account_home_path() -> pathlib.Path:
+    account = pwd.getpwuid(os.geteuid())
+    home = require_canonical_absolute(pathlib.Path(account.pw_dir), "account_home")
+    info = require_real_directory(home, "account_home")
+    if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        fail("account_home_identity_invalid")
+    return home
+
+
+def node_binary_path() -> pathlib.Path:
+    return require_canonical_absolute(
+        account_home_path() / NODE_RELATIVE_PATH,
+        "node_binary",
+    )
+
+
+def require_python_runtime_context() -> None:
+    if pathlib.Path(sys.executable) != PYTHON_BIN:
+        fail("python_executable_identity_invalid")
+    if (
+        not sys.flags.isolated
+        or not sys.flags.no_user_site
+        or not sys.flags.ignore_environment
+    ):
+        fail("python_isolation_flags_missing")
+    current_directory = os.path.realpath(os.getcwd())
+    for entry in sys.path:
+        if entry in ("", ".") or os.path.realpath(entry) == current_directory:
+            fail("python_import_path_polluted")
+    sys.dont_write_bytecode = True
+    os.umask(0o077)
+
+
+def install_fail_stop_signal_handlers() -> None:
+    def handle(signum: int, _: Any) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        fail(f"signal_received:{name}")
+
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+        signal.signal(signum, handle)
+
+
+def sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def stat_identity(info: os.stat_result) -> dict[str, int]:
+    return {
+        "device": int(info.st_dev),
+        "inode": int(info.st_ino),
+        "mode": int(info.st_mode),
+        "nlink": int(info.st_nlink),
+        "uid": int(info.st_uid),
+        "gid": int(info.st_gid),
+        "size": int(info.st_size),
+        "mtime_ns": int(info.st_mtime_ns),
+        "ctime_ns": int(info.st_ctime_ns),
+    }
+
+
+def identities_equal(left: os.stat_result, right: os.stat_result) -> bool:
+    return stat_identity(left) == stat_identity(right)
+
+
+def same_object_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_gid")
+    return all(int(getattr(left, field)) == int(getattr(right, field)) for field in fields)
+
+
+def same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid")
+    return all(int(getattr(left, field)) == int(getattr(right, field)) for field in fields)
+
+
+def require_canonical_absolute(path: pathlib.Path, label: str) -> pathlib.Path:
+    if not path.is_absolute():
+        fail(f"{label}_not_absolute")
+    lexical = pathlib.Path(os.path.abspath(os.fspath(path)))
+    try:
+        resolved = pathlib.Path(os.path.realpath(os.fspath(path)))
+    except OSError as error:
+        fail(f"{label}_realpath_failed:{error.errno}")
+    if lexical != path or resolved != path:
+        fail(f"{label}_not_canonical")
+    return path
+
+
+def require_real_directory(path: pathlib.Path, label: str) -> os.stat_result:
+    require_canonical_absolute(path, label)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        fail(f"{label}_missing")
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        fail(f"{label}_not_real_directory")
+    return info
+
+
+def stable_file(path: pathlib.Path, label: str) -> dict[str, Any]:
+    require_canonical_absolute(path, label)
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail("o_nofollow_unavailable")
+    try:
+        lexical = pathlib.Path(os.path.abspath(os.fspath(path)))
+    except OSError as error:
+        fail(f"{label}_absolute_failed:{error.errno}")
+    if lexical != path:
+        fail(f"{label}_not_canonical")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"{label}_open_failed:{error.errno}")
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        named_before = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            fail(f"{label}_not_regular")
+        if before.st_nlink != 1:
+            fail(f"{label}_hardlink_rejected")
+        if not identities_equal(before, named_before):
+            fail(f"{label}_named_identity_mismatch")
+        total = 0
+        while True:
+            chunk = os.read(descriptor, READ_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+        after = os.fstat(descriptor)
+        named_after = os.stat(path, follow_symlinks=False)
+        if (
+            not identities_equal(before, after)
+            or not identities_equal(after, named_after)
+            or total != after.st_size
+        ):
+            fail(f"{label}_identity_drifted_during_read")
+        return {
+            "sha256": digest.hexdigest(),
+            "identity": stat_identity(after),
+        }
+    finally:
+        os.close(descriptor)
+
+
+def stable_file_bytes(path: pathlib.Path, label: str, maximum: int) -> tuple[bytes, dict[str, Any]]:
+    require_canonical_absolute(path, label)
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail("o_nofollow_unavailable")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"{label}_open_failed:{error.errno}")
+    try:
+        before = os.fstat(descriptor)
+        named_before = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            fail(f"{label}_identity_invalid")
+        if not identities_equal(before, named_before):
+            fail(f"{label}_named_identity_mismatch")
+        if before.st_size < 0 or before.st_size > maximum:
+            fail(f"{label}_size_invalid")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(READ_SIZE, maximum + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                fail(f"{label}_size_invalid")
+        after = os.fstat(descriptor)
+        named_after = os.stat(path, follow_symlinks=False)
+        if (
+            not identities_equal(before, after)
+            or not identities_equal(after, named_after)
+            or total != after.st_size
+        ):
+            fail(f"{label}_identity_drifted_during_read")
+        raw = b"".join(chunks)
+        return raw, {"sha256": sha256_bytes(raw), "identity": stat_identity(after)}
+    finally:
+        os.close(descriptor)
+
+
+def stable_system_executable(path: pathlib.Path, label: str) -> dict[str, Any]:
+    require_canonical_absolute(path, label)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags)
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        named_before = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_mode & 0o022
+            or not before.st_mode & 0o111
+            or not identities_equal(before, named_before)
+        ):
+            fail(f"{label}_system_authority_invalid")
+        total = 0
+        while True:
+            chunk = os.read(descriptor, READ_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+        after = os.fstat(descriptor)
+        named_after = os.stat(path, follow_symlinks=False)
+        if (
+            not identities_equal(before, after)
+            or not identities_equal(after, named_after)
+            or total != after.st_size
+        ):
+            fail(f"{label}_identity_drifted_during_read")
+        return {"sha256": digest.hexdigest(), "identity": stat_identity(after)}
+    finally:
+        os.close(descriptor)
+
+
+def relative_name(root: pathlib.Path, path: pathlib.Path) -> str:
+    try:
+        relative = path.relative_to(root).as_posix()
+    except ValueError:
+        fail("path_escape_rejected")
+    if (
+        not relative
+        or relative.startswith("../")
+        or "/../" in relative
+        or "\\" in relative
+        or any(character in relative for character in ("\x00", "\r", "\n"))
+    ):
+        fail("relative_path_not_canonical")
+    try:
+        relative.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        fail("relative_path_not_utf8")
+    return relative
+
+
+def framed_digest(domain: str, rows: list[tuple[str, bytes]]) -> str:
+    digest = hashlib.sha256()
+    domain_raw = domain.encode("utf-8")
+    digest.update(len(domain_raw).to_bytes(4, "big"))
+    digest.update(domain_raw)
+    for label, payload in rows:
+        label_raw = label.encode("utf-8")
+        digest.update(len(label_raw).to_bytes(4, "big"))
+        digest.update(label_raw)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+def guard_command_argv_digest(arguments: list[str]) -> str:
+    digest = hashlib.sha256()
+
+    def append_frame(raw: bytes) -> None:
+        digest.update(len(raw).to_bytes(4, "big"))
+        digest.update(raw)
+
+    append_frame(b"cheng.guard.command_argv")
+    digest.update(len(arguments).to_bytes(4, "big"))
+    for argument in arguments:
+        append_frame(os.fsencode(argument))
+    return digest.hexdigest()
+
+
+def expected_guarded_runner_arguments(
+    runner_path: pathlib.Path,
+    expected: dict[str, str],
+) -> list[str]:
+    arguments = [
+        os.fspath(runner_path),
+        "--run",
+        f"--source-path={runner_path}",
+        "--manifest-fd-path",
+        MANIFEST_FD_PATH,
+    ]
+    for key in EXPECTED_KEYS:
+        flag = key.replace("_", "-")
+        arguments.append(f"--expected-{flag}={expected[key]}")
+    return arguments
+
+
+def tree_snapshot(
+    root: pathlib.Path,
+    label: str,
+    *,
+    allow_internal_symlinks: bool = False,
+    exclude_names: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    require_canonical_absolute(root, label)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        root_descriptor = os.open(root, directory_flags)
+    except OSError as error:
+        fail(f"{label}_root_open_failed:{error.errno}")
+    root_named = os.stat(root, follow_symlinks=False)
+    root_held = os.fstat(root_descriptor)
+    if (
+        not stat.S_ISDIR(root_held.st_mode)
+        or stat.S_ISLNK(root_named.st_mode)
+        or not identities_equal(root_named, root_held)
+    ):
+        os.close(root_descriptor)
+        fail(f"{label}_root_identity_invalid")
+    directories: list[dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
+    links: list[dict[str, Any]] = []
+
+    def canonical_name(name: str) -> None:
+        if (
+            not name
+            or name in (".", "..")
+            or "/" in name
+            or "\\" in name
+            or any(character in name for character in ("\x00", "\r", "\n"))
+        ):
+            fail(f"{label}_entry_name_invalid")
+        try:
+            name.encode("utf-8", "strict")
+        except UnicodeEncodeError:
+            fail(f"{label}_entry_name_not_utf8")
+
+    def stable_file_at(
+        directory_descriptor: int,
+        name: str,
+        expected_info: os.stat_result,
+        relative: str,
+    ) -> dict[str, Any]:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+        except OSError as error:
+            fail(f"{label}_file_open_failed:{relative}:{error.errno}")
+        digest = hashlib.sha256()
+        try:
+            before = os.fstat(descriptor)
+            named_before = os.stat(
+                name, dir_fd=directory_descriptor, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or not identities_equal(expected_info, before)
+                or not identities_equal(before, named_before)
+            ):
+                fail(f"{label}_file_identity_invalid:{relative}")
+            total = 0
+            while True:
+                chunk = os.read(descriptor, READ_SIZE)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                total += len(chunk)
+            after = os.fstat(descriptor)
+            named_after = os.stat(
+                name, dir_fd=directory_descriptor, follow_symlinks=False
+            )
+            if (
+                not identities_equal(before, after)
+                or not identities_equal(after, named_after)
+                or total != after.st_size
+            ):
+                fail(f"{label}_file_identity_drifted:{relative}")
+            return {
+                "path": relative,
+                "size": total,
+                "sha256": digest.hexdigest(),
+                "identity": stat_identity(after),
+            }
+        finally:
+            os.close(descriptor)
+
+    def visit(directory_descriptor: int, prefix: str) -> None:
+        before = os.fstat(directory_descriptor)
+        try:
+            names = os.listdir(directory_descriptor)
+            for name in names:
+                canonical_name(name)
+            names.sort(key=lambda name: name.encode("utf-8", "strict"))
+        except (OSError, UnicodeEncodeError) as error:
+            fail(f"{label}_directory_scan_failed:{getattr(error, 'errno', 0)}")
+        for name in names:
+            relative = f"{prefix}/{name}" if prefix else name
+            if not prefix and name in exclude_names:
+                continue
+            try:
+                info = os.stat(
+                    name, dir_fd=directory_descriptor, follow_symlinks=False
+                )
+            except OSError as error:
+                fail(f"{label}_entry_stat_failed:{relative}:{error.errno}")
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                try:
+                    child_descriptor = os.open(
+                        name, directory_flags, dir_fd=directory_descriptor
+                    )
+                except OSError as error:
+                    fail(f"{label}_directory_open_failed:{relative}:{error.errno}")
+                try:
+                    held = os.fstat(child_descriptor)
+                    if not identities_equal(info, held):
+                        fail(f"{label}_directory_identity_invalid:{relative}")
+                    directories.append(
+                        {"path": relative, "identity": stat_identity(held)}
+                    )
+                    visit(child_descriptor, relative)
+                    named_after = os.stat(
+                        name, dir_fd=directory_descriptor, follow_symlinks=False
+                    )
+                    if not identities_equal(held, named_after):
+                        fail(f"{label}_directory_identity_drifted:{relative}")
+                finally:
+                    os.close(child_descriptor)
+            elif stat.S_ISREG(info.st_mode):
+                files.append(stable_file_at(directory_descriptor, name, info, relative))
+            elif stat.S_ISLNK(info.st_mode):
+                if not allow_internal_symlinks:
+                    fail(f"{label}_symlink_rejected:{relative}")
+                target = os.readlink(name, dir_fd=directory_descriptor)
+                if any(character in target for character in ("\x00", "\r", "\n")):
+                    fail(f"{label}_symlink_target_rejected:{relative}")
+                after = os.stat(
+                    name, dir_fd=directory_descriptor, follow_symlinks=False
+                )
+                if (
+                    not identities_equal(info, after)
+                    or os.readlink(name, dir_fd=directory_descriptor) != target
+                ):
+                    fail(f"{label}_symlink_identity_drifted:{relative}")
+                links.append(
+                    {
+                        "path": relative,
+                        "target": target,
+                        "identity": stat_identity(after),
+                    }
+                )
+            else:
+                fail(f"{label}_unsupported_node:{relative}")
+        after = os.fstat(directory_descriptor)
+        try:
+            names_after = os.listdir(directory_descriptor)
+            for name in names_after:
+                canonical_name(name)
+            names_after.sort(key=lambda name: name.encode("utf-8", "strict"))
+        except (OSError, UnicodeEncodeError) as error:
+            fail(f"{label}_directory_rescan_failed:{getattr(error, 'errno', 0)}")
+        if not identities_equal(before, after) or names_after != names:
+            fail(f"{label}_directory_identity_drifted:{prefix or '.'}")
+
+    try:
+        visit(root_descriptor, "")
+        root_after = os.fstat(root_descriptor)
+        root_named_after = os.stat(root, follow_symlinks=False)
+        if (
+            not identities_equal(root_held, root_after)
+            or not identities_equal(root_after, root_named_after)
+        ):
+            fail(f"{label}_root_identity_drifted")
+    finally:
+        os.close(root_descriptor)
+
+    for item in links:
+        resolved = pathlib.Path(os.path.realpath(root / item["path"]))
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            fail(f"{label}_symlink_escape_rejected:{item['path']}")
+    directories.sort(key=lambda item: item["path"].encode("utf-8"))
+    files.sort(key=lambda item: item["path"].encode("utf-8"))
+    links.sort(key=lambda item: item["path"].encode("utf-8"))
+    byte_rows: list[tuple[str, bytes]] = []
+    identity_rows: list[tuple[str, bytes]] = []
+    for item in directories:
+        byte_rows.append(("directory", item["path"].encode("utf-8")))
+        identity_rows.append(
+            (
+                "directory_identity",
+                json.dumps(item, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            )
+        )
+    for item in files:
+        byte_rows.append(
+            (
+                "file",
+                json.dumps(
+                    {key: item[key] for key in ("path", "size", "sha256")},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            )
+        )
+        identity_rows.append(
+            (
+                "file_identity",
+                json.dumps(item, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            )
+        )
+    for item in links:
+        byte_rows.append(
+            (
+                "symlink",
+                json.dumps(
+                    {key: item[key] for key in ("path", "target")},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            )
+        )
+        identity_rows.append(
+            (
+                "symlink_identity",
+                json.dumps(item, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            )
+        )
+    identity_rows.append(
+        (
+            "root_identity",
+            json.dumps(stat_identity(root_after), sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+    )
+    return {
+        "bytes_root": framed_digest(f"{SCHEMA}.tree.bytes", byte_rows),
+        "identity_root": framed_digest(f"{SCHEMA}.tree.identity", identity_rows),
+        "directories": directories,
+        "files": files,
+        "links": links,
+        "directory_count": len(directories),
+        "file_count": len(files),
+        "symlink_count": len(links),
+        "root_identity": stat_identity(root_after),
+    }
+
+
+def require_expected(actual: str, expected: str, label: str) -> None:
+    if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
+        fail(f"{label}_expected_sha256_invalid")
+    if actual != expected:
+        fail(f"{label}_sha256_mismatch:{actual}")
+
+
+def directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def open_relative_directory(
+    root_descriptor: int,
+    relative: str,
+    label: str,
+    expected: dict[str, dict[str, int]] | None = None,
+) -> int:
+    descriptor = os.dup(root_descriptor)
+    if not relative:
+        return descriptor
+    prefix: list[str] = []
+    try:
+        for segment in relative.split("/"):
+            if not segment or segment in (".", ".."):
+                fail(f"{label}_relative_directory_invalid")
+            prefix.append(segment)
+            child = os.open(
+                segment,
+                directory_open_flags(),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+            info = os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                fail(f"{label}_not_directory:{'/'.join(prefix)}")
+            if expected is not None:
+                wanted = expected.get("/".join(prefix))
+                if wanted is None or stat_identity(info) != wanted:
+                    fail(f"{label}_directory_identity_mismatch:{'/'.join(prefix)}")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def create_relative_directory(root_descriptor: int, relative: str, label: str) -> None:
+    parent_name, _, leaf = relative.rpartition("/")
+    parent_descriptor = open_relative_directory(root_descriptor, parent_name, label)
+    try:
+        os.mkdir(leaf, 0o700, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    except OSError as error:
+        fail(f"{label}_mkdir_failed:{relative}:{error.errno}")
+    finally:
+        os.close(parent_descriptor)
+
+
+def copy_regular_file_from_snapshot(
+    source_root_descriptor: int,
+    destination_root_descriptor: int,
+    item: dict[str, Any],
+    source_directories: dict[str, dict[str, int]],
+    label: str,
+) -> None:
+    relative = item["path"]
+    parent_name, _, leaf = relative.rpartition("/")
+    source_parent = open_relative_directory(
+        source_root_descriptor,
+        parent_name,
+        f"{label}_source",
+        source_directories,
+    )
+    destination_parent = open_relative_directory(
+        destination_root_descriptor, parent_name, f"{label}_destination"
+    )
+    source_descriptor = -1
+    destination_descriptor = -1
+    digest = hashlib.sha256()
+    try:
+        source_descriptor = os.open(
+            leaf,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=source_parent,
+        )
+        before = os.fstat(source_descriptor)
+        named_before = os.stat(leaf, dir_fd=source_parent, follow_symlinks=False)
+        if (
+            stat_identity(before) != item["identity"]
+            or not identities_equal(before, named_before)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+        ):
+            fail(f"{label}_source_identity_invalid:{relative}")
+        destination_descriptor = os.open(
+            leaf,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=destination_parent,
+        )
+        total = 0
+        while True:
+            chunk = os.read(source_descriptor, READ_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_descriptor, view)
+                if written <= 0:
+                    fail(f"{label}_destination_write_failed:{relative}")
+                view = view[written:]
+            total += len(chunk)
+        source_after = os.fstat(source_descriptor)
+        source_named_after = os.stat(
+            leaf, dir_fd=source_parent, follow_symlinks=False
+        )
+        if (
+            not identities_equal(before, source_after)
+            or not identities_equal(source_after, source_named_after)
+            or total != item["size"]
+            or digest.hexdigest() != item["sha256"]
+        ):
+            fail(f"{label}_source_drifted_during_copy:{relative}")
+        os.fsync(destination_descriptor)
+        destination_after = os.fstat(destination_descriptor)
+        if (
+            not stat.S_ISREG(destination_after.st_mode)
+            or destination_after.st_nlink != 1
+            or destination_after.st_size != total
+        ):
+            fail(f"{label}_destination_identity_invalid:{relative}")
+        os.fsync(destination_parent)
+    finally:
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        os.close(destination_parent)
+        os.close(source_parent)
+
+
+def copy_tree_snapshot(
+    source_root: pathlib.Path,
+    destination_root: pathlib.Path,
+    snapshot: dict[str, Any],
+    label: str,
+    *,
+    allow_internal_symlinks: bool = False,
+) -> dict[str, Any]:
+    require_canonical_absolute(source_root, f"{label}_source_root")
+    require_canonical_absolute(destination_root, f"{label}_destination_root")
+    os.mkdir(destination_root, 0o700)
+    source_descriptor = os.open(source_root, directory_open_flags())
+    destination_descriptor = os.open(destination_root, directory_open_flags())
+    try:
+        if stat_identity(os.fstat(source_descriptor)) != snapshot["root_identity"]:
+            fail(f"{label}_source_root_identity_mismatch")
+        source_directories = {
+            item["path"]: item["identity"] for item in snapshot["directories"]
+        }
+        for item in snapshot["directories"]:
+            create_relative_directory(
+                destination_descriptor, item["path"], f"{label}_destination"
+            )
+        for item in snapshot["files"]:
+            copy_regular_file_from_snapshot(
+                source_descriptor,
+                destination_descriptor,
+                item,
+                source_directories,
+                label,
+            )
+        for item in snapshot["links"]:
+            if not allow_internal_symlinks:
+                fail(f"{label}_unexpected_symlink:{item['path']}")
+            relative = item["path"]
+            parent_name, _, leaf = relative.rpartition("/")
+            source_parent = open_relative_directory(
+                source_descriptor,
+                parent_name,
+                f"{label}_source",
+                source_directories,
+            )
+            destination_parent = open_relative_directory(
+                destination_descriptor,
+                parent_name,
+                f"{label}_destination",
+            )
+            try:
+                source_info = os.stat(
+                    leaf, dir_fd=source_parent, follow_symlinks=False
+                )
+                source_target = os.readlink(leaf, dir_fd=source_parent)
+                if (
+                    stat_identity(source_info) != item["identity"]
+                    or source_target != item["target"]
+                ):
+                    fail(f"{label}_source_symlink_drifted:{relative}")
+                os.symlink(source_target, leaf, dir_fd=destination_parent)
+                os.fsync(destination_parent)
+            finally:
+                os.close(destination_parent)
+                os.close(source_parent)
+        os.fsync(destination_descriptor)
+    finally:
+        os.close(destination_descriptor)
+        os.close(source_descriptor)
+    source_after = tree_snapshot(
+        source_root, f"{label}_source_after", allow_internal_symlinks=allow_internal_symlinks
+    )
+    if source_after != snapshot:
+        fail(f"{label}_source_changed_during_snapshot_copy")
+    destination_snapshot = tree_snapshot(
+        destination_root,
+        f"{label}_destination_after",
+        allow_internal_symlinks=allow_internal_symlinks,
+    )
+    if (
+        destination_snapshot["bytes_root"] != snapshot["bytes_root"]
+        or destination_snapshot["directory_count"] != snapshot["directory_count"]
+        or destination_snapshot["file_count"] != snapshot["file_count"]
+        or destination_snapshot["symlink_count"] != snapshot["symlink_count"]
+    ):
+        fail(f"{label}_destination_bytes_mismatch")
+    return destination_snapshot
+
+
+def copy_bound_file(
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    expected: dict[str, Any],
+    label: str,
+    mode: int,
+) -> dict[str, Any]:
+    require_canonical_absolute(source, f"{label}_source")
+    require_canonical_absolute(destination, f"{label}_destination")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    source_descriptor = os.open(source, flags)
+    destination_descriptor = -1
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(source_descriptor)
+        named_before = os.stat(source, follow_symlinks=False)
+        if (
+            stat_identity(before) != expected["identity"]
+            or not identities_equal(before, named_before)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+        ):
+            fail(f"{label}_source_identity_invalid")
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        total = 0
+        while True:
+            chunk = os.read(source_descriptor, READ_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_descriptor, view)
+                if written <= 0:
+                    fail(f"{label}_destination_write_failed")
+                view = view[written:]
+            total += len(chunk)
+        after = os.fstat(source_descriptor)
+        named_after = os.stat(source, follow_symlinks=False)
+        if (
+            not identities_equal(before, after)
+            or not identities_equal(after, named_after)
+            or total != expected["identity"]["size"]
+            or digest.hexdigest() != expected["sha256"]
+        ):
+            fail(f"{label}_source_drifted_during_copy")
+        os.fchmod(destination_descriptor, mode)
+        os.fsync(destination_descriptor)
+    finally:
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+        os.close(source_descriptor)
+    copied = stable_file(destination, f"{label}_destination")
+    if copied["sha256"] != expected["sha256"]:
+        fail(f"{label}_destination_sha256_mismatch")
+    return copied
+
+
+def seal_tree(path: pathlib.Path, label: str) -> None:
+    require_canonical_absolute(path, label)
+    root_descriptor = os.open(path, directory_open_flags())
+
+    def seal_directory(descriptor: int, relative: str) -> None:
+        names = os.listdir(descriptor)
+        names.sort(key=lambda name: name.encode("utf-8", "strict"))
+        for name in names:
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            child_relative = f"{relative}/{name}" if relative else name
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                child = os.open(name, directory_open_flags(), dir_fd=descriptor)
+                try:
+                    if not identities_equal(info, os.fstat(child)):
+                        fail(f"{label}_directory_identity_drifted:{child_relative}")
+                    seal_directory(child, child_relative)
+                    os.fchmod(child, 0o500)
+                    os.fsync(child)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(info.st_mode):
+                child = os.open(
+                    name,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=descriptor,
+                )
+                try:
+                    if not identities_equal(info, os.fstat(child)):
+                        fail(f"{label}_file_identity_drifted:{child_relative}")
+                    os.fchmod(child, 0o400)
+                    os.fsync(child)
+                finally:
+                    os.close(child)
+            elif not stat.S_ISLNK(info.st_mode):
+                fail(f"{label}_unsupported_node:{child_relative}")
+        os.fsync(descriptor)
+
+    try:
+        seal_directory(root_descriptor, "")
+        os.fchmod(root_descriptor, 0o500)
+        os.fsync(root_descriptor)
+    finally:
+        os.close(root_descriptor)
+
+
+def safe_remove_tree(path: pathlib.Path, expected_root: dict[str, int], label: str) -> None:
+    require_canonical_absolute(path, label)
+    parent = path.parent
+    parent_descriptor = os.open(parent, directory_open_flags())
+    root_descriptor = -1
+
+    def remove_contents(descriptor: int, relative: str) -> None:
+        names = os.listdir(descriptor)
+        names.sort(key=lambda name: name.encode("utf-8", "strict"))
+        for name in names:
+            child_relative = f"{relative}/{name}" if relative else name
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                child = os.open(name, directory_open_flags(), dir_fd=descriptor)
+                try:
+                    if not identities_equal(info, os.fstat(child)):
+                        fail(f"{label}_directory_identity_drifted:{child_relative}")
+                    os.fchmod(child, 0o700)
+                    remove_contents(child, child_relative)
+                    named_after = os.stat(
+                        name, dir_fd=descriptor, follow_symlinks=False
+                    )
+                    if not identities_equal(os.fstat(child), named_after):
+                        fail(f"{label}_directory_renamed:{child_relative}")
+                finally:
+                    os.close(child)
+                os.rmdir(name, dir_fd=descriptor)
+            else:
+                os.unlink(name, dir_fd=descriptor)
+            os.fsync(descriptor)
+
+    try:
+        named = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if stat_identity(named) != expected_root:
+            fail(f"{label}_root_identity_mismatch")
+        root_descriptor = os.open(
+            path.name, directory_open_flags(), dir_fd=parent_descriptor
+        )
+        if not identities_equal(named, os.fstat(root_descriptor)):
+            fail(f"{label}_root_open_identity_mismatch")
+        os.fchmod(root_descriptor, 0o700)
+        remove_contents(root_descriptor, "")
+        named_after = os.stat(
+            path.name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+        if not identities_equal(os.fstat(root_descriptor), named_after):
+            fail(f"{label}_root_renamed")
+        os.close(root_descriptor)
+        root_descriptor = -1
+        os.rmdir(path.name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+        os.close(parent_descriptor)
+
+
+def ensure_private_directory(path: pathlib.Path, label: str) -> os.stat_result:
+    require_canonical_absolute(path, label)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    info = require_real_directory(path, label)
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        fail(f"{label}_ownership_or_mode_invalid")
+    return info
+
+
+def acquire_generation_store(
+    package_root: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path, int, int, int]:
+    store = package_root / GENERATION_STORE
+    objects = store / GENERATION_OBJECTS
+    ensure_private_directory(store, "generation_store")
+    ensure_private_directory(objects, "generation_objects")
+    fsync_directory(store)
+    fsync_directory(package_root)
+    store_descriptor = os.open(store, directory_open_flags())
+    objects_descriptor = os.open(
+        GENERATION_OBJECTS, directory_open_flags(), dir_fd=store_descriptor
+    )
+    if (
+        not identities_equal(
+            os.fstat(store_descriptor), os.stat(store, follow_symlinks=False)
+        )
+        or not identities_equal(
+            os.fstat(objects_descriptor), os.stat(objects, follow_symlinks=False)
+        )
+    ):
+        os.close(objects_descriptor)
+        os.close(store_descriptor)
+        fail("generation_store_named_identity_invalid")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    lock_descriptor = os.open(
+        GENERATION_LOCK, flags, 0o600, dir_fd=store_descriptor
+    )
+    lock_info = os.fstat(lock_descriptor)
+    named_lock = os.stat(
+        GENERATION_LOCK, dir_fd=store_descriptor, follow_symlinks=False
+    )
+    if (
+        not stat.S_ISREG(lock_info.st_mode)
+        or lock_info.st_nlink != 1
+        or lock_info.st_uid != os.geteuid()
+        or lock_info.st_mode & 0o077
+        or not identities_equal(lock_info, named_lock)
+    ):
+        os.close(lock_descriptor)
+        os.close(objects_descriptor)
+        os.close(store_descriptor)
+        fail("generation_lock_identity_invalid")
+    os.fsync(lock_descriptor)
+    os.fsync(store_descriptor)
+    try:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_descriptor)
+        os.close(objects_descriptor)
+        os.close(store_descriptor)
+        fail("generation_writer_active")
+    return store, objects, store_descriptor, objects_descriptor, lock_descriptor
+
+
+def canonical_pointer_bytes(generation_cid: str) -> bytes:
+    return canonical_manifest_bytes(
+        {
+            "generation_cid": generation_cid,
+            "schema": POINTER_SCHEMA,
+        }
+    )
+
+
+def create_pending_directory(
+    parent: pathlib.Path,
+    parent_descriptor: int,
+    prefix: str,
+    label: str,
+) -> pathlib.Path:
+    for _ in range(128):
+        name = prefix + secrets.token_hex(16)
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+        except FileExistsError:
+            continue
+        os.fsync(parent_descriptor)
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        path = require_canonical_absolute(parent / name, label)
+        if not identities_equal(named, os.stat(path, follow_symlinks=False)):
+            fail(f"{label}_named_identity_invalid")
+        return path
+    fail(f"{label}_name_exhausted")
+
+
+def publish_current_pointer(store_descriptor: int, generation_cid: str) -> str:
+    raw = canonical_pointer_bytes(generation_cid)
+    pending_name = f".current.pending.{os.getpid()}.{secrets.token_hex(16)}"
+    pending_descriptor = -1
+    try:
+        pending_descriptor = os.open(
+            pending_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=store_descriptor,
+        )
+        offset = 0
+        while offset < len(raw):
+            written = os.write(pending_descriptor, raw[offset:])
+            if written <= 0:
+                fail("current_pointer_write_failed")
+            offset += written
+        os.fchmod(pending_descriptor, 0o400)
+        os.fsync(pending_descriptor)
+        pending_info = os.fstat(pending_descriptor)
+        if pending_info.st_size != len(raw) or pending_info.st_nlink != 1:
+            fail("current_pointer_pending_identity_invalid")
+        os.replace(
+            pending_name,
+            GENERATION_CURRENT,
+            src_dir_fd=store_descriptor,
+            dst_dir_fd=store_descriptor,
+        )
+        os.fsync(store_descriptor)
+        current_info = os.stat(
+            GENERATION_CURRENT,
+            dir_fd=store_descriptor,
+            follow_symlinks=False,
+        )
+        committed_info = os.fstat(pending_descriptor)
+        if (
+            not same_object_identity(pending_info, committed_info)
+            or pending_info.st_size != committed_info.st_size
+            or not identities_equal(committed_info, current_info)
+        ):
+            fail("current_pointer_commit_identity_invalid")
+    finally:
+        if pending_descriptor >= 0:
+            os.close(pending_descriptor)
+        try:
+            os.unlink(pending_name, dir_fd=store_descriptor)
+        except FileNotFoundError:
+            pass
+        else:
+            os.fsync(store_descriptor)
+    return sha256_bytes(raw)
+
+
+def publish_generation_object(
+    objects_descriptor: int,
+    staging_name: str,
+    generation_cid: str,
+) -> None:
+    require_generation_cid(generation_cid, "generation_publish_cid")
+    require_generation_staging_name(staging_name, "generation_publish_staging_name")
+    source_descriptor = os.open(
+        staging_name,
+        directory_open_flags(),
+        dir_fd=objects_descriptor,
+    )
+    try:
+        source_before = os.fstat(source_descriptor)
+        source_named_before = os.stat(
+            staging_name,
+            dir_fd=objects_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(source_before.st_mode)
+            or source_before.st_mode & 0o222
+            or not identities_equal(source_before, source_named_before)
+        ):
+            fail("generation_publish_source_identity_invalid")
+        try:
+            os.stat(
+                generation_cid,
+                dir_fd=objects_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            fail("generation_publish_destination_exists")
+        if sys.platform == "darwin":
+            libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+            operation = getattr(libc, "renameatx_np", None)
+            flag = 0x00000004
+        elif sys.platform.startswith("linux"):
+            libc = ctypes.CDLL(None, use_errno=True)
+            operation = getattr(libc, "renameat2", None)
+            flag = 0x00000001
+        else:
+            fail("generation_publish_platform_unsupported")
+        if operation is None:
+            fail("generation_publish_atomic_rename_unavailable")
+        operation.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        operation.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = operation(
+            objects_descriptor,
+            os.fsencode(staging_name),
+            objects_descriptor,
+            os.fsencode(generation_cid),
+            flag,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+                fail("generation_publish_destination_raced")
+            if error_number == errno.EXDEV:
+                fail("generation_publish_cross_device_rejected")
+            fail(f"generation_publish_atomic_rename_failed:{error_number}")
+        os.fsync(objects_descriptor)
+        destination = os.stat(
+            generation_cid,
+            dir_fd=objects_descriptor,
+            follow_symlinks=False,
+        )
+        source_after = os.fstat(source_descriptor)
+        if (
+            not same_directory_identity(source_before, source_after)
+            or not identities_equal(source_after, destination)
+        ):
+            fail("generation_publish_commit_identity_invalid")
+        try:
+            os.stat(
+                staging_name,
+                dir_fd=objects_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            fail("generation_publish_staging_name_survived")
+    finally:
+        os.close(source_descriptor)
+
+
+def parse_expected(arguments: list[str]) -> tuple[dict[str, str], list[str]]:
+    expected: dict[str, str] = {}
+    expected_order: list[str] = []
+    expected_positions: list[int] = []
+    remainder: list[str] = []
+    for position, argument in enumerate(arguments):
+        if argument.startswith("--expected-") and "=" in argument:
+            raw_key, value = argument[11:].split("=", 1)
+            key = raw_key.replace("-", "_")
+            if key in expected:
+                fail(f"duplicate_expected_identity:{key}")
+            expected[key] = value
+            expected_order.append(key)
+            expected_positions.append(position)
+        else:
+            remainder.append(argument)
+    if tuple(expected_order) != EXPECTED_KEYS:
+        fail("expected_identity_set_invalid")
+    expected_start = len(arguments) - len(EXPECTED_KEYS)
+    if expected_positions != list(range(expected_start, len(arguments))):
+        fail("expected_identity_suffix_invalid")
+    return expected, remainder
+
+
+def source_binding(source_path_raw: str) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    source_path = require_canonical_absolute(pathlib.Path(source_path_raw), "runner_source")
+    if source_path.name != RUNNER_NAME or source_path.parent.name != "tools":
+        fail("runner_source_location_invalid")
+    source = stable_file(source_path, "runner_source")
+    executing_path = pathlib.Path(os.path.abspath(__file__))
+    executing = stable_file(executing_path, "runner_execution_image")
+    if source["sha256"] != executing["sha256"]:
+        fail("runner_execution_image_mismatch")
+    repo_root = require_canonical_absolute(source_path.parent.parent, "repo_root")
+    package_root = require_canonical_absolute(repo_root / "ts-csg", "package_root")
+    require_real_directory(repo_root, "repo_root")
+    require_real_directory(package_root, "package_root")
+    return source_path, repo_root, package_root
+
+
+def validate_package_lock(package_root: pathlib.Path) -> None:
+    try:
+        lock_raw, _ = stable_file_bytes(
+            package_root / "package-lock.json", "package_lock_json", 16 * 1024 * 1024
+        )
+        installed_raw, _ = stable_file_bytes(
+            package_root / "node_modules/typescript/package.json",
+            "typescript_package_json",
+            1024 * 1024,
+        )
+        lock = json.loads(lock_raw.decode("utf-8"))
+        installed = json.loads(installed_raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        fail(f"package_metadata_invalid:{type(error).__name__}")
+    packages = lock.get("packages")
+    lock_typescript = packages.get("node_modules/typescript") if isinstance(packages, dict) else None
+    if not isinstance(lock_typescript, dict):
+        fail("package_lock_typescript_missing")
+    if lock_typescript.get("version") != installed.get("version"):
+        fail("installed_typescript_version_mismatch")
+    integrity = lock_typescript.get("integrity")
+    if not isinstance(integrity, str) or not integrity.startswith("sha512-"):
+        fail("package_lock_typescript_integrity_missing")
+
+
+def validate_tsconfig_contract(package_root: pathlib.Path) -> None:
+    raw, _ = stable_file_bytes(
+        package_root / "tsconfig.json", "tsconfig_contract", 1024 * 1024
+    )
+    try:
+        config = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        fail(f"tsconfig_contract_invalid:{type(error).__name__}")
+    expected = {
+        "compilerOptions": {
+            "declaration": True,
+            "esModuleInterop": True,
+            "exactOptionalPropertyTypes": True,
+            "forceConsistentCasingInFileNames": True,
+            "module": "NodeNext",
+            "moduleResolution": "NodeNext",
+            "noUncheckedIndexedAccess": True,
+            "outDir": "dist",
+            "rootDir": "src",
+            "skipLibCheck": True,
+            "strict": True,
+            "target": "ES2022",
+        },
+        "include": ["src/**/*.ts"],
+    }
+    if config != expected:
+        fail("tsconfig_contract_not_closed")
+
+
+def input_snapshot(
+    source_path: pathlib.Path,
+    repo_root: pathlib.Path,
+    package_root: pathlib.Path,
+    expected: dict[str, str],
+) -> dict[str, Any]:
+    tsc_path = package_root / "node_modules/typescript/bin/tsc"
+    fixed_paths = {
+        "atomic": package_root / "scripts/atomic-publish-directory",
+        "freeze": package_root / "scripts/freeze-dist.mjs",
+        "generation_cli": package_root / "scripts" / GENERATION_CLI,
+        "gate": repo_root / "tools" / GATE_NAME,
+        "guard": repo_root / "tools/beat_c_process_group_guard.sh",
+        "guard_runtime": repo_root / "tools/beat_c_process_group_guard_runtime.py",
+        "node": node_binary_path(),
+        "package_json": package_root / "package.json",
+        "package_lock": package_root / "package-lock.json",
+        "runner": source_path,
+        "tsc": tsc_path,
+        "tsconfig": package_root / "tsconfig.json",
+    }
+    files = {label: stable_file(path, label) for label, path in fixed_paths.items()}
+    files["atomic_python"] = stable_system_executable(
+        ATOMIC_PYTHON_BIN, "atomic_python"
+    )
+    files["python"] = stable_system_executable(PYTHON_BIN, "python")
+    require_expected(
+        files["atomic_python"]["sha256"],
+        expected["atomic_python_sha256"],
+        "atomic_python",
+    )
+    require_expected(files["atomic"]["sha256"], expected["atomic_sha256"], "atomic")
+    require_expected(files["freeze"]["sha256"], expected["freeze_sha256"], "freeze")
+    require_expected(
+        files["generation_cli"]["sha256"],
+        expected["generation_cli_sha256"],
+        "generation_cli",
+    )
+    require_expected(
+        files["guard_runtime"]["sha256"],
+        expected["guard_runtime_sha256"],
+        "guard_runtime",
+    )
+    require_expected(files["guard"]["sha256"], expected["guard_sha256"], "guard")
+    require_expected(files["node"]["sha256"], expected["node_sha256"], "node")
+    require_expected(files["python"]["sha256"], expected["python_sha256"], "python")
+    require_expected(files["runner"]["sha256"], expected["runner_sha256"], "runner")
+    require_expected(files["tsc"]["sha256"], expected["tsc_sha256"], "tsc")
+
+    sources = tree_snapshot(package_root / "src", "typescript_sources")
+    node_modules = tree_snapshot(
+        package_root / "node_modules",
+        "node_modules",
+        allow_internal_symlinks=True,
+    )
+    typescript = tree_snapshot(
+        package_root / "node_modules/typescript", "typescript_toolchain"
+    )
+    require_expected(
+        node_modules["bytes_root"],
+        expected["node_modules_tree_sha256"],
+        "node_modules_tree",
+    )
+    require_expected(
+        typescript["bytes_root"],
+        expected["typescript_tree_sha256"],
+        "typescript_tree",
+    )
+    validate_package_lock(package_root)
+    validate_tsconfig_contract(package_root)
+
+    byte_rows: list[tuple[str, bytes]] = []
+    identity_rows: list[tuple[str, bytes]] = []
+    for label in sorted(files):
+        byte_rows.append((label, files[label]["sha256"].encode("ascii")))
+        identity_rows.append(
+            (
+                label,
+                json.dumps(files[label], sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            )
+        )
+    for label, tree in (
+        ("node_modules", node_modules),
+        ("typescript_sources", sources),
+        ("typescript_toolchain", typescript),
+    ):
+        byte_rows.append((label, tree["bytes_root"].encode("ascii")))
+        identity_rows.append((label, tree["identity_root"].encode("ascii")))
+    return {
+        "bytes_root": framed_digest(f"{SCHEMA}.inputs.bytes", byte_rows),
+        "identity_root": framed_digest(f"{SCHEMA}.inputs.identity", identity_rows),
+        "source_file_count": sources["file_count"],
+        "node_modules_file_count": node_modules["file_count"],
+        "toolchain": {
+            "node_sha256": files["node"]["sha256"],
+            "python_sha256": files["python"]["sha256"],
+            "tsc_sha256": files["tsc"]["sha256"],
+            "typescript_tree_sha256": typescript["bytes_root"],
+            "node_modules_tree_sha256": node_modules["bytes_root"],
+            "freeze_sha256": files["freeze"]["sha256"],
+            "generation_cli_sha256": files["generation_cli"]["sha256"],
+            "gate_sha256": files["gate"]["sha256"],
+            "atomic_sha256": files["atomic"]["sha256"],
+            "guard_sha256": files["guard"]["sha256"],
+            "guard_runtime_sha256": files["guard_runtime"]["sha256"],
+            "runner_sha256": files["runner"]["sha256"],
+        },
+        "_material": {
+            "files": files,
+            "node_modules": node_modules,
+            "sources": sources,
+            "typescript": typescript,
+        },
+    }
+
+
+def assert_input_snapshot_equal(before: dict[str, Any], after: dict[str, Any]) -> None:
+    if before != after:
+        fail("build_inputs_changed_before_completion")
+
+
+def public_input_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in snapshot.items() if key != "_material"}
+
+
+def manifest_tree_rows(snapshot: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]]]:
+    directories = [item["path"] for item in snapshot["directories"]]
+    files = [
+        {key: item[key] for key in ("path", "size", "sha256")}
+        for item in snapshot["files"]
+    ]
+    return directories, files
+
+
+def validate_freeze_manifest(
+    path: pathlib.Path, active: dict[str, Any]
+) -> str:
+    raw, raw_entry = stable_file_bytes(path, "freeze_manifest", 64 * 1024 * 1024)
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        fail(f"freeze_manifest_invalid:{type(error).__name__}")
+    if list(manifest) != [
+        "schema",
+        "source_root",
+        "target_root",
+        "directories",
+        "file_count",
+        "files",
+    ]:
+        fail("freeze_manifest_fields_invalid")
+    directories, files = manifest_tree_rows(active)
+    if (
+        manifest["schema"] != "ts_csg_dist_freeze"
+        or manifest["source_root"] != "dist"
+        or manifest["target_root"] != "dist-frozen"
+        or manifest["directories"] != directories
+        or manifest["file_count"] != len(files)
+        or manifest["files"] != files
+    ):
+        fail("freeze_manifest_bytes_binding_invalid")
+    if not raw.endswith(b"\n"):
+        fail("freeze_manifest_final_lf_missing")
+    return raw_entry["sha256"]
+
+
+def require_snapshot_sealed(snapshot: dict[str, Any], label: str) -> None:
+    for item in snapshot["directories"]:
+        if item["identity"]["mode"] & 0o222:
+            fail(f"{label}_directory_writable:{item['path']}")
+    for item in snapshot["files"]:
+        if item["identity"]["mode"] & 0o222:
+            fail(f"{label}_file_writable:{item['path']}")
+    if snapshot["root_identity"]["mode"] & 0o222:
+        fail(f"{label}_root_writable")
+
+
+def verify_output_pair(
+    output_root: pathlib.Path,
+    label: str,
+    *,
+    require_sealed: bool = False,
+) -> dict[str, Any]:
+    active_root = require_canonical_absolute(output_root / "dist", f"{label}_active")
+    frozen_root = require_canonical_absolute(
+        output_root / "dist-frozen", f"{label}_frozen"
+    )
+    active_info = require_real_directory(active_root, f"{label}_active")
+    frozen_info = require_real_directory(frozen_root, f"{label}_frozen")
+    if active_info.st_dev == frozen_info.st_dev and active_info.st_ino == frozen_info.st_ino:
+        fail("active_frozen_root_identity_shared")
+    active = tree_snapshot(active_root, f"{label}_active")
+    frozen = tree_snapshot(
+        frozen_root,
+        f"{label}_frozen",
+        exclude_names=frozenset({FREEZE_MANIFEST}),
+    )
+    if require_sealed:
+        require_snapshot_sealed(active, f"{label}_active")
+        require_snapshot_sealed(frozen, f"{label}_frozen")
+    active_dirs, active_files = manifest_tree_rows(active)
+    frozen_dirs, frozen_files = manifest_tree_rows(frozen)
+    if active_dirs != frozen_dirs or active_files != frozen_files:
+        fail("active_frozen_bytes_mismatch")
+    active_identity = {
+        item["path"]: (item["identity"]["device"], item["identity"]["inode"])
+        for item in active["files"]
+    }
+    for item in frozen["files"]:
+        identity = (item["identity"]["device"], item["identity"]["inode"])
+        if active_identity.get(item["path"]) == identity:
+            fail(f"active_frozen_file_identity_shared:{item['path']}")
+    freeze_manifest_sha256 = validate_freeze_manifest(
+        frozen_root / FREEZE_MANIFEST, active
+    )
+    if require_sealed:
+        freeze_manifest_entry = stable_file(
+            frozen_root / FREEZE_MANIFEST, f"{label}_freeze_manifest_sealed"
+        )
+        if freeze_manifest_entry["identity"]["mode"] & 0o222:
+            fail(f"{label}_freeze_manifest_writable")
+    return {
+        "active_bytes_root": active["bytes_root"],
+        "active_identity_root": active["identity_root"],
+        "frozen_bytes_root": frozen["bytes_root"],
+        "frozen_identity_root": frozen["identity_root"],
+        "file_count": active["file_count"],
+        "freeze_manifest_sha256": freeze_manifest_sha256,
+    }
+
+
+def exact_child_environment(package_root: pathlib.Path) -> dict[str, str]:
+    account = pwd.getpwuid(os.geteuid())
+    home = pathlib.Path(account.pw_dir)
+    require_canonical_absolute(home, "account_home")
+    require_real_directory(home, "account_home")
+    return {
+        "HOME": os.fspath(home),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "NO_COLOR": "1",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONHASHSEED": "0",
+        "SOURCE_DATE_EPOCH": "0",
+        "TZ": "UTC",
+    }
+
+
+def consume_darwin_injected_environment() -> None:
+    key = "__CF_USER_TEXT_ENCODING"
+    value = os.environ.get(key)
+    if sys.platform == "darwin":
+        parts = value.split(":") if value is not None else []
+        expected_uid = f"0x{os.geteuid():X}"
+        if (
+            len(parts) != 3
+            or parts[0] != expected_uid
+            or any(
+                len(part) <= 2
+                or not part.startswith("0x")
+                or any(character not in "0123456789ABCDEF" for character in part[2:])
+                for part in parts
+            )
+        ):
+            fail("darwin_injected_environment_invalid")
+    elif value is not None:
+        fail("foreign_injected_environment_present")
+    if value is not None:
+        del os.environ[key]
+    if key in os.environ:
+        fail("injected_environment_not_consumed")
+
+
+def require_guard_context() -> dict[str, Any]:
+    consume_darwin_injected_environment()
+    expected_environment = {
+        "HOME": pwd.getpwuid(os.geteuid()).pw_dir,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONHASHSEED": "0",
+        "TZ": "UTC",
+    }
+    for key, value in expected_environment.items():
+        if os.environ.get(key) != value:
+            fail(f"guard_environment_invalid:{key}")
+    guard_keys = {
+        "BEAT_C_GUARD_PARENT_CAPABILITY",
+        "BEAT_C_GUARD_PARENT_LIMIT_BYTES",
+        "BEAT_C_GUARD_PARENT_MONITOR_PID",
+        "BEAT_C_GUARD_PARENT_PROOF_FD",
+    }
+    allowed = set(expected_environment) | guard_keys
+    unexpected = sorted(set(os.environ) - allowed)
+    if unexpected:
+        fail(f"guard_environment_polluted:{unexpected[0]}")
+    capability = os.environ.get("BEAT_C_GUARD_PARENT_CAPABILITY", "")
+    if len(capability) != 64 or any(
+        character not in "0123456789abcdef" for character in capability
+    ):
+        fail("guard_parent_capability_invalid")
+    if os.environ.get("BEAT_C_GUARD_PARENT_LIMIT_BYTES") != "1073741824":
+        fail("guard_parent_limit_invalid")
+    monitor_pid = os.environ.get("BEAT_C_GUARD_PARENT_MONITOR_PID", "")
+    if not monitor_pid.isdigit() or int(monitor_pid) <= 1:
+        fail("guard_parent_monitor_invalid")
+    if os.environ.get("BEAT_C_GUARD_PARENT_PROOF_FD") != "3":
+        fail("guard_parent_proof_fd_invalid")
+    try:
+        proof_info = os.fstat(3)
+    except OSError as error:
+        fail(f"guard_parent_proof_unavailable:{error.errno}")
+    if not stat.S_ISSOCK(proof_info.st_mode):
+        fail("guard_parent_proof_not_socket")
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    get_socket_option = libc.getsockopt
+    get_socket_option.argtypes = (
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    )
+    get_socket_option.restype = ctypes.c_int
+
+    def peer_pid() -> int:
+        peer = ctypes.c_int(0)
+        length = ctypes.c_uint32(ctypes.sizeof(peer))
+        ctypes.set_errno(0)
+        if get_socket_option(
+            3, 0, 0x002, ctypes.byref(peer), ctypes.byref(length)
+        ) != 0:
+            fail(f"guard_parent_peer_query_failed:{ctypes.get_errno()}")
+        if length.value != ctypes.sizeof(peer) or peer.value <= 1:
+            fail("guard_parent_peer_invalid")
+        return int(peer.value)
+
+    peer_before = peer_pid()
+    duplicate = socket.socket(fileno=os.dup(3))
+    deadline = time.monotonic() + 5.0
+    frame = b""
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("guard_parent_proof_timeout")
+            readable, _, _ = select.select([duplicate], [], [], remaining)
+            if not readable:
+                fail("guard_parent_proof_timeout")
+            frame = duplicate.recv(4101, socket.MSG_PEEK)
+            if not frame:
+                fail("guard_parent_proof_closed")
+            if len(frame) < 4:
+                continue
+            size = struct.unpack(">I", frame[:4])[0]
+            if size <= 0 or size > 4096:
+                fail("guard_parent_proof_size_invalid")
+            expected_size = 4 + size
+            if len(frame) < expected_size:
+                continue
+            if len(frame) != expected_size:
+                fail("guard_parent_proof_extra_bytes")
+            chunks: list[bytes] = []
+            consumed = 0
+            while consumed < expected_size:
+                chunk = duplicate.recv(expected_size - consumed)
+                if not chunk:
+                    fail("guard_parent_proof_truncated")
+                chunks.append(chunk)
+                consumed += len(chunk)
+            frame = b"".join(chunks)
+            break
+    finally:
+        duplicate.close()
+    proof_after = os.fstat(3)
+    peer_after = peer_pid()
+    if (
+        not same_object_identity(proof_info, proof_after)
+        or peer_before != peer_after
+        or peer_after != int(monitor_pid)
+    ):
+        fail("guard_parent_proof_physical_identity_invalid")
+    raw = frame[4:]
+    try:
+        text = raw.decode("utf-8", "strict")
+        record = json.loads(text)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        fail(f"guard_parent_proof_json_invalid:{type(error).__name__}")
+    keys = [
+        "schema",
+        "capability",
+        "monitorPid",
+        "monitorStartTvsec",
+        "monitorStartTvusec",
+        "limitBytes",
+        "rootPid",
+        "rootStartTvsec",
+        "rootStartTvusec",
+        "rootPpid",
+        "rootSid",
+        "rootPgid",
+    ]
+    if (
+        not isinstance(record, dict)
+        or list(record) != keys
+        or not text.endswith("\n")
+        or "\r" in text
+        or json.dumps(record, separators=(",", ":")) + "\n" != text
+    ):
+        fail("guard_parent_proof_not_canonical")
+    if (
+        record["schema"] != "cheng.guard.parent_proof"
+        or record["capability"] != capability
+        or record["monitorPid"] != int(monitor_pid)
+        or record["limitBytes"] != 1073741824
+        or record["rootPid"] != os.getpid()
+        or record["rootPpid"] != os.getppid()
+        or record["rootPpid"] != int(monitor_pid)
+        or record["rootSid"] != os.getsid(0)
+        or record["rootPgid"] != os.getpgid(0)
+    ):
+        fail("guard_parent_proof_binding_invalid")
+    for key in keys[2:]:
+        if type(record[key]) is not int or record[key] <= 0:
+            fail(f"guard_parent_proof_numeric_field_invalid:{key}")
+    return {
+        "limit_bytes": record["limitBytes"],
+        "monitor_pid": record["monitorPid"],
+        "monitor_start_tvsec": record["monitorStartTvsec"],
+        "monitor_start_tvusec": record["monitorStartTvusec"],
+        "proof_record_sha256": sha256_bytes(raw),
+        "root_pgid": record["rootPgid"],
+        "root_pid": record["rootPid"],
+        "root_ppid": record["rootPpid"],
+        "root_sid": record["rootSid"],
+        "root_start_tvsec": record["rootStartTvsec"],
+        "root_start_tvusec": record["rootStartTvusec"],
+    }
+
+
+def run_visible(
+    label: str,
+    arguments: list[str],
+    cwd: pathlib.Path,
+    environment: dict[str, str],
+    events: list[dict[str, Any]],
+    *,
+    bound_paths: dict[str, pathlib.Path],
+    bound_system_paths: dict[str, pathlib.Path] | None = None,
+    bound_trees: dict[str, tuple[pathlib.Path, bool]] | None = None,
+    capture_stdout_maximum: int = 0,
+    cwd_mutation_expected: bool = False,
+    system_executable: bool = False,
+) -> bytes:
+    if not arguments or pathlib.Path(arguments[0]) != pathlib.Path(arguments[0]).absolute():
+        fail(f"{label}_executable_not_absolute")
+    if any("\x00" in argument or "\n" in argument or "\r" in argument for argument in arguments):
+        fail(f"{label}_argument_not_canonical")
+    executable_path = pathlib.Path(arguments[0])
+    executable_before = (
+        stable_system_executable(executable_path, f"{label}_executable")
+        if system_executable
+        else stable_file(executable_path, f"{label}_executable")
+    )
+    bound_before = {
+        name: stable_file(path, f"{label}_bound_{name}")
+        for name, path in sorted(bound_paths.items())
+    }
+    system_bindings = bound_system_paths or {}
+    bound_system_before = {
+        name: stable_system_executable(path, f"{label}_bound_system_{name}")
+        for name, path in sorted(system_bindings.items())
+    }
+    tree_bindings = bound_trees or {}
+    trees_before = {
+        name: tree_snapshot(
+            path,
+            f"{label}_bound_tree_{name}",
+            allow_internal_symlinks=allow_symlinks,
+        )
+        for name, (path, allow_symlinks) in sorted(tree_bindings.items())
+    }
+    cwd_before = require_real_directory(cwd, f"{label}_cwd")
+    captured = bytearray()
+    process: subprocess.Popen[bytes] | None = None
+    child_pid = 0
+    return_code = -1
+    try:
+        with open(os.devnull, "rb") as stdin_file:
+            process = subprocess.Popen(
+                arguments,
+                cwd=cwd,
+                env=environment,
+                stdin=stdin_file,
+                close_fds=True,
+                stdout=subprocess.PIPE if capture_stdout_maximum > 0 else None,
+            )
+            child_pid = process.pid
+            if capture_stdout_maximum > 0:
+                if process.stdout is None:
+                    fail(f"{label}_stdout_pipe_missing")
+                while True:
+                    chunk = process.stdout.read(65536)
+                    if not chunk:
+                        break
+                    captured.extend(chunk)
+                    if len(captured) > capture_stdout_maximum:
+                        fail(f"{label}_stdout_limit_exceeded")
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(1, view)
+                        if written <= 0:
+                            fail(f"{label}_stdout_forward_failed")
+                        view = view[written:]
+                process.stdout.close()
+            return_code = process.wait()
+    except BaseException:
+        if process is not None:
+            if process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+        raise
+    if return_code != 0:
+        fail(f"child_command_failed:{label}:{return_code}")
+    executable_after = (
+        stable_system_executable(executable_path, f"{label}_executable_after")
+        if system_executable
+        else stable_file(executable_path, f"{label}_executable_after")
+    )
+    bound_after = {
+        name: stable_file(path, f"{label}_bound_{name}_after")
+        for name, path in sorted(bound_paths.items())
+    }
+    bound_system_after = {
+        name: stable_system_executable(
+            path, f"{label}_bound_system_{name}_after"
+        )
+        for name, path in sorted(system_bindings.items())
+    }
+    trees_after = {
+        name: tree_snapshot(
+            path,
+            f"{label}_bound_tree_{name}_after",
+            allow_internal_symlinks=allow_symlinks,
+        )
+        for name, (path, allow_symlinks) in sorted(tree_bindings.items())
+    }
+    cwd_after = require_real_directory(cwd, f"{label}_cwd_after")
+    if (
+        executable_before != executable_after
+        or bound_before != bound_after
+        or bound_system_before != bound_system_after
+        or trees_before != trees_after
+        or (
+            not same_directory_identity(cwd_before, cwd_after)
+            if cwd_mutation_expected
+            else not identities_equal(cwd_before, cwd_after)
+        )
+    ):
+        fail(f"{label}_physical_identity_changed_during_execution")
+    event = {
+        "argv": arguments,
+        "argv_sha256": framed_digest(
+            f"{SCHEMA}.child.argv",
+            [(str(index), value.encode("utf-8")) for index, value in enumerate(arguments)],
+        ),
+        "bound_files": bound_after,
+        "bound_system_files": bound_system_after,
+        "bound_trees": {
+            name: {
+                "bytes_root": snapshot["bytes_root"],
+                "identity_root": snapshot["identity_root"],
+            }
+            for name, snapshot in sorted(trees_after.items())
+        },
+        "cwd": os.fspath(cwd),
+        "cwd_identity": stat_identity(cwd_after),
+        "cwd_mutation": "expected" if cwd_mutation_expected else "forbidden",
+        "environment_sha256": framed_digest(
+            f"{SCHEMA}.child.environment",
+            [
+                (key, value.encode("utf-8"))
+                for key, value in sorted(environment.items())
+            ],
+        ),
+        "executable": executable_after,
+        "label": label,
+        "ordinal": len(events),
+        "pid": child_pid,
+        "return_code": return_code,
+        "stderr": "guard_inherited_visible",
+        "stdout": (
+            "guard_tee_visible" if capture_stdout_maximum > 0 else "guard_inherited_visible"
+        ),
+        "stdout_sha256": sha256_bytes(bytes(captured)),
+        "stdout_size": len(captured),
+    }
+    events.append(event)
+    return bytes(captured)
+
+
+def fsync_directory(path: pathlib.Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def canonical_manifest_bytes(manifest: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+
+def write_manifest_fd(fd_path: str, raw: bytes) -> None:
+    if fd_path != MANIFEST_FD_PATH:
+        fail("manifest_fd_path_invalid")
+    try:
+        descriptor = int(fd_path.rsplit("/", 1)[1])
+    except (ValueError, IndexError):
+        fail("manifest_fd_invalid")
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 0:
+        fail("manifest_fd_identity_invalid")
+    offset = 0
+    while offset < len(raw):
+        offset += os.write(descriptor, raw[offset:])
+    os.fsync(descriptor)
+    after = os.fstat(descriptor)
+    if after.st_size != len(raw):
+        fail("manifest_fd_size_mismatch")
+
+
+def parse_mode_arguments(
+    arguments: list[str],
+) -> tuple[str, str, dict[str, str], dict[str, str], list[str]]:
+    if not arguments or arguments[0] not in (
+        "--admit-manifest",
+        "--audit",
+        "--exec-current-cli",
+        "--run",
+        "--verify-admitted-manifest",
+        "--verify-manifest",
+    ):
+        fail("mode_invalid")
+    mode = arguments[0]
+    cli_arguments: list[str] = []
+    metadata_arguments = arguments[1:]
+    if mode == "--exec-current-cli":
+        if metadata_arguments.count("--") != 1:
+            fail("exec_current_cli_separator_invalid")
+        separator = metadata_arguments.index("--")
+        cli_arguments = metadata_arguments[separator + 1 :]
+        metadata_arguments = metadata_arguments[:separator]
+    elif "--" in metadata_arguments:
+        fail("argument_separator_invalid")
+    expected, remainder = parse_expected(metadata_arguments)
+    values: dict[str, str] = {}
+    manifest_fd_flag = "--manifest-fd-path"
+    if mode == "--run" and (
+        len(remainder) != 3
+        or not remainder[0].startswith("--source-path=")
+        or remainder[1:] != [manifest_fd_flag, MANIFEST_FD_PATH]
+    ):
+        fail("run_argument_order_invalid")
+    if manifest_fd_flag in remainder:
+        if remainder.count(manifest_fd_flag) != 1:
+            fail("argument_invalid:manifest-fd-path")
+        manifest_fd_index = remainder.index(manifest_fd_flag)
+        if manifest_fd_index + 1 >= len(remainder):
+            fail("argument_invalid:manifest-fd-path")
+        manifest_fd_value = remainder[manifest_fd_index + 1]
+        if not manifest_fd_value or manifest_fd_value.startswith("--"):
+            fail("argument_invalid:manifest-fd-path")
+        values["manifest-fd-path"] = manifest_fd_value
+        remainder = (
+            remainder[:manifest_fd_index]
+            + remainder[manifest_fd_index + 2 :]
+        )
+    for argument in remainder:
+        if not argument.startswith("--") or "=" not in argument:
+            fail("argument_invalid")
+        key, value = argument[2:].split("=", 1)
+        if key in values or key not in (
+            "guard-report-path",
+            "source-path",
+            "manifest-path",
+        ):
+            fail(f"argument_invalid:{key}")
+        values[key] = value
+    required = {"source-path"}
+    if mode == "--run":
+        required.add("manifest-fd-path")
+    if mode in (
+        "--admit-manifest",
+        "--verify-admitted-manifest",
+        "--verify-manifest",
+    ):
+        required.add("manifest-path")
+        required.add("guard-report-path")
+    if set(values) != required:
+        fail("argument_set_invalid")
+    return mode, values["source-path"], expected, values, cli_arguments
+
+
+def execution_receipt(events: list[dict[str, Any]]) -> dict[str, Any]:
+    for index, event in enumerate(events):
+        if event.get("ordinal") != index or event.get("return_code") != 0:
+            fail("execution_event_sequence_invalid")
+    rows = [
+        (
+            str(index),
+            canonical_manifest_bytes(event),
+        )
+        for index, event in enumerate(events)
+    ]
+    return {
+        "chain_root": framed_digest(f"{SCHEMA}.child.execution_chain", rows),
+        "event_count": len(events),
+        "events": events,
+    }
+
+
+def validate_tsc_file_list(raw: bytes, private_package: pathlib.Path) -> dict[str, Any]:
+    if not raw or not raw.endswith(b"\n") or b"\x00" in raw or b"\r" in raw:
+        fail("tsc_file_list_bytes_invalid")
+    try:
+        lines = raw.decode("utf-8", "strict").splitlines()
+    except UnicodeDecodeError:
+        fail("tsc_file_list_not_utf8")
+    if not lines or len(lines) != len(set(lines)):
+        fail("tsc_file_list_empty_or_duplicate")
+    rows: list[tuple[str, bytes]] = []
+    source_count = 0
+    for index, line in enumerate(lines):
+        path = pathlib.Path(line)
+        require_canonical_absolute(path, f"tsc_file_list_{index}")
+        try:
+            relative = path.relative_to(private_package).as_posix()
+        except ValueError:
+            fail(f"tsc_file_list_path_outside_snapshot:{index}")
+        if relative.startswith("src/"):
+            source_count += 1
+        entry = stable_file(path, f"tsc_file_list_{index}")
+        rows.append(
+            (
+                relative,
+                canonical_manifest_bytes(
+                    {
+                        "relative_path": relative,
+                        "sha256": entry["sha256"],
+                        "size": entry["identity"]["size"],
+                    }
+                ),
+            )
+        )
+    if source_count == 0:
+        fail("tsc_file_list_source_missing")
+    return {
+        "file_count": len(lines),
+        "root": framed_digest(f"{SCHEMA}.tsc_file_list", rows),
+        "source_file_count": source_count,
+    }
+
+
+def create_private_build_snapshot(
+    candidate_root: pathlib.Path,
+    package_root: pathlib.Path,
+    inputs: dict[str, Any],
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path, pathlib.Path]:
+    material = inputs["_material"]
+    private_package = candidate_root / "package"
+    private_output = candidate_root / "output"
+    private_tool_root = candidate_root / "tool"
+    os.mkdir(private_package, 0o700)
+    os.mkdir(private_output, 0o700)
+    os.mkdir(private_tool_root, 0o700)
+    copy_tree_snapshot(
+        package_root / "src",
+        private_package / "src",
+        material["sources"],
+        "private_typescript_sources",
+    )
+    copy_tree_snapshot(
+        package_root / "node_modules",
+        private_package / "node_modules",
+        material["node_modules"],
+        "private_node_modules",
+        allow_internal_symlinks=True,
+    )
+    private_typescript = tree_snapshot(
+        private_package / "node_modules/typescript", "private_typescript_toolchain"
+    )
+    if private_typescript["bytes_root"] != material["typescript"]["bytes_root"]:
+        fail("private_typescript_toolchain_bytes_mismatch")
+    for name, material_name in (
+        ("package.json", "package_json"),
+        ("package-lock.json", "package_lock"),
+        ("tsconfig.json", "tsconfig"),
+    ):
+        copy_bound_file(
+            package_root / name,
+            private_package / name,
+            material["files"][material_name],
+            f"private_{material_name}",
+            0o400,
+        )
+    private_scripts = private_package / "scripts"
+    os.mkdir(private_scripts, 0o700)
+    for name, material_name in (
+        ("freeze-dist.mjs", "freeze"),
+        ("atomic-publish-directory", "atomic"),
+    ):
+        copy_bound_file(
+            package_root / "scripts" / name,
+            private_scripts / name,
+            material["files"][material_name],
+            f"private_{material_name}",
+            0o400,
+        )
+    private_node = private_tool_root / "node"
+    copy_bound_file(
+        node_binary_path(),
+        private_node,
+        material["files"]["node"],
+        "private_node",
+        0o500,
+    )
+    seal_tree(private_package, "private_package_input_seal")
+    seal_tree(private_tool_root, "private_tool_input_seal")
+    private_node_descriptor = os.open(
+        private_node,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fchmod(private_node_descriptor, 0o500)
+        os.fsync(private_node_descriptor)
+    finally:
+        os.close(private_node_descriptor)
+    require_snapshot_sealed(
+        tree_snapshot(
+            private_package,
+            "private_package_input_snapshot",
+            allow_internal_symlinks=True,
+        ),
+        "private_package_input",
+    )
+    require_snapshot_sealed(
+        tree_snapshot(private_tool_root, "private_tool_input_snapshot"),
+        "private_tool_input",
+    )
+    fsync_directory(private_output)
+    fsync_directory(candidate_root)
+    return (
+        private_package,
+        private_output,
+        private_node,
+        private_scripts / "atomic-publish-directory",
+    )
+
+
+def write_new_canonical_file(
+    path: pathlib.Path, raw: bytes, label: str, mode: int = 0o400
+) -> dict[str, Any]:
+    require_canonical_absolute(path, label)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                fail(f"{label}_write_failed")
+            offset += written
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return stable_file(path, label)
+
+
+def output_manifest_fields(outputs: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "active_bytes_root": outputs["active_bytes_root"],
+        "active_identity_root": outputs["active_identity_root"],
+        "file_count": outputs["file_count"],
+        "freeze_manifest_sha256": outputs["freeze_manifest_sha256"],
+        "frozen_bytes_root": outputs["frozen_bytes_root"],
+        "frozen_identity_root": outputs["frozen_identity_root"],
+    }
+
+
+def parse_canonical_json(raw: bytes, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        fail(f"{label}_invalid:{type(error).__name__}")
+    if not isinstance(value, dict) or raw != canonical_manifest_bytes(value):
+        fail(f"{label}_not_canonical")
+    return value
+
+
+def require_generation_cid(generation_cid: Any, label: str) -> str:
+    if (
+        not isinstance(generation_cid, str)
+        or len(generation_cid) != 64
+        or any(character not in "0123456789abcdef" for character in generation_cid)
+    ):
+        fail(f"{label}_invalid")
+    return generation_cid
+
+
+def require_generation_staging_name(value: Any, label: str) -> str:
+    prefix = ".generation.pending."
+    if (
+        not isinstance(value, str)
+        or not value.startswith(prefix)
+        or len(value) != len(prefix) + 32
+        or any(
+            character not in "0123456789abcdef"
+            for character in value[len(prefix):]
+        )
+    ):
+        fail(f"{label}_invalid")
+    return value
+
+
+def load_generation_object(
+    package_root: pathlib.Path,
+    generation_cid_raw: Any,
+    label: str,
+    *,
+    staging_name: Any = None,
+) -> dict[str, Any]:
+    generation_cid = require_generation_cid(generation_cid_raw, f"{label}_cid")
+    store = require_canonical_absolute(
+        package_root / GENERATION_STORE, f"{label}_store"
+    )
+    store_info = require_real_directory(store, f"{label}_store")
+    objects = require_canonical_absolute(
+        store / GENERATION_OBJECTS, f"{label}_objects"
+    )
+    objects_info = require_real_directory(objects, f"{label}_objects")
+    for info, identity_label in (
+        (store_info, f"{label}_store"),
+        (objects_info, f"{label}_objects"),
+    ):
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            fail(f"{identity_label}_ownership_or_mode_invalid")
+    object_name = generation_cid
+    if staging_name is not None:
+        object_name = require_generation_staging_name(
+            staging_name, f"{label}_staging_name"
+        )
+    generation_root = require_canonical_absolute(
+        objects / object_name,
+        f"{label}_root",
+    )
+    generation_info = require_real_directory(
+        generation_root, f"{label}_root"
+    )
+    if (
+        generation_info.st_uid != os.geteuid()
+        or generation_info.st_mode & 0o277
+        or generation_info.st_mode & 0o700 != 0o500
+    ):
+        fail(f"{label}_root_not_sealed")
+    generation_manifest_path = generation_root / "generation-manifest.json"
+    generation_raw, generation_file = stable_file_bytes(
+        generation_manifest_path,
+        f"{label}_manifest",
+        16 * 1024 * 1024,
+    )
+    if (
+        generation_file["sha256"] != generation_cid
+        or generation_file["identity"]["uid"] != os.geteuid()
+        or generation_file["identity"]["mode"] & 0o777 != 0o400
+    ):
+        fail(f"{label}_manifest_identity_invalid")
+    generation = parse_canonical_json(generation_raw, f"{label}_manifest")
+    if list(generation) != [
+        "build_execution",
+        "guard_parent_proof",
+        "inputs",
+        "inputs_before_after_equal",
+        "legacy_directories_authority",
+        "outputs",
+        "schema",
+        "tsc_file_list",
+    ]:
+        fail(f"{label}_manifest_fields_invalid")
+    if (
+        generation.get("schema") != GENERATION_SCHEMA
+        or generation.get("inputs_before_after_equal") is not True
+        or generation.get("legacy_directories_authority") != "none"
+    ):
+        fail(f"{label}_manifest_schema_invalid")
+    proof = generation.get("guard_parent_proof")
+    proof_keys = [
+        "limit_bytes",
+        "monitor_pid",
+        "monitor_start_tvsec",
+        "monitor_start_tvusec",
+        "proof_record_sha256",
+        "root_pgid",
+        "root_pid",
+        "root_ppid",
+        "root_sid",
+        "root_start_tvsec",
+        "root_start_tvusec",
+    ]
+    if not isinstance(proof, dict) or list(proof) != proof_keys:
+        fail(f"{label}_guard_parent_proof_fields_invalid")
+    for key in proof_keys:
+        value = proof[key]
+        if key == "proof_record_sha256":
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                fail(f"{label}_guard_parent_proof_sha256_invalid")
+        elif type(value) is not int or value <= 0:
+            fail(f"{label}_guard_parent_proof_numeric_invalid:{key}")
+    outputs = verify_output_pair(
+        generation_root,
+        label,
+        require_sealed=True,
+    )
+    if generation.get("outputs") != output_manifest_fields(outputs):
+        fail(f"{label}_output_binding_mismatch")
+    store_after = os.stat(store, follow_symlinks=False)
+    objects_after = os.stat(objects, follow_symlinks=False)
+    generation_after = os.stat(generation_root, follow_symlinks=False)
+    if (
+        not identities_equal(store_info, store_after)
+        or not identities_equal(objects_info, objects_after)
+        or not identities_equal(generation_info, generation_after)
+    ):
+        fail(f"{label}_directory_identity_drifted")
+    return {
+        "generation": generation,
+        "generation_cid": generation_cid,
+        "generation_identity": stat_identity(generation_after),
+        "generation_manifest_sha256": generation_file["sha256"],
+        "generation_manifest_identity": generation_file["identity"],
+        "objects_identity": stat_identity(objects_after),
+        "outputs": outputs,
+        "store_identity": stat_identity(store_after),
+    }
+
+
+def load_current_generation(package_root: pathlib.Path) -> dict[str, Any]:
+    store = require_canonical_absolute(
+        package_root / GENERATION_STORE, "current_generation_store"
+    )
+    pointer_path = store / GENERATION_CURRENT
+    pointer_raw, pointer_file = stable_file_bytes(
+        pointer_path, "current_generation_pointer", 4096
+    )
+    if (
+        pointer_file["identity"]["uid"] != os.geteuid()
+        or pointer_file["identity"]["mode"] & 0o777 != 0o400
+    ):
+        fail("current_generation_pointer_not_sealed")
+    pointer = parse_canonical_json(pointer_raw, "current_generation_pointer")
+    if list(pointer) != ["generation_cid", "schema"] or pointer["schema"] != POINTER_SCHEMA:
+        fail("current_generation_pointer_fields_invalid")
+    loaded = load_generation_object(
+        package_root, pointer["generation_cid"], "current_generation"
+    )
+    pointer_raw_after, pointer_file_after = stable_file_bytes(
+        pointer_path, "current_generation_pointer_after", 4096
+    )
+    if pointer_raw_after != pointer_raw or pointer_file_after != pointer_file:
+        fail("current_generation_pointer_changed_during_read")
+    if (
+        loaded["store_identity"]
+        != stat_identity(os.stat(store, follow_symlinks=False))
+        or loaded["objects_identity"]
+        != stat_identity(
+            os.stat(store / GENERATION_OBJECTS, follow_symlinks=False)
+        )
+    ):
+        fail("current_generation_store_identity_drifted")
+    return dict(
+        loaded,
+        pointer_identity=pointer_file["identity"],
+        pointer_sha256=pointer_file["sha256"],
+    )
+
+
+def validate_current_generation_provenance(
+    current: dict[str, Any], inputs: dict[str, Any]
+) -> None:
+    generation = current["generation"]
+    public_inputs = public_input_snapshot(inputs)
+    if generation.get("inputs") != public_inputs:
+        fail("current_generation_input_binding_mismatch")
+    proof = generation.get("guard_parent_proof")
+    if not isinstance(proof, dict) or proof.get("limit_bytes") != 1073741824:
+        fail("current_generation_guard_limit_invalid")
+    execution = generation.get("build_execution")
+    if not isinstance(execution, dict):
+        fail("current_generation_build_execution_missing")
+    events = execution.get("events")
+    if not isinstance(events, list) or [event.get("label") for event in events] != [
+        "tsc_file_list",
+        "tsc_emit",
+        "freeze",
+    ]:
+        fail("current_generation_build_execution_sequence_invalid")
+    if execution_receipt(events) != execution:
+        fail("current_generation_build_execution_chain_invalid")
+    for index, event in enumerate(events):
+        if (
+            event.get("ordinal") != index
+            or event.get("return_code") != 0
+            or not isinstance(event.get("pid"), int)
+            or event["pid"] <= 1
+            or event.get("stderr") != "guard_inherited_visible"
+            or event.get("stdout")
+            != ("guard_tee_visible" if index == 0 else "guard_inherited_visible")
+        ):
+            fail(f"current_generation_build_execution_event_invalid:{index}")
+    file_list = generation.get("tsc_file_list")
+    if not isinstance(file_list, dict) or list(file_list) != [
+        "file_count",
+        "root",
+        "source_file_count",
+    ]:
+        fail("current_generation_tsc_file_list_fields_invalid")
+    if (
+        type(file_list["file_count"]) is not int
+        or file_list["file_count"] <= 0
+        or type(file_list["source_file_count"]) is not int
+        or file_list["source_file_count"] <= 0
+        or file_list["source_file_count"] > file_list["file_count"]
+        or not isinstance(file_list["root"], str)
+        or len(file_list["root"]) != 64
+        or any(character not in "0123456789abcdef" for character in file_list["root"])
+    ):
+        fail("current_generation_tsc_file_list_invalid")
+
+
+def validate_production_package_entry(package_root: pathlib.Path) -> None:
+    raw, _ = stable_file_bytes(
+        package_root / "package.json", "production_package_json", 1024 * 1024
+    )
+    try:
+        package = json.loads(raw.decode("utf-8", "strict"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        fail(f"production_package_json_invalid:{type(error).__name__}")
+    if not isinstance(package, dict):
+        fail("production_package_json_root_invalid")
+    binary = package.get("bin")
+    scripts = package.get("scripts")
+    if (
+        not isinstance(binary, dict)
+        or list(binary) != ["ts-csg"]
+        or binary["ts-csg"] != "scripts/" + GENERATION_CLI
+    ):
+        fail("production_package_bin_not_generation_authority")
+    if not isinstance(scripts, dict) or scripts.get("extract") != (
+        "scripts/" + GENERATION_CLI
+    ):
+        fail("production_package_extract_not_generation_authority")
+
+
+def execute_current_generation_cli(
+    source_path_raw: str,
+    expected: dict[str, str],
+    cli_arguments: list[str],
+) -> int:
+    source_path, repo_root, package_root = source_binding(source_path_raw)
+    validate_production_package_entry(package_root)
+    inputs_before = input_snapshot(source_path, repo_root, package_root, expected)
+    current_before = load_current_generation(package_root)
+    validate_current_generation_provenance(current_before, inputs_before)
+
+    generation_root = require_canonical_absolute(
+        package_root
+        / GENERATION_STORE
+        / GENERATION_OBJECTS
+        / current_before["generation_cid"],
+        "production_generation_root",
+    )
+    cli_path = require_canonical_absolute(
+        generation_root / "dist/cli.js", "production_generation_cli"
+    )
+    cli_before = stable_file(cli_path, "production_generation_cli")
+    if (
+        cli_before["identity"]["uid"] != os.geteuid()
+        or cli_before["identity"]["mode"] & 0o777 != 0o400
+    ):
+        fail("production_generation_cli_not_sealed")
+    cwd = require_canonical_absolute(pathlib.Path(os.getcwd()), "production_cli_cwd")
+    cwd_before = require_real_directory(cwd, "production_cli_cwd")
+
+    inputs_pre_exec = input_snapshot(source_path, repo_root, package_root, expected)
+    assert_input_snapshot_equal(inputs_before, inputs_pre_exec)
+    current_pre_exec = load_current_generation(package_root)
+    if current_pre_exec != current_before:
+        fail("current_generation_changed_before_execution")
+    cli_pre_exec = stable_file(cli_path, "production_generation_cli_pre_exec")
+    if cli_pre_exec != cli_before:
+        fail("production_generation_cli_changed_before_execution")
+
+    process: subprocess.Popen[bytes] | None = None
+    return_code: int | None = None
+    execution_error: BaseException | None = None
+    try:
+        process = subprocess.Popen(
+            [os.fspath(node_binary_path()), os.fspath(cli_path), *cli_arguments],
+            cwd=os.fspath(cwd),
+            env=exact_child_environment(package_root),
+            close_fds=True,
+        )
+        return_code = process.wait()
+    except BaseException as error:
+        execution_error = error
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+
+    inputs_after = input_snapshot(source_path, repo_root, package_root, expected)
+    assert_input_snapshot_equal(inputs_before, inputs_after)
+    current_after = load_current_generation(package_root)
+    if current_after != current_before:
+        fail("current_generation_changed_during_execution")
+    cli_after = stable_file(cli_path, "production_generation_cli_after")
+    if cli_after != cli_before:
+        fail("production_generation_cli_changed_during_execution")
+    cwd_after = os.stat(cwd, follow_symlinks=False)
+    if not same_directory_identity(cwd_before, cwd_after):
+        fail("production_cli_cwd_identity_drifted")
+    if execution_error is not None:
+        fail(f"production_generation_cli_spawn_failed:{type(execution_error).__name__}")
+    if return_code is None:
+        fail("production_generation_cli_return_code_missing")
+    if return_code < 0:
+        return 128 + abs(return_code)
+    return return_code
+
+
+def audit(
+    source_path_raw: str, expected: dict[str, str]
+) -> tuple[pathlib.Path, pathlib.Path, dict[str, Any], dict[str, Any]]:
+    source_path, repo_root, package_root = source_binding(source_path_raw)
+    validate_production_package_entry(package_root)
+    inputs = input_snapshot(source_path, repo_root, package_root, expected)
+    store = package_root / GENERATION_STORE
+    current_path = store / GENERATION_CURRENT
+    activation = {
+        "current_generation": "absent",
+        "module_consumers": "HARD_RED:legacy_root_dist",
+        "production_activation": "RED:no_current_generation",
+    }
+    if os.path.lexists(store):
+        store_info = require_real_directory(store, "audit_generation_store")
+        if store_info.st_uid != os.geteuid() or store_info.st_mode & 0o077:
+            fail("audit_generation_store_ownership_or_mode_invalid")
+    if os.path.lexists(current_path):
+        current = load_current_generation(package_root)
+        validate_current_generation_provenance(current, inputs)
+        activation = {
+            "current_generation": current["generation_cid"],
+            "module_consumers": "HARD_RED:legacy_root_dist",
+            "production_activation": "RED:module_consumers_unbound",
+        }
+    return repo_root, package_root, inputs, activation
+
+
+def build_and_publish(
+    source_path_raw: str,
+    expected: dict[str, str],
+    manifest_fd_path: str,
+) -> None:
+    guard_parent_proof = require_guard_context()
+    source_path, repo_root, package_root = source_binding(source_path_raw)
+    inputs_before = input_snapshot(source_path, repo_root, package_root, expected)
+    environment = exact_child_environment(package_root)
+    (
+        store,
+        objects,
+        store_descriptor,
+        objects_descriptor,
+        lock_descriptor,
+    ) = acquire_generation_store(package_root)
+    if os.path.lexists(store / GENERATION_CURRENT):
+        load_current_generation(package_root)
+    candidate_root: pathlib.Path | None = None
+    generation_stage: pathlib.Path | None = None
+    events: list[dict[str, Any]] = []
+    try:
+        candidate_root = pathlib.Path(
+            tempfile.mkdtemp(prefix=".csg-ts-source-freeze-candidate.", dir=package_root)
+        )
+        fsync_directory(package_root)
+        (
+            private_package,
+            private_output,
+            private_node,
+            private_atomic_helper,
+        ) = create_private_build_snapshot(candidate_root, package_root, inputs_before)
+        inputs_after_snapshot = input_snapshot(
+            source_path, repo_root, package_root, expected
+        )
+        assert_input_snapshot_equal(inputs_before, inputs_after_snapshot)
+        private_tsc = private_package / "node_modules/typescript/bin/tsc"
+        private_tsconfig = private_package / "tsconfig.json"
+        private_sources = private_package / "src"
+        private_node_modules = private_package / "node_modules"
+        candidate_active = private_output / "dist"
+        candidate_frozen = private_output / "dist-frozen"
+        if os.path.lexists(candidate_active) or os.path.lexists(candidate_frozen):
+            fail("private_output_preexists")
+
+        print(f"{SCHEMA} phase=tsc_file_list", flush=True)
+        file_list_raw = run_visible(
+            "tsc_file_list",
+            [
+                os.fspath(private_node),
+                os.fspath(private_tsc),
+                "-p",
+                os.fspath(private_tsconfig),
+                "--listFilesOnly",
+            ],
+            private_output,
+            environment,
+            events,
+            bound_paths={
+                "package_json": private_package / "package.json",
+                "tsc": private_tsc,
+                "tsconfig": private_tsconfig,
+            },
+            bound_trees={
+                "node_modules": (private_node_modules, True),
+                "sources": (private_sources, False),
+            },
+            capture_stdout_maximum=64 * 1024 * 1024,
+        )
+        file_list_receipt = validate_tsc_file_list(file_list_raw, private_package)
+
+        print(f"{SCHEMA} phase=tsc_emit", flush=True)
+        run_visible(
+            "tsc_emit",
+            [
+                os.fspath(private_node),
+                os.fspath(private_tsc),
+                "-p",
+                os.fspath(private_tsconfig),
+                "--outDir",
+                os.fspath(candidate_active),
+            ],
+            private_output,
+            environment,
+            events,
+            bound_paths={
+                "package_json": private_package / "package.json",
+                "tsc": private_tsc,
+                "tsconfig": private_tsconfig,
+            },
+            bound_trees={
+                "node_modules": (private_node_modules, True),
+                "sources": (private_sources, False),
+            },
+            cwd_mutation_expected=True,
+        )
+        tree_snapshot(candidate_active, "candidate_active")
+        print(f"{SCHEMA} phase=freeze", flush=True)
+        run_visible(
+            "freeze",
+            [
+                os.fspath(private_node),
+                os.fspath(private_package / "scripts/freeze-dist.mjs"),
+                "--package-root",
+                os.fspath(private_output),
+            ],
+            private_output,
+            environment,
+            events,
+            bound_paths={
+                "atomic_helper": private_atomic_helper,
+                "freeze": private_package / "scripts/freeze-dist.mjs",
+            },
+            bound_system_paths={"atomic_python": ATOMIC_PYTHON_BIN},
+            bound_trees={"active_dist": (candidate_active, False)},
+            cwd_mutation_expected=True,
+        )
+        verify_output_pair(private_output, "candidate_generation")
+        inputs_before_publish = input_snapshot(
+            source_path, repo_root, package_root, expected
+        )
+        assert_input_snapshot_equal(inputs_before, inputs_before_publish)
+
+        generation_stage = create_pending_directory(
+            objects,
+            objects_descriptor,
+            ".generation.pending.",
+            "generation_stage",
+        )
+        os.rename(candidate_active, generation_stage / "dist")
+        os.rename(candidate_frozen, generation_stage / "dist-frozen")
+        fsync_directory(private_output)
+        fsync_directory(generation_stage)
+        seal_tree(generation_stage / "dist", "generation_active_seal")
+        seal_tree(generation_stage / "dist-frozen", "generation_frozen_seal")
+        outputs = verify_output_pair(
+            generation_stage,
+            "generation_stage",
+            require_sealed=True,
+        )
+        build_execution = execution_receipt(events)
+        generation_manifest = {
+            "build_execution": build_execution,
+            "guard_parent_proof": guard_parent_proof,
+            "inputs": public_input_snapshot(inputs_before),
+            "inputs_before_after_equal": True,
+            "legacy_directories_authority": "none",
+            "outputs": output_manifest_fields(outputs),
+            "schema": GENERATION_SCHEMA,
+            "tsc_file_list": file_list_receipt,
+        }
+        generation_raw = canonical_manifest_bytes(generation_manifest)
+        generation_cid = sha256_bytes(generation_raw)
+        generation_manifest_file = write_new_canonical_file(
+            generation_stage / "generation-manifest.json",
+            generation_raw,
+            "generation_manifest",
+        )
+        if generation_manifest_file["sha256"] != generation_cid:
+            fail("generation_manifest_cid_mismatch")
+        generation_stage_descriptor = os.open(
+            generation_stage, directory_open_flags()
+        )
+        try:
+            os.fchmod(generation_stage_descriptor, 0o500)
+            os.fsync(generation_stage_descriptor)
+            if not identities_equal(
+                os.fstat(generation_stage_descriptor),
+                os.stat(generation_stage, follow_symlinks=False),
+            ):
+                fail("generation_stage_named_identity_drifted")
+        finally:
+            os.close(generation_stage_descriptor)
+        staging_name = generation_stage.name
+        if not identities_equal(
+            os.fstat(objects_descriptor), os.stat(objects, follow_symlinks=False)
+        ):
+            fail("generation_objects_named_identity_drifted_after_stage")
+        staged_generation = load_generation_object(
+            package_root,
+            generation_cid,
+            "staged_generation",
+            staging_name=staging_name,
+        )
+        if (
+            staged_generation["outputs"] != outputs
+            or staged_generation["generation"] != generation_manifest
+            or staged_generation["generation_manifest_sha256"] != generation_cid
+        ):
+            fail("staged_generation_binding_mismatch")
+        inputs_precommit = input_snapshot(
+            source_path, repo_root, package_root, expected
+        )
+        assert_input_snapshot_equal(inputs_before, inputs_precommit)
+
+        candidate_identity = stat_identity(os.stat(candidate_root, follow_symlinks=False))
+        safe_remove_tree(candidate_root, candidate_identity, "candidate_cleanup")
+        candidate_root = None
+        pointer_sha256 = sha256_bytes(canonical_pointer_bytes(generation_cid))
+        manifest = {
+            "dynamic_completion_credit": 0,
+            "execution": execution_receipt(events),
+            "generation": {
+                "commit": "pending_gate_admission",
+                "generation_cid": generation_cid,
+                "generation_manifest_sha256": generation_cid,
+                "pointer_sha256": pointer_sha256,
+                "staging_name": staging_name,
+            },
+            "guard_parent_proof": guard_parent_proof,
+            "inputs": public_input_snapshot(inputs_before),
+            "inputs_before_after_equal": True,
+            "legacy_directories_authority": "none",
+            "outputs": output_manifest_fields(outputs),
+            "schema": SCHEMA,
+            "status": "guarded_process_completed_pending_admission",
+            "tsc_file_list": file_list_receipt,
+        }
+        if not identities_equal(
+            os.fstat(store_descriptor), os.stat(store, follow_symlinks=False)
+        ):
+            fail("generation_store_named_identity_drifted_precommit")
+        write_manifest_fd(manifest_fd_path, canonical_manifest_bytes(manifest))
+        print(f"{SCHEMA} runner=PENDING_ADMISSION", flush=True)
+        _ = (store_descriptor, objects_descriptor, lock_descriptor)
+        return
+    except BaseException as original_error:
+        cleanup_errors: list[str] = []
+        for path, label in (
+            (generation_stage, "generation_stage_cleanup"),
+            (candidate_root, "candidate_cleanup"),
+        ):
+            if path is None or not os.path.lexists(path):
+                continue
+            try:
+                identity = stat_identity(os.stat(path, follow_symlinks=False))
+                safe_remove_tree(path, identity, label)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(f"{label}:{cleanup_error}")
+        if cleanup_errors:
+            fail(f"fd_safe_cleanup_failed:{'|'.join(cleanup_errors)}:{original_error}")
+        raise
+
+
+def verify_guard_report_binding(
+    report_path_raw: str,
+    manifest_path: pathlib.Path,
+    manifest_file: dict[str, Any],
+    manifest: dict[str, Any],
+    expected: dict[str, str],
+) -> None:
+    report_path = require_canonical_absolute(
+        pathlib.Path(report_path_raw), "guard_report"
+    )
+    if (
+        report_path.name != "guard.report.txt"
+        or manifest_path.name != "provenance-manifest.json"
+        or report_path.parent != manifest_path.parent
+    ):
+        fail("guard_report_transaction_path_invalid")
+    raw, report_file = stable_file_bytes(
+        report_path, "guard_report", 4 * 1024 * 1024
+    )
+    if report_file["identity"]["mode"] & 0o222:
+        fail("guard_report_not_sealed")
+    try:
+        text = raw.decode("utf-8", "strict")
+    except UnicodeError:
+        fail("guard_report_not_utf8")
+    if not text.endswith("\n") or "\r" in text:
+        fail("guard_report_not_canonical_text")
+    rows: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line or "=" not in line:
+            fail("guard_report_line_invalid")
+        key, value = line.split("=", 1)
+        if not key or key in rows:
+            fail(f"guard_report_field_duplicate:{key}")
+        rows[key] = value
+    runner_path = require_canonical_absolute(
+        pathlib.Path(__file__).resolve(), "guard_report_runner"
+    )
+    if runner_path.name != RUNNER_NAME or runner_path.parent.name != "tools":
+        fail("guard_report_runner_location_invalid")
+    expected_argv = expected_guarded_runner_arguments(runner_path, expected)
+    expected_argv_sha256 = guard_command_argv_digest(expected_argv)
+    monitor_python = stable_system_executable(
+        PYTHON_BIN, "guard_report_monitor_python"
+    )
+    monitor_identity = monitor_python["identity"]
+    required = {
+        "abort_reason": "",
+        "command_execution_mode": "private_single_link_snapshot",
+        "command_execution_snapshot_sha256": expected["runner_sha256"],
+        "command_path": os.fspath(runner_path),
+        "command_sha256": expected["runner_sha256"],
+        "command_argv_schema": "cheng.guard.command_argv",
+        "command_argv_count": str(len(expected_argv)),
+        "command_argv_sha256": expected_argv_sha256,
+        "expected_command_path": os.fspath(runner_path),
+        "expected_command_sha256": expected["runner_sha256"],
+        "exit_code_contract_status": "verified",
+        "formal_command_identity_status": "required_verified",
+        "memory_limit_bytes": "805306368",
+        "monitor_python_path": os.fspath(PYTHON_BIN),
+        "monitor_python_sha256": expected["python_sha256"],
+        "monitor_python_device": str(monitor_identity["device"]),
+        "monitor_python_inode": str(monitor_identity["inode"]),
+        "monitor_python_mode": format(monitor_identity["mode"], "o"),
+        "monitor_python_nlink": "1",
+        "monitor_python_uid": str(monitor_identity["uid"]),
+        "monitor_python_gid": str(monitor_identity["gid"]),
+        "monitor_python_size": str(monitor_identity["size"]),
+        "monitor_python_mtime_ns": str(monitor_identity["mtime_ns"]),
+        "monitor_python_ctime_ns": str(monitor_identity["ctime_ns"]),
+        "monitor_python_authority_status": "verified",
+        "monitor_python_startup_flags_status": "verified",
+        "observed_sample_limit_status": "proved",
+        "process_tree_escape_pid": "0",
+        "rc": "0",
+        "status": "completed",
+        "target_env_injected_parent_limit_bytes": "1073741824",
+        "target_env_injected_parent_proof_fd": "3",
+        "target_env_injected_parent_schema": "cheng.guard.target_env.injected_parent",
+        "tracked_output_0_identity_stable": "1",
+        "tracked_output_0_label": "provenance_manifest",
+        "tracked_output_0_nlink": "1",
+        "tracked_output_0_path": os.fspath(manifest_path),
+        "tracked_output_0_seal_status": "verified",
+        "tracked_output_0_sha256": manifest_file["sha256"],
+        "tracked_output_0_status": "verified",
+        "tracked_output_0_target_fd": "10",
+        "tracked_output_0_target_fd_identity_status": "verified_held_single_link_output",
+        "tracked_output_0_target_fd_inheritance_status": "verified_preexec_exact",
+        "tracked_output_0_target_fd_path": MANIFEST_FD_PATH,
+        "tracked_output_0_target_fd_argv_count": "1",
+        "tracked_output_0_target_fd_argv_sha256": expected_argv_sha256,
+        "tracked_output_fd_argv_sha256": expected_argv_sha256,
+        "tracked_output_fd_status": "verified_preexec_exact",
+    }
+    for key, value in required.items():
+        if rows.get(key) != value:
+            fail(f"guard_report_field_invalid:{key}")
+    capability = rows.get("target_env_injected_parent_capability", "")
+    if (
+        len(capability) != 64
+        or any(character not in "0123456789abcdef" for character in capability)
+        or rows.get("target_env_injected_parent_capability_sha256")
+        != sha256_bytes(capability.encode("ascii"))
+    ):
+        fail("guard_report_capability_invalid")
+    proof = manifest.get("guard_parent_proof")
+    if not isinstance(proof, dict):
+        fail("guard_report_manifest_proof_missing")
+    proof_rows = {
+        "limit_bytes": "target_env_injected_parent_limit_bytes",
+        "monitor_pid": "target_env_injected_parent_monitor_pid",
+        "proof_record_sha256": "target_env_injected_parent_proof_record_sha256",
+        "root_pgid": "target_env_injected_parent_root_pgid",
+        "root_pid": "target_env_injected_parent_root_pid",
+        "root_ppid": "target_env_injected_parent_root_ppid",
+        "root_sid": "target_env_injected_parent_root_sid",
+        "root_start_tvsec": "target_env_injected_parent_root_start_tvsec",
+        "root_start_tvusec": "target_env_injected_parent_root_start_tvusec",
+    }
+    for proof_key, report_key in proof_rows.items():
+        if rows.get(report_key) != str(proof.get(proof_key, "")):
+            fail(f"guard_report_proof_mismatch:{proof_key}")
+    runtime_path = report_path.parent / "guard-snapshot/beat_c_process_group_guard_runtime.py"
+    if rows.get("monitor_runtime_script_path") != os.fspath(runtime_path):
+        fail("guard_report_runtime_path_invalid")
+    runtime = stable_file(runtime_path, "guard_report_runtime")
+    runtime_identity = runtime["identity"]
+    runtime_required = {
+        "monitor_runtime_script_builtin_sha256": expected["guard_runtime_sha256"],
+        "monitor_runtime_script_device": str(runtime_identity["device"]),
+        "monitor_runtime_script_gid": str(runtime_identity["gid"]),
+        "monitor_runtime_script_inode": str(runtime_identity["inode"]),
+        "monitor_runtime_script_invocation_status": "verified_o_nofollow_loader_fd9",
+        "monitor_runtime_script_mode": format(runtime_identity["mode"], "o"),
+        "monitor_runtime_script_mtime_ns": str(runtime_identity["mtime_ns"]),
+        "monitor_runtime_script_nlink": "1",
+        "monitor_runtime_script_sha256": expected["guard_runtime_sha256"],
+        "monitor_runtime_script_size": str(runtime_identity["size"]),
+        "monitor_runtime_script_ctime_ns": str(runtime_identity["ctime_ns"]),
+        "monitor_runtime_script_stage_expected_sha256": expected["guard_runtime_sha256"],
+        "monitor_runtime_script_uid": str(runtime_identity["uid"]),
+        "monitor_runtime_script_expected_sha_match": "1",
+        "monitor_runtime_script_fd": "9",
+    }
+    for key, value in runtime_required.items():
+        if rows.get(key) != value:
+            fail(f"guard_report_runtime_field_invalid:{key}")
+    manifest_identity = manifest_file["identity"]
+    manifest_required = {
+        "tracked_output_0_device": str(manifest_identity["device"]),
+        "tracked_output_0_final_mode": format(manifest_identity["mode"], "o"),
+        "tracked_output_0_gid": str(manifest_identity["gid"]),
+        "tracked_output_0_inode": str(manifest_identity["inode"]),
+        "tracked_output_0_mode": format(manifest_identity["mode"], "o"),
+        "tracked_output_0_open_device": str(manifest_identity["device"]),
+        "tracked_output_0_open_inode": str(manifest_identity["inode"]),
+        "tracked_output_0_size": str(manifest_identity["size"]),
+        "tracked_output_0_uid": str(manifest_identity["uid"]),
+    }
+    for key, value in manifest_required.items():
+        if rows.get(key) != value:
+            fail(f"guard_report_manifest_field_invalid:{key}")
+
+
+def verify_manifest_state(
+    source_path_raw: str,
+    expected: dict[str, str],
+    manifest_path_raw: str,
+    guard_report_path_raw: str,
+    *,
+    admitted: bool,
+) -> dict[str, Any]:
+    manifest_path = require_canonical_absolute(
+        pathlib.Path(manifest_path_raw), "dynamic_manifest"
+    )
+    raw, manifest_file = stable_file_bytes(
+        manifest_path, "dynamic_manifest", 8 * 1024 * 1024
+    )
+    manifest = parse_canonical_json(raw, "dynamic_manifest")
+    if list(manifest) != [
+        "dynamic_completion_credit",
+        "execution",
+        "generation",
+        "guard_parent_proof",
+        "inputs",
+        "inputs_before_after_equal",
+        "legacy_directories_authority",
+        "outputs",
+        "schema",
+        "status",
+        "tsc_file_list",
+    ]:
+        fail("dynamic_manifest_fields_invalid")
+    if (
+        manifest.get("schema") != SCHEMA
+        or manifest.get("status")
+        != "guarded_process_completed_pending_admission"
+        or manifest.get("dynamic_completion_credit") != 0
+        or manifest.get("inputs_before_after_equal") is not True
+        or manifest.get("legacy_directories_authority") != "none"
+    ):
+        fail("dynamic_manifest_header_invalid")
+    source_path, repo_root, package_root = source_binding(source_path_raw)
+    inputs = input_snapshot(source_path, repo_root, package_root, expected)
+    public_inputs = public_input_snapshot(inputs)
+    if manifest.get("inputs") != public_inputs:
+        fail("dynamic_manifest_input_binding_mismatch")
+    generation_fields = manifest.get("generation")
+    if not isinstance(generation_fields, dict):
+        fail("dynamic_manifest_generation_missing")
+    generation_cid = require_generation_cid(
+        generation_fields.get("generation_cid"),
+        "dynamic_manifest_generation_cid",
+    )
+    staging_name = generation_fields.get("staging_name")
+    require_generation_staging_name(staging_name, "dynamic_manifest_staging_name")
+    loaded = load_generation_object(
+        package_root,
+        generation_cid,
+        "admitted_generation" if admitted else "pending_generation",
+        staging_name=None if admitted else staging_name,
+    )
+    expected_generation = {
+        "commit": "pending_gate_admission",
+        "generation_cid": loaded["generation_cid"],
+        "generation_manifest_sha256": loaded["generation_manifest_sha256"],
+        "pointer_sha256": sha256_bytes(
+            canonical_pointer_bytes(loaded["generation_cid"])
+        ),
+        "staging_name": staging_name,
+    }
+    if manifest.get("generation") != expected_generation:
+        fail("dynamic_manifest_generation_binding_mismatch")
+    if manifest.get("outputs") != output_manifest_fields(loaded["outputs"]):
+        fail("dynamic_manifest_output_binding_mismatch")
+    generation = loaded["generation"]
+    if (
+        generation.get("inputs") != public_inputs
+        or generation.get("outputs") != manifest.get("outputs")
+        or generation.get("tsc_file_list") != manifest.get("tsc_file_list")
+        or generation.get("guard_parent_proof")
+        != manifest.get("guard_parent_proof")
+        or generation.get("legacy_directories_authority") != "none"
+    ):
+        fail("dynamic_manifest_generation_content_mismatch")
+    execution = manifest.get("execution")
+    if not isinstance(execution, dict):
+        fail("dynamic_manifest_execution_missing")
+    events = execution.get("events")
+    if not isinstance(events, list) or [event.get("label") for event in events] != [
+        "tsc_file_list",
+        "tsc_emit",
+        "freeze",
+    ]:
+        fail("dynamic_manifest_execution_sequence_invalid")
+    if execution_receipt(events) != execution:
+        fail("dynamic_manifest_execution_chain_invalid")
+    build_execution = generation.get("build_execution")
+    if (
+        not isinstance(build_execution, dict)
+        or execution_receipt(events) != build_execution
+    ):
+        fail("dynamic_manifest_build_execution_mismatch")
+    for index, event in enumerate(events):
+        if (
+            event.get("ordinal") != index
+            or event.get("return_code") != 0
+            or not isinstance(event.get("pid"), int)
+            or event["pid"] <= 1
+            or event.get("stderr") != "guard_inherited_visible"
+            or event.get("stdout")
+            != ("guard_tee_visible" if index == 0 else "guard_inherited_visible")
+        ):
+            fail(f"dynamic_manifest_execution_event_invalid:{index}")
+    if manifest_file["identity"]["mode"] & 0o222:
+        fail("dynamic_manifest_not_sealed")
+    verify_guard_report_binding(
+        guard_report_path_raw,
+        manifest_path,
+        manifest_file,
+        manifest,
+        expected,
+    )
+    return {
+        "loaded": loaded,
+        "manifest": manifest,
+        "manifest_sha256": manifest_file["sha256"],
+        "package_root": package_root,
+        "raw": raw,
+    }
+
+
+def verify_pending_manifest(
+    source_path_raw: str,
+    expected: dict[str, str],
+    manifest_path_raw: str,
+    guard_report_path_raw: str,
+) -> dict[str, Any]:
+    return verify_manifest_state(
+        source_path_raw,
+        expected,
+        manifest_path_raw,
+        guard_report_path_raw,
+        admitted=False,
+    )
+
+
+def verify_dynamic_manifest(
+    source_path_raw: str,
+    expected: dict[str, str],
+    manifest_path_raw: str,
+    guard_report_path_raw: str,
+) -> None:
+    state = verify_pending_manifest(
+        source_path_raw,
+        expected,
+        manifest_path_raw,
+        guard_report_path_raw,
+    )
+    print(
+        " ".join(
+            (
+                f"{SCHEMA}",
+                "manifest=PENDING_ADMISSION_VERIFIED",
+                f"generation_cid={state['loaded']['generation_cid']}",
+                f"manifest_sha256={state['manifest_sha256']}",
+                "dynamic_completion_credit=0",
+            )
+        ),
+        flush=True,
+    )
+
+
+def identity_record_same_object(left: Any, right: Any) -> bool:
+    fields = [
+        "device",
+        "inode",
+        "mode",
+        "nlink",
+        "uid",
+        "gid",
+        "size",
+        "mtime_ns",
+        "ctime_ns",
+    ]
+    stable_fields = ("device", "inode", "mode", "nlink", "uid", "gid")
+    return (
+        isinstance(left, dict)
+        and isinstance(right, dict)
+        and list(left) == fields
+        and list(right) == fields
+        and all(left[field] == right[field] for field in stable_fields)
+    )
+
+
+def assert_published_generation_handoff(
+    pending: dict[str, Any], published: dict[str, Any]
+) -> None:
+    fields = [
+        "generation",
+        "generation_cid",
+        "generation_identity",
+        "generation_manifest_sha256",
+        "generation_manifest_identity",
+        "objects_identity",
+        "outputs",
+        "store_identity",
+    ]
+    if list(pending) != fields or list(published) != fields:
+        fail("admission_published_generation_fields_invalid")
+    for field in (
+        "generation",
+        "generation_cid",
+        "generation_manifest_sha256",
+        "generation_manifest_identity",
+        "outputs",
+        "store_identity",
+    ):
+        if pending[field] != published[field]:
+            fail(f"admission_published_generation_content_mismatch:{field}")
+    if (
+        not identity_record_same_object(
+            pending["generation_identity"], published["generation_identity"]
+        )
+        or pending["generation_identity"]["size"]
+        != published["generation_identity"]["size"]
+        or pending["generation_identity"]["mtime_ns"]
+        != published["generation_identity"]["mtime_ns"]
+    ):
+        fail("admission_published_generation_identity_mismatch")
+    if not identity_record_same_object(
+        pending["objects_identity"], published["objects_identity"]
+    ):
+        fail("admission_published_objects_identity_mismatch")
+
+
+def admit_dynamic_manifest(
+    source_path_raw: str,
+    expected: dict[str, str],
+    manifest_path_raw: str,
+    guard_report_path_raw: str,
+) -> None:
+    before = verify_pending_manifest(
+        source_path_raw,
+        expected,
+        manifest_path_raw,
+        guard_report_path_raw,
+    )
+    package_root = before["package_root"]
+    (
+        store,
+        _,
+        store_descriptor,
+        objects_descriptor,
+        lock_descriptor,
+    ) = acquire_generation_store(package_root)
+    if os.path.lexists(store / GENERATION_CURRENT):
+        load_current_generation(package_root)
+    after = verify_pending_manifest(
+        source_path_raw,
+        expected,
+        manifest_path_raw,
+        guard_report_path_raw,
+    )
+    if (
+        before["manifest_sha256"] != after["manifest_sha256"]
+        or before["loaded"] != after["loaded"]
+    ):
+        fail("admission_inputs_or_generation_changed_under_lock")
+    generation_cid = after["loaded"]["generation_cid"]
+    staging_name = after["manifest"]["generation"]["staging_name"]
+    publish_generation_object(
+        objects_descriptor,
+        staging_name,
+        generation_cid,
+    )
+    published = load_generation_object(
+        package_root,
+        generation_cid,
+        "admission_published_generation",
+    )
+    assert_published_generation_handoff(after["loaded"], published)
+    pointer_sha256 = publish_current_pointer(store_descriptor, generation_cid)
+    expected_pointer_sha256 = after["manifest"]["generation"]["pointer_sha256"]
+    if pointer_sha256 != expected_pointer_sha256:
+        fail("admission_pointer_sha256_mismatch")
+    current = load_current_generation(package_root)
+    if (
+        current["generation_cid"] != generation_cid
+        or current["generation_manifest_sha256"]
+        != after["loaded"]["generation_manifest_sha256"]
+        or current["outputs"] != after["loaded"]["outputs"]
+    ):
+        fail("admission_current_generation_mismatch")
+    _ = (objects_descriptor, lock_descriptor)
+    print(
+        " ".join(
+            (
+                f"{SCHEMA}",
+                "admission=PASS",
+                f"generation_cid={generation_cid}",
+                f"manifest_sha256={after['manifest_sha256']}",
+                f"pointer_sha256={pointer_sha256}",
+                "dynamic_completion_credit=1",
+            )
+        ),
+        flush=True,
+    )
+
+
+def verify_admitted_manifest(
+    source_path_raw: str,
+    expected: dict[str, str],
+    manifest_path_raw: str,
+    guard_report_path_raw: str,
+) -> None:
+    state = verify_manifest_state(
+        source_path_raw,
+        expected,
+        manifest_path_raw,
+        guard_report_path_raw,
+        admitted=True,
+    )
+    current = load_current_generation(state["package_root"])
+    loaded = state["loaded"]
+    if (
+        current["generation_cid"] != loaded["generation_cid"]
+        or current["generation_manifest_sha256"]
+        != loaded["generation_manifest_sha256"]
+        or current["outputs"] != loaded["outputs"]
+        or current["pointer_sha256"]
+        != state["manifest"]["generation"]["pointer_sha256"]
+    ):
+        fail("admitted_manifest_current_binding_mismatch")
+    print(
+        " ".join(
+            (
+                f"{SCHEMA}",
+                "admitted_manifest=CURRENT_VERIFIED",
+                f"generation_cid={loaded['generation_cid']}",
+                f"manifest_sha256={state['manifest_sha256']}",
+                "dynamic_completion_credit=1",
+            )
+        ),
+        flush=True,
+    )
+
+
+def expect_failure(action: Any, label: str) -> None:
+    try:
+        action()
+    except ProvenanceError:
+        return
+    fail(f"self_test_expected_failure_missing:{label}")
+
+
+def self_test() -> None:
+    home = pathlib.Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    evidence_base = home / "cheng-patches/csg-gates"
+    evidence_base.mkdir(parents=True, exist_ok=True)
+    work = pathlib.Path(tempfile.mkdtemp(prefix="ts-source-freeze-runner-contract.", dir=evidence_base))
+    try:
+        source_root = work / "source"
+        source_root.mkdir()
+        (source_root / "main.ts").write_text("export const value = 1;\n", encoding="utf-8")
+        first = tree_snapshot(source_root, "self_test_source")
+        (source_root / "main.ts").write_text("export const value = 2;\n", encoding="utf-8")
+        second = tree_snapshot(source_root, "self_test_source")
+        expect_failure(
+            lambda: assert_input_snapshot_equal(first, second), "stale_source"
+        )
+
+        active = work / "pair/dist"
+        frozen = work / "pair/dist-frozen"
+        active.mkdir(parents=True)
+        frozen.mkdir(parents=True)
+        (active / "cli.js").write_text("export {};\n", encoding="utf-8")
+        (frozen / "cli.js").write_text("export {};\n", encoding="utf-8")
+        active_snapshot = tree_snapshot(active, "self_test_active")
+        directories, files = manifest_tree_rows(active_snapshot)
+        freeze_manifest = {
+            "schema": "ts_csg_dist_freeze",
+            "source_root": "dist",
+            "target_root": "dist-frozen",
+            "directories": directories,
+            "file_count": len(files),
+            "files": files,
+        }
+        (frozen / FREEZE_MANIFEST).write_text(
+            json.dumps(freeze_manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        verify_output_pair(work / "pair", "self_test_pair")
+        (frozen / "cli.js").write_text("stale\n", encoding="utf-8")
+        expect_failure(
+            lambda: verify_output_pair(work / "pair", "self_test_pair"),
+            "stale_dist",
+        )
+
+        symlink_root = work / "symlink"
+        symlink_root.mkdir()
+        (symlink_root / "target").write_text("x\n", encoding="utf-8")
+        os.symlink("target", symlink_root / "link")
+        expect_failure(lambda: tree_snapshot(symlink_root, "self_test_symlink"), "symlink")
+
+        hardlink_root = work / "hardlink"
+        hardlink_root.mkdir()
+        (hardlink_root / "first").write_text("same inode\n", encoding="utf-8")
+        os.link(hardlink_root / "first", hardlink_root / "second")
+        expect_failure(
+            lambda: tree_snapshot(hardlink_root, "self_test_hardlink"),
+            "hardlink",
+        )
+
+        cleanup_outside = work / "cleanup-outside"
+        cleanup_outside.write_text("must survive\n", encoding="utf-8")
+        cleanup_root = work / "cleanup-root"
+        cleanup_root.mkdir()
+        (cleanup_root / "nested").mkdir()
+        (cleanup_root / "nested/file").write_text("delete\n", encoding="utf-8")
+        os.symlink(cleanup_outside, cleanup_root / "outside-link")
+        cleanup_identity = stat_identity(
+            os.stat(cleanup_root, follow_symlinks=False)
+        )
+        safe_remove_tree(cleanup_root, cleanup_identity, "self_test_cleanup")
+        if cleanup_root.exists() or cleanup_outside.read_text(encoding="utf-8") != "must survive\n":
+            fail("self_test_fd_safe_cleanup_failed")
+
+        pointer_store = work / "pointer-store"
+        pointer_store.mkdir(mode=0o700)
+        pointer_descriptor = os.open(pointer_store, directory_open_flags())
+        try:
+            pointer_cid = "a" * 64
+            pointer_sha = publish_current_pointer(pointer_descriptor, pointer_cid)
+        finally:
+            os.close(pointer_descriptor)
+        pointer_raw, pointer_entry = stable_file_bytes(
+            pointer_store / GENERATION_CURRENT,
+            "self_test_pointer",
+            4096,
+        )
+        if (
+            pointer_sha != pointer_entry["sha256"]
+            or parse_canonical_json(pointer_raw, "self_test_pointer")["generation_cid"]
+            != pointer_cid
+        ):
+            fail("self_test_pointer_commit_failed")
+
+        generation_objects = work / "generation-objects"
+        generation_objects.mkdir(mode=0o700)
+        staging_name = ".generation.pending." + "b" * 32
+        generation_cid = "c" * 64
+        generation_stage = generation_objects / staging_name
+        generation_stage.mkdir(mode=0o700)
+        (generation_stage / "payload").write_bytes(b"first\n")
+        os.chmod(generation_stage / "payload", 0o400)
+        os.chmod(generation_stage, 0o500)
+        generation_objects_descriptor = os.open(
+            generation_objects, directory_open_flags()
+        )
+        try:
+            publish_generation_object(
+                generation_objects_descriptor,
+                staging_name,
+                generation_cid,
+            )
+            published_before = tree_snapshot(
+                generation_objects / generation_cid,
+                "self_test_generation_published",
+            )
+            generation_stage.mkdir(mode=0o700)
+            (generation_stage / "payload").write_bytes(b"replay\n")
+            os.chmod(generation_stage / "payload", 0o400)
+            os.chmod(generation_stage, 0o500)
+            expect_failure(
+                lambda: publish_generation_object(
+                    generation_objects_descriptor,
+                    staging_name,
+                    generation_cid,
+                ),
+                "generation_replay",
+            )
+            published_after = tree_snapshot(
+                generation_objects / generation_cid,
+                "self_test_generation_published_after_replay",
+            )
+            if published_before != published_after:
+                fail("self_test_generation_replay_changed_object")
+        finally:
+            os.close(generation_objects_descriptor)
+        for generation_path, generation_label in (
+            (generation_objects / generation_cid, "self_test_generation_object_cleanup"),
+            (generation_stage, "self_test_generation_stage_cleanup"),
+        ):
+            safe_remove_tree(
+                generation_path,
+                stat_identity(os.stat(generation_path, follow_symlinks=False)),
+                generation_label,
+            )
+
+        replacement = work / "tool"
+        replacement.write_text("tool-a\n", encoding="utf-8")
+        expected_sha = stable_file(replacement, "self_test_tool")["sha256"]
+        replacement.write_text("tool-b\n", encoding="utf-8")
+        expect_failure(
+            lambda: require_expected(
+                stable_file(replacement, "self_test_tool")["sha256"],
+                expected_sha,
+                "self_test_tool",
+            ),
+            "tool_replacement",
+        )
+
+        expect_failure(
+            lambda: relative_name(source_root, work / "escaped"), "path_escape"
+        )
+        fake_manifest = work / "forged-manifest.json"
+        fake_manifest.write_text(
+            '{"dynamic_completion_credit":1,"schema":"csg_core_ts_source_freeze_provenance","status":"verified_in_guarded_process"}\n',
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: verify_dynamic_manifest(
+                pathlib.Path(__file__).resolve().as_posix(),
+                {key: "0" * 64 for key in EXPECTED_KEYS},
+                fake_manifest.as_posix(),
+                fake_manifest.as_posix(),
+            ),
+            "forged_manifest",
+        )
+        print(
+            f"{SCHEMA} self_test=PASS cases=10 evidence={work}",
+            flush=True,
+        )
+    except BaseException:
+        raise
+
+
+def main(arguments: list[str]) -> None:
+    require_python_runtime_context()
+    install_fail_stop_signal_handlers()
+    if arguments == ["--self-test"]:
+        self_test()
+        return
+    mode, source_path_raw, expected, values, cli_arguments = parse_mode_arguments(
+        arguments
+    )
+    if mode == "--audit":
+        _, _, inputs, activation = audit(source_path_raw, expected)
+        print(
+            " ".join(
+                (
+                    f"{SCHEMA}_gate",
+                    "STATIC_ONLY",
+                    f"source_inputs_sha256={inputs['bytes_root']}",
+                    "package_generation_entry=bound",
+                    f"current_generation={activation['current_generation']}",
+                    f"module_consumers={activation['module_consumers']}",
+                    f"production_activation={activation['production_activation']}",
+                    "launcher_exec_identity=HARD_RED:no_external_launcher_anchor",
+                    "historical_manifest_authority=none",
+                    "dynamic_completion_credit=0",
+                )
+            ),
+            flush=True,
+        )
+    elif mode == "--exec-current-cli":
+        raise SystemExit(
+            execute_current_generation_cli(
+                source_path_raw,
+                expected,
+                cli_arguments,
+            )
+        )
+    elif mode == "--run":
+        build_and_publish(
+            source_path_raw,
+            expected,
+            values["manifest-fd-path"],
+        )
+    elif mode == "--verify-manifest":
+        verify_dynamic_manifest(
+            source_path_raw,
+            expected,
+            values["manifest-path"],
+            values["guard-report-path"],
+        )
+    elif mode == "--admit-manifest":
+        admit_dynamic_manifest(
+            source_path_raw,
+            expected,
+            values["manifest-path"],
+            values["guard-report-path"],
+        )
+    else:
+        verify_admitted_manifest(
+            source_path_raw,
+            expected,
+            values["manifest-path"],
+            values["guard-report-path"],
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except ProvenanceError as error:
+        print(f"{SCHEMA}_error={error}", file=sys.stderr, flush=True)
+        raise SystemExit(1)

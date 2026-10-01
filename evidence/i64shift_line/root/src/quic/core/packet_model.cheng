@@ -1,0 +1,820 @@
+# MsQuic core packet model (no-pointer, in-process).
+
+import std/result
+import std/rawbytes
+import std/buffer as bytebuffer
+import std/varint
+import cheng/quic/core/frame_model
+import cheng/quic/core/quic_varint
+
+const
+    MsQuicMaxFramesPerPacket = 32
+    msQuicMaxFramesPerPacket = 32
+    MsQuicPacketBuildSourceCapacity = 128
+    MsQuicPacketStoreSlotCount = 4
+    MsQuicPacketStoreFrameCapacity = 128
+
+type
+    MsQuicPacket =
+        number: int64
+        storeSlot: int32
+        framesCount: int32
+        ackEliciting: bool
+        payload: Bytes
+
+    MsQuicFrameDecoded =
+        frame: frame_model.MsQuicFrame
+        next: int32
+
+    MsQuicPacketBuildOutcome =
+        packet: MsQuicPacket
+        used: int32
+
+    MsQuicPacketStore =
+        buildFrameKinds: int64[MsQuicMaxFramesPerPacket]
+        buildFrameStreamIds: int64[MsQuicMaxFramesPerPacket]
+        buildFrameOffsets: int64[MsQuicMaxFramesPerPacket]
+        buildFrameValues: int64[MsQuicMaxFramesPerPacket]
+        frameKinds: int64[MsQuicPacketStoreFrameCapacity]
+        frameStreamIds: int64[MsQuicPacketStoreFrameCapacity]
+        frameOffsets: int64[MsQuicPacketStoreFrameCapacity]
+        frameValues: int64[MsQuicPacketStoreFrameCapacity]
+        framePayloadPtrs: uint64[MsQuicPacketStoreFrameCapacity]
+        framePayloadLens: int32[MsQuicPacketStoreFrameCapacity]
+
+var
+    msquicPacketStore: MsQuicPacketStore
+    msquicPacketBuildFrameKinds: int64[MsQuicMaxFramesPerPacket]
+    msquicPacketBuildFrameStreamIds: int64[MsQuicMaxFramesPerPacket]
+    msquicPacketBuildFrameOffsets: int64[MsQuicMaxFramesPerPacket]
+    msquicPacketBuildFrameValues: int64[MsQuicMaxFramesPerPacket]
+    msquicPacketFrameKinds: int64[MsQuicPacketStoreFrameCapacity]
+    msquicPacketFrameStreamIds: int64[MsQuicPacketStoreFrameCapacity]
+    msquicPacketFrameOffsets: int64[MsQuicPacketStoreFrameCapacity]
+    msquicPacketFrameValues: int64[MsQuicPacketStoreFrameCapacity]
+    msquicPacketFramePayloadPtrs: uint64[MsQuicPacketStoreFrameCapacity]
+    msquicPacketFramePayloadLens: int32[MsQuicPacketStoreFrameCapacity]
+    msquicPacketBuildNumber: int64
+    msquicPacketBuildAckEliciting: bool
+    msquicPacketBuildFrameCount: int32
+    msquicPacketBuildUsed: int32
+    msquicPacketBuildMaxPacketSize: int32
+    msquicPacketBuildCurrentSize: int32
+    msquicPacketStoreNextSlot: int32
+
+fn packetFrameKind(frame: frame_model.MsQuicFrame): frame_model.MsQuicFrameType =
+    return frame.kind
+
+fn packetFrameKindCode(frame: frame_model.MsQuicFrame): int64 =
+    return frame_model.MsQuicFrameWireKind(frame)
+
+fn packetFrameStreamId(frame: frame_model.MsQuicFrame): int64 =
+    return frame.streamId
+
+fn packetFrameOffset(frame: frame_model.MsQuicFrame): int64 =
+    return frame.offset
+
+fn packetFrameValue(frame: frame_model.MsQuicFrame): int64 =
+    return frame.value
+
+fn packetFramePayload(frame: frame_model.MsQuicFrame): Bytes =
+    return frame.data
+
+fn packetFrameCodeAckEliciting(kindCode: int64): bool =
+    if kindCode == 0x02 ||
+       kindCode == 0x00 ||
+       kindCode == 0x1c ||
+       kindCode == 0x1d:
+        return false
+    return true
+
+fn packetFrameFromParts(kindCode: int64, streamId: int64, offset: int64, value: int64, data: Bytes): frame_model.MsQuicFrame =
+    var frame: frame_model.MsQuicFrame
+    let kindRes: Result[frame_model.MsQuicFrameType] = frame_model.MsQuicFrameTypeFromInt(kindCode)
+    if IsOk(kindRes):
+        frame.kind = Value(kindRes)
+    else:
+        frame.kind = frame_model.FramePadding
+    frame.wireKind = kindCode
+    frame.streamId = streamId
+    frame.offset = offset
+    frame.value = value
+    frame.data = data
+    return frame
+
+fn packetStoreAcquireSlot(): int32 =
+    return 0
+
+fn packetStoreFrameIndex(slot: int32, idx: int32): int32 =
+    return slot * MsQuicMaxFramesPerPacket + idx
+
+fn packetAppendPayloadBytes(packetOut: var MsQuicPacket, extra: Bytes) =
+    let oldLen: int32 = BytesLen(packetOut.payload)
+    let addLen: int32 = BytesLen(extra)
+    if addLen <= 0:
+        return
+    let out: Bytes = BytesAlloc(oldLen + addLen)
+    if oldLen > 0:
+        BytesCopyInto(out, 0, packetOut.payload)
+    BytesCopyInto(out, oldLen, extra)
+    packetOut.payload = out
+
+fn packetFramePayloadEncode(frame: frame_model.MsQuicFrame): Result[Bytes] =
+    return packetFramePayloadEncodeParts(packetFrameWireCode(frame),
+                                          packetFrameStreamId(frame),
+                                          packetFrameOffset(frame),
+                                          packetFrameValue(frame),
+                                          packetFramePayload(frame))
+
+# Wire-encode kind/streamId/offset/value varints + length-prefixed data directly
+# into one presized buffer (single BytesAlloc + bulk copy of `data`). Replaces
+# the old GrowByteBuffer append form, which reallocated + copied the whole
+# growing header on every one of the 5 appends and leaked a small Bytes chunk
+# per varint (quicVarIntAppend -> quicVarIntEncode -> BytesAlloc, never freed
+# after being copied into the buffer) — this is the per-app-data-frame hot
+# path (every STREAM frame on every video packet), so that leak/churn ran on
+# every packet sent.
+@borrows
+fn packetFramePayloadEncodeParts(kindCode: int64,
+                                 streamId: int64,
+                                 offset: int64,
+                                 value: int64,
+                                 data: Bytes): Result[Bytes] =
+    let dataLen: int32 = BytesLen(data)
+    let kindLen: int32 = quicVarIntEncodedLen(kindCode)
+    if kindLen <= 0:
+        return Err[Bytes]("msquic packet: invalid frame kind varint")
+    let streamLen: int32 = quicVarIntEncodedLen(streamId)
+    if streamLen <= 0:
+        return Err[Bytes]("msquic packet: invalid frame stream id varint")
+    let offsetLen: int32 = quicVarIntEncodedLen(offset)
+    if offsetLen <= 0:
+        return Err[Bytes]("msquic packet: invalid frame offset varint")
+    let valueLen: int32 = quicVarIntEncodedLen(value)
+    if valueLen <= 0:
+        return Err[Bytes]("msquic packet: invalid frame value varint")
+    let dataLenVarLen: int32 = quicVarIntEncodedLen(int64(dataLen))
+    if dataLenVarLen <= 0:
+        return Err[Bytes]("msquic packet: invalid frame payload length varint")
+    let total: int32 = kindLen + streamLen + offsetLen + valueLen + dataLenVarLen + dataLen
+    let out: Bytes = BytesAlloc(total)
+    let kindRes: Result[int32] = quicVarIntWriteInto(out, 0, kindCode)
+    let streamRes: Result[int32] = quicVarIntWriteInto(out, Value(kindRes), streamId)
+    let offsetRes: Result[int32] = quicVarIntWriteInto(out, Value(streamRes), offset)
+    let valueRes: Result[int32] = quicVarIntWriteInto(out, Value(offsetRes), value)
+    let lenRes: Result[int32] = quicVarIntWriteInto(out, Value(valueRes), int64(dataLen))
+    if dataLen > 0:
+        BytesCopyInto(out, Value(lenRes), data)
+    return Ok[Bytes](out)
+
+fn packetFrameAt(packet: var MsQuicPacket, idx: int32): frame_model.MsQuicFrame =
+    var offset: int32
+    var current: int32
+    while offset < BytesLen(packet.payload):
+        let frameRes: Result[MsQuicFrameDecoded] = msquicFramePayloadDecode(packet.payload, offset)
+        if IsErr(frameRes):
+            return packetFrameFromParts(0, 0, 0, 0, emptyBytes())
+        let decoded: MsQuicFrameDecoded = Value(frameRes)
+        if current == idx:
+            return decoded.frame
+        offset = decoded.next
+        current = current + 1
+    return packetFrameFromParts(0, 0, 0, 0, emptyBytes())
+
+fn packetSetFrameParts(packetOut: var MsQuicPacket, idx: int32, kindCode: int64, streamId: int64, offset: int64, value: int64, payload: Bytes) =
+    let encRes: Result[Bytes] = packetFramePayloadEncodeParts(kindCode, streamId, offset, value, payload)
+    if IsOk(encRes):
+        packetAppendPayloadBytes(packetOut, Value(encRes))
+
+fn packetFrameTypeWireCode(kind: frame_model.MsQuicFrameType): int64 =
+    let code: int64 = int64(kind)
+    if code >= 0 && code <= 0x1f:
+        return code
+    if code == 0x30:
+        return code
+    if code == 0xaf:
+        return code
+    if kind == frame_model.FramePadding:
+        return 0x00
+    if kind == frame_model.FramePing:
+        return 0x01
+    if kind == frame_model.FrameAck:
+        return 0x02
+    if kind == frame_model.FrameReset:
+        return 0x04
+    if kind == frame_model.FrameStopSending:
+        return 0x05
+    if kind == frame_model.FrameCrypto:
+        return 0x06
+    if kind == frame_model.FrameNewToken:
+        return 0x07
+    if kind == frame_model.FrameData:
+        return 0x0e
+    if kind == frame_model.FrameDataFin:
+        return 0x0f
+    if kind == frame_model.FrameMaxData:
+        return 0x10
+    if kind == frame_model.FrameMaxStreamData:
+        return 0x11
+    if kind == frame_model.FrameMaxStreamsBidi:
+        return 0x12
+    if kind == frame_model.FrameMaxStreamsUni:
+        return 0x13
+    if kind == frame_model.FrameDataBlocked:
+        return 0x14
+    if kind == frame_model.FrameStreamDataBlocked:
+        return 0x15
+    if kind == frame_model.FrameStreamsBlockedBidi:
+        return 0x16
+    if kind == frame_model.FrameStreamsBlockedUni:
+        return 0x17
+    if kind == frame_model.FrameNewConnectionId:
+        return 0x18
+    if kind == frame_model.FrameRetireConnectionId:
+        return 0x19
+    if kind == frame_model.FramePathChallenge:
+        return 0x1a
+    if kind == frame_model.FramePathResponse:
+        return 0x1b
+    if kind == frame_model.FrameConnectionClose:
+        return 0x1c
+    if kind == frame_model.FrameConnectionCloseApp:
+        return 0x1d
+    if kind == frame_model.FrameHandshakeDone:
+        return 0x1e
+    if kind == frame_model.FrameImmediateAck:
+        return 0x1f
+    if kind == frame_model.FrameDatagram:
+        return 0x30
+    if kind == frame_model.FrameAckFrequency:
+        return 0xaf
+    return -1
+
+fn packetFrameWireCode(frame: frame_model.MsQuicFrame): int64 =
+    let wireKind: int64 = packetFrameKindCode(frame)
+    if wireKind >= 0:
+        return wireKind
+    let kind = packetFrameKind(frame)
+    let code: int64 = int64(kind)
+    if code >= 0 && code <= 0x1f:
+        return code
+    if code == 0x30:
+        return code
+    if code == 0xaf:
+        return code
+    if kind == frame_model.FramePadding:
+        return 0x00
+    if kind == frame_model.FramePing:
+        return 0x01
+    if kind == frame_model.FrameAck:
+        return 0x02
+    if kind == frame_model.FrameReset:
+        return 0x04
+    if kind == frame_model.FrameStopSending:
+        return 0x05
+    if kind == frame_model.FrameCrypto:
+        return 0x06
+    if kind == frame_model.FrameNewToken:
+        return 0x07
+    if kind == frame_model.FrameData:
+        return 0x0e
+    if kind == frame_model.FrameDataFin:
+        return 0x0f
+    if kind == frame_model.FrameMaxData:
+        return 0x10
+    if kind == frame_model.FrameMaxStreamData:
+        return 0x11
+    if kind == frame_model.FrameMaxStreamsBidi:
+        return 0x12
+    if kind == frame_model.FrameMaxStreamsUni:
+        return 0x13
+    if kind == frame_model.FrameDataBlocked:
+        return 0x14
+    if kind == frame_model.FrameStreamDataBlocked:
+        return 0x15
+    if kind == frame_model.FrameStreamsBlockedBidi:
+        return 0x16
+    if kind == frame_model.FrameStreamsBlockedUni:
+        return 0x17
+    if kind == frame_model.FrameNewConnectionId:
+        return 0x18
+    if kind == frame_model.FrameRetireConnectionId:
+        return 0x19
+    if kind == frame_model.FramePathChallenge:
+        return 0x1a
+    if kind == frame_model.FramePathResponse:
+        return 0x1b
+    if kind == frame_model.FrameConnectionClose:
+        return 0x1c
+    if kind == frame_model.FrameConnectionCloseApp:
+        return 0x1d
+    if kind == frame_model.FrameHandshakeDone:
+        return 0x1e
+    if kind == frame_model.FrameImmediateAck:
+        return 0x1f
+    if kind == frame_model.FrameDatagram:
+        return 0x30
+    if kind == frame_model.FrameAckFrequency:
+        return 0xaf
+    return -1
+
+fn packetFrameSize(frame: frame_model.MsQuicFrame): int32 =
+    let kindLen: int32 = quicVarIntEncodedLen(packetFrameWireCode(frame))
+    let streamLen: int32 = quicVarIntEncodedLen(packetFrameStreamId(frame))
+    let offsetLen: int32 = quicVarIntEncodedLen(packetFrameOffset(frame))
+    let valueLen: int32 = quicVarIntEncodedLen(packetFrameValue(frame))
+    let dataLen: int32 = BytesLen(packetFramePayload(frame))
+    let payloadLenLen: int32 = quicVarIntEncodedLen(int64(dataLen))
+    if kindLen <= 0 || streamLen <= 0 || offsetLen <= 0 || valueLen <= 0 || payloadLenLen <= 0:
+        return 0
+    return kindLen + streamLen + offsetLen + valueLen + payloadLenLen + dataLen
+
+fn InitMsQuicPacket(number: int64): MsQuicPacket =
+    var out: MsQuicPacket
+    out.number = number
+    out.storeSlot = packetStoreAcquireSlot()
+    out.ackEliciting = false
+    out.framesCount = 0
+    out.payload = emptyBytes()
+    return out
+
+fn initMsQuicPacket(number: int64): MsQuicPacket =
+    return InitMsQuicPacket(number)
+
+fn MsQuicPacketReset(out: var MsQuicPacket, number: int64) =
+    out.number = number
+    out.storeSlot = packetStoreAcquireSlot()
+    out.ackEliciting = false
+    out.framesCount = 0
+    out.payload = emptyBytes()
+
+fn msquicPacketReset(out: var MsQuicPacket, number: int64) =
+    MsQuicPacketReset(out, number)
+
+fn MsQuicPacketSize(p: var MsQuicPacket): int32 =
+    return 16 + BytesLen(p.payload)
+
+fn msquicPacketSize(p: var MsQuicPacket): int32 =
+    return MsQuicPacketSize(p)
+
+fn MsQuicPacketAckEliciting(p: var MsQuicPacket): bool =
+    return p.ackEliciting
+
+fn MsQuicPacketNumber(p: var MsQuicPacket): int64 =
+    return p.number
+
+fn MsQuicPacketFrameCount(p: var MsQuicPacket): int32 =
+    return p.framesCount
+
+fn MsQuicPacketStoreSlot(p: var MsQuicPacket): int32 =
+    return p.storeSlot
+
+fn MsQuicPacketPayload(p: var MsQuicPacket): Bytes =
+    return p.payload
+
+fn MsQuicPacketFrameKindCodeAt(p: var MsQuicPacket, idx: int32): int64 =
+    let frame: frame_model.MsQuicFrame = packetFrameAt(p, idx)
+    return packetFrameKindCode(frame)
+
+fn MsQuicPacketFrameStreamIdAt(p: var MsQuicPacket, idx: int32): int64 =
+    let frame: frame_model.MsQuicFrame = packetFrameAt(p, idx)
+    return packetFrameStreamId(frame)
+
+fn MsQuicPacketFrameOffsetAt(p: var MsQuicPacket, idx: int32): int64 =
+    let frame: frame_model.MsQuicFrame = packetFrameAt(p, idx)
+    return packetFrameOffset(frame)
+
+fn MsQuicPacketFrameValueAt(p: var MsQuicPacket, idx: int32): int64 =
+    let frame: frame_model.MsQuicFrame = packetFrameAt(p, idx)
+    return packetFrameValue(frame)
+
+fn MsQuicPacketFramePayloadAt(p: var MsQuicPacket, idx: int32): Bytes =
+    let frame: frame_model.MsQuicFrame = packetFrameAt(p, idx)
+    return packetFramePayload(frame)
+
+fn msquicPacketAckEliciting(p: var MsQuicPacket): bool =
+    return MsQuicPacketAckEliciting(p)
+
+fn MsQuicPacketAddFrame(p: var MsQuicPacket, frame: frame_model.MsQuicFrame): Result[bool] =
+    if p.framesCount >= msQuicMaxFramesPerPacket:
+        return Err[bool]("msquic packet: frame list full")
+    let kindCode: int64 = packetFrameWireCode(frame)
+    if kindCode < 0:
+        return Err[bool]("msquic packet: invalid frame kind")
+    let encRes: Result[Bytes] = packetFramePayloadEncode(frame)
+    if IsErr(encRes):
+        return Err[bool](ErrorText(encRes))
+    packetAppendPayloadBytes(p, Value(encRes))
+    p.framesCount = p.framesCount + 1
+    if packetFrameCodeAckEliciting(kindCode):
+        p.ackEliciting = true
+    return Ok[bool](true)
+
+fn msquicPacketAddFrame(p: var MsQuicPacket, frame: frame_model.MsQuicFrame): Result[bool] =
+    return MsQuicPacketAddFrame(p, frame)
+
+@borrows
+fn MsQuicPacketAddFrameParts(
+    p: var MsQuicPacket,
+    kindCode: int64,
+    streamId: int64,
+    offset: int64,
+    value: int64,
+    data: Bytes
+): Result[bool] =
+    if p.framesCount >= msQuicMaxFramesPerPacket:
+        return Err[bool]("msquic packet: frame list full")
+    let kindRes: Result[frame_model.MsQuicFrameType] = frame_model.MsQuicFrameTypeFromInt(kindCode)
+    if IsErr(kindRes):
+        return Err[bool](ErrorText(kindRes))
+    if streamId < 0:
+        return Err[bool]("msquic packet: negative stream id")
+    if offset < 0:
+        return Err[bool]("msquic packet: negative frame offset")
+    if value < 0:
+        return Err[bool]("msquic packet: negative frame value")
+    let encRes: Result[Bytes] = packetFramePayloadEncodeParts(kindCode, streamId, offset, value, data)
+    if IsErr(encRes):
+        return Err[bool](ErrorText(encRes))
+    packetAppendPayloadBytes(p, Value(encRes))
+    p.framesCount = p.framesCount + 1
+    if packetFrameCodeAckEliciting(kindCode):
+        p.ackEliciting = true
+    return Ok[bool](true)
+
+fn msquicFrameDecode(data: Bytes, offset: int32): Result[MsQuicFrameDecoded] =
+    let kindRes: Result[VarintDecoded] = decodeUVarint(data, offset)
+    if IsErr(kindRes):
+        return Err[MsQuicFrameDecoded](ErrorText(kindRes))
+    let kindDec = Value(kindRes)
+
+    let streamRes: Result[VarintDecoded] = decodeUVarint(data, kindDec.next)
+    if IsErr(streamRes):
+        return Err[MsQuicFrameDecoded](ErrorText(streamRes))
+    let streamDec = Value(streamRes)
+
+    let offRes: Result[VarintDecoded] = decodeUVarint(data, streamDec.next)
+    if IsErr(offRes):
+        return Err[MsQuicFrameDecoded](ErrorText(offRes))
+    let offDec = Value(offRes)
+
+    let valRes: Result[VarintDecoded] = decodeUVarint(data, offDec.next)
+    if IsErr(valRes):
+        return Err[MsQuicFrameDecoded](ErrorText(valRes))
+    let valDec = Value(valRes)
+
+    let lenRes: Result[VarintDecoded] = decodeUVarint(data, valDec.next)
+    if IsErr(lenRes):
+        return Err[MsQuicFrameDecoded](ErrorText(lenRes))
+    let lenDec = Value(lenRes)
+
+    let dataLen: int32 = int32(lenDec.value)
+    if dataLen < 0:
+        return Err[MsQuicFrameDecoded]("msquic packet: negative frame length")
+    let endPos: int32 = lenDec.next + dataLen
+    if endPos > BytesLen(data):
+        return Err[MsQuicFrameDecoded]("msquic packet: frame data truncated")
+
+    let payload: Bytes = if dataLen > 0: BytesSlice(data, lenDec.next, dataLen) else: emptyBytes()
+    let kindRes2: Result[frame_model.MsQuicFrameType] = frame_model.MsQuicFrameTypeFromInt(kindDec.value)
+    if IsErr(kindRes2):
+        return Err[MsQuicFrameDecoded](ErrorText(kindRes2))
+    var frame: frame_model.MsQuicFrame
+    frame.kind = Value(kindRes2)
+    frame.wireKind = kindDec.value
+    frame.streamId = streamDec.value
+    frame.offset = offDec.value
+    frame.value = valDec.value
+    frame.data = payload
+    var decoded: MsQuicFrameDecoded
+    decoded.frame = frame
+    decoded.next = endPos
+    return Ok[MsQuicFrameDecoded](decoded)
+
+    let numRes: Result[VarintDecoded] = decodeUVarint(data, 0)
+    if IsErr(numRes):
+        return Err[MsQuicPacket](ErrorText(numRes))
+    let numDec = Value(numRes)
+
+    let countRes: Result[VarintDecoded] = decodeUVarint(data, numDec.next)
+    if IsErr(countRes):
+        return Err[MsQuicPacket](ErrorText(countRes))
+    let countDec = Value(countRes)
+
+    let count: int32 = int32(countDec.value)
+    if count < 0:
+        return Err[MsQuicPacket]("msquic packet: negative frame count")
+
+    var pkt: MsQuicPacket
+    msquicPacketReset(pkt, numDec.value)
+    var offset: int32 = countDec.next
+    for i in 0..<count:
+        let frameRes: Result[MsQuicFrameDecoded] = msquicFrameDecode(data, offset)
+        if IsErr(frameRes):
+            return Err[MsQuicPacket](ErrorText(frameRes))
+        let decoded = Value(frameRes)
+        if pkt.framesCount >= MsQuicMaxFramesPerPacket:
+            return Err[MsQuicPacket]("msquic packet: frame list full")
+        let decodedKindCode: int64 = packetFrameKindCode(decoded.frame)
+        if decodedKindCode < 0:
+            return Err[MsQuicPacket]("msquic packet: invalid decoded frame kind")
+        packetSetFrameParts(pkt,
+                            pkt.framesCount,
+                            decodedKindCode,
+                            decoded.frame.streamId,
+                            decoded.frame.offset,
+                            decoded.frame.value,
+                            decoded.frame.data)
+        pkt.framesCount = pkt.framesCount + 1
+        if packetFrameCodeAckEliciting(decodedKindCode):
+            pkt.ackEliciting = true
+        offset = decoded.next
+    return Ok[MsQuicPacket](pkt)
+
+fn msquicFrameEncode(frame: frame_model.MsQuicFrame): Bytes =
+    var buf: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    let kindCode: int64 = packetFrameWireCode(frame)
+    let kindBytes: Bytes = encodeUVarint(kindCode)
+    bytebuffer.AppendBytes(buf, kindBytes)
+    let frameStreamId: int64 = packetFrameStreamId(frame)
+    let streamIdBytes: Bytes = encodeUVarint(frameStreamId)
+    bytebuffer.AppendBytes(buf, streamIdBytes)
+    let frameOffset: int64 = packetFrameOffset(frame)
+    let offsetBytes: Bytes = encodeUVarint(frameOffset)
+    bytebuffer.AppendBytes(buf, offsetBytes)
+    let frameValue: int64 = packetFrameValue(frame)
+    let valueBytes: Bytes = encodeUVarint(frameValue)
+    bytebuffer.AppendBytes(buf, valueBytes)
+    let frameData: Bytes = packetFramePayload(frame)
+    let dataLen: int64 = int64(BytesLen(frameData))
+    let dataLenBytes: Bytes = encodeUVarint(dataLen)
+    bytebuffer.AppendBytes(buf, dataLenBytes)
+    if dataLen > 0:
+        bytebuffer.AppendBytes(buf, frameData)
+    return bytebuffer.ToBytes(buf)
+
+fn msquicPacketEncode(p: var MsQuicPacket): Bytes =
+    var buf: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    let packetNumberBytes: Bytes = encodeUVarint(p.number)
+    bytebuffer.AppendBytes(buf, packetNumberBytes)
+    let frameCountBytes: Bytes = encodeUVarint(int64(p.framesCount))
+    bytebuffer.AppendBytes(buf, frameCountBytes)
+    if BytesLen(p.payload) > 0:
+        bytebuffer.AppendBytes(buf, p.payload)
+    return bytebuffer.ToBytes(buf)
+
+fn msquicFramePayloadDecode(data: Bytes, offset: int32): Result[MsQuicFrameDecoded] =
+    let kindRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(data, offset)
+    if IsErr(kindRes):
+        return Err[MsQuicFrameDecoded](ErrorText(kindRes))
+    let kindDec = Value(kindRes)
+
+    let streamRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(data, kindDec.next)
+    if IsErr(streamRes):
+        return Err[MsQuicFrameDecoded](ErrorText(streamRes))
+    let streamDec = Value(streamRes)
+
+    let offRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(data, streamDec.next)
+    if IsErr(offRes):
+        return Err[MsQuicFrameDecoded](ErrorText(offRes))
+    let offDec = Value(offRes)
+
+    let valRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(data, offDec.next)
+    if IsErr(valRes):
+        return Err[MsQuicFrameDecoded](ErrorText(valRes))
+    let valDec = Value(valRes)
+
+    let lenRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(data, valDec.next)
+    if IsErr(lenRes):
+        return Err[MsQuicFrameDecoded](ErrorText(lenRes))
+    let lenDec = Value(lenRes)
+
+    let dataLen: int32 = int32(lenDec.value)
+    if dataLen < 0:
+        return Err[MsQuicFrameDecoded]("msquic payload: negative frame length")
+    let endPos: int32 = lenDec.next + dataLen
+    if endPos > BytesLen(data):
+        return Err[MsQuicFrameDecoded]("msquic payload: frame data truncated")
+
+    let payload: Bytes = if dataLen > 0: BytesSlice(data, lenDec.next, dataLen) else: emptyBytes()
+    let kindRes2: Result[frame_model.MsQuicFrameType] = frame_model.MsQuicFrameTypeFromInt(kindDec.value)
+    if IsErr(kindRes2):
+        return Err[MsQuicFrameDecoded](ErrorText(kindRes2))
+    var frame: frame_model.MsQuicFrame
+    frame.kind = Value(kindRes2)
+    frame.wireKind = kindDec.value
+    frame.streamId = streamDec.value
+    frame.offset = offDec.value
+    frame.value = valDec.value
+    frame.data = payload
+    var decoded: MsQuicFrameDecoded
+    decoded.frame = frame
+    decoded.next = endPos
+    return Ok[MsQuicFrameDecoded](decoded)
+
+fn msquicFramePayloadNext(data: Bytes, offset: int32): Result[int32] =
+    let kindRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(data, offset)
+    if IsErr(kindRes):
+        return Err[int32](ErrorText(kindRes))
+    let kindDec = Value(kindRes)
+    let kindTypeRes: Result[frame_model.MsQuicFrameType] = frame_model.MsQuicFrameTypeFromInt(kindDec.value)
+    if IsErr(kindTypeRes):
+        return Err[int32](ErrorText(kindTypeRes))
+    let streamRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(data, kindDec.next)
+    if IsErr(streamRes):
+        return Err[int32](ErrorText(streamRes))
+    let streamDec = Value(streamRes)
+    let offRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(data, streamDec.next)
+    if IsErr(offRes):
+        return Err[int32](ErrorText(offRes))
+    let offDec = Value(offRes)
+    let valRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(data, offDec.next)
+    if IsErr(valRes):
+        return Err[int32](ErrorText(valRes))
+    let valDec = Value(valRes)
+    let lenRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(data, valDec.next)
+    if IsErr(lenRes):
+        return Err[int32](ErrorText(lenRes))
+    let lenDec = Value(lenRes)
+    let dataLen: int32 = int32(lenDec.value)
+    if dataLen < 0:
+        return Err[int32]("msquic payload: negative frame length")
+    let endPos: int32 = lenDec.next + dataLen
+    if endPos > BytesLen(data):
+        return Err[int32]("msquic payload: frame data truncated")
+    return Ok[int32](endPos)
+
+fn msquicPacketPayloadDecode(payload: Bytes, packetNumber: int64): Result[MsQuicPacket] =
+    var out: MsQuicPacket
+    let decodeRes: Result[bool] = msquicPacketPayloadDecodeInto(out, payload, packetNumber)
+    if IsErr(decodeRes):
+        return Err[MsQuicPacket](ErrorText(decodeRes))
+    return Ok[MsQuicPacket](out)
+
+fn msquicPacketPayloadDecodeInto(out: var MsQuicPacket, payload: Bytes, packetNumber: int64): Result[bool] =
+    if packetNumber < 0:
+        return Err[bool]("msquic payload: negative packet number")
+    MsQuicPacketReset(out, packetNumber)
+    var offset: int32
+    while offset < BytesLen(payload):
+        let kindRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(payload, offset)
+        if IsErr(kindRes):
+            return Err[bool](ErrorText(kindRes))
+        let kindDec = Value(kindRes)
+        let nextRes: Result[int32] = msquicFramePayloadNext(payload, offset)
+        if IsErr(nextRes):
+            return Err[bool](ErrorText(nextRes))
+        let nextOffset: int32 = Value(nextRes)
+        if out.framesCount >= MsQuicMaxFramesPerPacket:
+            return Err[bool]("msquic packet: frame list full")
+        let frameBytes: Bytes = BytesSlice(payload, offset, nextOffset - offset)
+        packetAppendPayloadBytes(out, frameBytes)
+        out.framesCount = out.framesCount + 1
+        if packetFrameCodeAckEliciting(kindDec.value):
+            out.ackEliciting = true
+        offset = nextOffset
+    return Ok[bool](true)
+
+fn msquicPacketPayloadEncode(p: var MsQuicPacket): Result[Bytes] =
+    return Ok[Bytes](rawbytes.BytesSlice(p.payload, 0, rawbytes.BytesLen(p.payload)))
+
+fn MsQuicPacketBuildBegin(number: int64, maxPacketSize: int32): Result[bool] =
+    if maxPacketSize <= 0:
+        return Err[bool]("msquic packet: invalid max packet size")
+    msquicPacketBuildNumber = number
+    msquicPacketBuildAckEliciting = false
+    msquicPacketBuildFrameCount = 0
+    msquicPacketBuildUsed = 0
+    msquicPacketBuildMaxPacketSize = maxPacketSize
+    msquicPacketBuildCurrentSize = 16
+    return Ok[bool](true)
+
+fn MsQuicPacketBuildTryFrame(frame: frame_model.MsQuicFrame): Result[bool] =
+    if BytesLen(frame.data) > 0:
+        return Err[bool]("msquic packet builder: payload requires direct packet add")
+    let sizeNow: int32 = msquicPacketBuildCurrentSize
+    let frameSize: int32 = packetFrameSize(frame)
+    let nextSize: int32 = sizeNow + frameSize
+    if nextSize > msquicPacketBuildMaxPacketSize:
+        return Ok[bool](false)
+    if msquicPacketBuildFrameCount >= MsQuicMaxFramesPerPacket:
+        return Ok[bool](false)
+    let kindCode: int64 = packetFrameWireCode(frame)
+    if kindCode < 0:
+        return Err[bool]("msquic packet: invalid frame kind")
+    msquicPacketBuildFrameKinds[msquicPacketBuildFrameCount] = kindCode
+    msquicPacketBuildFrameStreamIds[msquicPacketBuildFrameCount] = frame.streamId
+    msquicPacketBuildFrameOffsets[msquicPacketBuildFrameCount] = frame.offset
+    msquicPacketBuildFrameValues[msquicPacketBuildFrameCount] = frame.value
+    msquicPacketBuildFrameCount = msquicPacketBuildFrameCount + 1
+    let frameKindCode: int64 = kindCode
+    if frameKindCode != 0x02 &&
+       frameKindCode != 0x00 &&
+       frameKindCode != 0x1c &&
+       frameKindCode != 0x1d:
+        msquicPacketBuildAckEliciting = true
+    msquicPacketBuildUsed = msquicPacketBuildUsed + 1
+    msquicPacketBuildCurrentSize = nextSize
+    return Ok[bool](true)
+
+fn MsQuicPacketFrameKindPadding(): int64 =
+    return packetFrameTypeWireCode(frame_model.FramePadding)
+
+fn MsQuicPacketFrameKindAck(): int64 =
+    return packetFrameTypeWireCode(frame_model.FrameAck)
+
+fn MsQuicPacketFrameKindPing(): int64 =
+    return packetFrameTypeWireCode(frame_model.FramePing)
+
+fn MsQuicPacketFrameKindData(): int64 =
+    return packetFrameTypeWireCode(frame_model.FrameData)
+
+fn MsQuicPacketBuildTryFrameParts(
+    kindCode: int64,
+    streamId: int64,
+    offset: int64,
+    value: int64,
+    data: Bytes
+): Result[bool] =
+    if BytesLen(data) > 0:
+        return Err[bool]("msquic packet builder: payload requires direct packet add")
+    let kindRes: Result[frame_model.MsQuicFrameType] = frame_model.MsQuicFrameTypeFromInt(kindCode)
+    if IsErr(kindRes):
+        return Err[bool](ErrorText(kindRes))
+    if streamId < 0:
+        return Err[bool]("msquic packet: negative stream id")
+    if offset < 0:
+        return Err[bool]("msquic packet: negative frame offset")
+    if value < 0:
+        return Err[bool]("msquic packet: negative frame value")
+    let kindLen: int32 = quicVarIntEncodedLen(kindCode)
+    let streamLen: int32 = quicVarIntEncodedLen(streamId)
+    let offsetLen: int32 = quicVarIntEncodedLen(offset)
+    let valueLen: int32 = quicVarIntEncodedLen(value)
+    let dataLen: int32 = BytesLen(data)
+    let dataLenLen: int32 = quicVarIntEncodedLen(int64(dataLen))
+    if kindLen <= 0 || streamLen <= 0 || offsetLen <= 0 || valueLen <= 0 || dataLenLen <= 0:
+        return Err[bool]("msquic packet: invalid frame size")
+    let frameSize: int32 = kindLen + streamLen + offsetLen + valueLen + dataLenLen + dataLen
+    let nextSize: int32 = msquicPacketBuildCurrentSize + frameSize
+    if nextSize > msquicPacketBuildMaxPacketSize:
+        return Ok[bool](false)
+    if msquicPacketBuildFrameCount >= MsQuicMaxFramesPerPacket:
+        return Ok[bool](false)
+    msquicPacketBuildFrameKinds[msquicPacketBuildFrameCount] = kindCode
+    msquicPacketBuildFrameStreamIds[msquicPacketBuildFrameCount] = streamId
+    msquicPacketBuildFrameOffsets[msquicPacketBuildFrameCount] = offset
+    msquicPacketBuildFrameValues[msquicPacketBuildFrameCount] = value
+    msquicPacketBuildFrameCount = msquicPacketBuildFrameCount + 1
+    if kindCode != 0x02 &&
+       kindCode != 0x00 &&
+       kindCode != 0x1c &&
+       kindCode != 0x1d:
+        msquicPacketBuildAckEliciting = true
+    msquicPacketBuildUsed = msquicPacketBuildUsed + 1
+    msquicPacketBuildCurrentSize = nextSize
+    return Ok[bool](true)
+
+fn MsQuicPacketBuildFinishInto(packetOut: var MsQuicPacket): Result[bool] =
+    if msquicPacketBuildUsed <= 0:
+        return Err[bool]("msquic packet: packet too small")
+    packetOut.storeSlot = packetStoreAcquireSlot()
+    packetOut.number = msquicPacketBuildNumber
+    packetOut.ackEliciting = msquicPacketBuildAckEliciting
+    packetOut.framesCount = msquicPacketBuildFrameCount
+    var i: int32
+    for i in i..<msquicPacketBuildFrameCount:
+        let kindCode: int64 = msquicPacketBuildFrameKinds[i]
+        let streamId: int64 = msquicPacketBuildFrameStreamIds[i]
+        let offset: int64 = msquicPacketBuildFrameOffsets[i]
+        let value: int64 = msquicPacketBuildFrameValues[i]
+        packetSetFrameParts(packetOut, i, kindCode, streamId, offset, value, emptyBytes())
+    return Ok[bool](true)
+
+fn MsQuicPacketBuildFinish(): Result[MsQuicPacket] =
+    var out: MsQuicPacket
+    let finishRes: Result[bool] = MsQuicPacketBuildFinishInto(out)
+    if IsErr(finishRes):
+        return Err[MsQuicPacket](ErrorText(finishRes))
+    return Ok[MsQuicPacket](out)
+
+fn MsQuicPacketBuildUsed(): int32 =
+    return msquicPacketBuildUsed
+
+fn MsQuicPacketFrameAt(packet: var MsQuicPacket, idx: int32): frame_model.MsQuicFrame =
+    return packetFrameAt(packet, idx)
+
+fn MsQuicPacketDecode(data: Bytes): Result[MsQuicPacket] =
+    return msquicPacketDecode(data)
+
+fn MsQuicPacketEncode(p: var MsQuicPacket): Bytes =
+    return msquicPacketEncode(p)
+
+fn MsQuicPacketPayloadDecode(payload: Bytes, packetNumber: int64): Result[MsQuicPacket] =
+    return msquicPacketPayloadDecode(payload, packetNumber)
+
+fn MsQuicPacketPayloadDecodeInto(out: var MsQuicPacket, payload: Bytes, packetNumber: int64): Result[bool] =
+    return msquicPacketPayloadDecodeInto(out, payload, packetNumber)
+
+fn MsQuicPacketPayloadEncode(p: var MsQuicPacket): Result[Bytes] =
+    return msquicPacketPayloadEncode(p)

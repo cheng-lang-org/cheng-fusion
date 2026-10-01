@@ -1,0 +1,3047 @@
+import std/strings
+import std/rawbytes
+import std/math as m
+import cheng/std/bytes_layout as layout
+import cheng/game/world3d
+import cheng/game/csg/execution
+import cheng/game/csg/ball_servo_rigid
+
+# F1 snapshot payload codec ("sv-snap.v1"): canonical binary serialization of
+# the memory-level checkpoint primitive (World3dClone + CsgExecutionSnapshot +
+# BallServoRigidState copy) for the semantic-video state_payload resource.
+#
+# Byte contract: little-endian, fixed widths. Header = 10-byte domain magic
+# "sv-snap.v1" + u32 declared-field count (SvSnapFieldCount). Every declared
+# field is written in the order below; arrays carry a u32 length prefix.
+# float64 travels bit-exactly as (neg:u8, expo:u32, mant:i64) through the
+# exact IEEE-754 decomposition below — only finite values are encodable;
+# inf/nan are a structured encode error (rejected physics steps never enter
+# the state, so this is fail-loud, never a fallback).
+#
+# Declared field list (174 fields). Field-cut == the proven checkpoint
+# primitives exactly:
+#   World3d (68): 8 scalars + 22 body columns + 31 constraint columns +
+#     7 wall columns, body/con/wall ranges [0,count)/[0,conCount)/[0,wallCount).
+#     bodyFx/Fy/Fz are deliberately absent: World3dClone (world3d.cheng:619)
+#     zeroes them (step-local scratch, dead state at tick boundaries — the
+#     proven csg_world_incremental equivalence), so the decode rebuilds the
+#     same Reset-default tail and zero forces, byte-equal to the Clone.
+#   CsgExecutionState (73): 14 int scalars + 36 float scalars + chainCid +
+#     22 arrays. Deliberately absent (snapshot-zeroed by
+#     CsgExecutionSnapshot, execution.cheng:1403): eventTick/eventKind/
+#     eventArg/eventCount, rejectedCount, graspOkCount, graspFailCount,
+#     releaseCount, graspLostCount, balCaptures — decode leaves them at the
+#     snapshot defaults so a restored branch evolves exactly like the
+#     snapshot primitive.
+#   BallServoRigidState (33): every field of ball_servo_rigid.cheng:117.
+
+const
+    SvSnapMagicLen: int32 = 10
+    # 8 world scalars + 22 body + 31 con + 7 wall + 14 exec i32/i64 +
+    # 36 exec f64 + 1 exec str + 22 exec arrays + 33 servo = 174
+    SvSnapFieldCount: int32 = 174
+    SvSnapTwo52: float64 = 4503599627370496.0
+    SvSnapMantMax: int64 = 4503599627370495
+    SvSnapExecArrayCap: int32 = 65536
+    SvSnapChainCidCap: int32 = 256
+
+type
+    SvSnapEncoded =
+        ok: bool
+        error: str
+        bytes: rawbytes.Bytes
+
+    SvSnapDecoded =
+        ok: bool
+        error: str
+        w: world3d.World3d
+        st: execution.CsgExecutionState
+        servo: ball_servo_rigid.BallServoRigidState
+
+    SvSnapF64 =
+        neg: bool
+        expo: int32
+        mant: int64
+
+borrows
+fn SvSnapMagicStr(): str =
+    return "sv-snap.v1"
+
+# ---- exact float64 decomposition -----------------------------------------
+# Every operation below is an exact power-of-two scaling or a Sterbenz-exact
+# subtraction, so split->join is the identity on bits for all finite values
+# (normals and denormals). inf/nan never enter (checked at encode).
+
+fn SvSnapF64Finite(v: float64): bool =
+    if !(v == v):
+        return false
+    if v != 0.0 && v * 2.0 == v:
+        return false
+    return true
+
+fn SvSnapF64Split(v: float64): SvSnapF64 =
+    var out: SvSnapF64
+    if v < 0.0:
+        out.neg = true
+    if v == 0.0:
+        # -0.0 sign survives through 1/v (inf sign)
+        if (1.0 / v) < 0.0:
+            out.neg = true
+        out.expo = 0
+        out.mant = 0
+        return out
+    var a: float64 = m.absFloat(v)
+    var e: int32 = 0
+    while a >= 2.0:
+        a = a * 0.5
+        e = e + 1
+    while a < 1.0:
+        a = a * 2.0
+        e = e - 1
+    if e >= -1022:
+        out.expo = e + 1023
+        out.mant = int64((a - 1.0) * SvSnapTwo52)
+    else:
+        # denormal: value = mant * 2^-1074, mant < 2^52
+        out.expo = 0
+        var mantF: float64 = a
+        var shift: int32 = 1074 + e
+        while shift > 0:
+            mantF = mantF * 2.0
+            shift = shift - 1
+        out.mant = int64(mantF)
+    return out
+
+fn SvSnapF64Join(part: SvSnapF64): float64 =
+    var v: float64
+    if part.expo == 0:
+        v = float64(part.mant)
+        var i: int32 = 0
+        while i < 1074:
+            v = v * 0.5
+            i = i + 1
+    else:
+        v = float64(part.mant) / SvSnapTwo52 + 1.0
+        var shift: int32 = part.expo - 1023
+        while shift > 0:
+            v = v * 2.0
+            shift = shift - 1
+        while shift < 0:
+            v = v * 0.5
+            shift = shift + 1
+    if part.neg:
+        return 0.0 - v
+    return v
+
+# ---- byte primitives ------------------------------------------------------
+
+fn SvSnapPutU8(out: var layout.ByteBuf, v: int32) =
+    layout.ByteBufAppendByte(out, v & 255)
+
+fn SvSnapPutI32(out: var layout.ByteBuf, v: int32) =
+    layout.ByteBufAppendByte(out, v & 255)
+    layout.ByteBufAppendByte(out, (v >> 8) & 255)
+    layout.ByteBufAppendByte(out, (v >> 16) & 255)
+    layout.ByteBufAppendByte(out, (v >> 24) & 255)
+
+fn SvSnapPutI64(out: var layout.ByteBuf, v: int64) =
+    layout.ByteBufAppendByte(out, int32(v & 255))
+    layout.ByteBufAppendByte(out, int32((v >> 8) & 255))
+    layout.ByteBufAppendByte(out, int32((v >> 16) & 255))
+    layout.ByteBufAppendByte(out, int32((v >> 24) & 255))
+    layout.ByteBufAppendByte(out, int32((v >> 32) & 255))
+    layout.ByteBufAppendByte(out, int32((v >> 40) & 255))
+    layout.ByteBufAppendByte(out, int32((v >> 48) & 255))
+    layout.ByteBufAppendByte(out, int32((v >> 56) & 255))
+
+fn SvSnapPutF64(out: var layout.ByteBuf, v: float64, failed: var bool) =
+    if !SvSnapF64Finite(v):
+        failed = true
+        SvSnapPutU8(out, 0)
+        SvSnapPutI32(out, 0)
+        SvSnapPutI64(out, 0)
+        return
+    let part = SvSnapF64Split(v)
+    var flag: int32 = 0
+    if part.neg:
+        flag = 1
+    SvSnapPutU8(out, flag)
+    SvSnapPutI32(out, part.expo)
+    SvSnapPutI64(out, part.mant)
+
+@borrows
+fn SvSnapPutStr(out: var layout.ByteBuf, text: str) =
+    SvSnapPutI32(out, text.len)
+    for i in 0..<text.len:
+        layout.ByteBufAppendByte(out, text[i])
+
+# ---- pure positional readers ----------------------------------------------
+# Each reader takes (data, at) and returns a POD result {value, next, failed}.
+# No var-mutation chains: the caller advances its own position variable.
+# Out-of-bounds reads return failed=true without touching memory.
+
+type
+    SvSnapRdI =
+        v: int64
+        at: int32
+        failed: bool
+
+    SvSnapRdF =
+        v: float64
+        at: int32
+        failed: bool
+
+fn SvSnapRdU8(data: rawbytes.Bytes, at: int32): SvSnapRdI =
+    var out: SvSnapRdI
+    out.at = at + 1
+    if at < 0 || at >= rawbytes.BytesLen(data):
+        out.failed = true
+        out.at = at
+        return out
+    out.v = int64(rawbytes.BytesGet(data, at) & 255)
+    return out
+
+fn SvSnapRdI32(data: rawbytes.Bytes, at: int32): SvSnapRdI =
+    var out: SvSnapRdI
+    out.at = at + 4
+    if at < 0 || at + 4 > rawbytes.BytesLen(data):
+        out.failed = true
+        out.at = at
+        return out
+    let b0: int32 = rawbytes.BytesGet(data, at) & 255
+    let b1: int32 = rawbytes.BytesGet(data, at + 1) & 255
+    let b2: int32 = rawbytes.BytesGet(data, at + 2) & 255
+    let b3: int32 = rawbytes.BytesGet(data, at + 3) & 255
+    out.v = int64(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+    return out
+
+fn SvSnapRdI64(data: rawbytes.Bytes, at: int32): SvSnapRdI =
+    var out: SvSnapRdI
+    out.at = at + 8
+    if at < 0 || at + 8 > rawbytes.BytesLen(data):
+        out.failed = true
+        out.at = at
+        return out
+    var v: int64 = 0
+    var k: int32 = 0
+    while k < 8:
+        v = v | (int64(rawbytes.BytesGet(data, at + k) & 255) << (k * 8))
+        k = k + 1
+    out.v = v
+    return out
+
+fn SvSnapRdF64(data: rawbytes.Bytes, at: int32): SvSnapRdF =
+    var out: SvSnapRdF
+    out.at = at + 13
+    if at < 0 || at + 13 > rawbytes.BytesLen(data):
+        out.failed = true
+        out.at = at
+        return out
+    let flags: int32 = rawbytes.BytesGet(data, at) & 255
+    var expo: int32 = 0
+    var k: int32 = 0
+    while k < 4:
+        expo = expo | ((rawbytes.BytesGet(data, at + 1 + k) & 255) << (k * 8))
+        k = k + 1
+    var mant: int64 = 0
+    k = 0
+    while k < 8:
+        mant = mant | (int64(rawbytes.BytesGet(data, at + 5 + k) & 255) << (k * 8))
+        k = k + 1
+    if flags > 1:
+        out.failed = true
+        return out
+    if expo < 0 || expo > 2046:
+        out.failed = true
+        return out
+    if mant < 0 || mant > SvSnapMantMax:
+        out.failed = true
+        return out
+    var part: SvSnapF64
+    part.neg = flags == 1
+    part.expo = expo
+    part.mant = mant
+    out.v = SvSnapF64Join(part)
+    return out
+
+# length-prefixed array length with a structural cap
+fn SvSnapRdLen(data: rawbytes.Bytes, at: int32, cap: int32): SvSnapRdI =
+    var out: SvSnapRdI
+    let r = SvSnapRdI32(data, at)
+    out.at = r.at
+    if r.failed:
+        out.failed = true
+        out.at = at
+        return out
+    let n: int32 = int32(r.v)
+    if n < 0 || n > cap:
+        out.failed = true
+        out.at = at
+        return out
+    out.v = r.v
+    return out
+
+# ---- encode ----------------------------------------------------------------
+
+@borrows
+fn SvSnapEncode(w: world3d.World3d,
+                st: execution.CsgExecutionState,
+                servo: ball_servo_rigid.BallServoRigidState): SvSnapEncoded =
+    var out: SvSnapEncoded
+    var failed: bool = false
+    var buf: layout.ByteBuf = layout.ByteBufInit(8192)
+    var magic: str = SvSnapMagicStr()
+    for i in 0..<SvSnapMagicLen:
+        SvSnapPutU8(buf, int32(magic[i]))
+    SvSnapPutI32(buf, SvSnapFieldCount)
+    # --- World3d: 8 scalars ---
+    SvSnapPutI64(buf, w.instanceId)
+    SvSnapPutI64(buf, w.tick)
+    SvSnapPutI32(buf, w.count)
+    SvSnapPutI32(buf, w.nextEntityId)
+    SvSnapPutI32(buf, w.conCount)
+    SvSnapPutI32(buf, w.wallCount)
+    SvSnapPutI32(buf, w.ropeActive)
+    SvSnapPutI32(buf, w.ropeAnchorSlot)
+    # --- 22 body columns over [0,count) ---
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutI32(buf, w.entityIds[i])
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutI32(buf, w.generations[i])
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutI32(buf, w.bodyKind[i])
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyPx[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyPy[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyPz[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyVx[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyVy[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyVz[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyInvMass[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyRadius[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyAngVx[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyAngVy[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyAngVz[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyQuatW[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyQuatX[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyQuatY[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyQuatZ[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyIxx[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyIyy[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyIzz[i], failed)
+    SvSnapPutI32(buf, w.count)
+    for i in 0..<w.count:
+        SvSnapPutF64(buf, w.bodyCapsuleHalf[i], failed)
+    # --- 31 constraint columns over [0,conCount) ---
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutI32(buf, w.conA[i])
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutI32(buf, w.conB[i])
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conRest[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutI32(buf, w.conKind[i])
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutI32(buf, w.conActive[i])
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conTarget[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAnchAx[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAnchAy[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAnchAz[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAnchBx[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAnchBy[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAnchBz[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAxisAx[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAxisAy[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAxisAz[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAxisBx[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAxisBy[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conAxisBz[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conRefAx[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conRefAy[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conRefAz[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conRefBx[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conRefBy[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conRefBz[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conCmd[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conGoal[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conLimMin[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conLimMax[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conMaxRate[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conTauMax[i], failed)
+    SvSnapPutI32(buf, w.conCount)
+    for i in 0..<w.conCount:
+        SvSnapPutF64(buf, w.conOmega0[i], failed)
+    # --- 7 wall columns over [0,wallCount) ---
+    SvSnapPutI32(buf, w.wallCount)
+    for i in 0..<w.wallCount:
+        SvSnapPutF64(buf, w.wallCx[i], failed)
+    SvSnapPutI32(buf, w.wallCount)
+    for i in 0..<w.wallCount:
+        SvSnapPutF64(buf, w.wallCy[i], failed)
+    SvSnapPutI32(buf, w.wallCount)
+    for i in 0..<w.wallCount:
+        SvSnapPutF64(buf, w.wallCz[i], failed)
+    SvSnapPutI32(buf, w.wallCount)
+    for i in 0..<w.wallCount:
+        SvSnapPutF64(buf, w.wallHx[i], failed)
+    SvSnapPutI32(buf, w.wallCount)
+    for i in 0..<w.wallCount:
+        SvSnapPutF64(buf, w.wallHy[i], failed)
+    SvSnapPutI32(buf, w.wallCount)
+    for i in 0..<w.wallCount:
+        SvSnapPutF64(buf, w.wallHz[i], failed)
+    SvSnapPutI32(buf, w.wallCount)
+    for i in 0..<w.wallCount:
+        SvSnapPutF64(buf, w.wallFriction[i], failed)
+    # --- CsgExecutionState: 14 int scalars ---
+    SvSnapPutI32(buf, st.mpPartCount)
+    SvSnapPutI32(buf, st.mpRopeNodeCount)
+    SvSnapPutI64(buf, st.stepCount)
+    SvSnapPutI64(buf, st.balBallEnableTick)
+    SvSnapPutI32(buf, st.dynFootStart)
+    SvSnapPutI32(buf, st.balOn)
+    SvSnapPutI32(buf, st.balPelvisSlot)
+    SvSnapPutI32(buf, st.balChestSlot)
+    SvSnapPutI32(buf, st.balHeadSlot)
+    SvSnapPutI32(buf, st.balFootLSlot)
+    SvSnapPutI32(buf, st.balFootRSlot)
+    SvSnapPutI32(buf, st.balBallMode)
+    SvSnapPutI32(buf, st.balBallSlot)
+    SvSnapPutI32(buf, st.balBallArmed)
+    # --- 36 float scalars ---
+    SvSnapPutF64(buf, st.balChestOffX, failed)
+    SvSnapPutF64(buf, st.balChestOffY, failed)
+    SvSnapPutF64(buf, st.balChestOffZ, failed)
+    SvSnapPutF64(buf, st.balHeadOffX, failed)
+    SvSnapPutF64(buf, st.balHeadOffY, failed)
+    SvSnapPutF64(buf, st.balHeadOffZ, failed)
+    SvSnapPutF64(buf, st.balPelvisOffX, failed)
+    SvSnapPutF64(buf, st.balPelvisOffY, failed)
+    SvSnapPutF64(buf, st.balPelvisOffZ, failed)
+    SvSnapPutF64(buf, st.balGain, failed)
+    SvSnapPutF64(buf, st.balDamp, failed)
+    SvSnapPutF64(buf, st.balCorrCapMps, failed)
+    SvSnapPutF64(buf, st.balCaptureSpeedMps, failed)
+    SvSnapPutF64(buf, st.balCaptureStepLenM, failed)
+    SvSnapPutF64(buf, st.balCaptureSteps, failed)
+    SvSnapPutF64(buf, st.balCaptureLeadTicks, failed)
+    SvSnapPutF64(buf, st.balCaptureWindowTicks, failed)
+    SvSnapPutF64(buf, st.balBallRadius, failed)
+    SvSnapPutF64(buf, st.balBallFootLOffX, failed)
+    SvSnapPutF64(buf, st.balBallFootLOffY, failed)
+    SvSnapPutF64(buf, st.balBallFootLOffZ, failed)
+    SvSnapPutF64(buf, st.balBallFootROffX, failed)
+    SvSnapPutF64(buf, st.balBallFootROffY, failed)
+    SvSnapPutF64(buf, st.balBallFootROffZ, failed)
+    SvSnapPutF64(buf, st.balBallPelvisOffX, failed)
+    SvSnapPutF64(buf, st.balBallPelvisOffY, failed)
+    SvSnapPutF64(buf, st.balBallGain, failed)
+    SvSnapPutF64(buf, st.balBallFootGain, failed)
+    SvSnapPutF64(buf, st.balBallDamp, failed)
+    SvSnapPutF64(buf, st.balBallCorrCapMps, failed)
+    SvSnapPutF64(buf, st.balBallTorsoCapMps, failed)
+    SvSnapPutF64(buf, st.balBallRollResist, failed)
+    SvSnapPutF64(buf, st.balBallTrim, failed)
+    SvSnapPutF64(buf, st.balBallTrimX, failed)
+    SvSnapPutF64(buf, st.balBallTrimY, failed)
+    SvSnapPutF64(buf, st.balBallUserLeanX, failed)
+    # --- chainCid ---
+    SvSnapPutStr(buf, st.chainCid)
+    # --- 22 arrays (runtime lengths, faithful to the snapshot copy) ---
+    SvSnapPutI32(buf, st.mpPartSlot.len)
+    for i in 0..<st.mpPartSlot.len:
+        SvSnapPutI32(buf, st.mpPartSlot[i])
+    SvSnapPutI32(buf, st.mpRopeNodeSlot.len)
+    for i in 0..<st.mpRopeNodeSlot.len:
+        SvSnapPutI32(buf, st.mpRopeNodeSlot[i])
+    SvSnapPutI32(buf, st.handGraspCon.len)
+    for i in 0..<st.handGraspCon.len:
+        SvSnapPutI32(buf, st.handGraspCon[i])
+    SvSnapPutI32(buf, st.graspNodeOfHand.len)
+    for i in 0..<st.graspNodeOfHand.len:
+        SvSnapPutI32(buf, st.graspNodeOfHand[i])
+    SvSnapPutI32(buf, st.jointOfPart.len)
+    for i in 0..<st.jointOfPart.len:
+        SvSnapPutI32(buf, st.jointOfPart[i])
+    SvSnapPutI32(buf, st.jointPeerSlot.len)
+    for i in 0..<st.jointPeerSlot.len:
+        SvSnapPutI32(buf, st.jointPeerSlot[i])
+    SvSnapPutI32(buf, st.legConOfPart.len)
+    for i in 0..<st.legConOfPart.len:
+        SvSnapPutI32(buf, st.legConOfPart[i])
+    SvSnapPutI32(buf, st.legPushing.len)
+    for i in 0..<st.legPushing.len:
+        SvSnapPutI32(buf, st.legPushing[i])
+    SvSnapPutI32(buf, st.lostGrace.len)
+    for i in 0..<st.lostGrace.len:
+        SvSnapPutI32(buf, st.lostGrace[i])
+    SvSnapPutI32(buf, st.footCon.len)
+    for i in 0..<st.footCon.len:
+        SvSnapPutI32(buf, st.footCon[i])
+    SvSnapPutI32(buf, st.footAnchor.len)
+    for i in 0..<st.footAnchor.len:
+        SvSnapPutI32(buf, st.footAnchor[i])
+    SvSnapPutI32(buf, st.footDone.len)
+    for i in 0..<st.footDone.len:
+        SvSnapPutI32(buf, st.footDone[i])
+    SvSnapPutI32(buf, st.dynFootPart.len)
+    for i in 0..<st.dynFootPart.len:
+        SvSnapPutI32(buf, st.dynFootPart[i])
+    SvSnapPutI32(buf, st.dynFootX.len)
+    for i in 0..<st.dynFootX.len:
+        SvSnapPutF64(buf, st.dynFootX[i], failed)
+    SvSnapPutI32(buf, st.dynFootY.len)
+    for i in 0..<st.dynFootY.len:
+        SvSnapPutF64(buf, st.dynFootY[i], failed)
+    SvSnapPutI32(buf, st.dynFootZ.len)
+    for i in 0..<st.dynFootZ.len:
+        SvSnapPutF64(buf, st.dynFootZ[i], failed)
+    SvSnapPutI32(buf, st.dynFootStartTick.len)
+    for i in 0..<st.dynFootStartTick.len:
+        SvSnapPutI64(buf, st.dynFootStartTick[i])
+    SvSnapPutI32(buf, st.dynFootEndTick.len)
+    for i in 0..<st.dynFootEndTick.len:
+        SvSnapPutI64(buf, st.dynFootEndTick[i])
+    SvSnapPutI32(buf, st.dynFootRate.len)
+    for i in 0..<st.dynFootRate.len:
+        SvSnapPutF64(buf, st.dynFootRate[i], failed)
+    SvSnapPutI32(buf, st.dynFootPlantLen.len)
+    for i in 0..<st.dynFootPlantLen.len:
+        SvSnapPutF64(buf, st.dynFootPlantLen[i], failed)
+    SvSnapPutI32(buf, st.anchorFreeSlot.len)
+    for i in 0..<st.anchorFreeSlot.len:
+        SvSnapPutI32(buf, st.anchorFreeSlot[i])
+    SvSnapPutI32(buf, st.footConFree.len)
+    for i in 0..<st.footConFree.len:
+        SvSnapPutI32(buf, st.footConFree[i])
+    # --- BallServoRigidState: 13 int + 20 float ---
+    SvSnapPutI32(buf, servo.ballSlot)
+    SvSnapPutI32(buf, servo.torsoSlot)
+    SvSnapPutI32(buf, servo.headSlot)
+    SvSnapPutI32(buf, servo.armed)
+    SvSnapPutI32(buf, servo.tickCount)
+    SvSnapPutI32(buf, servo.trimComLo)
+    SvSnapPutI32(buf, servo.trimComHi)
+    SvSnapPutI32(buf, servo.contactGateOn)
+    SvSnapPutI32(buf, servo.contactSeen)
+    SvSnapPutI32(buf, servo.contactTick)
+    SvSnapPutI32(buf, servo.footLSlot)
+    SvSnapPutI32(buf, servo.footRSlot)
+    SvSnapPutI32(buf, servo.anchorOn)
+    SvSnapPutF64(buf, servo.rampTicks, failed)
+    SvSnapPutF64(buf, servo.offX, failed)
+    SvSnapPutF64(buf, servo.offY, failed)
+    SvSnapPutF64(buf, servo.offZ, failed)
+    SvSnapPutF64(buf, servo.k, failed)
+    SvSnapPutF64(buf, servo.c, failed)
+    SvSnapPutF64(buf, servo.linCapMps, failed)
+    SvSnapPutF64(buf, servo.linDampCapMps, failed)
+    SvSnapPutF64(buf, servo.kAng, failed)
+    SvSnapPutF64(buf, servo.cAng, failed)
+    SvSnapPutF64(buf, servo.angCapRadS, failed)
+    SvSnapPutF64(buf, servo.angDampCapRadS, failed)
+    SvSnapPutF64(buf, servo.trimRate, failed)
+    SvSnapPutF64(buf, servo.trimX, failed)
+    SvSnapPutF64(buf, servo.trimY, failed)
+    SvSnapPutF64(buf, servo.contactDistM, failed)
+    SvSnapPutF64(buf, servo.anchorX, failed)
+    SvSnapPutF64(buf, servo.anchorY, failed)
+    SvSnapPutF64(buf, servo.anchorKp, failed)
+    SvSnapPutF64(buf, servo.anchorKd, failed)
+    if failed:
+        layout.ByteBufFree(buf)
+        out.error = "sv_snap_nonfinite"
+        return out
+    out.ok = true
+    out.bytes = layout.ByteBufToBytes(buf)
+    layout.ByteBufFree(buf)
+    return out
+
+# ---- decode ----------------------------------------------------------------
+
+@borrows
+fn SvSnapDecode(data: rawbytes.Bytes): SvSnapDecoded =
+    var out: SvSnapDecoded
+    var pos: int32 = 0
+    var failed: bool = false
+    var errCode: str = ""
+    var rd: SvSnapRdI
+    var rdf: SvSnapRdF
+    var magic: str = SvSnapMagicStr()
+    for i in 0..<SvSnapMagicLen:
+        rd = SvSnapRdU8(data, pos)
+        pos = rd.at
+        if rd.failed:
+            failed = true
+        if !failed && int32(rd.v) != int32(magic[i]):
+            failed = true
+            errCode = "sv_snap_bad_magic"
+    rd = SvSnapRdI32(data, pos)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    let fieldCount: int32 = int32(rd.v)
+    if !failed && fieldCount != SvSnapFieldCount:
+        failed = true
+        errCode = "sv_snap_bad_fieldcount"
+    if failed:
+        if errCode.len == 0:
+            errCode = "sv_snap_truncated"
+        out.error = strings.CloneStr(errCode)
+        return out
+    # --- World3d scalars ---
+    rd = SvSnapRdI64(data, pos)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    let instanceId: int64 = int64(rd.v)
+    rd = SvSnapRdI64(data, pos)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    let tick: int64 = int64(rd.v)
+    rd = SvSnapRdI32(data, pos)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    let count: int32 = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    let nextEntityId: int32 = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    let conCount: int32 = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    let wallCount: int32 = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    let ropeActive: int32 = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    let ropeAnchorSlot: int32 = int32(rd.v)
+    if failed:
+        out.error = "sv_snap_truncated"
+        return out
+    if count < 0 || count > world3d.World3dMaxBodies:
+        out.error = "sv_snap_body_cap"
+        return out
+    if conCount < 0 || conCount > world3d.World3dMaxConstraints:
+        out.error = "sv_snap_con_cap"
+        return out
+    if wallCount < 0 || wallCount > world3d.World3dMaxWalls:
+        out.error = "sv_snap_wall_cap"
+        return out
+    var w: world3d.World3d
+    world3d.World3dReset(w, instanceId)
+    w.nextEntityId = nextEntityId
+    w.count = count
+    w.conCount = conCount
+    w.wallCount = wallCount
+    w.ropeActive = ropeActive
+    w.ropeAnchorSlot = ropeAnchorSlot
+    w.tick = tick
+    # --- 22 body columns ---
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    var n: int32 = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        w.entityIds[i] = iv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        w.generations[i] = iv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        w.bodyKind[i] = iv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyPx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyPy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyPz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyVx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyVy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyVz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyInvMass[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyRadius[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyAngVx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyAngVy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyAngVz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyQuatW[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyQuatX[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyQuatY[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyQuatZ[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyIxx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyIyy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyIzz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxBodies)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != count:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<count:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.bodyCapsuleHalf[i] = fv
+    # --- 31 constraint columns ---
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        w.conA[i] = iv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        w.conB[i] = iv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conRest[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        w.conKind[i] = iv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        w.conActive[i] = iv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conTarget[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAnchAx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAnchAy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAnchAz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAnchBx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAnchBy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAnchBz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAxisAx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAxisAy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAxisAz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAxisBx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAxisBy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conAxisBz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conRefAx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conRefAy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conRefAz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conRefBx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conRefBy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conRefBz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conCmd[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conGoal[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conLimMin[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conLimMax[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conMaxRate[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conTauMax[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxConstraints)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != conCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<conCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.conOmega0[i] = fv
+    # --- 7 wall columns ---
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxWalls)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != wallCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<wallCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.wallCx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxWalls)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != wallCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<wallCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.wallCy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxWalls)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != wallCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<wallCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.wallCz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxWalls)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != wallCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<wallCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.wallHx[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxWalls)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != wallCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<wallCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.wallHy[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxWalls)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != wallCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<wallCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.wallHz[i] = fv
+    rd = SvSnapRdLen(data, pos, world3d.World3dMaxWalls)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    if n != wallCount:
+        out.error = "sv_snap_count_mismatch"
+        return out
+    for i in 0..<wallCount:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        w.wallFriction[i] = fv
+    if failed:
+        out.error = "sv_snap_truncated"
+        return out
+    # --- CsgExecutionState ---
+    var st: execution.CsgExecutionState
+    st.w = w
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.mpPartCount = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.mpRopeNodeCount = int32(rd.v)
+    rd = SvSnapRdI64(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.stepCount = rd.v
+    rd = SvSnapRdI64(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.balBallEnableTick = rd.v
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.dynFootStart = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.balOn = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.balPelvisSlot = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.balChestSlot = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.balHeadSlot = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.balFootLSlot = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.balFootRSlot = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.balBallMode = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.balBallSlot = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    st.balBallArmed = int32(rd.v)
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balChestOffX = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balChestOffY = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balChestOffZ = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balHeadOffX = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balHeadOffY = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balHeadOffZ = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balPelvisOffX = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balPelvisOffY = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balPelvisOffZ = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balGain = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balDamp = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balCorrCapMps = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balCaptureSpeedMps = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balCaptureStepLenM = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balCaptureSteps = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balCaptureLeadTicks = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balCaptureWindowTicks = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallRadius = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallFootLOffX = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallFootLOffY = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallFootLOffZ = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallFootROffX = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallFootROffY = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallFootROffZ = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallPelvisOffX = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallPelvisOffY = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallGain = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallFootGain = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallDamp = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallCorrCapMps = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallTorsoCapMps = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallRollResist = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallTrim = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallTrimX = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallTrimY = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    st.balBallUserLeanX = rdf.v
+    # chainCid
+    rd = SvSnapRdLen(data, pos, SvSnapChainCidCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    let cidLen: int32 = int32(rd.v)
+    var cidBuf: layout.ByteBuf = layout.ByteBufInit(cidLen + 1)
+    for i in 0..<cidLen:
+        rd = SvSnapRdU8(data, pos)
+        pos = rd.at
+        if rd.failed:
+            failed = true
+        layout.ByteBufAppendByte(cidBuf, int32(rd.v) & 255)
+    var cidBytes: rawbytes.Bytes = layout.ByteBufToBytes(cidBuf)
+    layout.ByteBufFree(cidBuf)
+    st.chainCid = rawbytes.BytesToString(cidBytes)
+    rawbytes.BytesFree(cidBytes)
+    # 22 arrays
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.mpPartSlot, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.mpPartSlot[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.mpRopeNodeSlot, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.mpRopeNodeSlot[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.handGraspCon, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.handGraspCon[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.graspNodeOfHand, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.graspNodeOfHand[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.jointOfPart, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.jointOfPart[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.jointPeerSlot, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.jointPeerSlot[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.legConOfPart, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.legConOfPart[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.legPushing, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.legPushing[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.lostGrace, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.lostGrace[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.footCon, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.footCon[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.footAnchor, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.footAnchor[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.footDone, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.footDone[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.dynFootPart, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.dynFootPart[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.dynFootX, n)
+    for i in 0..<n:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        st.dynFootX[i] = fv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.dynFootY, n)
+    for i in 0..<n:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        st.dynFootY[i] = fv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.dynFootZ, n)
+    for i in 0..<n:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        st.dynFootZ[i] = fv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.dynFootStartTick, n)
+    for i in 0..<n:
+        rd = SvSnapRdI64(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let lv: int64 = rd.v
+        st.dynFootStartTick[i] = lv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.dynFootEndTick, n)
+    for i in 0..<n:
+        rd = SvSnapRdI64(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let lv: int64 = rd.v
+        st.dynFootEndTick[i] = lv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.dynFootRate, n)
+    for i in 0..<n:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        st.dynFootRate[i] = fv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.dynFootPlantLen, n)
+    for i in 0..<n:
+        rdf = SvSnapRdF64(data, pos)
+
+        pos = rdf.at
+
+        if rdf.failed:
+
+            failed = true
+
+        let fv: float64 = rdf.v
+        st.dynFootPlantLen[i] = fv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.anchorFreeSlot, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.anchorFreeSlot[i] = iv
+    rd = SvSnapRdLen(data, pos, SvSnapExecArrayCap)
+    pos = rd.at
+    if rd.failed:
+        failed = true
+    n = int32(rd.v)
+    setLen(st.footConFree, n)
+    for i in 0..<n:
+        rd = SvSnapRdI32(data, pos)
+
+        pos = rd.at
+
+        if rd.failed:
+
+            failed = true
+
+        let iv: int32 = int32(rd.v)
+        st.footConFree[i] = iv
+    # --- BallServoRigidState ---
+    var servo: ball_servo_rigid.BallServoRigidState
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.ballSlot = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.torsoSlot = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.headSlot = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.armed = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.tickCount = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.trimComLo = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.trimComHi = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.contactGateOn = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.contactSeen = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.contactTick = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.footLSlot = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.footRSlot = int32(rd.v)
+    rd = SvSnapRdI32(data, pos)
+
+    pos = rd.at
+
+    if rd.failed:
+
+        failed = true
+
+    servo.anchorOn = int32(rd.v)
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.rampTicks = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.offX = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.offY = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.offZ = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.k = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.c = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.linCapMps = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.linDampCapMps = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.kAng = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.cAng = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.angCapRadS = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.angDampCapRadS = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.trimRate = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.trimX = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.trimY = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.contactDistM = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.anchorX = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.anchorY = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.anchorKp = rdf.v
+    rdf = SvSnapRdF64(data, pos)
+
+    pos = rdf.at
+
+    if rdf.failed:
+
+        failed = true
+
+    servo.anchorKd = rdf.v
+    if failed:
+        out.error = "sv_snap_truncated"
+        return out
+    if pos != rawbytes.BytesLen(data):
+        out.error = "sv_snap_trailing"
+        return out
+    out.ok = true
+    out.w = w
+    out.st = st
+    out.servo = servo
+    return out

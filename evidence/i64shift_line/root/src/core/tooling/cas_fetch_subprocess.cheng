@@ -1,0 +1,252 @@
+# CAS fetch-on-miss 子进程 fetcher (编译器进程内零 QUIC)。
+#
+# 签名严格 == cas_store.CasSourceFetcher 别名 fn(cidHex: str): Result[Bytes], 可直接经
+# parser.ParserSetCasFetcher 注入 parser 拉源槽。委托 fork+execv 调 S4 CLI
+# (src/libp2p/cli/net_cas_cli_main.cheng `pull`) 真 UDP QUIC 拉源到本地 store, 再读回内容
+# 寻址 blob 字节。QUIC/host_quic 闭包只活在被 fork 的独立子进程里, 编译器进程本体绝不
+# import libp2p/QUIC — 本模块只 import std/os/process 原语 + core/tooling/path。故此 fetcher
+# 在装机 stage3 cold-hybrid (system-link-exec) 与 driver-bake 双态皆可用, 不受 cheng_cold
+# 不编 host_quic-transitive 闭包的限制 (那是 in-process cwlp wrapper 的限制)。
+#
+# env 面:
+#   CHENG_CAS_BOOTSTRAP   多 bootstrap peer 列表, 逗号/空白 (空格/tab/换行) 分隔 host:port;
+#                         设置即优先于单项。逐 peer 尝试, 第一个 cid 自证+admit 通过者胜 (OR-liveness)。
+#   CHENG_CAS_FETCH_FROM  单项 peer host:port (旧口径, BOOTSTRAP 未设时回退; 兼容 gate 注入值)。
+#   CHENG_CAS_CLI         net_cas_cli 可执行路径 (装机 stage3 预编)。
+#   CHENG_CAS_ROOT        parser store (CLI --store 必须 == parser store, 字节精确回环)。
+# 无任何 peer (BOOTSTRAP 与 FETCH_FROM 皆空) / CLI 缺 / ROOT 缺 = 硬 Err 上抛, 无兜底。
+#
+# 多 bootstrap 安全论证 (为何逐个尝试而非多数投票 quorum): blob 内容寻址, cid == sha256(bytes)。
+# 恶意/eclipse peer 伪造不出匹配 cid 的字节 (改一位 → cid 变 → net_cas_cli 内 CasAdmitFetchedBytes
+# admit 失败 → pull rc≠0), 只能扣留 (回 miss/垃圾 → 同样 rc≠0)。故一个诚实可达 peer 即够 liveness,
+# 安全来自自证非 peer 数; 多数 quorum 在此反是安全 bug (eclipse 多数能票掉唯一诚实 peer)。全部
+# peer 失败 = 聚合各 peer 错因硬 Err 上抛, 绝不静默空手。
+#
+# 生产纪律 (no fallback / let it crash): env 缺 / CLI rc≠0 (带 rc+合并输出) / blob 读回失败
+# 全 Err[Bytes] 上抛。cid 终校验由 CLI 内 fetch (host_quic) + CasAdmitFetchedBytes 双门已做,
+# parser 侧 CasAdmitFetchedBytes 收到本 fetcher 交出的字节再校验第三次。
+
+import std/result
+import std/os
+import std/os_host_process as hostos
+import std/strings
+import std/strutils as strutil
+import std/rawbytes
+import cheng/core/tooling/path as chengpath
+import cheng/libp2p/cas_store as cas
+import cheng/libp2p/protocols/cas_source/channel_head/manifest_lock_codec as mlc
+import cheng/std/bytes_layout as layout
+
+# 逗号与任意空白 (空格/tab/换行) 皆为分隔符; 空 token 丢弃。保留原始顺序 = OR 尝试顺序。
+@borrows
+fn CasSubprocessParsePeers(raw: str): str[] =
+    return strutil.SplitWhitespace(strutil.Replace(raw, ",", " "))
+
+# peer 列表来源: CHENG_CAS_BOOTSTRAP 列表优先; 未设 (空) 时回退单项 CHENG_CAS_FETCH_FROM。
+# 两者皆空 → 空列表 (调用方硬错)。
+fn CasSubprocessPeerList(): str[] =
+    let boot = strutil.Strip(os.GetEnv("CHENG_CAS_BOOTSTRAP"))
+    if boot != "":
+        return CasSubprocessParsePeers(boot)
+    var out: str[]
+    let single = strutil.Strip(os.GetEnv("CHENG_CAS_FETCH_FROM"))
+    if single != "":
+        add(out, single)
+    return out
+
+# 向单个 peer fork+execv net_cas_cli pull: rc≠0 (含 cid 自证/admit 失败) → Err; 否则读回 admit
+# 后的内容寻址 blob 字节交出。
+@borrows
+fn casSubprocessPullOne(cidHex: str, peer: str, cli: str, store: str): Result[Bytes] =
+    var argv: str[]
+    add(argv, "pull")
+    add(argv, strings.CloneStr(cidHex))
+    add(argv, "--from")
+    add(argv, strings.CloneStr(peer))
+    add(argv, "--store")
+    add(argv, strings.CloneStr(store))
+    var res = hostos.ExecFileCapture(
+        strings.CloneStr(cli), argv, [], "", true, 120)
+    let rc = res.exitCode
+    if rc != 0:
+        let capturedOut = strings.CloneStr(res.output)
+        return Err[Bytes](strutil.Join(["cas subproc: net_cas_cli pull rc=",
+                                         IntToStr(rc),
+                                         " peer=", strings.CloneStr(peer),
+                                         " cid=", strings.CloneStr(cidHex),
+                                         " out=", capturedOut], ""))
+
+    # CLI 已 admit blob 到 <store>/cas/<shard>/<cid> (内容寻址正典位, 同 cas_store.CasBlobPath
+    # 布局: shard = cidHex 前 2 位)。读回原字节交出, parser 侧再 admit 一次幂等。
+    let shard = chengpath.TextSlice(cidHex, 0, 2)
+    let blobPath = strutil.Join(
+        [strings.CloneStr(store), "/cas/", shard, "/",
+         strings.CloneStr(cidHex)], "")
+    return os.ReadFileBytesResult(blobPath)
+
+# 读回 fetch-head 子进程持久化到 <store>/discovered_endpoints.txt 的快照发现 endpoint 集。
+# P5-S2 源侧: 发现集【只】扩宽源/manifest 取物的 OR-liveness 候选; ★C1 安全红线: 绝不回流撤销 UNION /
+# fetch-head --bootstrap (那恒绑静态 CHENG_CAS_BOOTSTRAP 集)。文件缺 / 读失败 = 空集 (发现层 fail-open,
+# 缺席只是不扩宽候选, 与静态-only S1 行为一致; 内容安全由下游 cid 自证 + CasAdmitFetchedBytes 兜底)。
+# 每行一个 host:port, 空行 / 前后空白丢弃; 顺序 = 追加尝试次序。
+@borrows
+fn CasSubprocessDiscoveredPeers(store: str): str[] =
+    var out: str[]
+    if store == "":
+        return out
+    let path = strutil.Join(
+        [strings.CloneStr(store), "/discovered_endpoints.txt"], "")
+    if !os.FileExists(path):
+        return out
+    let rr = os.ReadFileResult(path)
+    if IsErr(rr):
+        return out
+    let lines = strutil.Split(Value(rr), '\n')
+    for i in 0..<lines.len:
+        let ep = strutil.Strip(lines[i])
+        if ep != "":
+            add(out, ep)
+    return out
+
+# str[] 顺序保留式成员判定 (静态 ∪ 发现 去重扩集用)。
+@borrows
+fn casSubprocessPeerSeen(acc: str[], ep: str): bool =
+    for i in 0..<acc.len:
+        if acc[i] == ep:
+            return true
+    return false
+
+@borrows
+fn CasSubprocessFetcher(cidHex: str): Result[Bytes] =
+    let staticPeers = CasSubprocessPeerList()
+    let cli = strutil.Strip(os.GetEnv("CHENG_CAS_CLI"))
+    let store = strutil.Strip(os.GetEnv("CHENG_CAS_ROOT"))
+    if staticPeers.len == 0:
+        return Err[Bytes]("cas subproc: 无 bootstrap peer (需 CHENG_CAS_BOOTSTRAP 列表或 CHENG_CAS_FETCH_FROM 单项)")
+    if cli == "":
+        return Err[Bytes]("cas subproc: CHENG_CAS_CLI 未设 (net_cas_cli 路径)")
+    if store == "":
+        return Err[Bytes]("cas subproc: CHENG_CAS_ROOT 未设 (parser store)")
+
+    # 候选集构造 (P5-S2 源侧接线): 静态 CHENG_CAS_BOOTSTRAP 在前 (既有 OR 次序纪律), 快照发现集追加在后;
+    # 发现集来自 fetch-head 子进程持久化的 <store>/discovered_endpoints.txt, 与 head 侧 headPeers 同构。
+    # ★C1: 此 merge【只】喂本地 pull (源/manifest) 的 OR-liveness, 绝不回流撤销 UNION / fetch-head
+    #   --bootstrap (那恒用静态集, 见 CasSubprocessEnsureLock:peersJoined 与 net_cas_cli fetch-head:staticPeers)。
+    var peers = staticPeers
+    let discovered = CasSubprocessDiscoveredPeers(store)
+    for d in 0..<discovered.len:
+        if !casSubprocessPeerSeen(peers, discovered[d]):
+            add(peers, strings.CloneStr(discovered[d]))
+
+    # OR-liveness: 逐 peer 尝试, 第一个成功 (cid 自证+admit+读回) 即返回; 全失败聚合各 peer 错因硬错。
+    var errs: str[]
+    for i in 0..<peers.len:
+        let r = casSubprocessPullOne(cidHex, peers[i], cli, store)
+        if !IsErr(r):
+            return r
+        add(errs, Error(r))
+    return Err[Bytes](strutil.Join(["cas subproc: 全部 ", IntToStr(peers.len),
+                                     " 个 bootstrap peer 取 cid=", strings.CloneStr(cidHex),
+                                     " 均失败 [", strutil.Join(errs, " | "), "]"], ""))
+
+# ---- P5-S1 缺锁自举: channelId → head → manifest → lock 展开 (编译器进程零 QUIC) ----
+#
+# fork net_cas_cli fetch-head: 子进程内做 head OR-liveness (首个自证+验签+请求绑定通过者胜) +
+# 撤销并集 (任一 peer 命中撤销即硬拒), 成功把 head.headCid 写 <store>/heads/<channelHex>.headcid;
+# 本函数读回该 headCid hex。rc≠0 (含验签败/撤销命中/无 head) → Err(带 rc+合并输出)。QUIC/host_quic
+# 闭包只活在被 fork 的 net_cas_cli 子进程, 编译器进程本体绝不 import libp2p/QUIC。
+@borrows
+fn casSubprocessFetchHeadHex(channelHex: str, cli: str, store: str, peersJoined: str): Result[str] =
+    let headOut = strutil.Join(
+        [strings.CloneStr(store), "/heads/",
+         strings.CloneStr(channelHex), ".headcid"], "")
+    if os.FileExists(headOut):
+        os.RemoveFile(headOut)                # 去陈: 保证读回的是本次 fetch-head 的结果
+    var argv: str[]
+    add(argv, "fetch-head")
+    add(argv, strings.CloneStr(channelHex))
+    add(argv, "--store")
+    add(argv, strings.CloneStr(store))
+    add(argv, "--bootstrap")
+    add(argv, strings.CloneStr(peersJoined))
+    let res = hostos.ExecFileCapture(
+        strings.CloneStr(cli), argv, [], "", true, 120)
+    let rc = os.ExecCmdResultExitCode(res)
+    if rc != 0:
+        return Err[str](strutil.Join(["cas subproc: net_cas_cli fetch-head rc=", IntToStr(rc),
+                                       " channel=", strings.CloneStr(channelHex),
+                                       " peers=", strings.CloneStr(peersJoined),
+                                       " out=", os.ExecCmdResultOutput(res)], ""))
+    if !os.FileExists(headOut):
+        return Err[str](strutil.Join(["cas subproc: fetch-head rc=0 但 headcid 文件缺: ", headOut], ""))
+    var readRes = os.ReadFileResult(headOut)
+    if IsErr(readRes):
+        return Err[str](strutil.Join(["cas subproc: headcid 读回失败: ", headOut, ": ", Error(readRes)], ""))
+    let headCidHex = strutil.Strip(Value(readRes))
+    if headCidHex == "":
+        return Err[str](strutil.Join(["cas subproc: headcid 文件为空: ", headOut], ""))
+    return Ok[str](headCidHex)
+
+# P5-S1 主干 ensurer: lock 缺该模块 cid 时, 从 channelId 一跳自证展开整依赖集 lock。
+#   channelId(hex) → head 拉取 (子进程, 自证+验签+请求绑定+撤销并集) → head.headCid
+#     → 按 cid 拉 manifest blob (== lock 内容, 经既有 pull 路径 per-peer OR + admit 自校验)
+#     → 件1 codec: sha256(manifest)==headCid 校验 + 解码 → 逐 entry 落 index.lock.txt (幂等 merge)。
+# 已锁 (lock 已含该模块) → no-op (首解析后离线可复现, 满足正典 §11.5 离线不变量)。每步失败硬 Err
+# 上抛 (head 验签败 / headCid 不匹配 / manifest 非法行 / 任一 cid 拉不到 = 编译错, 绝不静默跳过)。
+# 全 named 直调 (无 fn-value), 故装机 stage3 cold-hybrid 与 driver-bake 双态皆可 lower。
+@borrows
+fn CasSubprocessEnsureLock(channelHex: str, modulePath: str, store: str): Result[bool] =
+    let channel = strutil.Strip(channelHex)
+    let cli = strutil.Strip(os.GetEnv("CHENG_CAS_CLI"))
+    let storeRoot = strutil.Strip(store)
+    if channel == "":
+        return Err[bool]("cas ensure-lock: 空 channelId")
+    if storeRoot == "":
+        return Err[bool]("cas ensure-lock: 空 store (CHENG_CAS_ROOT)")
+    if cli == "":
+        return Err[bool]("cas ensure-lock: CHENG_CAS_CLI 未设 (net_cas_cli 路径)")
+    # 幂等: lock 已含该模块 → no-op
+    var loadRes = cas.CasLockLoad(storeRoot)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    if cas.CasLockLookup(Value(loadRes), modulePath) != "":
+        return Ok[bool](true)
+    let peers = CasSubprocessPeerList()
+    if peers.len == 0:
+        return Err[bool]("cas ensure-lock: 无 bootstrap peer (需 CHENG_CAS_BOOTSTRAP 列表或 CHENG_CAS_FETCH_FROM 单项)")
+    let peersJoined = strutil.Join(peers, ",")
+    # ① channelId → head → headCid (子进程内 head OR-liveness + 撤销并集)
+    var headHexRes = casSubprocessFetchHeadHex(
+        channel,
+        cli,
+        storeRoot,
+        peersJoined)
+    if IsErr(headHexRes):
+        return Err[bool](Error(headHexRes))
+    let headCidHex = strings.CloneStr(Value(headHexRes))
+    # ② 按 cid 拉 manifest blob (== lock 内容) 经既有 pull 路径 (per-peer OR + admit 自校验)
+    var manifestRes = CasSubprocessFetcher(headCidHex)
+    if IsErr(manifestRes):
+        return Err[bool](strutil.Join(["cas ensure-lock: 拉 manifest blob 失败 headCid=", strings.CloneStr(headCidHex), ": ", Error(manifestRes)], ""))
+    var manifestBytes = Value(manifestRes)
+    # ③ 件1 codec: sha256(manifest)==headCid 校验 + 解码 (不符/非法行硬 Err)
+    var headCidRes = layout.FixedBytes32FromHex(headCidHex)
+    if IsErr(headCidRes):
+        return Err[bool](strutil.Join(["cas ensure-lock: headCid 非法 hex: ", strings.CloneStr(headCidHex), ": ", Error(headCidRes)], ""))
+    let headCid = Value(headCidRes)
+    var verifyRes = mlc.ManifestLockVerifyHeadCid(manifestBytes, headCid)
+    if IsErr(verifyRes):
+        return Err[bool](Error(verifyRes))
+    var decodeRes = mlc.ManifestLockDecode(manifestBytes)
+    if IsErr(decodeRes):
+        return Err[bool](Error(decodeRes))
+    let lock = Value(decodeRes)
+    # ④ 逐 entry 落 index.lock.txt (幂等 merge, 保留既有条目)
+    for i in 0..<lock.entries.len:
+        var recRes = cas.CasLockRecord(
+            storeRoot,
+            lock.entries[i].modulePath,
+            lock.entries[i].cidHex)
+        if IsErr(recRes):
+            return Err[bool](Error(recRes))
+    return Ok[bool](true)

@@ -1,0 +1,1596 @@
+# Physics3D authority step (solver-decision §1, frozen):
+#   1. exact-in-step ballistic integration under constant per-body force:
+#        x += v*dt + (F/m)*dt^2/2 ;  v += (F/m)*dt
+#   2. constraint projection (constraints3d, 8 iterations, slot order)
+#   3. contact resolution (contacts3d, e=0, Coulomb)
+# A rejected step (NaN/Inf or post-solve residual > 10 mm) rolls the world
+# back to the exact pre-step state and never advances the tick — the film
+# pipeline sees a failed step, not a frozen frame shipped as success.
+import cheng/game/world3d
+import std/rawbytes
+import cheng/game/constraints3d
+import cheng/game/contacts3d
+import cheng/game/csg/numerics
+import std/math as m
+import std/strings as strings
+import std/strutils as strutil
+
+
+const
+    Physics3dSchema = "cheng.game.physics3d.v1"
+    Physics3dGravity = 9.80665
+    # foot pad (DUCK_FOOT_PAD): TPU rubber pad model
+    Physics3dFootPadK = 500.0
+    Physics3dFootPadC = 22.0
+    Physics3dFootPadT = 0.004
+    Physics3dStatusOk = 1
+    Physics3dStatusNonFinite = 2
+    Physics3dStatusResidual = 3
+    Physics3dResidualLimitM = 0.002
+    # line-contact support band for the capsule pair solve: both poles
+    # within this gap of the plane carry load together (see
+    # physics3dCapsuleGroundContact); anchored at the engine's own
+    # residual gate scale
+    Physics3dCapsuleSupportBandM = 0.010
+
+type
+    Physics3dStepReceipt =
+        schema: str
+        tick: int64
+        sourceWorldCid: str
+        resultWorldCid: str
+        contactCount: int32
+        maxResidualMm: float64
+        statusCode: int32
+        forceSource: str
+        receiptCid: str
+
+fn Physics3dClearForces(w: var World3d) =
+    var i: int32 = 0
+    while i < w.count:
+        w.bodyFx[i] = 0.0
+        w.bodyFy[i] = 0.0
+        w.bodyFz[i] = 0.0
+        i = i + 1
+
+# Accumulate a controller force on one body; the caller (motion controller)
+# owns magnitude capping and records the source string into the receipt.
+fn Physics3dAddForce(w: var World3d, slot: int32, fx: float64, fy: float64, fz: float64) =
+    if slot < 0 || slot >= w.count:
+        panic("physics3d: add force slot out of range")
+    w.bodyFx[slot] = w.bodyFx[slot] + fx
+    w.bodyFy[slot] = w.bodyFy[slot] + fy
+    w.bodyFz[slot] = w.bodyFz[slot] + fz
+
+# Actuator tick (joint-motor precedent): walk every servo command toward
+# its goal at a bounded per-tick rate BEFORE the step projects on it.
+#   kind 8 (anchor distance): fixed maxRate column, metres per tick.
+#   kind 9 (hinge servo): DC double cap rate = min(omega0*dt, tauMax*dt^2/
+#     I_eff) with I_eff = I_t(B) + m_B*d^2 and d the (conservative) local
+#     anchor arm — one step can never demand more angular correction than
+#     the stall torque can deliver. Commands clamp into the passive limits
+#     when those are enabled.
+fn physics3dServoWalk(w: var World3d, dt: float64) =
+    var ci: int32 = 0
+    while ci < w.conCount:
+        if w.conActive[ci] == 1:
+            let kind = w.conKind[ci]
+            if kind == world3d.World3dConAnchorDist:
+                let err = w.conGoal[ci] - w.conCmd[ci]
+                let rate = w.conMaxRate[ci]
+                if err > rate:
+                    w.conCmd[ci] = w.conCmd[ci] + rate
+                if err < 0.0 - rate:
+                    w.conCmd[ci] = w.conCmd[ci] - rate
+                if err <= rate:
+                    if err >= 0.0 - rate:
+                        w.conCmd[ci] = w.conGoal[ci]
+            if kind == world3d.World3dConHingeServo:
+                let bSlot = w.conB[ci]
+                if w.bodyInvMass[bSlot] > 0.0:
+                    let massB = 1.0 / w.bodyInvMass[bSlot]
+                    let dx = w.conAnchBx[ci]
+                    let dy = w.conAnchBy[ci]
+                    let dz = w.conAnchBz[ci]
+                    let d = numerics.CsgSqrt(dx * dx + dy * dy + dz * dz)
+                    let iEff = w.bodyIxx[bSlot] + massB * d * d
+                    # effective servo constants: the probe overrides replace
+                    # the assembled values for every hinge servo when set
+                    var omega0 = w.conOmega0[ci]
+                    var tauMaxJ = w.conTauMax[ci]
+                    if physics3dServoOmegaM > 0:
+                        omega0 = float64(physics3dServoOmegaM) / 1000.0
+                    if physics3dServoTauM > 0:
+                        tauMaxJ = float64(physics3dServoTauM) / 1000.0
+                    var rate = omega0 * dt
+                    if iEff > 0.0:
+                        let cap = tauMaxJ * dt * dt / iEff
+                        if cap < rate:
+                            rate = cap
+                    # velocity-feedback target (the PD D-term): the cmd
+                    # chases goal minus a rate-proportional offset, so a
+                    # loaded joint hunting around its goal sees the target
+                    # move WITH the load instead of against it — kills the
+                    # standing limit cycle (knee +-1.5 deg at ~2 Hz, feet
+                    # jacked up 1 mm per 10 ticks until topple). kD*dt
+                    # keeps it dimensionless-relative to the walk rate.
+                    var target = w.conGoal[ci]
+                    if iEff > 0.0:
+                        let aSlot = w.conA[ci]
+                        let qw = w.bodyQuatW[aSlot]
+                        let qx = w.bodyQuatX[aSlot]
+                        let qy = w.bodyQuatY[aSlot]
+                        let qz = w.bodyQuatZ[aSlot]
+                        let lx = w.conAxisAx[ci]
+                        let ly = w.conAxisAy[ci]
+                        let lz = w.conAxisAz[ci]
+                        let r00 = 1.0 - 2.0 * (qy * qy + qz * qz)
+                        let r10 = 2.0 * (qx * qy + qz * qw)
+                        let r20 = 2.0 * (qx * qz - qy * qw)
+                        let r01 = 2.0 * (qx * qy - qz * qw)
+                        let r11 = 1.0 - 2.0 * (qx * qx + qz * qz)
+                        let r21 = 2.0 * (qy * qz + qx * qw)
+                        let r02 = 2.0 * (qx * qz + qy * qw)
+                        let r12 = 2.0 * (qy * qz - qx * qw)
+                        let r22 = 1.0 - 2.0 * (qx * qx + qy * qy)
+                        let ux2 = r00 * lx + r01 * ly + r02 * lz
+                        let uy2 = r10 * lx + r11 * ly + r12 * lz
+                        let uz2 = r20 * lx + r21 * ly + r22 * lz
+                        let wAx = w.bodyAngVx[aSlot]
+                        let wAy = w.bodyAngVy[aSlot]
+                        let wAz = w.bodyAngVz[aSlot]
+                        let wBx = w.bodyAngVx[bSlot]
+                        let wBy = w.bodyAngVy[bSlot]
+                        let wBz = w.bodyAngVz[bSlot]
+                        let wrel = (wBx - wAx) * ux2 + (wBy - wAy) * uy2 + (wBz - wAz) * uz2
+                        let kD: float64 = float64(physics3dServoKdM) / 1000.0
+                        target = w.conGoal[ci] - kD * wrel / omega0
+                    let err = target - w.conCmd[ci]
+                    if err > rate:
+                        w.conCmd[ci] = w.conCmd[ci] + rate
+                    if err < 0.0 - rate:
+                        w.conCmd[ci] = w.conCmd[ci] - rate
+                    if err <= rate:
+                        if err >= 0.0 - rate:
+                            w.conCmd[ci] = w.conGoal[ci]
+                    if w.conLimMax[ci] > w.conLimMin[ci]:
+                        if w.conCmd[ci] > w.conLimMax[ci]:
+                            w.conCmd[ci] = w.conLimMax[ci]
+                        if w.conCmd[ci] < w.conLimMin[ci]:
+                            w.conCmd[ci] = w.conLimMin[ci]
+        ci = ci + 1
+
+# gait-mode gate relax switch (set by the app's walk controller);
+# int32 because the cold chain rejects cross-module bool var writes
+var physics3dGaitMode: int32 = 0
+# per-stage per-body velocity-delta diagnostic (DUCK_DV_ECHO): 1 echoes
+# rdv (velocity rebuild vs the pre-step velocity snapshot) and gcdv
+# (ball rolling + restitution + capsule ground coupling vs the
+# post-rebuild state) for the first 240 ticks — the standing-lean
+# force-source locator
+var physics3dDvEcho: int32 = 0
+
+fn physics3dFmtMilli(x: float64): str =
+    var neg: bool = x < 0.0
+    var mag: int64 = int64(x * 1000.0)
+    if neg:
+        mag = 0 - mag
+    var sign: str = ""
+    if neg:
+        sign = "-"
+    return sign + strings.Int64ToStr(mag)
+
+@borrows
+fn physics3dEchoDv(tag: str, w: World3d, ax: float64[], ay: float64[], az: float64[], bx: float64[], by: float64[], bz: float64[]) =
+    # echoes delta = b - a per moving body, nonzero rows only
+    var i: int32 = 0
+    while i < w.count:
+        if w.bodyInvMass[i] > 0.0:
+            let dx = bx[i] - ax[i]
+            let dy = by[i] - ay[i]
+            let dz = bz[i] - az[i]
+            let mag = dx * dx + dy * dy + dz * dz
+            if mag > 0.0000000001:
+                echo(tag + " t=" + strings.Int64ToStr(w.tick) + " i=" + strings.IntToStr(i) + " dvx=" + physics3dFmtMilli(dx) + " dvy=" + physics3dFmtMilli(dy) + " dvz=" + physics3dFmtMilli(dz))
+        i = i + 1
+# servo D-term gain in milli-units (cross-module int32 write contract);
+# the csg_player episode latch sets it from DUCK_SERVO_KD_M
+var physics3dServoKdM: int32 = 20
+# actuator authority overrides for the hinge-servo double cap (probe
+# envs DUCK_SERVO_OMEGA_M / DUCK_SERVO_TAUM_M, cross-module int32
+# milli-rad-s / milli-Nm write contract), 0 = use the assembled
+# per-constraint value. Read locally inside physics3dServoWalk only:
+# writing the con columns would churn the world CID and trip the
+# World3dValid magnitude bounds; this keeps the override env-gated and
+# bit-identical when unset.
+var physics3dServoOmegaM: int32 = 0
+var physics3dServoTauM: int32 = 0
+# joint damping switch and milli-gain (DUCK_JOINT_DAMP / DUCK_JOINT_DAMP_CM)
+var physics3dJointDampOn: int32 = 0
+# hinge velocity post-stabilization switch (DUCK_VPROJ)
+var physics3dVprojOn: int32 = 0
+# gate override in milli-metres (DUCK_GATE_MM), 0 = default
+var physics3dGateScaleM: int32 = 0
+# lateral roll reactivity switch (DUCK_ROLL_REACTIVE, default 1): the
+# contact-layer roll-rate redistribution is ACTIVE BALANCE authority —
+# under the rigid block solve the feet's solve-window omega noise
+# drives dj (proportional to the full weight normal impulse) into a
+# rocking feedback loop, so the passive standing contract must be able
+# to turn it off
+var physics3dRollReactiveOn: int32 = 1
+# per-pole contact impulse dump (DUCK_POLE_ECHO): pair normals and
+# per-pole friction deltas in the launch window
+var physics3dPoleEchoOn: int32 = 0
+var physics3dFootPadOn: int32 = 0
+# chain-coupled contact LCP (DUCK_CONTACT_CHAIN): the foot pair 2x2
+# solves with the CONSTRAINT-CHAIN response measured by unit-impulse
+# probes + VPROJ instead of the foot's own invMass only — a foot impulse
+# decelerates the whole held assembly through the hinges, not the
+# 26.5 g foot alone (the tap-overshoot / per-tick re-tap churn root)
+var physics3dContactChainOn: int32 = 0
+# interactive refine cap (DUCK_REFINE_MAX): caps the refine budget so
+# fallen/impact ticks cannot burn the full 4096-sweep budget and stall
+# the display loop. 0 = uncapped (headless acceptance default).
+var physics3dRefineMaxN: int32 = 0
+# pad stiffness in N/m (DUCK_PAD_K), 0 = default 1800
+var physics3dFootPadKN: int32 = 0
+# pad damping in N*s/m (DUCK_PAD_C), 0 = default 22
+var physics3dFootPadCN: int32 = 0
+# physics dt divisor for duckmode (DUCK_DT_DIV): dt = (1/240)/N. The
+# solve-window churn per step scales dt^2 (the gravity drop the
+# constraints repair), so finer steps shrink the per-step noise that
+# random-walks the stance across its support margin
+var physics3dDtDivN: int32 = 1
+
+fn physics3dFootPadCRead(): float64 =
+    if physics3dFootPadCN > 0:
+        return float64(physics3dFootPadCN)
+    return 22.0
+
+fn physics3dFootPadKRead(): float64 =
+    if physics3dFootPadKN > 0:
+        return float64(physics3dFootPadKN)
+    return 500.0
+var physics3dJointDampCmM: int32 = 20
+
+fn physics3dIsFinite(v: float64): bool =
+    # NaN fails both >= 0 and <= 0; +-Inf exceeds the huge bound.
+    if v > 1000000000.0:
+        return false
+    if v < -1000000000.0:
+        return false
+    let nonNeg: bool = v >= 0.0
+    let nonPos: bool = v <= 0.0
+    if !nonNeg:
+        if !nonPos:
+            return false
+    return true
+
+@borrows
+fn physics3dWorldFinite(w: World3d): bool =
+    var i: int32 = 0
+    while i < w.count:
+        if !physics3dIsFinite(w.bodyPx[i]):
+            return false
+        if !physics3dIsFinite(w.bodyPy[i]):
+            return false
+        if !physics3dIsFinite(w.bodyPz[i]):
+            return false
+        if !physics3dIsFinite(w.bodyVx[i]):
+            return false
+        if !physics3dIsFinite(w.bodyVy[i]):
+            return false
+        if !physics3dIsFinite(w.bodyVz[i]):
+            return false
+        if !physics3dIsFinite(w.bodyAngVx[i]):
+            return false
+        if !physics3dIsFinite(w.bodyAngVy[i]):
+            return false
+        if !physics3dIsFinite(w.bodyAngVz[i]):
+            return false
+        if w.bodyKind[i] == World3dBodyCapsuleRigid:
+            if !physics3dIsFinite(w.bodyQuatW[i]):
+                return false
+            if !physics3dIsFinite(w.bodyQuatX[i]):
+                return false
+            if !physics3dIsFinite(w.bodyQuatY[i]):
+                return false
+            if !physics3dIsFinite(w.bodyQuatZ[i]):
+                return false
+        i = i + 1
+    return true
+
+# --- Capsule rigid rotation (quaternion pose, symmetric-top inertia) ---
+#
+# Frame choice: angular velocity is stored in the WORLD frame (shared
+# bodyAngV columns) while the principal moments bodyIxx/Iyy/Izz are the
+# BODY-frame diagonal. The world inertia tensor I_world = R diag R^T is
+# rebuilt from the pose every step; for the capsule the transverse moments
+# are equal (Ixx = Iyy = It, axial Izz = Ia), so with the world axis
+# a = R e_z:
+#   I_world v = It v + (Ia - It) (a.v) a          (apply)
+#   I^-1_world v = v_perp/It + (a.v) a/Ia         (inverse, a principal)
+
+type
+    Physics3dVec3 =
+        x: float64
+        y: float64
+        z: float64
+
+fn physics3dVec3(vx: float64, vy: float64, vz: float64): Physics3dVec3 =
+    var v: Physics3dVec3
+    v.x = vx
+    v.y = vy
+    v.z = vz
+    return v
+
+fn physics3dCapsuleAxis(qw: float64, qx: float64, qy: float64, qz: float64): Physics3dVec3 =
+    # image of the local +Z capsule axis under the body rotation:
+    # third column of the rotation matrix, (2(xz + wy), 2(yz - wx), 1 - 2(x^2 + y^2))
+    return physics3dVec3(2.0 * (qx * qz + qw * qy), 2.0 * (qy * qz - qw * qx), 1.0 - 2.0 * (qx * qx + qy * qy))
+
+fn physics3dInertiaInv(it: float64, ia: float64, ax: float64, ay: float64, az: float64, vx: float64, vy: float64, vz: float64): Physics3dVec3 =
+    let par = vx * ax + vy * ay + vz * az
+    let px = vx - par * ax
+    let py = vy - par * ay
+    let pz = vz - par * az
+    return physics3dVec3(px / it + par * ax / ia, py / it + par * ay / ia, pz / it + par * az / ia)
+
+# Gyroscopic term, KEPT (not dropped): tau_gyro = -omega x (I_world omega).
+# The capsule is exactly a symmetric top (Ixx = Iyy), and Euler's equation
+# in the body frame reduces to a steady rotation of omega about the body
+# symmetry axis with rate ((Ia-It)/It)(a.omega) — solved here in closed
+# form with a Rodrigues rotation, which is orthogonal, so |omega| is
+# preserved to machine precision. Numerical Euler on
+# omega_dot = I^-1(-omega x I omega) would pump |omega| by ~(Omega dt)^2/2
+# per step (~10% over a 2 s probe at 240 Hz); the closed form has zero
+# drift and covers the entire capsule inertia class.
+fn physics3dCapsuleGyro(w: var World3d, i: int32, dt: float64) =
+    let it = w.bodyIxx[i]
+    let ia = w.bodyIzz[i]
+    let axis = physics3dCapsuleAxis(w.bodyQuatW[i], w.bodyQuatX[i], w.bodyQuatY[i], w.bodyQuatZ[i])
+    let wx = w.bodyAngVx[i]
+    let wy = w.bodyAngVy[i]
+    let wz = w.bodyAngVz[i]
+    let par = wx * axis.x + wy * axis.y + wz * axis.z
+    let phi = (ia - it) / it * par * dt
+    let cs = m.cosFloat(phi)
+    let sn = m.sinFloat(phi)
+    let crx = axis.y * wz - axis.z * wy
+    let cry = axis.z * wx - axis.x * wz
+    let crz = axis.x * wy - axis.y * wx
+    let rad = par * (1.0 - cs)
+    w.bodyAngVx[i] = wx * cs + crx * sn + axis.x * rad
+    w.bodyAngVy[i] = wy * cs + cry * sn + axis.y * rad
+    w.bodyAngVz[i] = wz * cs + crz * sn + axis.z * rad
+
+# Capsule rotational integration, after the linear half-step:
+#   1. exact gyroscopic precession of omega (above)
+#   2. pose: q <- dq(q(omega)) q with dq the exact axis-angle quaternion of
+#      the step rotation (world-frame omega acts on the left), renormalized
+#      so roundoff can never accumulate into a pose shear
+fn physics3dCapsuleIntegrateRotation(w: var World3d, dt: float64) =
+    var i: int32 = 0
+    while i < w.count:
+        if w.bodyKind[i] == World3dBodyCapsuleRigid:
+            if w.bodyInvMass[i] > 0.0:
+                physics3dCapsuleGyro(w, i, dt)
+                let wx = w.bodyAngVx[i]
+                let wy = w.bodyAngVy[i]
+                let wz = w.bodyAngVz[i]
+                let wMag = numerics.CsgSqrt(wx * wx + wy * wy + wz * wz)
+                if wMag > 0.0:
+                    let half = 0.5 * wMag * dt
+                    let dw = m.cosFloat(half)
+                    let sn = m.sinFloat(half) / wMag
+                    let dx = wx * sn
+                    let dy = wy * sn
+                    let dz = wz * sn
+                    let qw = w.bodyQuatW[i]
+                    let qx = w.bodyQuatX[i]
+                    let qy = w.bodyQuatY[i]
+                    let qz = w.bodyQuatZ[i]
+                    let nw = dw * qw - dx * qx - dy * qy - dz * qz
+                    let nx = dw * qx + dx * qw + dy * qz - dz * qy
+                    let ny = dw * qy - dx * qz + dy * qw + dz * qx
+                    let nz = dw * qz + dx * qy - dy * qx + dz * qw
+                    let qn = numerics.CsgSqrt(nw * nw + nx * nx + ny * ny + nz * nz)
+                    w.bodyQuatW[i] = nw / qn
+                    w.bodyQuatX[i] = nx / qn
+                    w.bodyQuatY[i] = ny / qn
+                    w.bodyQuatZ[i] = nz / qn
+        i = i + 1
+
+# Capsule ground prepass: capsule = segment (half length h along the local
+# z axis) + radius r; the solid dips below z=0 exactly when a hemisphere
+# center does. Push the body up so the lower hemisphere center sits at
+# z = r exactly, BEFORE Contacts3dResolveAll runs — same cut as the ball
+# prepass: contacts3d's Coulomb clamp is center-of-mass translation only,
+# and after the pushout the center height pz = r + h|az| >= r keeps the
+# center-based ground loop away from capsules. The capsule's own contact,
+# including the omega coupling, is applied by physics3dCapsuleGroundContact
+# after the velocity rebuild. Capsule-vs-wall faces still go through
+# contacts3d as center spheres — accepted scope of the minimal cut.
+# liftZ records the per-body pushout raise: the raise is pure geometric
+# repair and must not enter the Verlet velocity rebuild as COM velocity.
+# For a ballistic descent the lift cancels the fall exactly and the
+# rebuild reads ~0 either way (the flat landing fixed point); for a
+# TUMBLE- or constraint-driven penetration the lift is sideways geometry
+# repair — feeding it to the rebuild converts it into upward COM velocity
+# (lift/dt per tick), which re-launches the body, feeds the next slam,
+# and pumps the capsule into the sky (measured: a 45 deg capsule dropped
+# from 0.7 m reached omega > 2000 rad/s and z > 160 m; the duck ankle
+# unit rejected non-finite from tick 274 on and froze the tick loop).
+fn physics3dCapsuleGroundPushout(w: var World3d, liftZ: var float64[]) =
+    var i: int32 = 0
+    while i < w.count:
+        liftZ[i] = 0.0
+        if w.bodyKind[i] == World3dBodyCapsuleRigid:
+            if w.bodyInvMass[i] > 0.0:
+                let axis = physics3dCapsuleAxis(w.bodyQuatW[i], w.bodyQuatX[i], w.bodyQuatY[i], w.bodyQuatZ[i])
+                let h = w.bodyCapsuleHalf[i]
+                let lowest = w.bodyPz[i] - h * m.absFloat(axis.z)
+                let penetration = w.bodyRadius[i] - lowest
+                if penetration > 0.0:
+                    # pad mode: the pad soaks the first T of compression
+                    # (spring force above); the pushout only repairs the
+                    # BOTTOM-OUT excess beyond the pad travel
+                    if physics3dFootPadOn == 1:
+                        if penetration > Physics3dFootPadT:
+                            w.bodyPz[i] = w.bodyPz[i] + (penetration - Physics3dFootPadT)
+                            liftZ[i] = penetration - Physics3dFootPadT
+                    else:
+                        w.bodyPz[i] = w.bodyPz[i] + penetration
+                        liftZ[i] = penetration
+        i = i + 1
+
+# Velocity-level contact of one capsule end (hemisphere center e) with the
+# ground plane, r_c the offset of the contact point (projection of e onto
+# the plane) from the center of mass:
+#   contact velocity u = v + omega x r_c   (rolling-coupling generalization)
+#   normal: e=0 impulse Jn = -vn / (1/m + n.(I^-1(rc x n) x rc)) for vn < 0
+#   Coulomb friction: stick impulse J = -u/|u| * |u|/k_t along the slip,
+#     clamped by mu * Jn (this pole's own normal impulse of this tick);
+#     k_t the rotational effective mass along
+#     the slip direction. Impulse J acts on v by J/m and on omega by
+#     I^-1_world(rc x J) — the torque of the contact force.
+# bias is the gravity half-step kick carried by constraint-held bodies
+# (see physics3dCapsuleGroundContact): 0 for free bodies, whose offset
+# support couple IS the real support/topple dynamics.
+fn physics3dCapsuleEndContact(w: var World3d,
+                              i: int32,
+                              it: float64,
+                              ia: float64,
+                              ax: float64,
+                              ay: float64,
+                              az: float64,
+                              rcx: float64,
+                              rcy: float64,
+                              dt: float64,
+                              bias: float64,
+                              held: bool) =
+    let invMass = w.bodyInvMass[i]
+    let vcz = w.bodyVz[i] + (w.bodyAngVx[i] * rcy - w.bodyAngVy[i] * rcx) + bias
+    if vcz < 0.0:
+        # impulse direction n = (0,0,1), rc x n = (rcy, -rcx, 0)
+        let iinv = physics3dInertiaInv(it, ia, ax, ay, az, rcy, 0.0 - rcx, 0.0)
+        let tz = iinv.x * rcy - iinv.y * rcx
+        let kn = invMass + tz
+        let jn = (0.0 - vcz) / kn
+        w.bodyVz[i] = w.bodyVz[i] + jn * invMass
+        let tax = rcy * jn
+        let tay = (0.0 - rcx) * jn
+        let dw = physics3dInertiaInv(it, ia, ax, ay, az, tax, tay, 0.0)
+        w.bodyAngVx[i] = w.bodyAngVx[i] + dw.x
+        w.bodyAngVy[i] = w.bodyAngVy[i] + dw.y
+        w.bodyAngVz[i] = w.bodyAngVz[i] + dw.z
+        # Coulomb friction belongs to the same contact event as the normal
+        # impulse (no normal force, no friction): friction outside this gate
+        # fired on SEPARATING or airborne poles too, feeding torque through
+        # the contact-point lever rcz = -pz without any normal force.
+        physics3dCapsuleEndFriction(w, i, it, ia, ax, ay, az, rcx, rcy, jn, dt, held)
+
+# Coulomb friction at one capsule end, on the post-normal contact velocity.
+# held capsules take the TRANSLATION-ONLY friction channel (the same
+# ownership split as contacts3dResolveCapsuleBall: a constraint-held light
+# capsule's support couple belongs to the constraint stage). The full
+# contact-point friction torque (lever rcz = -pz, ~1 cm for a duck foot)
+# applied every tick at the Coulomb clamp drives Ixx^-1 ~ 1e5 of a held
+# foot at O(1) rad/s per tick that the constraint stage (already run this
+# tick) must undo - the measured slam energy pump. Free capsules keep the
+# full rolling-coupled friction: there the torque is the real roll physics.
+fn physics3dCapsuleEndFriction(w: var World3d,
+                               i: int32,
+                               it: float64,
+                               ia: float64,
+                               ax: float64,
+                               ay: float64,
+                               az: float64,
+                               rcx: float64,
+                               rcy: float64,
+                               jn: float64,
+                               dt: float64,
+                               held: bool) =
+    let invMass = w.bodyInvMass[i]
+    var rcz = 0.0 - w.bodyPz[i]
+    var ucx = w.bodyVx[i] + (w.bodyAngVy[i] * rcz - w.bodyAngVz[i] * rcy)
+    var ucy = w.bodyVy[i] + (w.bodyAngVz[i] * rcx - w.bodyAngVx[i] * rcz)
+    if held:
+        # translation-only channel: slip of the CENTER, zero torque lever
+        rcz = 0.0
+        ucx = w.bodyVx[i]
+        ucy = w.bodyVy[i]
+    # lateral roll-stiffness for held feet: the trunk tipping sideways
+    # (roll rate about y... engine roll about the forward X axis) gets
+    # a ground reaction pair — an angular impulse about the capsule's
+    # horizontal transverse direction opposing the body's roll RATE,
+    # budget-clamped by this pole's normal impulse. Without it the
+    # feet are torque-blind at the ground and a standing/walking duck
+    # has NO lateral ground support (the fold: up 0.98->0.48 in 40
+    # ticks with both feet planted).
+    let uMag = numerics.CsgSqrt(ucx * ucx + ucy * ucy)
+    if uMag > 0.000000001:
+        let tx = ucx / uMag
+        let ty = ucy / uMag
+        # c = rc x t_hat with t_hat = (tx, ty, 0): x component is
+        # rcy*0 - rcz*ty. The former rcy*ty - rcz*tx made kt an INDEFINITE
+        # bilinear form (c_code vs c_true), so kt could flip negative and
+        # unclamp jMag into an unbounded reversed friction impulse - the
+        # slam energy pump (9 out-of-bound impulses in a 2400 tick probe).
+        let iinv = physics3dInertiaInv(it, ia, ax, ay, az, 0.0 - rcz * ty, rcz * tx, rcx * ty - rcy * tx)
+        let gx = iinv.y * rcz - iinv.z * rcy
+        let gy = iinv.z * rcx - iinv.x * rcz
+        let kt = invMass + gx * tx + gy * ty
+        var jMag = uMag / kt
+        # Coulomb clamp on THIS pole's own normal impulse of this tick (the
+        # same contact event that produced jn): the friction budget is the
+        # actual contact load - a standing duck foot carries the whole
+        # trunk/head mass through the joint chain, ~14x its own weight, so
+        # the old mu*ownWeight*dt clamp starved the grip and the feet crept
+        # out of the support. Jn = 0 means no normal force, zero friction.
+        let jMax = Contacts3dGroundFriction * jn
+        if jMag > jMax:
+            jMag = jMax
+        let jx = (0.0 - jMag) * tx
+        let jy = (0.0 - jMag) * ty
+        w.bodyVx[i] = w.bodyVx[i] + jx * invMass
+        w.bodyVy[i] = w.bodyVy[i] + jy * invMass
+        if physics3dPoleEchoOn == 1:
+            if w.tick >= 235 and w.tick <= 285:
+                echo("fric t=" + strings.Int64ToStr(w.tick) + " i=" + strings.IntToStr(i) + " jn=" + strings.Int64ToStr(int64(jn * 1000000.0)) + " jx=" + strings.Int64ToStr(int64(jx * invMass * 1000000.0)) + " jy=" + strings.Int64ToStr(int64(jy * invMass * 1000000.0)) + " tx=" + strings.Int64ToStr(int64(tx * 1000.0)) + " ty=" + strings.Int64ToStr(int64(ty * 1000.0)))
+        if !held:
+            # rc x J with J = (jx, jy, 0)
+            let dw = physics3dInertiaInv(it, ia, ax, ay, az, (0.0 - rcz) * jy, rcz * jx, rcx * jy - rcy * jx)
+            w.bodyAngVx[i] = w.bodyAngVx[i] + dw.x
+            w.bodyAngVy[i] = w.bodyAngVy[i] + dw.y
+            w.bodyAngVz[i] = w.bodyAngVz[i] + dw.z
+
+# Both-end support contact: the discrete form of the capsule's ground line
+# contact. A horizontal capsule rests on the whole bottom silhouette line,
+# whose honest two-point reduction is BOTH hemisphere poles; solving them
+# as two independent impulses (one Gauss-Seidel sweep) lets each end's
+# angular response re-excite the other through Ixx^-1 ~ 1.6e5 for a light
+# foot capsule and ratchets omega without bound. Instead the pair is one
+# coupled 2x2 LCP in (jn1, jn2) — the same generalized effective-mass
+# family as the ball's J = -u/(1/m + r^2/I):
+#   K = J M^-1 J^T,  K_kj = 1/m + ((I^-1 c_j) x rc_k).z,  c_k = rc_k x n
+#   K j = -vn  solved exactly, then clamped to the unilateral j >= 0
+# (pivot: a negative component deactivates that pole, the other re-solves
+# alone). Symmetric loads give j1 = j2 with cancelling torques, so a flat
+# supported capsule carries weight without any angular kick.
+fn physics3dCapsulePairContact(w: var World3d,
+                               i: int32,
+                               it: float64,
+                               ia: float64,
+                               ax: float64,
+                               ay: float64,
+                               az: float64,
+                               h: float64,
+                               dt: float64,
+                               bias: float64,
+                               held: bool,
+                               restFloorJ: float64) =
+    let invMass = w.bodyInvMass[i]
+    let rc1x = h * ax
+    let rc1y = h * ay
+    let rc2x = (0.0 - h) * ax
+    let rc2y = (0.0 - h) * ay
+    # vn carries the gravity bias only for constraint-held bodies (see
+    # physics3dCapsuleGroundContact); free bodies solve with raw vn
+    let vn1 = w.bodyVz[i] + w.bodyAngVx[i] * rc1y - w.bodyAngVy[i] * rc1x + bias
+    let vn2 = w.bodyVz[i] + w.bodyAngVx[i] * rc2y - w.bodyAngVy[i] * rc2x + bias
+    let iinv1 = physics3dInertiaInv(it, ia, ax, ay, az, rc1y, 0.0 - rc1x, 0.0)
+    let iinv2 = physics3dInertiaInv(it, ia, ax, ay, az, rc2y, 0.0 - rc2x, 0.0)
+    # K is symmetric by construction (J M^-1 J^T); one off-diagonal entry.
+    let k11 = invMass + iinv1.x * rc1y - iinv1.y * rc1x
+    let k12 = invMass + iinv2.x * rc1y - iinv2.y * rc1x
+    let k22 = invMass + iinv2.x * rc2y - iinv2.y * rc2x
+    # chain-coupled effective mass (DUCK_CONTACT_CHAIN): measure the
+    # assembly's (vn1, vn2) response to unit normal impulses at each
+    # pole THROUGH the constraint chain — apply a probe impulse, run the
+    # hinge velocity projection so the response is chain-consistent,
+    # measure both pole rates, restore every velocity exactly. The pair
+    # LCP then solves against the measured 2x2 K: one impulse decelerates
+    # the whole held assembly at that pole instead of only the foot
+    # (foot-alone K under-supports by the foot/assembly mass ratio, so
+    # the chain re-delivers the closure next tick — the re-tap churn).
+    # VPROJ touches v/omega only, so a full velocity save/restore is a
+    # complete probe undo.
+    var solvedChain: bool = false
+    var j1: float64
+    var j2: float64
+    if physics3dContactChainOn == 1:
+        if held:
+            var sx: float64[]
+            var sy: float64[]
+            var sz: float64[]
+            var swx: float64[]
+            var swy: float64[]
+            var swz: float64[]
+            setLen(sx, 0)
+            setLen(sy, 0)
+            setLen(sz, 0)
+            setLen(swx, 0)
+            setLen(swy, 0)
+            setLen(swz, 0)
+            var bi: int32 = 0
+            while bi < w.count:
+                add(sx, w.bodyVx[bi])
+                add(sy, w.bodyVy[bi])
+                add(sz, w.bodyVz[bi])
+                add(swx, w.bodyAngVx[bi])
+                add(swy, w.bodyAngVy[bi])
+                add(swz, w.bodyAngVz[bi])
+                bi = bi + 1
+            var d11: float64 = 0.0
+            var d21: float64 = 0.0
+            var d12: float64 = 0.0
+            var d22: float64 = 0.0
+            var probe: int32 = 0
+            while probe < 2:
+                if probe == 0:
+                    w.bodyVz[i] = w.bodyVz[i] + invMass
+                    let dwp = physics3dInertiaInv(it, ia, ax, ay, az, rc1y, 0.0 - rc1x, 0.0)
+                    w.bodyAngVx[i] = w.bodyAngVx[i] + dwp.x
+                    w.bodyAngVy[i] = w.bodyAngVy[i] + dwp.y
+                    w.bodyAngVz[i] = w.bodyAngVz[i] + dwp.z
+                else:
+                    w.bodyVz[i] = w.bodyVz[i] + invMass
+                    let dwp2 = physics3dInertiaInv(it, ia, ax, ay, az, rc2y, 0.0 - rc2x, 0.0)
+                    w.bodyAngVx[i] = w.bodyAngVx[i] + dwp2.x
+                    w.bodyAngVy[i] = w.bodyAngVy[i] + dwp2.y
+                    w.bodyAngVz[i] = w.bodyAngVz[i] + dwp2.z
+                constraints3d.Constraints3dProjectHingeVelocities(w)
+                let m1 = w.bodyVz[i] + w.bodyAngVx[i] * rc1y - w.bodyAngVy[i] * rc1x
+                let m2 = w.bodyVz[i] + w.bodyAngVx[i] * rc2y - w.bodyAngVy[i] * rc2x
+                if probe == 0:
+                    d11 = m1 - vn1
+                    d21 = m2 - vn2
+                else:
+                    d12 = m1 - vn1
+                    d22 = m2 - vn2
+                var ri: int32 = 0
+                while ri < w.count:
+                    w.bodyVx[ri] = sx[ri]
+                    w.bodyVy[ri] = sy[ri]
+                    w.bodyVz[ri] = sz[ri]
+                    w.bodyAngVx[ri] = swx[ri]
+                    w.bodyAngVy[ri] = swy[ri]
+                    w.bodyAngVz[ri] = swz[ri]
+                    ri = ri + 1
+                probe = probe + 1
+            let detC = d11 * d22 - d12 * d21
+            if detC > 0.000000001:
+                j1 = ((0.0 - vn1) * d22 + d12 * vn2) / detC
+                j2 = ((0.0 - vn2) * d11 + d21 * vn1) / detC
+                if j1 < 0.0:
+                    j1 = 0.0
+                    if vn2 < 0.0:
+                        j2 = (0.0 - vn2) / d22
+                    else:
+                        j2 = 0.0
+                else:
+                    if j2 < 0.0:
+                        j2 = 0.0
+                        if vn1 < 0.0:
+                            j1 = (0.0 - vn1) / d11
+                        else:
+                            j1 = 0.0
+                solvedChain = true
+    if !solvedChain:
+        let det = k11 * k22 - k12 * k12
+        if det > 0.0:
+            j1 = ((0.0 - vn1) * k22 + k12 * vn2) / det
+            j2 = ((0.0 - vn2) * k11 + k12 * vn1) / det
+            if j1 < 0.0:
+                # pole 1 separates: deactivate it, pole 2 re-solves alone
+                j1 = 0.0
+                if vn2 < 0.0:
+                    j2 = (0.0 - vn2) / k22
+                else:
+                    j2 = 0.0
+            else:
+                if j2 < 0.0:
+                    j2 = 0.0
+                    if vn1 < 0.0:
+                        j1 = (0.0 - vn1) / k11
+                    else:
+                        j1 = 0.0
+        else:
+            # singular rows (axis vertical in the band): the angular channel is
+            # zero, the support impulse splits equally between the poles
+            j1 = (0.0 - (vn1 + vn2) * 0.5) * 0.5 / invMass
+            j2 = j1
+    # lateral roll reactivity (held bodies): a roll rate about world X
+    # modulates the pole split — the ground pushes harder on the pole
+    # the body falls onto. dj is clamped to a fraction of the pair
+    # impulses (pure redistribution, zero net energy) and vanishes at
+    # zero roll rate (rest contact unchanged).
+    if held:
+        var pairMag = j1
+        if pairMag < 0.0:
+            pairMag = 0.0 - pairMag
+        if j2 > 0.0:
+            pairMag = pairMag + j2
+        else:
+            pairMag = pairMag - j2
+        if physics3dRollReactiveOn == 1:
+            let rollV = w.bodyAngVx[i]
+            var dj: float64 = 0.0 - 0.02 * rollV * (j1 + j2)
+            let djMax = 0.3 * pairMag
+            if dj > djMax:
+                dj = djMax
+            if dj < 0.0 - djMax:
+                dj = 0.0 - djMax
+            j1 = j1 + dj
+            j2 = j2 - dj
+            if j1 < 0.0:
+                j1 = 0.0
+            if j2 < 0.0:
+                j2 = 0.0
+    if physics3dPoleEchoOn == 1:
+        if w.tick >= 235 and w.tick <= 285:
+            echo("pair t=" + strings.Int64ToStr(w.tick) + " i=" + strings.IntToStr(i) + " vn1=" + strings.Int64ToStr(int64(vn1 * 1000000.0)) + " vn2=" + strings.Int64ToStr(int64(vn2 * 1000000.0)) + " j1=" + strings.Int64ToStr(int64(j1 * 1000000.0)) + " j2=" + strings.Int64ToStr(int64(j2 * 1000000.0)) + " g1=" + strings.Int64ToStr(int64((w.bodyPz[i] + h * az - w.bodyRadius[i]) * 1000000.0)) + " g2=" + strings.Int64ToStr(int64((w.bodyPz[i] - h * az - w.bodyRadius[i]) * 1000000.0)))
+    # simultaneous application: combined COM impulse + combined torque
+    w.bodyVz[i] = w.bodyVz[i] + (j1 + j2) * invMass
+    let tqx = rc1y * j1 + rc2y * j2
+    let tqy = (0.0 - rc1x) * j1 + (0.0 - rc2x) * j2
+    let dw = physics3dInertiaInv(it, ia, ax, ay, az, tqx, tqy, 0.0)
+    w.bodyAngVx[i] = w.bodyAngVx[i] + dw.x
+    w.bodyAngVy[i] = w.bodyAngVy[i] + dw.y
+    w.bodyAngVz[i] = w.bodyAngVz[i] + dw.z
+    # Coulomb friction rides each pole's OWN normal contact event: a pole
+    # the LCP deactivated (j = 0, separating) carries no normal force and
+    # must carry no friction either - its airborne lever rcz = -pz would
+    # otherwise inject a full-clamp friction torque impulse into omega
+    # every tick with nothing to justify it (the slam energy pump, see
+    # physics3dCapsuleEndContact). The clamp is mu * the pole's own j.
+    #
+    # Rest-contact floor: a HELD capsule pole sustained ON the plane
+    # (gap <= 0) carries at least its own weight as the load reference, so
+    # the Coulomb budget survives cyclic rest, where the LCP itself yields
+    # j = 0 exactly (a resting held body stores zero velocity after the
+    # closure-velocity rebuild, so no approach event ever fires and the
+    # event-only clamp would leave a standing duck skating on whatever
+    # residual coast the settle leaves). The floor is per-pole per-tick
+    # (half of m*g*dt for the pair), touches the translational channel
+    # only, and is zero for free bodies and airborne poles (gap > 0): the
+    # pure event clamp is unchanged everywhere else.
+    var jf1 = 0.0
+    var jf2 = 0.0
+    if restFloorJ > 0.0:
+        let g1 = w.bodyPz[i] + h * az - w.bodyRadius[i]
+        let g2 = w.bodyPz[i] - h * az - w.bodyRadius[i]
+        if g1 <= 0.0:
+            jf1 = restFloorJ
+        if g2 <= 0.0:
+            jf2 = restFloorJ
+    if j1 > 0.0 || jf1 > 0.0:
+        physics3dCapsuleEndFriction(w, i, it, ia, ax, ay, az, rc1x, rc1y, j1 + jf1, dt, held)
+    if j2 > 0.0 || jf2 > 0.0:
+        physics3dCapsuleEndFriction(w, i, it, ia, ax, ay, az, rc2x, rc2y, j2 + jf2, dt, held)
+
+# A capsule is constraint-held when any active constraint references it.
+# The held/free split decides the gravity-bias handling of the ground
+# contact: the Verlet rebuild bakes the half-step gravity kick (-0.5 g dt)
+# into every pole's normal velocity while the pushout already absorbed the
+# same gravity at position level, and a single offset support pole turns
+# the whole kick into a support couple. For a FREE body that couple is the
+# real support/topple dynamics (a tilted capsule balancing on one pole
+# must topple — there is no other gravity-torque channel). For a HELD body
+# the couple belongs to the constraint stage, which ran earlier this tick
+# and cannot respond anymore; re-delivering it as an O(h/Ixx) rotation
+# kick per tick is a pure artifact that ratchets omega (a 0.04 kg foot
+# kicks ~0.8 rad/s per tick). Held bodies therefore solve with the bias
+# removed; free bodies get the raw impulse.
+@borrows
+fn physics3dBodyHeld(w: World3d, i: int32): bool =
+    var ci: int32 = 0
+    while ci < w.conCount:
+        if w.conActive[ci] == 1:
+            if w.conA[ci] == i:
+                return true
+            if w.conB[ci] == i:
+                return true
+        ci = ci + 1
+    return false
+
+# Capsule ground coupling. Per-pole engage is the speculative linearization
+# of the pole height constraint over the tick — the same linearization the
+# impulse itself applies: pole k engages when
+#   g_k + vn_k * dt < 0,   g_k = e_k_z - r,  vn_k = vz + (omega x rc_k)_z.
+# A pole penetrating now engages; so does a pole that would first cross the
+# plane within this tick — the flat slap of a swinging capsule, which the
+# post-pushout e <= r test could never see (it pins the lowest pole to
+# z = r, leaving the other at r + 2h|axis.z|, so fast sweeps jumped the
+# band and single-pole support ratcheted omega).
+# Near-flat support band: when both poles' gaps are within
+# Physics3dCapsuleSupportBandM of the plane, BOTH poles solve as one
+# coupled pair — the discrete line-contact regime. A single offset pole
+# support would otherwise deliver the whole support couple to Ixx^-1
+# (~1.6e5 for a light foot) as an ~O(1) rad/s per-tick spin kick that the
+# constraint stage (which ran earlier this tick) can no longer balance.
+# Inside the band the pair solve carries the load with cancelling torques
+# instead. The band sits at the engine's own 10 mm residual-gate scale,
+# and true single-point topples released with bigger gaps stay on the
+# single-pole path.
+# Per-pole unilateral pad impulses: F = max(0, k*x - c*vn), j = F*dt
+# applied at the pole with its lever; friction rides each pole's own
+# pad load. The pad's damping physically damps the heel-rocker: one
+# pole compressing pushes up while the other (extending) pulls its
+# force down — a restoring, dissipative couple instead of the instant
+# 1.5 m/s impulse per tap.
+fn physics3dCapsulePadContact(w: var World3d, dt: float64) =
+    var i: int32 = 0
+    while i < w.count:
+        if w.bodyKind[i] == World3dBodyCapsuleRigid:
+            if w.bodyInvMass[i] > 0.0:
+                let invMass = w.bodyInvMass[i]
+                let r = w.bodyRadius[i]
+                let h = w.bodyCapsuleHalf[i]
+                let axis = physics3dCapsuleAxis(w.bodyQuatW[i], w.bodyQuatX[i], w.bodyQuatY[i], w.bodyQuatZ[i])
+                let held = physics3dBodyHeld(w, i)
+                let rc1x = h * axis.x
+                let rc1y = h * axis.y
+                let rc2x = (0.0 - h) * axis.x
+                let rc2y = (0.0 - h) * axis.y
+                let g1 = w.bodyPz[i] + h * axis.z - r
+                let g2 = w.bodyPz[i] - h * axis.z - r
+                var padJ1: float64 = 0.0
+                var padJ2: float64 = 0.0
+                let x1 = 0.0 - g1
+                if x1 > 0.0:
+                    let vn1 = w.bodyVz[i] + w.bodyAngVx[i] * rc1y - w.bodyAngVy[i] * rc1x
+                    let f1 = physics3dFootPadKRead() * x1 - physics3dFootPadCRead() * vn1
+                    if f1 > 0.0:
+                        padJ1 = f1 * dt
+                let x2 = 0.0 - g2
+                if x2 > 0.0:
+                    let vn2 = w.bodyVz[i] + w.bodyAngVx[i] * rc2y - w.bodyAngVy[i] * rc2x
+                    let f2 = physics3dFootPadKRead() * x2 - physics3dFootPadCRead() * vn2
+                    if f2 > 0.0:
+                        padJ2 = f2 * dt
+                if padJ1 > 0.0 or padJ2 > 0.0:
+                    w.bodyVz[i] = w.bodyVz[i] + (padJ1 + padJ2) * invMass
+                    let tqx = rc1y * padJ1 + rc2y * padJ2
+                    let tqy = (0.0 - rc1x) * padJ1 + (0.0 - rc2x) * padJ2
+                    let dw = physics3dInertiaInv(w.bodyIxx[i], w.bodyIzz[i], axis.x, axis.y, axis.z, tqx, tqy, 0.0)
+                    w.bodyAngVx[i] = w.bodyAngVx[i] + dw.x
+                    w.bodyAngVy[i] = w.bodyAngVy[i] + dw.y
+                    w.bodyAngVz[i] = w.bodyAngVz[i] + dw.z
+                    if padJ1 > 0.0:
+                        physics3dCapsuleEndFriction(w, i, w.bodyIxx[i], w.bodyIzz[i], axis.x, axis.y, axis.z, rc1x, rc1y, padJ1, dt, held)
+                    if padJ2 > 0.0:
+                        physics3dCapsuleEndFriction(w, i, w.bodyIxx[i], w.bodyIzz[i], axis.x, axis.y, axis.z, rc2x, rc2y, padJ2, dt, held)
+        i = i + 1
+
+fn physics3dCapsuleGroundContact(w: var World3d, dt: float64) =
+    var i: int32 = 0
+    while i < w.count:
+        if w.bodyKind[i] == World3dBodyCapsuleRigid:
+            if w.bodyInvMass[i] > 0.0:
+                let r = w.bodyRadius[i]
+                let h = w.bodyCapsuleHalf[i]
+                let axis = physics3dCapsuleAxis(w.bodyQuatW[i], w.bodyQuatX[i], w.bodyQuatY[i], w.bodyQuatZ[i])
+                # the held gravity-bias compensation is retired: held
+                # capsules now store the pure closure velocity (the rebuild
+                # no longer leaves the -g*dt/2 kick in vz for them), so
+                # there is no stored kick for the contact to cancel - the
+                # solve sees the true approach rate directly
+                var bias: float64 = 0.0
+                let held = physics3dBodyHeld(w, i)
+                let rc1x = h * axis.x
+                let rc1y = h * axis.y
+                let rc2x = (0.0 - h) * axis.x
+                let rc2y = (0.0 - h) * axis.y
+                let g1 = w.bodyPz[i] + h * axis.z - r
+                let g2 = w.bodyPz[i] - h * axis.z - r
+                # held bodies engage on the true closure rate (their stored
+                # vz no longer carries a gravity kick)
+                let vn1 = w.bodyVz[i] + w.bodyAngVx[i] * rc1y - w.bodyAngVy[i] * rc1x + bias
+                let vn2 = w.bodyVz[i] + w.bodyAngVx[i] * rc2y - w.bodyAngVy[i] * rc2x + bias
+                let a1 = g1 + vn1 * dt < 0.0
+                let a2 = g2 + vn2 * dt < 0.0
+                let b1 = g1 <= Physics3dCapsuleSupportBandM
+                let b2 = g2 <= Physics3dCapsuleSupportBandM
+                if held:
+                    # constraint-held capsule: BOTH poles co-solve as one
+                    # pair at ANY attitude. The pair's cancelling torques
+                    # are the ground half of the support the constraints
+                    # already balance; a single-pole solve here would hand
+                    # the whole couple to Ixx^-1 as a spin kick. Measured
+                    # (M5a): the pair-always regime keeps a duck foot at
+                    # omega <= 0.5 rad/s through the whole settle, while
+                    # the gap-gated single-pole regime explodes it past
+                    # 10^3 rad/s within ten ticks. A pole merely SUSTAINED
+                    # in the support band (a1/a2 false, b1/b2 true) is
+                    # engaged too so the rest-contact friction floor
+                    # applies: at cyclic rest vn == 0 exactly and the
+                    # strict engage gate would otherwise leave the
+                    # standing feet with zero friction budget forever.
+                    if a1 || a2 || b1 || b2:
+                        var restFloor = 0.0
+                        if b1 || b2:
+                            restFloor = 0.5 * Physics3dGravity * dt / w.bodyInvMass[i]
+                        physics3dCapsulePairContact(w, i, w.bodyIxx[i], w.bodyIzz[i], axis.x, axis.y, axis.z, h, dt, bias, held, restFloor)
+                else:
+                    if b1 && b2:
+                        # line-contact support band: co-solve the pair
+                        if a1 || a2:
+                            physics3dCapsulePairContact(w, i, w.bodyIxx[i], w.bodyIzz[i], axis.x, axis.y, axis.z, h, dt, bias, held, 0.0)
+                    else:
+                        if b1 || b2:
+                            # tilted: the true single-point contact
+                            if a1:
+                                physics3dCapsuleEndContact(w, i, w.bodyIxx[i], w.bodyIzz[i], axis.x, axis.y, axis.z, rc1x, rc1y, dt, bias, held)
+                            if a2:
+                                physics3dCapsuleEndContact(w, i, w.bodyIxx[i], w.bodyIzz[i], axis.x, axis.y, axis.z, rc2x, rc2y, dt, bias, held)
+                        else:
+                            # both poles off-plane: catch a simultaneous
+                            # slap as one pair, else each pole alone
+                            if a1 && a2:
+                                physics3dCapsulePairContact(w, i, w.bodyIxx[i], w.bodyIzz[i], axis.x, axis.y, axis.z, h, dt, bias, held, 0.0)
+                            else:
+                                if a1:
+                                    physics3dCapsuleEndContact(w, i, w.bodyIxx[i], w.bodyIzz[i], axis.x, axis.y, axis.z, rc1x, rc1y, dt, bias, held)
+                                if a2:
+                                    physics3dCapsuleEndContact(w, i, w.bodyIxx[i], w.bodyIzz[i], axis.x, axis.y, axis.z, rc2x, rc2y, dt, bias, held)
+        i = i + 1
+
+@borrows
+fn physics3dReceiptPreimage(r: Physics3dStepReceipt): str =
+    var b: rawbytes.BytesBuilder = rawbytes.BytesBuilderNew(512)
+    World3dCidAppendLit(b, r.schema)
+    World3dCidAppendLit(b, "|tick=")
+    World3dCidAppendI64(b, r.tick)
+    World3dCidAppendLit(b, "|src=")
+    World3dCidAppendLit(b, r.sourceWorldCid)
+    World3dCidAppendLit(b, "|res=")
+    World3dCidAppendLit(b, r.resultWorldCid)
+    World3dCidAppendLit(b, "|contacts=")
+    World3dCidAppendI64(b, r.contactCount)
+    let residMm: int64 = numerics.CsgQuantMm(r.maxResidualMm)
+    World3dCidAppendLit(b, "|resid=")
+    World3dCidAppendI64(b, residMm)
+    World3dCidAppendLit(b, "|status=")
+    World3dCidAppendI64(b, r.statusCode)
+    World3dCidAppendLit(b, "|force=")
+    World3dCidAppendLit(b, r.forceSource)
+    var raw: rawbytes.Bytes = rawbytes.BytesBuilderFinish(b)
+    let out: str = rawbytes.BytesToString(raw)
+    rawbytes.BytesFree(raw)
+    return out
+
+@borrows
+fn Physics3dReceiptCid(r: Physics3dStepReceipt): str =
+    return strings.Sha256(physics3dReceiptPreimage(r))
+
+@borrows
+fn Physics3dReceiptValid(r: Physics3dStepReceipt): bool =
+    if r.statusCode <= 0:
+        return false
+    if r.schema != Physics3dSchema:
+        return false
+    if r.sourceWorldCid.len != 64:
+        return false
+    if r.resultWorldCid.len != 64:
+        return false
+    if r.receiptCid != Physics3dReceiptCid(r):
+        return false
+    return true
+
+# Save/restore of the motion columns (translation, rigid-ball angular
+# velocity, capsule quaternion pose) for transaction rollback.
+@borrows
+fn physics3dSaveMotion(w: World3d,
+                       px: var float64[],
+                       py: var float64[],
+                       pz: var float64[],
+                       vx: var float64[],
+                       vy: var float64[],
+                       vz: var float64[],
+                       wx: var float64[],
+                       wy: var float64[],
+                       wz: var float64[],
+                       qw: var float64[],
+                       qx: var float64[],
+                       qy: var float64[],
+                       qz: var float64[]) =
+    setLen(px, 0)
+    setLen(py, 0)
+    setLen(pz, 0)
+    setLen(vx, 0)
+    setLen(vy, 0)
+    setLen(vz, 0)
+    setLen(wx, 0)
+    setLen(wy, 0)
+    setLen(wz, 0)
+    setLen(qw, 0)
+    setLen(qx, 0)
+    setLen(qy, 0)
+    setLen(qz, 0)
+    var i: int32 = 0
+    while i < w.count:
+        add(px, w.bodyPx[i])
+        add(py, w.bodyPy[i])
+        add(pz, w.bodyPz[i])
+        add(vx, w.bodyVx[i])
+        add(vy, w.bodyVy[i])
+        add(vz, w.bodyVz[i])
+        add(wx, w.bodyAngVx[i])
+        add(wy, w.bodyAngVy[i])
+        add(wz, w.bodyAngVz[i])
+        add(qw, w.bodyQuatW[i])
+        add(qx, w.bodyQuatX[i])
+        add(qy, w.bodyQuatY[i])
+        add(qz, w.bodyQuatZ[i])
+        i = i + 1
+
+fn physics3dRestoreMotion(w: var World3d,
+                          px: float64[],
+                          py: float64[],
+                          pz: float64[],
+                          vx: float64[],
+                          vy: float64[],
+                          vz: float64[],
+                          wx: float64[],
+                          wy: float64[],
+                          wz: float64[],
+                          qw: float64[],
+                          qx: float64[],
+                          qy: float64[],
+                          qz: float64[]) =
+    var i: int32 = 0
+    while i < w.count:
+        w.bodyPx[i] = px[i]
+        w.bodyPy[i] = py[i]
+        w.bodyPz[i] = pz[i]
+        w.bodyVx[i] = vx[i]
+        w.bodyVy[i] = vy[i]
+        w.bodyVz[i] = vz[i]
+        w.bodyAngVx[i] = wx[i]
+        w.bodyAngVy[i] = wy[i]
+        w.bodyAngVz[i] = wz[i]
+        w.bodyQuatW[i] = qw[i]
+        w.bodyQuatX[i] = qx[i]
+        w.bodyQuatY[i] = qy[i]
+        w.bodyQuatZ[i] = qz[i]
+        i = i + 1
+
+# Rigid-ball ground prepass: push the ball out to z = r exactly, BEFORE
+# Contacts3dResolveAll runs. contacts3d's Coulomb clamp is center-of-mass
+# translation only — physically wrong for a rolling sphere (it would brake
+# a purely rolling ball as if sliding). With penetration zeroed here the
+# ground loop skips the ball entirely; the ball's own friction, including
+# the omega coupling, is applied by physics3dBallRollingContact after the
+# velocity rebuild. Sphere-vs-wall faces still go through contacts3d
+# (translation-only friction) — accepted scope of the minimal cut.
+fn physics3dBallGroundPushout(w: var World3d) =
+    var i: int32 = 0
+    while i < w.count:
+        if w.bodyKind[i] == World3dBodyBallRigid:
+            if w.bodyInvMass[i] > 0.0:
+                let penetration = w.bodyRadius[i] - w.bodyPz[i]
+                if penetration > 0.0:
+                    w.bodyPz[i] = w.bodyPz[i] + penetration
+        i = i + 1
+
+# Rigid-ball rolling contact, velocity level, after the Verlet-PBD rebuild.
+# Contact at the -z pole (r_c = (0,0,-r)): the contact-point slip is
+#   u = (vx - wy*r, vy + wx*r)
+# (v + omega x r_c). The Coulomb impulse J, |J| <= mu*N*dt, opposes u and
+# acts both on translation (v += J/m) and spin (omega += (r_c x J)/I), so
+# sliding converges to pure rolling and pure rolling sustains with zero
+# tangential force. The stick impulse that zeroes u exactly is
+# J = -u / (1/m + r^2/I). On top of the Coulomb channel a load-aware
+# rolling resistance (parameters below) dissipates carried-load deformation
+# energy while leaving the unloaded ball bit-identical.
+
+# Load-aware rolling resistance: a ball carrying contact load beyond its
+# own weight (rider pressure) deforms against the ground and rolling
+# becomes dissipative (hysteresis loss per distance ~ Crr * N). Real
+# ball-on-floor coefficients of rolling resistance are small: a basketball
+# rolled on a hardwood/parquet floor decelerates at ~0.01-0.05 g depending
+# on inflation and surface. Crr = 0.03 is the band midpoint; it applies
+# ONLY to the load above self weight (threshold = m*g, scale 1.0), so an
+# unloaded or lightly loaded ball keeps the exact pre-resistance
+# trajectory.
+const
+    Physics3dBallLoadThreshScale = 1.0
+
+# Ball environment parameters, module-level runtime-settable (the M-a
+# Contacts3dBallLoadRead module-level channel pattern: deliberately NOT
+# world state, never enters any CID preimage). Implementation note: the
+# parameters live in one grow-only float64[] (the contacts3dBallLoadFz
+# shape) because a plain module-level float64 SCALAR var written from an
+# fn is a known-broken cold shape (the repro_wanfront128r2 regression:
+# FunctionContractAdmission rejects the global-address store). Readers
+# fall back to the frozen engine default when a cell was never set, and
+# the fallback literals are the frozen values bit-for-bit — Crr 0.03;
+# restitution e = 0 (the engine's only ball-ground normal channel was
+# exactly inelastic); friction mu = 0.6 = Contacts3dGroundFriction, the
+# Coulomb clamp budget of the ball's OWN rolling-contact channel (the
+# capsule/foot channels keep reading Contacts3dGroundFriction directly)
+# — so worlds that never call the setters keep the exact
+# pre-parameterization trajectories and CIDs. The setters are a
+# SERIAL-evaluation surface (environment scans / CEM probes must
+# evaluate cells one at a time in one main loop): plain module slots
+# would race under parallel evaluation, so parallel callers must not
+# use them.
+const
+    Physics3dBallParamCrr = 0
+    Physics3dBallParamE = 1
+    Physics3dBallParamMu = 2
+
+var physics3dBallEnvParams: float64[]
+
+fn Physics3dBallRollResistSet(crr: float64) =
+    if physics3dBallEnvParams.len < 3:
+        setLen(physics3dBallEnvParams, 3)
+    physics3dBallEnvParams[Physics3dBallParamCrr] = crr
+
+fn Physics3dBallRestitutionSet(e: float64) =
+    if physics3dBallEnvParams.len < 3:
+        setLen(physics3dBallEnvParams, 3)
+    physics3dBallEnvParams[Physics3dBallParamE] = e
+
+fn Physics3dBallFrictionSet(mu: float64) =
+    if physics3dBallEnvParams.len < 3:
+        setLen(physics3dBallEnvParams, 3)
+    physics3dBallEnvParams[Physics3dBallParamMu] = mu
+
+# Reader: a cell a setter never wrote reads as the frozen engine default
+# (the fallback literal IS the frozen value), so the default path is
+# bit-identical.
+fn Physics3dBallEnvParamRead(idx: int32, fallback: float64): float64 =
+    if idx >= physics3dBallEnvParams.len:
+        return fallback
+    return physics3dBallEnvParams[idx]
+
+fn physics3dBallRollingContact(w: var World3d, dt: float64) =
+    var i: int32 = 0
+    while i < w.count:
+        if w.bodyKind[i] == World3dBodyBallRigid:
+            if w.bodyInvMass[i] > 0.0:
+                # contact test runs after the prepass pushout, so the
+                # resting ball sits at exactly z = r — touching counts
+                if w.bodyPz[i] <= w.bodyRadius[i]:
+                    let r = w.bodyRadius[i]
+                    let mass = 1.0 / w.bodyInvMass[i]
+                    let inertia = World3dBallInertia(w, i)
+                    # rider pressure rides the contacts3d capsule-ball
+                    # report channel (exact zero without capsule-ball
+                    # contacts, so unloaded worlds keep this expression
+                    # bit-identical)
+                    var load = mass * Physics3dGravity - w.bodyFz[i] + Contacts3dBallLoadRead(i)
+                    if load < 0.0:
+                        load = 0.0
+                    let ux = w.bodyVx[i] - w.bodyAngVy[i] * r
+                    let uy = w.bodyVy[i] + w.bodyAngVx[i] * r
+                    let uMag = numerics.CsgSqrt(ux * ux + uy * uy)
+                    if uMag > 0.0:
+                        let invMeff = 1.0 / mass + r * r / inertia
+                        var jMag = uMag / invMeff
+                        # the ball's own Coulomb clamp budget: the module
+                        # parameter (fallback 0.6 = Contacts3dGroundFriction,
+                        # bit-identical) — the capsule/foot channels keep
+                        # Contacts3dGroundFriction directly
+                        let jMax = Physics3dBallEnvParamRead(Physics3dBallParamMu, 0.6) * load * dt
+                        if jMag > jMax:
+                            jMag = jMax
+                        let s = jMag / uMag
+                        let jx = 0.0 - ux * s
+                        let jy = 0.0 - uy * s
+                        w.bodyVx[i] = w.bodyVx[i] + jx / mass
+                        w.bodyVy[i] = w.bodyVy[i] + jy / mass
+                        w.bodyAngVx[i] = w.bodyAngVx[i] + r * jy / inertia
+                        w.bodyAngVy[i] = w.bodyAngVy[i] - r * jx / inertia
+                    # load-aware rolling resistance: `load` above is the
+                    # engine's ground-normal estimate (m*g minus held-up
+                    # force, plus the contacts3d capsule-ball rider-load
+                    # channel), so rider pressure enters both as a downward
+                    # Fz and through the PBD contact impulses the duck's
+                    # capsule links deliver to the ball each tick, and
+                    # raises load past self weight:
+                    #   excess = load - thresh*m*g  (>0 only under carried load)
+                    #   J_r = excess * Crr * dt     opposing the CENTER velocity
+                    # with the matching spin delta dw_y = dvx/r, dw_x =
+                    # -dvy/r so both slip components u_x = vx - wy*r and
+                    # u_y = vy + wx*r are invariant — pure roll decelerates
+                    # as pure roll. |J_r| is clamped so the center velocity
+                    # cannot reverse. excess <= 0 never passes the gate:
+                    # an unloaded ball takes exactly zero extra impulses
+                    # (the 5/7 v0 pure-roll case is bit-identical).
+                    let excess = load - mass * Physics3dBallLoadThreshScale * Physics3dGravity
+                    if excess > 0.0:
+                        let vhx = w.bodyVx[i]
+                        let vhy = w.bodyVy[i]
+                        let vhMag = numerics.CsgSqrt(vhx * vhx + vhy * vhy)
+                        if vhMag > 0.0:
+                            var jr = excess * Physics3dBallEnvParamRead(Physics3dBallParamCrr, 0.03) * dt
+                            let jrMax = vhMag * mass
+                            if jr > jrMax:
+                                jr = jrMax
+                            let sr = jr / vhMag
+                            let jrx = (0.0 - vhx) * sr
+                            let jry = (0.0 - vhy) * sr
+                            w.bodyVx[i] = w.bodyVx[i] + jrx / mass
+                            w.bodyVy[i] = w.bodyVy[i] + jry / mass
+                            w.bodyAngVy[i] = w.bodyAngVy[i] + jrx / (mass * r)
+                            w.bodyAngVx[i] = w.bodyAngVx[i] - jry / (mass * r)
+        i = i + 1
+
+# One authority step at dt = 1/240 s in frozen column order.
+@borrows
+fn Physics3dStep(w: var World3d, forceSource: str): Physics3dStepReceipt =
+    var receipt: Physics3dStepReceipt
+    receipt.schema = Physics3dSchema
+    receipt.tick = w.tick
+    receipt.sourceWorldCid = World3dCid(w)
+    receipt.statusCode = Physics3dStatusOk
+    receipt.forceSource = forceSource
+    receipt.maxResidualMm = 0.0
+    var svPx: float64[]
+    var svPy: float64[]
+    var svPz: float64[]
+    var svVx: float64[]
+    var svVy: float64[]
+    var svVz: float64[]
+    var svWx: float64[]
+    var svWy: float64[]
+    var svWz: float64[]
+    var svQw: float64[]
+    var svQx: float64[]
+    var svQy: float64[]
+    var svQz: float64[]
+    physics3dSaveMotion(w, svPx, svPy, svPz, svVx, svVy, svVz, svWx, svWy, svWz, svQw, svQx, svQy, svQz)
+    var dt: float64 = 1.0 / 240.0
+    if forceSource == "duckmode":
+        if physics3dDtDivN > 1:
+            dt = 1.0 / (240.0 * float64(physics3dDtDivN))
+    let dt2 = dt * dt
+    # actuator tick first: the servo commands this step projects on
+    physics3dServoWalk(w, dt)
+    # 1. integrate (exact ballistic under constant in-step force)
+    var i: int32 = 0
+    while i < w.count:
+        if w.bodyInvMass[i] > 0.0:
+            let mass = 1.0 / w.bodyInvMass[i]
+            let ax = w.bodyFx[i] / mass
+            let ay = w.bodyFy[i] / mass
+            let az = w.bodyFz[i] / mass - Physics3dGravity
+            w.bodyPx[i] = w.bodyPx[i] + w.bodyVx[i] * dt + 0.5 * ax * dt2
+            w.bodyPy[i] = w.bodyPy[i] + w.bodyVy[i] * dt + 0.5 * ay * dt2
+            w.bodyPz[i] = w.bodyPz[i] + w.bodyVz[i] * dt + 0.5 * az * dt2
+            w.bodyVx[i] = w.bodyVx[i] + ax * dt
+            w.bodyVy[i] = w.bodyVy[i] + ay * dt
+            w.bodyVz[i] = w.bodyVz[i] + az * dt
+        i = i + 1
+    # 1b. capsule rotation: exact gyroscopic precession of the world
+    #     angular velocity, then the exact axis-angle pose update
+    physics3dCapsuleIntegrateRotation(w, dt)
+    # pose checkpoint after free integration: the angular rebuild below
+    # attributes everything that happens to the pose from here to the end
+    # of projection to the constraints (single source of truth)
+    var q1w: float64[]
+    var q1x: float64[]
+    var q1y: float64[]
+    var q1z: float64[]
+    setLen(q1w, 0)
+    setLen(q1x, 0)
+    setLen(q1y, 0)
+    setLen(q1z, 0)
+    i = 0
+    while i < w.count:
+        add(q1w, w.bodyQuatW[i])
+        add(q1x, w.bodyQuatX[i])
+        add(q1y, w.bodyQuatY[i])
+        add(q1z, w.bodyQuatZ[i])
+        i = i + 1
+    # 2. constraints (refinement pass runs automatically above the gate).
+    #     The solve's gauge-drift removal is pure geometric repair - the
+    #     same family as the ground pushout lift below - so its per-body
+    #     position delta is tracked and subtracted from the Verlet velocity
+    #     rebuild: a gauge rotation chosen to preserve every constraint
+    #     must not bill the dynamics a COM velocity (the angular rebuild
+    #     already excludes it via the removal itself; the linear channel
+    #     previously did not, and the standing duck self-accelerated).
+    var gaugeDx: float64[]
+    var gaugeDy: float64[]
+    var gaugeDz: float64[]
+    # gait mode relaxes the gate: sliding servo goals keep the hinge
+    # rows permanently off-target (by design), the 2 mm gate forced
+    # the full 4096-sweep refine every tick (seconds per tick); 10 mm
+    # matches the sliding-target transient scale
+    var gateM: float64 = Physics3dResidualLimitM
+    var refineM: int32 = constraints3d.Constraints3dRefineIterations
+    if physics3dRefineMaxN > 0:
+        if physics3dRefineMaxN < refineM:
+            refineM = physics3dRefineMaxN
+    var residFailM: float64 = Physics3dResidualLimitM
+    if physics3dGateScaleM > 0:
+        # per-tick gate override in milli-metres (DUCK_GATE_MM): the
+        # exact block solve converges in a handful of sweeps, so a
+        # tighter gate no longer stalls the refine — and the 2 mm gate
+        # let every row park at a gate-equivalent error whose sum
+        # biased the standing COM past the capsule support margin
+        gateM = float64(physics3dGateScaleM) / 1000.0 / 1000.0
+        residFailM = gateM * 20.0
+    if physics3dGaitMode == 1:
+        gateM = Physics3dResidualLimitM * 7.5
+        refineM = 256
+        # sliding-goal transients: accept steps to 40 mm, roll back
+        # only on non-finite state (a rollback vs the sliding goals is
+        # a livelock — the goals moved on while the tick replayed)
+        residFailM = Physics3dResidualLimitM * 100000.0
+    var supRepair: float64[]
+    setLen(supRepair, 0)
+    var sli: int32 = 0
+    while sli < w.count * 4:
+        add(supRepair, 0.0)
+        sli = sli + 1
+    let residual = constraints3d.Constraints3dSolveTrackedBudget(w, gateM, gaugeDx, gaugeDy, gaugeDz, supRepair, refineM)
+    let _residFailM = residFailM
+    receipt.maxResidualMm = residual * 1000.0
+    # 2b. rigid-ball and capsule ground pushouts keep contacts3d's
+    #     translation-only Coulomb clamp away from rolling/tumbling rigid
+    #     bodies (see prepass comments). The capsule lift is recorded and
+    #     subtracted in the velocity rebuild below: geometric ground repair
+    #     must not read as COM velocity (the slam energy pump).
+    physics3dBallGroundPushout(w)
+    var capLift: float64[]
+    setLen(capLift, 0)
+    var li: int32 = 0
+    while li < w.count:
+        add(capLift, 0.0)
+        li = li + 1
+    physics3dCapsuleGroundPushout(w, capLift)
+    # 3. contacts (friction acts at position level against the saved
+    #    pre-step positions, so the rebuild below inherits it)
+    var cstats = Contacts3dResolveAll(w, svPx, svPy, svPz)
+    receipt.contactCount = cstats.contactCount
+    if !physics3dWorldFinite(w):
+        receipt.statusCode = Physics3dStatusNonFinite
+    else:
+        if residual > residFailM:
+            receipt.statusCode = Physics3dStatusResidual
+    if receipt.statusCode != Physics3dStatusOk:
+        physics3dRestoreMotion(w, svPx, svPy, svPz, svVx, svVy, svVz, svWx, svWy, svWz, svQw, svQx, svQy, svQz)
+        Physics3dClearForces(w)
+        receipt.resultWorldCid = receipt.sourceWorldCid
+        receipt.receiptCid = Physics3dReceiptCid(receipt)
+        return receipt
+    var preVx: float64[]
+    var preVy: float64[]
+    var preVz: float64[]
+    setLen(preVx, 0)
+    setLen(preVy, 0)
+    setLen(preVz, 0)
+    var pvi: int32 = 0
+    while pvi < w.count:
+        add(preVx, w.bodyVx[pvi])
+        add(preVy, w.bodyVy[pvi])
+        add(preVz, w.bodyVz[pvi])
+        pvi = pvi + 1
+    # Verlet-PBD velocity update: the stored velocity is the half-step
+    # center velocity (dx/dt advanced by a*dt), so constant-force flight
+    # stays analytically exact while constraint impulses enter through the
+    # actual post-projection displacement. The ground pushout lift is not
+    # dynamics and is subtracted (see physics3dCapsuleGroundPushout).
+    # CONSTRAINT-HELD capsules store the pure closure velocity instead
+    # (no + a*dt/2 gravity term): their positions were just restored by
+    # the constraint stage, so the falling-trajectory half-kick is not
+    # real motion - keeping it stored injected a -g*dt/2 downward velocity
+    # into every resting held body each tick (measured: the standing duck
+    # carried vz = -20.4 mm/s = -g*dt/2 on every link, doubled the per-tick
+    # gravity drop the projection had to repair, and fueled the slow
+    # squat-fold ratchet). Free bodies keep the exact ballistic form.
+    i = 0
+    while i < w.count:
+        if w.bodyInvMass[i] > 0.0:
+            let mass = 1.0 / w.bodyInvMass[i]
+            let ax = w.bodyFx[i] / mass
+            let ay = w.bodyFy[i] / mass
+            let az = w.bodyFz[i] / mass - Physics3dGravity
+            let closure = w.bodyKind[i] == World3dBodyCapsuleRigid
+            if physics3dBodyHeld(w, i):
+                if closure:
+                    w.bodyVx[i] = (w.bodyPx[i] - gaugeDx[i] - svPx[i]) / dt
+                    w.bodyVy[i] = (w.bodyPy[i] - gaugeDy[i] - svPy[i]) / dt
+                    w.bodyVz[i] = (w.bodyPz[i] - gaugeDz[i] - capLift[i] - supRepair[i * 4] - svPz[i]) / dt
+            if !physics3dBodyHeld(w, i) || !closure:
+                w.bodyVx[i] = (w.bodyPx[i] - gaugeDx[i] - svPx[i]) / dt + 0.5 * ax * dt
+                w.bodyVy[i] = (w.bodyPy[i] - gaugeDy[i] - svPy[i]) / dt + 0.5 * ay * dt
+                w.bodyVz[i] = (w.bodyPz[i] - gaugeDz[i] - capLift[i] - supRepair[i * 4] - svPz[i]) / dt + 0.5 * az * dt
+        i = i + 1
+    # 3b. angular rebuild, constraint-carried rotation only (the exact
+    #     analogue of the linear Verlet rebuild above): omega inherits the
+    #     rotation the constraints applied to the pose since the q1
+    #     checkpoint, as 2*vec(q2 (x) q1^-1)/dt in the world frame. A body
+    #     nothing rotated has q2 == q1 and the quaternion product cancels
+    #     bit-exactly to zero, so free spin (gyro probe) and the direct
+    #     contact-impulse path are untouched — no double counting.
+    i = 0
+    while i < w.count:
+        if w.bodyKind[i] == World3dBodyCapsuleRigid:
+            if w.bodyInvMass[i] > 0.0:
+                let qw2 = w.bodyQuatW[i]
+                let qx2 = w.bodyQuatX[i]
+                let qy2 = w.bodyQuatY[i]
+                let qz2 = w.bodyQuatZ[i]
+                let qw1 = q1w[i]
+                let qx1 = q1x[i]
+                let qy1 = q1y[i]
+                let qz1 = q1z[i]
+                # q2 (x) conj(q1): world-frame relative rotation vector
+                let relx = (0.0 - qw2) * qx1 + qw1 * qx2 + (0.0 - qy2) * qz1 + qz2 * qy1
+                let rely = (0.0 - qw2) * qy1 + qw1 * qy2 + (0.0 - qz2) * qx1 + qx2 * qz1
+                let relz = (0.0 - qw2) * qz1 + qw1 * qz2 + (0.0 - qx2) * qy1 + qy2 * qx1
+                let s = 2.0 / dt
+                w.bodyAngVx[i] = w.bodyAngVx[i] + relx * s
+                w.bodyAngVy[i] = w.bodyAngVy[i] + rely * s
+                w.bodyAngVz[i] = w.bodyAngVz[i] + relz * s
+        i = i + 1
+    var postRx: float64[]
+    var postRy: float64[]
+    var postRz: float64[]
+    setLen(postRx, 0)
+    setLen(postRy, 0)
+    setLen(postRz, 0)
+    pvi = 0
+    while pvi < w.count:
+        add(postRx, w.bodyVx[pvi])
+        add(postRy, w.bodyVy[pvi])
+        add(postRz, w.bodyVz[pvi])
+        pvi = pvi + 1
+    # hinge velocity post-stabilization BEFORE the contact stage: the
+    # rebuild bills the solve-window correction rotations as omega
+    # (measured: torso +-1 rad/s, feet +-3-7 rad/s at t=10 — gravity
+    # drop -> anchor gaps -> gap/arm rotations), and the contact LCP
+    # would otherwise read that phantom slip and answer with friction
+    # impulses — the launch engine. Project first, contacts see a clean
+    # state.
+    if physics3dVprojOn == 1:
+        constraints3d.Constraints3dProjectHingeVelocities(w)
+    # 3c. rigid-ball ground restitution, velocity level, the Newton
+    #     impact law (the e parameter): a touching ball whose
+    #     post-integration pre-contact vz was downward leaves with
+    #     vz = -e * vz_in, vz_in = saved pre-step vz + this tick's
+    #     force/gravity kick (the velocity at the contact moment). Runs
+    #     before the rolling coupling so the bounce tick still carries
+    #     its friction budget; the reflected vz replaces the ~0 vertical
+    #     velocity the pushout + rebuild left (the e = 0 fixed point).
+    #     The engine default is e = 0 and the e > 0 gate never opens
+    #     there, so the default path is bit-identical.
+    if Physics3dBallEnvParamRead(Physics3dBallParamE, 0.0) > 0.0:
+        var bi: int32 = 0
+        while bi < w.count:
+            if w.bodyKind[bi] == World3dBodyBallRigid:
+                if w.bodyInvMass[bi] > 0.0:
+                    if w.bodyPz[bi] <= w.bodyRadius[bi]:
+                        let massBi = 1.0 / w.bodyInvMass[bi]
+                        let azBi = w.bodyFz[bi] / massBi - Physics3dGravity
+                        let vzIn = svVz[bi] + azBi * dt
+                        if vzIn < 0.0:
+                            w.bodyVz[bi] = (0.0 - Physics3dBallEnvParamRead(Physics3dBallParamE, 0.0)) * vzIn
+            bi = bi + 1
+    # 3d. joint velocity damping (velocity level, post-rebuild): each
+    #     active hinge servo's relative axis rate gets a capped
+    #     equal-and-opposite impulse pair about the world hinge axis —
+    #     the gearbox viscous friction the MJCF omits (real XL330
+    #     drivetrain damps exactly this way). Purely dissipative: the
+    #     per-tick relative-rate removal is capped at
+    #     DUCK-scale kDamp*tau_max*dt/I_eff (never overshoots zero, so
+    #     it can never inject energy), and the reaction on the parent
+    #     keeps total angular momentum exact. Under the rigid block
+    #     solve the solve-window correction noise reads as joint omega;
+    #     without this sink the standing stance random-walks on its own
+    #     friction (measured: lateral creep vy 0.4 m/s by t=160).
+    if physics3dJointDampOn == 1:
+        let dampC: float64 = float64(physics3dJointDampCmM) / 1000.0
+        var ci: int32 = 0
+        while ci < w.conCount:
+            if w.conActive[ci] == 1:
+                let kind = w.conKind[ci]
+                if kind == world3d.World3dConHingeServo:
+                    let aSlot = w.conA[ci]
+                    let bSlot = w.conB[ci]
+                    if w.bodyInvMass[bSlot] > 0.0:
+                        if w.bodyKind[bSlot] == World3dBodyCapsuleRigid:
+                            if w.bodyIxx[bSlot] > 0.0:
+                                let qw = w.bodyQuatW[aSlot]
+                                let qx = w.bodyQuatX[aSlot]
+                                let qy = w.bodyQuatY[aSlot]
+                                let qz = w.bodyQuatZ[aSlot]
+                                let lx = w.conAxisAx[ci]
+                                let ly = w.conAxisAy[ci]
+                                let lz = w.conAxisAz[ci]
+                                let ux = (1.0 - 2.0 * (qy * qy + qz * qz)) * lx + 2.0 * (qx * qy - qz * qw) * ly + 2.0 * (qx * qz + qy * qw) * lz
+                                let uy = 2.0 * (qx * qy + qz * qw) * lx + (1.0 - 2.0 * (qx * qx + qz * qz)) * ly + 2.0 * (qy * qz - qx * qw) * lz
+                                let uz = 2.0 * (qx * qz - qy * qw) * lx + 2.0 * (qy * qz + qx * qw) * ly + (1.0 - 2.0 * (qx * qx + qy * qy)) * lz
+                                let wrel = (w.bodyAngVx[bSlot] - w.bodyAngVx[aSlot]) * ux + (w.bodyAngVy[bSlot] - w.bodyAngVy[aSlot]) * uy + (w.bodyAngVz[bSlot] - w.bodyAngVz[aSlot]) * uz
+                                # relative inverse inertia along u: the
+                                # axis-rate change per unit angular impulse
+                                # applied as the pair (child -, parent +)
+                                var sRel: float64 = 0.0
+                                if w.bodyInvMass[aSlot] > 0.0:
+                                    if w.bodyKind[aSlot] == World3dBodyCapsuleRigid:
+                                        if w.bodyIxx[aSlot] > 0.0:
+                                            let ua = constraints3d.constraints3dCapsuleInvInertia(w, aSlot, constraints3d.constraints3dVec(ux, uy, uz))
+                                            sRel = sRel + ua.x * ux + ua.y * uy + ua.z * uz
+                                if w.bodyKind[bSlot] == World3dBodyCapsuleRigid:
+                                    if w.bodyIxx[bSlot] > 0.0:
+                                        let ub = constraints3d.constraints3dCapsuleInvInertia(w, bSlot, constraints3d.constraints3dVec(ux, uy, uz))
+                                        sRel = sRel + ub.x * ux + ub.y * uy + ub.z * uz
+                                if sRel > 0.000000001:
+                                    # desired exponential sink (tau 0.1 s),
+                                    # torque-capped at dampC*tau_max: the
+                                    # impulse never drives wrel past zero
+                                    let want = wrel * dt * 10.0
+                                    var pImp: float64 = want / sRel
+                                    let pMax = dampC * w.conTauMax[ci] * dt
+                                    if pImp > pMax:
+                                        pImp = pMax
+                                    if pImp < 0.0 - pMax:
+                                        pImp = 0.0 - pMax
+                                    let duB = constraints3d.constraints3dCapsuleInvInertia(w, bSlot, constraints3d.constraints3dVec(0.0 - pImp * ux, 0.0 - pImp * uy, 0.0 - pImp * uz))
+                                    w.bodyAngVx[bSlot] = w.bodyAngVx[bSlot] + duB.x
+                                    w.bodyAngVy[bSlot] = w.bodyAngVy[bSlot] + duB.y
+                                    w.bodyAngVz[bSlot] = w.bodyAngVz[bSlot] + duB.z
+                                    if w.bodyInvMass[aSlot] > 0.0:
+                                        if w.bodyKind[aSlot] == World3dBodyCapsuleRigid:
+                                            if w.bodyIxx[aSlot] > 0.0:
+                                                let duA = constraints3d.constraints3dCapsuleInvInertia(w, aSlot, constraints3d.constraints3dVec(pImp * ux, pImp * uy, pImp * uz))
+                                                w.bodyAngVx[aSlot] = w.bodyAngVx[aSlot] + duA.x
+                                                w.bodyAngVy[aSlot] = w.bodyAngVy[aSlot] + duA.y
+                                                w.bodyAngVz[aSlot] = w.bodyAngVz[aSlot] + duA.z
+            ci = ci + 1
+    # 4. rigid-ball rolling coupling: the slip-aware Coulomb impulse acts
+    #    on both v and omega after the rebuild fixed the linear velocity
+    physics3dBallRollingContact(w, dt)
+    # 5. capsule ground coupling: per-endpoint normal + friction impulses
+    #    with the omega x r_c contact-point coupling and the contact torque;
+    #    speculative per-pole engage, both-pole band solves the pair as one
+    #    coupled 2x2 LCP instead of two impulses that re-excite each other
+    #    through I^-1
+    if physics3dFootPadOn == 1:
+        physics3dCapsulePadContact(w, dt)
+        if physics3dVprojOn == 1:
+            constraints3d.Constraints3dProjectHingeVelocities(w)
+    else:
+        physics3dCapsuleGroundContact(w, dt)
+        # the chain-coupled LCP probes measure the response THROUGH the
+        # hinge velocity projection — the deploy path must run the same
+        # operator after the real impulse, or the measured K and the
+        # applied impulse disagree (giant unrecovered j = launch)
+        if physics3dVprojOn == 1 or physics3dContactChainOn == 1:
+            constraints3d.Constraints3dProjectHingeVelocities(w)
+    if physics3dDvEcho == 1:
+        if w.tick <= 240:
+            physics3dEchoDv("rdv", w, preVx, preVy, preVz, postRx, postRy, postRz)
+            physics3dEchoDv("gcdv", w, postRx, postRy, postRz, w.bodyVx, w.bodyVy, w.bodyVz)
+    Physics3dClearForces(w)
+    w.tick = w.tick + int64(1)
+    receipt.resultWorldCid = World3dCid(w)
+    receipt.receiptCid = Physics3dReceiptCid(receipt)
+    return receipt

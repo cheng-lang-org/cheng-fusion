@@ -1,0 +1,348 @@
+# Step 2 leaf-inliner scaffold — callgraph + leaf classification.
+#
+# Status: SCAFFOLD ONLY.  No statement mutation, no node cloning, no
+# substitution.  Default off via env gate CHENG_LEAF_INLINER=1.
+#
+# Design source: docs/beat-c.md §6.13 (§3, §4.1–§4.3, §6).
+# Master plan: docs/beat-c.md §1.9.
+#
+# This file is intentionally not wired into the pipeline yet (op-lane shares
+# lowering_plan.cheng / primary_object_plan.cheng — wiring lands in a follow-up
+# commit after op-lane signals quiescence).  The pass is invoked from
+# BuildLoweringPlanStubFromCompilerCsg once wired.
+#
+# Public entry point: TypedIrInlinePassRun(typedIr, report).  If the env gate
+# is off (default), the pass returns immediately.  When on, it builds a
+# per-source-path callgraph, classifies functions by leaf kind, and appends
+# diagnostic counters to the report string.  No SoA columns are mutated.
+
+import std/os
+import std/strings
+import cheng/core/lang/typed_expr as texpr
+import cheng/core/lang/intern as langintern
+import cheng/core/runtime/arena as arenamod
+
+type
+    TypedIrLeafKind = enum
+        TypedIrLeafUnknown,
+        TypedIrLeafPure,
+        TypedIrLeafWithStoreLocal,
+        TypedIrLeafNonLeaf,
+        TypedIrLeafRecursiveScc,
+        TypedIrLeafControlFlow,
+        TypedIrLeafBanned
+
+    TypedIrCallGraph =
+        # Parallel arrays: callGraphCallerFnIndex[i] calls callGraphCalleeFnIndex[i].
+        # Caller is resolved by enclosing function's row index in functions2_*.
+        # Callee is resolved by linear lookup of (sourcePathId, functionNameId).
+        # callee = -1 means external / unresolved (builtin, importc, missing).
+        callerFnIndex: int32[]
+        calleeFnIndex: int32[]
+        # Per-function summaries (length == functions2_functionNameIds.len).
+        fnLeafKind: int32[]
+        fnNodeBudget: int32[]
+        fnInlinedCallSites: int32[]
+        # Counters surfaced via report string (no SoA mutation).
+        builtCallSites: int32
+        resolvedCallSites: int32
+        leafPureCount: int32
+        leafWithStoreLocalCount: int32
+        nonLeafCount: int32
+        controlFlowCount: int32
+        bannedCount: int32
+
+fn TypedIrInlinePassCallGraphInit(): TypedIrCallGraph =
+    var out: TypedIrCallGraph
+    return out
+
+# Linear function lookup by (sourcePathId, functionNameId) — O(N) per query.
+# Scaffold-grade: a follow-up will replace with the existing
+# LoweringPlanTypedIrFunctionIndex helper once the pass is wired through plan.
+fn TypedIrInlinePassFunctionIndexBy(typedIr: var texpr.TypedExprIr,
+                                     sourcePathId: langintern.InternId,
+                                     functionNameId: langintern.InternId): int32 =
+    if sourcePathId == langintern.InvalidInternId():
+        return -1
+    if functionNameId == langintern.InvalidInternId():
+        return -1
+    let n = typedIr.functions2_functionNameIds.len
+    for i in 0..<n:
+        if typedIr.functions2_sourcePathIds[i] != sourcePathId:
+            continue
+        if typedIr.functions2_functionNameIds[i] != functionNameId:
+            continue
+        return i
+    return -1
+
+# Returns true when a callee's body contains any banned construct that makes
+# inlining unsound under the textual-ParamRef-substitution model
+# (design §4.6).  Scaffold heuristic: scan nodes2_opKinds in the callee's node
+# window.  No SSA reasoning; pessimistic — banning is always safe.
+fn TypedIrInlinePassIsBannedOpKind(opKind: texpr.TypedExprIrOpKind): bool =
+    if opKind == texpr.TypedExprIrOpFmt:
+        return true
+    if opKind == texpr.TypedExprIrOpStrAdd:
+        return true
+    if opKind == texpr.TypedExprIrOpSeqLiteral:
+        return true
+    if opKind == texpr.TypedExprIrOpEmptySeqInit:
+        return true
+    if opKind == texpr.TypedExprIrOpAddrOf:
+        return true
+    if opKind == texpr.TypedExprIrOpCallExpr:
+        return true
+    if opKind == texpr.TypedExprIrOpFuncRef:
+        return true
+    return false
+
+# Returns true when a statement kind introduces control flow that the
+# scaffold inliner refuses to descend into (design §4.6).
+fn TypedIrInlinePassIsControlFlowStmt(kind: texpr.TypedExprIrStatementKind): bool =
+    if kind == texpr.TypedExprIrStmtIf:
+        return true
+    if kind == texpr.TypedExprIrStmtElif:
+        return true
+    if kind == texpr.TypedExprIrStmtElse:
+        return true
+    if kind == texpr.TypedExprIrStmtFor:
+        return true
+    if kind == texpr.TypedExprIrStmtMatch:
+        return true
+    if kind == texpr.TypedExprIrStmtCase:
+        return true
+    if kind == texpr.TypedExprIrStmtWhile:
+        return true
+    return false
+
+# Returns true when a statement kind makes another call (caller-side observation
+# from the callgraph build perspective, design §4.2).
+fn TypedIrInlinePassStmtIsCallSite(kind: texpr.TypedExprIrStatementKind): bool =
+    if kind == texpr.TypedExprIrStmtLetCall:
+        return true
+    if kind == texpr.TypedExprIrStmtCall:
+        return true
+    if kind == texpr.TypedExprIrStmtIfCall:
+        return true
+    if kind == texpr.TypedExprIrStmtResultIntrinsic:
+        return true
+    return false
+
+# Step 1 of the pass (design §4.2): walk every statement of every function,
+# record (caller, callee) pairs in callerFnIndex / calleeFnIndex.  Callees
+# that fail name resolution land as -1 and bump only builtCallSites.
+fn TypedIrInlinePassBuildCallGraph(typedIr: var texpr.TypedExprIr,
+                                    graph: var TypedIrCallGraph) =
+    let fnCount = typedIr.functions2_functionNameIds.len
+    for fi in 0..<fnCount:
+        let stmtStart = arenamod.ArenaArrayInt32Get(typedIr.arena,
+                                                     typedIr.functions2_statementStarts,
+                                                     fi)
+        let stmtCount = arenamod.ArenaArrayInt32Get(typedIr.arena,
+                                                     typedIr.functions2_statementCounts,
+                                                     fi)
+        if stmtCount <= 0:
+            continue
+        for soff in 0..<stmtCount:
+            let s = stmtStart + soff
+            if s < 0 || s >= typedIr.statements2_kinds.len:
+                continue
+            let kind = typedIr.statements2_kinds[s]
+            if !TypedIrInlinePassStmtIsCallSite(kind):
+                continue
+            graph.builtCallSites = graph.builtCallSites + 1
+            let calleePath = typedIr.statements2_callTargetSourcePathIds[s]
+            let calleeName = typedIr.statements2_callTargetIds[s]
+            let calleeFi = TypedIrInlinePassFunctionIndexBy(typedIr,
+                                                            calleePath,
+                                                            calleeName)
+            add(graph.callerFnIndex, fi)
+            add(graph.calleeFnIndex, calleeFi)
+            if calleeFi >= 0:
+                graph.resolvedCallSites = graph.resolvedCallSites + 1
+
+# Per-function classifier (design §4.3).  Returns one of:
+#   TypedIrLeafPure         — small accessor-shape, no calls, no banned ops
+#   TypedIrLeafWithStoreLocal — small but contains FieldGet/IndexGet
+#   TypedIrLeafControlFlow  — contains If/For/While/Match
+#   TypedIrLeafBanned       — contains Fmt/StrAdd/SeqLiteral/AddrOf/CallExpr/FuncRef
+#   TypedIrLeafNonLeaf      — makes a call (LetCall/Call/IfCall/ResultIntrinsic)
+#
+# Scaffold heuristic; refine when wiring the actual substitution.
+fn TypedIrInlinePassClassifyOne(typedIr: var texpr.TypedExprIr,
+                                 fi: int32): int32 =
+    let stmtStart = arenamod.ArenaArrayInt32Get(typedIr.arena,
+                                                 typedIr.functions2_statementStarts,
+                                                 fi)
+    let stmtCount = arenamod.ArenaArrayInt32Get(typedIr.arena,
+                                                 typedIr.functions2_statementCounts,
+                                                 fi)
+    let nodeStart = arenamod.ArenaArrayInt32Get(typedIr.arena,
+                                                 typedIr.functions2_nodeStarts,
+                                                 fi)
+    let nodeCount = arenamod.ArenaArrayInt32Get(typedIr.arena,
+                                                 typedIr.functions2_nodeCounts,
+                                                 fi)
+    # Empty body — refuse classification; treat as non-leaf to be conservative.
+    if stmtCount <= 0:
+        return int32(TypedIrLeafNonLeaf)
+    # Size budget: leaf-pure requires ≤ 3 statements (design §4.3).
+    var sawCall: bool
+    var sawControlFlow: bool
+    var sawStoreLocal: bool
+    for soff in 0..<stmtCount:
+        let s = stmtStart + soff
+        if s < 0 || s >= typedIr.statements2_kinds.len:
+            continue
+        let kind = typedIr.statements2_kinds[s]
+        if TypedIrInlinePassStmtIsCallSite(kind):
+            sawCall = true
+        if TypedIrInlinePassIsControlFlowStmt(kind):
+            sawControlFlow = true
+        if typedIr.statements2_callTargetImportcs[s]:
+            sawCall = true
+    var sawBanned: bool
+    var sawFieldOrIndex: bool
+    for noff in 0..<nodeCount:
+        let n = nodeStart + noff
+        if n < 0 || n >= typedIr.nodes2_opKinds.len:
+            continue
+        let opKind = typedIr.nodes2_opKinds[n]
+        if TypedIrInlinePassIsBannedOpKind(opKind):
+            sawBanned = true
+        if opKind == texpr.TypedExprIrOpFieldGet:
+            sawFieldOrIndex = true
+        if opKind == texpr.TypedExprIrOpIndexGet:
+            sawFieldOrIndex = true
+        if opKind == texpr.TypedExprIrOpLetCall:
+            sawCall = true
+        if opKind == texpr.TypedExprIrOpIfCall:
+            sawCall = true
+    if sawBanned:
+        return int32(TypedIrLeafBanned)
+    if sawControlFlow:
+        return int32(TypedIrLeafControlFlow)
+    if sawCall:
+        return int32(TypedIrLeafNonLeaf)
+    if sawStoreLocal || sawFieldOrIndex:
+        if stmtCount <= 8:
+            return int32(TypedIrLeafWithStoreLocal)
+        return int32(TypedIrLeafNonLeaf)
+    if stmtCount <= 3:
+        return int32(TypedIrLeafPure)
+    return int32(TypedIrLeafNonLeaf)
+
+# Step 2 of the pass (design §4.3): allocate per-function arrays and classify
+# each function once.  Updates graph.fnLeafKind and graph.fnNodeBudget; counter
+# fields (leafPureCount/...) are bumped for the report.
+fn TypedIrInlinePassClassifyLeaves(typedIr: var texpr.TypedExprIr,
+                                    graph: var TypedIrCallGraph) =
+    let fnCount = typedIr.functions2_functionNameIds.len
+    for _ in 0..<fnCount:
+        add(graph.fnLeafKind, int32(TypedIrLeafUnknown))
+        add(graph.fnNodeBudget, 8)
+        add(graph.fnInlinedCallSites, 0)
+    for fi in 0..<fnCount:
+        let k = TypedIrInlinePassClassifyOne(typedIr, fi)
+        graph.fnLeafKind[fi] = k
+        if k == int32(TypedIrLeafPure):
+            graph.leafPureCount = graph.leafPureCount + 1
+        if k == int32(TypedIrLeafWithStoreLocal):
+            graph.leafWithStoreLocalCount = graph.leafWithStoreLocalCount + 1
+        if k == int32(TypedIrLeafNonLeaf):
+            graph.nonLeafCount = graph.nonLeafCount + 1
+        if k == int32(TypedIrLeafControlFlow):
+            graph.controlFlowCount = graph.controlFlowCount + 1
+        if k == int32(TypedIrLeafBanned):
+            graph.bannedCount = graph.bannedCount + 1
+
+# Returns true when the env gate CHENG_LEAF_INLINER=1 is present.  Any other
+# value (missing, "0", "false", "no", "off", empty) keeps the pass off.
+fn TypedIrInlinePassEnvGateOn(): bool =
+    let raw: str = os.GetEnvDefault("CHENG_LEAF_INLINER", "")
+    if raw == "":
+        return false
+    if raw == "0":
+        return false
+    if raw == "false":
+        return false
+    if raw == "no":
+        return false
+    if raw == "off":
+        return false
+    return true
+
+# Append `key=value` line to a report buffer; uses strings.IntToStr to match
+# the cold compiler's qualified-call expectations.
+fn TypedIrInlinePassReportAppend(report: var str,
+                                  key: str,
+                                  value: int32) =
+    report = report + key
+    report = report + "="
+    report = report + strings.IntToStr(value)
+    report = report + "\n"
+
+# Public entry point.  Env-gated; default off → returns immediately with no
+# side effects.  When on, builds the callgraph + leaf classification and
+# appends diagnostic counters to `report`.  NEVER mutates `typedIr` columns.
+fn TypedIrInlinePassRun(typedIr: var texpr.TypedExprIr,
+                         report: var str): bool =
+    if !TypedIrInlinePassEnvGateOn():
+        return false
+    var graph: TypedIrCallGraph = TypedIrInlinePassCallGraphInit()
+    TypedIrInlinePassBuildCallGraph(typedIr, graph)
+    TypedIrInlinePassClassifyLeaves(typedIr, graph)
+    TypedIrInlinePassReportAppend(report,
+                                   "typed_ir_inline_pass_function_count",
+                                   typedIr.functions2_functionNameIds.len)
+    TypedIrInlinePassReportAppend(report,
+                                   "typed_ir_inline_pass_call_sites_total",
+                                   graph.builtCallSites)
+    TypedIrInlinePassReportAppend(report,
+                                   "typed_ir_inline_pass_call_sites_resolved",
+                                   graph.resolvedCallSites)
+    TypedIrInlinePassReportAppend(report,
+                                   "typed_ir_inline_pass_leaf_pure_count",
+                                   graph.leafPureCount)
+    TypedIrInlinePassReportAppend(report,
+                                   "typed_ir_inline_pass_leaf_with_store_local_count",
+                                   graph.leafWithStoreLocalCount)
+    TypedIrInlinePassReportAppend(report,
+                                   "typed_ir_inline_pass_non_leaf_count",
+                                   graph.nonLeafCount)
+    TypedIrInlinePassReportAppend(report,
+                                   "typed_ir_inline_pass_control_flow_count",
+                                   graph.controlFlowCount)
+    TypedIrInlinePassReportAppend(report,
+                                   "typed_ir_inline_pass_banned_count",
+                                   graph.bannedCount)
+    # Compact line that scrapers can grep for the headline count
+    # (design §3 step 5 — must be present in the report).
+    TypedIrInlinePassReportAppend(report,
+                                   "typed_ir_inline_pass_leaf_count",
+                                   graph.leafPureCount + graph.leafWithStoreLocalCount)
+    # Step 2 observability: emit a single grep-able line to stderr so callers
+    # can verify the classifier actually ran.  The `report` string parameter is
+    # currently not read back by lowering_plan.cheng (output black-hole), so
+    # without this line the env-gated pass would be invisible.  Guarded by the
+    # env gate (we only reach this point when gate is on, line 290).
+    var stderrLine: str = "[tilip] leaf_count="
+    stderrLine = stderrLine + strings.IntToStr(graph.leafPureCount + graph.leafWithStoreLocalCount)
+    stderrLine = stderrLine + " leaf_pure="
+    stderrLine = stderrLine + strings.IntToStr(graph.leafPureCount)
+    stderrLine = stderrLine + " leaf_with_store_local="
+    stderrLine = stderrLine + strings.IntToStr(graph.leafWithStoreLocalCount)
+    stderrLine = stderrLine + " non_leaf="
+    stderrLine = stderrLine + strings.IntToStr(graph.nonLeafCount)
+    stderrLine = stderrLine + " control_flow="
+    stderrLine = stderrLine + strings.IntToStr(graph.controlFlowCount)
+    stderrLine = stderrLine + " banned="
+    stderrLine = stderrLine + strings.IntToStr(graph.bannedCount)
+    stderrLine = stderrLine + " call_sites_total="
+    stderrLine = stderrLine + strings.IntToStr(graph.builtCallSites)
+    stderrLine = stderrLine + " call_sites_resolved="
+    stderrLine = stderrLine + strings.IntToStr(graph.resolvedCallSites)
+    stderrLine = stderrLine + " function_count="
+    stderrLine = stderrLine + strings.IntToStr(typedIr.functions2_functionNameIds.len)
+    os.WriteLine(os.GetStderr(), stderrLine)
+    return true

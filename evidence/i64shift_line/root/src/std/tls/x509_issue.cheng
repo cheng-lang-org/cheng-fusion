@@ -1,0 +1,298 @@
+# Minimal production-grade self-signed leaf certificate issuance
+# (ECDSA P-256 + SHA-256, DER encoding) -- sibling module to std/tls/x509.cheng,
+# which only ever had verification/parsing, never issuance.
+#
+# Built for the WebTransport `serverCertificateHashes` flow: browsers require
+# a leaf certificate with validity <= 14 days and a non-RSA public key, and
+# accept it purely on a pinned SHA-256(DER) hash (no CA chain / hostname
+# check needed). See docs slice-2 design notes.
+#
+# Every primitive below (ECDSA keygen/sign, SHA-256, DER TLV encoding) is a
+# real, already-shipped implementation from std/crypto/ecnist.cheng and
+# std/crypto/minasn1.cheng -- nothing here reimplements curve math or hashing.
+
+import std/result
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
+import std/crypto/minasn1
+import std/crypto/ecnist
+import std/crypto/rand
+import std/crypto/sha256
+import std/times
+
+const
+    x509IssueOidEcPublicKey = "1.2.840.10045.2.1"
+    x509IssueOidPrime256v1 = "1.2.840.10045.3.1.7"
+    x509IssueOidEcdsaWithSha256 = "1.2.840.10045.4.3.2"
+    x509IssueOidCommonName = "2.5.4.3"
+    x509IssueOidBasicConstraints = "2.5.29.19"
+    x509IssueOidKeyUsage = "2.5.29.15"
+    x509IssueOidExtKeyUsage = "2.5.29.37"
+    x509IssueOidSubjectAltName = "2.5.29.17"
+    x509IssueOidServerAuth = "1.3.6.1.5.5.7.3.1"
+    x509IssueMaxValidityDays: int32 = 14
+    x509IssueSecondsPerDay: int64 = 86400
+    x509IssueSerialLen: int32 = 19
+
+type
+    X509IssuedCert =
+        der: Bytes
+        # Raw 32-byte big-endian scalar (ecnist.ecdsaPrivateKeyToBytes format) --
+        # this is exactly what MsQuicTlsPolicy.certPrivateKey expects for an
+        # X509KeyEcdsaP256 leaf (see quic/tls/test_pki.cheng's ECDSA transport
+        # policy + src/tests/quic_tls_transport_ecdsa_smoke.cheng).
+        privateKeyRaw: Bytes
+        # SHA-256(der) -- ready to feed a WebTransport client's
+        # serverCertificateHashes list.
+        certHash: Bytes
+
+# ---- small local helpers (kept private to this file; no shared-file edits) ----
+
+fn x509IssueZeroPad2(value: int32): str =
+    let tens: int32 = value / 10
+    let ones: int32 = value % 10
+    return strutil.Join([strings.IntToStr(tens), strings.IntToStr(ones)], "")
+
+# NOTE: deliberately NOT using std/datetime.cheng here. Empirically verified
+# (isolated repro, pinned driver) that std/datetime's dtTimestamp() returns 0
+# and dtFromUnix() decodes the wrong calendar (a real epoch 1783739513
+# UTC 2026-07-11 came back as "year=57 month=1 day=192" -- day 192 alone
+# proves the month/day split is broken, not just an epoch-offset issue). Both
+# are pre-existing std-library defects independent of this task; see
+# evidence.md. std/times.cheng's cheng_epoch_time_seconds() FFI (direct
+# return value, no pointer out-param) was cross-checked against `date +%s`
+# and is correct, so only that + a hand-rolled, independently-verified civil
+# calendar conversion are used for certificate date encoding.
+
+# Howard Hinnant's "days_from_civil"/"civil_from_days" affine algorithm
+# (public-domain, used by libc++ and most modern date libraries), restricted
+# to the safe non-negative-z domain: WebTransport certificates are always
+# dated in the modern era (now +/- <=30 days), so z (days since 1970-01-01)
+# is always comfortably positive and the z<0 branch is never exercised.
+fn x509IssueDaysSinceEpoch(epochSecs: int64): int64 =
+    return epochSecs / x509IssueSecondsPerDay
+
+fn x509IssueSecondsOfDay(epochSecs: int64): int64 =
+    return epochSecs - x509IssueDaysSinceEpoch(epochSecs) * x509IssueSecondsPerDay
+
+fn x509IssueCivilFromDays(daysSinceEpoch: int64, outYear: var int64, outMonth: var int64, outDay: var int64) =
+    let z: int64 = daysSinceEpoch + int64(719468)
+    let era: int64 = z / int64(146097)
+    let doe: int64 = z - era * int64(146097)
+    let yoe: int64 = (doe - doe / int64(1460) + doe / int64(36524) - doe / int64(146096)) / int64(365)
+    let y: int64 = yoe + era * int64(400)
+    let doy: int64 = doe - (int64(365) * yoe + yoe / int64(4) - yoe / int64(100))
+    let mp: int64 = (int64(5) * doy + int64(2)) / int64(153)
+    let d: int64 = doy - (int64(153) * mp + int64(2)) / int64(5) + int64(1)
+    var m: int64
+    if mp < int64(10):
+        m = mp + int64(3)
+    else:
+        m = mp - int64(9)
+    if m <= int64(2):
+        outYear = y + int64(1)
+    else:
+        outYear = y
+    outMonth = m
+    outDay = d
+
+fn x509IssueUtcTimeString(epochSecs: int64): str =
+    let days: int64 = x509IssueDaysSinceEpoch(epochSecs)
+    var year: int64
+    var month: int64
+    var day: int64
+    x509IssueCivilFromDays(days, year, month, day)
+    let daySecs: int64 = x509IssueSecondsOfDay(epochSecs)
+    let hour: int64 = daySecs / int64(3600)
+    let minute: int64 = (daySecs % int64(3600)) / int64(60)
+    let second: int64 = daySecs % int64(60)
+    # Single Join with all seven parts: the previous reassignment chain of
+    # by-value strutil.Join calls corrupted the heap string (UTCTime content
+    # came out as NUL bytes and the cert failed x509 parse with "time missing
+    # Z" -- same corruption class as the strip/trim by-value chains).
+    return strutil.Join([x509IssueZeroPad2(int32(year % int64(100))),
+                         x509IssueZeroPad2(int32(month)),
+                         x509IssueZeroPad2(int32(day)),
+                         x509IssueZeroPad2(int32(hour)),
+                         x509IssueZeroPad2(int32(minute)),
+                         x509IssueZeroPad2(int32(second)),
+                         "Z"], "")
+
+# Base-128 encode a single OID arc (mirrors std/tls/x509.cheng's x509OidToString
+# decode loop in reverse; double-pass count-then-fill, same style as
+# minasn1.asn1EncodeLength).
+fn x509IssueEncodeOidArc(value: int64): Bytes =
+    if value < 0:
+        panic("x509issue: oid arc negative")
+    if value == 0:
+        let out: Bytes = BytesAlloc(1)
+        BytesSet(out, 0, 0)
+        return out
+    var tmp: int64 = value
+    var count: int32
+    while tmp > 0:
+        count = count + 1
+        tmp = tmp >> 7
+    let out: Bytes = BytesAlloc(count)
+    for i in 0..<count:
+        let shift: int32 = (count - 1 - i) * 7
+        var b: int32 = int32((value >> shift) & 0x7f)
+        if i < count - 1:
+            b = b | 0x80
+        BytesSet(out, i, b)
+    return out
+
+# Dotted-decimal OID string ("1.2.840.10045.2.1") -> DER content bytes
+# (caller wraps with asn1EncodeOid for the full TLV).
+fn x509IssueEncodeOid(dotted: str): Bytes =
+    let parts: str[] = strutil.Split(dotted, '.')
+    if parts.len < 2:
+        panic("x509issue: oid needs >= 2 arcs")
+    let arc0: int32 = int32(strutil.ParseInt(parts[0]))
+    let arc1: int32 = int32(strutil.ParseInt(parts[1]))
+    var content: Bytes = BytesAlloc(1)
+    BytesSet(content, 0, arc0 * 40 + arc1)
+    for i in 2..<parts.len:
+        let arc: int64 = int64(strutil.ParseInt(parts[i]))
+        content = BytesConcat(content, x509IssueEncodeOidArc(arc))
+    return content
+
+fn x509IssueBooleanTrue(): Bytes =
+    let b: Bytes = BytesAlloc(1)
+    BytesSet(b, 0, 0xff)
+    return asn1EncodeTlv(0x01, b)
+
+fn x509IssueEncodeExtension(oidDotted: str, critical: bool, extnValue: Bytes): Bytes =
+    var body: Bytes = asn1EncodeOid(x509IssueEncodeOid(oidDotted))
+    if critical:
+        body = BytesConcat(body, x509IssueBooleanTrue())
+    body = BytesConcat(body, asn1EncodeOctetString(extnValue))
+    return asn1EncodeSequence(body)
+
+# KeyUsage ::= BIT STRING; digitalSignature is bit 0 (MSB of the first
+# content byte). DER-minimal single-bit encoding: unused=7, data=0x80.
+fn x509IssueKeyUsageDigitalSignatureExtnValue(): Bytes =
+    let content: Bytes = BytesAlloc(2)
+    BytesSet(content, 0, 7)
+    BytesSet(content, 1, 0x80)
+    return asn1EncodeTlv(0x03, content)
+
+fn x509IssueVersionV3Explicit(): Bytes =
+    let v: Bytes = BytesAlloc(1)
+    BytesSet(v, 0, 2)
+    return asn1EncodeTlv(0xa0, asn1EncodeInteger(v))
+
+# Single-RDN "CN=<host>" issuer/subject Name (self-signed: issuer == subject).
+fn x509IssueNameDer(commonName: str): Bytes =
+    let cnOid: Bytes = asn1EncodeOid(x509IssueEncodeOid(x509IssueOidCommonName))
+    let cnValue: Bytes = asn1EncodeTlv(0x0c, BytesFromString(commonName)) # UTF8String
+    let atv: Bytes = asn1EncodeSequence(BytesConcat(cnOid, cnValue))
+    let rdn: Bytes = asn1EncodeTlv(0x31, atv) # SET
+    return asn1EncodeSequence(rdn)
+
+fn x509IssueBuildTbs(pubKeyBytes: Bytes,
+                      notBeforeEpoch: int64,
+                      notAfterEpoch: int64,
+                      serialBytes: Bytes,
+                      nameDer: Bytes,
+                      sanHost: str): Bytes =
+    let serial: Bytes = asn1EncodeInteger(serialBytes)
+    let sigAlgSeq: Bytes = asn1EncodeSequence(asn1EncodeOid(x509IssueEncodeOid(x509IssueOidEcdsaWithSha256)))
+
+    # Materialize the time strings BEFORE BytesFromString: that fn returns a
+    # borrow-view of the str, and passing the temporary directly freed the str
+    # at expression end, leaving the TLV encoder a dangling view (the DER's
+    # UTCTime content came out as aliased TLV bytes "17 0d" repeats and the
+    # cert failed x509 parse).
+    let notBeforeText: str = x509IssueUtcTimeString(notBeforeEpoch)
+    let notBeforeTlv: Bytes = asn1EncodeTlv(0x17, BytesFromString(notBeforeText))
+    let notAfterText: str = x509IssueUtcTimeString(notAfterEpoch)
+    let notAfterTlv: Bytes = asn1EncodeTlv(0x17, BytesFromString(notAfterText))
+    let validity: Bytes = asn1EncodeSequence(BytesConcat(notBeforeTlv, notAfterTlv))
+
+    let ecPubOid: Bytes = asn1EncodeOid(x509IssueEncodeOid(x509IssueOidEcPublicKey))
+    let curveOid: Bytes = asn1EncodeOid(x509IssueEncodeOid(x509IssueOidPrime256v1))
+    let spkiAlg: Bytes = asn1EncodeSequence(BytesConcat(ecPubOid, curveOid))
+    let spkiBits: Bytes = asn1EncodeBitString(pubKeyBytes)
+    let spki: Bytes = asn1EncodeSequence(BytesConcat(spkiAlg, spkiBits))
+
+    let bcExt: Bytes = x509IssueEncodeExtension(x509IssueOidBasicConstraints, true, asn1EncodeSequence(EmptyBytes()))
+    let kuExt: Bytes = x509IssueEncodeExtension(x509IssueOidKeyUsage, true, x509IssueKeyUsageDigitalSignatureExtnValue())
+    let ekuValue: Bytes = asn1EncodeSequence(asn1EncodeOid(x509IssueEncodeOid(x509IssueOidServerAuth)))
+    let ekuExt: Bytes = x509IssueEncodeExtension(x509IssueOidExtKeyUsage, false, ekuValue)
+    let sanGn: Bytes = asn1EncodeTlv(0x82, BytesFromString(sanHost)) # dNSName [2] IMPLICIT IA5String
+    let sanExt: Bytes = x509IssueEncodeExtension(x509IssueOidSubjectAltName, false, asn1EncodeSequence(sanGn))
+    var extsBody: Bytes = bcExt
+    extsBody = BytesConcat(extsBody, kuExt)
+    extsBody = BytesConcat(extsBody, ekuExt)
+    extsBody = BytesConcat(extsBody, sanExt)
+    let extsExplicit: Bytes = asn1EncodeTlv(0xa3, asn1EncodeSequence(extsBody))
+
+    var tbsBody: Bytes = x509IssueVersionV3Explicit()
+    tbsBody = BytesConcat(tbsBody, serial)
+    tbsBody = BytesConcat(tbsBody, sigAlgSeq)
+    tbsBody = BytesConcat(tbsBody, nameDer)   # issuer (self-signed == subject)
+    tbsBody = BytesConcat(tbsBody, validity)
+    tbsBody = BytesConcat(tbsBody, nameDer)   # subject
+    tbsBody = BytesConcat(tbsBody, spki)
+    tbsBody = BytesConcat(tbsBody, extsExplicit)
+    return asn1EncodeSequence(tbsBody)
+
+# Explicit-time primitive (used by the capped convenience wrapper below, and
+# directly by tests that need a deliberately-expired certificate).
+fn X509IssueSelfSignedLeafAt(sanHost: str, notBeforeEpoch: int64, notAfterEpoch: int64): Result[X509IssuedCert] =
+    let kpRes: Result[ecnist.EcKeyPair] = ecnist.generateEcKeyPair()
+    if IsErr(kpRes):
+        return Err[X509IssuedCert](Error(kpRes))
+    let kp: ecnist.EcKeyPair = Value(kpRes)
+    let pubBytes: Bytes = ecnist.ecdsaPublicKeyToBytes(kp.publicKey)
+    let privRaw: Bytes = ecnist.ecdsaPrivateKeyToBytes(kp.privateKey)
+
+    let serialRandRes: Result[Bytes] = rand.RandomBytes(x509IssueSerialLen)
+    if IsErr(serialRandRes):
+        return Err[X509IssuedCert](Error(serialRandRes))
+    var serialBytes: Bytes = Value(serialRandRes)
+    # Force positive (clear sign bit) and non-zero (OR in bit 0); no leading
+    # 0x00 padding needed, matching a strict-DER-minimal INTEGER.
+    BytesSet(serialBytes, 0, (BytesGet(serialBytes, 0) & 0x7f) | 0x01)
+
+    let nameDer: Bytes = x509IssueNameDer(strings.CloneStr(sanHost))
+    let tbs: Bytes = x509IssueBuildTbs(pubBytes, notBeforeEpoch, notAfterEpoch, serialBytes, nameDer, sanHost)
+
+    let sigRawRes: Result[Bytes] = ecnist.ecdsaSignBytes(privRaw, tbs)
+    if IsErr(sigRawRes):
+        return Err[X509IssuedCert](Error(sigRawRes))
+    let sigRaw: Bytes = Value(sigRawRes)
+    let rBytes: Bytes = BytesSlice(sigRaw, 0, 32)
+    let sBytes: Bytes = BytesSlice(sigRaw, 32, 32)
+    let sigDer: Bytes = asn1EncodeSequence(BytesConcat(asn1EncodeInteger(rBytes), asn1EncodeInteger(sBytes)))
+    let sigBits: Bytes = asn1EncodeBitString(sigDer)
+    let sigAlgSeq: Bytes = asn1EncodeSequence(asn1EncodeOid(x509IssueEncodeOid(x509IssueOidEcdsaWithSha256)))
+
+    var certBody: Bytes = tbs
+    certBody = BytesConcat(certBody, sigAlgSeq)
+    certBody = BytesConcat(certBody, sigBits)
+    let der: Bytes = asn1EncodeSequence(certBody)
+
+    var out: X509IssuedCert
+    out.der = der
+    out.privateKeyRaw = privRaw
+    out.certHash = Sha256Digest(der)
+    return Ok[X509IssuedCert](out)
+
+# Production entry point: self-signed ECDSA P-256 leaf, notBefore = now,
+# validity capped at 14 days (WebTransport serverCertificateHashes hard
+# requirement). sanHost also becomes the CN and the sole SAN dNSName entry.
+fn X509IssueSelfSignedLeaf(sanHost: str, validityDays: int32): Result[X509IssuedCert] =
+    if validityDays <= 0 || validityDays > x509IssueMaxValidityDays:
+        return Err[X509IssuedCert]("x509issue: validity days out of range (1..14)")
+    let notBefore: int64 = times.EpochTimeSeconds()
+    let notAfter: int64 = notBefore + int64(validityDays) * x509IssueSecondsPerDay
+    return X509IssueSelfSignedLeafAt(sanHost, notBefore, notAfter)
+
+# SHA-256(DER) -- the certhash value WebTransport's serverCertificateHashes
+# expects (independently reproducible via `openssl x509 -in cert.der -inform
+# DER -noout -fingerprint -sha256`).
+fn X509CertHash(der: Bytes): Bytes =
+    return Sha256Digest(der)

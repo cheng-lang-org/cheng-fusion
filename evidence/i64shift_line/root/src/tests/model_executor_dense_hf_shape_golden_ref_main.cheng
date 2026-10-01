@@ -1,0 +1,775 @@
+import std/result
+import std/strings
+import std/strutils as strutil
+import std/math as mathlib
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/hf_model_graph as hfgraph
+import cheng/inference/weight_store as ws
+import cheng/inference/weight_binding as wb
+import cheng/inference/model_executor as mexec
+import cheng/inference/distributed_engine as engine
+
+# 小优引擎里程碑A 片8: dense_transformer HF 形状执行器切片 -- 独立 SUT/oracle
+# 交叉验证 + 手工锚, 覆盖 model_executor.cheng::ModelExecutorExecuteDenseTransformerOp
+# 新增的 HF safetensors 形状派发分支 (qkv 4 权重 q/k/v/o -> 分离 GQA 投影,
+# attention 1 权重 -> 真 paged-kv 硬 argmax 检索 + o_proj, mlp 3 权重
+# gate/up/down -> SwiGLU, 以及全新的 residual_add 分支)。
+#
+# 缺口背景 (见 scratchpad/xiaoyou_planner_slice1.patch 文件头): 真 HF config
+# (如 Qwen2.5) 喂进 hf_model_graph.HfModelGraphBuildDenseTransformerFromConfig
+# 产出的图, 其算子权重 arity 与旧执行器 (照 ModelGraphBuildTinyDenseTransformerFixture
+# 单权重惯例写) 完全不匹配, 任何 matmul 之前必死 "dense qkv: arity"。本文件验证
+# 补丁后的新分支在真实的 (虽然是缩小合成的) HF 形状图上端到端正确, 且旧 tiny
+# 单权重路径完全不受影响 (那部分由已有三个 smoke 覆盖: model_executor_dense_transformer_smoke.cheng
+# / distributed_inference_engine_smoke.cheng / inference_dense_golden_ref_main.cheng,
+# 三者在本切片补丁后逐位零回归, 见提交说明)。
+#
+# 合成 config: 2 层 / hidden=8 / attentionHeads=4 / keyValueHeads=2 (GQA 2:1,
+# headDim 派生 = hidden/heads = 2) / intermediateSize=6 / vocab=6 / rope_theta
+# =10000.0 / tie_word_embeddings=false -- 结构上是真 HfModelGraphBuildDenseTransformerFromConfig
+# 产出 (真跑该函数, 不是手搭 ModelGraph 字面量), 只是维度缩到可手算规模 (对比
+# 2026-07-13 规划器切片1 的真 Qwen2.5-0.5B config: hidden=896/24层/151936 词表,
+# 那是端到端 plumbing 验证, 不是本文件这种可手工核对的单元级交叉验证)。
+#
+# 独立性契约: HfDgRef 前缀的每个函数都是从 model_executor.cheng 对应算子的
+# 公开数学定义重新独立手写的 (embedding 查表/RmsNorm/transposed-weight 线性层/
+# neox RoPE/GQA 硬 argmax paged 检索/SwiGLU/residual add), 本文件里只有
+# main()/hfShapeBuildSutFixture()/hfShapeConfigJson()/sutCycleAt()/sutTakeStream()
+# 这几个"搭 SUT 夹具"的函数导入并调用 cheng/inference/* -- 所有 HfDgRef* 函数体
+# 内部零调用任何 cheng/inference/* 符号 (可用 grep 'HfDgRef' 与 grep 'mexec\.\|infer\.\|hfgraph\.\|ws\.\|wb\.\|engine\.' 交叉核对两者互斥)。
+# sutCycleAt/HfDgRefCycleAt 是同一份确定性合成配方的两次独立实现 (同
+# inference_dense_golden_ref_main.cheng 的 denseF16RawAt/DgRefCycleAt 关系一致:
+# 共享的是"夹具惯例"数值本身, 不是算法), 图拓扑(算子序列/每层执行子步骤顺序)
+# 同理是从 hf_model_graph.cheng 头部已读到的结构事实, 不是被测算法。
+#
+# 手工锚 (2026-07-13, 见文件末尾 main() 里对应断言, 数值均用 bash 整数四则/bc
+# 三角函数复核过, 非临场心算): layer0 attention 算子的输出 (第一步 attention
+# 输出, row1=第二个 prompt token), 逐算子链路:
+#   embedding: hidden0 row1 = embed[token=2] (ordinals 16..23 of the 6-cycle
+#     [1000,-500,250,4000,-2000,125]) = [-2000,125,1000,-500,250,4000,-2000,125]
+#   rmsnorm(inputNorm=[1000,-500,250,4000,-2000,125,1000,-500], eps=1, scale=1000)
+#     squareSum = 2000^2+125^2+1000^2+500^2+250^2+4000^2+2000^2+125^2 = 25343750
+#     meanSquare = 25343750/8 = 3167968 (trunc); normBase = 3167968/1000 + 1 = 3168
+#     norm0Out row1 = [-631,-19,78,-631,-157,157,-631,-19] (plain truncating
+#     '/' per element, matches ModelExecutorRmsNormRowsFill exactly)
+#   q = Linear(norm0Out row1, qW[8,8]) = [-939,3503,-3412,-939,3503,-3412,-939,3503]
+#   k = Linear(norm0Out row1, kW[4,8]) = [-3412,-939,3503,-3412]
+#   v = Linear(norm0Out row1, vW[4,8]) = [-939,3503,-3412,-939]
+#     (Linear here is the transposed-weight [outFeatures,inFeatures] convention,
+#     each inFeature term individually round-div'd by scale=1000 THEN summed --
+#     matches ModelExecutorLinearOutInWeightFill exactly, NOT the plain
+#     [inFeatures,outFeatures] DgRefMatMul convention the tiny fixture's own
+#     qkv/mlp weights use)
+#   RoPE (neox, headDim=2 -> halfDim=1 -> invFreq=[theta^0]=[1.0] always,
+#     angle = position*1.0 radians; position=1: cos(1)=0.5403023058681397,
+#     sin(1)=0.8414709848078965, scaled by trigScale=1073741824 and rounded ->
+#     c=580145183, s=903522590):
+#     q row1 per-head(dim2) rotate: head0[-939,3503]->[-3455,1103],
+#       head1[-3412,-939]->[-1054,-3378], head2[3503,-3412]->[4764,1104],
+#       head3[-939,3503]->[-3455,1103]
+#       -> qRoped row1 = [-3455,1103,-1054,-3378,4764,1104,-3455,1103]
+#     k row1 per-head(dim2) rotate: head0[-3412,-939]->[-1054,-3378],
+#       head1[3503,-3412]->[4764,1104] -> kRoped row1 = [-1054,-3378,4764,1104]
+#     (row0/position0 rotates to the identity exactly: cos(0)=1,sin(0)=0 are
+#     exact, so qRoped row0=q row0, kRoped row0=k row0 -- no rounding at all)
+#   [2026-07-18 #155 UPDATE: the paragraph below (originally derived
+#   2026-07-13) described a GQA combined-representative-head hardmax
+#   retrieval that is no longer what ModelExecutorPagedCausalAttentionFill's
+#   CPU branch does. #153/#154 changed it: every attention head now keeps
+#   its own query vector and its own independent 1/sqrt(headDim)-scaled
+#   softmax distribution over causal candidates (paged_kv_cache.cheng's
+#   PagedKVAttentionQueryFill, called with graph.attentionHeads query heads
+#   and repeat=attentionHeads/keyValueHeads -- see
+#   model_executor.cheng:838-852's own comment: "every attention head keeps
+#   its own query vector and its own independent softmax distribution (HF
+#   repeat_kv GQA semantics) -- heads sharing a kv-head group are NOT
+#   collapsed into one distribution and broadcast"). The old
+#   hardmax-and-broadcast paragraph, its combined-query-vector construction,
+#   and its dot-product-only score are all stale and are kept below only as
+#   a historical record of the pre-#153 formula this test used to pin down;
+#   HfDgRefAttention has been rewritten (2026-07-18) to run the new
+#   per-head-softmax algorithm and its output -- now
+#   [-15353,55704,7379,-15353,55704,7379,-15353,55704] -- is what
+#   `handAnchorRow1` below actually pins, verified against the real SUT's
+#   "layer0.attention" tensor slot bit-for-bit by this file's own asserts,
+#   not hand-expanded term-by-term here (the per-head loop, the 1/sqrt
+#   fixed-point scale, and the 12-term Taylor softmax are mechanically
+#   identical to inference_dense_golden_ref_main.cheng's DgRefCausalSoftmaxAttention
+#   and paged_kv_cache_smoke.cheng's already hand-verified anchors -- see
+#   those files for a fully expanded worked example of the same formula).]
+#   GQA combined-representative-head hardmax retrieval (STALE, pre-#153 --
+#   mirrors ModelExecutorGroupedQueryVectorFill + PagedKVAttentionQueryFill's
+#   pre-#153 form: ONE combined width-kvRows query vector per token, taking
+#   each kv head's FIRST query head (queryHead=kvHead*repeat, repeat=4/2=2)
+#   -- NOT independent per-kv-head retrieval; the "attention" was a single
+#   raw dot-product hardmax pick per token, not softmax):
+#     combined query (row1) = [qRoped head0, qRoped head2] = [-3455,1103,4764,1104]
+#     candidate0 (token0, kRoped row0=[1783,-3585,-636,1783]):
+#       score0 = -3455*1783 + 1103*-3585 + 4764*-636 + 1104*1783 = -11175992
+#     candidate1 (token1/self, kRoped row1=[-1054,-3378,4764,1104]):
+#       score1 = -3455*-1054 + 1103*-3378 + 4764*4764 + 1104*1104 = 23830148
+#     score1 > score0 -> hardmax winner = token1 (self); groupedOut = v row1
+#       = [-939,3503,-3412,-939] (v is never rotated by RoPE)
+#     broadcast winner's per-kv-head slice to its repeat=2 query heads:
+#       queryHead0=queryHead1 <- groupedOut[0:2]=[-939,3503]
+#       queryHead2=queryHead3 <- groupedOut[2:4]=[-3412,-939]
+#       -> context row1 = [-939,3503,-939,3503,-3412,-939,-3412,-939]
+#     o_proj = Linear(context row1, oW[8,8]) -> pre-#153 attn0 row1 =
+#       [1723,14851,8542,1723,14851,8542,1723,14851] (superseded, see
+#       2026-07-18 update above)
+# The current (post-#153/#154) row1 vector is asserted three ways below:
+# (1) against `handAnchorRow1`, (2) against HfDgRefAttention's
+# independently-coded result, (3) against the real SUT's
+# ModelExecutorExecuteDenseTransformerOp op-by-op replay reading the
+# "layer0.attention" tensor slot straight out of the executor -- a genuine
+# intermediate-tensor (not just final-logits) bit-for-bit cross-check,
+# matching the milestone brief's "关键中间张量逐位" requirement.
+
+const
+    HfDgRefScale: int32 = 1000
+    HfDgRefTrigScale: int32 = 1073741824
+    HfDgRefSoftmaxScale: int32 = 10000
+
+fn HfDgRefRopeTheta(): float64 =
+    return 10000.0
+
+# Same deterministic synthetic cycle convention as
+# inference_dense_golden_ref_main.cheng's DgRefCycleAt / model_executor_dense_transformer_smoke.cheng's
+# denseF16RawAt (a shared fixture convention, independently re-typed here --
+# see the independence-contract header comment above).
+fn HfDgRefCycleAt(ordinal: int32): int32 =
+    let slot = ordinal % 6
+    if slot == 0:
+        return 1000
+    if slot == 1:
+        return -500
+    if slot == 2:
+        return 250
+    if slot == 3:
+        return 4000
+    if slot == 4:
+        return -2000
+    return 125
+
+fn HfDgRefTakeStream(ordinal: var int32, count: int32): int32[] =
+    var out: int32[]
+    for _ in 0..<count:
+        add(out, HfDgRefCycleAt(ordinal))
+        ordinal = ordinal + 1
+    return out
+
+type
+    HfDgRefMat =
+        rows: int32
+        cols: int32
+        vals: int32[]
+
+fn HfDgRefOffset(cols: int32, row: int32, col: int32): int32 =
+    return row * cols + col
+
+fn HfDgRefSat(value: int64): int32 =
+    if value > int64(2147483647):
+        return 2147483647
+    if value < int64(-2147483648):
+        return -2147483648
+    return int32(value)
+
+fn HfDgRefRoundDiv(numer: int64, denom: int64): int64 =
+    if denom <= int64(0):
+        return int64(0)
+    let half = denom / int64(2)
+    if numer >= int64(0):
+        return (numer + half) / denom
+    return (numer - half) / denom
+
+# Integer sqrt via Newton's method, mirroring infer.InferenceIntSqrt
+# (kernel.cheng) exactly.
+fn HfDgRefIntSqrt(value: int64): int64 =
+    if value <= int64(0):
+        return int64(0)
+    var x = value
+    var y = (x + int64(1)) / int64(2)
+    while y < x:
+        x = y
+        y = (x + value / x) / int64(2)
+    return x
+
+fn HfDgRefMulQ(a: int32, b: int32, scale: int32): int32 =
+    let product = int64(a) * int64(b)
+    return HfDgRefSat(HfDgRefRoundDiv(product, int64(scale)))
+
+fn HfDgRefEmbedding(tokenIds: int32[], emb: HfDgRefMat): HfDgRefMat =
+    let tokenCount = tokenIds.len
+    let hidden = emb.cols
+    var outVals: int32[]
+    for _ in 0..<(tokenCount * hidden):
+        add(outVals, 0)
+    for t in 0..<tokenCount:
+        let tokenId = tokenIds[t]
+        for h in 0..<hidden:
+            outVals[HfDgRefOffset(hidden, t, h)] = emb.vals[HfDgRefOffset(hidden, tokenId, h)]
+    return HfDgRefMat(rows: tokenCount, cols: hidden, vals: outVals)
+
+fn HfDgRefRmsNormRows(x: HfDgRefMat, weight: int32[], epsilonScale: int32): HfDgRefMat =
+    var outVals: int32[]
+    for _ in 0..<x.vals.len:
+        add(outVals, 0)
+    for t in 0..<x.rows:
+        var squareSum: int64
+        for h in 0..<x.cols:
+            let v = x.vals[HfDgRefOffset(x.cols, t, h)]
+            squareSum = squareSum + int64(v) * int64(v)
+        let meanSquare = squareSum / int64(x.cols)
+        # #153/#154 root fix mirrored here: normBase is the fixed-point sqrt
+        # of (meanSquare + epsilonScale), not a truncated-divide-by-scale --
+        # matches ModelExecutorRmsNormRowsFill exactly (model_executor.cheng:918).
+        var normBase = HfDgRefIntSqrt(meanSquare + int64(epsilonScale))
+        if normBase <= int64(0):
+            normBase = int64(1)
+        for h in 0..<x.cols:
+            let inputValue = x.vals[HfDgRefOffset(x.cols, t, h)]
+            let weightValue = weight[h]
+            let weighted = int64(inputValue) * int64(weightValue)
+            outVals[HfDgRefOffset(x.cols, t, h)] = HfDgRefSat(weighted / normBase)
+    return HfDgRefMat(rows: x.rows, cols: x.cols, vals: outVals)
+
+# Transposed-weight ([outFeatures,inFeatures], real safetensors/nn.Linear
+# layout) linear layer: #153 root fix mirrored here -- the full-precision
+# int64 dot product is accumulated across every inFeature term first, then
+# round-divided by scale exactly once at the end -- mirrors
+# ModelExecutorLinearOutInWeightFill exactly (model_executor.cheng:1029-1037).
+# This is a different weight-layout convention from the tiny fixture's own
+# [inFeatures,outFeatures] plain-matmul qkv/mlp weights (see file header).
+fn HfDgRefLinear(x: HfDgRefMat, w: HfDgRefMat): HfDgRefMat =
+    var outVals: int32[]
+    for row in 0..<x.rows:
+        for outF in 0..<w.rows:
+            var sum: int64
+            for inF in 0..<x.cols:
+                let product = int64(x.vals[HfDgRefOffset(x.cols, row, inF)]) *
+                              int64(w.vals[HfDgRefOffset(w.cols, outF, inF)])
+                sum = sum + product
+            add(outVals, HfDgRefSat(HfDgRefRoundDiv(sum, int64(HfDgRefScale))))
+    return HfDgRefMat(rows: x.rows, cols: w.rows, vals: outVals)
+
+# Prefill-only per-head neox RoPE (position == row index, no kv-cache carry-in
+# -- ModelExecutorExecuteDenseTransformerTokens takes no kv-state param, full
+# recompute every generate step, so basePosition is always 0 in production
+# too). Rotates every `headCount` consecutive headDim-wide column span in
+# each row. Mirrors ModelExecutorRopeApplyQkFill's per-head loop (generalized
+# to any headCount, covering both the attentionHeads-many q heads and the
+# keyValueHeads-many k heads).
+fn HfDgRefRopeApplyHeads(x: HfDgRefMat, headCount: int32, headDim: int32, theta: float64): HfDgRefMat =
+    let halfDim = headDim / 2
+    var outVals: int32[]
+    for i in 0..<x.vals.len:
+        add(outVals, x.vals[i])
+    let lnTheta = mathlib.Ln(theta)
+    var invFreq: float64[]
+    for j in 0..<halfDim:
+        let exponent = 0.0 - float64(2 * j) / float64(2 * halfDim)
+        add(invFreq, mathlib.Exp(exponent * lnTheta))
+    let trigScaleF = float64(HfDgRefTrigScale)
+    for row in 0..<x.rows:
+        var cosRow: int32[]
+        var sinRow: int32[]
+        for j in 0..<halfDim:
+            let angle = float64(row) * invFreq[j]
+            add(cosRow, int32(int64(mathlib.Round(mathlib.Cos(angle) * trigScaleF))))
+            add(sinRow, int32(int64(mathlib.Round(mathlib.Sin(angle) * trigScaleF))))
+        for head in 0..<headCount:
+            let colStart = head * headDim
+            for j in 0..<halfDim:
+                let idx1 = HfDgRefOffset(x.cols, row, colStart + j)
+                let idx2 = HfDgRefOffset(x.cols, row, colStart + halfDim + j)
+                let x1 = outVals[idx1]
+                let x2 = outVals[idx2]
+                let c = cosRow[j]
+                let s = sinRow[j]
+                let o1 = HfDgRefSat(int64(HfDgRefMulQ(x1, c, HfDgRefTrigScale)) - int64(HfDgRefMulQ(x2, s, HfDgRefTrigScale)))
+                let o2 = HfDgRefSat(int64(HfDgRefMulQ(x2, c, HfDgRefTrigScale)) + int64(HfDgRefMulQ(x1, s, HfDgRefTrigScale)))
+                outVals[idx1] = o1
+                outVals[idx2] = o2
+    return HfDgRefMat(rows: x.rows, cols: x.cols, vals: outVals)
+
+# GQA causal attention: mirrors ModelExecutorPagedCausalAttentionFill +
+# ModelExecutorGroupedQueryVectorFill + PagedKVAttentionQueryFill +
+# ModelExecutorWriteGroupedValueToHiddenRow exactly. Production is NOT
+# softmax attention and NOT independent per-kv-head retrieval: it builds one
+# combined width-kvRows query vector per token (each kv head contributes only
+# its FIRST query head's slice), does a single raw-dot-product HARDMAX pick
+# (strict '>', ties keep the earliest candidate) against every causal
+# candidate's full kvRows-wide key, then broadcasts the winning candidate's
+# full kvRows-wide value back out, per kv head, to every query head in that
+# kv head's group. This is pre-existing shared production code (unmodified
+# by this milestone's patch); this oracle reproduces it byte-for-byte, not a
+# "textbook" independent-multi-head-softmax attention.
+# #153/#154 root fix mirrored here: every attention head keeps its own
+# query vector and its own independent 1/sqrt(headDim)-scaled softmax
+# distribution over causal candidates (HF repeat_kv GQA semantics) -- heads
+# sharing a kv-head group are NOT collapsed into one hardmax pick and
+# broadcast. Mirrors paged_kv_cache.cheng's PagedKVAttentionQueryFill
+# exactly (as invoked from ModelExecutorPagedCausalAttentionFill's CPU
+# branch, model_executor.cheng:838-852), specialized to attend over the
+# causal candidate rows 0..t already computed here as full matrices, since
+# this oracle has no separate paged-cache append step.
+fn HfDgRefAttention(qRoped: HfDgRefMat, kRoped: HfDgRefMat, v: HfDgRefMat, oW: HfDgRefMat,
+                    attentionHeads: int32, keyValueHeads: int32, headDim: int32): HfDgRefMat =
+    let repeat = attentionHeads / keyValueHeads
+    let hidden = attentionHeads * headDim
+    let sqrtFix: int64 = int64(10000)
+    let isqrtHead = HfDgRefIntSqrt(int64(headDim) * sqrtFix * sqrtFix)
+    var contextVals: int32[]
+    for _ in 0..<(qRoped.rows * hidden):
+        add(contextVals, 0)
+    for t in 0..<qRoped.rows:
+        for qh in 0..<attentionHeads:
+            let kvHead = qh / repeat
+            let queryBase = qh * headDim
+            let kvBase = kvHead * headDim
+            var scores: int32[]
+            var maxScore: int32
+            var sawCandidate: bool
+            for c in 0..<t + 1:
+                var dot: int64
+                for d in 0..<headDim:
+                    dot = dot + int64(qRoped.vals[HfDgRefOffset(qRoped.cols, t, queryBase + d)]) *
+                                int64(kRoped.vals[HfDgRefOffset(kRoped.cols, c, kvBase + d)])
+                let score = HfDgRefSat(HfDgRefRoundDiv(dot * sqrtFix, int64(HfDgRefScale) * isqrtHead))
+                if !sawCandidate || score > maxScore:
+                    maxScore = score
+                    sawCandidate = true
+                add(scores, score)
+            var weights: int32[]
+            var denom: int64
+            for i in 0..<scores.len:
+                let weight = HfDgRefExpNegQ(scores[i] - maxScore, HfDgRefScale, HfDgRefSoftmaxScale)
+                add(weights, weight)
+                denom = denom + int64(weight)
+            for d in 0..<headDim:
+                var numer: int64
+                for c in 0..<t + 1:
+                    numer = numer + int64(v.vals[HfDgRefOffset(v.cols, c, kvBase + d)]) * int64(weights[c])
+                contextVals[HfDgRefOffset(hidden, t, queryBase + d)] = HfDgRefSat(HfDgRefRoundDiv(numer, denom))
+    let context = HfDgRefMat(rows: qRoped.rows, cols: hidden, vals: contextVals)
+    return HfDgRefLinear(context, oW)
+
+# #153 root fix mirrored here: q/k/v projection bias, row-wise add per
+# output feature -- mirrors ModelExecutorAddBiasRows exactly
+# (model_executor.cheng:986-1005).
+fn HfDgRefAddBiasRows(x: HfDgRefMat, bias: int32[]): HfDgRefMat =
+    var outVals: int32[]
+    for row in 0..<x.rows:
+        for f in 0..<x.cols:
+            let off = HfDgRefOffset(x.cols, row, f)
+            add(outVals, HfDgRefSat(int64(x.vals[off]) + int64(bias[f])))
+    return HfDgRefMat(rows: x.rows, cols: x.cols, vals: outVals)
+
+fn HfDgRefResidualAdd(a: HfDgRefMat, b: HfDgRefMat): HfDgRefMat =
+    var outVals: int32[]
+    for i in 0..<a.vals.len:
+        add(outVals, HfDgRefSat(int64(a.vals[i]) + int64(b.vals[i])))
+    return HfDgRefMat(rows: a.rows, cols: a.cols, vals: outVals)
+
+# Same 12-term fixed-point Taylor series identity as
+# inference_dense_golden_ref_main.cheng's DgRefExpNegQ / model_executor.cheng's
+# InferenceExpNegQ, independently re-typed (see independence-contract header).
+fn HfDgRefExpNegQ(delta: int32, inputScale: int32, outputScale: int32): int32 =
+    if delta >= 0:
+        return outputScale
+    if delta <= 0 - inputScale * 8:
+        return 0
+    let dQ = HfDgRefSat(HfDgRefRoundDiv(int64(0 - delta) * int64(outputScale), int64(inputScale)))
+    var term: int64 = int64(outputScale)
+    var total: int64 = int64(outputScale)
+    for k in 1..12:
+        term = HfDgRefRoundDiv(term * int64(dQ), int64(outputScale * k))
+        total = total + term
+    if total <= int64(0):
+        return 0
+    return HfDgRefSat(HfDgRefRoundDiv(int64(outputScale) * int64(outputScale), total))
+
+# sigmoid(x) = 1/(1+exp(-x)) in HfDgRefScale fixed point, mirrors
+# ModelExecutorSigmoidQ exactly (both branches, split at value>=0 the same
+# way for numerical stability -- see that function's own comment).
+fn HfDgRefSigmoidQ(value: int32, scale: int32): int32 =
+    var expTerm: int32
+    if value >= 0:
+        expTerm = HfDgRefExpNegQ(0 - value, scale, scale)
+        let denom = int64(scale) + int64(expTerm)
+        return HfDgRefSat(HfDgRefRoundDiv(int64(scale) * int64(scale), denom))
+    expTerm = HfDgRefExpNegQ(value, scale, scale)
+    let denom = int64(scale) + int64(expTerm)
+    return HfDgRefSat(HfDgRefRoundDiv(int64(expTerm) * int64(scale), denom))
+
+# SwiGLU(gate,up) = up * SiLU(gate), SiLU(x) = x*sigmoid(x). Mirrors
+# ModelExecutorSwiGluFill exactly.
+fn HfDgRefSwiGlu(gate: HfDgRefMat, up: HfDgRefMat): HfDgRefMat =
+    var outVals: int32[]
+    for i in 0..<gate.vals.len:
+        let sigmoid = HfDgRefSigmoidQ(gate.vals[i], HfDgRefScale)
+        let silu = HfDgRefSat(HfDgRefRoundDiv(int64(gate.vals[i]) * int64(sigmoid), int64(HfDgRefScale)))
+        add(outVals, HfDgRefSat(HfDgRefRoundDiv(int64(silu) * int64(up.vals[i]), int64(HfDgRefScale))))
+    return HfDgRefMat(rows: gate.rows, cols: gate.cols, vals: outVals)
+
+type
+    HfDgRefLayerWeights =
+        inputNorm: int32[]
+        qW: HfDgRefMat
+        kW: HfDgRefMat
+        vW: HfDgRefMat
+        oW: HfDgRefMat
+        qBias: int32[]
+        kBias: int32[]
+        vBias: int32[]
+        postNorm: int32[]
+        gateW: HfDgRefMat
+        upW: HfDgRefMat
+        downW: HfDgRefMat
+
+    HfDgRefWeights =
+        emb: HfDgRefMat
+        layers: HfDgRefLayerWeights[]
+        finalNorm: int32[]
+        lmHeadW: HfDgRefMat
+
+# Weight order mirrors HfModelGraphBuildDenseTransformerFromConfig's
+# graph.weights list exactly (embed -> per layer [inputNorm, q, k, v, o,
+# qBias, kBias, vBias, postNorm, gate, up, down] -> finalNorm -> lmHead,
+# tie_word_embeddings=false so lmHead is its own shard) -- a structural
+# fixture fact, not the algorithm under test (see file header). #153 added
+# the per-layer q/k/v projection biases (hf_model_graph.cheng:2442-2453,
+# self_attn.{q,k,v}_proj.bias), which is the real +6 weights (3 biases x 2
+# layers) behind the "21 -> 27" inventory count re-derivation below.
+fn HfDgRefBuildWeights(layerCount: int32, hiddenSize: int32, kvRows: int32,
+                       intermediateSize: int32, vocabSize: int32): HfDgRefWeights =
+    var ordinal: int32
+    let embVals = HfDgRefTakeStream(ordinal, vocabSize * hiddenSize)
+    var layers: HfDgRefLayerWeights[]
+    for _ in 0..<layerCount:
+        let inputNorm = HfDgRefTakeStream(ordinal, hiddenSize)
+        let qVals = HfDgRefTakeStream(ordinal, hiddenSize * hiddenSize)
+        let kVals = HfDgRefTakeStream(ordinal, kvRows * hiddenSize)
+        let vVals = HfDgRefTakeStream(ordinal, kvRows * hiddenSize)
+        let oVals = HfDgRefTakeStream(ordinal, hiddenSize * hiddenSize)
+        let qBias = HfDgRefTakeStream(ordinal, hiddenSize)
+        let kBias = HfDgRefTakeStream(ordinal, kvRows)
+        let vBias = HfDgRefTakeStream(ordinal, kvRows)
+        let postNorm = HfDgRefTakeStream(ordinal, hiddenSize)
+        let gateVals = HfDgRefTakeStream(ordinal, intermediateSize * hiddenSize)
+        let upVals = HfDgRefTakeStream(ordinal, intermediateSize * hiddenSize)
+        let downVals = HfDgRefTakeStream(ordinal, hiddenSize * intermediateSize)
+        add(layers, HfDgRefLayerWeights(
+            inputNorm: inputNorm,
+            qW: HfDgRefMat(rows: hiddenSize, cols: hiddenSize, vals: qVals),
+            kW: HfDgRefMat(rows: kvRows, cols: hiddenSize, vals: kVals),
+            vW: HfDgRefMat(rows: kvRows, cols: hiddenSize, vals: vVals),
+            oW: HfDgRefMat(rows: hiddenSize, cols: hiddenSize, vals: oVals),
+            qBias: qBias,
+            kBias: kBias,
+            vBias: vBias,
+            postNorm: postNorm,
+            gateW: HfDgRefMat(rows: intermediateSize, cols: hiddenSize, vals: gateVals),
+            upW: HfDgRefMat(rows: intermediateSize, cols: hiddenSize, vals: upVals),
+            downW: HfDgRefMat(rows: hiddenSize, cols: intermediateSize, vals: downVals)
+        ))
+    let finalNorm = HfDgRefTakeStream(ordinal, hiddenSize)
+    let lmHeadVals = HfDgRefTakeStream(ordinal, vocabSize * hiddenSize)
+    return HfDgRefWeights(
+        emb: HfDgRefMat(rows: vocabSize, cols: hiddenSize, vals: embVals),
+        layers: layers,
+        finalNorm: finalNorm,
+        lmHeadW: HfDgRefMat(rows: vocabSize, cols: hiddenSize, vals: lmHeadVals)
+    )
+
+# Op sequence per layer mirrors ModelExecutorExecuteDenseTransformerOp's new
+# HF-shape dispatch order exactly: RmsNorm(input) -> Qkv(4w) -> Rope(qk-split)
+# -> Attention(1w, GQA) -> ResidualAdd -> RmsNorm(post) -> Mlp(3w, SwiGLU) ->
+# ResidualAdd.
+fn HfDgRefLayerForward(x: HfDgRefMat, w: HfDgRefLayerWeights,
+                       attentionHeads: int32, keyValueHeads: int32, headDim: int32,
+                       theta: float64): HfDgRefMat =
+    let normed = HfDgRefRmsNormRows(x, w.inputNorm, 1)
+    let q = HfDgRefAddBiasRows(HfDgRefLinear(normed, w.qW), w.qBias)
+    let k = HfDgRefAddBiasRows(HfDgRefLinear(normed, w.kW), w.kBias)
+    let v = HfDgRefAddBiasRows(HfDgRefLinear(normed, w.vW), w.vBias)
+    let qRoped = HfDgRefRopeApplyHeads(q, attentionHeads, headDim, theta)
+    let kRoped = HfDgRefRopeApplyHeads(k, keyValueHeads, headDim, theta)
+    let attnOut = HfDgRefAttention(qRoped, kRoped, v, w.oW, attentionHeads, keyValueHeads, headDim)
+    let attnResidual = HfDgRefResidualAdd(x, attnOut)
+    let postNormed = HfDgRefRmsNormRows(attnResidual, w.postNorm, 1)
+    let gate = HfDgRefLinear(postNormed, w.gateW)
+    let up = HfDgRefLinear(postNormed, w.upW)
+    let activated = HfDgRefSwiGlu(gate, up)
+    let mlpOut = HfDgRefLinear(activated, w.downW)
+    return HfDgRefResidualAdd(attnResidual, mlpOut)
+
+fn HfDgRefForward(tokenIds: int32[], w: HfDgRefWeights,
+                  attentionHeads: int32, keyValueHeads: int32, headDim: int32,
+                  theta: float64): HfDgRefMat =
+    var hidden = HfDgRefEmbedding(tokenIds, w.emb)
+    for i in 0..<w.layers.len:
+        hidden = HfDgRefLayerForward(hidden, w.layers[i], attentionHeads, keyValueHeads, headDim, theta)
+    let normed = HfDgRefRmsNormRows(hidden, w.finalNorm, 1)
+    return HfDgRefLinear(normed, w.lmHeadW)
+
+fn HfDgRefArgmaxRow(logits: HfDgRefMat, row: int32): int32 =
+    var bestIndex: int32
+    var bestValue = logits.vals[HfDgRefOffset(logits.cols, row, 0)]
+    for c in 1..<logits.cols:
+        let v = logits.vals[HfDgRefOffset(logits.cols, row, c)]
+        if v > bestValue:
+            bestValue = v
+            bestIndex = c
+    return bestIndex
+
+# Algorithm-independent re-derivation of DistributedGenerateGreedyDenseTransformerTokens's
+# contract: no persisted kv cache, full forward recompute every step over the
+# whole token list so far, next token = argmax over the last row's logits.
+fn HfDgRefGenerateGreedy(promptTokenIds: int32[], maxNewTokens: int32, eosTokenId: int32,
+                         w: HfDgRefWeights, attentionHeads: int32, keyValueHeads: int32,
+                         headDim: int32, theta: float64): int32[] =
+    var current: int32[]
+    for i in 0..<promptTokenIds.len:
+        add(current, promptTokenIds[i])
+    for _ in 0..<maxNewTokens:
+        let logits = HfDgRefForward(current, w, attentionHeads, keyValueHeads, headDim, theta)
+        let lastRow = current.len - 1
+        let token = HfDgRefArgmaxRow(logits, lastRow)
+        add(current, token)
+        if eosTokenId >= 0 && token == eosTokenId:
+            break
+    return current
+
+fn HfDgRefIntArrayToString(arr: int32[]): str =
+    var parts: str[]
+    for i in 0..<arr.len:
+        add(parts, strings.IntToStr(arr[i]))
+    return strutil.Join(parts, ",")
+
+# ============ SUT-side setup (this half imports cheng/inference/*) ============
+
+fn hfShapeConfigJson(): str =
+    return strutil.Join([
+        "{",
+        "\"architectures\":[\"Qwen2ForCausalLM\"],",
+        "\"model_type\":\"qwen2\",",
+        "\"vocab_size\":6,",
+        "\"hidden_size\":8,",
+        "\"num_hidden_layers\":2,",
+        "\"num_attention_heads\":4,",
+        "\"num_key_value_heads\":2,",
+        "\"intermediate_size\":6,",
+        "\"tie_word_embeddings\":false,",
+        "\"rope_theta\":10000.0",
+        "}"
+    ], "")
+
+# Independently re-typed instance of the same 6-value cycle as HfDgRefCycleAt
+# (shared fixture convention, not shared algorithm -- see file header).
+fn sutCycleAt(ordinal: int32): int32 =
+    let slot = ordinal % 6
+    if slot == 0:
+        return 1000
+    if slot == 1:
+        return -500
+    if slot == 2:
+        return 250
+    if slot == 3:
+        return 4000
+    if slot == 4:
+        return -2000
+    return 125
+
+fn sutTakeStream(ordinal: var int32, count: int32): int32[] =
+    var out: int32[]
+    for _ in 0..<count:
+        add(out, sutCycleAt(ordinal))
+        ordinal = ordinal + 1
+    return out
+
+type
+    HfShapeSutFixture =
+        graph: mg.ModelGraph
+        bindings: wb.WeightBindingSet
+        store: ws.WeightTensorStore
+
+fn hfShapeBuildSutFixture(): HfShapeSutFixture =
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        hfShapeConfigJson(),
+        "cid:model:dense-hf-shape-golden-ref",
+        kir.KernelDtypeFp16,
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsOk(graphRes), " model executor dense hf shape golden ref: build graph")
+    let graph = Value(graphRes)
+    assert(IsOk(mg.ModelGraphValidate(graph)), " model executor dense hf shape golden ref: graph valid")
+    assert(graph.architecture == mg.InferenceModelArchitectureDenseTransformer &&
+           graph.weights.len == 27 && graph.ops.len == 19 &&
+           graph.hiddenSize == 8 && graph.attentionHeads == 4 &&
+           graph.keyValueHeads == 2 && graph.headDim == 2 && graph.layerCount == 2,
+           " model executor dense hf shape golden ref: graph inventory (real HF-shape dims)")
+
+    var ordinal: int32
+    var payloads: ws.WeightTensorPayload[]
+    var bindings: wb.WeightShardBinding[]
+    for i in 0..<graph.weights.len:
+        let countRes = mg.ModelGraphTensorElementCount(graph.weights[i].shape)
+        assert(IsOk(countRes), " model executor dense hf shape golden ref: weight element count")
+        let elemCount = int32(Value(countRes))
+        let data = sutTakeStream(ordinal, elemCount)
+        var tensor: infer.TensorQ
+        let fillOk = infer.TensorFromDataFill(tensor, graph.weights[i].shape, HfDgRefScale, data)
+        assert(IsOk(fillOk), " model executor dense hf shape golden ref: weight tensor fill")
+        let peerId = strutil.Join(["peer:dense-hf-shape:", strings.IntToStr(i)], "")
+        let payloadRes = ws.WeightTensorPayloadBuild(
+            graph.weights[i].modelCid,
+            graph.weights[i].tensorName,
+            graph.weights[i].shardCid,
+            graph.weights[i].dtype,
+            graph.weights[i].quantScheme,
+            peerId,
+            tensor
+        )
+        assert(IsOk(payloadRes), " model executor dense hf shape golden ref: weight payload")
+        let payload = Value(payloadRes)
+        add(payloads, payload)
+        add(bindings, wb.WeightShardBinding(
+            modelCid: graph.weights[i].modelCid,
+            tensorName: graph.weights[i].tensorName,
+            shardCid: graph.weights[i].shardCid,
+            dtype: graph.weights[i].dtype,
+            quantScheme: graph.weights[i].quantScheme,
+            sizeBytes: graph.weights[i].sizeBytes,
+            peerId: peerId,
+            payloadHash: payload.payloadHash
+        ))
+    let set = wb.WeightBindingBuildSet(graph.modelCid, bindings)
+    let store = ws.WeightTensorStoreBuild(graph.modelCid, payloads)
+    var hashes: int64[]
+    for i in 0..<payloads.len:
+        add(hashes, payloads[i].payloadHash)
+    let boundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(graph, hashes)
+    assert(IsOk(boundGraphRes), " model executor dense hf shape golden ref: bind weight anchors")
+    let boundGraph = Value(boundGraphRes)
+    assert(IsOk(wb.WeightBindingValidate(set, boundGraph)), " model executor dense hf shape golden ref: weight bindings")
+    assert(IsOk(ws.WeightTensorValidateStore(store, set, boundGraph)), " model executor dense hf shape golden ref: weight store")
+    return HfShapeSutFixture(graph: boundGraph, bindings: set, store: store)
+
+# Manual op-by-op replay (same public ModelExecutorExecuteDenseTransformerOp
+# calls ModelExecutorExecuteDenseTransformerTokens's own loop makes
+# internally) so this test can read the "layer0.attention" intermediate
+# tensor straight out of the executor's tensor slots -- the "关键中间张量逐位"
+# cross-check, not just a final-logits comparison.
+fn hfShapeReplayOps(graph: mg.ModelGraph, store: ws.WeightTensorStore,
+                    tokenIds: infer.TensorQ): mexec.ModelExecutorTensorSlot[] =
+    var slots: mexec.ModelExecutorTensorSlot[]
+    let putToken = mexec.ModelExecutorPutTensor(slots, "token_ids", tokenIds)
+    assert(IsOk(putToken), " model executor dense hf shape golden ref: put token ids")
+    var executionHash: int64
+    for i in 0..<graph.ops.len:
+        let opOk = mexec.ModelExecutorExecuteDenseTransformerOp(graph, store, graph.ops[i], slots, executionHash)
+        if IsErr(opOk):
+            echo(strutil.Join(["op replay failed at i=", strings.IntToStr(i), " opKind=", graph.ops[i].opKind,
+                                " out=", graph.ops[i].outputName, " err=", Error(opOk)], ""))
+        assert(IsOk(opOk), " model executor dense hf shape golden ref: op replay")
+    return slots
+
+fn main(): int32 =
+    let fixture = hfShapeBuildSutFixture()
+    let graph = fixture.graph
+    let attentionHeads: int32 = 4
+    let keyValueHeads: int32 = 2
+    let headDim: int32 = 2
+    let hiddenSize: int32 = 8
+    let kvRows = keyValueHeads * headDim
+    let intermediateSize: int32 = 6
+    let vocabSize: int32 = 6
+    let layerCount: int32 = 2
+
+    var promptTokenIds: infer.TensorQ
+    let promptOk = infer.TensorFromDataFill(promptTokenIds, [2], 1, [1, 2])
+    assert(IsOk(promptOk), " model executor dense hf shape golden ref: prompt tensor build")
+
+    # --- independent oracle forward pass ---
+    let oracleWeights = HfDgRefBuildWeights(layerCount, hiddenSize, kvRows, intermediateSize, vocabSize)
+    let oraclePromptIds = [1, 2]
+    let oracleLogits = HfDgRefForward(oraclePromptIds, oracleWeights, attentionHeads, keyValueHeads, headDim, HfDgRefRopeTheta())
+    echo(strutil.Join(["oracle logits: ", HfDgRefIntArrayToString(oracleLogits.vals)], ""))
+
+    # --- hand-derivation anchor: layer0's attention op OUTPUT at row1, cross
+    # -checked against (1) HfDgRefAttention directly and (2) the SUT's own
+    # "layer0.attention" tensor slot below ---
+    let handAnchorRow1 = [-15353, 55704, 7379, -15353, 55704, 7379, -15353, 55704]
+    let oracleNorm0 = HfDgRefRmsNormRows(HfDgRefEmbedding(oraclePromptIds, oracleWeights.emb), oracleWeights.layers[0].inputNorm, 1)
+    let oracleQ0 = HfDgRefAddBiasRows(HfDgRefLinear(oracleNorm0, oracleWeights.layers[0].qW), oracleWeights.layers[0].qBias)
+    let oracleK0 = HfDgRefAddBiasRows(HfDgRefLinear(oracleNorm0, oracleWeights.layers[0].kW), oracleWeights.layers[0].kBias)
+    let oracleV0 = HfDgRefAddBiasRows(HfDgRefLinear(oracleNorm0, oracleWeights.layers[0].vW), oracleWeights.layers[0].vBias)
+    let oracleQRoped0 = HfDgRefRopeApplyHeads(oracleQ0, attentionHeads, headDim, HfDgRefRopeTheta())
+    let oracleKRoped0 = HfDgRefRopeApplyHeads(oracleK0, keyValueHeads, headDim, HfDgRefRopeTheta())
+    let oracleAttn0 = HfDgRefAttention(oracleQRoped0, oracleKRoped0, oracleV0, oracleWeights.layers[0].oW, attentionHeads, keyValueHeads, headDim)
+    echo(strutil.Join(["oracle layer0 attention row1: ", HfDgRefIntArrayToString(oracleAttn0.vals)], ""))
+    for c in 0..<8:
+        assert(oracleAttn0.vals[HfDgRefOffset(8, 1, c)] == handAnchorRow1[c],
+               " model executor dense hf shape golden ref: hand-derivation anchor vs independent oracle")
+
+    # --- SUT op-by-op replay: read the same "layer0.attention" tensor
+    # straight out of the production executor ---
+    let slots = hfShapeReplayOps(graph, fixture.store, promptTokenIds)
+    let sutLayer0Attn = mexec.ModelExecutorFindTensor(slots, "layer0.attention")
+    assert(IsOk(sutLayer0Attn), " model executor dense hf shape golden ref: find layer0.attention slot")
+    let sutAttn0 = Value(sutLayer0Attn)
+    assert(sutAttn0.shape.len == 2 && sutAttn0.shape[0] == 2 && sutAttn0.shape[1] == 8,
+           " model executor dense hf shape golden ref: sut layer0.attention shape")
+    echo(strutil.Join(["sut layer0 attention row1: ", HfDgRefIntArrayToString([
+        sutAttn0.data[8], sutAttn0.data[9], sutAttn0.data[10], sutAttn0.data[11],
+        sutAttn0.data[12], sutAttn0.data[13], sutAttn0.data[14], sutAttn0.data[15]
+    ])], ""))
+    for c in 0..<8:
+        assert(sutAttn0.data[8 + c] == handAnchorRow1[c],
+               " model executor dense hf shape golden ref: hand-derivation anchor vs SUT intermediate tensor")
+        assert(sutAttn0.data[8 + c] == oracleAttn0.vals[HfDgRefOffset(8, 1, c)],
+               " model executor dense hf shape golden ref: SUT intermediate tensor vs independent oracle")
+
+    let sutLogitsTensor = mexec.ModelExecutorFindTensor(slots, "logits")
+    assert(IsOk(sutLogitsTensor), " model executor dense hf shape golden ref: find logits slot")
+    let sutReplayLogits = Value(sutLogitsTensor)
+
+    # --- SUT official entry point (same function DistributedGenerateGreedyDenseTransformerTokens
+    # calls) -- must agree with both the manual replay above and the
+    # independent oracle, bit for bit ---
+    let executed = mexec.ModelExecutorExecuteDenseTransformerTokens(graph, fixture.bindings, fixture.store, promptTokenIds)
+    assert(IsOk(executed), " model executor dense hf shape golden ref: sut forward execution")
+    let sutOutput = Value(executed)
+    echo(strutil.Join(["sut logits: ", HfDgRefIntArrayToString(sutOutput.logits.data)], ""))
+    assert(sutOutput.logits.shape.len == 2 && sutOutput.logits.shape[0] == 2 && sutOutput.logits.shape[1] == vocabSize,
+           " model executor dense hf shape golden ref: sut logits shape")
+    assert(sutOutput.logits.scale == HfDgRefScale,
+           " model executor dense hf shape golden ref: sut logits scale")
+    for i in 0..<sutOutput.logits.data.len:
+        assert(sutOutput.logits.data[i] == sutReplayLogits.data[i],
+               " model executor dense hf shape golden ref: sut tokens-entry-point vs sut op-replay logits")
+        assert(sutOutput.logits.data[i] == oracleLogits.vals[i],
+               " model executor dense hf shape golden ref: sut logits vs independent oracle logits")
+
+    # --- greedy generate loop: SUT (DistributedGenerateGreedyDenseTransformerTokens)
+    # vs independent oracle (HfDgRefGenerateGreedy), same no-kv-cache /
+    # full-recompute-per-step / argmax-with-earliest-tie-wins contract ---
+    let maxNewTokens: int32 = 2
+    let oracleGenerated = HfDgRefGenerateGreedy(oraclePromptIds, maxNewTokens, -1, oracleWeights, attentionHeads, keyValueHeads, headDim, HfDgRefRopeTheta())
+    echo(strutil.Join(["oracle generate: ", HfDgRefIntArrayToString(oracleGenerated)], ""))
+    let sutGenerated = engine.DistributedGenerateGreedyDenseTransformerTokens(
+        graph, fixture.bindings, fixture.store, promptTokenIds, maxNewTokens, -1)
+    assert(IsOk(sutGenerated), " model executor dense hf shape golden ref: sut generate ok")
+    let sutGeneratedTokens = Value(sutGenerated)
+    echo(strutil.Join(["sut generate: ", HfDgRefIntArrayToString(sutGeneratedTokens.data)], ""))
+    assert(sutGeneratedTokens.shape.len == 1 && sutGeneratedTokens.shape[0] == oracleGenerated.len,
+           " model executor dense hf shape golden ref: sut/oracle generate token count")
+    for i in 0..<oracleGenerated.len:
+        assert(sutGeneratedTokens.data[i] == oracleGenerated[i],
+               " model executor dense hf shape golden ref: sut/oracle generated token sequence")
+
+    echo(" model_executor_dense_hf_shape_golden_ref ok")
+    return 0

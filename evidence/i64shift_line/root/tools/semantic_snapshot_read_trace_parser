@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Strict parser and identity helpers for semantic-snapshot read traces."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import struct
+import sys
+from typing import Any, Sequence
+
+
+DARWIN_METHOD = "darwin_dtrace_read_syscalls"
+LINUX_METHOD = "linux_strace_read_syscalls"
+METHODS = (DARWIN_METHOD, LINUX_METHOD)
+LINUX_SYSCALLS = ("read", "pread64", "readv", "preadv", "preadv2")
+DARWIN_SYSCALLS = (
+    "read", "read_nocancel", "pread", "pread_nocancel", "readv",
+    "readv_nocancel", "preadv", "preadv_nocancel",
+)
+LINUX_TRACE_FILTER = "trace=" + ",".join(LINUX_SYSCALLS)
+DARWIN_DTRACE_PROGRAM = """#pragma D option quiet
+syscall::read:entry,
+syscall::read_nocancel:entry,
+syscall::pread:entry,
+syscall::pread_nocancel:entry,
+syscall::readv:entry,
+syscall::readv_nocancel:entry,
+syscall::preadv:entry,
+syscall::preadv_nocancel:entry
+/pid == $target || progenyof($target)/
+{
+    self->cheng_read_active = 1;
+}
+
+syscall::read:return,
+syscall::read_nocancel:return,
+syscall::pread:return,
+syscall::pread_nocancel:return,
+syscall::readv:return,
+syscall::readv_nocancel:return,
+syscall::preadv:return,
+syscall::preadv_nocancel:return
+/self->cheng_read_active/
+{
+    printf("CHENG_READ\\t%d\\t%s\\t%lld\\n", pid, probefunc, (int64_t)arg0);
+    self->cheng_read_active = 0;
+}
+"""
+
+_LINUX_COMPLETE = re.compile(
+    rb"^(?P<pid>[1-9][0-9]*) +(?P<name>read|pread64|readv|preadv|preadv2)"
+    rb"\(.*\) += +(?P<result>-?[0-9]+)(?P<error>.*)$")
+_LINUX_UNFINISHED = re.compile(
+    rb"^(?P<pid>[1-9][0-9]*) +(?P<name>read|pread64|readv|preadv|preadv2)"
+    rb"\(.* <unfinished \.\.\.>$")
+_LINUX_RESUMED = re.compile(
+    rb"^(?P<pid>[1-9][0-9]*) +<\.\.\. "
+    rb"(?P<name>read|pread64|readv|preadv|preadv2) resumed>.*\) += +"
+    rb"(?P<result>-?[0-9]+)(?P<error>.*)$")
+_DARWIN_RECORD = re.compile(
+    rb"^CHENG_READ\t(?P<pid>[1-9][0-9]*)\t"
+    rb"(?P<name>read|read_nocancel|pread|pread_nocancel|readv|readv_nocancel|"
+    rb"preadv|preadv_nocancel)\t"
+    rb"(?P<result>-?[0-9]+)$")
+_LINUX_ERROR = re.compile(rb"^ [A-Z][A-Z0-9_]*(?: \(.*\))?$")
+
+
+class ReadTraceError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class ReadTraceCounts:
+    read_syscalls: int
+    read_bytes: int
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value)
+
+
+def _text_frame(raw: bytes) -> bytes:
+    return struct.pack(">I", len(raw)) + raw
+
+
+def argv_digest(argv: Sequence[str]) -> str:
+    payload = bytearray(_text_frame(b"cheng.guard.command_argv"))
+    payload.extend(struct.pack(">I", len(argv)))
+    for value in argv:
+        if not isinstance(value, str) or "\x00" in value:
+            raise ReadTraceError("command argv contains invalid text")
+        payload.extend(_text_frame(os.fsencode(value)))
+    return sha256_bytes(bytes(payload))
+
+
+def trace_contract_sha256(method: str) -> str:
+    if method == DARWIN_METHOD:
+        raw = DARWIN_DTRACE_PROGRAM.encode("utf-8")
+    elif method == LINUX_METHOD:
+        raw = ("strace:-f,-qq,-e," + LINUX_TRACE_FILTER +
+               ",-e,signal=none,-o,$RAW,--,$COMMAND").encode("ascii")
+    else:
+        raise ReadTraceError("unknown read trace method")
+    return sha256_bytes(b"cheng.semantic_snapshot.read_trace_contract\x00" + raw)
+
+
+def _validate_result_suffix(result: int, suffix: bytes, line_number: int) -> None:
+    if result >= 0:
+        if suffix:
+            raise ReadTraceError(
+                f"strace line {line_number}: unexpected successful-call suffix")
+    elif not _LINUX_ERROR.fullmatch(suffix):
+        raise ReadTraceError(f"strace line {line_number}: malformed errno suffix")
+
+
+def parse_linux_strace(raw: bytes) -> ReadTraceCounts:
+    if raw and not raw.endswith(b"\n"):
+        raise ReadTraceError("strace record is truncated")
+    if b"\x00" in raw:
+        raise ReadTraceError("strace record contains NUL")
+    pending: set[tuple[int, bytes]] = set()
+    count = 0
+    byte_count = 0
+    for line_number, line in enumerate(raw.splitlines(), 1):
+        if not line or len(line) > 1024 * 1024:
+            raise ReadTraceError(f"strace line {line_number}: invalid record length")
+        match = _LINUX_COMPLETE.fullmatch(line)
+        if match is not None:
+            result = int(match.group("result"))
+            _validate_result_suffix(result, match.group("error"), line_number)
+            count += 1
+            byte_count += max(0, result)
+            continue
+        match = _LINUX_UNFINISHED.fullmatch(line)
+        if match is not None:
+            key = (int(match.group("pid")), match.group("name"))
+            if key in pending:
+                raise ReadTraceError(f"strace line {line_number}: duplicate unfinished call")
+            pending.add(key)
+            continue
+        match = _LINUX_RESUMED.fullmatch(line)
+        if match is not None:
+            key = (int(match.group("pid")), match.group("name"))
+            if key not in pending:
+                raise ReadTraceError(f"strace line {line_number}: orphan resumed call")
+            pending.remove(key)
+            result = int(match.group("result"))
+            _validate_result_suffix(result, match.group("error"), line_number)
+            count += 1
+            byte_count += max(0, result)
+            continue
+        raise ReadTraceError(f"strace line {line_number}: unknown or trailing record")
+    if pending:
+        raise ReadTraceError("strace record ends with unfinished calls")
+    return ReadTraceCounts(count, byte_count)
+
+
+def parse_darwin_dtrace(raw: bytes) -> ReadTraceCounts:
+    if raw and not raw.endswith(b"\n"):
+        raise ReadTraceError("dtrace record is truncated")
+    if b"\x00" in raw:
+        raise ReadTraceError("dtrace record contains NUL")
+    count = 0
+    byte_count = 0
+    for line_number, line in enumerate(raw.splitlines(), 1):
+        if not line or len(line) > 512:
+            raise ReadTraceError(f"dtrace line {line_number}: invalid record length")
+        match = _DARWIN_RECORD.fullmatch(line)
+        if match is None:
+            raise ReadTraceError(f"dtrace line {line_number}: unknown or trailing record")
+        result = int(match.group("result"))
+        count += 1
+        byte_count += max(0, result)
+    return ReadTraceCounts(count, byte_count)
+
+
+def parse_read_trace(raw: bytes, method: str) -> ReadTraceCounts:
+    if method == DARWIN_METHOD:
+        return parse_darwin_dtrace(raw)
+    if method == LINUX_METHOD:
+        return parse_linux_strace(raw)
+    raise ReadTraceError("unknown read trace method")
+
+
+def receipt_cid(receipt: dict[str, Any]) -> str:
+    body = dict(receipt)
+    value = body.pop("measurement_receipt_cid", None)
+    if value is not None and not is_sha256(value):
+        raise ReadTraceError("measurement receipt CID is malformed")
+    return sha256_bytes(
+        b"cheng.semantic_snapshot.read_trace_receipt\x00" + canonical_json_bytes(body))
+
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--method", choices=METHODS, required=True)
+    parser.add_argument("trace", type=Path)
+    args = parser.parse_args()
+    raw = args.trace.read_bytes()
+    counts = parse_read_trace(raw, args.method)
+    sys.stdout.buffer.write(canonical_json_bytes({
+        "schema": "cheng.semantic_snapshot.read_trace_counts",
+        "method": args.method,
+        "raw_sha256": sha256_bytes(raw),
+        "raw_bytes": len(raw),
+        "read_syscalls": counts.read_syscalls,
+        "read_bytes": counts.read_bytes,
+    }))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

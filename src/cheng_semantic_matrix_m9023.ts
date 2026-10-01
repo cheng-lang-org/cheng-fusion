@@ -203,18 +203,10 @@ function deepFreeze<T>(value: T): Readonly<T> {
   return value as Readonly<T>;
 }
 
-function canonicalize(value: unknown): unknown {
-  if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map(canonicalize);
-  const record = value as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
-  for (const key of Object.keys(record).sort()) out[key] = canonicalize(record[key]);
-  return out;
-}
-
-export function canonicalJson(value: unknown): string {
-  return JSON.stringify(canonicalize(value));
-}
+// canonicalJson 实现外迁至 cheng_canonical_json.ts(单一权威副本), 此处 import 后原样
+// re-export: 本模块自身与全部旧消费方继续可用。参见新模块头注的热路径切边理由。
+import {canonicalJson} from "./cheng_canonical_json.ts";
+export {canonicalJson};
 
 export function sha256(value: string | Buffer): string {
   const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");

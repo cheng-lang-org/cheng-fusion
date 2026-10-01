@@ -1,0 +1,2296 @@
+import std/result
+import std/os
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/model_executor as exec
+import cheng/inference/device as dev
+import cheng/inference/weight_store as ws
+
+const
+    SafetensorsValid = 0
+    SafetensorsDtypeDrift = 1
+    SafetensorsShapeDrift = 2
+    SafetensorsByteCountDrift = 3
+    SafetensorsMissingTensor = 4
+    SafetensorsOverlap = 5
+    HfIndexValid = 0
+    HfIndexMissingTensor = 1
+    HfIndexPathTraversal = 2
+    HfIndexAbsolutePath = 3
+    HfIndexBadSuffix = 4
+
+fn writeU64LE(buf: var rawbytes.Bytes, offset: int32, value: int64) =
+    rawbytes.BytesSet(buf, offset, int32(value & int64(255)))
+    rawbytes.BytesSet(buf, offset + 1, int32((value >> 8) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 2, int32((value >> 16) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 3, int32((value >> 24) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 4, int32((value >> 32) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 5, int32((value >> 40) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 6, int32((value >> 48) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 7, int32((value >> 56) & int64(255)))
+
+fn safetensorsDtype(dtype: str, drift: bool): str =
+    if drift:
+        return "BF16"
+    if dtype == "fp16":
+        return "F16"
+    if dtype == "bf16":
+        return "BF16"
+    if dtype == "fp8_e4m3":
+        return "F8_E4M3"
+    if dtype == "int8":
+        return "I8"
+    if dtype == "int4":
+        return "U8"
+    return "UNSUPPORTED"
+
+fn safetensorsShapeJson(shape: int32[], drift: bool): str =
+    var parts: str[]
+    for i in 0..<shape.len:
+        var dim = shape[i]
+        if drift && i == 0:
+            dim = dim + 1
+        add(parts, strings.IntToStr(dim))
+    return strutil.Join(["[", strutil.Join(parts, ","), "]"], "")
+
+fn safetensorsTotalDataBytes(graph: mg.ModelGraph): int64 =
+    var total: int64
+    for i in 0..<graph.weights.len:
+        total = total + graph.weights[i].sizeBytes
+    return total
+
+fn safetensorsHeader(graph: mg.ModelGraph, mode: int32): str =
+    var parts: str[]
+    var cursor: int64
+    for i in 0..<graph.weights.len:
+        if mode == SafetensorsMissingTensor && i == graph.weights.len - 1:
+            continue
+        var start = cursor
+        var end = cursor + graph.weights[i].sizeBytes
+        if mode == SafetensorsOverlap && i == 1:
+            start = int64(0)
+            end = graph.weights[i].sizeBytes
+        if mode == SafetensorsByteCountDrift && i == 0:
+            end = end + int64(1)
+        let dtypeText = safetensorsDtype(graph.weights[i].dtype, mode == SafetensorsDtypeDrift && i == 0)
+        let shapeText = safetensorsShapeJson(graph.weights[i].shape, mode == SafetensorsShapeDrift && i == 0)
+        add(parts, strutil.Join([
+            "\"",
+            graph.weights[i].tensorName,
+            "\":{\"dtype\":\"",
+            dtypeText,
+            "\",\"shape\":",
+            shapeText,
+            ",\"data_offsets\":[",
+            strings.Int64ToStr(start),
+            ",",
+            strings.Int64ToStr(end),
+            "]}"
+        ], ""))
+        cursor = cursor + graph.weights[i].sizeBytes
+    return strutil.Join(["{", strutil.Join(parts, ","), "}"], "")
+
+fn safetensorsBytesFromHeader(header: str, dataBytes: int32): rawbytes.Bytes =
+    let headerBytes = rawbytes.BytesFromString(header)
+    let outLen = 8 + rawbytes.BytesLen(headerBytes) + dataBytes
+    var out = rawbytes.BytesAlloc(outLen)
+    writeU64LE(out, 0, int64(rawbytes.BytesLen(headerBytes)))
+    rawbytes.BytesCopyInto(out, 8, headerBytes)
+    let dataBase = 8 + rawbytes.BytesLen(headerBytes)
+    for i in 0..<dataBytes:
+        rawbytes.BytesSet(out, dataBase + i, (i * 17 + 3) & 255)
+    return out
+
+fn safetensorsBytes(graph: mg.ModelGraph, mode: int32): rawbytes.Bytes =
+    let header = safetensorsHeader(graph, mode)
+    return safetensorsBytesFromHeader(header, int32(safetensorsTotalDataBytes(graph)))
+
+fn writeF16LE(buf: var rawbytes.Bytes, offset: int32, raw: int32) =
+    rawbytes.BytesSet(buf, offset, raw & 255)
+    rawbytes.BytesSet(buf, offset + 1, (raw >> 8) & 255)
+
+fn safetensorsF16RawAt(elementIndex: int32): int32 =
+    let slot = elementIndex % 6
+    if slot == 0:
+        return 0x3c00
+    if slot == 1:
+        return 0xbc00
+    if slot == 2:
+        return 0x3800
+    if slot == 3:
+        return 0x0000
+    if slot == 4:
+        return 0x4000
+    return 0xc000
+
+fn safetensorsNumericBytes(graph: mg.ModelGraph): rawbytes.Bytes =
+    let header = safetensorsHeader(graph, SafetensorsValid)
+    let headerBytes = rawbytes.BytesFromString(header)
+    let totalData = int32(safetensorsTotalDataBytes(graph))
+    let outLen = 8 + rawbytes.BytesLen(headerBytes) + totalData
+    var out = rawbytes.BytesAlloc(outLen)
+    writeU64LE(out, 0, int64(rawbytes.BytesLen(headerBytes)))
+    rawbytes.BytesCopyInto(out, 8, headerBytes)
+    let dataBase = 8 + rawbytes.BytesLen(headerBytes)
+    var cursor: int32
+    var elementOrdinal: int32
+    for i in 0..<graph.weights.len:
+        let tensorBytes = int32(graph.weights[i].sizeBytes)
+        var j: int32
+        while j < tensorBytes:
+            writeF16LE(out, dataBase + cursor + j, safetensorsF16RawAt(elementOrdinal))
+            j = j + 2
+            elementOrdinal = elementOrdinal + 1
+        cursor = cursor + tensorBytes
+    return out
+
+fn safetensorsElementStart(graph: mg.ModelGraph, weightStart: int32): int32 =
+    var total: int32
+    for i in 0..<weightStart:
+        total = total + int32(graph.weights[i].sizeBytes / int64(2))
+    return total
+
+fn safetensorsHeaderRange(graph: mg.ModelGraph, weightStart: int32, weightEnd: int32): str =
+    var parts: str[]
+    var cursor: int64
+    for i in weightStart..<weightEnd:
+        let start = cursor
+        let end = cursor + graph.weights[i].sizeBytes
+        let dtypeText = safetensorsDtype(graph.weights[i].dtype, false)
+        let shapeText = safetensorsShapeJson(graph.weights[i].shape, false)
+        add(parts, strutil.Join([
+            "\"",
+            graph.weights[i].tensorName,
+            "\":{\"dtype\":\"",
+            dtypeText,
+            "\",\"shape\":",
+            shapeText,
+            ",\"data_offsets\":[",
+            strings.Int64ToStr(start),
+            ",",
+            strings.Int64ToStr(end),
+            "]}"
+        ], ""))
+        cursor = cursor + graph.weights[i].sizeBytes
+    return strutil.Join(["{", strutil.Join(parts, ","), "}"], "")
+
+fn safetensorsNumericBytesRange(graph: mg.ModelGraph, weightStart: int32, weightEnd: int32): rawbytes.Bytes =
+    let header = safetensorsHeaderRange(graph, weightStart, weightEnd)
+    let headerBytes = rawbytes.BytesFromString(header)
+    var totalData: int32
+    for i in weightStart..<weightEnd:
+        totalData = totalData + int32(graph.weights[i].sizeBytes)
+    let outLen = 8 + rawbytes.BytesLen(headerBytes) + totalData
+    var out = rawbytes.BytesAlloc(outLen)
+    writeU64LE(out, 0, int64(rawbytes.BytesLen(headerBytes)))
+    rawbytes.BytesCopyInto(out, 8, headerBytes)
+    let dataBase = 8 + rawbytes.BytesLen(headerBytes)
+    var cursor: int32
+    var elementOrdinal = safetensorsElementStart(graph, weightStart)
+    for i in weightStart..<weightEnd:
+        let tensorBytes = int32(graph.weights[i].sizeBytes)
+        var j: int32
+        while j < tensorBytes:
+            writeF16LE(out, dataBase + cursor + j, safetensorsF16RawAt(elementOrdinal))
+            j = j + 2
+            elementOrdinal = elementOrdinal + 1
+        cursor = cursor + tensorBytes
+    return out
+
+fn safetensorsQuantFixtureGraph(modelCid: str,
+                                dtype: str,
+                                quantScheme: str,
+                                tensorQuantScheme: str): mg.ModelGraph =
+    var sizeBytes: int64 = int64(4)
+    if dtype == kir.KernelDtypeFp16 || dtype == kir.KernelDtypeBf16:
+        sizeBytes = int64(8)
+    if dtype == kir.KernelDtypeInt4:
+        sizeBytes = int64(2)
+    let tensors = [
+        mg.ModelTensorDesc(name: "quant_hidden", dtype: kir.KernelDtypeFp16, shape: [1, 4], quantScheme: tensorQuantScheme)
+    ]
+    let weights = [
+        mg.ModelWeightShard(modelCid: modelCid, shardCid: "cid:quant:int8", tensorName: "quant.weight", dtype: dtype, quantScheme: quantScheme, shape: [4], sizeBytes: sizeBytes, expectedPayloadHash: int64(0))
+    ]
+    let ops = [
+        mg.ModelGraphOp(opKind: mg.InferenceModelOpMlp, inputNames: ["quant_hidden"], outputName: "quant_out", weightNames: ["quant.weight"], layerIndex: 0, expertId: -1)
+    ]
+    var graph = mg.ModelGraph(
+        schema: mg.InferenceModelGraphSchema,
+        modelCid: modelCid,
+        architecture: "int8_quant_fixture",
+        hiddenSize: 4,
+        attentionHeads: 1,
+        keyValueHeads: 1,
+        headDim: 4,
+        layerCount: 1,
+        expertCount: 1,
+        topK: 1,
+        ropeTheta: 10000.0,
+        tensors: tensors,
+        weights: weights,
+        ops: ops,
+        graphHash: int64(0)
+    )
+    graph.graphHash = mg.ModelGraphHash(graph)
+    return graph
+
+fn safetensorsInt4OddFixtureGraph(modelCid: str): mg.ModelGraph =
+    let tensors = [
+        mg.ModelTensorDesc(name: "quant_hidden", dtype: kir.KernelDtypeFp16, shape: [1, 3], quantScheme: mg.ModelQuantSchemeNone)
+    ]
+    let weights = [
+        mg.ModelWeightShard(modelCid: modelCid, shardCid: "cid:quant:int4:odd", tensorName: "quant.weight", dtype: kir.KernelDtypeInt4, quantScheme: mg.ModelQuantSchemeSymmetricInt4, shape: [3], sizeBytes: int64(2), expectedPayloadHash: int64(0))
+    ]
+    let ops = [
+        mg.ModelGraphOp(opKind: mg.InferenceModelOpMlp, inputNames: ["quant_hidden"], outputName: "quant_out", weightNames: ["quant.weight"], layerIndex: 0, expertId: -1)
+    ]
+    var graph = mg.ModelGraph(
+        schema: mg.InferenceModelGraphSchema,
+        modelCid: modelCid,
+        architecture: "int4_quant_padding_fixture",
+        hiddenSize: 3,
+        attentionHeads: 1,
+        keyValueHeads: 1,
+        headDim: 3,
+        layerCount: 1,
+        expertCount: 1,
+        topK: 1,
+        ropeTheta: 10000.0,
+        tensors: tensors,
+        weights: weights,
+        ops: ops,
+        graphHash: int64(0)
+    )
+    graph.graphHash = mg.ModelGraphHash(graph)
+    return graph
+
+fn safetensorsW4Afp8FixtureGraph(modelCid: str): mg.ModelGraph =
+    let tensors = [
+        mg.ModelTensorDesc(name: "quant_hidden", dtype: kir.KernelDtypeFp16, shape: [1, 4], quantScheme: mg.ModelQuantSchemeNone)
+    ]
+    let weights = [
+        mg.ModelWeightShard(modelCid: modelCid, shardCid: "cid:quant:w4afp8:weight", tensorName: "quant.weight", dtype: kir.KernelDtypeInt8, quantScheme: mg.ModelQuantSchemeW4Afp8, shape: [4], sizeBytes: int64(4), expectedPayloadHash: int64(0)),
+        mg.ModelWeightShard(modelCid: modelCid, shardCid: "cid:quant:w4afp8:scale", tensorName: "quant.weight_scale_inv", dtype: kir.KernelDtypeFp8E4M3, quantScheme: mg.ModelQuantSchemeNone, shape: [4], sizeBytes: int64(4), expectedPayloadHash: int64(0)),
+        mg.ModelWeightShard(modelCid: modelCid, shardCid: "cid:quant:w4afp8:input-scale", tensorName: "quant.input_scale", dtype: kir.KernelDtypeFp8E4M3, quantScheme: mg.ModelQuantSchemeNone, shape: [4], sizeBytes: int64(4), expectedPayloadHash: int64(0))
+    ]
+    let ops = [
+        mg.ModelGraphOp(opKind: mg.InferenceModelOpMlp, inputNames: ["quant_hidden"], outputName: "quant_out", weightNames: ["quant.weight"], layerIndex: 0, expertId: -1)
+    ]
+    var graph = mg.ModelGraph(
+        schema: mg.InferenceModelGraphSchema,
+        modelCid: modelCid,
+        architecture: "w4afp8_quant_fixture",
+        hiddenSize: 4,
+        attentionHeads: 1,
+        keyValueHeads: 1,
+        headDim: 4,
+        layerCount: 1,
+        expertCount: 1,
+        topK: 1,
+        ropeTheta: 10000.0,
+        tensors: tensors,
+        weights: weights,
+        ops: ops,
+        graphHash: int64(0)
+    )
+    graph.graphHash = mg.ModelGraphHash(graph)
+    return graph
+
+fn safetensorsW4Afp8BadInputScaleFixtureGraph(modelCid: str): mg.ModelGraph =
+    var graph = safetensorsW4Afp8FixtureGraph(modelCid)
+    graph.weights[2].dtype = kir.KernelDtypeFp16
+    graph.weights[2].sizeBytes = int64(8)
+    graph.graphHash = mg.ModelGraphHash(graph)
+    return graph
+
+fn safetensorsW4Afp8LinearKernelFixtureGraph(modelCid: str): mg.ModelGraph =
+    let tensors = [
+        mg.ModelTensorDesc(name: "linear_hidden", dtype: kir.KernelDtypeFp16, shape: [2, 3], quantScheme: mg.ModelQuantSchemeNone)
+    ]
+    let weights = [
+        mg.ModelWeightShard(modelCid: modelCid, shardCid: "cid:linear:w4afp8:weight", tensorName: "linear.weight", dtype: kir.KernelDtypeInt8, quantScheme: mg.ModelQuantSchemeW4Afp8, shape: [2, 3], sizeBytes: int64(6), expectedPayloadHash: int64(0)),
+        mg.ModelWeightShard(modelCid: modelCid, shardCid: "cid:linear:w4afp8:scale", tensorName: "linear.weight_scale_inv", dtype: kir.KernelDtypeFp8E4M3, quantScheme: mg.ModelQuantSchemeNone, shape: [2], sizeBytes: int64(2), expectedPayloadHash: int64(0)),
+        mg.ModelWeightShard(modelCid: modelCid, shardCid: "cid:linear:w4afp8:input-scale", tensorName: "linear.input_scale", dtype: kir.KernelDtypeFp8E4M3, quantScheme: mg.ModelQuantSchemeNone, shape: [1], sizeBytes: int64(1), expectedPayloadHash: int64(0))
+    ]
+    let ops = [
+        mg.ModelGraphOp(opKind: mg.InferenceModelOpMlp, inputNames: ["linear_hidden"], outputName: "linear_out", weightNames: ["linear.weight"], layerIndex: 0, expertId: -1)
+    ]
+    var graph = mg.ModelGraph(
+        schema: mg.InferenceModelGraphSchema,
+        modelCid: modelCid,
+        architecture: "w4afp8_linear_kernel_fixture",
+        hiddenSize: 3,
+        attentionHeads: 1,
+        keyValueHeads: 1,
+        headDim: 3,
+        layerCount: 1,
+        expertCount: 1,
+        topK: 1,
+        ropeTheta: 10000.0,
+        tensors: tensors,
+        weights: weights,
+        ops: ops,
+        graphHash: int64(0)
+    )
+    graph.graphHash = mg.ModelGraphHash(graph)
+    return graph
+
+fn safetensorsInt8QuantBytes(graph: mg.ModelGraph): rawbytes.Bytes =
+    let header = safetensorsHeader(graph, SafetensorsValid)
+    let headerBytes = rawbytes.BytesFromString(header)
+    let outLen = 8 + rawbytes.BytesLen(headerBytes) + int32(safetensorsTotalDataBytes(graph))
+    var out = rawbytes.BytesAlloc(outLen)
+    writeU64LE(out, 0, int64(rawbytes.BytesLen(headerBytes)))
+    rawbytes.BytesCopyInto(out, 8, headerBytes)
+    let dataBase = 8 + rawbytes.BytesLen(headerBytes)
+    rawbytes.BytesSet(out, dataBase, 0)
+    rawbytes.BytesSet(out, dataBase + 1, 1)
+    rawbytes.BytesSet(out, dataBase + 2, 255)
+    rawbytes.BytesSet(out, dataBase + 3, 127)
+    return out
+
+fn safetensorsInt4QuantBytes(graph: mg.ModelGraph): rawbytes.Bytes =
+    let header = safetensorsHeader(graph, SafetensorsValid)
+    let headerBytes = rawbytes.BytesFromString(header)
+    let outLen = 8 + rawbytes.BytesLen(headerBytes) + int32(safetensorsTotalDataBytes(graph))
+    var out = rawbytes.BytesAlloc(outLen)
+    writeU64LE(out, 0, int64(rawbytes.BytesLen(headerBytes)))
+    rawbytes.BytesCopyInto(out, 8, headerBytes)
+    let dataBase = 8 + rawbytes.BytesLen(headerBytes)
+    rawbytes.BytesSet(out, dataBase, 0x10)
+    rawbytes.BytesSet(out, dataBase + 1, 0x7f)
+    return out
+
+fn safetensorsW4Afp8Bytes(graph: mg.ModelGraph): rawbytes.Bytes =
+    let header = safetensorsHeader(graph, SafetensorsValid)
+    let headerBytes = rawbytes.BytesFromString(header)
+    let outLen = 8 + rawbytes.BytesLen(headerBytes) + int32(safetensorsTotalDataBytes(graph))
+    var out = rawbytes.BytesAlloc(outLen)
+    writeU64LE(out, 0, int64(rawbytes.BytesLen(headerBytes)))
+    rawbytes.BytesCopyInto(out, 8, headerBytes)
+    let dataBase = 8 + rawbytes.BytesLen(headerBytes)
+    rawbytes.BytesSet(out, dataBase, 0)
+    rawbytes.BytesSet(out, dataBase + 1, 1)
+    rawbytes.BytesSet(out, dataBase + 2, 255)
+    rawbytes.BytesSet(out, dataBase + 3, 127)
+    rawbytes.BytesSet(out, dataBase + 4, 56)
+    rawbytes.BytesSet(out, dataBase + 5, 184)
+    rawbytes.BytesSet(out, dataBase + 6, 48)
+    rawbytes.BytesSet(out, dataBase + 7, 64)
+    rawbytes.BytesSet(out, dataBase + 8, 56)
+    rawbytes.BytesSet(out, dataBase + 9, 48)
+    rawbytes.BytesSet(out, dataBase + 10, 64)
+    rawbytes.BytesSet(out, dataBase + 11, 184)
+    return out
+
+fn safetensorsW4Afp8LinearKernelBytes(graph: mg.ModelGraph): rawbytes.Bytes =
+    let header = safetensorsHeader(graph, SafetensorsValid)
+    let headerBytes = rawbytes.BytesFromString(header)
+    let outLen = 8 + rawbytes.BytesLen(headerBytes) + int32(safetensorsTotalDataBytes(graph))
+    var out = rawbytes.BytesAlloc(outLen)
+    writeU64LE(out, 0, int64(rawbytes.BytesLen(headerBytes)))
+    rawbytes.BytesCopyInto(out, 8, headerBytes)
+    let dataBase = 8 + rawbytes.BytesLen(headerBytes)
+    rawbytes.BytesSet(out, dataBase, 1)
+    rawbytes.BytesSet(out, dataBase + 1, 254)
+    rawbytes.BytesSet(out, dataBase + 2, 3)
+    rawbytes.BytesSet(out, dataBase + 3, 4)
+    rawbytes.BytesSet(out, dataBase + 4, 0)
+    rawbytes.BytesSet(out, dataBase + 5, 255)
+    rawbytes.BytesSet(out, dataBase + 6, 56)
+    rawbytes.BytesSet(out, dataBase + 7, 64)
+    rawbytes.BytesSet(out, dataBase + 8, 56)
+    return out
+
+fn safetensorsInt4OddPaddingBytes(graph: mg.ModelGraph, badPadding: bool): rawbytes.Bytes =
+    let header = safetensorsHeader(graph, SafetensorsValid)
+    let headerBytes = rawbytes.BytesFromString(header)
+    let outLen = 8 + rawbytes.BytesLen(headerBytes) + int32(safetensorsTotalDataBytes(graph))
+    var out = rawbytes.BytesAlloc(outLen)
+    writeU64LE(out, 0, int64(rawbytes.BytesLen(headerBytes)))
+    rawbytes.BytesCopyInto(out, 8, headerBytes)
+    let dataBase = 8 + rawbytes.BytesLen(headerBytes)
+    rawbytes.BytesSet(out, dataBase, 0x10)
+    if badPadding:
+        rawbytes.BytesSet(out, dataBase + 1, 0x1f)
+    else:
+        rawbytes.BytesSet(out, dataBase + 1, 0x0f)
+    return out
+
+fn peersForGraph(graph: mg.ModelGraph): str[] =
+    var peers: str[]
+    for i in 0..<graph.weights.len:
+        add(peers, strutil.Join(["peer:", strings.IntToStr(i)], ""))
+    return peers
+
+fn safetensorsShardIndexForGraph(graph: mg.ModelGraph,
+                                 path0: str,
+                                 path1: str,
+                                 splitIndex: int32): ws.WeightSafetensorsShardIndex =
+    var entries: ws.WeightSafetensorsShardIndexEntry[]
+    for i in 0..<graph.weights.len:
+        var path = path1
+        if i < splitIndex:
+            path = path0
+        add(entries, ws.WeightSafetensorsShardIndexEntry(
+            modelCid: graph.weights[i].modelCid,
+            graphHash: graph.graphHash,
+            tensorName: graph.weights[i].tensorName,
+            shardCid: graph.weights[i].shardCid,
+            dtype: graph.weights[i].dtype,
+            quantScheme: graph.weights[i].quantScheme,
+            sizeBytes: graph.weights[i].sizeBytes,
+            filePath: path,
+            peerId: strutil.Join(["peer:", strings.IntToStr(i)], ""),
+            tensorScale: 1000
+        ))
+    return ws.WeightSafetensorsShardIndexBuild(graph.modelCid, graph.graphHash, entries)
+
+fn safetensorsHfIndexShardName(mode: int32, ordinal: int32, file0: str, file1: str): str =
+    if mode == HfIndexPathTraversal && ordinal == 0:
+        return "../evil.safetensors"
+    if mode == HfIndexAbsolutePath && ordinal == 0:
+        return "/tmp/evil.safetensors"
+    if mode == HfIndexBadSuffix && ordinal == 0:
+        return "model.bin"
+    if ordinal == 0:
+        return file0
+    return file1
+
+fn safetensorsHfIndexJson(graph: mg.ModelGraph,
+                          splitIndex: int32,
+                          file0: str,
+                          file1: str,
+                          mode: int32): str =
+    var parts: str[]
+    for i in 0..<graph.weights.len:
+        if mode == HfIndexMissingTensor && i == graph.weights.len - 1:
+            continue
+        var ordinal: int32 = 1
+        if i < splitIndex:
+            ordinal = 0
+        let fileName = safetensorsHfIndexShardName(mode, ordinal, file0, file1)
+        add(parts, strutil.Join([
+            "\"",
+            graph.weights[i].tensorName,
+            "\":\"",
+            fileName,
+            "\""
+        ], ""))
+    return strutil.Join([
+        "{\"metadata\":{\"total_size\":",
+        strings.Int64ToStr(safetensorsTotalDataBytes(graph)),
+        "},\"weight_map\":{",
+        strutil.Join(parts, ","),
+        "}}"
+    ], "")
+
+fn safetensorsPayloadHashesForGraph(graph: mg.ModelGraph,
+                                    store: ws.WeightTensorStore): Result[int64[]] =
+    if store.payloads.len != graph.weights.len:
+        return Err[int64[]]("weight safetensors manifest smoke: payload hash count")
+    var hashes: int64[]
+    for i in 0..<graph.weights.len:
+        if store.payloads[i].tensorName != graph.weights[i].tensorName:
+            return Err[int64[]]("weight safetensors manifest smoke: payload hash order")
+        add(hashes, store.payloads[i].payloadHash)
+    return Ok[int64[]](hashes)
+
+fn factsContain(facts: str[], needle: str): bool =
+    for i in 0..<facts.len:
+        if strutil.Contains(facts[i], needle):
+            return true
+    return false
+
+fn smokeTensor(shape: int32[], scale: int32, data: int32[]): infer.TensorQ =
+    var out: infer.TensorQ
+    let ok = infer.TensorFromDataFill(out, shape, scale, data)
+    assert(IsOk(ok), " weight safetensors manifest smoke: tensor")
+    return out
+
+fn smokePackedInt4(shape: int32[], scale: int32, values: int32[]): kir.KernelPackedInt4Tensor =
+    let countRes = infer.TensorElementCount(shape)
+    assert(IsOk(countRes) && Value(countRes) == values.len,
+           " weight safetensors manifest smoke: packed int4 count")
+    var bytes = rawbytes.BytesAlloc(values.len / 2 + values.len % 2)
+    for i in 0..<values.len:
+        assert(values[i] >= -8 && values[i] <= 7,
+               " weight safetensors manifest smoke: packed int4 range")
+        var nibble = values[i]
+        if nibble < 0:
+            nibble = nibble + 16
+        let byteIndex = i / 2
+        let oldByte = rawbytes.BytesGet(bytes, byteIndex)
+        if i % 2 == 0:
+            rawbytes.BytesSet(bytes, byteIndex, (oldByte & 240) | (nibble & 15))
+        else:
+            rawbytes.BytesSet(bytes, byteIndex, (oldByte & 15) | ((nibble & 15) << 4))
+    let packed = kir.KernelPackedInt4Tensor(shape: shape, scale: scale, packed: bytes)
+    assert(IsOk(kir.KernelIrPackedInt4TensorValidate(packed)),
+           " weight safetensors manifest smoke: packed int4 validate")
+    return packed
+
+fn smokeRawBytes(values: int32[]): rawbytes.Bytes =
+    var out = rawbytes.BytesAlloc(values.len)
+    for i in 0..<values.len:
+        assert(values[i] >= 0 && values[i] <= 255,
+               " weight safetensors manifest smoke: raw byte range")
+        rawbytes.BytesSet(out, i, values[i])
+    return out
+
+fn main(): int32 =
+    let graph = mg.ModelGraphBuildTinyGlmMoeFixture("cid:model:safetensors-fixture")
+    let validBytes = safetensorsBytes(graph, SafetensorsValid)
+    let valid = ws.WeightSafetensorsValidateGraphFile(validBytes, graph)
+    assert(IsOk(valid), " weight safetensors manifest smoke: valid file")
+    let manifest = Value(valid)
+    assert(manifest.schema == "cheng.inference.weight_safetensors_manifest.v1",
+           " weight safetensors manifest smoke: schema")
+    assert(manifest.headerHash > int64(0),
+           " weight safetensors manifest smoke: header hash")
+    assert(manifest.tensors.len == graph.weights.len,
+           " weight safetensors manifest smoke: tensor count")
+    assert(manifest.tensors[0].tensorName == "embedding.weight",
+           " weight safetensors manifest smoke: first tensor")
+    assert(manifest.tensors[0].byteCount == graph.weights[0].sizeBytes,
+           " weight safetensors manifest smoke: byte count")
+
+    let path = strutil.Join([
+        "/tmp/cheng_weight_safetensors_manifest_",
+        strings.Int64ToStr(graph.graphHash),
+        ".safetensors"
+    ], "")
+    if os.FileExists(path):
+        assert(os.RemoveFile(path), " weight safetensors manifest smoke: remove old file")
+    var fileBytes = validBytes
+    let writeOk = os.WriteFileBytesResult(path, fileBytes)
+    assert(IsOk(writeOk), " weight safetensors manifest smoke: write file")
+    assert(IsOk(ws.WeightSafetensorsValidateGraphFilePath(path, graph)),
+           " weight safetensors manifest smoke: path validation")
+    let prefix8 = os.ReadFilePrefixBytesResult(path, 8)
+    assert(IsOk(prefix8) && rawbytes.BytesLen(Value(prefix8)) == 8,
+           " weight safetensors manifest smoke: prefix read length")
+    let prefixWhole = os.ReadFilePrefixBytesResult(path, rawbytes.BytesLen(validBytes) + 64)
+    assert(IsOk(prefixWhole) && rawbytes.BytesLen(Value(prefixWhole)) == rawbytes.BytesLen(validBytes),
+           " weight safetensors manifest smoke: prefix read clipped to file")
+    assert(IsErr(os.ReadFilePrefixBytesResult(path, 0)),
+           " weight safetensors manifest smoke: prefix read max hard fail")
+    let range8 = os.ReadFileRangeBytesResult(path, 8, 7)
+    assert(IsOk(range8) && rawbytes.BytesLen(Value(range8)) == 7 &&
+           rawbytes.BytesGet(Value(range8), 0) == rawbytes.BytesGet(validBytes, 8),
+           " weight safetensors manifest smoke: range read offset")
+    assert(IsErr(os.ReadFileRangeBytesResult(path, int64(rawbytes.BytesLen(validBytes)) - int64(3), 4)),
+           " weight safetensors manifest smoke: range read beyond file hard fail")
+    let headerPathManifest = ws.WeightSafetensorsValidateGraphFileHeaderPath(path, graph)
+    assert(IsOk(headerPathManifest),
+           " weight safetensors manifest smoke: header path validation")
+    assert(Value(headerPathManifest).headerHash == manifest.headerHash &&
+           Value(headerPathManifest).tensors.len == graph.weights.len,
+           " weight safetensors manifest smoke: header path manifest")
+
+    assert(IsErr(ws.WeightSafetensorsValidateGraphFile(safetensorsBytes(graph, SafetensorsDtypeDrift), graph)),
+           " weight safetensors manifest smoke: dtype drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsValidateGraphFile(safetensorsBytes(graph, SafetensorsShapeDrift), graph)),
+           " weight safetensors manifest smoke: shape drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsValidateGraphFile(safetensorsBytes(graph, SafetensorsByteCountDrift), graph)),
+           " weight safetensors manifest smoke: byte count drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsValidateGraphFile(safetensorsBytes(graph, SafetensorsMissingTensor), graph)),
+           " weight safetensors manifest smoke: missing tensor hard fail")
+    assert(IsErr(ws.WeightSafetensorsValidateGraphFile(safetensorsBytes(graph, SafetensorsOverlap), graph)),
+           " weight safetensors manifest smoke: overlap hard fail")
+
+    let truncated = rawbytes.BytesSlice(validBytes, 0, rawbytes.BytesLen(validBytes) - 1)
+    assert(IsErr(ws.WeightSafetensorsValidateGraphFile(truncated, graph)),
+           " weight safetensors manifest smoke: truncated file hard fail")
+
+    let duplicateHeader = strutil.Join([
+        "{\"embedding.weight\":{\"dtype\":\"F16\",\"shape\":[8,4],\"data_offsets\":[0,64]},",
+        "\"embedding.weight\":{\"dtype\":\"F16\",\"shape\":[8,4],\"data_offsets\":[64,128]}}"
+    ], "")
+    let duplicateBytes = safetensorsBytesFromHeader(duplicateHeader, int32(128))
+    assert(IsErr(ws.WeightSafetensorsValidateGraphFile(duplicateBytes, graph)),
+           " weight safetensors manifest smoke: duplicate tensor hard fail")
+
+    let numericBytes = safetensorsNumericBytes(graph)
+    let peerIds = peersForGraph(graph)
+    let loaded = ws.WeightSafetensorsLoadGraphFile(numericBytes, graph, peerIds, 1000)
+    assert(IsOk(loaded), " weight safetensors manifest smoke: load numeric f16")
+    let loadResult = Value(loaded)
+    assert(loadResult.manifest.tensors.len == graph.weights.len,
+           " weight safetensors manifest smoke: load manifest")
+    assert(IsOk(ws.WeightTensorValidateStore(loadResult.store, loadResult.bindings, graph)),
+           " weight safetensors manifest smoke: loaded store validates")
+    assert(loadResult.store.payloads.len == graph.weights.len,
+           " weight safetensors manifest smoke: loaded payload count")
+    assert(loadResult.store.payloads[0].tensor.scale == 1000,
+           " weight safetensors manifest smoke: loaded tensor scale")
+    assert(loadResult.store.payloads[0].tensor.data[0] == 1000,
+           " weight safetensors manifest smoke: f16 one")
+    assert(loadResult.store.payloads[0].tensor.data[1] == -1000,
+           " weight safetensors manifest smoke: f16 negative one")
+    assert(loadResult.store.payloads[0].tensor.data[2] == 500,
+           " weight safetensors manifest smoke: f16 half")
+    assert(loadResult.store.payloads[0].tensor.data[3] == 0,
+           " weight safetensors manifest smoke: f16 zero")
+    assert(loadResult.store.payloads[0].tensor.data[4] == 2000,
+           " weight safetensors manifest smoke: f16 two")
+    assert(loadResult.store.payloads[0].tensor.data[5] == -2000,
+           " weight safetensors manifest smoke: f16 negative two")
+    let expectedPayloadHashes = safetensorsPayloadHashesForGraph(graph, loadResult.store)
+    assert(IsOk(expectedPayloadHashes),
+           " weight safetensors manifest smoke: expected payload hashes")
+    let boundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(graph, Value(expectedPayloadHashes))
+    assert(IsOk(boundGraphRes),
+           " weight safetensors manifest smoke: bind expected payload hashes")
+    let boundGraph = Value(boundGraphRes)
+    assert(IsOk(mg.ModelGraphValidate(graph)),
+           " weight safetensors manifest smoke: bind does not mutate source graph")
+    let boundLoaded = ws.WeightSafetensorsLoadGraphFile(numericBytes, boundGraph, peerIds, 1000)
+    assert(IsOk(boundLoaded),
+           " weight safetensors manifest smoke: bound graph load")
+    assert(Value(boundLoaded).store.storeHash == loadResult.store.storeHash,
+           " weight safetensors manifest smoke: bound graph store hash")
+    var payloadDriftBytes = rawbytes.BytesSlice(numericBytes, 0, rawbytes.BytesLen(numericBytes))
+    let payloadDriftHeaderLen = ws.WeightSafetensorsHeaderLength(payloadDriftBytes)
+    assert(IsOk(payloadDriftHeaderLen),
+           " weight safetensors manifest smoke: payload drift header")
+    rawbytes.BytesSet(payloadDriftBytes, 8 + Value(payloadDriftHeaderLen), 1)
+    assert(IsErr(ws.WeightSafetensorsLoadGraphFile(payloadDriftBytes, boundGraph, peerIds, 1000)),
+           " weight safetensors manifest smoke: expected payload hash drift hard fail")
+    let bf16One = ws.WeightSafetensorsDecodeBf16Scaled(0x3f80, 1000)
+    assert(IsOk(bf16One) && Value(bf16One) == 1000,
+           " weight safetensors manifest smoke: bf16 one")
+    let bf16NegativeOne = ws.WeightSafetensorsDecodeBf16Scaled(0xbf80, 1000)
+    assert(IsOk(bf16NegativeOne) && Value(bf16NegativeOne) == -1000,
+           " weight safetensors manifest smoke: bf16 negative one")
+    let i8NegativeOne = ws.WeightSafetensorsDecodeI8Scaled(255, 1000)
+    assert(IsOk(i8NegativeOne) && Value(i8NegativeOne) == -1000,
+           " weight safetensors manifest smoke: i8 negative one")
+    let i8Max = ws.WeightSafetensorsDecodeI8Scaled(127, 10)
+    assert(IsOk(i8Max) && Value(i8Max) == 1270,
+           " weight safetensors manifest smoke: i8 max")
+    let i4NegativeOne = ws.WeightSafetensorsDecodeI4Scaled(15, 1000)
+    assert(IsOk(i4NegativeOne) && Value(i4NegativeOne) == -1000,
+           " weight safetensors manifest smoke: i4 negative one")
+    let i4Max = ws.WeightSafetensorsDecodeI4Scaled(7, 10)
+    assert(IsOk(i4Max) && Value(i4Max) == 70,
+           " weight safetensors manifest smoke: i4 max")
+    let fp8One = ws.WeightSafetensorsDecodeFp8E4M3Scaled(0x38, 1000)
+    assert(IsOk(fp8One) && Value(fp8One) == 1000,
+           " weight safetensors manifest smoke: fp8 e4m3 one")
+    let fp8NegativeOne = ws.WeightSafetensorsDecodeFp8E4M3Scaled(0xb8, 1000)
+    assert(IsOk(fp8NegativeOne) && Value(fp8NegativeOne) == -1000,
+           " weight safetensors manifest smoke: fp8 e4m3 negative one")
+    let fp8Half = ws.WeightSafetensorsDecodeFp8E4M3Scaled(0x30, 1000)
+    assert(IsOk(fp8Half) && Value(fp8Half) == 500,
+           " weight safetensors manifest smoke: fp8 e4m3 half")
+    let fp8Two = ws.WeightSafetensorsDecodeFp8E4M3Scaled(0x40, 1000)
+    assert(IsOk(fp8Two) && Value(fp8Two) == 2000,
+           " weight safetensors manifest smoke: fp8 e4m3 two")
+    let fp8Subnormal = ws.WeightSafetensorsDecodeFp8E4M3Scaled(0x01, 512000)
+    assert(IsOk(fp8Subnormal) && Value(fp8Subnormal) == 1000,
+           " weight safetensors manifest smoke: fp8 e4m3 subnormal")
+
+    let quantGraph = safetensorsQuantFixtureGraph(
+        "cid:model:safetensors-int8-quant",
+        kir.KernelDtypeInt8,
+        mg.ModelQuantSchemeSymmetricInt8,
+        mg.ModelQuantSchemeNone
+    )
+    let quantBytes = safetensorsInt8QuantBytes(quantGraph)
+    let quantPeers = peersForGraph(quantGraph)
+    let quantLoaded = ws.WeightSafetensorsLoadGraphFile(quantBytes, quantGraph, quantPeers, 10)
+    assert(IsOk(quantLoaded),
+           " weight safetensors manifest smoke: int8 symmetric load")
+    let quantResult = Value(quantLoaded)
+    assert(quantResult.store.payloads.len == 1 &&
+           quantResult.store.payloads[0].dtype == kir.KernelDtypeInt8 &&
+           quantResult.store.payloads[0].quantScheme == mg.ModelQuantSchemeSymmetricInt8,
+           " weight safetensors manifest smoke: int8 symmetric identity")
+    assert(quantResult.store.payloads[0].tensor.data[0] == 0 &&
+           quantResult.store.payloads[0].tensor.data[1] == 10 &&
+           quantResult.store.payloads[0].tensor.data[2] == -10 &&
+           quantResult.store.payloads[0].tensor.data[3] == 1270,
+           " weight safetensors manifest smoke: int8 symmetric values")
+    let quantPayloadHashes = safetensorsPayloadHashesForGraph(quantGraph, quantResult.store)
+    assert(IsOk(quantPayloadHashes),
+           " weight safetensors manifest smoke: int8 payload hash list")
+    let quantBoundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(quantGraph, Value(quantPayloadHashes))
+    assert(IsOk(quantBoundGraphRes),
+           " weight safetensors manifest smoke: int8 bind expected payload")
+    let quantBoundGraph = Value(quantBoundGraphRes)
+    assert(IsOk(ws.WeightSafetensorsLoadGraphFile(quantBytes, quantBoundGraph, quantPeers, 10)),
+           " weight safetensors manifest smoke: int8 bound load")
+    var quantDriftBytes = rawbytes.BytesSlice(quantBytes, 0, rawbytes.BytesLen(quantBytes))
+    let quantHeaderLen = ws.WeightSafetensorsHeaderLength(quantDriftBytes)
+    assert(IsOk(quantHeaderLen),
+           " weight safetensors manifest smoke: int8 drift header")
+    rawbytes.BytesSet(quantDriftBytes, 8 + Value(quantHeaderLen) + 1, 2)
+    assert(IsErr(ws.WeightSafetensorsLoadGraphFile(quantDriftBytes, quantBoundGraph, quantPeers, 10)),
+           " weight safetensors manifest smoke: int8 payload drift hard fail")
+
+    let w4Afp8Graph = safetensorsW4Afp8FixtureGraph("cid:model:safetensors-w4afp8")
+    assert(IsOk(mg.ModelGraphValidate(w4Afp8Graph)),
+           " weight safetensors manifest smoke: w4afp8 graph validate")
+    let w4Afp8Bytes = safetensorsW4Afp8Bytes(w4Afp8Graph)
+    let w4Afp8Peers = peersForGraph(w4Afp8Graph)
+    let w4Afp8Loaded = ws.WeightSafetensorsLoadGraphFile(w4Afp8Bytes, w4Afp8Graph, w4Afp8Peers, 1000)
+    assert(IsOk(w4Afp8Loaded),
+           " weight safetensors manifest smoke: w4afp8 direct load")
+    let w4Afp8Result = Value(w4Afp8Loaded)
+    assert(w4Afp8Result.store.payloads.len == 3 &&
+           w4Afp8Result.store.payloads[0].dtype == kir.KernelDtypeInt8 &&
+           w4Afp8Result.store.payloads[0].quantScheme == mg.ModelQuantSchemeW4Afp8 &&
+           w4Afp8Result.store.payloads[1].dtype == kir.KernelDtypeFp8E4M3 &&
+           w4Afp8Result.store.payloads[1].quantScheme == mg.ModelQuantSchemeNone &&
+           w4Afp8Result.store.payloads[2].dtype == kir.KernelDtypeFp8E4M3 &&
+           w4Afp8Result.store.payloads[2].quantScheme == mg.ModelQuantSchemeNone,
+           " weight safetensors manifest smoke: w4afp8 payload identity")
+    assert(w4Afp8Result.store.payloads[0].tensor.data[0] == 0 &&
+           w4Afp8Result.store.payloads[0].tensor.data[1] == 1000 &&
+           w4Afp8Result.store.payloads[0].tensor.data[2] == -1000 &&
+           w4Afp8Result.store.payloads[0].tensor.data[3] == 127000 &&
+           w4Afp8Result.store.payloads[1].tensor.data[0] == 1000 &&
+           w4Afp8Result.store.payloads[1].tensor.data[1] == -1000 &&
+           w4Afp8Result.store.payloads[1].tensor.data[2] == 500 &&
+           w4Afp8Result.store.payloads[1].tensor.data[3] == 2000 &&
+           w4Afp8Result.store.payloads[2].tensor.data[0] == 1000 &&
+           w4Afp8Result.store.payloads[2].tensor.data[1] == 500 &&
+           w4Afp8Result.store.payloads[2].tensor.data[2] == 2000 &&
+           w4Afp8Result.store.payloads[2].tensor.data[3] == -1000,
+           " weight safetensors manifest smoke: w4afp8 decoded values")
+    assert(w4Afp8Result.store.payloads[0].hasW4Afp8Raw &&
+           w4Afp8Result.store.payloads[0].w4Afp8RawHash > int64(0) &&
+           rawbytes.BytesLen(w4Afp8Result.store.payloads[0].w4Afp8Raw) == 4 &&
+           rawbytes.BytesGet(w4Afp8Result.store.payloads[0].w4Afp8Raw, 0) == 0 &&
+           rawbytes.BytesGet(w4Afp8Result.store.payloads[0].w4Afp8Raw, 1) == 1 &&
+           rawbytes.BytesGet(w4Afp8Result.store.payloads[0].w4Afp8Raw, 2) == 255 &&
+           rawbytes.BytesGet(w4Afp8Result.store.payloads[0].w4Afp8Raw, 3) == 127,
+           " weight safetensors manifest smoke: w4afp8 raw payload")
+    let w4Afp8RawHash = ws.WeightTensorRawBytesHash(w4Afp8Result.store.payloads[0].w4Afp8Raw)
+    assert(IsOk(w4Afp8RawHash) &&
+           Value(w4Afp8RawHash) == w4Afp8Result.store.payloads[0].w4Afp8RawHash,
+           " weight safetensors manifest smoke: w4afp8 raw hash")
+    let w4Afp8Facts = ws.WeightTensorStoreFacts(w4Afp8Result.store)
+    assert(factsContain(w4Afp8Facts, strutil.Join([
+               "weight_tensor_w4afp8_raw=quant.weight:",
+               strings.Int64ToStr(w4Afp8Result.store.payloads[0].w4Afp8RawHash)
+           ], "")),
+           " weight safetensors manifest smoke: w4afp8 raw facts")
+    let w4Afp8PayloadHashes = safetensorsPayloadHashesForGraph(w4Afp8Graph, w4Afp8Result.store)
+    assert(IsOk(w4Afp8PayloadHashes),
+           " weight safetensors manifest smoke: w4afp8 payload hashes")
+    let w4Afp8BoundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(w4Afp8Graph, Value(w4Afp8PayloadHashes))
+    assert(IsOk(w4Afp8BoundGraphRes),
+           " weight safetensors manifest smoke: w4afp8 bind expected payload")
+    let w4Afp8BoundGraph = Value(w4Afp8BoundGraphRes)
+    assert(IsOk(ws.WeightSafetensorsLoadGraphFile(w4Afp8Bytes, w4Afp8BoundGraph, w4Afp8Peers, 1000)),
+           " weight safetensors manifest smoke: w4afp8 bound load")
+    let w4MaterializedPath = strutil.Join([
+        "/tmp/cheng_weight_safetensors_w4afp8_materialized_",
+        strings.Int64ToStr(w4Afp8Result.store.payloads[0].payloadHash),
+        ".cw1"
+    ], "")
+    if os.FileExists(w4MaterializedPath):
+        assert(os.RemoveFile(w4MaterializedPath), " weight safetensors manifest smoke: remove w4 materialized")
+    assert(IsErr(ws.WeightTensorPayloadWriteMaterializedShardFile(w4MaterializedPath, w4Afp8Result.store.payloads[0])),
+           " weight safetensors manifest smoke: w4afp8 materialized hard fail")
+
+    let w4KernelGraph = safetensorsW4Afp8LinearKernelFixtureGraph("cid:model:safetensors-w4afp8-kernel-page")
+    let w4KernelBytes = safetensorsW4Afp8LinearKernelBytes(w4KernelGraph)
+    let w4KernelPath = strutil.Join([
+        "/tmp/cheng_weight_safetensors_w4afp8_kernel_page_",
+        strings.Int64ToStr(w4KernelGraph.graphHash),
+        ".safetensors"
+    ], "")
+    if os.FileExists(w4KernelPath):
+        assert(os.RemoveFile(w4KernelPath), " weight safetensors manifest smoke: remove w4 kernel page file")
+    var w4KernelFileBytes = w4KernelBytes
+    assert(IsOk(os.WriteFileBytesResult(w4KernelPath, w4KernelFileBytes)),
+           " weight safetensors manifest smoke: write w4 kernel page file")
+    let w4KernelIndex = safetensorsShardIndexForGraph(
+        w4KernelGraph,
+        w4KernelPath,
+        w4KernelPath,
+        w4KernelGraph.weights.len
+    )
+    let w4KernelDeviceCapabilityHash = dev.DeviceCapabilityHash(
+        dev.InferenceDeviceBackendMetal,
+        dev.InferenceDeviceCapabilityMetalCompute,
+        "weight-store-w4-page-kernel-smoke"
+    )
+    let w4KernelDevice = dev.Device(
+        backend: dev.InferenceDeviceBackendMetal,
+        name: "weight-store-w4-page-kernel-smoke",
+        capabilityHash: w4KernelDeviceCapabilityHash,
+        capabilityMask: dev.InferenceDeviceCapabilityMetalCompute,
+        ready: true
+    )
+    let w4KernelPreflight = ws.WeightSafetensorsBuildPayloadHashPreflight(w4KernelIndex, w4KernelGraph, 2)
+    assert(IsOk(w4KernelPreflight),
+           " weight safetensors manifest smoke: w4 page kernel payload preflight")
+    let w4KernelPageTables = ws.WeightSafetensorsBuildDevicePageTablesFromPayloadPreflight(
+        w4KernelIndex,
+        w4KernelGraph,
+        Value(w4KernelPreflight),
+        w4KernelDevice,
+        int64(2)
+    )
+    assert(IsOk(w4KernelPageTables),
+           " weight safetensors manifest smoke: w4 page kernel page tables")
+    let w4KernelBindingSet = ws.WeightSafetensorsBuildDevicePageBindingSetFromPayloadPreflight(
+        w4KernelIndex,
+        w4KernelGraph,
+        Value(w4KernelPreflight),
+        Value(w4KernelPageTables),
+        w4KernelDeviceCapabilityHash
+    )
+    assert(IsOk(w4KernelBindingSet),
+           " weight safetensors manifest smoke: w4 page kernel binding set")
+    let w4KernelPageLoads = ws.WeightSafetensorsLoadDevicePageSetFromBindingSet(
+        w4KernelIndex,
+        w4KernelGraph,
+        w4KernelDevice,
+        Value(w4KernelPageTables),
+        Value(w4KernelBindingSet),
+        0
+    )
+    assert(IsOk(w4KernelPageLoads),
+           " weight safetensors manifest smoke: w4 page kernel page loads")
+    let w4KernelPageSet = ws.WeightSafetensorsBuildDevicePageLoadSetReceipt(
+        w4KernelIndex,
+        w4KernelGraph,
+        w4KernelDevice,
+        Value(w4KernelPageTables),
+        Value(w4KernelBindingSet),
+        0,
+        Value(w4KernelPageLoads)
+    )
+    assert(IsOk(w4KernelPageSet),
+           " weight safetensors manifest smoke: w4 page kernel page set")
+    assert(Value(w4KernelPageSet).schema == "cheng.inference.weight_safetensors_device_page_load_set_receipt.v1" &&
+           Value(w4KernelPageSet).bindingHash == Value(w4KernelBindingSet).bindings[0].bindingHash &&
+           Value(w4KernelPageSet).pageCount == Value(w4KernelPageTables)[0].pageCount &&
+           Value(w4KernelPageSet).byteCount == int64(6) &&
+           Value(w4KernelPageSet).pageLoadStatus == dev.InferenceDeviceBufferLoadStatusMetalBufferLoaded &&
+           Value(w4KernelPageSet).receiptHash == ws.WeightSafetensorsDevicePageLoadSetReceiptHash(Value(w4KernelPageSet)),
+           " weight safetensors manifest smoke: w4 page kernel page set facts")
+    let w4KernelWeightBufferLoad = dev.DeviceMetalLoadFileRangeBuffer(
+        w4KernelDevice,
+        Value(w4KernelPageTables)[0].filePath,
+        Value(w4KernelPageTables)[0].offsetBytes,
+        Value(w4KernelPageTables)[0].byteCount,
+        Value(w4KernelPageTables)[0].chunkBytes,
+        kir.KernelDtypeInt8
+    )
+    assert(IsOk(w4KernelWeightBufferLoad),
+           " weight safetensors manifest smoke: w4 page kernel whole weight buffer")
+    let w4KernelProgram = kir.KernelIrLinearOutInW4Afp8WeightProgram(2, 2, 3, kir.KernelDtypeFp16, 1000, 1000, 1000)
+    assert(IsOk(kir.KernelIrValidateProgram(w4KernelProgram)),
+           " weight safetensors manifest smoke: w4 page kernel ir")
+    let w4KernelLeft = smokeTensor([2, 3], 1000, [1000, 2000, -1000, 3000, -2000, 1000])
+    let w4KernelWeightScale = smokeTensor([2], 1000, [1000, 2000])
+    let w4KernelInputScale = smokeTensor([1], 1000, [1000])
+    var w4KernelOut: infer.TensorQ
+    let w4KernelReceipt = ws.WeightSafetensorsDeviceMetalLinearOutInW4Afp8WeightPageSetBufferFill(
+        w4KernelOut,
+        w4KernelIndex,
+        w4KernelGraph,
+        w4KernelDevice,
+        Value(w4KernelPageTables),
+        Value(w4KernelBindingSet),
+        0,
+        Value(w4KernelPageLoads),
+        Value(w4KernelPageSet),
+        w4KernelProgram,
+        w4KernelLeft,
+        Value(w4KernelWeightBufferLoad).buffer,
+        Value(w4KernelWeightBufferLoad).receipt,
+        w4KernelWeightScale,
+        w4KernelInputScale
+    )
+    assert(IsOk(w4KernelReceipt),
+           " weight safetensors manifest smoke: w4 page kernel launch")
+    assert(w4KernelOut.data.len == 4 &&
+           w4KernelOut.data[0] == -6000 &&
+           w4KernelOut.data[1] == 10000 &&
+           w4KernelOut.data[2] == 10000 &&
+           w4KernelOut.data[3] == 22000 &&
+           Value(w4KernelReceipt).inputHash > int64(0) &&
+           Value(w4KernelReceipt).outputHash > int64(0),
+           " weight safetensors manifest smoke: w4 page kernel output")
+    var badW4KernelPageSet = Value(w4KernelPageSet)
+    badW4KernelPageSet.pageLoadReceiptHash = badW4KernelPageSet.pageLoadReceiptHash + int64(1)
+    badW4KernelPageSet.receiptHash = ws.WeightSafetensorsDevicePageLoadSetReceiptHash(badW4KernelPageSet)
+    assert(IsErr(ws.WeightSafetensorsDeviceMetalLinearOutInW4Afp8WeightPageSetBufferFill(
+        w4KernelOut,
+        w4KernelIndex,
+        w4KernelGraph,
+        w4KernelDevice,
+        Value(w4KernelPageTables),
+        Value(w4KernelBindingSet),
+        0,
+        Value(w4KernelPageLoads),
+        badW4KernelPageSet,
+        w4KernelProgram,
+        w4KernelLeft,
+        Value(w4KernelWeightBufferLoad).buffer,
+        Value(w4KernelWeightBufferLoad).receipt,
+        w4KernelWeightScale,
+        w4KernelInputScale
+    )), " weight safetensors manifest smoke: w4 page kernel page set drift hard fail")
+    let w4KernelWeightScalePageLoads = ws.WeightSafetensorsLoadDevicePageSetFromBindingSet(
+        w4KernelIndex,
+        w4KernelGraph,
+        w4KernelDevice,
+        Value(w4KernelPageTables),
+        Value(w4KernelBindingSet),
+        1
+    )
+    assert(IsOk(w4KernelWeightScalePageLoads),
+           " weight safetensors manifest smoke: w4 raw scale page kernel weight scale page loads")
+    let w4KernelWeightScalePageSet = ws.WeightSafetensorsBuildDevicePageLoadSetReceipt(
+        w4KernelIndex,
+        w4KernelGraph,
+        w4KernelDevice,
+        Value(w4KernelPageTables),
+        Value(w4KernelBindingSet),
+        1,
+        Value(w4KernelWeightScalePageLoads)
+    )
+    assert(IsOk(w4KernelWeightScalePageSet),
+           " weight safetensors manifest smoke: w4 raw scale page kernel weight scale page set")
+    let w4KernelInputScalePageLoads = ws.WeightSafetensorsLoadDevicePageSetFromBindingSet(
+        w4KernelIndex,
+        w4KernelGraph,
+        w4KernelDevice,
+        Value(w4KernelPageTables),
+        Value(w4KernelBindingSet),
+        2
+    )
+    assert(IsOk(w4KernelInputScalePageLoads),
+           " weight safetensors manifest smoke: w4 raw scale page kernel input scale page loads")
+    let w4KernelInputScalePageSet = ws.WeightSafetensorsBuildDevicePageLoadSetReceipt(
+        w4KernelIndex,
+        w4KernelGraph,
+        w4KernelDevice,
+        Value(w4KernelPageTables),
+        Value(w4KernelBindingSet),
+        2,
+        Value(w4KernelInputScalePageLoads)
+    )
+    assert(IsOk(w4KernelInputScalePageSet),
+           " weight safetensors manifest smoke: w4 raw scale page kernel input scale page set")
+    let w4KernelWeightScaleBufferLoad = dev.DeviceMetalLoadFileRangeBuffer(
+        w4KernelDevice,
+        Value(w4KernelPageTables)[1].filePath,
+        Value(w4KernelPageTables)[1].offsetBytes,
+        Value(w4KernelPageTables)[1].byteCount,
+        Value(w4KernelPageTables)[1].chunkBytes,
+        kir.KernelDtypeFp8E4M3
+    )
+    assert(IsOk(w4KernelWeightScaleBufferLoad),
+           " weight safetensors manifest smoke: w4 raw scale page kernel whole weight scale buffer")
+    let w4KernelInputScaleBufferLoad = dev.DeviceMetalLoadFileRangeBuffer(
+        w4KernelDevice,
+        Value(w4KernelPageTables)[2].filePath,
+        Value(w4KernelPageTables)[2].offsetBytes,
+        Value(w4KernelPageTables)[2].byteCount,
+        Value(w4KernelPageTables)[2].chunkBytes,
+        kir.KernelDtypeFp8E4M3
+    )
+    assert(IsOk(w4KernelInputScaleBufferLoad),
+           " weight safetensors manifest smoke: w4 raw scale page kernel whole input scale buffer")
+    let w4KernelLeftPath = strutil.Join([
+        "/tmp/cheng_weight_safetensors_w4afp8_kernel_page_left_",
+        strings.Int64ToStr(w4KernelGraph.graphHash),
+        ".bin"
+    ], "")
+    if os.FileExists(w4KernelLeftPath):
+        assert(os.RemoveFile(w4KernelLeftPath), " weight safetensors manifest smoke: remove w4 page kernel left file")
+    var w4KernelLeftBytes = rawbytes.BytesAlloc(w4KernelLeft.data.len * 4)
+    assert(w4KernelLeftBytes.data != nil,
+           " weight safetensors manifest smoke: w4 page kernel left allocation")
+    for i in 0..<w4KernelLeft.data.len:
+        dev.DeviceWriteI32LE(w4KernelLeftBytes, i * 4, w4KernelLeft.data[i])
+    assert(IsOk(os.WriteFileBytesResult(w4KernelLeftPath, w4KernelLeftBytes)),
+           " weight safetensors manifest smoke: write w4 page kernel left file")
+    let w4KernelLeftBufferLoad = dev.DeviceMetalLoadFileRangeBuffer(
+        w4KernelDevice,
+        w4KernelLeftPath,
+        int64(0),
+        int64(w4KernelLeft.data.len * 4),
+        4,
+        kir.KernelDtypeI32
+    )
+    assert(IsOk(w4KernelLeftBufferLoad),
+           " weight safetensors manifest smoke: w4 raw scale page kernel left buffer")
+    let w4KernelRawScaleResult = ws.WeightSafetensorsDeviceMetalLinearOutInW4Afp8RawScalePageSetBuffersToBufferFill(
+        w4KernelIndex,
+        w4KernelGraph,
+        w4KernelDevice,
+        Value(w4KernelPageTables),
+        Value(w4KernelBindingSet),
+        0,
+        Value(w4KernelPageLoads),
+        Value(w4KernelPageSet),
+        1,
+        Value(w4KernelWeightScalePageLoads),
+        Value(w4KernelWeightScalePageSet),
+        2,
+        Value(w4KernelInputScalePageLoads),
+        Value(w4KernelInputScalePageSet),
+        w4KernelProgram,
+        Value(w4KernelLeftBufferLoad).buffer,
+        Value(w4KernelLeftBufferLoad).receipt,
+        Value(w4KernelWeightBufferLoad).buffer,
+        Value(w4KernelWeightBufferLoad).receipt,
+        Value(w4KernelWeightScaleBufferLoad).buffer,
+        Value(w4KernelWeightScaleBufferLoad).receipt,
+        Value(w4KernelInputScaleBufferLoad).buffer,
+        Value(w4KernelInputScaleBufferLoad).receipt
+    )
+    assert(IsOk(w4KernelRawScaleResult),
+           " weight safetensors manifest smoke: w4 raw scale page kernel launch")
+    assert(Value(w4KernelRawScaleResult).output.data.len == 4 &&
+           Value(w4KernelRawScaleResult).output.data[0] == -6000 &&
+           Value(w4KernelRawScaleResult).output.data[1] == 10000 &&
+           Value(w4KernelRawScaleResult).output.data[2] == 10000 &&
+           Value(w4KernelRawScaleResult).output.data[3] == 22000 &&
+           Value(w4KernelRawScaleResult).buffer.handle != uint64(0) &&
+           Value(w4KernelRawScaleResult).receipt.inputHash > int64(0) &&
+           Value(w4KernelRawScaleResult).receipt.outputHash > int64(0),
+           " weight safetensors manifest smoke: w4 raw scale page kernel output")
+    var badW4KernelWeightScalePageSet = Value(w4KernelWeightScalePageSet)
+    badW4KernelWeightScalePageSet.pageLoadReceiptHash = badW4KernelWeightScalePageSet.pageLoadReceiptHash + int64(1)
+    badW4KernelWeightScalePageSet.receiptHash = ws.WeightSafetensorsDevicePageLoadSetReceiptHash(badW4KernelWeightScalePageSet)
+    assert(IsErr(ws.WeightSafetensorsDeviceMetalLinearOutInW4Afp8RawScalePageSetBuffersToBufferFill(
+        w4KernelIndex,
+        w4KernelGraph,
+        w4KernelDevice,
+        Value(w4KernelPageTables),
+        Value(w4KernelBindingSet),
+        0,
+        Value(w4KernelPageLoads),
+        Value(w4KernelPageSet),
+        1,
+        Value(w4KernelWeightScalePageLoads),
+        badW4KernelWeightScalePageSet,
+        2,
+        Value(w4KernelInputScalePageLoads),
+        Value(w4KernelInputScalePageSet),
+        w4KernelProgram,
+        Value(w4KernelLeftBufferLoad).buffer,
+        Value(w4KernelLeftBufferLoad).receipt,
+        Value(w4KernelWeightBufferLoad).buffer,
+        Value(w4KernelWeightBufferLoad).receipt,
+        Value(w4KernelWeightScaleBufferLoad).buffer,
+        Value(w4KernelWeightScaleBufferLoad).receipt,
+        Value(w4KernelInputScaleBufferLoad).buffer,
+        Value(w4KernelInputScaleBufferLoad).receipt
+    )), " weight safetensors manifest smoke: w4 raw scale page kernel scale page set drift hard fail")
+    assert(IsOk(dev.DeviceMetalReleaseBuffer(Value(w4KernelRawScaleResult).buffer)),
+           " weight safetensors manifest smoke: w4 raw scale page kernel output release")
+    assert(IsOk(dev.DeviceMetalReleaseBuffer(Value(w4KernelLeftBufferLoad).buffer)),
+           " weight safetensors manifest smoke: w4 raw scale page kernel left release")
+    assert(IsOk(dev.DeviceMetalReleaseBuffer(Value(w4KernelWeightScaleBufferLoad).buffer)),
+           " weight safetensors manifest smoke: w4 raw scale page kernel whole weight scale release")
+    assert(IsOk(dev.DeviceMetalReleaseBuffer(Value(w4KernelInputScaleBufferLoad).buffer)),
+           " weight safetensors manifest smoke: w4 raw scale page kernel whole input scale release")
+    let w4KernelWeightScalePageLoadValues = Value(w4KernelWeightScalePageLoads)
+    for i in 0..<w4KernelWeightScalePageLoadValues.len:
+        assert(IsOk(dev.DeviceMetalReleaseBuffer(w4KernelWeightScalePageLoadValues[i].buffer)),
+               " weight safetensors manifest smoke: w4 raw scale page kernel weight scale page release")
+    let w4KernelInputScalePageLoadValues = Value(w4KernelInputScalePageLoads)
+    for i in 0..<w4KernelInputScalePageLoadValues.len:
+        assert(IsOk(dev.DeviceMetalReleaseBuffer(w4KernelInputScalePageLoadValues[i].buffer)),
+               " weight safetensors manifest smoke: w4 raw scale page kernel input scale page release")
+    assert(IsOk(dev.DeviceMetalReleaseBuffer(Value(w4KernelWeightBufferLoad).buffer)),
+           " weight safetensors manifest smoke: w4 page kernel whole weight release")
+    let w4KernelPageLoadValues = Value(w4KernelPageLoads)
+    for i in 0..<w4KernelPageLoadValues.len:
+        assert(IsOk(dev.DeviceMetalReleaseBuffer(w4KernelPageLoadValues[i].buffer)),
+               " weight safetensors manifest smoke: w4 page kernel page release")
+
+    let int4Graph = safetensorsQuantFixtureGraph(
+        "cid:model:safetensors-int4-quant",
+        kir.KernelDtypeInt4,
+        mg.ModelQuantSchemeSymmetricInt4,
+        mg.ModelQuantSchemeNone
+    )
+    let int4Bytes = safetensorsInt4QuantBytes(int4Graph)
+    let int4Peers = peersForGraph(int4Graph)
+    let int4Loaded = ws.WeightSafetensorsLoadGraphFile(int4Bytes, int4Graph, int4Peers, 10)
+    assert(IsOk(int4Loaded),
+           " weight safetensors manifest smoke: int4 symmetric load")
+    let int4Result = Value(int4Loaded)
+    assert(int4Result.store.payloads.len == 1 &&
+           int4Result.store.payloads[0].dtype == kir.KernelDtypeInt4 &&
+           int4Result.store.payloads[0].quantScheme == mg.ModelQuantSchemeSymmetricInt4,
+           " weight safetensors manifest smoke: int4 symmetric identity")
+    assert(int4Result.store.payloads[0].tensor.data[0] == 0 &&
+           int4Result.store.payloads[0].tensor.data[1] == 10 &&
+           int4Result.store.payloads[0].tensor.data[2] == -10 &&
+           int4Result.store.payloads[0].tensor.data[3] == 70,
+           " weight safetensors manifest smoke: int4 symmetric values")
+    assert(int4Result.store.payloads[0].hasPackedInt4 &&
+           int4Result.store.payloads[0].packedInt4Hash > int64(0) &&
+           rawbytes.BytesLen(int4Result.store.payloads[0].packedInt4.packed) == 2 &&
+           kir.KernelIrPackedInt4ValueAtUnchecked(int4Result.store.payloads[0].packedInt4, 0) == 0 &&
+           kir.KernelIrPackedInt4ValueAtUnchecked(int4Result.store.payloads[0].packedInt4, 1) == 10 &&
+           kir.KernelIrPackedInt4ValueAtUnchecked(int4Result.store.payloads[0].packedInt4, 2) == -10 &&
+           kir.KernelIrPackedInt4ValueAtUnchecked(int4Result.store.payloads[0].packedInt4, 3) == 70,
+           " weight safetensors manifest smoke: int4 packed payload")
+    let int4PackedHash = kir.KernelIrPackedInt4TensorHash(int4Result.store.payloads[0].packedInt4)
+    assert(IsOk(int4PackedHash) &&
+           Value(int4PackedHash) == int4Result.store.payloads[0].packedInt4Hash,
+           " weight safetensors manifest smoke: int4 packed hash")
+    let int4MaterializedPath = strutil.Join([
+        "/tmp/cheng_weight_safetensors_int4_materialized_",
+        strings.Int64ToStr(int4Result.store.payloads[0].payloadHash),
+        ".cw1"
+    ], "")
+    if os.FileExists(int4MaterializedPath):
+        assert(os.RemoveFile(int4MaterializedPath), " weight safetensors manifest smoke: remove int4 materialized")
+    assert(IsErr(ws.WeightTensorPayloadWriteMaterializedShardFile(int4MaterializedPath, int4Result.store.payloads[0])),
+           " weight safetensors manifest smoke: int4 materialized hard fail")
+    let linearPacked = smokePackedInt4([2, 2], 10, [1, -2, 3, 4])
+    let linearTensor = smokeTensor([2, 2], 10, [10, -20, 30, 40])
+    let linearPayload = ws.WeightTensorPayloadBuildWithPackedInt4(
+        "cid:model:linear-int4",
+        "linear.weight",
+        "cid:linear:int4",
+        kir.KernelDtypeInt4,
+        mg.ModelQuantSchemeSymmetricInt4,
+        "peer:linear:int4",
+        linearTensor,
+        true,
+        linearPacked
+    )
+    assert(IsOk(linearPayload), " weight safetensors manifest smoke: int4 linear payload")
+    let linearInput = smokeTensor([1, 2], 10, [10, 20])
+    var linearOut: infer.TensorQ
+    let linearOk = exec.ModelExecutorLinearOutInPayloadFill(linearOut, linearInput, Value(linearPayload), "int4_linear")
+    assert(IsOk(linearOk), " weight safetensors manifest smoke: int4 linear payload exec")
+    assert(linearOut.data.len == 2 &&
+           linearOut.data[0] == -30 &&
+           linearOut.data[1] == 110,
+           " weight safetensors manifest smoke: int4 linear payload value")
+    let badLinearTensor = smokeTensor([2, 2], 10, [10, -10, 30, 40])
+    assert(IsErr(ws.WeightTensorPayloadBuildWithPackedInt4(
+        "cid:model:linear-int4",
+        "linear.weight",
+        "cid:linear:int4",
+        kir.KernelDtypeInt4,
+        mg.ModelQuantSchemeSymmetricInt4,
+        "peer:linear:int4",
+        badLinearTensor,
+        true,
+        linearPacked
+    )), " weight safetensors manifest smoke: int4 packed decoded mismatch")
+    let w4LinearTensor = smokeTensor([2, 2], 10, [10, -20, 30, 40])
+    assert(IsErr(ws.WeightTensorPayloadBuild(
+        "cid:model:linear-w4afp8",
+        "linear.weight",
+        "cid:linear:w4afp8",
+        kir.KernelDtypeInt8,
+        mg.ModelQuantSchemeW4Afp8,
+        "peer:linear:w4afp8",
+        w4LinearTensor
+    )), " weight safetensors manifest smoke: w4afp8 raw required")
+    let w4LinearPayload = ws.WeightTensorPayloadBuildWithW4Afp8Raw(
+        "cid:model:linear-w4afp8",
+        "linear.weight",
+        "cid:linear:w4afp8",
+        kir.KernelDtypeInt8,
+        mg.ModelQuantSchemeW4Afp8,
+        "peer:linear:w4afp8",
+        w4LinearTensor,
+        smokeRawBytes([1, 254, 3, 4])
+    )
+    assert(IsOk(w4LinearPayload), " weight safetensors manifest smoke: w4afp8 linear payload")
+    let w4LinearScalePayload = ws.WeightTensorPayloadBuild(
+        "cid:model:linear-w4afp8",
+        "linear.weight_scale_inv",
+        "cid:linear:w4afp8:scale",
+        kir.KernelDtypeFp8E4M3,
+        mg.ModelQuantSchemeNone,
+        "peer:linear:w4afp8:scale",
+        smokeTensor([2], 10, [10, 20])
+    )
+    assert(IsOk(w4LinearScalePayload), " weight safetensors manifest smoke: w4afp8 scale payload")
+    let w4LinearInputScalePayload = ws.WeightTensorPayloadBuild(
+        "cid:model:linear-w4afp8",
+        "linear.input_scale",
+        "cid:linear:w4afp8:input-scale",
+        kir.KernelDtypeFp8E4M3,
+        mg.ModelQuantSchemeNone,
+        "peer:linear:w4afp8:input-scale",
+        smokeTensor([1], 10, [10])
+    )
+    assert(IsOk(w4LinearInputScalePayload), " weight safetensors manifest smoke: w4afp8 input scale payload")
+    assert(IsErr(ws.WeightTensorPayloadBuildWithW4Afp8Raw(
+        "cid:model:linear-w4afp8",
+        "linear.weight",
+        "cid:linear:w4afp8",
+        kir.KernelDtypeInt8,
+        mg.ModelQuantSchemeW4Afp8,
+        "peer:linear:w4afp8",
+        w4LinearTensor,
+        smokeRawBytes([1, 255, 3, 4])
+    )), " weight safetensors manifest smoke: w4afp8 raw decoded mismatch")
+    var w4LinearOut: infer.TensorQ
+    assert(IsErr(exec.ModelExecutorLinearOutInPayloadFill(w4LinearOut, linearInput, Value(w4LinearPayload), "w4afp8_linear")),
+           " weight safetensors manifest smoke: w4afp8 single payload hard fail")
+    let w4LinearOk = exec.ModelExecutorLinearOutInW4Afp8PayloadFill(
+        w4LinearOut,
+        linearInput,
+        Value(w4LinearPayload),
+        Value(w4LinearScalePayload),
+        Value(w4LinearInputScalePayload),
+        "w4afp8_linear"
+    )
+    assert(IsOk(w4LinearOk), " weight safetensors manifest smoke: w4afp8 linear payload exec")
+    assert(w4LinearOut.data.len == 2 &&
+           w4LinearOut.data[0] == -30 &&
+           w4LinearOut.data[1] == 220,
+           " weight safetensors manifest smoke: w4afp8 linear payload value")
+    let w4LinearStore = ws.WeightTensorStoreBuild(
+        "cid:model:linear-w4afp8",
+        [Value(w4LinearPayload), Value(w4LinearScalePayload), Value(w4LinearInputScalePayload)]
+    )
+    var w4LinearAutoCtx = exec.ModelExecutorMetalContextDisabled()
+    var w4LinearAutoOut: infer.TensorQ
+    let w4LinearAutoOk = exec.ModelExecutorLinearOutInStorePayloadMaybeMetalFill(
+        w4LinearAutoOut,
+        linearInput,
+        w4LinearStore,
+        Value(w4LinearPayload),
+        "w4afp8_linear_auto",
+        w4LinearAutoCtx
+    )
+    assert(IsOk(w4LinearAutoOk) &&
+           w4LinearAutoOut.data.len == 2 &&
+           w4LinearAutoOut.data[0] == -30 &&
+           w4LinearAutoOut.data[1] == 220,
+           " weight safetensors manifest smoke: w4afp8 auto companion exec")
+    let w4LinearNoInputScaleStore = ws.WeightTensorStoreBuild(
+        "cid:model:linear-w4afp8",
+        [Value(w4LinearPayload), Value(w4LinearScalePayload)]
+    )
+    var w4LinearIdentityCtx = exec.ModelExecutorMetalContextDisabled()
+    var w4LinearIdentityOut: infer.TensorQ
+    let w4LinearIdentityOk = exec.ModelExecutorLinearOutInStorePayloadMaybeMetalFill(
+        w4LinearIdentityOut,
+        linearInput,
+        w4LinearNoInputScaleStore,
+        Value(w4LinearPayload),
+        "w4afp8_linear_auto_identity",
+        w4LinearIdentityCtx
+    )
+    assert(IsOk(w4LinearIdentityOk) &&
+           w4LinearIdentityOut.data.len == 2 &&
+           w4LinearIdentityOut.data[0] == -30 &&
+           w4LinearIdentityOut.data[1] == 220,
+           " weight safetensors manifest smoke: w4afp8 optional input scale identity")
+    let w4LinearMissingScaleStore = ws.WeightTensorStoreBuild(
+        "cid:model:linear-w4afp8",
+        [Value(w4LinearPayload), Value(w4LinearInputScalePayload)]
+    )
+    var w4LinearMissingCtx = exec.ModelExecutorMetalContextDisabled()
+    var w4LinearMissingOut: infer.TensorQ
+    assert(IsErr(exec.ModelExecutorLinearOutInStorePayloadMaybeMetalFill(
+        w4LinearMissingOut,
+        linearInput,
+        w4LinearMissingScaleStore,
+        Value(w4LinearPayload),
+        "w4afp8_linear_auto_missing_scale",
+        w4LinearMissingCtx
+    )), " weight safetensors manifest smoke: w4afp8 missing scale hard fail")
+    let int4PayloadHashes = safetensorsPayloadHashesForGraph(int4Graph, int4Result.store)
+    assert(IsOk(int4PayloadHashes),
+           " weight safetensors manifest smoke: int4 payload hash list")
+    let int4BoundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(int4Graph, Value(int4PayloadHashes))
+    assert(IsOk(int4BoundGraphRes),
+           " weight safetensors manifest smoke: int4 bind expected payload")
+    let int4BoundGraph = Value(int4BoundGraphRes)
+    assert(IsOk(ws.WeightSafetensorsLoadGraphFile(int4Bytes, int4BoundGraph, int4Peers, 10)),
+           " weight safetensors manifest smoke: int4 bound load")
+    var int4DriftBytes = rawbytes.BytesSlice(int4Bytes, 0, rawbytes.BytesLen(int4Bytes))
+    let int4HeaderLen = ws.WeightSafetensorsHeaderLength(int4DriftBytes)
+    assert(IsOk(int4HeaderLen),
+           " weight safetensors manifest smoke: int4 drift header")
+    rawbytes.BytesSet(int4DriftBytes, 8 + Value(int4HeaderLen) + 1, 0x6f)
+    assert(IsErr(ws.WeightSafetensorsLoadGraphFile(int4DriftBytes, int4BoundGraph, int4Peers, 10)),
+           " weight safetensors manifest smoke: int4 payload drift hard fail")
+    let int4OddGraph = safetensorsInt4OddFixtureGraph("cid:model:safetensors-int4-odd")
+    let int4OddPeers = peersForGraph(int4OddGraph)
+    assert(IsOk(ws.WeightSafetensorsLoadGraphFile(safetensorsInt4OddPaddingBytes(int4OddGraph, false), int4OddGraph, int4OddPeers, 10)),
+           " weight safetensors manifest smoke: int4 odd padding zero")
+    assert(IsErr(ws.WeightSafetensorsLoadGraphFile(safetensorsInt4OddPaddingBytes(int4OddGraph, true), int4OddGraph, int4OddPeers, 10)),
+           " weight safetensors manifest smoke: int4 odd padding hard fail")
+
+    let badQuantGraph = safetensorsQuantFixtureGraph(
+        "cid:model:safetensors-bad-quant",
+        kir.KernelDtypeInt8,
+        "nf4",
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsErr(mg.ModelGraphValidate(badQuantGraph)),
+           " weight safetensors manifest smoke: unknown quant hard fail")
+    assert(IsErr(ws.WeightSafetensorsValidateGraphFile(safetensorsInt8QuantBytes(badQuantGraph), badQuantGraph)),
+           " weight safetensors manifest smoke: loader unknown quant hard fail")
+    let implicitInt8QuantGraph = safetensorsQuantFixtureGraph(
+        "cid:model:safetensors-implicit-int8",
+        kir.KernelDtypeInt8,
+        mg.ModelQuantSchemeNone,
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsErr(mg.ModelGraphValidate(implicitInt8QuantGraph)),
+           " weight safetensors manifest smoke: implicit int8 quant hard fail")
+    let implicitInt4QuantGraph = safetensorsQuantFixtureGraph(
+        "cid:model:safetensors-implicit-int4",
+        kir.KernelDtypeInt4,
+        mg.ModelQuantSchemeNone,
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsErr(mg.ModelGraphValidate(implicitInt4QuantGraph)),
+           " weight safetensors manifest smoke: implicit int4 quant hard fail")
+    let badDtypeQuantGraph = safetensorsQuantFixtureGraph(
+        "cid:model:safetensors-bad-quant-dtype",
+        kir.KernelDtypeFp16,
+        mg.ModelQuantSchemeSymmetricInt8,
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsErr(mg.ModelGraphValidate(badDtypeQuantGraph)),
+           " weight safetensors manifest smoke: int8 quant dtype hard fail")
+    let badInt4DtypeQuantGraph = safetensorsQuantFixtureGraph(
+        "cid:model:safetensors-bad-int4-quant-dtype",
+        kir.KernelDtypeFp16,
+        mg.ModelQuantSchemeSymmetricInt4,
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsErr(mg.ModelGraphValidate(badInt4DtypeQuantGraph)),
+           " weight safetensors manifest smoke: int4 quant dtype hard fail")
+    let badTensorQuantGraph = safetensorsQuantFixtureGraph(
+        "cid:model:safetensors-bad-tensor-quant",
+        kir.KernelDtypeInt8,
+        mg.ModelQuantSchemeSymmetricInt8,
+        mg.ModelQuantSchemeSymmetricInt8
+    )
+    assert(IsErr(mg.ModelGraphValidate(badTensorQuantGraph)),
+           " weight safetensors manifest smoke: activation quant hard fail")
+    let missingW4ScaleGraph = safetensorsQuantFixtureGraph(
+        "cid:model:safetensors-w4afp8-missing-scale",
+        kir.KernelDtypeInt8,
+        mg.ModelQuantSchemeW4Afp8,
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsOk(mg.ModelGraphValidate(missingW4ScaleGraph)),
+           " weight safetensors manifest smoke: w4afp8 graph without scale still graph-valid")
+    let w4ConfigJson = "{\"quantization_config\":{\"quant_method\":\"w4afp8\"}}"
+    let w4Config = ws.WeightSafetensorsHfQuantizationConfigFromJson(w4ConfigJson)
+    assert(IsOk(w4Config),
+           " weight safetensors manifest smoke: w4afp8 quant config parse")
+    assert(IsErr(ws.WeightSafetensorsHfQuantizationConfigValidateForGraph(Value(w4Config), missingW4ScaleGraph)),
+           " weight safetensors manifest smoke: w4afp8 missing scale hard fail")
+    let badW4InputScaleGraph = safetensorsW4Afp8BadInputScaleFixtureGraph("cid:model:safetensors-w4afp8-bad-input-scale")
+    assert(IsOk(mg.ModelGraphValidate(badW4InputScaleGraph)),
+           " weight safetensors manifest smoke: w4afp8 bad input scale graph-valid")
+    assert(IsErr(ws.WeightSafetensorsHfQuantizationConfigValidateForGraph(Value(w4Config), badW4InputScaleGraph)),
+           " weight safetensors manifest smoke: w4afp8 bad input scale hard fail")
+
+    let tokenIds = infer.TensorQ(shape: [2], scale: 1, data: [0, 1])
+    assert(IsOk(infer.TensorValidate(tokenIds)),
+           " weight safetensors manifest smoke: token tensor")
+    let routeRes = exec.ModelExecutorBuildTinyRoutePlan(graph, loadResult.bindings, loadResult.store, tokenIds, 2)
+    assert(IsOk(routeRes), " weight safetensors manifest smoke: loaded route")
+    let execRes = exec.ModelExecutorExecuteTinyGlmMoe(graph, loadResult.bindings, loadResult.store, tokenIds, Value(routeRes))
+    assert(IsOk(execRes), " weight safetensors manifest smoke: loaded execute")
+    assert(Value(execRes).logits.shape.len == 2 && Value(execRes).logits.shape[0] == 2 &&
+           Value(execRes).logits.shape[1] == 8,
+           " weight safetensors manifest smoke: loaded execute logits shape")
+    assert(Value(execRes).executionHash > int64(0),
+           " weight safetensors manifest smoke: loaded execute hash")
+
+    let numericPath = strutil.Join([
+        "/tmp/cheng_weight_safetensors_numeric_",
+        strings.Int64ToStr(graph.graphHash),
+        ".safetensors"
+    ], "")
+    if os.FileExists(numericPath):
+        assert(os.RemoveFile(numericPath), " weight safetensors manifest smoke: remove numeric file")
+    var numericFileBytes = numericBytes
+    assert(IsOk(os.WriteFileBytesResult(numericPath, numericFileBytes)),
+           " weight safetensors manifest smoke: write numeric file")
+    let loadedPath = ws.WeightSafetensorsLoadGraphFilePath(numericPath, graph, peerIds, 1000)
+    assert(IsOk(loadedPath), " weight safetensors manifest smoke: load numeric path")
+    assert(Value(loadedPath).store.storeHash == loadResult.store.storeHash,
+           " weight safetensors manifest smoke: path store hash")
+
+    let shardPath0 = strutil.Join([
+        "/tmp/cheng_weight_safetensors_index_a_",
+        strings.Int64ToStr(graph.graphHash),
+        ".safetensors"
+    ], "")
+    let shardPath1 = strutil.Join([
+        "/tmp/cheng_weight_safetensors_index_b_",
+        strings.Int64ToStr(graph.graphHash),
+        ".safetensors"
+    ], "")
+    if os.FileExists(shardPath0):
+        assert(os.RemoveFile(shardPath0), " weight safetensors manifest smoke: remove index file a")
+    if os.FileExists(shardPath1):
+        assert(os.RemoveFile(shardPath1), " weight safetensors manifest smoke: remove index file b")
+    var shardBytes0 = safetensorsNumericBytesRange(graph, 0, 3)
+    var shardBytes1 = safetensorsNumericBytesRange(graph, 3, graph.weights.len)
+    assert(IsOk(os.WriteFileBytesResult(shardPath0, shardBytes0)),
+           " weight safetensors manifest smoke: write index file a")
+    assert(IsOk(os.WriteFileBytesResult(shardPath1, shardBytes1)),
+           " weight safetensors manifest smoke: write index file b")
+    let shardIndex = safetensorsShardIndexForGraph(graph, shardPath0, shardPath1, 3)
+    assert(IsOk(ws.WeightSafetensorsShardIndexValidate(shardIndex, graph)),
+           " weight safetensors manifest smoke: index validates")
+    let indexedLoad = ws.WeightSafetensorsLoadShardIndex(shardIndex, graph)
+    assert(IsOk(indexedLoad), " weight safetensors manifest smoke: index load")
+    let indexedResult = Value(indexedLoad)
+    assert(indexedResult.fileReceipts.len == 2,
+           " weight safetensors manifest smoke: index file receipt count")
+    assert(indexedResult.fileReceipts[0].indexedTensorCount == 3 &&
+           indexedResult.fileReceipts[1].indexedTensorCount == graph.weights.len - 3,
+           " weight safetensors manifest smoke: index file receipt tensors")
+    assert(IsOk(ws.WeightTensorValidateStore(indexedResult.store, indexedResult.bindings, graph)),
+           " weight safetensors manifest smoke: indexed store validates")
+    assert(indexedResult.store.storeHash == loadResult.store.storeHash,
+           " weight safetensors manifest smoke: indexed store hash")
+    let indexedRoute = exec.ModelExecutorBuildTinyRoutePlan(graph, indexedResult.bindings, indexedResult.store, tokenIds, 2)
+    assert(IsOk(indexedRoute), " weight safetensors manifest smoke: indexed route")
+    let indexedExec = exec.ModelExecutorExecuteTinyGlmMoe(graph, indexedResult.bindings, indexedResult.store, tokenIds, Value(indexedRoute))
+    assert(IsOk(indexedExec), " weight safetensors manifest smoke: indexed execute")
+    assert(Value(indexedExec).executionHash == Value(execRes).executionHash,
+           " weight safetensors manifest smoke: indexed execute hash")
+
+    let hfBaseDir = "/tmp"
+    let hfFile0 = strutil.Join([
+        "cheng_weight_safetensors_hf_a_",
+        strings.Int64ToStr(graph.graphHash),
+        ".safetensors"
+    ], "")
+    let hfFile1 = strutil.Join([
+        "cheng_weight_safetensors_hf_b_",
+        strings.Int64ToStr(graph.graphHash),
+        ".safetensors"
+    ], "")
+    let hfPath0 = os.JoinPath(hfBaseDir, hfFile0)
+    let hfPath1 = os.JoinPath(hfBaseDir, hfFile1)
+    if os.FileExists(hfPath0):
+        assert(os.RemoveFile(hfPath0), " weight safetensors manifest smoke: remove hf file a")
+    if os.FileExists(hfPath1):
+        assert(os.RemoveFile(hfPath1), " weight safetensors manifest smoke: remove hf file b")
+    var hfBytes0 = safetensorsNumericBytesRange(graph, 0, 3)
+    var hfBytes1 = safetensorsNumericBytesRange(graph, 3, graph.weights.len)
+    assert(IsOk(os.WriteFileBytesResult(hfPath0, hfBytes0)),
+           " weight safetensors manifest smoke: write hf file a")
+    assert(IsOk(os.WriteFileBytesResult(hfPath1, hfBytes1)),
+           " weight safetensors manifest smoke: write hf file b")
+    let hfJson = safetensorsHfIndexJson(graph, 3, hfFile0, hfFile1, HfIndexValid)
+    let hfIndexRes = ws.WeightSafetensorsShardIndexFromHfWeightMap(hfJson, graph, hfBaseDir, peerIds, 1000)
+    assert(IsOk(hfIndexRes), " weight safetensors manifest smoke: hf index build")
+    let hfIndex = Value(hfIndexRes)
+    assert(hfIndex.indexHash > int64(0),
+           " weight safetensors manifest smoke: hf index hash")
+    let hfLoad = ws.WeightSafetensorsLoadShardIndex(hfIndex, graph)
+    assert(IsOk(hfLoad), " weight safetensors manifest smoke: hf index load")
+    assert(Value(hfLoad).fileReceipts.len == 2,
+           " weight safetensors manifest smoke: hf receipt count")
+    assert(Value(hfLoad).store.storeHash == loadResult.store.storeHash,
+           " weight safetensors manifest smoke: hf store hash")
+    let hfRangePayload = ws.WeightSafetensorsBuildPayloadFromEntryRange(hfIndex, graph, 0, 64)
+    assert(IsOk(hfRangePayload),
+           " weight safetensors manifest smoke: hf range payload")
+    assert(Value(hfRangePayload).payloadHash == Value(hfLoad).store.payloads[0].payloadHash,
+           " weight safetensors manifest smoke: hf range payload hash")
+    assert(IsErr(ws.WeightSafetensorsBuildPayloadFromEntryRange(hfIndex, graph, 0, 1)),
+           " weight safetensors manifest smoke: hf range payload cap hard fail")
+    let hfHeaderPreflight = ws.WeightSafetensorsBuildShardHeaderPreflight(hfIndex, graph)
+    assert(IsOk(hfHeaderPreflight),
+           " weight safetensors manifest smoke: hf header preflight")
+    assert(Value(hfHeaderPreflight).schema == "cheng.inference.weight_safetensors_shard_header_preflight.v1" &&
+           Value(hfHeaderPreflight).fileReceipts.len == 2 &&
+           Value(hfHeaderPreflight).tensorCount == graph.weights.len &&
+           Value(hfHeaderPreflight).receiptHash == ws.WeightSafetensorsShardHeaderPreflightHash(Value(hfHeaderPreflight)),
+           " weight safetensors manifest smoke: hf header preflight receipt")
+    assert(Value(hfHeaderPreflight).fileReceipts[0].fileByteCount == int64(rawbytes.BytesLen(hfBytes0)) &&
+           Value(hfHeaderPreflight).fileReceipts[0].indexedTensorCount == 3 &&
+           Value(hfHeaderPreflight).fileReceipts[0].receiptHash == ws.WeightSafetensorsShardHeaderReceiptHash(Value(hfHeaderPreflight).fileReceipts[0]),
+           " weight safetensors manifest smoke: hf header file receipt")
+    assert(IsOk(ws.WeightSafetensorsValidateShardHeaderPreflight(hfIndex, graph, Value(hfHeaderPreflight))),
+           " weight safetensors manifest smoke: hf header preflight validate")
+    var hfTruncatedBytes0 = rawbytes.BytesSlice(hfBytes0, 0, rawbytes.BytesLen(hfBytes0) - 1)
+    assert(IsOk(os.WriteFileBytesResult(hfPath0, hfTruncatedBytes0)),
+           " weight safetensors manifest smoke: hf header truncate write")
+    assert(IsErr(ws.WeightSafetensorsBuildShardHeaderPreflight(hfIndex, graph)),
+           " weight safetensors manifest smoke: hf header truncated hard fail")
+    assert(IsOk(os.WriteFileBytesResult(hfPath0, hfBytes0)),
+           " weight safetensors manifest smoke: hf header restore")
+    let hfPayloadReceipt = ws.WeightSafetensorsBuildTensorRawPayloadHashReceipt(hfIndex, graph, 0, 3)
+    assert(IsOk(hfPayloadReceipt),
+           " weight safetensors manifest smoke: hf raw payload hash receipt")
+    let hfPayloadReceiptWide = ws.WeightSafetensorsBuildTensorRawPayloadHashReceipt(hfIndex, graph, 0, 64)
+    assert(IsOk(hfPayloadReceiptWide),
+           " weight safetensors manifest smoke: hf raw payload hash receipt wide")
+    assert(Value(hfPayloadReceipt).rawPayloadByteHash == Value(hfPayloadReceiptWide).rawPayloadByteHash &&
+           Value(hfPayloadReceipt).byteCount == graph.weights[0].sizeBytes &&
+           Value(hfPayloadReceipt).receiptHash == ws.WeightSafetensorsTensorRawPayloadHashReceiptHash(Value(hfPayloadReceipt)),
+           " weight safetensors manifest smoke: hf raw payload hash receipt facts")
+    assert(IsOk(ws.WeightSafetensorsValidateTensorRawPayloadHashReceipt(hfIndex, graph, 0, Value(hfPayloadReceipt))),
+           " weight safetensors manifest smoke: hf raw payload hash receipt validate")
+    let hfDeviceCapabilityHash = dev.DeviceCapabilityHash(
+        dev.InferenceDeviceBackendMetal,
+        dev.InferenceDeviceCapabilityMetalCompute,
+        "weight-store-range-smoke"
+    )
+    let hfDevice = dev.Device(
+        backend: dev.InferenceDeviceBackendMetal,
+        name: "weight-store-range-smoke",
+        capabilityHash: hfDeviceCapabilityHash,
+        capabilityMask: dev.InferenceDeviceCapabilityMetalCompute,
+        ready: true
+    )
+    let hfDeviceBuffer = dev.DeviceBufferLogical(
+        hfDevice,
+        Value(hfPayloadReceipt).byteCount,
+        Value(hfPayloadReceipt).dtype,
+        Value(hfPayloadReceipt).rawPayloadByteHash
+    )
+    let hfDeviceLoadReceipt = dev.DeviceBuildVerifiedFileRangeBufferLoadReceipt(
+        hfDevice,
+        hfDeviceBuffer,
+        Value(hfPayloadReceipt).filePath,
+        Value(hfPayloadReceipt).dataStart,
+        Value(hfPayloadReceipt).byteCount,
+        Value(hfPayloadReceipt).chunkBytes
+    )
+    assert(IsOk(hfDeviceLoadReceipt),
+           " weight safetensors manifest smoke: hf device file range load receipt")
+    assert(Value(hfDeviceLoadReceipt).schema == dev.InferenceDeviceFileRangeBufferLoadReceiptSchema &&
+           Value(hfDeviceLoadReceipt).deviceCapabilityHash == hfDeviceCapabilityHash &&
+           Value(hfDeviceLoadReceipt).deviceBufferLogicalHash == Value(hfPayloadReceipt).rawPayloadByteHash &&
+           Value(hfDeviceLoadReceipt).sourceRangeHash == Value(hfPayloadReceipt).rawPayloadByteHash &&
+           Value(hfDeviceLoadReceipt).receiptHash == dev.DeviceFileRangeBufferLoadReceiptHash(Value(hfDeviceLoadReceipt)),
+           " weight safetensors manifest smoke: hf device file range load receipt facts")
+    assert(IsOk(dev.DeviceValidateFileRangeBufferLoadReceipt(hfDevice, hfDeviceBuffer, Value(hfDeviceLoadReceipt))),
+           " weight safetensors manifest smoke: hf device file range load receipt validate")
+    let hfDevicePageTable = dev.DeviceBuildFileRangePageTableReceipt(
+        hfDevice,
+        Value(hfPayloadReceipt).filePath,
+        Value(hfPayloadReceipt).dataStart,
+        Value(hfPayloadReceipt).byteCount,
+        int64(2),
+        Value(hfPayloadReceipt).chunkBytes
+    )
+    assert(IsOk(hfDevicePageTable),
+           " weight safetensors manifest smoke: hf device page table")
+    assert(Value(hfDevicePageTable).schema == dev.InferenceDeviceFileRangePageTableReceiptSchema &&
+           Value(hfDevicePageTable).deviceCapabilityHash == hfDeviceCapabilityHash &&
+           Value(hfDevicePageTable).offsetBytes == Value(hfPayloadReceipt).dataStart &&
+           Value(hfDevicePageTable).byteCount == Value(hfPayloadReceipt).byteCount &&
+           Value(hfDevicePageTable).chunkBytes == Value(hfPayloadReceipt).chunkBytes &&
+           Value(hfDevicePageTable).pageCount > 0 &&
+           Value(hfDevicePageTable).pageAggregateHash == dev.DeviceFileRangePageAggregateHash(Value(hfDevicePageTable).pages) &&
+           Value(hfDevicePageTable).receiptHash == dev.DeviceFileRangePageTableReceiptHash(Value(hfDevicePageTable)),
+           " weight safetensors manifest smoke: hf device page table facts")
+    assert(IsOk(dev.DeviceValidateFileRangePageTableReceipt(hfDevice, Value(hfDevicePageTable))),
+           " weight safetensors manifest smoke: hf device page table validate")
+    let hfDeviceRangeBinding = ws.WeightSafetensorsBuildDeviceRangeBindingFromReceipt(
+        hfIndex,
+        graph,
+        0,
+        Value(hfPayloadReceipt),
+        hfDeviceCapabilityHash,
+        Value(hfPayloadReceipt).byteCount,
+        Value(hfPayloadReceipt).dtype,
+        Value(hfPayloadReceipt).rawPayloadByteHash
+    )
+    assert(IsOk(hfDeviceRangeBinding),
+           " weight safetensors manifest smoke: hf device range binding")
+    assert(Value(hfDeviceRangeBinding).schema == "cheng.inference.weight_safetensors_device_range_binding.v1" &&
+           Value(hfDeviceRangeBinding).payloadReceiptHash == Value(hfPayloadReceipt).receiptHash &&
+           Value(hfDeviceRangeBinding).deviceCapabilityHash == hfDeviceCapabilityHash &&
+           Value(hfDeviceRangeBinding).deviceBufferSizeBytes == Value(hfPayloadReceipt).byteCount &&
+           Value(hfDeviceRangeBinding).deviceBufferLogicalHash == Value(hfPayloadReceipt).rawPayloadByteHash &&
+           Value(hfDeviceRangeBinding).bindingHash == ws.WeightSafetensorsDeviceRangeBindingHash(Value(hfDeviceRangeBinding)),
+           " weight safetensors manifest smoke: hf device range binding facts")
+    assert(IsOk(ws.WeightSafetensorsValidateDeviceRangeBinding(hfIndex, graph, 0, Value(hfDeviceRangeBinding))),
+           " weight safetensors manifest smoke: hf device range binding validate")
+    let hfDeviceRangeBindingDirect = ws.WeightSafetensorsBuildDeviceRangeBinding(
+        hfIndex,
+        graph,
+        0,
+        3,
+        hfDeviceCapabilityHash,
+        Value(hfPayloadReceipt).byteCount,
+        Value(hfPayloadReceipt).dtype,
+        Value(hfPayloadReceipt).rawPayloadByteHash
+    )
+    assert(IsOk(hfDeviceRangeBindingDirect) &&
+           Value(hfDeviceRangeBindingDirect).bindingHash == Value(hfDeviceRangeBinding).bindingHash,
+           " weight safetensors manifest smoke: hf device range binding direct")
+    let hfDevicePageBinding = ws.WeightSafetensorsBuildDevicePageBindingFromReceipt(
+        hfIndex,
+        graph,
+        0,
+        Value(hfPayloadReceipt),
+        Value(hfDevicePageTable),
+        hfDeviceCapabilityHash,
+        Value(hfPayloadReceipt).dtype
+    )
+    assert(IsOk(hfDevicePageBinding),
+           " weight safetensors manifest smoke: hf device page binding")
+    assert(Value(hfDevicePageBinding).schema == "cheng.inference.weight_safetensors_device_page_binding.v1" &&
+           Value(hfDevicePageBinding).payloadReceiptHash == Value(hfPayloadReceipt).receiptHash &&
+           Value(hfDevicePageBinding).deviceCapabilityHash == hfDeviceCapabilityHash &&
+           Value(hfDevicePageBinding).pageAggregateHash == Value(hfDevicePageTable).pageAggregateHash &&
+           Value(hfDevicePageBinding).pageTableReceiptHash == Value(hfDevicePageTable).receiptHash &&
+           Value(hfDevicePageBinding).bindingHash == ws.WeightSafetensorsDevicePageBindingHash(Value(hfDevicePageBinding)),
+           " weight safetensors manifest smoke: hf device page binding facts")
+    assert(IsOk(ws.WeightSafetensorsValidateDevicePageBinding(
+        hfIndex,
+        graph,
+        0,
+        Value(hfDevicePageTable),
+        Value(hfDevicePageBinding)
+    )), " weight safetensors manifest smoke: hf device page binding validate")
+    let hfDevicePageBindingDirect = ws.WeightSafetensorsBuildDevicePageBinding(
+        hfIndex,
+        graph,
+        0,
+        3,
+        Value(hfDevicePageTable),
+        hfDeviceCapabilityHash,
+        Value(hfPayloadReceipt).dtype
+    )
+    assert(IsOk(hfDevicePageBindingDirect) &&
+           Value(hfDevicePageBindingDirect).bindingHash == Value(hfDevicePageBinding).bindingHash,
+           " weight safetensors manifest smoke: hf device page binding direct")
+    assert(IsErr(ws.WeightSafetensorsBuildDevicePageBindingFromReceipt(
+        hfIndex,
+        graph,
+        0,
+        Value(hfPayloadReceipt),
+        Value(hfDevicePageTable),
+        hfDeviceCapabilityHash,
+        "bad-dtype"
+    )),
+           " weight safetensors manifest smoke: hf device page binding dtype hard fail")
+    var hfBadDevicePageTable = Value(hfDevicePageTable)
+    hfBadDevicePageTable.pages[0].sourceRangeHash = hfBadDevicePageTable.pages[0].sourceRangeHash + int64(1)
+    hfBadDevicePageTable.pages[0].pageHash = dev.DeviceFileRangePageHash(hfBadDevicePageTable.pages[0])
+    hfBadDevicePageTable.pageAggregateHash = dev.DeviceFileRangePageAggregateHash(hfBadDevicePageTable.pages)
+    hfBadDevicePageTable.receiptHash = dev.DeviceFileRangePageTableReceiptHash(hfBadDevicePageTable)
+    assert(IsErr(ws.WeightSafetensorsValidateDevicePageBinding(
+        hfIndex,
+        graph,
+        0,
+        hfBadDevicePageTable,
+        Value(hfDevicePageBinding)
+    )), " weight safetensors manifest smoke: hf device page binding table drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsBuildDeviceRangeBindingFromReceipt(
+        hfIndex,
+        graph,
+        0,
+        Value(hfPayloadReceipt),
+        hfDeviceCapabilityHash,
+        Value(hfPayloadReceipt).byteCount - int64(1),
+        Value(hfPayloadReceipt).dtype,
+        Value(hfPayloadReceipt).rawPayloadByteHash
+    )),
+           " weight safetensors manifest smoke: hf device range binding size hard fail")
+    assert(IsErr(ws.WeightSafetensorsBuildDeviceRangeBindingFromReceipt(
+        hfIndex,
+        graph,
+        0,
+        Value(hfPayloadReceipt),
+        hfDeviceCapabilityHash,
+        Value(hfPayloadReceipt).byteCount,
+        Value(hfPayloadReceipt).dtype,
+        Value(hfPayloadReceipt).rawPayloadByteHash + int64(1)
+    )),
+           " weight safetensors manifest smoke: hf device range binding hash hard fail")
+    let hfPayloadPreflight = ws.WeightSafetensorsBuildPayloadHashPreflight(hfIndex, graph, 5)
+    assert(IsOk(hfPayloadPreflight),
+           " weight safetensors manifest smoke: hf payload hash preflight")
+    assert(Value(hfPayloadPreflight).schema == "cheng.inference.weight_safetensors_payload_hash_preflight.v1" &&
+           Value(hfPayloadPreflight).tensorReceipts.len == graph.weights.len &&
+           Value(hfPayloadPreflight).tensorCount == graph.weights.len &&
+           Value(hfPayloadPreflight).totalPayloadBytes == safetensorsTotalDataBytes(graph) &&
+           Value(hfPayloadPreflight).chunkBytes == 5 &&
+           Value(hfPayloadPreflight).tensorReceiptHash == ws.WeightSafetensorsTensorRawPayloadHashReceiptSetHash(Value(hfPayloadPreflight).tensorReceipts) &&
+           Value(hfPayloadPreflight).receiptHash == ws.WeightSafetensorsPayloadHashPreflightHash(Value(hfPayloadPreflight)),
+           " weight safetensors manifest smoke: hf payload hash preflight facts")
+    assert(IsOk(ws.WeightSafetensorsValidatePayloadHashPreflight(hfIndex, graph, Value(hfPayloadPreflight))),
+           " weight safetensors manifest smoke: hf payload hash preflight validate")
+    let hfDeviceRangeBindingChunk5 = ws.WeightSafetensorsBuildDeviceRangeBinding(
+        hfIndex,
+        graph,
+        0,
+        5,
+        hfDeviceCapabilityHash,
+        Value(hfPayloadReceipt).byteCount,
+        Value(hfPayloadReceipt).dtype,
+        Value(hfPayloadReceipt).rawPayloadByteHash
+    )
+    assert(IsOk(hfDeviceRangeBindingChunk5),
+           " weight safetensors manifest smoke: hf device range binding chunk5")
+    var hfDevicePageTables: dev.DeviceFileRangePageTableReceipt[]
+    for i in 0..<Value(hfPayloadPreflight).tensorReceipts.len:
+        let receipt = Value(hfPayloadPreflight).tensorReceipts[i]
+        let pageTable = dev.DeviceBuildFileRangePageTableReceipt(
+            hfDevice,
+            receipt.filePath,
+            receipt.dataStart,
+            receipt.byteCount,
+            int64(2),
+            receipt.chunkBytes
+        )
+        assert(IsOk(pageTable), " weight safetensors manifest smoke: hf device page table set item")
+        add(hfDevicePageTables, Value(pageTable))
+    let hfDevicePageBindingChunk5 = ws.WeightSafetensorsBuildDevicePageBinding(
+        hfIndex,
+        graph,
+        0,
+        5,
+        hfDevicePageTables[0],
+        hfDeviceCapabilityHash,
+        Value(hfPayloadPreflight).tensorReceipts[0].dtype
+    )
+    assert(IsOk(hfDevicePageBindingChunk5),
+           " weight safetensors manifest smoke: hf device page binding chunk5")
+    let hfDeviceRangeBindingSet = ws.WeightSafetensorsBuildDeviceRangeBindingSetFromPayloadPreflight(
+        hfIndex,
+        graph,
+        Value(hfPayloadPreflight),
+        hfDeviceCapabilityHash
+    )
+    assert(IsOk(hfDeviceRangeBindingSet),
+           " weight safetensors manifest smoke: hf device range binding set")
+    assert(Value(hfDeviceRangeBindingSet).schema == "cheng.inference.weight_safetensors_device_range_binding_set.v1" &&
+           Value(hfDeviceRangeBindingSet).bindings.len == graph.weights.len &&
+           Value(hfDeviceRangeBindingSet).tensorCount == graph.weights.len &&
+           Value(hfDeviceRangeBindingSet).totalBytes == Value(hfPayloadPreflight).totalPayloadBytes &&
+           Value(hfDeviceRangeBindingSet).payloadPreflightHash == Value(hfPayloadPreflight).receiptHash &&
+           Value(hfDeviceRangeBindingSet).bindingSetHash == ws.WeightSafetensorsDeviceRangeBindingSetHash(Value(hfDeviceRangeBindingSet)),
+           " weight safetensors manifest smoke: hf device range binding set facts")
+    assert(Value(hfDeviceRangeBindingSet).bindings[0].bindingHash == Value(hfDeviceRangeBindingChunk5).bindingHash,
+           " weight safetensors manifest smoke: hf device range binding set first")
+    assert(IsOk(ws.WeightSafetensorsValidateDeviceRangeBindingSet(hfIndex, graph, Value(hfDeviceRangeBindingSet))),
+           " weight safetensors manifest smoke: hf device range binding set validate")
+    let hfDeviceRangeBindingSetDirect = ws.WeightSafetensorsBuildDeviceRangeBindingSet(
+        hfIndex,
+        graph,
+        5,
+        hfDeviceCapabilityHash
+    )
+    assert(IsOk(hfDeviceRangeBindingSetDirect) &&
+           Value(hfDeviceRangeBindingSetDirect).bindingSetHash == Value(hfDeviceRangeBindingSet).bindingSetHash,
+           " weight safetensors manifest smoke: hf device range binding set direct")
+    let hfDevicePageBindingSet = ws.WeightSafetensorsBuildDevicePageBindingSetFromPayloadPreflight(
+        hfIndex,
+        graph,
+        Value(hfPayloadPreflight),
+        hfDevicePageTables,
+        hfDeviceCapabilityHash
+    )
+    assert(IsOk(hfDevicePageBindingSet),
+           " weight safetensors manifest smoke: hf device page binding set")
+    assert(Value(hfDevicePageBindingSet).schema == "cheng.inference.weight_safetensors_device_page_binding_set.v1" &&
+           Value(hfDevicePageBindingSet).bindings.len == graph.weights.len &&
+           Value(hfDevicePageBindingSet).tensorCount == graph.weights.len &&
+           Value(hfDevicePageBindingSet).totalBytes == Value(hfPayloadPreflight).totalPayloadBytes &&
+           Value(hfDevicePageBindingSet).payloadPreflightHash == Value(hfPayloadPreflight).receiptHash &&
+           Value(hfDevicePageBindingSet).bindingSetHash == ws.WeightSafetensorsDevicePageBindingSetHash(Value(hfDevicePageBindingSet)),
+           " weight safetensors manifest smoke: hf device page binding set facts")
+    assert(Value(hfDevicePageBindingSet).bindings[0].bindingHash == Value(hfDevicePageBindingChunk5).bindingHash,
+           " weight safetensors manifest smoke: hf device page binding set first")
+    assert(IsOk(ws.WeightSafetensorsValidateDevicePageBindingSet(hfIndex, graph, hfDevicePageTables, Value(hfDevicePageBindingSet))),
+           " weight safetensors manifest smoke: hf device page binding set validate")
+    let hfDevicePageBindingSetDirect = ws.WeightSafetensorsBuildDevicePageBindingSet(
+        hfIndex,
+        graph,
+        5,
+        hfDevicePageTables,
+        hfDeviceCapabilityHash
+    )
+    assert(IsOk(hfDevicePageBindingSetDirect) &&
+           Value(hfDevicePageBindingSetDirect).bindingSetHash == Value(hfDevicePageBindingSet).bindingSetHash,
+           " weight safetensors manifest smoke: hf device page binding set direct")
+    let hfDevicePageTablesAuto = ws.WeightSafetensorsBuildDevicePageTablesFromPayloadPreflight(
+        hfIndex,
+        graph,
+        Value(hfPayloadPreflight),
+        hfDevice,
+        int64(2)
+    )
+    assert(IsOk(hfDevicePageTablesAuto),
+           " weight safetensors manifest smoke: hf device page tables auto")
+    assert(Value(hfDevicePageTablesAuto).len == hfDevicePageTables.len &&
+           Value(hfDevicePageTablesAuto)[0].receiptHash == hfDevicePageTables[0].receiptHash,
+           " weight safetensors manifest smoke: hf device page tables auto match")
+    let hfDevicePageBindingSetAuto = ws.WeightSafetensorsBuildDevicePageBindingSetFromPayloadPreflightForDevice(
+        hfIndex,
+        graph,
+        Value(hfPayloadPreflight),
+        hfDevice,
+        int64(2)
+    )
+    assert(IsOk(hfDevicePageBindingSetAuto) &&
+           Value(hfDevicePageBindingSetAuto).bindingSetHash == Value(hfDevicePageBindingSet).bindingSetHash,
+           " weight safetensors manifest smoke: hf device page binding set auto")
+    let hfDevicePageBindingSetDeviceDirect = ws.WeightSafetensorsBuildDevicePageBindingSetForDevice(
+        hfIndex,
+        graph,
+        5,
+        hfDevice,
+        int64(2)
+    )
+    assert(IsOk(hfDevicePageBindingSetDeviceDirect) &&
+           Value(hfDevicePageBindingSetDeviceDirect).bindingSetHash == Value(hfDevicePageBindingSet).bindingSetHash,
+           " weight safetensors manifest smoke: hf device page binding set device direct")
+    let hfPage0 = hfDevicePageTables[0].pages[0]
+    let hfDevicePage0Buffer = dev.DeviceBufferLogical(
+        hfDevice,
+        hfPage0.byteCount,
+        Value(hfDevicePageBindingSet).bindings[0].deviceBufferDtype,
+        hfPage0.sourceRangeHash
+    )
+    let hfDevicePage0BufferReceipt = dev.DeviceBuildVerifiedFileRangeBufferLoadReceipt(
+        hfDevice,
+        hfDevicePage0Buffer,
+        hfDevicePageTables[0].filePath,
+        hfPage0.offsetBytes,
+        hfPage0.byteCount,
+        hfPage0.chunkBytes
+    )
+    assert(IsOk(hfDevicePage0BufferReceipt),
+           " weight safetensors manifest smoke: hf device page buffer receipt")
+    let hfDevicePage0Loaded = dev.DeviceFileRangeBufferLoadResult(
+        buffer: hfDevicePage0Buffer,
+        receipt: Value(hfDevicePage0BufferReceipt)
+    )
+    let hfDevicePage0Load = ws.WeightSafetensorsBuildDevicePageLoadReceiptFromBuffer(
+        hfIndex,
+        graph,
+        hfDevice,
+        hfDevicePageTables,
+        Value(hfDevicePageBindingSet),
+        0,
+        0,
+        hfDevicePage0Loaded
+    )
+    assert(IsOk(hfDevicePage0Load),
+           " weight safetensors manifest smoke: hf device page load receipt")
+    assert(Value(hfDevicePage0Load).receipt.schema == "cheng.inference.weight_safetensors_device_page_load_receipt.v1" &&
+           Value(hfDevicePage0Load).receipt.bindingSetHash == Value(hfDevicePageBindingSet).bindingSetHash &&
+           Value(hfDevicePage0Load).receipt.bindingHash == Value(hfDevicePageBindingSet).bindings[0].bindingHash &&
+           Value(hfDevicePage0Load).receipt.pageTableReceiptHash == hfDevicePageTables[0].receiptHash &&
+           Value(hfDevicePage0Load).receipt.pageIndex == 0 &&
+           Value(hfDevicePage0Load).receipt.pageOffsetBytes == hfPage0.offsetBytes &&
+           Value(hfDevicePage0Load).receipt.pageByteCount == hfPage0.byteCount &&
+           Value(hfDevicePage0Load).receipt.pageSourceRangeHash == hfPage0.sourceRangeHash &&
+           Value(hfDevicePage0Load).receipt.bufferLoadStatus == dev.InferenceDeviceBufferLoadStatusVerifiedLogical &&
+           Value(hfDevicePage0Load).receipt.bufferLoadReceiptHash == Value(hfDevicePage0BufferReceipt).receiptHash &&
+           Value(hfDevicePage0Load).receipt.receiptHash == ws.WeightSafetensorsDevicePageLoadReceiptHash(Value(hfDevicePage0Load).receipt),
+           " weight safetensors manifest smoke: hf device page load receipt facts")
+    assert(IsOk(ws.WeightSafetensorsValidateDevicePageLoadReceipt(
+        hfIndex,
+        graph,
+        hfDevice,
+        hfDevicePageTables,
+        Value(hfDevicePageBindingSet),
+        0,
+        0,
+        hfDevicePage0Loaded,
+        Value(hfDevicePage0Load).receipt
+    )), " weight safetensors manifest smoke: hf device page load receipt validate")
+    var hfBadDevicePage0LoadReceipt = Value(hfDevicePage0Load).receipt
+    hfBadDevicePage0LoadReceipt.pageSourceRangeHash = hfBadDevicePage0LoadReceipt.pageSourceRangeHash + int64(1)
+    hfBadDevicePage0LoadReceipt.receiptHash = ws.WeightSafetensorsDevicePageLoadReceiptHash(hfBadDevicePage0LoadReceipt)
+    assert(IsErr(ws.WeightSafetensorsValidateDevicePageLoadReceipt(
+        hfIndex,
+        graph,
+        hfDevice,
+        hfDevicePageTables,
+        Value(hfDevicePageBindingSet),
+        0,
+        0,
+        hfDevicePage0Loaded,
+        hfBadDevicePage0LoadReceipt
+    )), " weight safetensors manifest smoke: hf device page load receipt drift hard fail")
+    let hfDevicePage1MetalLoad = ws.WeightSafetensorsLoadDevicePageFromBindingSet(
+        hfIndex,
+        graph,
+        hfDevice,
+        hfDevicePageTables,
+        Value(hfDevicePageBindingSet),
+        0,
+        1
+    )
+    assert(IsOk(hfDevicePage1MetalLoad),
+           " weight safetensors manifest smoke: hf device page metal load")
+    assert(Value(hfDevicePage1MetalLoad).buffer.handle != uint64(0) &&
+           Value(hfDevicePage1MetalLoad).bufferReceipt.status == dev.InferenceDeviceBufferLoadStatusMetalBufferLoaded &&
+           Value(hfDevicePage1MetalLoad).receipt.bufferLoadStatus == dev.InferenceDeviceBufferLoadStatusMetalBufferLoaded &&
+           Value(hfDevicePage1MetalLoad).receipt.pageIndex == 1 &&
+           Value(hfDevicePage1MetalLoad).receipt.deviceBufferHandle == Value(hfDevicePage1MetalLoad).buffer.handle &&
+           Value(hfDevicePage1MetalLoad).receipt.bufferLoadReceiptHash == Value(hfDevicePage1MetalLoad).bufferReceipt.receiptHash,
+           " weight safetensors manifest smoke: hf device page metal load facts")
+    let hfDevicePage1Loaded = dev.DeviceFileRangeBufferLoadResult(
+        buffer: Value(hfDevicePage1MetalLoad).buffer,
+        receipt: Value(hfDevicePage1MetalLoad).bufferReceipt
+    )
+    assert(IsOk(ws.WeightSafetensorsValidateDevicePageLoadReceipt(
+        hfIndex,
+        graph,
+        hfDevice,
+        hfDevicePageTables,
+        Value(hfDevicePageBindingSet),
+        0,
+        1,
+        hfDevicePage1Loaded,
+        Value(hfDevicePage1MetalLoad).receipt
+    )), " weight safetensors manifest smoke: hf device page metal load validate")
+    assert(IsOk(dev.DeviceMetalReleaseBuffer(Value(hfDevicePage1MetalLoad).buffer)),
+           " weight safetensors manifest smoke: hf device page metal release")
+    assert(IsErr(ws.WeightSafetensorsLoadDevicePageFromBindingSet(
+        hfIndex,
+        graph,
+        hfDevice,
+        hfDevicePageTables,
+        Value(hfDevicePageBindingSet),
+        0,
+        hfDevicePageTables[0].pageCount
+    )),
+           " weight safetensors manifest smoke: hf device page metal range hard fail")
+    assert(IsErr(ws.WeightSafetensorsBuildDevicePageBindingSetFromPayloadPreflightForDevice(
+        hfIndex,
+        graph,
+        Value(hfPayloadPreflight),
+        hfDevice,
+        int64(0)
+    )),
+           " weight safetensors manifest smoke: hf device page binding set page hard fail")
+    var hfPayloadDriftBytes0 = rawbytes.BytesSlice(hfBytes0, 0, rawbytes.BytesLen(hfBytes0))
+    let hfPayloadHeaderLen = ws.WeightSafetensorsHeaderLength(hfPayloadDriftBytes0)
+    assert(IsOk(hfPayloadHeaderLen),
+           " weight safetensors manifest smoke: hf payload drift header")
+    rawbytes.BytesSet(hfPayloadDriftBytes0, 8 + Value(hfPayloadHeaderLen), rawbytes.BytesGet(hfPayloadDriftBytes0, 8 + Value(hfPayloadHeaderLen)) ^ 1)
+    assert(IsOk(os.WriteFileBytesResult(hfPath0, hfPayloadDriftBytes0)),
+           " weight safetensors manifest smoke: hf payload drift write")
+    assert(IsErr(ws.WeightSafetensorsValidateTensorRawPayloadHashReceipt(hfIndex, graph, 0, Value(hfPayloadReceipt))),
+           " weight safetensors manifest smoke: hf raw payload drift hard fail")
+    assert(IsErr(dev.DeviceValidateFileRangeBufferLoadReceipt(hfDevice, hfDeviceBuffer, Value(hfDeviceLoadReceipt))),
+           " weight safetensors manifest smoke: hf device file range load receipt drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsValidateDevicePageLoadReceipt(
+        hfIndex,
+        graph,
+        hfDevice,
+        hfDevicePageTables,
+        Value(hfDevicePageBindingSet),
+        0,
+        0,
+        hfDevicePage0Loaded,
+        Value(hfDevicePage0Load).receipt
+    )), " weight safetensors manifest smoke: hf device page load receipt payload drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsLoadDevicePageFromBindingSet(
+        hfIndex,
+        graph,
+        hfDevice,
+        hfDevicePageTables,
+        Value(hfDevicePageBindingSet),
+        0,
+        0
+    )),
+           " weight safetensors manifest smoke: hf device page metal payload drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsValidateDeviceRangeBinding(hfIndex, graph, 0, Value(hfDeviceRangeBinding))),
+           " weight safetensors manifest smoke: hf device range binding drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsValidateDevicePageBinding(
+        hfIndex,
+        graph,
+        0,
+        Value(hfDevicePageTable),
+        Value(hfDevicePageBinding)
+    )), " weight safetensors manifest smoke: hf device page binding drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsValidatePayloadHashPreflight(hfIndex, graph, Value(hfPayloadPreflight))),
+           " weight safetensors manifest smoke: hf payload hash preflight drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsBuildDevicePageTablesFromPayloadPreflight(
+        hfIndex,
+        graph,
+        Value(hfPayloadPreflight),
+        hfDevice,
+        int64(2)
+    )),
+           " weight safetensors manifest smoke: hf device page tables auto drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsValidateDeviceRangeBindingSet(hfIndex, graph, Value(hfDeviceRangeBindingSet))),
+           " weight safetensors manifest smoke: hf device range binding set drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsValidateDevicePageBindingSet(hfIndex, graph, hfDevicePageTables, Value(hfDevicePageBindingSet))),
+           " weight safetensors manifest smoke: hf device page binding set drift hard fail")
+    assert(IsOk(os.WriteFileBytesResult(hfPath0, hfBytes0)),
+           " weight safetensors manifest smoke: hf payload restore")
+    let hfRoute = exec.ModelExecutorBuildTinyRoutePlan(graph, Value(hfLoad).bindings, Value(hfLoad).store, tokenIds, 2)
+    assert(IsOk(hfRoute), " weight safetensors manifest smoke: hf route")
+    let hfExec = exec.ModelExecutorExecuteTinyGlmMoe(graph, Value(hfLoad).bindings, Value(hfLoad).store, tokenIds, Value(hfRoute))
+    assert(IsOk(hfExec), " weight safetensors manifest smoke: hf execute")
+    assert(Value(hfExec).executionHash == Value(execRes).executionHash,
+           " weight safetensors manifest smoke: hf execute hash")
+
+    let hfIndexPath = strutil.Join([
+        "/tmp/cheng_weight_safetensors_hf_index_",
+        strings.Int64ToStr(graph.graphHash),
+        ".json"
+    ], "")
+    if os.FileExists(hfIndexPath):
+        assert(os.RemoveFile(hfIndexPath), " weight safetensors manifest smoke: remove hf json")
+    var hfJsonBytes = rawbytes.BytesFromString(hfJson)
+    assert(IsOk(os.WriteFileBytesResult(hfIndexPath, hfJsonBytes)),
+           " weight safetensors manifest smoke: write hf json")
+    let hfIndexPathRes = ws.WeightSafetensorsShardIndexFromHfWeightMapPath(hfIndexPath, graph, hfBaseDir, peerIds, 1000)
+    assert(IsOk(hfIndexPathRes), " weight safetensors manifest smoke: hf path build")
+    assert(Value(hfIndexPathRes).indexHash == hfIndex.indexHash,
+           " weight safetensors manifest smoke: hf path index hash")
+    let hfBoundIndexRes = ws.WeightSafetensorsShardIndexFromHfWeightMap(hfJson, boundGraph, hfBaseDir, peerIds, 1000)
+    assert(IsOk(hfBoundIndexRes),
+           " weight safetensors manifest smoke: hf bound index build")
+    let hfBoundLoad = ws.WeightSafetensorsLoadShardIndex(Value(hfBoundIndexRes), boundGraph)
+    assert(IsOk(hfBoundLoad),
+           " weight safetensors manifest smoke: hf bound index load")
+    assert(Value(hfBoundLoad).store.storeHash == loadResult.store.storeHash,
+           " weight safetensors manifest smoke: hf bound store hash")
+    assert(IsOk(ws.WeightSafetensorsBuildPayloadFromEntryRange(Value(hfBoundIndexRes), boundGraph, 0, 64)),
+           " weight safetensors manifest smoke: hf bound range payload")
+    let hfRepository = ws.WeightSafetensorsLoadHfRepository(hfJson, boundGraph, hfBaseDir, peerIds, 1000)
+    assert(IsOk(hfRepository),
+           " weight safetensors manifest smoke: hf repository load")
+    let hfRepositoryValue = Value(hfRepository)
+    assert(hfRepositoryValue.receipt.schema == "cheng.inference.weight_safetensors_repository_receipt.v1",
+           " weight safetensors manifest smoke: hf repository schema")
+    assert(hfRepositoryValue.receipt.modelCid == boundGraph.modelCid &&
+           hfRepositoryValue.receipt.graphHash == boundGraph.graphHash,
+           " weight safetensors manifest smoke: hf repository graph")
+    assert(hfRepositoryValue.receipt.hfConfigHash > int64(0) &&
+           hfRepositoryValue.receipt.quantConfigHash > int64(0),
+           " weight safetensors manifest smoke: hf repository config hash")
+    assert(hfRepositoryValue.receipt.shardIndexHash == Value(hfBoundIndexRes).indexHash,
+           " weight safetensors manifest smoke: hf repository shard index hash")
+    assert(hfRepositoryValue.receipt.fileReceiptHash == ws.WeightSafetensorsShardFileReceiptHash(hfRepositoryValue.load.fileReceipts),
+           " weight safetensors manifest smoke: hf repository file receipt hash")
+    assert(hfRepositoryValue.receipt.bindingHash == hfRepositoryValue.load.bindings.bindingHash &&
+           hfRepositoryValue.receipt.storeHash == hfRepositoryValue.load.store.storeHash,
+           " weight safetensors manifest smoke: hf repository binding store hash")
+    assert(hfRepositoryValue.receipt.payloadCount == boundGraph.weights.len &&
+           hfRepositoryValue.receipt.receiptHash == ws.WeightSafetensorsRepositoryReceiptHash(hfRepositoryValue.receipt),
+           " weight safetensors manifest smoke: hf repository receipt hash")
+    assert(hfRepositoryValue.load.fileReceipts[0].fileByteHash > int64(0) &&
+           hfRepositoryValue.load.fileReceipts[0].fileByteCount > int64(0),
+           " weight safetensors manifest smoke: hf repository file bytes")
+    let hfRepositoryPath = ws.WeightSafetensorsLoadHfRepositoryPath(hfIndexPath, boundGraph, hfBaseDir, peerIds, 1000)
+    assert(IsOk(hfRepositoryPath),
+           " weight safetensors manifest smoke: hf repository path load")
+    assert(Value(hfRepositoryPath).receipt.receiptHash == hfRepositoryValue.receipt.receiptHash,
+           " weight safetensors manifest smoke: hf repository path hash")
+    assert(IsErr(ws.WeightSafetensorsLoadHfRepository(hfJson, graph, hfBaseDir, peerIds, 1000)),
+           " weight safetensors manifest smoke: hf repository unanchored graph hard fail")
+    let unsupportedQuantConfigJson = "{\"quantization_config\":{\"quant_method\":\"gptq\",\"bits\":4,\"group_size\":128}}"
+    assert(IsErr(ws.WeightSafetensorsLoadHfRepositoryWithConfig(hfJson, unsupportedQuantConfigJson, boundGraph, hfBaseDir, peerIds, 1000)),
+           " weight safetensors manifest smoke: unsupported quant config hard fail")
+    var hfDriftBytes0 = rawbytes.BytesSlice(hfBytes0, 0, rawbytes.BytesLen(hfBytes0))
+    let hfDriftHeaderLen = ws.WeightSafetensorsHeaderLength(hfDriftBytes0)
+    assert(IsOk(hfDriftHeaderLen),
+           " weight safetensors manifest smoke: hf repository drift header")
+    rawbytes.BytesSet(hfDriftBytes0, 8 + Value(hfDriftHeaderLen), 1)
+    assert(IsOk(os.WriteFileBytesResult(hfPath0, hfDriftBytes0)),
+           " weight safetensors manifest smoke: hf repository drift write")
+    assert(IsErr(ws.WeightSafetensorsLoadHfRepository(hfJson, boundGraph, hfBaseDir, peerIds, 1000)),
+           " weight safetensors manifest smoke: hf repository drift hard fail")
+    assert(IsErr(ws.WeightSafetensorsBuildPayloadFromEntryRange(Value(hfBoundIndexRes), boundGraph, 0, 64)),
+           " weight safetensors manifest smoke: hf bound range payload drift hard fail")
+
+    let quantHfFile = strutil.Join([
+        "cheng_weight_safetensors_quant_hf_",
+        strings.Int64ToStr(quantBoundGraph.graphHash),
+        ".safetensors"
+    ], "")
+    let quantHfPath = os.JoinPath(hfBaseDir, quantHfFile)
+    if os.FileExists(quantHfPath):
+        assert(os.RemoveFile(quantHfPath), " weight safetensors manifest smoke: remove quant hf file")
+    var quantHfBytes = quantBytes
+    assert(IsOk(os.WriteFileBytesResult(quantHfPath, quantHfBytes)),
+           " weight safetensors manifest smoke: write quant hf file")
+    let quantHfJson = safetensorsHfIndexJson(quantBoundGraph, 1, quantHfFile, quantHfFile, HfIndexValid)
+    let quantConfigJson = "{\"quantization_config\":{\"quant_method\":\"symmetric_int8\",\"bits\":8}}"
+    assert(IsErr(ws.WeightSafetensorsLoadHfRepository(quantHfJson, quantBoundGraph, hfBaseDir, quantPeers, 10)),
+           " weight safetensors manifest smoke: quant hf missing config hard fail")
+    let quantHfRepository = ws.WeightSafetensorsLoadHfRepositoryWithConfig(quantHfJson, quantConfigJson, quantBoundGraph, hfBaseDir, quantPeers, 10)
+    assert(IsOk(quantHfRepository),
+           " weight safetensors manifest smoke: quant hf repository load")
+    assert(Value(quantHfRepository).receipt.quantConfigHash > int64(0) &&
+           Value(quantHfRepository).load.store.storeHash == quantResult.store.storeHash,
+           " weight safetensors manifest smoke: quant hf repository receipt")
+    let quantConfigPath = strutil.Join([
+        "/tmp/cheng_weight_safetensors_quant_config_",
+        strings.Int64ToStr(quantBoundGraph.graphHash),
+        ".json"
+    ], "")
+    if os.FileExists(quantConfigPath):
+        assert(os.RemoveFile(quantConfigPath), " weight safetensors manifest smoke: remove quant config")
+    var quantConfigBytes = rawbytes.BytesFromString(quantConfigJson)
+    assert(IsOk(os.WriteFileBytesResult(quantConfigPath, quantConfigBytes)),
+           " weight safetensors manifest smoke: write quant config")
+    let quantIndexPath = strutil.Join([
+        "/tmp/cheng_weight_safetensors_quant_index_",
+        strings.Int64ToStr(quantBoundGraph.graphHash),
+        ".json"
+    ], "")
+    if os.FileExists(quantIndexPath):
+        assert(os.RemoveFile(quantIndexPath), " weight safetensors manifest smoke: remove quant index")
+    var quantIndexBytes = rawbytes.BytesFromString(quantHfJson)
+    assert(IsOk(os.WriteFileBytesResult(quantIndexPath, quantIndexBytes)),
+           " weight safetensors manifest smoke: write quant index")
+    let quantHfPathRepository = ws.WeightSafetensorsLoadHfRepositoryPathWithConfigPath(quantIndexPath, quantConfigPath, quantBoundGraph, hfBaseDir, quantPeers, 10)
+    assert(IsOk(quantHfPathRepository),
+           " weight safetensors manifest smoke: quant hf repository path load")
+    assert(Value(quantHfPathRepository).receipt.receiptHash == Value(quantHfRepository).receipt.receiptHash,
+           " weight safetensors manifest smoke: quant hf repository path hash")
+
+    let int4HfFile = strutil.Join([
+        "cheng_weight_safetensors_int4_hf_",
+        strings.Int64ToStr(int4BoundGraph.graphHash),
+        ".safetensors"
+    ], "")
+    let int4HfPath = os.JoinPath(hfBaseDir, int4HfFile)
+    if os.FileExists(int4HfPath):
+        assert(os.RemoveFile(int4HfPath), " weight safetensors manifest smoke: remove int4 hf file")
+    var int4HfBytes = int4Bytes
+    assert(IsOk(os.WriteFileBytesResult(int4HfPath, int4HfBytes)),
+           " weight safetensors manifest smoke: write int4 hf file")
+    let int4HfJson = safetensorsHfIndexJson(int4BoundGraph, 1, int4HfFile, int4HfFile, HfIndexValid)
+    let int4ConfigJson = "{\"quantization_config\":{\"quant_method\":\"symmetric_int4\",\"bits\":4}}"
+    assert(IsErr(ws.WeightSafetensorsLoadHfRepository(int4HfJson, int4BoundGraph, hfBaseDir, int4Peers, 10)),
+           " weight safetensors manifest smoke: int4 hf missing config hard fail")
+    assert(IsErr(ws.WeightSafetensorsLoadHfRepositoryWithConfig(int4HfJson, quantConfigJson, int4BoundGraph, hfBaseDir, int4Peers, 10)),
+           " weight safetensors manifest smoke: int4 hf int8 config hard fail")
+    let int4HfRepository = ws.WeightSafetensorsLoadHfRepositoryWithConfig(int4HfJson, int4ConfigJson, int4BoundGraph, hfBaseDir, int4Peers, 10)
+    assert(IsOk(int4HfRepository),
+           " weight safetensors manifest smoke: int4 hf repository load")
+    assert(Value(int4HfRepository).receipt.quantConfigHash > int64(0) &&
+           Value(int4HfRepository).load.store.storeHash == int4Result.store.storeHash,
+           " weight safetensors manifest smoke: int4 hf repository receipt")
+
+    let w4Afp8HfFile = strutil.Join([
+        "cheng_weight_safetensors_w4afp8_hf_",
+        strings.Int64ToStr(w4Afp8BoundGraph.graphHash),
+        ".safetensors"
+    ], "")
+    let w4Afp8HfPath = os.JoinPath(hfBaseDir, w4Afp8HfFile)
+    if os.FileExists(w4Afp8HfPath):
+        assert(os.RemoveFile(w4Afp8HfPath), " weight safetensors manifest smoke: remove w4afp8 hf file")
+    var w4Afp8HfBytes = w4Afp8Bytes
+    assert(IsOk(os.WriteFileBytesResult(w4Afp8HfPath, w4Afp8HfBytes)),
+           " weight safetensors manifest smoke: write w4afp8 hf file")
+    let w4Afp8HfJson = safetensorsHfIndexJson(w4Afp8BoundGraph, 3, w4Afp8HfFile, w4Afp8HfFile, HfIndexValid)
+    assert(IsErr(ws.WeightSafetensorsLoadHfRepository(w4Afp8HfJson, w4Afp8BoundGraph, hfBaseDir, w4Afp8Peers, 1000)),
+           " weight safetensors manifest smoke: w4afp8 hf missing config hard fail")
+    assert(IsErr(ws.WeightSafetensorsLoadHfRepositoryWithConfig(w4Afp8HfJson, quantConfigJson, w4Afp8BoundGraph, hfBaseDir, w4Afp8Peers, 1000)),
+           " weight safetensors manifest smoke: w4afp8 hf int8 config hard fail")
+    let w4Afp8HfRepository = ws.WeightSafetensorsLoadHfRepositoryWithConfig(w4Afp8HfJson, w4ConfigJson, w4Afp8BoundGraph, hfBaseDir, w4Afp8Peers, 1000)
+    assert(IsOk(w4Afp8HfRepository),
+           " weight safetensors manifest smoke: w4afp8 hf repository load")
+    assert(Value(w4Afp8HfRepository).receipt.quantConfigHash > int64(0) &&
+           Value(w4Afp8HfRepository).load.store.storeHash == w4Afp8Result.store.storeHash,
+           " weight safetensors manifest smoke: w4afp8 hf repository receipt")
+
+    assert(IsErr(ws.WeightSafetensorsShardIndexFromHfWeightMap("{\"metadata\":{\"total_size\":1}}", graph, hfBaseDir, peerIds, 1000)),
+           " weight safetensors manifest smoke: hf missing weight_map hard fail")
+    assert(IsErr(ws.WeightSafetensorsShardIndexFromHfWeightMap("{\"weight_map\":[]}", graph, hfBaseDir, peerIds, 1000)),
+           " weight safetensors manifest smoke: hf weight_map object hard fail")
+    assert(IsErr(ws.WeightSafetensorsShardIndexFromHfWeightMap(safetensorsHfIndexJson(graph, 3, hfFile0, hfFile1, HfIndexMissingTensor), graph, hfBaseDir, peerIds, 1000)),
+           " weight safetensors manifest smoke: hf missing tensor hard fail")
+    assert(IsErr(ws.WeightSafetensorsShardIndexFromHfWeightMap(safetensorsHfIndexJson(graph, 3, hfFile0, hfFile1, HfIndexPathTraversal), graph, hfBaseDir, peerIds, 1000)),
+           " weight safetensors manifest smoke: hf traversal hard fail")
+    assert(IsErr(ws.WeightSafetensorsShardIndexFromHfWeightMap(safetensorsHfIndexJson(graph, 3, hfFile0, hfFile1, HfIndexAbsolutePath), graph, hfBaseDir, peerIds, 1000)),
+           " weight safetensors manifest smoke: hf absolute path hard fail")
+    assert(IsErr(ws.WeightSafetensorsShardIndexFromHfWeightMap(safetensorsHfIndexJson(graph, 3, hfFile0, hfFile1, HfIndexBadSuffix), graph, hfBaseDir, peerIds, 1000)),
+           " weight safetensors manifest smoke: hf bad suffix hard fail")
+    let duplicateHfJson = strutil.Join([
+        "{\"weight_map\":{\"embedding.weight\":\"",
+        hfFile0,
+        "\",\"embedding.weight\":\"",
+        hfFile1,
+        "\"}}"
+    ], "")
+    assert(IsErr(ws.WeightSafetensorsShardIndexFromHfWeightMap(duplicateHfJson, graph, hfBaseDir, peerIds, 1000)),
+           " weight safetensors manifest smoke: hf duplicate key hard fail")
+    var hfShortPeers: str[]
+    add(hfShortPeers, "peer:short")
+    assert(IsErr(ws.WeightSafetensorsShardIndexFromHfWeightMap(hfJson, graph, hfBaseDir, hfShortPeers, 1000)),
+           " weight safetensors manifest smoke: hf peer count hard fail")
+    assert(IsErr(ws.WeightSafetensorsShardIndexFromHfWeightMap(hfJson, graph, hfBaseDir, peerIds, 0)),
+           " weight safetensors manifest smoke: hf tensor scale hard fail")
+
+    var badHashIndex = shardIndex
+    badHashIndex.indexHash = badHashIndex.indexHash + int64(1)
+    assert(IsErr(ws.WeightSafetensorsLoadShardIndex(badHashIndex, graph)),
+           " weight safetensors manifest smoke: index hash hard fail")
+
+    var missingTensorEntries: ws.WeightSafetensorsShardIndexEntry[]
+    for i in 0..<shardIndex.entries.len:
+        var entry = shardIndex.entries[i]
+        if i == 0:
+            entry.filePath = shardPath1
+        add(missingTensorEntries, entry)
+    let missingTensorIndex = ws.WeightSafetensorsShardIndexBuild(graph.modelCid, graph.graphHash, missingTensorEntries)
+    assert(IsErr(ws.WeightSafetensorsLoadShardIndex(missingTensorIndex, graph)),
+           " weight safetensors manifest smoke: index file tensor hard fail")
+
+    var emptyPeerEntries: ws.WeightSafetensorsShardIndexEntry[]
+    for i in 0..<shardIndex.entries.len:
+        var entry = shardIndex.entries[i]
+        if i == 0:
+            entry.peerId = ""
+        add(emptyPeerEntries, entry)
+    let emptyPeerIndex = ws.WeightSafetensorsShardIndexBuild(graph.modelCid, graph.graphHash, emptyPeerEntries)
+    assert(IsErr(ws.WeightSafetensorsLoadShardIndex(emptyPeerIndex, graph)),
+           " weight safetensors manifest smoke: index peer hard fail")
+
+    var duplicateEntries: ws.WeightSafetensorsShardIndexEntry[]
+    for i in 0..<shardIndex.entries.len:
+        var entry = shardIndex.entries[i]
+        if i == 1:
+            entry = shardIndex.entries[0]
+        add(duplicateEntries, entry)
+    let duplicateIndex = ws.WeightSafetensorsShardIndexBuild(graph.modelCid, graph.graphHash, duplicateEntries)
+    assert(IsErr(ws.WeightSafetensorsLoadShardIndex(duplicateIndex, graph)),
+           " weight safetensors manifest smoke: duplicate index hard fail")
+
+    var shortPeers: str[]
+    add(shortPeers, "peer:short")
+    assert(IsErr(ws.WeightSafetensorsLoadGraphFile(numericBytes, graph, shortPeers, 1000)),
+           " weight safetensors manifest smoke: peer count hard fail")
+    assert(IsErr(ws.WeightSafetensorsLoadGraphFile(numericBytes, graph, peerIds, 0)),
+           " weight safetensors manifest smoke: tensor scale hard fail")
+
+    var infBytes = numericBytes
+    let headerLen = ws.WeightSafetensorsHeaderLength(infBytes)
+    assert(IsOk(headerLen), " weight safetensors manifest smoke: numeric header len")
+    writeF16LE(infBytes, 8 + Value(headerLen), 0x7c00)
+    assert(IsErr(ws.WeightSafetensorsLoadGraphFile(infBytes, graph, peerIds, 1000)),
+           " weight safetensors manifest smoke: f16 inf hard fail")
+    assert(IsErr(ws.WeightSafetensorsDecodeBf16Scaled(0x7f80, 1000)),
+           " weight safetensors manifest smoke: bf16 inf hard fail")
+
+    echo(" weight_safetensors_manifest_smoke ok")
+    return 0

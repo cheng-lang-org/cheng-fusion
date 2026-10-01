@@ -1,0 +1,266 @@
+# libp2p P3 收尾片: channel 授权记录线格式 codec + 签验 + 授权谓词 (正典 §11.6 P3)。
+# 撤销 / recovery 绑定 / rotation / delegation cert 四类授权记录共用一副 169B 骨架, 仅
+# tag / DOMAIN / 授权谓词不同 (DRY)。照 head_codec 纪律 (固定长 + 显式 tag + 域分离签名输入),
+# 直 import ed25519 (禁 crypto/crypto 的 case-int64 冷拒 / signed_envelope 编不进 stage3)。
+#
+# 共享线格式 (固定 169 字节, big-endian):
+#   [tag:1][A:32][B:32][epoch u64-be:8][signerPubKey:32][sig:64]
+#   偏移: tag@0, A@1..32, B@33..64, epoch@65..72, signer@73..104, sig@105..168
+#
+# 签名输入 (域分离规范字节, 除 sig 外全字段规范序):
+#   DOMAIN ++ A(32) ++ B(32) ++ epoch(u64-be 8) ++ signer(32)   (长度 = len(DOMAIN)+104)
+#
+# 四记录型语义 (A/B/signer 各自绑定):
+#   撤销 0x20      : A=channelId       B=revokedPubKey   signer=授权者    DOMAIN channel-revoke/v1
+#   recovery 绑定 0x30: A=channelId    B=recoveryKeyHash signer=根钥      DOMAIN channel-recovery-bind/v1
+#   rotation 0x31  : A=oldChannelId    B=newChannelId    signer=recovery钥 DOMAIN channel-rotate/v1
+#   delegation 0x40: A=channelId(L)    B=delegatePubKey  signer=根钥      DOMAIN channel-delegate/v1
+#
+# 生产纪律 (no fallback / let it crash): 畸形 (线长非 169 / tag 错 / 字段非 32B / 签名不符)
+#   一律 Result Err 带独立 rejectReason (每环独立可辨); 授权谓词双否即拒。
+
+import std/result
+import std/rawbytes
+import cheng/std/bytes_layout as layout
+import cheng/libp2p/crypto/ed25519/ed25519 as ed
+import cheng/libp2p/protocols/cas_source/channel_head/head_codec as head
+
+const
+    AuthzTagRevoke: int32 = 0x20
+    AuthzTagRecoveryBind: int32 = 0x30
+    AuthzTagRotate: int32 = 0x31
+    AuthzTagDelegate: int32 = 0x40
+    authzWireLen: int32 = 169
+    authzPubKeyLen: int32 = 32
+    authzSigLen: int32 = 64
+    authzSignInputCap: int32 = 256
+    domainRevoke: str = "cheng/libp2p/channel-revoke/v1"
+    domainRecoveryBind: str = "cheng/libp2p/channel-recovery-bind/v1"
+    domainRotate: str = "cheng/libp2p/channel-rotate/v1"
+    domainDelegate: str = "cheng/libp2p/channel-delegate/v1"
+
+type
+    AuthzRecord =
+        tag: int32
+        a: layout.FixedBytes32
+        b: layout.FixedBytes32
+        epoch: int64
+        signerPubKey: Bytes   # 32B raw ed25519 公钥
+        sig: Bytes            # 64B raw ed25519 签名
+
+# 托管字段逐字段克隆重建 (禁止整份 MOVE 复用; 负例变体从此构造)。
+@borrows
+fn AuthzRecordClone(src: AuthzRecord): AuthzRecord =
+    var out: AuthzRecord
+    out.tag = src.tag
+    out.a = src.a
+    out.b = src.b
+    out.epoch = src.epoch
+    out.signerPubKey = BytesSlice(src.signerPubKey, 0, BytesLen(src.signerPubKey))
+    out.sig = BytesSlice(src.sig, 0, BytesLen(src.sig))
+    return out
+
+# ---- tag → DOMAIN 映射 (无 Fmt, 纯 if 链) ----
+
+fn authzDomainForTag(tag: int32): str =
+    if tag == AuthzTagRevoke:
+        return domainRevoke
+    if tag == AuthzTagRecoveryBind:
+        return domainRecoveryBind
+    if tag == AuthzTagRotate:
+        return domainRotate
+    if tag == AuthzTagDelegate:
+        return domainDelegate
+    return ""
+
+# ---- u64 big-endian (照 head_codec 已验证的 int64 移位口径) ----
+
+fn authzAppendU64BE(buf: var layout.ByteBuf, value: int64) =
+    layout.ByteBufAppendByte(buf, int32((value >> 56) & 255))
+    layout.ByteBufAppendByte(buf, int32((value >> 48) & 255))
+    layout.ByteBufAppendByte(buf, int32((value >> 40) & 255))
+    layout.ByteBufAppendByte(buf, int32((value >> 32) & 255))
+    layout.ByteBufAppendByte(buf, int32((value >> 24) & 255))
+    layout.ByteBufAppendByte(buf, int32((value >> 16) & 255))
+    layout.ByteBufAppendByte(buf, int32((value >> 8) & 255))
+    layout.ByteBufAppendByte(buf, int32(value & 255))
+
+fn authzReadU64BE(payload: Bytes, off: int32): int64 =
+    let b0: int64 = int64(BytesGet(payload, off))
+    let b1: int64 = int64(BytesGet(payload, off + 1))
+    let b2: int64 = int64(BytesGet(payload, off + 2))
+    let b3: int64 = int64(BytesGet(payload, off + 3))
+    let b4: int64 = int64(BytesGet(payload, off + 4))
+    let b5: int64 = int64(BytesGet(payload, off + 5))
+    let b6: int64 = int64(BytesGet(payload, off + 6))
+    let b7: int64 = int64(BytesGet(payload, off + 7))
+    return (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32) | (b4 << 24) | (b5 << 16) | (b6 << 8) | b7
+
+# ---- 域分离规范签名输入 (除 sig 外全字段规范序) ----
+
+fn authzSigningInput(domain: str, a: layout.FixedBytes32, b: layout.FixedBytes32, epoch: int64, signer: Bytes): Bytes =
+    var buf = layout.ByteBufInit(authzSignInputCap)
+    layout.ByteBufAppendBytes(buf, rawbytes.BytesFromString(domain))
+    layout.ByteBufAppendBytes(buf, layout.FixedBytes32ToBytes(a))
+    layout.ByteBufAppendBytes(buf, layout.FixedBytes32ToBytes(b))
+    authzAppendU64BE(buf, epoch)
+    layout.ByteBufAppendBytes(buf, signer)
+    return layout.ByteBufToBytes(buf)
+
+# ---- 编码 (纯序列化; 字段长硬校验) ----
+
+@borrows
+fn AuthzRecordEncode(rec: AuthzRecord): Result[Bytes] =
+    if authzDomainForTag(rec.tag) == "":
+        return Err[Bytes]("authz: 未知 tag (拒编码)")
+    if BytesLen(rec.signerPubKey) != authzPubKeyLen:
+        return Err[Bytes]("authz: signerPubKey 必须 32B")
+    if BytesLen(rec.sig) != authzSigLen:
+        return Err[Bytes]("authz: sig 必须 64B")
+    var buf = layout.ByteBufInit(authzWireLen)
+    layout.ByteBufAppendByte(buf, rec.tag)
+    layout.ByteBufAppendBytes(buf, layout.FixedBytes32ToBytes(rec.a))
+    layout.ByteBufAppendBytes(buf, layout.FixedBytes32ToBytes(rec.b))
+    authzAppendU64BE(buf, rec.epoch)
+    layout.ByteBufAppendBytes(buf, rec.signerPubKey)
+    layout.ByteBufAppendBytes(buf, rec.sig)
+    return Ok[Bytes](layout.ByteBufToBytes(buf))
+
+# ---- 解码 (纯反序列化 + tag 校验; 无签名验证, 签验单独走 AuthzRecordVerifySig) ----
+# expectTag: 调用方钦定期望 tag (记录型判别位); 不符即拒 (防跨记录型混淆)。
+# labelFor: 各记录型独立 rejectReason 前缀 (revoke / recovery-bind / rotate / delegate)。
+
+fn authzLabelForTag(tag: int32): str =
+    if tag == AuthzTagRevoke:
+        return "revoke"
+    if tag == AuthzTagRecoveryBind:
+        return "recovery-bind"
+    if tag == AuthzTagRotate:
+        return "rotate"
+    if tag == AuthzTagDelegate:
+        return "delegate"
+    return "authz"
+
+@borrows
+fn AuthzRecordDecode(payload: Bytes, expectTag: int32): Result[AuthzRecord] =
+    let label = authzLabelForTag(expectTag)
+    if BytesLen(payload) != authzWireLen:
+        return Err[AuthzRecord](label + ": 线长非 169")
+    if BytesGet(payload, 0) != expectTag:
+        return Err[AuthzRecord](label + ": tag 不符")
+    var rec: AuthzRecord
+    rec.tag = expectTag
+    var aRes = layout.FixedBytes32FromBytes(BytesSlice(payload, 1, 32))
+    if IsErr(aRes):
+        return Err[AuthzRecord](label + ": A 字段非 32B")
+    rec.a = Value(aRes)
+    var bRes = layout.FixedBytes32FromBytes(BytesSlice(payload, 33, 32))
+    if IsErr(bRes):
+        return Err[AuthzRecord](label + ": B 字段非 32B")
+    rec.b = Value(bRes)
+    rec.epoch = authzReadU64BE(payload, 65)
+    rec.signerPubKey = BytesSlice(payload, 73, 32)
+    rec.sig = BytesSlice(payload, 105, 64)
+    if BytesLen(rec.signerPubKey) != authzPubKeyLen:
+        return Err[AuthzRecord](label + ": signerPubKey 非 32B")
+    if BytesLen(rec.sig) != authzSigLen:
+        return Err[AuthzRecord](label + ": sig 非 64B")
+    return Ok[AuthzRecord](rec)
+
+# ---- 签名 (真 ed25519, 域分离规范字节; priv = 64B seed||pub) ----
+
+fn AuthzRecordSign(tag: int32, priv: Bytes, a: layout.FixedBytes32, b: layout.FixedBytes32, epoch: int64, signer: Bytes): Result[AuthzRecord] =
+    let domain = authzDomainForTag(tag)
+    if domain == "":
+        return Err[AuthzRecord]("authz: 未知 tag (拒签名)")
+    if BytesLen(signer) != authzPubKeyLen:
+        return Err[AuthzRecord]("authz: signerPubKey 必须 32B")
+    if BytesLen(priv) != 64:
+        return Err[AuthzRecord]("authz: priv 必须 64B (seed||pub)")
+    let input = authzSigningInput(domain, a, b, epoch, signer)
+    var sigRes = ed.signEd25519Raw(priv, input)
+    if IsErr(sigRes):
+        return Err[AuthzRecord](Error(sigRes))
+    var rec: AuthzRecord
+    rec.tag = tag
+    rec.a = a
+    rec.b = b
+    rec.epoch = epoch
+    rec.signerPubKey = signer
+    rec.sig = Value(sigRes)
+    return Ok[AuthzRecord](rec)
+
+# ---- 签名验证 (真 ed25519 + 域分离规范字节重建) ----
+
+@borrows
+fn AuthzRecordVerifySig(rec: AuthzRecord): bool =
+    if BytesLen(rec.signerPubKey) != authzPubKeyLen:
+        return false
+    if BytesLen(rec.sig) != authzSigLen:
+        return false
+    let domain = authzDomainForTag(rec.tag)
+    if domain == "":
+        return false
+    let input = authzSigningInput(domain, rec.a, rec.b, rec.epoch, rec.signerPubKey)
+    return ed.verifyEd25519(rec.signerPubKey, input, rec.sig)
+
+# ==== 授权谓词 (store-free; recovery pin 由调用方以显式参数传入, 便于单测) ====
+
+# ① 撤销授权: sig 验过 AND (A==sha256(signer) [根钥自撤/撤委托] OR sha256(signer)==pinnedRecoveryKeyHash [恢复钥撤根钥])。
+# hasRecoveryPin=false 时只认根钥自撤路径。
+@borrows
+fn RevocationVerify(rec: AuthzRecord, hasRecoveryPin: bool, recoveryKeyHash: layout.FixedBytes32): Result[bool] =
+    if rec.tag != AuthzTagRevoke:
+        return Err[bool]("revoke: tag 不符")
+    if !AuthzRecordVerifySig(rec):
+        return Err[bool]("revoke: 签名不匹配规范字节")
+    let signerHash = head.ChannelIdForPubKey(rec.signerPubKey)
+    let selfRoot = layout.FixedBytes32Equal(signerHash, rec.a)
+    var recoveryAuth = false
+    if hasRecoveryPin:
+        recoveryAuth = layout.FixedBytes32Equal(signerHash, recoveryKeyHash)
+    if !(selfRoot || recoveryAuth):
+        return Err[bool]("revoke: signer 对 channel 无撤销权")
+    return Ok[bool](true)
+
+# ② recovery 绑定授权: sig 验过 AND A(channelId)==sha256(signer) (只有根钥能声明 recovery 钥)。
+# 返回 recoveryKeyHash (= B)。
+@borrows
+fn RecoveryBindVerify(rec: AuthzRecord): Result[layout.FixedBytes32] =
+    if rec.tag != AuthzTagRecoveryBind:
+        return Err[layout.FixedBytes32]("recovery-bind: tag 不符")
+    if !AuthzRecordVerifySig(rec):
+        return Err[layout.FixedBytes32]("recovery-bind: 签名不匹配")
+    let signerHash = head.ChannelIdForPubKey(rec.signerPubKey)
+    if !layout.FixedBytes32Equal(signerHash, rec.a):
+        return Err[layout.FixedBytes32]("recovery-bind: 只有根钥能声明 recovery 钥")
+    return Ok[layout.FixedBytes32](rec.b)
+
+# ③ rotation 授权: sig 验过 AND sha256(recoveryPubKey=signer)==pinnedRecoveryKeyHash。
+# (T6 无 recovery pin 的拒在 authz_store 前置; 本谓词只在有 pin 时被调。)
+@borrows
+fn RotationVerify(rec: AuthzRecord, pinnedRecoveryKeyHash: layout.FixedBytes32): Result[bool] =
+    if rec.tag != AuthzTagRotate:
+        return Err[bool]("rotate: tag 不符")
+    if !AuthzRecordVerifySig(rec):
+        return Err[bool]("rotate: 签名不匹配")
+    let signerHash = head.ChannelIdForPubKey(rec.signerPubKey)
+    if !layout.FixedBytes32Equal(signerHash, pinnedRecoveryKeyHash):
+        return Err[bool]("rotate: rotation 授权拒 (非 recovery 钥)")
+    return Ok[bool](true)
+
+# ④ delegation cert 授权: sig 验过 AND cert signer 自证为 currentRoot (sha256(signer)==currentRoot)
+# AND A(声明 channel)==currentRoot。depth-1 由此结构化保证 (delegate 无根私钥, 造不出 signer
+# 自证==currentRoot 的 cert)。
+@borrows
+fn DelegationVerify(rec: AuthzRecord, currentRootChannelId: layout.FixedBytes32): Result[bool] =
+    if rec.tag != AuthzTagDelegate:
+        return Err[bool]("delegate: tag 不符")
+    if !AuthzRecordVerifySig(rec):
+        return Err[bool]("delegate: cert 签名不匹配")
+    let signerChannel = head.ChannelIdForPubKey(rec.signerPubKey)
+    if !layout.FixedBytes32Equal(signerChannel, currentRootChannelId):
+        return Err[bool]("delegate: cert 签发者非根钥 (伪造/子委托拒)")
+    if !layout.FixedBytes32Equal(rec.a, currentRootChannelId):
+        return Err[bool]("delegate: cert channel 不符请求")
+    return Ok[bool](true)

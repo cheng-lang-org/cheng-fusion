@@ -1,0 +1,668 @@
+# AES-GCM AEAD(RFC 5116 / NIST SP 800-38D).
+
+import std/result
+import std/rawbytes
+import std/seqs
+import std/rawmem_support
+import std/crypto/aes
+
+type
+    # 原生词访问别名（模块私有）：CTR keystream 词异或与计数器直写用。
+    AesGcmU32Ptr = uint32 *
+    AesGcmU64Ptr = uint64 *
+const
+    aesGcmNonceSize = 12
+    aesGcmTagSize = 16
+
+type
+    AesGcmKey =
+        rounds: int32
+        roundKeys: Bytes
+
+    AesGcmNonce =
+        data: Bytes
+
+    AesGcmTag =
+        data: Bytes
+
+fn intoAesGcmKey(data: Bytes): Result[AesGcmKey] =
+    var out: AesGcmKey
+    let fillRes: Result[bool] = intoAesGcmKeyInto(out, data)
+    if IsErr(fillRes):
+        return Err[AesGcmKey](ErrorText(fillRes))
+    return Ok[AesGcmKey](out)
+
+fn intoAesGcmKeyInto(out: var AesGcmKey, data: Bytes): Result[bool] =
+    var keys: aes.AesRoundKeys
+    let res: Result[bool] = aes.aesKeyExpandInto(keys, data)
+    if IsErr(res):
+        return Err[bool](ErrorText(res))
+    out.rounds = keys.rounds
+    out.roundKeys = keys.data
+    return Ok[bool](true)
+
+fn intoAesGcmNonce(data: Bytes): Result[AesGcmNonce] =
+    var out: AesGcmNonce
+    let fillRes: Result[bool] = intoAesGcmNonceInto(out, data)
+    if IsErr(fillRes):
+        return Err[AesGcmNonce](ErrorText(fillRes))
+    return Ok[AesGcmNonce](out)
+
+fn intoAesGcmNonceInto(out: var AesGcmNonce, data: Bytes): Result[bool] =
+    if BytesLen(data) != aesGcmNonceSize:
+        return Err[bool]("aesgcm: invalid nonce size")
+    out.data = data
+    return Ok[bool](true)
+
+fn intoAesGcmTag(data: Bytes): Result[AesGcmTag] =
+    var out: AesGcmTag
+    let fillRes: Result[bool] = intoAesGcmTagInto(out, data)
+    if IsErr(fillRes):
+        return Err[AesGcmTag](ErrorText(fillRes))
+    return Ok[AesGcmTag](out)
+
+fn intoAesGcmTagInto(out: var AesGcmTag, data: Bytes): Result[bool] =
+    if BytesLen(data) != aesGcmTagSize:
+        return Err[bool]("aesgcm: invalid tag size")
+    out.data = data
+    return Ok[bool](true)
+
+fn gcmLoadBE64(data: Bytes, offset: int32): uint64 =
+    var v: uint64
+    for j in 0..<8:
+        v = (v << 8) | uint64(BytesGet(data, offset + j) & 255)
+    return v
+
+@borrows
+fn gcmStoreBE64(out: Bytes, offset: int32, v: uint64) =
+    for j in 0..<8:
+        BytesSet(out, offset + j, int32(v >> (56 - j * 8)) & 255)
+
+# Load up to 16 bytes at offset as a big-endian (hi,lo) uint64 pair, zero-padding a
+# short final block. Replaces gcmBlock's per-block BytesAlloc(16) — the GHASH input
+# block now lives in two registers instead of a heap buffer.
+@borrows
+fn gcmLoadBlockPair(data: Bytes, offset: int32, outHi: var uint64, outLo: var uint64) =
+    # 原生 u64 双词载入 + 字节反转（大端块语义）。块边界 16B ⇒ 载入 8B 对齐；
+    # 尾块（offset+16 > len，仅流末尾）回退到原逐字节边界感知形式。
+    let n: int32 = BytesLen(data)
+    if offset + 16 <= n:
+        let base: ptr = data.data
+        let v0: uint64 = *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(base, offset)))
+        let v1: uint64 = *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(base, offset + 8)))
+        outHi = gcmBswap64(v0)
+        outLo = gcmBswap64(v1)
+        return
+    var hi: uint64
+    var lo: uint64
+    for j in 0..<8:
+        let idx: int32 = offset + j
+        var b: uint64
+        if idx < n:
+            b = uint64(BytesGet(data, idx) & 255)
+        hi = (hi << 8) | b
+    for j in 0..<8:
+        let idx: int32 = offset + 8 + j
+        var b: uint64
+        if idx < n:
+            b = uint64(BytesGet(data, idx) & 255)
+        lo = (lo << 8) | b
+    outHi = hi
+    outLo = lo
+
+fn gcmBswap64(x: uint64): uint64 =
+    return ((x & uint64(255)) << 56) | ((x & uint64(0xFF00)) << 40) |
+           ((x & uint64(0xFF0000)) << 24) | ((x & uint64(0xFF000000)) << 8) |
+           ((x >> 8) & uint64(0xFF000000)) | ((x >> 24) & uint64(0xFF0000)) |
+           ((x >> 40) & uint64(0xFF00)) | ((x >> 56) & uint64(255))
+
+# 单步 ×x：与 gcmMulPair 内层逐步一致（128 位右移 1 + 0xe1 顶部折叠）。
+fn gcmMulX1Step(hi: var uint64, lo: var uint64) =
+    let lsb: uint64 = lo & uint64(1)
+    lo = (lo >> 1) | ((hi & uint64(1)) << 63)
+    hi = hi >> 1
+    if lsb != uint64(0):
+        hi = hi ^ (uint64(0xe1) << 56)
+
+# 造一个字节位置表：T[b] = XOR over set bits t of b of M[mkBase + (7 - t)]。
+# 利用 GF(2) 线性按最低位递推，每表 O(256)。
+@borrows
+fn gcmBuildByteTable(th: var uint64[], tl: var uint64[], mkBase: int32,
+                     mktH: uint64[], mktL: uint64[]) =
+    setLen(th, 256)
+    setLen(tl, 256)
+    for b in 1..<256:
+        var t: int32
+        while ((b >> t) & 1) == 0:
+            t = t + 1
+        let prev: int32 = b ^ (1 << t)
+        let k: int32 = mkBase + (7 - t)
+        th[b] = th[prev] ^ mktH[k]
+        tl[b] = tl[prev] ^ mktL[k]
+
+# GHASH GF(2^128) multiply on 64-bit limbs, fully register-resident: both the
+# 128-bit accumulator and the multiplier are (hi,lo) uint64 pairs. No heap block
+# is allocated per call. This is the bulk-relay hot path (one call per 16-byte
+# block). Table form: the multiply is GF(2)-linear in x ^ y, so with basis
+# images M_k = H·x^k (M_0 = H, M_k = M_{k-1}·x via gcmMulX1Step — the exact
+# recurrence of the old 128-step bit loop) the product is
+#   x·H = XOR_p T_p[byte_p(z)],  z = x ^ y
+# with T_p[b] = XOR over set bits t of b of M[8p + (7-t)]. 16 byte-position
+# tables replace 128 conditional steps: 16 lookups per block. Verified
+# bit-identical to gcmMulPair (exhaustive single-bit + 10k random differentials).
+# Tables are built once per ghashInto call (~35us), amortized over the stream.
+@borrows
+fn ghashInto(out: Bytes, hHi: uint64, hLo: uint64, aad: Bytes, data: Bytes) =
+    var mktH: uint64[]
+    var mktL: uint64[]
+    setLen(mktH, 128)
+    setLen(mktL, 128)
+    mktH[0] = hHi
+    mktL[0] = hLo
+    for k in 1..<128:
+        var kh: uint64 = mktH[k - 1]
+        var kl: uint64 = mktL[k - 1]
+        gcmMulX1Step(kh, kl)
+        mktH[k] = kh
+        mktL[k] = kl
+    var t0h: uint64[]
+    var t0l: uint64[]
+    var t1h: uint64[]
+    var t1l: uint64[]
+    var t2h: uint64[]
+    var t2l: uint64[]
+    var t3h: uint64[]
+    var t3l: uint64[]
+    var t4h: uint64[]
+    var t4l: uint64[]
+    var t5h: uint64[]
+    var t5l: uint64[]
+    var t6h: uint64[]
+    var t6l: uint64[]
+    var t7h: uint64[]
+    var t7l: uint64[]
+    var t8h: uint64[]
+    var t8l: uint64[]
+    var t9h: uint64[]
+    var t9l: uint64[]
+    var t10h: uint64[]
+    var t10l: uint64[]
+    var t11h: uint64[]
+    var t11l: uint64[]
+    var t12h: uint64[]
+    var t12l: uint64[]
+    var t13h: uint64[]
+    var t13l: uint64[]
+    var t14h: uint64[]
+    var t14l: uint64[]
+    var t15h: uint64[]
+    var t15l: uint64[]
+    gcmBuildByteTable(t0h, t0l, 0, mktH, mktL)
+    gcmBuildByteTable(t1h, t1l, 8, mktH, mktL)
+    gcmBuildByteTable(t2h, t2l, 16, mktH, mktL)
+    gcmBuildByteTable(t3h, t3l, 24, mktH, mktL)
+    gcmBuildByteTable(t4h, t4l, 32, mktH, mktL)
+    gcmBuildByteTable(t5h, t5l, 40, mktH, mktL)
+    gcmBuildByteTable(t6h, t6l, 48, mktH, mktL)
+    gcmBuildByteTable(t7h, t7l, 56, mktH, mktL)
+    gcmBuildByteTable(t8h, t8l, 64, mktH, mktL)
+    gcmBuildByteTable(t9h, t9l, 72, mktH, mktL)
+    gcmBuildByteTable(t10h, t10l, 80, mktH, mktL)
+    gcmBuildByteTable(t11h, t11l, 88, mktH, mktL)
+    gcmBuildByteTable(t12h, t12l, 96, mktH, mktL)
+    gcmBuildByteTable(t13h, t13l, 104, mktH, mktL)
+    gcmBuildByteTable(t14h, t14l, 112, mktH, mktL)
+    gcmBuildByteTable(t15h, t15l, 120, mktH, mktL)
+    let t0hP: ptr = seqs.dataPtr(t0h)
+    let t0lP: ptr = seqs.dataPtr(t0l)
+    let t1hP: ptr = seqs.dataPtr(t1h)
+    let t1lP: ptr = seqs.dataPtr(t1l)
+    let t2hP: ptr = seqs.dataPtr(t2h)
+    let t2lP: ptr = seqs.dataPtr(t2l)
+    let t3hP: ptr = seqs.dataPtr(t3h)
+    let t3lP: ptr = seqs.dataPtr(t3l)
+    let t4hP: ptr = seqs.dataPtr(t4h)
+    let t4lP: ptr = seqs.dataPtr(t4l)
+    let t5hP: ptr = seqs.dataPtr(t5h)
+    let t5lP: ptr = seqs.dataPtr(t5l)
+    let t6hP: ptr = seqs.dataPtr(t6h)
+    let t6lP: ptr = seqs.dataPtr(t6l)
+    let t7hP: ptr = seqs.dataPtr(t7h)
+    let t7lP: ptr = seqs.dataPtr(t7l)
+    let t8hP: ptr = seqs.dataPtr(t8h)
+    let t8lP: ptr = seqs.dataPtr(t8l)
+    let t9hP: ptr = seqs.dataPtr(t9h)
+    let t9lP: ptr = seqs.dataPtr(t9l)
+    let t10hP: ptr = seqs.dataPtr(t10h)
+    let t10lP: ptr = seqs.dataPtr(t10l)
+    let t11hP: ptr = seqs.dataPtr(t11h)
+    let t11lP: ptr = seqs.dataPtr(t11l)
+    let t12hP: ptr = seqs.dataPtr(t12h)
+    let t12lP: ptr = seqs.dataPtr(t12l)
+    let t13hP: ptr = seqs.dataPtr(t13h)
+    let t13lP: ptr = seqs.dataPtr(t13l)
+    let t14hP: ptr = seqs.dataPtr(t14h)
+    let t14lP: ptr = seqs.dataPtr(t14l)
+    let t15hP: ptr = seqs.dataPtr(t15h)
+    let t15lP: ptr = seqs.dataPtr(t15l)
+    var yHi: uint64
+    var yLo: uint64
+    var offset: int32
+    let aadLen: int32 = BytesLen(aad)
+    while offset < aadLen:
+        var bHi: uint64
+        var bLo: uint64
+        gcmLoadBlockPair(aad, offset, bHi, bLo)
+        let zHi: uint64 = yHi ^ bHi
+        let zLo: uint64 = yLo ^ bLo
+        var aH: uint64
+        var aL: uint64
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t0hP, Int32((zHi >> 56) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t0lP, Int32((zHi >> 56) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t1hP, Int32((zHi >> 48) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t1lP, Int32((zHi >> 48) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t2hP, Int32((zHi >> 40) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t2lP, Int32((zHi >> 40) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t3hP, Int32((zHi >> 32) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t3lP, Int32((zHi >> 32) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t4hP, Int32((zHi >> 24) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t4lP, Int32((zHi >> 24) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t5hP, Int32((zHi >> 16) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t5lP, Int32((zHi >> 16) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t6hP, Int32((zHi >> 8) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t6lP, Int32((zHi >> 8) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t7hP, Int32(zHi & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t7lP, Int32(zHi & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t8hP, Int32((zLo >> 56) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t8lP, Int32((zLo >> 56) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t9hP, Int32((zLo >> 48) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t9lP, Int32((zLo >> 48) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t10hP, Int32((zLo >> 40) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t10lP, Int32((zLo >> 40) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t11hP, Int32((zLo >> 32) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t11lP, Int32((zLo >> 32) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t12hP, Int32((zLo >> 24) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t12lP, Int32((zLo >> 24) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t13hP, Int32((zLo >> 16) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t13lP, Int32((zLo >> 16) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t14hP, Int32((zLo >> 8) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t14lP, Int32((zLo >> 8) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t15hP, Int32(zLo & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t15lP, Int32(zLo & uint64(255)) * 8)))
+        yHi = aH
+        yLo = aL
+        offset = offset + 16
+    offset = 0
+    let dataLen: int32 = BytesLen(data)
+    while offset < dataLen:
+        var bHi: uint64
+        var bLo: uint64
+        gcmLoadBlockPair(data, offset, bHi, bLo)
+        let zHi: uint64 = yHi ^ bHi
+        let zLo: uint64 = yLo ^ bLo
+        var aH: uint64
+        var aL: uint64
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t0hP, Int32((zHi >> 56) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t0lP, Int32((zHi >> 56) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t1hP, Int32((zHi >> 48) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t1lP, Int32((zHi >> 48) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t2hP, Int32((zHi >> 40) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t2lP, Int32((zHi >> 40) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t3hP, Int32((zHi >> 32) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t3lP, Int32((zHi >> 32) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t4hP, Int32((zHi >> 24) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t4lP, Int32((zHi >> 24) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t5hP, Int32((zHi >> 16) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t5lP, Int32((zHi >> 16) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t6hP, Int32((zHi >> 8) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t6lP, Int32((zHi >> 8) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t7hP, Int32(zHi & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t7lP, Int32(zHi & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t8hP, Int32((zLo >> 56) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t8lP, Int32((zLo >> 56) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t9hP, Int32((zLo >> 48) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t9lP, Int32((zLo >> 48) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t10hP, Int32((zLo >> 40) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t10lP, Int32((zLo >> 40) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t11hP, Int32((zLo >> 32) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t11lP, Int32((zLo >> 32) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t12hP, Int32((zLo >> 24) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t12lP, Int32((zLo >> 24) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t13hP, Int32((zLo >> 16) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t13lP, Int32((zLo >> 16) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t14hP, Int32((zLo >> 8) & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t14lP, Int32((zLo >> 8) & uint64(255)) * 8)))
+        aH = aH ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t15hP, Int32(zLo & uint64(255)) * 8)))
+        aL = aL ^ *(AesGcmU64Ptr(rawmem_support.RawmemPtrAdd(t15lP, Int32(zLo & uint64(255)) * 8)))
+        yHi = aH
+        yLo = aL
+        offset = offset + 16
+    let aadBits: uint64 = uint64(int64(aadLen) * 8)
+    let dataBits: uint64 = uint64(int64(dataLen) * 8)
+    gcmMulPair(yHi ^ aadBits, yLo ^ dataBits, hHi, hLo, yHi, yLo)
+    gcmStoreBE64(out, 0, yHi)
+    gcmStoreBE64(out, 8, yLo)
+
+# Reference 128-step bitwise multiply (the pre-table implementation). Still used
+# once per ghashInto call for the aad/data length block; the per-block hot path
+# above is the 16-table linear-image form, verified bit-identical to this loop.
+fn gcmMulPair(xHi: uint64, xLo: uint64, yHi: uint64, yLo: uint64, outHi: var uint64, outLo: var uint64) =
+    var vHi: uint64 = yHi
+    var vLo: uint64 = yLo
+    var zHi: uint64
+    var zLo: uint64
+    for i in 0..<128:
+        var bit: uint64
+        if i < 64:
+            bit = (xHi >> (63 - i)) & uint64(1)
+        else:
+            bit = (xLo >> (127 - i)) & uint64(1)
+        if bit != uint64(0):
+            zHi = zHi ^ vHi
+            zLo = zLo ^ vLo
+        let lsb: uint64 = vLo & uint64(1)
+        vLo = (vLo >> 1) | ((vHi & uint64(1)) << 63)
+        vHi = vHi >> 1
+        if lsb != uint64(0):
+            vHi = vHi ^ (uint64(0xe1) << 56)
+    outHi = zHi
+    outLo = zLo
+
+# Increment the low 32 bits of the 16-byte counter in place (no allocation).
+fn aesGcmInc32InPlace(ctr: Bytes) =
+    let b0: int32 = BytesGet(ctr, 12)
+    let b1: int32 = BytesGet(ctr, 13)
+    let b2: int32 = BytesGet(ctr, 14)
+    let b3: int32 = BytesGet(ctr, 15)
+    let value: int64 = (int64(b0) << 24) | (int64(b1) << 16) | (int64(b2) << 8) | int64(b3)
+    let next: int64 = (value + 1) & ((int64(1) << 32) - 1)
+    BytesSet(ctr, 12, int32((next >> 24) & 255))
+    BytesSet(ctr, 13, int32((next >> 16) & 255))
+    BytesSet(ctr, 14, int32((next >> 8) & 255))
+    BytesSet(ctr, 15, int32(next & 255))
+
+fn aesGcmXorCtr(keys: AesGcmKey, counter: Bytes, data: Bytes): Result[bool] =
+    return aesGcmXorCtrRaw(keys.rounds, keys.roundKeys, counter, data)
+
+# 把 4 个大端 32 位列字（keystream 列）异或进 data 的 16 字节。
+@borrows
+fn aesGcmXorColsInto(data: Bytes, offset: int32, w0: int64, w1: int64, w2: int64, w3: int64) =
+    BytesSet(data, offset, BytesGet(data, offset) ^ int32((w0 >> 24) & 255))
+    BytesSet(data, offset + 1, BytesGet(data, offset + 1) ^ int32((w0 >> 16) & 255))
+    BytesSet(data, offset + 2, BytesGet(data, offset + 2) ^ int32((w0 >> 8) & 255))
+    BytesSet(data, offset + 3, BytesGet(data, offset + 3) ^ int32(w0 & 255))
+    BytesSet(data, offset + 4, BytesGet(data, offset + 4) ^ int32((w1 >> 24) & 255))
+    BytesSet(data, offset + 5, BytesGet(data, offset + 5) ^ int32((w1 >> 16) & 255))
+    BytesSet(data, offset + 6, BytesGet(data, offset + 6) ^ int32((w1 >> 8) & 255))
+    BytesSet(data, offset + 7, BytesGet(data, offset + 7) ^ int32(w1 & 255))
+    BytesSet(data, offset + 8, BytesGet(data, offset + 8) ^ int32((w2 >> 24) & 255))
+    BytesSet(data, offset + 9, BytesGet(data, offset + 9) ^ int32((w2 >> 16) & 255))
+    BytesSet(data, offset + 10, BytesGet(data, offset + 10) ^ int32((w2 >> 8) & 255))
+    BytesSet(data, offset + 11, BytesGet(data, offset + 11) ^ int32(w2 & 255))
+    BytesSet(data, offset + 12, BytesGet(data, offset + 12) ^ int32((w3 >> 24) & 255))
+    BytesSet(data, offset + 13, BytesGet(data, offset + 13) ^ int32((w3 >> 16) & 255))
+    BytesSet(data, offset + 14, BytesGet(data, offset + 14) ^ int32((w3 >> 8) & 255))
+    BytesSet(data, offset + 15, BytesGet(data, offset + 15) ^ int32(w3 & 255))
+
+@borrows
+fn aesGcmXorCtrRaw(keyRounds: int32, keyRoundKeys: Bytes, counter: Bytes, data: Bytes): Result[bool] =
+    var offset: int32
+    # Build the forward S-box (final round) + 4 native int64[] T-tables once for
+    # the whole CTR stream. T-tables collapse SubBytes+ShiftRows+MixColumns into
+    # 4 native array lookups + XOR per column (zero per-byte Bytes FFI in rounds).
+    var sbox: Bytes = aes.aesBuildSbox()
+    var te0: int64[]
+    var te1: int64[]
+    var te2: int64[]
+    var te3: int64[]
+    aes.aesBuildTeTables(te0, te1, te2, te3)
+    let rk: int64[] = aes.aesBuildRoundKeyCols(keyRoundKeys, keyRounds)
+    # One reusable counter buffer + one reusable keystream-block buffer for the
+    # whole stream; zero heap work in the loop.
+    var ctr: Bytes = BytesSlice(counter, 0, 16)
+    var block: Bytes = BytesAlloc(16)
+    let dataLen: int32 = BytesLen(data)
+    # Register-domain CTR: the 16-byte counter lives in four big-endian 32-bit
+    # column words. The old per-block 32x Bytes copy + Inc32 round-trip collapses
+    # to `c3 += 1` (GCM inc32 wraps mod 2^32 inside the last word only), and the
+    # keystream is applied straight from the encrypt outputs (no block buffer
+    # write-back). Note: the 4-block hw seam (aesEncrypt4xHwHost) is NOT wired —
+    # on the --emit:exe pipeline the kind-2 recognizer does not fire (verified: 0
+    # AESE words in the produced image), the call would BL to the gf256Pow scalar
+    # body. T-table column kernel is the production path for all key sizes.
+    var c0: int64 = (int64(BytesGet(ctr, 0)) << 24) | (int64(BytesGet(ctr, 1)) << 16) | (int64(BytesGet(ctr, 2)) << 8) | int64(BytesGet(ctr, 3))
+    var c1: int64 = (int64(BytesGet(ctr, 4)) << 24) | (int64(BytesGet(ctr, 5)) << 16) | (int64(BytesGet(ctr, 6)) << 8) | int64(BytesGet(ctr, 7))
+    var c2: int64 = (int64(BytesGet(ctr, 8)) << 24) | (int64(BytesGet(ctr, 9)) << 16) | (int64(BytesGet(ctr, 10)) << 8) | int64(BytesGet(ctr, 11))
+    var c3: int64 = (int64(BytesGet(ctr, 12)) << 24) | (int64(BytesGet(ctr, 13)) << 16) | (int64(BytesGet(ctr, 14)) << 8) | int64(BytesGet(ctr, 15))
+    # 注意: 初始 ARK 由 aesEncryptColsTTable 内部完成，这里不能再提前异或，
+    # 否则 rk[0..3] 会被应用两次（零密钥 KAT 对此盲区，e2e 抓住过）。
+    # HW 4 块 CTR 主循环（仅 AES-128，rounds==10）：4 个计数块物化进 64B 缓冲
+    # （c0..c2 一次性写入；c3 列每 group 以字节反转的 u32 直写），4x AESE seam
+    # 原地加密（编译器带 kind-2 识别器时为 99 词硬件序列，否则 bl 标量体，仍
+    # 正确），keystream 按 u64 词异或进 data。GCM inc32 语义与逐块路径逐位一致。
+    if keyRounds == 10:
+        var hwBuf: Bytes = BytesAlloc(64)
+        for b in 0..<4:
+            BytesSet(hwBuf, b * 16 + 0, int32((c0 >> 24) & 255))
+            BytesSet(hwBuf, b * 16 + 1, int32((c0 >> 16) & 255))
+            BytesSet(hwBuf, b * 16 + 2, int32((c0 >> 8) & 255))
+            BytesSet(hwBuf, b * 16 + 3, int32(c0 & 255))
+            BytesSet(hwBuf, b * 16 + 4, int32((c1 >> 24) & 255))
+            BytesSet(hwBuf, b * 16 + 5, int32((c1 >> 16) & 255))
+            BytesSet(hwBuf, b * 16 + 6, int32((c1 >> 8) & 255))
+            BytesSet(hwBuf, b * 16 + 7, int32(c1 & 255))
+            BytesSet(hwBuf, b * 16 + 8, int32((c2 >> 24) & 255))
+            BytesSet(hwBuf, b * 16 + 9, int32((c2 >> 16) & 255))
+            BytesSet(hwBuf, b * 16 + 10, int32((c2 >> 8) & 255))
+            BytesSet(hwBuf, b * 16 + 11, int32(c2 & 255))
+        let rkPtr: ptr = keyRoundKeys.data
+        let hwPtr: ptr = hwBuf.data
+        let dPtr: ptr = data.data
+        while offset + 64 <= dataLen:
+            var cb: int64 = c3
+            for b in 0..<4:
+                cb = (cb + 1) & int64(0xFFFFFFFF)
+                let rev: int64 = ((cb & 255) << 24) | (((cb >> 8) & 255) << 16) | (((cb >> 16) & 255) << 8) | ((cb >> 24) & 255)
+                *(AesGcmU32Ptr(rawmem_support.RawmemPtrAdd(hwPtr, b * 16 + 12))) = uint32(rev)
+            aes.aesEncrypt4xHwHost(hwPtr, rawmem_support.RawmemPtrAdd(hwPtr, 16), rawmem_support.RawmemPtrAdd(hwPtr, 32), rawmem_support.RawmemPtrAdd(hwPtr, 48), rkPtr)
+            for w in 0..<8:
+                let ksAddr: ptr = rawmem_support.RawmemPtrAdd(hwPtr, w * 8)
+                let dAddr: ptr = rawmem_support.RawmemPtrAdd(dPtr, offset + w * 8)
+                *(AesGcmU64Ptr(dAddr)) = *(AesGcmU64Ptr(dAddr)) ^ *(AesGcmU64Ptr(ksAddr))
+            c3 = (c3 + 4) & int64(0xFFFFFFFF)
+            offset = offset + 64
+        BytesFree(hwBuf)
+    while offset + 16 <= dataLen:
+        # inc32 first: matches the original Inc32-then-encrypt per-block order.
+        c3 = (c3 + 1) & int64(0xFFFFFFFF)
+        var s0: int64 = c0
+        var s1: int64 = c1
+        var s2: int64 = c2
+        var s3: int64 = c3
+        aes.aesEncryptColsTTable(s0, s1, s2, s3, keyRounds, rk, te0, te1, te2, te3, sbox)
+        aesGcmXorColsInto(data, offset, s0, s1, s2, s3)
+        offset = offset + 16
+    # Sync the last-used counter word back into the ctr slice for the tail loop.
+    BytesSet(ctr, 12, int32((c3 >> 24) & 255))
+    BytesSet(ctr, 13, int32((c3 >> 16) & 255))
+    BytesSet(ctr, 14, int32((c3 >> 8) & 255))
+    BytesSet(ctr, 15, int32(c3 & 255))
+    while offset < dataLen:
+        aesGcmInc32InPlace(ctr)
+        for i in 0..<16:
+            BytesSet(block, i, BytesGet(ctr, i))
+        # AES-128/256: T-table scalar. The hardware AES-128 intrinsic seam
+        # (aes.aesEncryptBlockHwHost / cheng_crypto_aes_block_enc128) only inlines on the
+        # --emit:obj path today; the production --emit:exe Darwin-arm64 fill is gated to
+        # non-emit-first and emits a plain BL to the slow scalar body, which regressed
+        # AES-128 ~42x (77 vs 3269 KiB/s). Reverted to T-table until the exe-path inline
+        # gating (primaryUseEmitFirst == EmitObj, primary_object_plan ~44641) is fixed.
+        aes.aesEncryptBlockTTable(block, keyRounds, rk, te0, te1, te2, te3, sbox)
+        for i in 0..<16:
+            if !(offset + i < dataLen):
+                break
+            BytesSet(data, offset + i, BytesGet(data, offset + i) ^ BytesGet(block, i))
+        offset = offset + 16
+    BytesFree(ctr)
+    BytesFree(block)
+    BytesFree(sbox)
+    return Ok[bool](true)
+
+@borrows
+fn tagEqual(a: Bytes, b: Bytes): bool =
+    if BytesLen(a) != BytesLen(b):
+        return false
+    var diff: int32
+    for i in 0..<BytesLen(a):
+        diff = diff | (BytesGet(a, i) ^ BytesGet(b, i))
+    return diff == 0
+
+fn aesGcmEncrypt(key: AesGcmKey, nonce: AesGcmNonce, tag: var AesGcmTag, data: Bytes, aad: Bytes): Result[bool] =
+    var tagBytes: Bytes
+    let encRes: Result[bool] = aesGcmEncryptRaw(key.rounds, key.roundKeys, nonce.data, tagBytes, data, aad)
+    if IsErr(encRes):
+        return Err[bool](ErrorText(encRes))
+    tag.data = tagBytes
+    return Ok[bool](true)
+
+# W7 hot-path helper: single-block AES encrypt into a caller-owned 16B buffer
+# via the T-table kernel (same tables the CTR stream already uses). The old
+# route aes.aesEncryptBlockInto hits the hardware-seam host whose --emit:exe
+# fill BLs into the gf256Pow-per-byte scalar body (~0.5ms per block on the
+# judgment driver), which made the per-op fixed cost of every seal/open
+# dominate the bulk work. Bit-identical AES (same key schedule, same round
+# function); the hardware intrinsic seam itself stays untouched (compiler
+# lane). `out` must be exactly 16 bytes; its current content is encrypted.
+fn gcmAesBlockTTableInto(out: Bytes, keyRounds: int32, keyRoundKeys: Bytes) =
+    var sbox: Bytes = aes.aesBuildSbox()
+    var te0: int64[]
+    var te1: int64[]
+    var te2: int64[]
+    var te3: int64[]
+    aes.aesBuildTeTables(te0, te1, te2, te3)
+    let rk: int64[] = aes.aesBuildRoundKeyCols(keyRoundKeys, keyRounds)
+    aes.aesEncryptBlockTTable(out, keyRounds, rk, te0, te1, te2, te3, sbox)
+    BytesFree(sbox)
+
+@borrows
+fn aesGcmEncryptRaw(keyRounds: int32,
+                    keyRoundKeys: Bytes,
+                    nonceData: Bytes,
+                    tagData: var Bytes,
+                    data: Bytes,
+                    aad: Bytes): Result[bool] =
+    if BytesLen(nonceData) != aesGcmNonceSize:
+        return Err[bool]("aesgcm: invalid nonce")
+    if BytesLen(keyRoundKeys) != (keyRounds + 1) * 16:
+        return Err[bool]("aesgcm: invalid round keys")
+    var h: Bytes = BytesAlloc(16)
+    gcmAesBlockTTableInto(h, keyRounds, keyRoundKeys)
+    let hHi: uint64 = gcmLoadBE64(h, 0)
+    let hLo: uint64 = gcmLoadBE64(h, 8)
+    BytesFree(h)
+    var j0: Bytes = BytesAlloc(16)
+    for i in 0..<aesGcmNonceSize:
+        BytesSet(j0, i, BytesGet(nonceData, i))
+    BytesSet(j0, 15, 1)
+    let ctrRes: Result[bool] = aesGcmXorCtrRaw(keyRounds, keyRoundKeys, j0, data)
+    if IsErr(ctrRes):
+        BytesFree(j0)
+        return Err[bool](ErrorText(ctrRes))
+    var s: Bytes = BytesAlloc(16)
+    ghashInto(s, hHi, hLo, aad, data)
+    var e: Bytes = BytesAlloc(16)
+    BytesCopyInto(e, 0, j0)
+    BytesFree(j0)
+    gcmAesBlockTTableInto(e, keyRounds, keyRoundKeys)
+    var tag: Bytes = BytesAlloc(16)
+    for i in 0..<16:
+        BytesSet(tag, i, BytesGet(e, i) ^ BytesGet(s, i))
+    BytesFree(e)
+    BytesFree(s)
+    tagData = tag
+    return Ok[bool](true)
+
+fn aesGcmDecrypt(key: AesGcmKey, nonce: AesGcmNonce, tag: AesGcmTag, data: Bytes, aad: Bytes): Result[bool] =
+    return aesGcmDecryptRaw(key.rounds, key.roundKeys, nonce.data, tag.data, data, aad)
+
+@borrows
+fn aesGcmDecryptRaw(keyRounds: int32,
+                    keyRoundKeys: Bytes,
+                    nonceData: Bytes,
+                    tagData: Bytes,
+                    data: Bytes,
+                    aad: Bytes): Result[bool] =
+    if BytesLen(nonceData) != aesGcmNonceSize:
+        return Err[bool]("aesgcm: invalid nonce")
+    if BytesLen(tagData) != aesGcmTagSize:
+        return Err[bool]("aesgcm: invalid tag size")
+    if BytesLen(keyRoundKeys) != (keyRounds + 1) * 16:
+        return Err[bool]("aesgcm: invalid round keys")
+    var h: Bytes = BytesAlloc(16)
+    gcmAesBlockTTableInto(h, keyRounds, keyRoundKeys)
+    let hHi: uint64 = gcmLoadBE64(h, 0)
+    let hLo: uint64 = gcmLoadBE64(h, 8)
+    BytesFree(h)
+    var j0: Bytes = BytesAlloc(16)
+    for i in 0..<aesGcmNonceSize:
+        BytesSet(j0, i, BytesGet(nonceData, i))
+    BytesSet(j0, 15, 1)
+    var s: Bytes = BytesAlloc(16)
+    ghashInto(s, hHi, hLo, aad, data)
+    var e: Bytes = BytesAlloc(16)
+    BytesCopyInto(e, 0, j0)
+    gcmAesBlockTTableInto(e, keyRounds, keyRoundKeys)
+    var expect: Bytes = BytesAlloc(16)
+    for i in 0..<16:
+        BytesSet(expect, i, BytesGet(e, i) ^ BytesGet(s, i))
+    BytesFree(e)
+    BytesFree(s)
+    let tagOk: bool = tagEqual(expect, tagData)
+    BytesFree(expect)
+    if ! tagOk:
+        BytesFree(j0)
+        return Err[bool]("aesgcm: tag mismatch")
+    let ctrRes: Result[bool] = aesGcmXorCtrRaw(keyRounds, keyRoundKeys, j0, data)
+    BytesFree(j0)
+    if IsErr(ctrRes):
+        return Err[bool](ErrorText(ctrRes))
+    return Ok[bool](true)
+
+fn AesGcmKnownAnswerSelfTest(): Result[bool] =
+    let aesRes: Result[bool] = aes.AesKnownAnswerSelfTest()
+    if IsErr(aesRes):
+        return Err[bool](ErrorText(aesRes))
+
+    let keyBytes: Bytes = BytesAlloc(16)
+    var key: AesGcmKey
+    let keyRes: Result[bool] = intoAesGcmKeyInto(key, keyBytes)
+    if IsErr(keyRes):
+        return Err[bool](ErrorText(keyRes))
+    let nonce: Bytes = BytesAlloc(12)
+    let aad: Bytes = emptyBytes()
+
+    var emptyData: Bytes = emptyBytes()
+    var emptyTag: Bytes
+    let emptyEncRes: Result[bool] = aesGcmEncryptRaw(key.rounds, key.roundKeys, nonce, emptyTag, emptyData, aad)
+    if IsErr(emptyEncRes):
+        return Err[bool](ErrorText(emptyEncRes))
+    if BytesToHex(emptyTag) != "58e2fccefa7e3061367f1d57a4e7455a":
+        return Err[bool]("aesgcm: empty tag vector mismatch")
+
+    var data: Bytes = BytesAlloc(16)
+    var tag: Bytes
+    let encRes: Result[bool] = aesGcmEncryptRaw(key.rounds, key.roundKeys, nonce, tag, data, aad)
+    if IsErr(encRes):
+        return Err[bool](ErrorText(encRes))
+    if BytesToHex(data) != "0388dace60b6a392f328c2b971b2fe78":
+        return Err[bool]("aesgcm: ciphertext vector mismatch")
+    if BytesToHex(tag) != "ab6e47d42cec13bdf53a67b21257bddf":
+        return Err[bool]("aesgcm: tag vector mismatch")
+
+    let decRes: Result[bool] = aesGcmDecryptRaw(key.rounds, key.roundKeys, nonce, tag, data, aad)
+    if IsErr(decRes):
+        return Err[bool](ErrorText(decRes))
+    let expectedPlain: Bytes = BytesAlloc(16)
+    if ! BytesEqual(data, expectedPlain):
+        return Err[bool]("aesgcm: decrypt vector mismatch")
+    return Ok[bool](true)

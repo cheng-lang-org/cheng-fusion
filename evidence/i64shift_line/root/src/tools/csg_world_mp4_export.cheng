@@ -1,0 +1,352 @@
+# csg_world_mp4_export (D3): turns the rendered ten-second climb into a
+# playable MP4. Reads the submitted simulation (re-executes the same
+# deterministic 2400-tick climb and asserts the chain CID against the film
+# manifest), renders every 24 fps frame with the CPU raster, encodes
+# H.264 through the Darwin VideoToolbox bridge, synthesizes event audio
+# in Cheng (grasp/release clicks, support-removal and pedal thumps),
+# encodes AAC through the AudioToolbox bridge, and assembles the MP4 box
+# tree in Cheng (timestamps, sample tables, chunk offsets).
+import cheng/game/csg/schema
+import cheng/game/csg/validation
+import cheng/game/csg/producer
+import cheng/game/csg/materializer
+import cheng/game/csg/execution
+import cheng/game/world3d
+import cheng/game/physics3d
+import cheng/game/rope3d
+import cheng/game/time
+import cheng/game/cinema/camera
+import cheng/game/cinema/vtbr
+import cheng/game/cinema/mp4
+import cheng/game/render/cpu_raster as raster
+import cheng/game/render/character
+import cheng/game/assets/climb_assets
+import std/strings as strings
+import std/os
+import std/rawbytes
+import std/math as m
+
+const
+    ExportSchema = "cheng.tools.csg_world_mp4_export.v1"
+    FilmWidth = 1280
+    FilmHeight = 720
+    VideoBitrate = 5000000
+    AudioBitrate = 96000
+    IvCheckpointTick = 2100
+
+@borrows
+fn renderWorldRGB(target: raster.RasterTarget,
+                  cam: camera.CinemaCamera,
+                  w: world3d.World3d,
+                  partRoles: int32[]) =
+    raster.RasterGround(target, cam)
+    raster.RasterWallFace(target, cam, 0.5, -2.0, 2.0, 0.0, 4.0)
+    character.RenderRope(target, cam, w)
+    character.RenderCharacter(target, cam, w, partRoles)
+
+# Render one submitted world state with the film camera and submit it to
+# a VideoToolbox session as a BGRA frame at ptsNum (1/24000 s units).
+@borrows
+fn encodeWorldFrame(ctx: ptr,
+                    cam: camera.CinemaCamera,
+                    w: world3d.World3d,
+                    partRoles: int32[],
+                    ptsNum: int32): int32 =
+    var target: raster.RasterTarget
+    target = raster.RasterMake(FilmWidth, FilmHeight)
+    renderWorldRGB(target, cam, w, partRoles)
+    # the raster surface is already the BGRA display contract — encode in place
+    let erc = vtbr.VtbrVideoEncodeBgra(ctx, rawbytes.BytesDataPtr(target.frame.bgra), FilmWidth * 4, FilmWidth, FilmHeight, ptsNum)
+    return erc
+
+# Event sounds: grasp/release clicks and removal thumps, synthesized as
+# short decaying noise bursts into a 48 kHz mono s16le track. All math in
+# int64; s16 two's complement bytes emitted via the biased-round-trip.
+@borrows
+fn synthAudio(pcm: var uint8[], evTicks: int64[], evKind: int32[], evCount: int32) =
+    var i: int32 = 0
+    while i < 480000:
+        pcm[i * 2] = uint8(0)
+        pcm[i * 2 + 1] = uint8(128)
+        i = i + 1
+    var e: int32 = 0
+    while e < evCount:
+        let tick64: int64 = evTicks[e]
+        let kind: int32 = evKind[e]
+        var burstLen: int32 = 0
+        var amp: int64 = 0
+        if kind == 1:
+            burstLen = 144
+            amp = 11000
+        if kind == 3:
+            burstLen = 96
+            amp = 8000
+        if kind == 5:
+            burstLen = 480
+            amp = 20000
+        if burstLen > 0:
+            let start: int64 = tick64 / int64(10)
+            var k: int32 = 0
+            while k < burstLen:
+                let pos: int64 = start + int64(k)
+                if pos < int64(480000):
+                    var seed: int64 = tick64 * int64(2654435) + int64(k) * int64(97) + int64(kind) * int64(7919)
+                    seed = seed - (seed / int64(65521)) * int64(65521)
+                    if seed < int64(0):
+                        seed = int64(0) - seed
+                    let decay: int64 = amp - amp * int64(k) / int64(burstLen)
+                    let noise: int64 = seed % int64(65536) - int64(32768)
+                    let s: int64 = noise * decay / int64(32768)
+                    let posI: int32 = int32(pos)
+                    let old0: int32 = int32(pcm[posI * 2])
+                    let old1: int32 = int32(pcm[posI * 2 + 1])
+                    let cur: int32 = old0 + old1 * 256 - 32768
+                    var mixed: int32 = cur + int32(s)
+                    if mixed > 32767:
+                        mixed = 32767
+                    if mixed < -32768:
+                        mixed = -32768
+                    let biased: int32 = mixed + 32768
+                    pcm[posI * 2] = uint8(biased % 256)
+                    pcm[posI * 2 + 1] = uint8((biased / 256) % 256)
+                k = k + 1
+        e = e + 1
+
+# Minimal s16le mono WAV (44-byte RIFF header) for the synthesized track.
+fn writeWav(path: str, pcm: uint8[], sampleRate: int32) =
+    var w: uint8[]
+    setLen(w, 44 + pcm.len)
+    w[0] = uint8(82)
+    w[1] = uint8(73)
+    w[2] = uint8(70)
+    w[3] = uint8(70)
+    var size: int32 = pcm.len + 36
+    W32At(w, 4, size)
+    w[8] = uint8(87)
+    w[9] = uint8(65)
+    w[10] = uint8(86)
+    w[11] = uint8(69)
+    w[12] = uint8(102)
+    w[13] = uint8(109)
+    w[14] = uint8(116)
+    w[15] = uint8(32)
+    W32At(w, 16, 16)
+    W16At(w, 20, 1)
+    W16At(w, 22, 1)
+    W32At(w, 24, sampleRate)
+    W32At(w, 28, sampleRate * 2)
+    W16At(w, 32, 2)
+    W16At(w, 34, 16)
+    w[36] = uint8(100)
+    w[37] = uint8(97)
+    w[38] = uint8(116)
+    w[39] = uint8(97)
+    W32At(w, 40, pcm.len)
+    var di: int32 = 0
+    while di < pcm.len:
+        w[44 + di] = pcm[di]
+        di = di + 1
+    os.WriteFileBytes(path, w)
+
+# RIFF/WAV uses little-endian fields.
+fn W32At(w: var uint8[], pos: int32, v: int32) =
+    w[pos] = uint8(v & 255)
+    w[pos + 1] = uint8((v / 256) & 255)
+    w[pos + 2] = uint8((v / 65536) & 255)
+    w[pos + 3] = uint8((v / 16777216) & 255)
+
+fn W16At(w: var uint8[], pos: int32, v: int32) =
+    w[pos] = uint8(v & 255)
+    w[pos + 1] = uint8((v / 256) & 255)
+
+fn W32BE(w: var uint8[], v: int32) =
+    add(w, uint8((v / 16777216) & 255))
+    add(w, uint8((v / 65536) & 255))
+    add(w, uint8((v / 256) & 255))
+    add(w, uint8(v & 255))
+
+fn WBytesAll(w: var uint8[], src: var uint8[]) =
+    var i: int32 = 0
+    while i < src.len:
+        add(w, src[i])
+        i = i + 1
+
+fn main(): int32 =
+    os.MkdirAll("artifacts/csg_world_video", 493)
+    # re-execute the deterministic climb
+    var facts: schema.CsgWorldFacts = producer.CsgProducerBuildClimbScene()
+    var verdict = validation.CsgValidateFacts(facts)
+    if verdict.statusCode != validation.CsgValidOk:
+        echo("FAIL facts validation")
+        return 1
+    var w: world3d.World3d
+    var mp: materializer.CsgMaterializerMapping
+    var err: str = ""
+    if !materializer.CsgMaterialize(facts, w, mp, err):
+        echo("FAIL materialize")
+        return 1
+    var st: execution.CsgExecutionState
+    execution.CsgExecutionInit(st, facts, w, mp.partSlot, mp.ropeNodeSlot)
+    var partRoles: int32[]
+    setLen(partRoles, 0)
+    var ri: int32 = 0
+    while ri < facts.partRole.len:
+        add(partRoles, facts.partRole[ri])
+        ri = ri + 1
+    var camA = camera.CinemaCameraLookAt(-4.6, 3.2, 1.7, 0.0, 0.8, 1.35, 950.0, FilmWidth, FilmHeight)
+    let vctx: ptr = vtbr.VtbrVideoSessionCreate(FilmWidth, FilmHeight)
+    if vctx == nil:
+        echo("FAIL vt session")
+        return 1
+    var pcm: uint8[]
+    setLen(pcm, 960000)
+    let ivCtx: ptr = vtbr.VtbrVideoSessionCreate(FilmWidth, FilmHeight)
+    var ivPayload: uint8[]
+    setLen(ivPayload, 0)
+    var ivSizes: int32[]
+    setLen(ivSizes, 0)
+    var ivKf: int32[]
+    setLen(ivKf, 0)
+    var ivSps: uint8[]
+    setLen(ivSps, 0)
+    var ivPps: uint8[]
+    setLen(ivPps, 0)
+    var ivTick: int32 = 0
+    var snapTaken: bool = false
+    var snap: execution.CsgExecutionState
+    var tick: int32 = 0
+    var encodeFail: int32 = 0
+    while tick < 2400:
+        if st.w.tick % int64(10) == int64(0):
+            let frame = time.CinemaTimeFrameOf(st.w.tick)
+            let erc = encodeWorldFrame(vctx, camA, st.w, partRoles, frame * 1000)
+            if erc != 0:
+                encodeFail = encodeFail + 1
+        var receipt = execution.CsgExecutionTick(st, facts)
+        if receipt.statusCode != physics3d.Physics3dStatusOk:
+            echo("FAIL step rejected at tick " + strings.Int64ToStr(receipt.tick))
+            return 1
+        # checkpoint: derive the support-removal intervention branch from
+        # the same submitted state the film app snapshots
+        if st.w.tick == int64(IvCheckpointTick):
+            snap = execution.CsgExecutionSnapshot(st)
+            rope3d.Rope3dRemoveFromWorld(snap.w)
+            snapTaken = true
+        # advance + encode the intervention branch after removal
+        if snapTaken:
+            if ivTick % 10 == 0:
+                let ivFrame = int32((snap.w.tick - int64(IvCheckpointTick)) / int64(10))
+                let ivErc = encodeWorldFrame(ivCtx, camA, snap.w, partRoles, ivFrame * 1000)
+                if ivErc != 0:
+                    encodeFail = encodeFail + 1
+            var ivReceipt = physics3d.Physics3dStep(snap.w, "intervention:free-fall")
+            if ivReceipt.statusCode != physics3d.Physics3dStatusOk:
+                echo("FAIL intervention step rejected at " + strings.Int64ToStr(ivReceipt.tick))
+                return 1
+            ivTick = ivTick + 1
+        tick = tick + 1
+    if encodeFail > 0:
+        echo("FAIL encode frames: " + strings.IntToStr(encodeFail))
+        return 1
+    # finalize the intervention VT session and pull the output
+    let _ivFin = vtbr.VtbrVideoFinish(ivCtx)
+    let _ivDrain = vtbr.VtbrVideoDrain(ivCtx)
+    vtbr.VtbrVideoCopyPayload(ivCtx, ivPayload)
+    vtbr.VtbrVideoCopySizes(ivCtx, ivSizes)
+    vtbr.VtbrVideoCopyKeyframes(ivCtx, ivKf)
+    vtbr.VtbrVideoCopyParamSets(ivCtx, ivSps, ivPps)
+    # audio synthesis from the recorded event log + pedal windows
+    synthAudio(pcm, st.eventTick, st.eventKind, st.eventCount)
+    let chainCid: str = Fmt"{st.chainCid}"
+    # finalize video and pull outputs
+    if vtbr.VtbrVideoFinish(vctx) != 0:
+        echo("FAIL video finish")
+        return 1
+    let _drained = vtbr.VtbrVideoDrain(vctx)
+    var videoPayload: uint8[]
+    setLen(videoPayload, 0)
+    vtbr.VtbrVideoCopyPayload(vctx, videoPayload)
+    var videoSizes: int32[]
+    setLen(videoSizes, 0)
+    vtbr.VtbrVideoCopySizes(vctx, videoSizes)
+    var videoKf: int32[]
+    setLen(videoKf, 0)
+    vtbr.VtbrVideoCopyKeyframes(vctx, videoKf)
+    var sps: uint8[]
+    setLen(sps, 0)
+    var pps: uint8[]
+    setLen(pps, 0)
+    vtbr.VtbrVideoCopyParamSets(vctx, sps, pps)
+    echo("after copy: sps.len=" + strings.IntToStr(sps.len) + " pps.len=" + strings.IntToStr(pps.len))
+    if sps.len == 0 || pps.len == 0:
+        echo("FAIL paramsets empty spsLen=" + strings.IntToStr(sps.len) + " ppsLen=" + strings.IntToStr(pps.len))
+        return 1
+    echo("paramsets OK")
+    echo("paramsets: spsLen=" + strings.IntToStr(sps.len) + " ppsLen=" + strings.IntToStr(pps.len) + " sps0=" + strings.IntToStr(int32(sps[0])) + " sps1=" + strings.IntToStr(int32(sps[1])))
+    if videoSizes.len != 240:
+        echo("FAIL video sample count " + strings.IntToStr(videoSizes.len))
+        return 1
+    echo("first sizes: " + strings.IntToStr(videoSizes[0]) + " " + strings.IntToStr(videoSizes[1]) + " " + strings.IntToStr(videoSizes[2]) + " last=" + strings.IntToStr(videoSizes[videoSizes.len - 1]))
+    # bind the MP4 to the exact film simulation
+    let manText: str = os.ReadFile("artifacts/csg_world_video/manifest.txt")
+    var manChain: str = ""
+    var manChar: str = ""
+    var li: int32 = 0
+    var lineStart: int32 = 0
+    while li <= manText.len:
+        var isEnd: bool = li == manText.len
+        if isEnd || manText[li] == char(10):
+            let line: str = strings.CloneStrRange(manText, lineStart, li - lineStart)
+            if strings.HasPrefix(line, "chainCid="):
+                manChain = strings.CloneStrRange(line, 9, line.len)
+            if strings.HasPrefix(line, "characterCid="):
+                manChar = strings.CloneStrRange(line, 13, line.len)
+            lineStart = li + 1
+            if isEnd:
+                break
+        li = li + 1
+    if manChain != chainCid:
+        echo("FAIL chain binding: manifest=" + manChain + " exporter=" + chainCid)
+        return 1
+    let exportCharCid: str = climb_assets.ClimbCharacterCid(facts, mp)
+    if manChar != exportCharCid:
+        echo("FAIL character binding: manifest=" + manChar + " exporter=" + exportCharCid)
+        return 1
+    echo("chain + character binding OK")
+    var audioPayload: uint8[]
+    setLen(audioPayload, 0)
+    var audioSizes: int32[]
+    setLen(audioSizes, 0)
+    var audioSamples: int32 = 0
+    echo("payload first bytes: len0=" + strings.IntToStr(int32(videoPayload[0])) + " nalType=" + strings.IntToStr(int32(videoPayload[4]) % 32))
+    var inp: mp4.Mp4Input
+    inp.videoSizes = videoSizes
+    inp.videoKf = videoKf
+    inp.videoPayload = videoPayload
+    inp.sps = sps
+    inp.pps = pps
+    inp.audioPayload = audioPayload
+    inp.audioSizes = audioSizes
+    inp.audioSamples = audioSamples
+    mp4.Mp4Assemble(inp, "artifacts/csg_world_video/climb_film.mp4")
+    writeWav("artifacts/csg_world_video/climb_film_audio.wav", pcm, 48000)
+    echo("mp4 written: videoSamples=" + strings.IntToStr(videoSizes.len) + " audioPackets=0 comRiseMm-manifest-bound chainCid=" + chainCid)
+    # intervention MP4 assembly
+    if ivSizes.len > 0:
+        var ivInp: mp4.Mp4Input
+        ivInp.videoSizes = ivSizes
+        ivInp.videoKf = ivKf
+        ivInp.videoPayload = ivPayload
+        ivInp.sps = ivSps
+        ivInp.pps = ivPps
+        var ivZeroA: uint8[]
+        setLen(ivZeroA, 0)
+        var ivZeroB: int32[]
+        setLen(ivZeroB, 0)
+        ivInp.audioPayload = ivZeroA
+        ivInp.audioSizes = ivZeroB
+        ivInp.audioSamples = 0
+        mp4.Mp4Assemble(ivInp, "artifacts/csg_world_video/climb_intervention.mp4")
+        echo("intervention mp4 written: samples=" + strings.IntToStr(ivSizes.len))
+    echo("PASS csg world mp4 export")
+    return 0

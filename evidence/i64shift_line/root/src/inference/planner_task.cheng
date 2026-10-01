@@ -1,0 +1,628 @@
+import std/result
+import std/os
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
+import cheng/std/unicode as uni
+import cheng/inference/tokenizer as tok
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/hf_model_graph as hfgraph
+import cheng/inference/weight_store as ws
+import cheng/inference/weight_binding as wb
+import cheng/inference/model_executor as mexec
+import cheng/inference/distributed_engine as engine
+
+# 小优 S3->S4 后续切片: 规划器输出 -> 结构化任务分类桥。
+#
+# PlannerTaskKind 字符串常量与 UniMaker React.js/app/libp2p/asiComputerUseContract.ts
+# 的 AsiComputerUseTaskKind 联合类型逐字节对齐。
+#
+# S2 真模型接线 (#15): PlannerTaskClassifyFromTextWithBudget 走真模型 logits
+# argmax —— 通过 env CHENG_PLANNER_CONFIG / CHENG_PLANNER_WEIGHTS 指向真实
+# HF config.json + safetensors (Qwen2.5-0.5B), 构造 7 候选编号分类 prompt,
+# 单次 dense forward 后在 7 个候选编号 token 的 logits 上做受限 argmax。
+#
+# 任务03 失败语义 (合同: docs/campaigns/2026-09-21-csg-decision-computer-use/
+# contract.md §3): 模型路径是唯一判定路径, 任何一步失败 (env 未设 / 文件缺失 /
+# 加载失败 / 词表越界 / 推理错误 / 取消 / 超时) 一律返回显式 Err, 不回落规则
+# 闭环 —— 成功伪装已移除。规则闭环只保留显式独立入口 PlannerTaskClassifyRulesFromText,
+# 由调用者预先选择, 不是任何失败的替换品; 规则逐条镜像 asiComputerUseContract.ts
+# classifyTaskKind (asiComputerUseContract.ts:353-363), 规则判断顺序不可变
+# (尤其"二手+距离"必须先于"搜索"判断, 否则语义反转)。
+
+const
+    PlannerTaskKindPublishShortVideoDraft = "publish-short-video-draft"
+    PlannerTaskKindPublishAdVideoDraft = "publish-ad-video-draft"
+    PlannerTaskKindAuthorizedProductPublishDraft = "authorized-product-publish-draft"
+    PlannerTaskKindPurchaseAssistReview = "purchase-assist-review"
+    PlannerTaskKindContentSearchReview = "content-search-review"
+    PlannerTaskKindFeedFilterReview = "feed-filter-review"
+    PlannerTaskKindUnsupportedReview = "unsupported-review"
+
+@borrows
+fn plannerTextContainsAny(text: str, patterns: str[]): bool =
+    for i in 0..<patterns.len:
+        if strutil.Contains(text, patterns[i]):
+            return true
+    return false
+
+# 候选 taskKind 的编号顺序 (1..7)。顺序镜像规则闭环的判定优先级
+# (广告视频在短视频之前), 分类 prompt 里的选项编号与之逐一对应。
+fn PlannerTaskCandidateKinds(): str[] =
+    return [
+        PlannerTaskKindPublishAdVideoDraft,
+        PlannerTaskKindPublishShortVideoDraft,
+        PlannerTaskKindAuthorizedProductPublishDraft,
+        PlannerTaskKindPurchaseAssistReview,
+        PlannerTaskKindContentSearchReview,
+        PlannerTaskKindFeedFilterReview,
+        PlannerTaskKindUnsupportedReview
+    ]
+
+fn plannerTaskBuildClassifyPrompt(text: str): str =
+    return strutil.Join([
+        "任务分类。请从以下选项中选出最符合用户请求的任务类型编号:\n",
+        "1. 发布广告视频草稿\n",
+        "2. 发布短视频草稿\n",
+        "3. 授权商品发布草稿\n",
+        "4. 购买辅助\n",
+        "5. 内容搜索\n",
+        "6. 二手同城筛选\n",
+        "7. 其他\n",
+        "用户请求: ", text, "\n",
+        "最符合的选项编号是"
+    ], "")
+
+type
+    PlannerTaskModelFixture =
+        graph: mg.ModelGraph
+        bindings: wb.WeightBindingSet
+        store: ws.WeightTensorStore
+
+# 用已加载的 dense fixture + tokenizer 对 text 做候选受限 logits argmax。
+# 候选编号 token ("1".."7") 必须各自恰好编码成单 token, 否则 Err (由调用方
+# 回退规则闭环)。
+fn PlannerTaskClassifyWithDenseFixture(graph: mg.ModelGraph,
+                                       bindings: wb.WeightBindingSet,
+                                       store: ws.WeightTensorStore,
+                                       t: tok.Tokenizer,
+                                       tables: uni.UnicodeTables,
+                                       text: str): Result[str] =
+    let kinds = PlannerTaskCandidateKinds()
+    let prompt = plannerTaskBuildClassifyPrompt(text)
+    let promptIds = tok.TokenizerEncode(t, tables, prompt)
+    let promptLen = promptIds.len
+    if promptLen <= 0:
+        return Err[str]("planner task model classify: empty prompt encoding")
+    var candidateIds: int32[]
+    let digits = ["1", "2", "3", "4", "5", "6", "7"]
+    for i in 0..<digits.len:
+        let digitIds = tok.TokenizerEncode(t, tables, digits[i])
+        if digitIds.len != 1:
+            return Err[str]("planner task model classify: candidate token not single")
+        add(candidateIds, digitIds[0])
+    var promptTensor: infer.TensorQ
+    let fillOk = infer.TensorFromDataFill(promptTensor, [promptLen], 1, promptIds)
+    if IsErr(fillOk):
+        return Err[str](Error(fillOk))
+    let outputRes = mexec.ModelExecutorExecuteDenseTransformerTokens(graph, bindings, store, promptTensor)
+    if IsErr(outputRes):
+        return Err[str](Error(outputRes))
+    let logits = Value(outputRes).logits
+    if logits.shape.len != 2 || logits.shape[0] < promptLen:
+        return Err[str]("planner task model classify: logits shape")
+    let lastRow = promptLen - 1
+    var bestIndex: int32
+    var bestValue: int32
+    for i in 0..<candidateIds.len:
+        if candidateIds[i] < 0 || candidateIds[i] >= logits.shape[1]:
+            return Err[str]("planner task model classify: candidate id out of vocab")
+        let value = logits.data[infer.TensorOffset2(logits.shape, lastRow, candidateIds[i])]
+        if i == 0 || value > bestValue:
+            bestValue = value
+            bestIndex = i
+    return Ok[str](strings.CloneStr(kinds[bestIndex]))
+
+# env 驱动的真权重加载 (与 inference_planner_cli_main cliLoadFromPaths 同一
+# 校验链: 图构建 -> 流式 safetensors 解码 -> binding/store 校验 -> 执行门)。
+fn plannerTaskLoadFixtureFromEnv(): Result[PlannerTaskModelFixture] =
+    let configPath = os.GetEnv("CHENG_PLANNER_CONFIG")
+    let weightsPath = os.GetEnv("CHENG_PLANNER_WEIGHTS")
+    if configPath == "" || weightsPath == "":
+        return Err[PlannerTaskModelFixture]("planner task model: env not set")
+    if !os.FileExists(configPath) || !os.FileExists(weightsPath):
+        return Err[PlannerTaskModelFixture]("planner task model: path not found")
+    var linearDtype = kir.KernelDtypeBf16
+    let dtypeEnv = os.GetEnv("CHENG_PLANNER_DTYPE")
+    if dtypeEnv == "fp16":
+        linearDtype = kir.KernelDtypeFp16
+    elif dtypeEnv != "" && dtypeEnv != "bf16":
+        return Err[PlannerTaskModelFixture]("planner task model: dtype env")
+    var tensorScale: int32 = 100000
+    let scaleEnv = os.GetEnv("CHENG_PLANNER_TENSOR_SCALE")
+    if scaleEnv != "":
+        tensorScale = int32(strutil.ParseInt(scaleEnv))
+        if tensorScale <= 0:
+            return Err[PlannerTaskModelFixture]("planner task model: tensor scale env")
+    let configRes = os.ReadFileResult(configPath)
+    if IsErr(configRes):
+        return Err[PlannerTaskModelFixture](Error(configRes))
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        Value(configRes),
+        "cid:model:xiaoyou-planner-task",
+        linearDtype,
+        mg.ModelQuantSchemeNone
+    )
+    if IsErr(graphRes):
+        return Err[PlannerTaskModelFixture](Error(graphRes))
+    let graph = Value(graphRes)
+    if graph.architecture != mg.InferenceModelArchitectureDenseTransformer:
+        return Err[PlannerTaskModelFixture]("planner task model: architecture")
+    if graph.weights.len <= 0:
+        return Err[PlannerTaskModelFixture]("planner task model: empty weight inventory")
+    var peerIds: str[]
+    for i in 0..<graph.weights.len:
+        add(peerIds, "peer:xiaoyou-planner-task")
+    let loaded = ws.WeightSafetensorsLoadGraphFilePathStreaming(weightsPath, share(graph), peerIds, tensorScale)
+    if IsErr(loaded):
+        return Err[PlannerTaskModelFixture](Error(loaded))
+    let loadResult = Value(loaded)
+    let gateRes = mexec.ModelExecutorValidateDenseTransformerGraph(
+        graph, loadResult.bindings, loadResult.store)
+    if IsErr(gateRes):
+        return Err[PlannerTaskModelFixture](Error(gateRes))
+    if !Value(gateRes):
+        return Err[PlannerTaskModelFixture]("planner task model: dense graph gate false")
+    return Ok[PlannerTaskModelFixture](PlannerTaskModelFixture(
+        graph: graph,
+        bindings: share(loadResult.bindings),
+        store: share(loadResult.store)
+    ))
+
+fn plannerTaskClassifyViaEnvModel(text: str): Result[str] =
+    let fixtureRes = plannerTaskLoadFixtureFromEnv()
+    if IsErr(fixtureRes):
+        return Err[str](Error(fixtureRes))
+    var fixture = Value(fixtureRes)
+    var tokenizerPath = os.GetEnv("CHENG_PLANNER_TOKENIZER")
+    if tokenizerPath == "":
+        tokenizerPath = "artifacts/tokenizer/qwen25/tokenizer_qwen25.bin"
+    var unicodePath = os.GetEnv("CHENG_PLANNER_UNICODE_TABLES")
+    if unicodePath == "":
+        unicodePath = "artifacts/tokenizer/unicode_tables.bin"
+    let uniRes = uni.UnicodeTablesLoad(unicodePath)
+    if IsErr(uniRes):
+        return Err[str](Error(uniRes))
+    let tokRes = tok.TokenizerLoad(tokenizerPath)
+    if IsErr(tokRes):
+        return Err[str](Error(tokRes))
+    var graph = fixture.graph
+    var bindings = fixture.bindings
+    var store = fixture.store
+    return PlannerTaskClassifyWithDenseFixture(
+        graph, bindings, store,
+        Value(tokRes), Value(uniRes), text)
+
+# 镜像 asiComputerUseContract.ts classifyTaskKind: JS 侧对部分分支用
+# transcript.toLowerCase() (这里的 lowered), 对另一些分支用原始 transcript
+# (这里的 text) 做正则测试; 中文字符不受 toLowerCase 影响, 差异只体现在
+# ad/video/taobao/km 这类 ASCII 关键词的大小写不敏感匹配上, 逐分支保持一致。
+#
+# 任务03: 规则判定权威实现 (模块内私有); 公开入口是下方
+# PlannerTaskClassifyRulesFromText 薄包装。
+@borrows
+fn plannerTaskClassifyRulesFromText(text: str): str =
+    if text == "":
+        return PlannerTaskKindUnsupportedReview
+    let lowered = strutil.ToLowerAscii(text)
+    if plannerTextContainsAny(lowered, ["广告", "ad"]) &&
+       plannerTextContainsAny(lowered, ["视频", "video"]) &&
+       plannerTextContainsAny(text, ["发布", "上传", "发"]):
+        return PlannerTaskKindPublishAdVideoDraft
+    if plannerTextContainsAny(text, ["短视频", "视频"]) &&
+       plannerTextContainsAny(text, ["发布", "上传", "发"]):
+        return PlannerTaskKindPublishShortVideoDraft
+    if plannerTextContainsAny(lowered, ["授权商品", "商品源", "商品草稿", "淘宝", "taobao", "抓取商品", "导入商品"]):
+        return PlannerTaskKindAuthorizedProductPublishDraft
+    if plannerTextContainsAny(text, ["购买", "帮我买", "买", "下单", "加入购物车", "搜索商品"]):
+        return PlannerTaskKindPurchaseAssistReview
+    if plannerTextContainsAny(text, ["二手"]) &&
+       plannerTextContainsAny(lowered, ["距离", "最近", "公里", "km", "千米", "查看", "看"]):
+        return PlannerTaskKindFeedFilterReview
+    if plannerTextContainsAny(text, ["搜索", "搜一下", "搜", "查找", "查一下", "找一下"]):
+        return PlannerTaskKindContentSearchReview
+    return PlannerTaskKindUnsupportedReview
+
+# 任务03: 显式规则模式唯一公开入口 (薄包装, 判定权威是上面的私有实现)。
+# 调用者必须预先明确选择规则模式; 本入口不是模型路径任何失败的替换品。
+@borrows
+fn PlannerTaskClassifyRulesFromText(text: str): str =
+    return plannerTaskClassifyRulesFromText(text)
+
+# #141 F1: budget-gated classify. classify is a single atomic dense forward
+# (PlannerTaskClassifyWithDenseFixture, no generation loop to checkpoint
+# inside).
+#
+# 任务03 失败语义: 取消/超时先于任何权重加载与 forward 检查, 返回可区分的
+# 显式 Err (取消后不执行任何模型调用, 不产生 emit/副作用); 模型路径任何失败
+# 原样返回 Err, 不回落关键词规则 —— 调用者能区别模型答案 (Ok) 与失败 (Err),
+# 规则答案只能来自显式入口 PlannerTaskClassifyRulesFromText。
+fn PlannerTaskClassifyFromTextWithBudget(text: str, budget: engine.DistributedGenerationBudget): Result[str] =
+    if engine.DistributedGenerationBudgetDeadlinePassed(budget):
+        return Err[str]("planner task model: budget deadline passed")
+    if budget.cancelPoll():
+        return Err[str]("planner task model: budget cancelled")
+    return plannerTaskClassifyViaEnvModel(strings.CloneStr(text))
+
+# 任务03: 原 frozen delegate ("无界预算 + 失败回落规则", 返回 str) 的成功
+# 伪装语义已移除; 本名保留为显式失败合同的薄别名 (Result[str]), 与
+# WithBudget 同一权威实现, 无任何回退通道。
+@borrows
+fn PlannerTaskClassifyFromText(text: str): Result[str] =
+    return PlannerTaskClassifyFromTextWithBudget(strings.CloneStr(text), engine.DistributedGenerationBudgetUnbounded())
+
+# S8 (#15): 结构化槽位抽取 —— taskKind 之外补 title/price/query 等文本槽位。
+#
+# 选型 (s8a_note.md 全量分析): 二次 prompt + 复用既有
+# engine.DistributedGenerateGreedyDenseTransformerTokens (贪心自回归生成,
+# 已在 inference_planner_cli_main 验证过真权重可用), 不是"同一 forward 复用"
+# (模型只有单一 next-token LM head, classify 那次 forward 的候选编号 logits
+# 不携带任意长度槽位文本), 也不是"受限生成/schema 约束解码" (执行器当前无
+# 逐步 logits mask 挂载点, 引入它是新子系统, 不是复用, 且要改共享核心生成
+# 循环, 超出本次最小改动范围)。
+#
+# 安全铁律 (不可违, 调用方必须原样延续): PlannerTaskSlot 只有 name/status/
+# value 三个纯文本/枚举字段, 不存在任何字段能表达或影响
+# confirmationRequired/effectClass/actions —— 这三个概念只存在于 UniMaker
+# TS 模板层, Cheng 引擎侧代码从未引用过, 模型输出无论内容是什么都只是
+# value: str 里一段被净化过的文本, 不是可执行的指令通道。
+#
+# 三态: hit(命中, value 非空) / miss(该 taskKind 下该槽位适用但抽取失败或
+# 模型不可用) / not_applicable(该槽位不属于当前 taskKind 的 schema, 从未
+# 尝试抽取)。槽位名全集固定 6 个, 每次调用逐一给出三态之一, 顺序稳定,
+# 可直接逐位 diff, 不是"只返回适用的几个"。
+
+const
+    PlannerTaskSlotStatusHit = "hit"
+    PlannerTaskSlotStatusMiss = "miss"
+    PlannerTaskSlotStatusNotApplicable = "not_applicable"
+
+    PlannerTaskSlotNameTitle = "title"
+    PlannerTaskSlotNameDescription = "description"
+    PlannerTaskSlotNameProductTitle = "productTitle"
+    PlannerTaskSlotNamePrice = "price"
+    PlannerTaskSlotNameQuery = "query"
+    PlannerTaskSlotNameDistanceKm = "distanceKm"
+
+    PlannerTaskSlotNoneMarker = "无"
+
+    # 生产默认值; 桌面验证 CLI 可传更小的值以控制真权重跑通耗时 (执行器
+    # 无 KV cache, 每步全量重算, 见 fix_verdict.md 的真实延迟实测)。
+    PlannerTaskSlotMaxNewTokensText: int32 = 16
+    PlannerTaskSlotMaxNewTokensNumeric: int32 = 6
+
+    PlannerTaskSlotMaxRunesText: int32 = 60
+    PlannerTaskSlotMaxRunesNumeric: int32 = 16
+
+type
+    PlannerTaskSlotEntry =
+        name: str
+        status: str
+        value: str
+
+    PlannerTaskSlotResult =
+        taskKind: str
+        slots: PlannerTaskSlotEntry[]
+
+# 槽位名全集, 顺序固定 (下游可逐位 diff)。
+fn PlannerTaskAllSlotNames(): str[] =
+    return [
+        PlannerTaskSlotNameTitle,
+        PlannerTaskSlotNameDescription,
+        PlannerTaskSlotNameProductTitle,
+        PlannerTaskSlotNamePrice,
+        PlannerTaskSlotNameQuery,
+        PlannerTaskSlotNameDistanceKm
+    ]
+
+# 镜像 asiComputerUseContract.ts payloadBindingsForTask 的纯文本槽位子集
+# (排除 videoFile/confirmPublish/addToCart/feedFilter 这类常量或 JSON 复合
+# 字段, 模型无等价物, 也不该有 —— 那些字段永远走手写模板)。
+fn plannerTaskSlotNamesForKind(taskKind: str): str[] =
+    var none: str[]
+    if taskKind == PlannerTaskKindPublishShortVideoDraft ||
+       taskKind == PlannerTaskKindPublishAdVideoDraft:
+        return [PlannerTaskSlotNameTitle, PlannerTaskSlotNameDescription]
+    if taskKind == PlannerTaskKindAuthorizedProductPublishDraft:
+        return [PlannerTaskSlotNameProductTitle, PlannerTaskSlotNamePrice]
+    if taskKind == PlannerTaskKindPurchaseAssistReview ||
+       taskKind == PlannerTaskKindContentSearchReview:
+        return [PlannerTaskSlotNameQuery]
+    if taskKind == PlannerTaskKindFeedFilterReview:
+        return [PlannerTaskSlotNameDistanceKm]
+    return none
+
+fn plannerTaskSlotNameInList(name: str, names: str[]): bool =
+    for i in 0..<names.len:
+        if names[i] == name:
+            return true
+    return false
+
+fn plannerTaskSlotIsNumeric(name: str): bool =
+    return name == PlannerTaskSlotNamePrice || name == PlannerTaskSlotNameDistanceKm
+
+fn plannerTaskSlotLabel(name: str): str =
+    if name == PlannerTaskSlotNameTitle:
+        return "标题"
+    if name == PlannerTaskSlotNameDescription:
+        return "文案描述"
+    if name == PlannerTaskSlotNameProductTitle:
+        return "商品标题"
+    if name == PlannerTaskSlotNamePrice:
+        return "价格"
+    if name == PlannerTaskSlotNameQuery:
+        return "搜索关键词"
+    return "距离公里数"
+
+# 每个槽位一条手写单样例 (few-shot 锚定输出格式, 0.5B base 模型零指令微调,
+# 靠结构化提示而非对话式指令跟随, 与既有 classify prompt 的"编号菜单"技巧
+# 同族)。样例与下游真实验证用例的文本不重叠, 避免"复制样例"被误判为抽取
+# 成功。
+fn plannerTaskSlotExemplarText(name: str): str =
+    if name == PlannerTaskSlotNameTitle:
+        return "帮我发布一个我家猫咪吃饭的短视频"
+    if name == PlannerTaskSlotNameDescription:
+        return "发布视频,文案写:周末爬山看日出真的太美了"
+    if name == PlannerTaskSlotNameProductTitle:
+        return "从淘宝导入商品,商品标题是复古港风衬衫"
+    if name == PlannerTaskSlotNamePrice:
+        return "帮我发布商品,价格是129.9"
+    if name == PlannerTaskSlotNameQuery:
+        return "帮我搜索一下附近的咖啡馆"
+    return "看看二手相机,距离最近的5公里以内"
+
+fn plannerTaskSlotExemplarAnswer(name: str): str =
+    if name == PlannerTaskSlotNameTitle:
+        return "我家猫咪吃饭"
+    if name == PlannerTaskSlotNameDescription:
+        return "周末爬山看日出真的太美了"
+    if name == PlannerTaskSlotNameProductTitle:
+        return "复古港风衬衫"
+    if name == PlannerTaskSlotNamePrice:
+        return "129.9"
+    if name == PlannerTaskSlotNameQuery:
+        return "附近的咖啡馆"
+    return "5"
+
+fn plannerTaskBuildSlotExtractPrompt(text: str, name: str): str =
+    let label = plannerTaskSlotLabel(name)
+    return strutil.Join([
+        "从用户请求中提取", label, "。只输出", label, "本身, 不要输出其它文字;",
+        "如果用户请求没有提到, 输出:", PlannerTaskSlotNoneMarker, "\n",
+        "用户请求: ", plannerTaskSlotExemplarText(name), "\n",
+        label, ": ", plannerTaskSlotExemplarAnswer(name), "\n",
+        "用户请求: ", text, "\n",
+        label, ":"
+    ], "")
+
+fn plannerSlotPunctuationAllowed(cp: int32): bool =
+    return cp == 0x20 || cp == 0x2c || cp == 0xff0c || cp == 0x2e ||
+           cp == 0x3002 || cp == 0x3001 || cp == 0x21 || cp == 0xff01 ||
+           cp == 0x3f || cp == 0xff1f || cp == 0x2d || cp == 0x3a ||
+           cp == 0xff1a || cp == 0x25
+
+fn plannerSlotIsNumericChar(cp: int32): bool =
+    return (cp >= 0x30 && cp <= 0x39) || cp == 0x2e
+
+# 安全前缀扫描 (不调用 uni.Utf8Decode —— 那个函数对残缺/非法字节序列是硬
+# panic, 不是 Result): 逐字节走一遍与 Utf8Decode 相同的长度判定 (ASCII/2/3/
+# 4 字节前导), 遇到"剩余字节不够"或"前导字节本身不合法"立即停止, 返回已扫过
+# 的合法字节数。模型生成的 token 是字节级 BPE, 陆续吐出的新 token 不保证落在
+# 字符边界上 (尤其 maxNewTokens 很小时, 生成常常在多字节字符中途截断) ——
+# 净化函数的输入是不可信模型输出, 必须先把"可能不完整的 UTF-8 尾部"截掉,
+# 再喂给 Utf8Decode, 否则一次不巧的截断就会 panic 整个进程 (不是"让它 crash
+# 暴露问题", 是让一次正常的短生成拖垮整条槽位抽取流水线, 不可接受)。
+fn plannerSlotValidUtf8PrefixByteLen(bytes: rawbytes.Bytes): int32 =
+    let n = rawbytes.BytesLen(bytes)
+    var i: int32 = 0
+    while i < n:
+        let b0 = rawbytes.BytesGet(bytes, i) & 255
+        if b0 < 0x80:
+            i = i + 1
+        elif (b0 & 0xe0) == 0xc0:
+            if i + 1 >= n:
+                return i
+            i = i + 2
+        elif (b0 & 0xf0) == 0xe0:
+            if i + 2 >= n:
+                return i
+            i = i + 3
+        elif (b0 & 0xf8) == 0xf0:
+            if i + 3 >= n:
+                return i
+            i = i + 4
+        else:
+            return i
+    return i
+
+# 净化: 先截掉不完整/非法的 UTF-8 尾部 (见 plannerSlotValidUtf8PrefixByteLen),
+# 再逐 codepoint 扫描: 命中控制字符/DEL 立即截断 (模型换行/控制字符视为答案
+# 结束); 数字槽位命中第一个非数字/小数点字符同样截断 (保留数字前缀, 丢弃
+# 后续叙述); 文本槽位靠 UnicodeIsLetter/UnicodeIsNumber + 固定标点白名单
+# 逐字放行, 其余字符丢弃 (不截断, 只是单字符噪声); 命中长度上限立即停止。
+fn PlannerTaskSanitizeSlotValue(tables: uni.UnicodeTables, raw: str, maxRunes: int32, numericOnly: bool): str =
+    let bytes = rawbytes.BytesFromString(raw)
+    let validLen = plannerSlotValidUtf8PrefixByteLen(bytes)
+    let safeBytes = rawbytes.BytesSlice(bytes, 0, validLen)
+    let cps = uni.Utf8Decode(safeBytes)
+    var outCps: int32[]
+    for i in 0..<cps.len:
+        let cp = cps[i]
+        if cp < 0x20 || cp == 0x7f:
+            break
+        if outCps.len >= maxRunes:
+            break
+        if numericOnly:
+            if plannerSlotIsNumericChar(cp):
+                add(outCps, cp)
+            else:
+                break
+        elif uni.UnicodeIsLetter(tables, cp) || uni.UnicodeIsNumber(tables, cp) ||
+             plannerSlotPunctuationAllowed(cp):
+            add(outCps, cp)
+    let outBytes = uni.Utf8Encode(outCps)
+    return strutil.Strip(rawbytes.BytesToString(outBytes))
+
+fn plannerTaskSlotValueIsMiss(name: str, sanitized: str): bool =
+    if sanitized == "" || sanitized == PlannerTaskSlotNoneMarker:
+        return true
+    if plannerTaskSlotIsNumeric(name):
+        let bytes = rawbytes.BytesFromString(sanitized)
+        let cps = uni.Utf8Decode(bytes)
+        var hasDigit = false
+        for i in 0..<cps.len:
+            if cps[i] >= 0x30 && cps[i] <= 0x39:
+                hasDigit = true
+        return !hasDigit
+    return false
+
+# 单槽位一次独立生成调用: 复用 engine.DistributedGenerateGreedyDenseTransformerTokensWithKvState
+# (#141 起 -- prefill 一次 + decode 逐 token 复用 paged kv cache, 贪心 argmax,
+# 无采样, 与 classify 同款确定性, 与冻结的全量重算版逐位等价 -- 见
+# model_executor_dense_kv_state_equivalence_smoke.cheng), 只取 prompt 之后
+# 新生成的 token 解码, 不做净化 (净化由调用方独立跑, 便于单测)。budget 贯穿
+# 整个生成循环 (#141 F1): 预算耗尽/取消不算错误, 只是提前拿到更短的
+# tokenIds, 落回下面 outIds.len<=promptIds.len 的既有"该槽位记 miss"路径。
+fn plannerTaskGenerateSlotRawViaFixture(graph: mg.ModelGraph,
+                                        bindings: wb.WeightBindingSet,
+                                        store: ws.WeightTensorStore,
+                                        t: tok.Tokenizer,
+                                        tables: uni.UnicodeTables,
+                                        text: str,
+                                        name: str,
+                                        maxNewTokens: int32,
+                                        budget: engine.DistributedGenerationBudget): Result[str] =
+    let prompt = plannerTaskBuildSlotExtractPrompt(text, name)
+    let promptIds = tok.TokenizerEncode(t, tables, prompt)
+    if promptIds.len <= 0:
+        return Err[str]("planner task slot extract: empty prompt encoding")
+    var promptTensor: infer.TensorQ
+    let fillOk = infer.TensorFromDataFill(promptTensor, [promptIds.len], 1, promptIds)
+    if IsErr(fillOk):
+        return Err[str](Error(fillOk))
+    let generateRes = engine.DistributedGenerateGreedyDenseTransformerTokensWithKvState(
+        graph, bindings, store, promptTensor, maxNewTokens, -1, budget)
+    if IsErr(generateRes):
+        return Err[str](Error(generateRes))
+    let outIds = Value(generateRes).tokenIds.data
+    if outIds.len <= promptIds.len:
+        return Ok[str]("")
+    var newIds: int32[]
+    for i in promptIds.len..<outIds.len:
+        add(newIds, outIds[i])
+    return Ok[str](tok.TokenizerDecode(t, newIds))
+
+# 全 6 槽位构建结果: 非该 taskKind 适用的槽位一律 not_applicable, 适用的
+# 槽位逐一跑生成+净化+三态判定。maxNewTokensText/maxNewTokensNumeric 由
+# 调用方显式传入 (生产入口用 PlannerTaskSlotMaxNewTokens{Text,Numeric}
+# 默认值, 验证 CLI 可传更小的值控制真权重跑通耗时, 不改变本函数逻辑)。
+# #141 F1: budget 在适用槽位循环里逐槽位检查 -- 命中(已过期/已取消)则该槽位
+# 及循环继续到的后续适用槽位直接记 miss, 不再发起新的生成调用 (预算是整次
+# 调用累积消耗的, 不是每槽位各自独立满格)。
+fn PlannerTaskExtractSlotsWithDenseFixtureWithBudget(graph: mg.ModelGraph,
+                                                      bindings: wb.WeightBindingSet,
+                                                      store: ws.WeightTensorStore,
+                                                      t: tok.Tokenizer,
+                                                      tables: uni.UnicodeTables,
+                                                      text: str,
+                                                      taskKind: str,
+                                                      maxNewTokensText: int32,
+                                                      maxNewTokensNumeric: int32,
+                                                      budget: engine.DistributedGenerationBudget): PlannerTaskSlotResult =
+    let allNames = PlannerTaskAllSlotNames()
+    let applicableNames = plannerTaskSlotNamesForKind(taskKind)
+    var entries: PlannerTaskSlotEntry[]
+    for i in 0..<allNames.len:
+        let name = allNames[i]
+        if !plannerTaskSlotNameInList(name, applicableNames):
+            add(entries, PlannerTaskSlotEntry(name: name, status: PlannerTaskSlotStatusNotApplicable, value: ""))
+            continue
+        if engine.DistributedGenerationBudgetDeadlinePassed(budget) || budget.cancelPoll():
+            add(entries, PlannerTaskSlotEntry(name: name, status: PlannerTaskSlotStatusMiss, value: ""))
+            continue
+        let numeric = plannerTaskSlotIsNumeric(name)
+        var maxNewTokens = maxNewTokensText
+        if numeric:
+            maxNewTokens = maxNewTokensNumeric
+        var maxRunes = PlannerTaskSlotMaxRunesText
+        if numeric:
+            maxRunes = PlannerTaskSlotMaxRunesNumeric
+        let rawRes = plannerTaskGenerateSlotRawViaFixture(graph, bindings, store, t, tables, text, name, maxNewTokens, budget)
+        if IsErr(rawRes):
+            add(entries, PlannerTaskSlotEntry(name: name, status: PlannerTaskSlotStatusMiss, value: ""))
+            continue
+        let sanitized = PlannerTaskSanitizeSlotValue(tables, Value(rawRes), maxRunes, numeric)
+        if plannerTaskSlotValueIsMiss(name, sanitized):
+            add(entries, PlannerTaskSlotEntry(name: name, status: PlannerTaskSlotStatusMiss, value: ""))
+        else:
+            add(entries, PlannerTaskSlotEntry(name: name, status: PlannerTaskSlotStatusHit, value: sanitized))
+    return PlannerTaskSlotResult(taskKind: taskKind, slots: entries)
+
+# Frozen delegate (pre-#141 signature and behavior): unbounded budget never
+# trips the per-slot check above, so every applicable slot always attempts
+# generation, exactly as before.
+fn PlannerTaskExtractSlotsWithDenseFixture(graph: mg.ModelGraph,
+                                           bindings: wb.WeightBindingSet,
+                                           store: ws.WeightTensorStore,
+                                           t: tok.Tokenizer,
+                                           tables: uni.UnicodeTables,
+                                           text: str,
+                                           taskKind: str,
+                                           maxNewTokensText: int32,
+                                           maxNewTokensNumeric: int32): PlannerTaskSlotResult =
+    return PlannerTaskExtractSlotsWithDenseFixtureWithBudget(
+        graph, bindings, store, t, tables, text, taskKind,
+        maxNewTokensText, maxNewTokensNumeric, engine.DistributedGenerationBudgetUnbounded())
+
+# 生产入口: taskKind 判定走 PlannerTaskClassifyFromTextWithBudget (显式失败
+# 合同, 见其注释)。classify 失败 → 本入口原样 Err, 不再用规则 kind 或"全
+# miss 表"伪装成功; fixture/分词器/unicode 表加载失败同样 Err 短路。单槽位
+# 生成失败/预算中途耗尽仍按既有三态合同的按槽诚实语义记 miss (那是槽位级
+# 抽取失败, 不是全局能力不可用)。
+#
+# #141 F1: 同一个 budget 贯穿 classify + 权重加载 + 每个槽位的生成调用 ——
+# 一次调用消耗的是同一份累积预算 (deadlineMs 是整个调用的墙钟截止时间,
+# 不是每个子步骤各自独立满格)。权重加载 (plannerTaskLoadFixtureFromEnv,
+# 可能有几十秒 I/O+反量化耗时) 是原子的单次调用, 同 classify 一样只能
+# "开始前跳过"。
+fn PlannerTaskExtractSlotsFromTextWithBudget(text: str, budget: engine.DistributedGenerationBudget): Result[PlannerTaskSlotResult] =
+    let kindRes = PlannerTaskClassifyFromTextWithBudget(text, budget)
+    if IsErr(kindRes):
+        return Err[PlannerTaskSlotResult](Error(kindRes))
+    let taskKind = Value(kindRes)
+    if engine.DistributedGenerationBudgetDeadlinePassed(budget):
+        return Err[PlannerTaskSlotResult]("planner task model: budget deadline passed")
+    if budget.cancelPoll():
+        return Err[PlannerTaskSlotResult]("planner task model: budget cancelled")
+    let fixtureRes = plannerTaskLoadFixtureFromEnv()
+    if IsErr(fixtureRes):
+        return Err[PlannerTaskSlotResult](Error(fixtureRes))
+    let fixture = Value(fixtureRes)
+    var tokenizerPath = os.GetEnv("CHENG_PLANNER_TOKENIZER")
+    if tokenizerPath == "":
+        tokenizerPath = "artifacts/tokenizer/qwen25/tokenizer_qwen25.bin"
+    var unicodePath = os.GetEnv("CHENG_PLANNER_UNICODE_TABLES")
+    if unicodePath == "":
+        unicodePath = "artifacts/tokenizer/unicode_tables.bin"
+    let uniRes = uni.UnicodeTablesLoad(unicodePath)
+    if IsErr(uniRes):
+        return Err[PlannerTaskSlotResult](Error(uniRes))
+    let tokRes = tok.TokenizerLoad(tokenizerPath)
+    if IsErr(tokRes):
+        return Err[PlannerTaskSlotResult](Error(tokRes))
+    return Ok[PlannerTaskSlotResult](PlannerTaskExtractSlotsWithDenseFixtureWithBudget(
+        fixture.graph, fixture.bindings, fixture.store,
+        Value(tokRes), Value(uniRes), text, taskKind,
+        PlannerTaskSlotMaxNewTokensText, PlannerTaskSlotMaxNewTokensNumeric, budget))

@@ -1,0 +1,292 @@
+# Deterministic discrete-event network simulator kernel (Wave 0).
+#
+# - Virtual clock: int64 microseconds, advances only via SimStep/SimRunUntil.
+# - Event heap: binary min-heap ordered by (time, seq); seq is a monotonic
+#   counter so simultaneous events keep a stable total order.
+# - Link model: per directed (src, dst) pair {delayUs, jitterUs, lossPermille,
+#   partitioned}. Jitter and loss draw from one deterministic LCG, in SimSend
+#   call order, so the same seed plus the same call sequence yields the same
+#   event sequence. Partition drops at send time and also cuts in-flight
+#   packets at delivery time.
+# - LCG: x = (x * 1103515245 + 12345) & 0x7fffffff. Mask (not `% 2^31`) on
+#   purpose: int64 literals >= 2^31 are miscompiled (findings 2026-06-12).
+# - Payload Bytes are caller-owned and live in an append-only log; events,
+#   deliveries and cursors are pure-scalar structs stored whole-element.
+#   Cold backend constraints honored here: scalar global-seq element stores
+#   inside functions are miscompiled (silently dropped / corrupted), and
+#   struct elements containing Bytes crash on overwrite; whole-struct stores
+#   of pure-scalar structs with local indices are the reliable pattern.
+
+import std/system
+import std/seqs
+import cheng/libp2p/utils/result
+import cheng/libp2p/utils/bytes
+
+type
+    SimLink =
+        delayUs: int64
+        jitterUs: int64
+        lossPermille: int32
+        partitioned: bool
+
+    SimEvent =
+        time: int64
+        seq: int64
+        src: int32
+        dst: int32
+        payloadIdx: int32
+
+    SimDeliveryRec =
+        time: int64
+        src: int32
+        dst: int32
+        payloadIdx: int32
+
+    SimDelivery =
+        time: int64
+        src: int32
+        dst: int32
+        payload: Bytes
+
+const
+    simMaxNodes = 64
+    simLinkSlots = 4096
+
+var
+    simNow: int64
+    simSeqCounter: int64
+    simRngState: int64
+    simNodeCount: int32
+    simHeapLen: int32
+    simDeliveredTotal: int64
+    simGlobalCursor: int32
+    simEvents: SimEvent[]
+    simPayloads: Bytes[]
+    simDels: SimDeliveryRec[]
+    simNodeCursors: int32[]
+    simLinks: SimLink[]
+
+fn simRngNext(): int64 =
+    simRngState = (simRngState * 1103515245 + 12345) & 2147483647
+    return simRngState
+
+fn simEventBefore(a: SimEvent, b: SimEvent): bool =
+    if a.time != b.time:
+        return a.time < b.time
+    return a.seq < b.seq
+
+fn simHeapSiftUp(start: int32) =
+    var i: int32 = start
+    while i > 0:
+        let parent: int32 = (i - 1) / 2
+        let cur: SimEvent = simEvents[i]
+        let par: SimEvent = simEvents[parent]
+        if simEventBefore(cur, par):
+            simEvents[i] = par
+            simEvents[parent] = cur
+            i = parent
+        else:
+            break
+
+fn simHeapSiftDown(start: int32) =
+    var i: int32 = start
+    var done: bool
+    while ! done:
+        let left: int32 = i * 2 + 1
+        if left >= simHeapLen:
+            done = true
+        else:
+            var best: int32 = left
+            let right: int32 = left + 1
+            if right < simHeapLen:
+                let l: SimEvent = simEvents[left]
+                let r: SimEvent = simEvents[right]
+                if simEventBefore(r, l):
+                    best = right
+            let cand: SimEvent = simEvents[best]
+            let cur: SimEvent = simEvents[i]
+            if simEventBefore(cand, cur):
+                simEvents[best] = cur
+                simEvents[i] = cand
+                i = best
+            else:
+                done = true
+
+fn simHeapPush(ev: SimEvent) =
+    let at: int32 = simHeapLen
+    if at < simEvents.len:
+        simEvents[at] = ev
+    else:
+        add(simEvents, ev)
+    simHeapLen = simHeapLen + 1
+    simHeapSiftUp(at)
+
+fn simHeapRemoveRoot() =
+    simHeapLen = simHeapLen - 1
+    let n: int32 = simHeapLen
+    if n > 0:
+        let last: SimEvent = simEvents[n]
+        simEvents[0] = last
+        simHeapSiftDown(0)
+
+fn simLinkIndex(fromNode: int32, toNode: int32): int32 =
+    return fromNode * simMaxNodes + toNode
+
+fn simValidNode(node: int32): bool =
+    return node >= 0 && node < simNodeCount
+
+fn SimNew(seed: int64) =
+    simNow = 0
+    simSeqCounter = 0
+    simRngState = seed & 2147483647
+    simNodeCount = 0
+    simHeapLen = 0
+    simDeliveredTotal = 0
+    simGlobalCursor = 0
+    setLen(simEvents, 0)
+    setLen(simPayloads, 0)
+    setLen(simDels, 0)
+    setLen(simNodeCursors, 0)
+    setLen(simLinks, 0)
+    setLen(simLinks, simLinkSlots)
+
+fn SimAddNode(): int32 =
+    if simNodeCount >= simMaxNodes:
+        panic("netsim: node capacity exceeded")
+    let id: int32 = simNodeCount
+    simNodeCount = simNodeCount + 1
+    var cursor: int32
+    add(simNodeCursors, cursor)
+    return id
+
+fn SimSetLink(fromNode: int32, toNode: int32, delayUs: int64, jitterUs: int64, lossPermille: int32): Result[bool] =
+    if ! simValidNode(fromNode) || ! simValidNode(toNode):
+        return Err[bool]("netsim: setlink invalid node")
+    if delayUs < 0 || jitterUs < 0 || lossPermille < 0 || lossPermille > 1000:
+        return Err[bool]("netsim: setlink invalid params")
+    let idx: int32 = simLinkIndex(fromNode, toNode)
+    var cfg: SimLink = simLinks[idx]
+    cfg.delayUs = delayUs
+    cfg.jitterUs = jitterUs
+    cfg.lossPermille = lossPermille
+    simLinks[idx] = cfg
+    return Ok[bool](true)
+
+fn SimSetPartitioned(fromNode: int32, toNode: int32, partitioned: bool): Result[bool] =
+    if ! simValidNode(fromNode) || ! simValidNode(toNode):
+        return Err[bool]("netsim: partition invalid node")
+    let idx: int32 = simLinkIndex(fromNode, toNode)
+    var cfg: SimLink = simLinks[idx]
+    cfg.partitioned = partitioned
+    simLinks[idx] = cfg
+    return Ok[bool](true)
+
+# Returns Ok(true) when the packet was scheduled, Ok(false) when it was
+# dropped by partition or loss.
+fn SimSend(fromNode: int32, toNode: int32, payload: Bytes): Result[bool] =
+    if ! simValidNode(fromNode) || ! simValidNode(toNode):
+        return Err[bool]("netsim: send invalid node")
+    let cfg: SimLink = simLinks[simLinkIndex(fromNode, toNode)]
+    if cfg.partitioned:
+        return Ok[bool](false)
+    if cfg.lossPermille > 0:
+        let roll: int64 = simRngNext() % 1000
+        if roll < int64(cfg.lossPermille):
+            return Ok[bool](false)
+    var jitter: int64
+    if cfg.jitterUs > 0:
+        jitter = simRngNext() % (cfg.jitterUs + 1)
+    add(simPayloads, payload)
+    var ev: SimEvent
+    ev.time = simNow + cfg.delayUs + jitter
+    ev.seq = simSeqCounter
+    ev.src = fromNode
+    ev.dst = toNode
+    ev.payloadIdx = simPayloads.len - 1
+    simSeqCounter = simSeqCounter + 1
+    simHeapPush(ev)
+    return Ok[bool](true)
+
+# Pops the next event and advances the virtual clock to it. Returns false
+# when no event is pending. A popped packet whose link is partitioned at
+# delivery time is cut (consumed, not delivered).
+fn SimStep(): bool =
+    if simHeapLen <= 0:
+        return false
+    let ev: SimEvent = simEvents[0]
+    simHeapRemoveRoot()
+    simNow = ev.time
+    let cfg: SimLink = simLinks[simLinkIndex(ev.src, ev.dst)]
+    if cfg.partitioned:
+        return true
+    var rec: SimDeliveryRec
+    rec.time = ev.time
+    rec.src = ev.src
+    rec.dst = ev.dst
+    rec.payloadIdx = ev.payloadIdx
+    add(simDels, rec)
+    simDeliveredTotal = simDeliveredTotal + 1
+    return true
+
+fn SimRun() =
+    var more: bool = SimStep()
+    while more:
+        more = SimStep()
+
+# Processes every event with time <= t, then parks the clock at t.
+fn SimRunUntil(t: int64) =
+    var more: bool = true
+    while more && simHeapLen > 0:
+        let top: SimEvent = simEvents[0]
+        if top.time > t:
+            more = false
+        else:
+            SimStep()
+    if t > simNow:
+        simNow = t
+
+fn SimNow(): int64 =
+    return simNow
+
+fn SimPendingCount(): int32 =
+    return simHeapLen
+
+fn SimDeliveredCount(): int64 =
+    return simDeliveredTotal
+
+fn simDeliveryAt(idx: int32, out: var SimDelivery) =
+    let rec: SimDeliveryRec = simDels[idx]
+    out.time = rec.time
+    out.src = rec.src
+    out.dst = rec.dst
+    let payloadIdx: int32 = rec.payloadIdx
+    # Deliver an independent owned copy: storing the log element itself would
+    # leave out.payload a borrow of simPayloads and couple every consumer's
+    # lifetime to the global log.
+    out.payload = BytesSlice(simPayloads[payloadIdx],
+                             0,
+                             BytesLen(simPayloads[payloadIdx]))
+
+# Per-node receive queue: pops the oldest unread delivery addressed to node.
+fn SimNextDelivery(node: int32, out: var SimDelivery): bool =
+    if ! simValidNode(node):
+        return false
+    let startCur: int32 = simNodeCursors[node]
+    let total: int32 = simDels.len
+    for cur in startCur..<total:
+        let rec: SimDeliveryRec = simDels[cur]
+        if rec.dst == node:
+            simNodeCursors[node] = cur + 1
+            simDeliveryAt(cur, out)
+            return true
+    simNodeCursors[node] = total
+    return false
+
+# Global delivery log cursor in delivery order (for whole-run fingerprints).
+fn SimNextDeliveryGlobal(out: var SimDelivery): bool =
+    let idx: int32 = simGlobalCursor
+    if idx >= simDels.len:
+        return false
+    simGlobalCursor = idx + 1
+    simDeliveryAt(idx, out)
+    return true

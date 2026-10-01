@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { canonicalJson } from "./cheng_semantic_matrix_m9023.ts";
+import { canonicalJson } from "./cheng_canonical_json.ts";
 
 export const CHENG_FUSION_MCP_RUNTIME_IDENTITY_SCHEMA =
   "cheng_fusion_mcp_runtime_identity";

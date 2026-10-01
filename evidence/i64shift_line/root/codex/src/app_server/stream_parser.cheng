@@ -1,0 +1,657 @@
+# Stream parser for app-server v2 response format
+#
+# The app-server v2 protocol is JSON-RPC-lite (no "jsonrpc" field).
+# Streaming responses are newline-delimited JSON objects (NDJSON).
+#
+# Each line can be:
+#   Notification: {"method":"eventName","params":{...}}
+#   Response:     {"id":1,"result":{...}}
+#   Error:        {"id":1,"error":{"code":-1,"message":"..."}}
+#
+# Notification methods (streaming events):
+#   thread/started, thread/closed
+#   turn/started, turn/completed, turn/diff/updated
+#   item/started, item/completed, item/agentMessage/delta
+#   item/commandExecution/outputDelta
+#   error, warning, deprecationNotice
+#   etc.
+
+import cheng/codex/protocol/wire as wire
+
+# ─── Event type ─────────────────────────────────────────────────────────────────
+
+type
+    AppServerStreamEvent =
+        eventCat: str         # Event classification:
+                            #   "thread/started", "turn/started", "turn/completed",
+                            #   "item/started", "item/completed", "item/delta",
+                            #   "error", "response", or the raw method string for other events
+        method: str         # JSON-RPC method name from the notification
+        threadId: str       # thread_id extracted from params
+        turnId: str         # turn_id extracted from params
+        itemJson: str       # Raw JSON of the ThreadItem (item/started, item/completed)
+        deltaJson: str      # Delta text content (item/agentMessage/delta, etc.)
+        errorJson: str      # Raw JSON of the error object
+        paramsJson: str     # Full raw params JSON for the notification
+
+# ─── Internal JSON helpers ─────────────────────────────────────────────────────
+
+# Find the character position after `"key":` in a JSON string.
+# Returns -1 if the key is not found.
+fn RustCsgStreamJsonFindKeyStart(text: str, key: str): int32 =
+    var i: int32 = 0
+    while i < text.len:
+        if text[i] != '"':
+            i = i + 1
+            continue
+        i = i + 1  # skip opening quote
+        var j: int32 = 0
+        while j < key.len:
+            if i + j >= text.len:
+                break
+            if int32(text[i + j]) != int32(key[j]):
+                break
+            j = j + 1
+        if j < key.len:
+            i = i + 1
+            continue
+        if i + j >= text.len:
+            break
+        if text[i + j] != '"':
+            i = i + j + 1
+            continue
+        # Found "key", skip closing quote
+        var p: int32 = i + j + 1
+        # Skip whitespace before ':'
+        while p < text.len:
+            let c = text[p]
+            if c == ' ' || c == '\n' || c == '\r' || c == '\t':
+                p = p + 1
+            else:
+                break
+        if p < text.len && text[p] == ':':
+            p = p + 1
+            # Skip whitespace after ':'
+            while p < text.len:
+                let c = text[p]
+                if c == ' ' || c == '\n' || c == '\r' || c == '\t':
+                    p = p + 1
+                else:
+                    break
+            return p
+        i = p + 1
+    return -1
+
+# Extract a JSON string field value by key.
+# Returns the string content (without surrounding quotes).
+# Returns "" if the key is not found or the value is not a string.
+fn RustCsgStreamJsonFindStr(text: str, key: str): str =
+    let p = RustCsgStreamJsonFindKeyStart(text, key)
+    if p < 0:
+        return ""
+    if p >= text.len:
+        return ""
+    if text[p] != '"':
+        return ""
+    let valueStart: int32 = p + 1
+    var i: int32 = valueStart
+    var out: str = ""
+    while i < text.len:
+        if text[i] == '\\':
+            i = i + 1
+            if i >= text.len:
+                return ""
+            let esc = text[i]
+            if esc == 'n':
+                out = wire.RustCsgCat(out, "\n")
+            elif esc == 'r':
+                out = wire.RustCsgCat(out, "\r")
+            elif esc == 't':
+                out = wire.RustCsgCat(out, "\t")
+            elif esc == '"' || esc == '\\' || esc == '/':
+                out = wire.RustCsgCat(out, wire.RustCsgSliceBytes(text, i, 1))
+            else:
+                return ""
+        elif text[i] == '"':
+            if out.len == 0 && i == valueStart:
+                return ""
+            if out.len == 0:
+                return wire.RustCsgSliceBytes(text, valueStart, i - valueStart)
+            return out
+        else:
+            out = wire.RustCsgCat(out, wire.RustCsgSliceBytes(text, i, 1))
+        i = i + 1
+    return ""
+
+# Extract a raw JSON value for a given key.
+# Returns the raw JSON substring including delimiters.
+# Supports: objects {}, arrays [], strings "", numbers, booleans, null.
+fn RustCsgStreamJsonFindValueRaw(text: str, key: str): str =
+    let p = RustCsgStreamJsonFindKeyStart(text, key)
+    if p < 0:
+        return ""
+    if p >= text.len:
+        return ""
+    let ch = text[p]
+    if ch == '{':
+        var depth: int32 = 1
+        var inStr: bool = false
+        var i: int32 = p + 1
+        while i < text.len && depth > 0:
+            if inStr:
+                if text[i] == '\\':
+                    i = i + 1
+                elif text[i] == '"':
+                    inStr = false
+            elif text[i] == '"':
+                inStr = true
+            elif text[i] == '{':
+                depth = depth + 1
+            elif text[i] == '}':
+                depth = depth - 1
+            i = i + 1
+        if depth == 0:
+            return wire.RustCsgSliceBytes(text, p, i - p)
+        return ""
+    if ch == '[':
+        var depth: int32 = 1
+        var inStr: bool = false
+        var i: int32 = p + 1
+        while i < text.len && depth > 0:
+            if inStr:
+                if text[i] == '\\':
+                    i = i + 1
+                elif text[i] == '"':
+                    inStr = false
+            elif text[i] == '"':
+                inStr = true
+            elif text[i] == '[':
+                depth = depth + 1
+            elif text[i] == ']':
+                depth = depth - 1
+            i = i + 1
+        if depth == 0:
+            return wire.RustCsgSliceBytes(text, p, i - p)
+        return ""
+    if ch == '"':
+        var i: int32 = p + 1
+        while i < text.len:
+            if text[i] == '\\':
+                i = i + 1
+            elif text[i] == '"':
+                return wire.RustCsgSliceBytes(text, p, i - p + 1)
+            i = i + 1
+        return ""
+    # Number or keyword (true/false/null)
+    var i: int32 = p
+    while i < text.len:
+        let c = text[i]
+        if c == ',' || c == '}' || c == ']' || c == ' ' || c == '\n' || c == '\r' || c == '\t':
+            break
+        i = i + 1
+    return wire.RustCsgSliceBytes(text, p, i - p)
+
+# Trim leading and trailing whitespace from a string.
+fn RustCsgStreamTrimWhitespace(text: str): str =
+    var start: int32 = 0
+    while start < text.len:
+        let c = text[start]
+        if c == ' ' || c == '\n' || c == '\r' || c == '\t':
+            start = start + 1
+        else:
+            break
+    var end: int32 = text.len
+    while end > start:
+        let c = text[end - 1]
+        if c == ' ' || c == '\n' || c == '\r' || c == '\t':
+            end = end - 1
+        else:
+            break
+    if end <= start:
+        return ""
+    return wire.RustCsgSliceBytes(text, start, end - start)
+
+fn RustCsgStreamLineComplete(line: str): bool =
+    var depth: int32 = 0
+    var inStr: bool = false
+    var escaped: bool = false
+    var i: int32 = 0
+    while i < line.len:
+        let ch = line[i]
+        if inStr:
+            if escaped:
+                escaped = false
+            elif ch == '\\':
+                escaped = true
+            elif ch == '"':
+                inStr = false
+        else:
+            if ch == '"':
+                inStr = true
+            elif ch == '{' || ch == '[':
+                depth = depth + 1
+            elif ch == '}' || ch == ']':
+                depth = depth - 1
+                if depth < 0:
+                    return false
+        i = i + 1
+    return !inStr && depth == 0
+
+fn RustCsgStreamEventJson(found: bool, consumed: int32, eventCat: str, method: str,
+                          threadId: str, turnId: str, itemJson: str,
+                          deltaJson: str, errorJson: str, itemType: str): str =
+    var itemRaw: str = "null"
+    if itemJson.len > 0:
+        itemRaw = itemJson
+    var errorRaw: str = "null"
+    if errorJson.len > 0:
+        errorRaw = errorJson
+    var out: str = "{"
+    if found:
+        out = wire.RustCsgCat(out, "\"found\":true")
+    else:
+        out = wire.RustCsgCat(out, "\"found\":false")
+    out = wire.RustCsgCat(out, ",")
+    out = wire.RustCsgCat(out, wire.RustCsgJsonFieldInt32("consumed", consumed))
+    out = wire.RustCsgCat(out, ",")
+    out = wire.RustCsgCat(out, wire.RustCsgJsonFieldStr("eventCat", eventCat))
+    out = wire.RustCsgCat(out, ",")
+    out = wire.RustCsgCat(out, wire.RustCsgJsonFieldStr("method", method))
+    out = wire.RustCsgCat(out, wire.RustCsgJsonOptionalFieldStr("itemType", itemType))
+    out = wire.RustCsgCat(out, ",")
+    out = wire.RustCsgCat(out, wire.RustCsgJsonFieldStr("threadId", threadId))
+    out = wire.RustCsgCat(out, ",")
+    out = wire.RustCsgCat(out, wire.RustCsgJsonFieldStr("turnId", turnId))
+    out = wire.RustCsgCat(out, ",")
+    out = wire.RustCsgCat(out, wire.RustCsgJsonFieldRaw("item", itemRaw))
+    out = wire.RustCsgCat(out, ",")
+    out = wire.RustCsgCat(out, wire.RustCsgJsonFieldStr("delta", deltaJson))
+    out = wire.RustCsgCat(out, ",")
+    out = wire.RustCsgCat(out, wire.RustCsgJsonFieldRaw("error", errorRaw))
+    out = wire.RustCsgCat(out, "}")
+    return out
+
+fn RustCsgStreamEventJsonAppendRaw(eventJson: str, key: str, raw: str): str =
+    if raw == "":
+        return eventJson
+    if eventJson.len == 0:
+        return eventJson
+    if eventJson[eventJson.len - 1] != '}':
+        return eventJson
+    let prefix = wire.RustCsgSliceBytes(eventJson, 0, eventJson.len - 1)
+    return wire.RustCsgCat4(prefix, ",", wire.RustCsgJsonFieldRaw(key, raw), "}")
+
+fn RustCsgStreamParseJsonLineToJson(line: str, consumed: int32): str =
+    if line.len == 0:
+        return RustCsgStreamEventJson(true, consumed, "empty", "", "", "", "", "", "", "")
+    if line[0] != '{':
+        return RustCsgStreamEventJson(true, consumed, "invalid", "", "", "", "", "", "", "")
+
+    let method = RustCsgStreamJsonFindStr(line, "method")
+    if method.len > 0:
+        let paramsJson = RustCsgStreamJsonFindValueRaw(line, "params")
+        if method == "thread/started":
+            let threadVal = RustCsgStreamJsonFindValueRaw(paramsJson, "thread")
+            return RustCsgStreamEventJson(true, consumed, "thread/started", method,
+                RustCsgStreamJsonFindStr(threadVal, "id"), "", "", "", "", "")
+        elif method == "turn/started":
+            let turnVal = RustCsgStreamJsonFindValueRaw(paramsJson, "turn")
+            return RustCsgStreamEventJson(true, consumed, "turn/started", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(turnVal, "id"), "", "", "", "")
+        elif method == "turn/completed":
+            let turnVal = RustCsgStreamJsonFindValueRaw(paramsJson, "turn")
+            var base = RustCsgStreamEventJson(true, consumed, "turn/completed", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(turnVal, "id"), "", "", "", "")
+            base = RustCsgStreamEventJsonAppendRaw(base, "status", RustCsgStreamJsonFindValueRaw(turnVal, "status"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "completedAt", RustCsgStreamJsonFindValueRaw(turnVal, "completedAt"))
+            return RustCsgStreamEventJsonAppendRaw(base, "durationMs", RustCsgStreamJsonFindValueRaw(turnVal, "durationMs"))
+        elif method == "turn/aborted" || method == "turn_aborted":
+            var eventTurnId = RustCsgStreamJsonFindStr(paramsJson, "turnId")
+            if eventTurnId == "":
+                eventTurnId = RustCsgStreamJsonFindStr(paramsJson, "turn_id")
+            var base = RustCsgStreamEventJson(true, consumed, "turn/aborted", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                eventTurnId, "", "", "", "")
+            base = RustCsgStreamEventJsonAppendRaw(base, "reason", RustCsgStreamJsonFindValueRaw(paramsJson, "reason"))
+            var completedAtRaw = RustCsgStreamJsonFindValueRaw(paramsJson, "completedAt")
+            if completedAtRaw == "":
+                completedAtRaw = RustCsgStreamJsonFindValueRaw(paramsJson, "completed_at")
+            base = RustCsgStreamEventJsonAppendRaw(base, "completedAt", completedAtRaw)
+            var durationMsRaw = RustCsgStreamJsonFindValueRaw(paramsJson, "durationMs")
+            if durationMsRaw == "":
+                durationMsRaw = RustCsgStreamJsonFindValueRaw(paramsJson, "duration_ms")
+            return RustCsgStreamEventJsonAppendRaw(base, "durationMs", durationMsRaw)
+        elif method == "item/started":
+            let base = RustCsgStreamEventJson(true, consumed, "item/started", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(paramsJson, "turnId"),
+                RustCsgStreamJsonFindValueRaw(paramsJson, "item"), "", "", "")
+            return RustCsgStreamEventJsonAppendRaw(base, "startedAtMs", RustCsgStreamJsonFindValueRaw(paramsJson, "startedAtMs"))
+        elif method == "item/completed":
+            let base = RustCsgStreamEventJson(true, consumed, "item/completed", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(paramsJson, "turnId"),
+                RustCsgStreamJsonFindValueRaw(paramsJson, "item"), "", "", "")
+            return RustCsgStreamEventJsonAppendRaw(base, "completedAtMs", RustCsgStreamJsonFindValueRaw(paramsJson, "completedAtMs"))
+        elif method == "item/agentMessage/delta":
+            let base = RustCsgStreamEventJson(true, consumed, "item/delta", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(paramsJson, "turnId"),
+                "", RustCsgStreamJsonFindStr(paramsJson, "delta"), "", "agentMessage")
+            return RustCsgStreamEventJsonAppendRaw(base, "itemId", RustCsgStreamJsonFindValueRaw(paramsJson, "itemId"))
+        elif method == "item/reasoning/summaryTextDelta":
+            return RustCsgStreamEventJson(true, consumed, "item/delta", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(paramsJson, "turnId"),
+                "", RustCsgStreamJsonFindStr(paramsJson, "delta"), "", "reasoning")
+        elif method == "item/reasoning/textDelta":
+            return RustCsgStreamEventJson(true, consumed, "item/delta", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(paramsJson, "turnId"),
+                "", RustCsgStreamJsonFindStr(paramsJson, "delta"), "", "reasoning")
+        elif method == "item/reasoning/summaryPartAdded":
+            return RustCsgStreamEventJson(true, consumed, "item/reasoning/summaryPartAdded", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(paramsJson, "turnId"), "", "", "", "reasoning")
+        elif method == "item/commandExecution/outputDelta":
+            return RustCsgStreamEventJson(true, consumed, "item/commandExecution/outputDelta", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(paramsJson, "turnId"),
+                "", RustCsgStreamJsonFindStr(paramsJson, "delta"), "", "")
+        elif method == "item/commandExecution/requestApproval" || method == "item/fileChange/requestApproval":
+            var base = RustCsgStreamEventJson(true, consumed, method, method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(paramsJson, "turnId"),
+                "", "", "", "")
+            base = RustCsgStreamEventJsonAppendRaw(base, "params", paramsJson)
+            return RustCsgStreamEventJsonAppendRaw(base, "serverRequestId", wire.RustCsgJsonFindOptionalValueRaw(line, "id"))
+        elif method == "thread/status":
+            return RustCsgStreamEventJson(true, consumed, "thread/status", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"), "",
+                "", RustCsgStreamJsonFindStr(paramsJson, "status"), "", "")
+        elif method == "error":
+            let base = RustCsgStreamEventJson(true, consumed, "error", method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(paramsJson, "turnId"),
+                "", "", RustCsgStreamJsonFindValueRaw(paramsJson, "error"), "")
+            return RustCsgStreamEventJsonAppendRaw(base, "willRetry", RustCsgStreamJsonFindValueRaw(paramsJson, "willRetry"))
+        else:
+            return RustCsgStreamEventJson(true, consumed, method, method,
+                RustCsgStreamJsonFindStr(paramsJson, "threadId"),
+                RustCsgStreamJsonFindStr(paramsJson, "turnId"), "", "", "", "")
+
+    let errorVal = RustCsgStreamJsonFindValueRaw(line, "error")
+    if errorVal.len > 0 && errorVal[0] == '{':
+        return RustCsgStreamEventJson(true, consumed, "error", "", "", "", "", "", errorVal, "")
+
+    let resultVal = RustCsgStreamJsonFindValueRaw(line, "result")
+    if resultVal.len > 0:
+        let turnVal = RustCsgStreamJsonFindValueRaw(resultVal, "turn")
+        if turnVal.len > 0:
+            return RustCsgStreamEventJson(true, consumed, "response", "",
+                RustCsgStreamJsonFindStr(turnVal, "threadId"),
+                RustCsgStreamJsonFindStr(turnVal, "id"), "", "", "", "")
+        let threadVal = RustCsgStreamJsonFindValueRaw(resultVal, "thread")
+        if threadVal.len > 0:
+            var base = RustCsgStreamEventJson(true, consumed, "response", "",
+                RustCsgStreamJsonFindStr(threadVal, "id"), "", "", "", "", "")
+            base = RustCsgStreamEventJsonAppendRaw(base, "sessionId", RustCsgStreamJsonFindValueRaw(threadVal, "sessionId"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "forkedFromId", RustCsgStreamJsonFindValueRaw(threadVal, "forkedFromId"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "threadSource", RustCsgStreamJsonFindValueRaw(threadVal, "threadSource"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "threadName", RustCsgStreamJsonFindValueRaw(threadVal, "name"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "rolloutPath", RustCsgStreamJsonFindValueRaw(threadVal, "path"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "model", RustCsgStreamJsonFindValueRaw(resultVal, "model"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "modelProvider", RustCsgStreamJsonFindValueRaw(resultVal, "modelProvider"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "serviceTier", RustCsgStreamJsonFindValueRaw(resultVal, "serviceTier"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "approvalPolicy", RustCsgStreamJsonFindValueRaw(resultVal, "approvalPolicy"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "approvalsReviewer", RustCsgStreamJsonFindValueRaw(resultVal, "approvalsReviewer"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "sandbox", RustCsgStreamJsonFindValueRaw(resultVal, "sandbox"))
+            base = RustCsgStreamEventJsonAppendRaw(base, "activePermissionProfile", RustCsgStreamJsonFindValueRaw(resultVal, "activePermissionProfile"))
+            var cwdRaw = RustCsgStreamJsonFindValueRaw(resultVal, "cwd")
+            if cwdRaw == "":
+                cwdRaw = RustCsgStreamJsonFindValueRaw(threadVal, "cwd")
+            base = RustCsgStreamEventJsonAppendRaw(base, "cwd", cwdRaw)
+            return RustCsgStreamEventJsonAppendRaw(base, "reasoningEffort", RustCsgStreamJsonFindValueRaw(resultVal, "reasoningEffort"))
+        return RustCsgStreamEventJson(true, consumed, "response", "", "", "", "", "", "", "")
+
+    return RustCsgStreamEventJson(true, consumed, "unknown", "", "", "", "", "", "", "")
+
+fn AppServerParseStreamEventJson(chunk: str): str =
+    if chunk.len == 0:
+        return RustCsgStreamEventJson(false, 0, "", "", "", "", "", "", "", "")
+
+    # Skip leading whitespace
+    var pos: int32 = 0
+    while pos < chunk.len:
+        let c = chunk[pos]
+        if c == '\n' || c == '\r' || c == ' ' || c == '\t':
+            pos = pos + 1
+        else:
+            break
+    if pos >= chunk.len:
+        # Entire chunk is whitespace — consume it all
+        return RustCsgStreamEventJson(true, chunk.len, "blank", "", "", "", "", "", "", "")
+
+    # Find end of line
+    var lineEnd: int32 = pos
+    while lineEnd < chunk.len && chunk[lineEnd] != '\n':
+        lineEnd = lineEnd + 1
+
+    var consumed: int32
+    var line: str
+    if lineEnd < chunk.len:
+        line = wire.RustCsgSliceBytes(chunk, pos, lineEnd - pos)
+        consumed = lineEnd + 1  # include '\n'
+    else:
+        line = wire.RustCsgSliceBytes(chunk, pos, chunk.len - pos)
+        consumed = chunk.len
+
+    let trimmed = RustCsgStreamTrimWhitespace(line)
+    if trimmed.len == 0:
+        # Blank/whitespace-only line — skip it
+        return RustCsgStreamEventJson(true, consumed, "blank", "", "", "", "", "", "", "")
+
+    if !RustCsgStreamLineComplete(trimmed):
+        if lineEnd < chunk.len:
+            # Line terminated by \n but JSON is incomplete — broken/invalid line
+            return RustCsgStreamEventJson(true, consumed, "invalid", "", "", "", "", "", "", "")
+        # Incomplete line at end of chunk — wait for more data
+        return RustCsgStreamEventJson(false, 0, "", "", "", "", "", "", "", "")
+
+    return RustCsgStreamParseJsonLineToJson(trimmed, consumed)
+
+# ─── Core parsing ──────────────────────────────────────────────────────────────
+
+# Parse a single trimmed JSON line into an AppServerStreamEvent.
+# line must be a non-empty JSON object string starting with '{'.
+# Returns the parsed event by value to avoid var-parameter struct field
+# corruption in hot-path compiled code.
+fn RustCsgStreamParseJsonLine(line: str): AppServerStreamEvent =
+    var outEvent: AppServerStreamEvent
+    if line.len == 0:
+        outEvent.eventCat = "empty"
+        return outEvent
+    if line[0] != '{':
+        outEvent.eventCat = "invalid"
+        return outEvent
+
+    # Check for notification: {"method":"...","params":{...}}
+    let method = RustCsgStreamJsonFindStr(line, "method")
+    if method.len > 0:
+        outEvent.method = method
+        outEvent.paramsJson = RustCsgStreamJsonFindValueRaw(line, "params")
+
+        # Classify by method name and extract standard fields
+        if method == "thread/started":
+            outEvent.eventCat = "thread/started"
+            let threadVal = RustCsgStreamJsonFindValueRaw(outEvent.paramsJson, "thread")
+            outEvent.threadId = RustCsgStreamJsonFindStr(threadVal, "id")
+        elif method == "turn/started":
+            outEvent.eventCat = "turn/started"
+            outEvent.threadId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "threadId")
+            let turnVal = RustCsgStreamJsonFindValueRaw(outEvent.paramsJson, "turn")
+            outEvent.turnId = RustCsgStreamJsonFindStr(turnVal, "id")
+        elif method == "turn/completed":
+            outEvent.eventCat = "turn/completed"
+            outEvent.threadId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "threadId")
+            let turnVal = RustCsgStreamJsonFindValueRaw(outEvent.paramsJson, "turn")
+            outEvent.turnId = RustCsgStreamJsonFindStr(turnVal, "id")
+        elif method == "item/started":
+            outEvent.eventCat = "item/started"
+            outEvent.threadId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "threadId")
+            outEvent.turnId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "turnId")
+            outEvent.itemJson = RustCsgStreamJsonFindValueRaw(outEvent.paramsJson, "item")
+        elif method == "item/completed":
+            outEvent.eventCat = "item/completed"
+            outEvent.threadId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "threadId")
+            outEvent.turnId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "turnId")
+            outEvent.itemJson = RustCsgStreamJsonFindValueRaw(outEvent.paramsJson, "item")
+        elif method == "item/agentMessage/delta":
+            outEvent.eventCat = "item/delta"
+            outEvent.threadId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "threadId")
+            outEvent.turnId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "turnId")
+            outEvent.deltaJson = RustCsgStreamJsonFindStr(outEvent.paramsJson, "delta")
+        elif method == "item/commandExecution/outputDelta":
+            outEvent.eventCat = "item/commandExecution/outputDelta"
+            outEvent.threadId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "threadId")
+            outEvent.turnId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "turnId")
+            outEvent.deltaJson = RustCsgStreamJsonFindStr(outEvent.paramsJson, "delta")
+        elif method == "error":
+            outEvent.eventCat = "error"
+            outEvent.errorJson = RustCsgStreamJsonFindValueRaw(outEvent.paramsJson, "error")
+            outEvent.threadId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "threadId")
+            outEvent.turnId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "turnId")
+        else:
+            # Generic notification - use method as kind, extract common fields
+            outEvent.eventCat = method
+            outEvent.threadId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "threadId")
+            outEvent.turnId = RustCsgStreamJsonFindStr(outEvent.paramsJson, "turnId")
+
+        return outEvent
+
+    # Check for error response: {"id":...,"error":{...}}
+    let errorVal = RustCsgStreamJsonFindValueRaw(line, "error")
+    if errorVal.len > 0 && errorVal[0] == '{':
+        outEvent.eventCat = "error"
+        outEvent.errorJson = errorVal
+        return outEvent
+
+    # Check for response: {"id":...,"result":...}
+    let resultVal = RustCsgStreamJsonFindValueRaw(line, "result")
+    if resultVal.len > 0:
+        outEvent.eventCat = "response"
+        # Extract thread id from result.turn.threadId or result.thread.id
+        let turnVal = RustCsgStreamJsonFindValueRaw(resultVal, "turn")
+        if turnVal.len > 0:
+            outEvent.turnId = RustCsgStreamJsonFindStr(turnVal, "id")
+            outEvent.threadId = RustCsgStreamJsonFindStr(turnVal, "threadId")
+        let threadVal = RustCsgStreamJsonFindValueRaw(resultVal, "thread")
+        if threadVal.len > 0:
+            if outEvent.threadId.len == 0:
+                outEvent.threadId = RustCsgStreamJsonFindStr(threadVal, "id")
+        return outEvent
+
+    # Unknown JSON structure
+    outEvent.eventCat = "unknown"
+    return outEvent
+
+# Parse a single event from a JSON stream chunk.
+#
+# chunk: raw bytes that may contain one or more complete JSON lines.
+# outConsumed: number of bytes consumed from chunk (including trailing newline).
+#
+# Returns an AppServerStreamEvent by value. Returns a zero-initialized struct
+# (eventCat == "") when no complete event is available.
+#
+# Return-by-value avoids var struct parameter corruption in the cold compiler.
+fn AppServerParseStreamEvent(chunk: str, outConsumed: var int32): AppServerStreamEvent =
+    outConsumed = 0
+
+    if chunk.len == 0:
+        var empty: AppServerStreamEvent
+        return empty
+
+    # Skip leading newlines and whitespace
+    var pos: int32 = 0
+    while pos < chunk.len:
+        let c = chunk[pos]
+        if c == '\n' || c == '\r' || c == ' ' || c == '\t':
+            pos = pos + 1
+        else:
+            break
+
+    if pos >= chunk.len:
+        # Entire chunk is whitespace — consume it all
+        outConsumed = chunk.len
+        var blankEvent: AppServerStreamEvent
+        blankEvent.eventCat = "blank"
+        return blankEvent
+
+    # Find end of this line (next '\n' or end of chunk)
+    var lineEnd: int32 = pos
+    while lineEnd < chunk.len && chunk[lineEnd] != '\n':
+        lineEnd = lineEnd + 1
+
+    # Extract the line content
+    var consumed: int32
+    var line: str
+    if lineEnd < chunk.len:
+        line = wire.RustCsgSliceBytes(chunk, pos, lineEnd - pos)
+        consumed = lineEnd + 1  # include '\n'
+    else:
+        line = wire.RustCsgSliceBytes(chunk, pos, chunk.len - pos)
+        consumed = chunk.len
+
+    let trimmed = RustCsgStreamTrimWhitespace(line)
+    if trimmed.len == 0:
+        # Blank/whitespace-only line — skip it, advance cursor
+        outConsumed = consumed
+        var blankEvent: AppServerStreamEvent
+        blankEvent.eventCat = "blank"
+        return blankEvent
+
+    if !RustCsgStreamLineComplete(trimmed):
+        if lineEnd < chunk.len:
+            # Line terminated by \n but JSON is incomplete — broken/invalid line
+            outConsumed = consumed
+            var invalidEvent: AppServerStreamEvent
+            invalidEvent.eventCat = "invalid"
+            return invalidEvent
+        # Incomplete line at end of chunk — wait for more data
+        var empty: AppServerStreamEvent
+        return empty
+
+    outConsumed = consumed
+    return RustCsgStreamParseJsonLine(trimmed)
+
+# Parse an entire response body into a list of events.
+#
+# body: the full response text containing zero or more newline-delimited JSON lines.
+# Returns: array of AppServerStreamEvent.
+#
+# Uses return-by-value pattern to avoid struct array corruption in the cold compiler.
+fn AppServerParseResponse(body: str): AppServerStreamEvent[] =
+    var events: AppServerStreamEvent[]
+    var remaining: str = body
+
+    while true:
+        var consumed: int32
+        let event = AppServerParseStreamEvent(remaining, consumed)
+        if event.eventCat.len == 0:
+            break
+        if consumed == 0:
+            break
+        if event.eventCat == "blank" || event.eventCat == "invalid":
+            # Skip blank and invalid lines, advance cursor
+            if consumed >= remaining.len:
+                break
+            remaining = wire.RustCsgSliceBytes(remaining, consumed, remaining.len - consumed)
+            continue
+        add(events, event)
+        if consumed >= remaining.len:
+            break
+        remaining = wire.RustCsgSliceBytes(remaining, consumed, remaining.len - consumed)
+
+    return events

@@ -1,0 +1,577 @@
+import std/result
+import std/rawbytes
+import std/os
+import std/strings
+import std/strutils as strutil
+import cheng/std/bytes_layout as layout
+import cheng/chain/binary_types as btypes
+import cheng/chain/lsmr_types as lt
+import cheng/chain/pubsub
+import cheng/overlay/contracts as overlay
+import cheng/libp2p/core/types as core
+import cheng/libp2p/core/multiaddr
+import cheng/libp2p/host/host
+import cheng/libp2p/protocols/gossipsub as gossip
+import cheng/libp2p/cas_fetch_env as casfetch
+import cheng/core/tooling/path as chengpath
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/compiler_world as cworld
+import cheng/core/tooling/compiler_csg as ccsg
+import cheng/core/lang/parser
+import cheng/core/backend/system_link_exec as sexec
+
+import cheng/core/tooling/compiler_world_libp2p as cwlp
+type
+    CompilerWorldFreshNodeSyncState =
+        syncedEntryCount: int32
+        syncedHead: cworld.CompilerWorldHead
+        syncedManifest: cworld.CompilerUniverseManifest
+        syncedReceipt: ccsg.CompileReceipt
+        materializedMirrorCount: int32
+
+fn CompilerWorldTopicScope(): overlay.OverlayTopicScope =
+    return overlay.OverlayScopeGlobal
+
+fn CompilerWorldAddress(): btypes.LsmrAddress =
+    return btypes.LsmrAddress()
+
+fn CompilerWorldQuery(sourcePeerId: core.Libp2pPeerId): overlay.StoreQuery =
+    var query = overlay.StoreQuery()
+    query.sourcePeerId = sourcePeerId.value
+    query.topicScope = CompilerWorldTopicScope()
+    query.address = CompilerWorldAddress()
+    return query
+
+fn CompilerWorldPayloadCid(payload: Bytes): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.ByteBufInit(BytesLen(payload) + 32)
+    layout.ByteBufAppendBytes(buf, payload)
+    let cid = lt.FixedCidFromBuf(buf)
+    layout.ByteBufFree(buf)
+    return cid
+
+# ---- S3 CAS fetch-on-miss wrapper (core→libp2p 桥, QUIC 依赖圈在此既有桥内) ----
+# 顶层命名 fn, 签名严格 == cas_store.CasSourceFetcher 别名 fn(cidHex: str): Result[Bytes];
+# 委托给 S3 适配器 cas_fetch_env.CasHostQuicFetcherFromEnv (env CHENG_CAS_PEER host:port →
+# 真 UDP QUIC 按 cid 拉 CAS 源)。由 compiler_main env-gated 经 parser.ParserSetCasFetcher
+# 注入 parser 槽。★静态闭包: 谁 import 本网络模块谁就把 host_quic (msquic native) 拉进闭包 —
+# 本网络模块只被 driver/网络测试 import, 绝不被 parser (编译器核心) import, 故 QUIC 不入
+# 核心/cold-bootstrap 闭包 (parser 仍只 import cas_store)。全后端 driver-bake 编译, 与既有
+# host_quic-transitive 生产模块 (如 content_runtime_quic) 同路径; cheng_cold 不 cross-module
+# import host_quic-transitive 库 (既有限制), 故此 wrapper 仅 driver-bake 下编译。
+fn CompilerWorldCasQuicFetch(cidHex: str): Result[Bytes] =
+    return casfetch.CasHostQuicFetcherFromEnv(cidHex)
+
+fn CompilerWorldIngress(sourcePeerId: core.Libp2pPeerId,
+                          payloadKind: int32,
+                          payloadReport: str,
+                          stampEpoch: int32,
+                          stampGanzhi: int32): overlay.IngressEnvelope =
+    let payload = cwlp.CompilerWorldLibp2pOwnedBytesFromText(payloadReport)
+    var ingress = overlay.IngressEnvelope()
+    ingress.sourcePeerId = sourcePeerId.value
+    ingress.topicScope = CompilerWorldTopicScope()
+    ingress.address = CompilerWorldAddress()
+    ingress.payloadKind = payloadKind
+    ingress.payload = payload
+    ingress.payloadCid = CompilerWorldPayloadCid(payload)
+    ingress.payloadLen = BytesLen(payload)
+    ingress.stampEpoch = stampEpoch
+    ingress.stampGanzhi = stampGanzhi
+    return ingress
+
+fn CompilerWorldRegister(hostRef: var host.Libp2pHost) =
+    host.Libp2pRegisterHandler(hostRef, core.Libp2pProtocolSync)
+    host.Libp2pRegisterHandler(hostRef, core.Libp2pProtocolIngress)
+
+fn CompilerWorldPublishEntry(hostRef: var host.Libp2pHost,
+                               ingress: overlay.IngressEnvelope,
+                               announceHead: bool) =
+    host.Libp2pStorePut(hostRef, ingress)
+    host.Libp2pKadProvide(hostRef, ingress.payloadCid)
+    if !announceHead:
+        return
+    let pubRecord = gossip.Libp2pPubRecordFromIngress(hostRef.selfPeerId, ingress)
+    host.Libp2pPublish(hostRef, pubRecord)
+
+@borrows
+fn CompilerWorldManagedMirrorBundlesFromHost(hostRef: host.Libp2pHost): Result[cwlp.CompilerManagedMirrorBundle[]] =
+    var out: cwlp.CompilerManagedMirrorBundle[]
+    for i in 0..<hostRef.storeEntries.len:
+        let ingress = hostRef.storeEntries[i].ingress
+        if ingress.payloadKind != pubsub.PubSubPayloadKindCompilerManagedMirrorBundle:
+            continue
+        var bundle: cwlp.CompilerManagedMirrorBundle
+        let parseRes = cwlp.CompilerWorldManagedMirrorBundleFromReportText(cworld.CompilerWorldOwnText(rawbytes.BytesToString(ingress.payload)),
+                                                                        bundle)
+        if IsErr(parseRes):
+            return Err[cwlp.CompilerManagedMirrorBundle[]](Error(parseRes))
+        add(out, bundle)
+    return Ok[cwlp.CompilerManagedMirrorBundle[]](out)
+
+@borrows
+fn CompilerWorldPublishUniverseWithManagedMirrorBundles(hostRef: var host.Libp2pHost,
+                                                          universe: cworld.CompilerLocalUniverse,
+                                                          compilerCsg: ccsg.CompilerCsg,
+                                                          exportSurface: ccsg.CsgExportSurface,
+                                                          receipt: ccsg.CompileReceipt,
+                                                          managedMirrorBundles: cwlp.CompilerManagedMirrorBundle[]) =
+    var compactManagedReceipt: cwlp.CompilerManagedDependencyReceipt
+    let compactManagedReceiptRes =
+        cwlp.CompilerWorldManagedDependencyReceiptFromManifest(
+            universe.manifest,
+            compactManagedReceipt)
+    if IsErr(compactManagedReceiptRes):
+        panic(Error(compactManagedReceiptRes))
+    let authorizedMirrorsRes = cwlp.CompilerWorldManagedMirrorBundlesAuthorized(
+        universe.manifest,
+        compactManagedReceipt,
+        managedMirrorBundles)
+    if IsErr(authorizedMirrorsRes):
+        panic(Error(authorizedMirrorsRes))
+    let authorizedMirrors = Value(authorizedMirrorsRes)
+    let stampEpoch = universe.worldHead.headEpoch
+    let stampGanzhi = 1
+    let worldIngress = CompilerWorldIngress(hostRef.selfPeerId,
+                                              pubsub.PubSubPayloadKindCompilerWorldHead,
+                                              cworld.CompilerWorldHeadReport(universe.worldHead),
+                                              stampEpoch,
+                                              stampGanzhi)
+    CompilerWorldPublishEntry(hostRef, worldIngress, true)
+    let manifestIngress = CompilerWorldIngress(hostRef.selfPeerId,
+                                                 pubsub.PubSubPayloadKindCompilerUniverseManifest,
+                                                 cworld.CompilerUniverseManifestReport(universe.manifest),
+                                                 stampEpoch,
+                                                 stampGanzhi)
+    CompilerWorldPublishEntry(hostRef, manifestIngress, false)
+    let compilerIngress = CompilerWorldIngress(hostRef.selfPeerId,
+                                                 pubsub.PubSubPayloadKindCompilerPackageSnapshot,
+                                                 cworld.CompilerPackageSnapshotReport(universe.compilerSnapshot),
+                                                 stampEpoch,
+                                                 stampGanzhi)
+    CompilerWorldPublishEntry(hostRef, compilerIngress, false)
+    let stdIngress = CompilerWorldIngress(hostRef.selfPeerId,
+                                            pubsub.PubSubPayloadKindCompilerPackageSnapshot,
+                                            cworld.CompilerPackageSnapshotReport(universe.stdSnapshot),
+                                            stampEpoch,
+                                            stampGanzhi)
+    CompilerWorldPublishEntry(hostRef, stdIngress, false)
+    let runtimeIngress = CompilerWorldIngress(hostRef.selfPeerId,
+                                                pubsub.PubSubPayloadKindCompilerPackageSnapshot,
+                                                cworld.CompilerPackageSnapshotReport(universe.runtimeSnapshot),
+                                                stampEpoch,
+                                                stampGanzhi)
+    CompilerWorldPublishEntry(hostRef, runtimeIngress, false)
+    let csgIngress = CompilerWorldIngress(hostRef.selfPeerId,
+                                            pubsub.PubSubPayloadKindCompilerCsg,
+                                            ccsg.CompilerCsgWireReport(compilerCsg),
+                                            stampEpoch,
+                                            stampGanzhi)
+    CompilerWorldPublishEntry(hostRef, csgIngress, false)
+    let surfaceIngress = CompilerWorldIngress(hostRef.selfPeerId,
+                                                pubsub.PubSubPayloadKindCompilerExportSurface,
+                                                ccsg.CompilerExportSurfaceReport(exportSurface),
+                                                stampEpoch,
+                                                stampGanzhi)
+    CompilerWorldPublishEntry(hostRef, surfaceIngress, false)
+    let receiptIngress = CompilerWorldIngress(hostRef.selfPeerId,
+                                                pubsub.PubSubPayloadKindCompilerCompileReceipt,
+                                                ccsg.CompileReceiptReport(receipt),
+                                                stampEpoch,
+                                                stampGanzhi)
+    CompilerWorldPublishEntry(hostRef, receiptIngress, false)
+    for i in 0..<authorizedMirrors.len:
+        let mirrorIngress = CompilerWorldIngress(hostRef.selfPeerId,
+                                                   pubsub.PubSubPayloadKindCompilerManagedMirrorBundle,
+                                                   cwlp.CompilerWorldManagedMirrorBundleReport(authorizedMirrors[i]),
+                                                   stampEpoch,
+                                                   stampGanzhi)
+        CompilerWorldPublishEntry(hostRef, mirrorIngress, false)
+
+fn CompilerWorldPublishUniverse(hostRef: var host.Libp2pHost,
+                                  universe: cworld.CompilerLocalUniverse,
+                                  compilerCsg: ccsg.CompilerCsg,
+                                  exportSurface: ccsg.CsgExportSurface,
+                                  receipt: ccsg.CompileReceipt) =
+    var managedMirrorBundles: cwlp.CompilerManagedMirrorBundle[]
+    CompilerWorldPublishUniverseWithManagedMirrorBundles(hostRef,
+                                                           universe,
+                                                           compilerCsg,
+                                                           exportSurface,
+                                                           receipt,
+                                                           managedMirrorBundles)
+
+fn CompilerWorldStoredEntryCount(hostRef: var host.Libp2pHost): int32 =
+    let query = CompilerWorldQuery(hostRef.selfPeerId)
+    return host.Libp2pStoreQueryCount(hostRef, query)
+
+@borrows
+fn CompilerWorldPublishedHeadCount(hostRef: host.Libp2pHost): int32 =
+    var out = 0
+    for i in 0..<hostRef.publishLog.len:
+        if hostRef.publishLog[i].payloadKind == pubsub.PubSubPayloadKindCompilerWorldHead:
+            out = out + 1
+    return out
+
+@borrows
+fn CompilerWorldFirstPayloadTextByKind(hostRef: host.Libp2pHost,
+                                         payloadKind: int32,
+                                         outText: var str): bool =
+    for i in 0..<hostRef.storeEntries.len:
+        let ingress = hostRef.storeEntries[i].ingress
+        if ingress.payloadKind != payloadKind:
+            continue
+        outText = cworld.CompilerWorldOwnText(rawbytes.BytesToString(ingress.payload))
+        return true
+    outText = ""
+    return false
+
+fn CompilerWorldSync(localHost: var host.Libp2pHost,
+                       remoteHost: var host.Libp2pHost,
+                       remotePeerId: core.Libp2pPeerId): Result[int32] =
+    var entries: overlay.IngressEnvelope[]
+    let query = CompilerWorldQuery(localHost.selfPeerId)
+    let syncRes = host.Libp2pSyncRequest(localHost, remoteHost, remotePeerId, query, entries)
+    if IsErr(syncRes):
+        return Err[int32](Error(syncRes))
+    for i in 0..<entries.len:
+        let entryIngress: overlay.IngressEnvelope = entries[i]
+        host.Libp2pStorePut(localHost, entryIngress)
+    return Ok[int32](entries.len)
+
+fn CompilerWorldSyncSmokeReport(rootDir: str,
+                                  sourcePath: str,
+                                  outputPath: str): Result[str] =
+    let packageRoot = strings.CloneStr(rootDir)
+    var req = creq.CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.EmitExe,
+        ""
+    )
+    creq.CompilerRequestSeal(req)
+    let planRes = sexec.BuildSystemLinkExecPlan(rootDir, req)
+    if IsErr(planRes):
+        return Err[str](Error(planRes))
+    let plan = Value(planRes)
+    var managedDependencyReceipt: cwlp.CompilerManagedDependencyReceipt
+    let managedDependencyReceiptRes =
+        cwlp.CompilerWorldManagedDependencyReceiptFromPlanProjection(
+            plan.managedDependencyReceipt,
+            managedDependencyReceipt)
+    if IsErr(managedDependencyReceiptRes):
+        return Err[str](Error(managedDependencyReceiptRes))
+    let mirrorBundlesRes =
+        cwlp.CompilerWorldManagedMirrorBundlesFromReceipt(
+            rootDir,
+            plan.localUniverse.manifest,
+            managedDependencyReceipt)
+    if IsErr(mirrorBundlesRes):
+        return Err[str](Error(mirrorBundlesRes))
+    let mirrorBundles = Value(mirrorBundlesRes)
+    var seedHost = host.Libp2pHostInit("compiler-world-seed")
+    var syncHost = host.Libp2pHostInit("compiler-world-sync")
+    CompilerWorldRegister(seedHost)
+    CompilerWorldRegister(syncHost)
+    var seedAddr: core.Libp2pMultiaddr
+    var seedDialAddr: core.Libp2pMultiaddr
+    var syncAddr: core.Libp2pMultiaddr
+    var syncDialAddr: core.Libp2pMultiaddr
+    multiaddr.Libp2pMultiaddrFillTcp(seedAddr, "127.0.0.1", 6461)
+    multiaddr.Libp2pMultiaddrFillTcp(seedDialAddr, "127.0.0.1", 6461)
+    multiaddr.Libp2pMultiaddrFillTcp(syncAddr, "127.0.0.1", 6462)
+    multiaddr.Libp2pMultiaddrFillTcp(syncDialAddr, "127.0.0.1", 6462)
+    let seedListenRes = host.Libp2pListen(seedHost, seedAddr)
+    if IsErr(seedListenRes):
+        return Err[str](Error(seedListenRes))
+    let syncListenRes = host.Libp2pListen(syncHost, syncAddr)
+    if IsErr(syncListenRes):
+        return Err[str](Error(syncListenRes))
+    let dialSeedRes = host.Libp2pDial(syncHost, seedHost.selfPeerId, seedDialAddr, 1)
+    if IsErr(dialSeedRes):
+        return Err[str](Error(dialSeedRes))
+    let dialSyncRes = host.Libp2pDial(seedHost, syncHost.selfPeerId, syncDialAddr, 1)
+    if IsErr(dialSyncRes):
+        return Err[str](Error(dialSyncRes))
+    CompilerWorldPublishUniverseWithManagedMirrorBundles(seedHost,
+                                                           plan.localUniverse,
+                                                           plan.compilerCsg,
+                                                           plan.exportSurface,
+                                                           plan.compileReceipt,
+                                                           mirrorBundles)
+    let syncRes = CompilerWorldSync(syncHost, seedHost, seedHost.selfPeerId)
+    if IsErr(syncRes):
+        return Err[str](Error(syncRes))
+    var worldText = ""
+    if !CompilerWorldFirstPayloadTextByKind(syncHost,
+                                              pubsub.PubSubPayloadKindCompilerWorldHead,
+                                              worldText):
+        return Err[str](" compiler world libp2p: missing synced world head")
+    var parsedHead: cworld.CompilerWorldHead
+    let parseHeadRes = cworld.CompilerWorldHeadFromReportText(worldText, parsedHead)
+    if IsErr(parseHeadRes):
+        return Err[str](Error(parseHeadRes))
+    if !layout.FixedBytes32Equal(parsedHead.headCid, plan.localUniverse.worldHead.headCid):
+        return Err[str](" compiler world libp2p: synced head cid mismatch")
+    var manifestText = ""
+    if !CompilerWorldFirstPayloadTextByKind(syncHost,
+                                              pubsub.PubSubPayloadKindCompilerUniverseManifest,
+                                              manifestText):
+        return Err[str](" compiler world libp2p: missing synced manifest")
+    var parsedManifest: cworld.CompilerUniverseManifest
+    let parseManifestRes = cworld.CompilerUniverseManifestFromReportText(manifestText, parsedManifest)
+    if IsErr(parseManifestRes):
+        return Err[str](strutil.Join([" compiler world libp2p: parse manifest failed: ", Error(parseManifestRes)], ""))
+    if !layout.FixedBytes32Equal(parsedManifest.manifestCid, plan.localUniverse.manifest.manifestCid):
+        return Err[str](" compiler world libp2p: synced manifest cid mismatch")
+    var reportLines: str[]
+    add(reportLines, Fmt" seed_entries={IntToStr(CompilerWorldStoredEntryCount(seedHost))}")
+    add(reportLines, Fmt" sync_entries={IntToStr(CompilerWorldStoredEntryCount(syncHost))}")
+    add(reportLines, Fmt" published_heads={IntToStr(CompilerWorldPublishedHeadCount(seedHost))}")
+    add(reportLines, Fmt" synced_entries={IntToStr(Value(syncRes))}")
+    add(reportLines, Fmt" world_head_cid={layout.FixedBytes32Hex(plan.localUniverse.worldHead.headCid)}")
+    add(reportLines, Fmt" manifest_root_cid={layout.FixedBytes32Hex(parsedManifest.manifestCid)}")
+    add(reportLines, Fmt" manifest_entry_count={IntToStr(parsedManifest.entryCount)}")
+    add(reportLines, Fmt" managed_mirror_count={IntToStr(mirrorBundles.len)}")
+    add(reportLines, Fmt" receipt_cid={layout.FixedBytes32Hex(plan.compileReceipt.receiptCid)}")
+    return Ok[str](strutil.Join(reportLines, "\n"))
+
+fn CompilerWorldFreshNodeSyncPublished(seedHost: var host.Libp2pHost,
+                                         freshHost: var host.Libp2pHost,
+                                         localUniverse: cworld.CompilerLocalUniverse,
+                                         compilerCsg: ccsg.CompilerCsg,
+                                         exportSurface: ccsg.CsgExportSurface,
+                                         receipt: ccsg.CompileReceipt,
+                                         mirrorBundles: cwlp.CompilerManagedMirrorBundle[]): Result[int32] =
+    CompilerWorldPublishUniverseWithManagedMirrorBundles(seedHost,
+                                                           localUniverse,
+                                                           compilerCsg,
+                                                           exportSurface,
+                                                           receipt,
+                                                           mirrorBundles)
+    return CompilerWorldSync(freshHost, seedHost, seedHost.selfPeerId)
+
+@borrows
+fn CompilerWorldFreshNodeSyncedState(rootDir: str,
+                                       freshHost: host.Libp2pHost,
+                                       localUniverse: cworld.CompilerLocalUniverse,
+                                       receipt: ccsg.CompileReceipt,
+                                       syncedEntryCount: int32): Result[CompilerWorldFreshNodeSyncState] =
+    var worldText = ""
+    if !CompilerWorldFirstPayloadTextByKind(freshHost,
+                                              pubsub.PubSubPayloadKindCompilerWorldHead,
+                                              worldText):
+        return Err[CompilerWorldFreshNodeSyncState](" compiler world libp2p: missing fresh world head")
+    worldText = cworld.CompilerWorldOwnText(worldText)
+    var receiptText = ""
+    if !CompilerWorldFirstPayloadTextByKind(freshHost,
+                                              pubsub.PubSubPayloadKindCompilerCompileReceipt,
+                                              receiptText):
+        return Err[CompilerWorldFreshNodeSyncState](" compiler world libp2p: missing fresh receipt")
+    receiptText = cworld.CompilerWorldOwnText(receiptText)
+    var syncedHead: cworld.CompilerWorldHead
+    let parseHeadRes = cworld.CompilerWorldHeadFromReportText(worldText, syncedHead)
+    if IsErr(parseHeadRes):
+        return Err[CompilerWorldFreshNodeSyncState](strutil.Join([" compiler world libp2p: parse fresh head failed: ", Error(parseHeadRes)], ""))
+    if !layout.FixedBytes32Equal(syncedHead.headCid, localUniverse.worldHead.headCid):
+        return Err[CompilerWorldFreshNodeSyncState](" compiler world libp2p: fresh node head cid mismatch")
+    var manifestText = ""
+    if !CompilerWorldFirstPayloadTextByKind(freshHost,
+                                              pubsub.PubSubPayloadKindCompilerUniverseManifest,
+                                              manifestText):
+        return Err[CompilerWorldFreshNodeSyncState](" compiler world libp2p: missing fresh manifest")
+    manifestText = cworld.CompilerWorldOwnText(manifestText)
+    var syncedManifest: cworld.CompilerUniverseManifest
+    let parseManifestRes = cworld.CompilerUniverseManifestFromReportText(manifestText, syncedManifest)
+    if IsErr(parseManifestRes):
+        return Err[CompilerWorldFreshNodeSyncState](strutil.Join([" compiler world libp2p: parse fresh manifest failed: ", Error(parseManifestRes)], ""))
+    if !layout.FixedBytes32Equal(syncedManifest.manifestCid, localUniverse.manifest.manifestCid):
+        return Err[CompilerWorldFreshNodeSyncState](" compiler world libp2p: fresh manifest cid mismatch")
+    var syncedReceipt: ccsg.CompileReceipt
+    let parseReceiptRes = ccsg.CompileReceiptFromReportText(receiptText, syncedReceipt)
+    if IsErr(parseReceiptRes):
+        return Err[CompilerWorldFreshNodeSyncState](strutil.Join([" compiler world libp2p: parse fresh receipt failed: ", Error(parseReceiptRes)], ""))
+    if !ccsg.CompileReceiptEquivalent(receipt, syncedReceipt):
+        return Err[CompilerWorldFreshNodeSyncState](" compiler world libp2p: synced receipt drift")
+    let syncedMirrorBundlesRes = CompilerWorldManagedMirrorBundlesFromHost(freshHost)
+    if IsErr(syncedMirrorBundlesRes):
+        return Err[CompilerWorldFreshNodeSyncState](Error(syncedMirrorBundlesRes))
+    var compactManagedReceipt: cwlp.CompilerManagedDependencyReceipt
+    let compactManagedReceiptRes =
+        cwlp.CompilerWorldManagedDependencyReceiptFromManifest(
+            syncedManifest,
+            compactManagedReceipt)
+    if IsErr(compactManagedReceiptRes):
+        return Err[CompilerWorldFreshNodeSyncState](
+            Error(compactManagedReceiptRes))
+    let materializeRes = cwlp.CompilerWorldMaterializeManagedMirrorBundles(
+        rootDir,
+        syncedManifest,
+        compactManagedReceipt,
+        Value(syncedMirrorBundlesRes))
+    if IsErr(materializeRes):
+        return Err[CompilerWorldFreshNodeSyncState](Error(materializeRes))
+    var state: CompilerWorldFreshNodeSyncState
+    state.syncedEntryCount = syncedEntryCount
+    state.syncedHead = syncedHead
+    state.syncedManifest = syncedManifest
+    state.syncedReceipt = syncedReceipt
+    state.materializedMirrorCount = Value(materializeRes)
+    return Ok[CompilerWorldFreshNodeSyncState](state)
+
+fn CompilerWorldFreshNodeRebuild(rootDir: str,
+                                   req: creq.CompilerRequest,
+                                   localUniverse: cworld.CompilerLocalUniverse,
+                                   syncedHead: cworld.CompilerWorldHead,
+                                   channelRaw: str): Result[ccsg.CompileReceipt] =
+    if !creq.CompilerRequestStrictValidateSealed(req):
+        return Err[ccsg.CompileReceipt](
+            " compiler world libp2p: source request is not sealed")
+    let requestedWorldHead = cworld.CompilerWorldOwnText(layout.FixedBytes32Hex(syncedHead.headCid))
+    let sourcePath = cworld.CompilerWorldOwnText(req.sourcePath)
+    let freshOutputPath = cworld.CompilerWorldOwnText(strutil.Join([strings.CloneStr(req.outputPath), ".fresh_node"], ""))
+    let freshLockPath = cworld.CompilerWorldOwnText(Fmt"{freshOutputPath}.lock.toml")
+    let targetTriple = cworld.CompilerWorldOwnText(req.targetTriple)
+    if !chengpath.WriteTextFile(rootDir, freshLockPath, cworld.CompilerLockText(localUniverse)):
+        return Err[ccsg.CompileReceipt](strutil.Join([" compiler world libp2p: failed to write fresh rebuild lock: ", freshLockPath], ""))
+    var freshReq = creq.CompilerRequestNew(req.rootDir,
+                                             sourcePath,
+                                             freshOutputPath,
+                                             targetTriple,
+                                             req.emitKind,
+                                             "")
+    freshReq = creq.CompilerRequestWithSymbolVisibility(
+        freshReq, req.symbolVisibility)
+    freshReq = creq.CompilerRequestWithBrowserBridgeObject(
+        freshReq, req.browserBridgeObjectPath)
+    freshReq = creq.CompilerRequestWithExportRootSymbols(
+        freshReq, req.exportRootSymbols)
+    freshReq = creq.CompilerRequestWithProviderObjectPaths(
+        freshReq, req.providerObjectPaths)
+    freshReq = creq.CompilerRequestWithRuntimeProviderBundle(
+        freshReq, req.runtimeProviderBundle)
+    freshReq = creq.CompilerRequestWithMode(
+        freshReq, req.compileMode)
+    freshReq.backendKind = req.backendKind
+    freshReq.jobCount = req.jobCount
+    creq.CompilerRequestSeal(freshReq)
+    let freshPlanRes = sexec.BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
+                                                                          freshReq,
+                                                                          requestedWorldHead,
+                                                                          freshLockPath,
+                                                                          "",
+                                                                          channelRaw)
+    if IsErr(freshPlanRes):
+        return Err[ccsg.CompileReceipt](strutil.Join([" compiler world libp2p: fresh rebuild plan failed: ", Error(freshPlanRes)], ""))
+    let freshPlan = Value(freshPlanRes)
+    var ownedReceipt: ccsg.CompileReceipt
+    let ownedReceiptRes = ccsg.CompileReceiptFromReportText(
+        ccsg.CompileReceiptReport(freshPlan.compileReceipt),
+        ownedReceipt)
+    if IsErr(ownedReceiptRes):
+        return Err[ccsg.CompileReceipt](Error(ownedReceiptRes))
+    return Ok[ccsg.CompileReceipt](ownedReceipt)
+
+fn CompilerWorldFreshNodeReportText(seedHost: host.Libp2pHost,
+                                      freshHost: host.Libp2pHost,
+                                      receipt: ccsg.CompileReceipt,
+                                      state: CompilerWorldFreshNodeSyncState,
+                                      freshReceipt: ccsg.CompileReceipt): str =
+    var out = ""
+    out = strutil.Join([out, "seed_entries=", IntToStr(CompilerWorldStoredEntryCount(seedHost)), "\n"], "")
+    out = strutil.Join([out, "fresh_entries=", IntToStr(CompilerWorldStoredEntryCount(freshHost)), "\n"], "")
+    out = strutil.Join([out, "published_heads=", IntToStr(CompilerWorldPublishedHeadCount(seedHost)), "\n"], "")
+    out = strutil.Join([out, "synced_entries=", IntToStr(state.syncedEntryCount), "\n"], "")
+    out = strutil.Join([out, "world_head_cid=", layout.FixedBytes32Hex(state.syncedHead.headCid), "\n"], "")
+    out = strutil.Join([out, "manifest_root_cid=", layout.FixedBytes32Hex(state.syncedManifest.manifestCid), "\n"], "")
+    out = strutil.Join([out, "manifest_entry_count=", IntToStr(state.syncedManifest.entryCount), "\n"], "")
+    out = strutil.Join([out, "managed_mirror_count=", IntToStr(state.materializedMirrorCount), "\n"], "")
+    out = strutil.Join([out, "seed_receipt_cid=", layout.FixedBytes32Hex(receipt.receiptCid), "\n"], "")
+    out = strutil.Join([out, "synced_receipt_cid=", layout.FixedBytes32Hex(state.syncedReceipt.receiptCid), "\n"], "")
+    out = strutil.Join([out, "fresh_receipt_cid=", layout.FixedBytes32Hex(freshReceipt.receiptCid), "\n"], "")
+    out = strutil.Join([out, "receipt_equivalent=1\n"], "")
+    out = strutil.Join([out, "receipt_cid_match=1"], "")
+    return out
+
+fn CompilerWorldFreshNodeSelfhostReport(rootDir: str,
+                                          req: creq.CompilerRequest,
+                                          plan: sexec.SystemLinkExecPlan): Result[str] =
+    var seedHost = host.Libp2pHostInit("compiler-world-seed")
+    var freshHost = host.Libp2pHostInit("compiler-world-fresh")
+    CompilerWorldRegister(seedHost)
+    CompilerWorldRegister(freshHost)
+    let localUniverse = plan.localUniverse
+    let compilerCsg = plan.compilerCsg
+    let exportSurface = plan.exportSurface
+    let receipt = plan.compileReceipt
+    var managedDependencyReceipt: cwlp.CompilerManagedDependencyReceipt
+    let managedDependencyReceiptRes =
+        cwlp.CompilerWorldManagedDependencyReceiptFromPlanProjection(
+            plan.managedDependencyReceipt,
+            managedDependencyReceipt)
+    if IsErr(managedDependencyReceiptRes):
+        return Err[str](Error(managedDependencyReceiptRes))
+    let mirrorBundlesRes =
+        cwlp.CompilerWorldManagedMirrorBundlesFromReceipt(
+            rootDir,
+            plan.localUniverse.manifest,
+            managedDependencyReceipt)
+    if IsErr(mirrorBundlesRes):
+        return Err[str](Error(mirrorBundlesRes))
+    let mirrorBundles = Value(mirrorBundlesRes)
+    let channelRaw = localUniverse.worldHead.channel
+    var seedAddr: core.Libp2pMultiaddr
+    var seedDialAddr: core.Libp2pMultiaddr
+    var freshAddr: core.Libp2pMultiaddr
+    var freshDialAddr: core.Libp2pMultiaddr
+    multiaddr.Libp2pMultiaddrFillTcp(seedAddr, "127.0.0.1", 6463)
+    multiaddr.Libp2pMultiaddrFillTcp(seedDialAddr, "127.0.0.1", 6463)
+    multiaddr.Libp2pMultiaddrFillTcp(freshAddr, "127.0.0.1", 6464)
+    multiaddr.Libp2pMultiaddrFillTcp(freshDialAddr, "127.0.0.1", 6464)
+    let seedListenRes = host.Libp2pListen(seedHost, seedAddr)
+    if IsErr(seedListenRes):
+        return Err[str](Error(seedListenRes))
+    let freshListenRes = host.Libp2pListen(freshHost, freshAddr)
+    if IsErr(freshListenRes):
+        return Err[str](Error(freshListenRes))
+    let dialSeedRes = host.Libp2pDial(freshHost, seedHost.selfPeerId, seedDialAddr, 1)
+    if IsErr(dialSeedRes):
+        return Err[str](Error(dialSeedRes))
+    let dialFreshRes = host.Libp2pDial(seedHost, freshHost.selfPeerId, freshDialAddr, 1)
+    if IsErr(dialFreshRes):
+        return Err[str](Error(dialFreshRes))
+    let syncRes = CompilerWorldFreshNodeSyncPublished(seedHost,
+                                                        freshHost,
+                                                        localUniverse,
+                                                        compilerCsg,
+                                                        exportSurface,
+                                                        receipt,
+                                                        mirrorBundles)
+    if IsErr(syncRes):
+        return Err[str](Error(syncRes))
+    let stateRes = CompilerWorldFreshNodeSyncedState(rootDir,
+                                                       freshHost,
+                                                       localUniverse,
+                                                       receipt,
+                                                       Value(syncRes))
+    if IsErr(stateRes):
+        return Err[str](Error(stateRes))
+    let state = Value(stateRes)
+    let freshReceiptRes = CompilerWorldFreshNodeRebuild(rootDir,
+                                                          req,
+                                                          localUniverse,
+                                                          state.syncedHead,
+                                                          channelRaw)
+    if IsErr(freshReceiptRes):
+        return Err[str](Error(freshReceiptRes))
+    let freshReceipt = Value(freshReceiptRes)
+    if !ccsg.CompileReceiptEquivalent(state.syncedReceipt, freshReceipt):
+        return Err[str](" compiler world libp2p: fresh rebuild receipt drift")
+    if !layout.FixedBytes32Equal(state.syncedReceipt.receiptCid, freshReceipt.receiptCid):
+        return Err[str](" compiler world libp2p: fresh rebuild receipt cid mismatch")
+    return Ok[str](CompilerWorldFreshNodeReportText(seedHost,
+                                                      freshHost,
+                                                      receipt,
+                                                      state,
+                                                      freshReceipt))

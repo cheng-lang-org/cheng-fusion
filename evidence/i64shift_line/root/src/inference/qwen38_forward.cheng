@@ -1,0 +1,851 @@
+import std/result
+import std/math as m
+import cheng/inference/gated_delta_net as gdn
+import cheng/inference/qwen38_hybrid_executor as hx
+
+# Qwen3.8 hybrid minimal end-to-end forward (structural fixture chain).
+#
+# STRUCT-LEVEL E2E ONLY: this module verifies scheduler/kernel/contract
+# assembly correctness on self-consistent mini dimensions. Every weight below
+# is a fixed-seed LCG synthetic value -- a mathematical fixture, NOT real
+# model weights; the real-weight execution path belongs to the integration
+# line. Mini dims deliberately keep the structural invariants of the real
+# Qwen3.8 stack: valueHeads == 3 * keyHeads, full-attention layer every 4th
+# slot (3 linear + 1 full), depthwise causal short conv (kernel 4) feeding
+# the GDN recurrence, residual stream, finalNorm -> lmHead, plus an MTP
+# eh_proj head carried and shape-gated for the contract surface.
+#
+# Dataflow per pushed token (all float64, fixed summation orders, every entry
+# point Result[T] with hard-fail shape/finiteness gates):
+#   x = embedding[token]
+#   per layer: y = Branch(RMSNorm(x));  x = x + y
+#     linear layer: mini-dim projections -> streaming causal conv ->
+#                   GatedDeltaNetStepRecurrentFill (kernel-owned recurrence)
+#     full layer:   single-head scaled dot-product attention over the stored
+#                   KV prefix (causal by construction: position t only sees
+#                   keys/values cached for positions <= t)
+#   logits[v] = lmHead[v] . RMSNorm_final(x)
+#
+# The batch surface Qwen38MiniForwardLogitsFill is implemented as repeated
+# pushes through the identical stepping core, so whole-sequence outputs and
+# incremental decode are bitwise equal by construction and the causality
+# contract is directly observable. No RoPE/MLP/MTP application here: those
+# are structure-level simplifications of this fixture chain.
+
+const
+    Qwen38ForwardSchema = "cheng.inference.qwen38_forward.v1"
+    Qwen38MiniVocab = 32
+    Qwen38MiniHidden = 24
+    Qwen38MiniKeyHeads = 2
+    Qwen38MiniValueHeads = 6
+    Qwen38MiniHeadDim = 8
+    Qwen38MiniLayerCount = 4
+    Qwen38MiniLinearLayerCount = 3
+    Qwen38MiniFullLayerCount = 1
+    Qwen38MiniChunkLen = 7
+    Qwen38MiniMaxPositions = 16
+
+# --- hashing (model_graph style mixer; floats hashed via exact IEEE bit
+# decomposition because the backend exposes no f64 bitcast) ---
+
+fn Qwen38FwdHashStep(hash: int64, value: int64): int64 =
+    let mixed = hash * int64(2654435761) + value + int64(173)
+    if mixed < int64(0):
+        return int64(0) - mixed
+    return mixed
+
+@borrows
+fn Qwen38FwdHashTextWith(hashRaw: int64, text: str): int64 =
+    var h: int64 = hashRaw
+    for i in 0..<len(text):
+        h = Qwen38FwdHashStep(h, int64(Int32(text[i])))
+    return h
+
+@borrows
+fn Qwen38FwdHashF64With(hashRaw: int64, values: float64[]): Result[int64] =
+    # Every element passes an explicit finite gate before its bits are mixed:
+    # GdnDecomposeF64 alone walks NaN through with garbage digits, so NaN
+    # detection relies on the exhaustive-split probe below.
+    var h: int64 = hashRaw
+    h = Qwen38FwdHashStep(h, int64(values.len))
+    for i in 0..<values.len:
+        let finRes = Qwen38FwdFiniteGate(values[i])
+        if IsErr(finRes):
+            return Err[int64]("qwen38 forward hash: non finite float")
+        let bitsRes = gdn.GdnDecomposeF64(values[i])
+        if IsErr(bitsRes):
+            return Err[int64]("qwen38 forward hash: non finite float")
+        let bits = Value(bitsRes)
+        h = Qwen38FwdHashStep(h, bits.signBit)
+        h = Qwen38FwdHashStep(h, bits.expUnbiased + int64(1023))
+        h = Qwen38FwdHashStep(h, bits.mantissa52)
+    return Ok[int64](h)
+
+# Non-finiteness gate. NaN fails BOTH arms of an exhaustive magnitude split
+# (unordered compares are false in both directions), +/-inf walks the doubling
+# ladder past the exponent cap; finite values take exactly one arm.
+fn Qwen38FwdFiniteGate(x: float64): Result[bool] =
+    var v: float64 = x
+    if v < 0.0:
+        v = 0.0 - v
+    if v < 8.0:
+        return Ok[bool](true)
+    if v >= 8.0:
+        var e: int32 = 0
+        while v >= 2.0:
+            v = v / 2.0
+            e = e + 1
+            if e > 2200:
+                return Err[bool]("qwen38 forward: non finite float")
+        return Ok[bool](true)
+    return Err[bool]("qwen38 forward: non finite float (nan)")
+
+# --- synthetic weight package (SoA flat float64 arrays, LCG fixture) ---
+
+type
+    Qwen38MiniWeights =
+        schema: str
+        vocabSize: int32
+        hiddenSize: int32
+        keyHeads: int32
+        valueHeads: int32
+        headDim: int32
+        convKernel: int32
+        chunkLen: int32
+        layerCount: int32
+        linearLayerCount: int32
+        fullLayerCount: int32
+        rmsNormEps: float64
+        embedding: float64[]
+        layerNormW: float64[]
+        gdnQProj: float64[]
+        gdnKProj: float64[]
+        gdnVProj: float64[]
+        gdnGateAlpha: float64[]
+        gdnGateBeta: float64[]
+        gdnOutGate: float64[]
+        gdnOutProj: float64[]
+        gdnConvW: float64[]
+        fullQProj: float64[]
+        fullKProj: float64[]
+        fullVProj: float64[]
+        fullOProj: float64[]
+        finalNormW: float64[]
+        lmHead: float64[]
+        mtpEhProj: float64[]
+        sourceHash: int64
+        weightsHash: int64
+
+fn qfwdLcgDraw(seed: var int64, amp: float64): float64 =
+    seed = seed * int64(6364136223846793005) + int64(1442695040888963407)
+    let draw: int64 = (seed >> 33) & int64(1023)
+    return (float64(draw) - 512.0) / 1024.0 * amp
+
+fn qfwdFill(outArr: var float64[], n: int32, seed: var int64, amp: float64) =
+    for i in 0..<n:
+        add(outArr, qfwdLcgDraw(seed, amp))
+
+fn qfwdFillAroundOne(outArr: var float64[], n: int32, seed: var int64) =
+    for i in 0..<n:
+        add(outArr, 1.0 + qfwdLcgDraw(seed, 0.05))
+
+@borrows
+fn Qwen38MiniWeightsHash(weights: Qwen38MiniWeights): Result[int64] =
+    var h: int64 = int64(173)
+    h = Qwen38FwdHashTextWith(h, weights.schema)
+    h = Qwen38FwdHashStep(h, int64(weights.vocabSize))
+    h = Qwen38FwdHashStep(h, int64(weights.hiddenSize))
+    h = Qwen38FwdHashStep(h, int64(weights.keyHeads))
+    h = Qwen38FwdHashStep(h, int64(weights.valueHeads))
+    h = Qwen38FwdHashStep(h, int64(weights.headDim))
+    h = Qwen38FwdHashStep(h, int64(weights.convKernel))
+    h = Qwen38FwdHashStep(h, int64(weights.chunkLen))
+    h = Qwen38FwdHashStep(h, int64(weights.layerCount))
+    h = Qwen38FwdHashStep(h, int64(weights.linearLayerCount))
+    h = Qwen38FwdHashStep(h, int64(weights.fullLayerCount))
+    let epsRes = gdn.GdnDecomposeF64(weights.rmsNormEps)
+    if IsErr(epsRes):
+        return Err[int64]("qwen38 forward weights hash: non finite eps")
+    let epsBits = Value(epsRes)
+    h = Qwen38FwdHashStep(h, epsBits.expUnbiased)
+    h = Qwen38FwdHashStep(h, epsBits.mantissa52)
+    var segRes = Qwen38FwdHashF64With(h, weights.embedding)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.layerNormW)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.gdnQProj)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.gdnKProj)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.gdnVProj)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.gdnGateAlpha)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.gdnGateBeta)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.gdnOutGate)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.gdnOutProj)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.gdnConvW)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.fullQProj)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.fullKProj)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.fullVProj)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.fullOProj)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.finalNormW)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.lmHead)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    segRes = Qwen38FwdHashF64With(h, weights.mtpEhProj)
+    if IsErr(segRes):
+        return Err[int64]("qwen38 forward weights hash: non finite")
+    h = Value(segRes)
+    h = Qwen38FwdHashStep(h, weights.sourceHash)
+    return Ok[int64](h)
+
+@borrows
+fn Qwen38MiniWeightsValidate(weights: Qwen38MiniWeights): Result[bool] =
+    if weights.schema != Qwen38ForwardSchema:
+        return Err[bool]("qwen38 forward weights: schema")
+    if weights.vocabSize != Qwen38MiniVocab || weights.hiddenSize != Qwen38MiniHidden:
+        return Err[bool]("qwen38 forward weights: vocab/hidden dims")
+    if weights.keyHeads != Qwen38MiniKeyHeads || weights.headDim != Qwen38MiniHeadDim:
+        return Err[bool]("qwen38 forward weights: key head dims")
+    if weights.valueHeads != weights.keyHeads * 3:
+        return Err[bool]("qwen38 forward weights: value head ratio")
+    if weights.convKernel != gdn.GatedDeltaNetConvKernel:
+        return Err[bool]("qwen38 forward weights: conv kernel")
+    if weights.chunkLen != Qwen38MiniChunkLen:
+        return Err[bool]("qwen38 forward weights: chunk len")
+    if weights.layerCount != Qwen38MiniLayerCount ||
+       weights.linearLayerCount != Qwen38MiniLinearLayerCount ||
+       weights.fullLayerCount != Qwen38MiniFullLayerCount ||
+       weights.linearLayerCount + weights.fullLayerCount != weights.layerCount:
+        return Err[bool]("qwen38 forward weights: layer split")
+    if weights.sourceHash == int64(0):
+        return Err[bool]("qwen38 forward weights: source hash")
+    let fin = Qwen38MiniHidden
+    let kW = Qwen38MiniKeyHeads * Qwen38MiniHeadDim
+    let vW = Qwen38MiniValueHeads * Qwen38MiniHeadDim
+    let nl = weights.linearLayerCount
+    let nf = weights.fullLayerCount
+    let convTotal = gdn.GatedDeltaNetConvKernel * (kW + kW + vW)
+    if weights.embedding.len != Qwen38MiniVocab * fin ||
+       weights.layerNormW.len != weights.layerCount * fin ||
+       weights.finalNormW.len != fin ||
+       weights.lmHead.len != Qwen38MiniVocab * fin ||
+       weights.mtpEhProj.len != fin * (fin * 2):
+        return Err[bool]("qwen38 forward weights: stream array length")
+    if weights.gdnQProj.len != nl * kW * fin ||
+       weights.gdnKProj.len != nl * kW * fin ||
+       weights.gdnVProj.len != nl * vW * fin ||
+       weights.gdnGateAlpha.len != nl * Qwen38MiniKeyHeads * fin ||
+       weights.gdnGateBeta.len != nl * Qwen38MiniKeyHeads * fin ||
+       weights.gdnOutGate.len != nl * vW * fin ||
+       weights.gdnOutProj.len != nl * vW * fin ||
+       weights.gdnConvW.len != nl * convTotal:
+        return Err[bool]("qwen38 forward weights: gdn array length")
+    if weights.fullQProj.len != nf * fin * fin ||
+       weights.fullKProj.len != nf * fin * fin ||
+       weights.fullVProj.len != nf * fin * fin ||
+       weights.fullOProj.len != nf * fin * fin:
+        return Err[bool]("qwen38 forward weights: full array length")
+    let epsFin = Qwen38FwdFiniteGate(weights.rmsNormEps)
+    if IsErr(epsFin):
+        return Err[bool]("qwen38 forward weights: non finite eps")
+    if !(weights.rmsNormEps > 0.0):
+        return Err[bool]("qwen38 forward weights: eps range")
+    # every float array is walked (and finite-gated) by the hash below
+    let hashRes = Qwen38MiniWeightsHash(weights)
+    if IsErr(hashRes):
+        return Err[bool]("qwen38 forward weights: hash")
+    if Value(hashRes) != weights.weightsHash:
+        return Err[bool]("qwen38 forward weights: hash mismatch")
+    return Ok[bool](true)
+
+fn Qwen38MiniWeightsBuild(baseSeed: int64): Result[Qwen38MiniWeights] =
+    if baseSeed == int64(0):
+        return Err[Qwen38MiniWeights]("qwen38 forward weights: zero seed")
+    var w: Qwen38MiniWeights
+    w.schema = Qwen38ForwardSchema
+    w.vocabSize = Qwen38MiniVocab
+    w.hiddenSize = Qwen38MiniHidden
+    w.keyHeads = Qwen38MiniKeyHeads
+    w.valueHeads = Qwen38MiniValueHeads
+    w.headDim = Qwen38MiniHeadDim
+    w.convKernel = gdn.GatedDeltaNetConvKernel
+    w.chunkLen = Qwen38MiniChunkLen
+    w.layerCount = Qwen38MiniLayerCount
+    w.linearLayerCount = Qwen38MiniLinearLayerCount
+    w.fullLayerCount = Qwen38MiniFullLayerCount
+    w.rmsNormEps = 1.0 / 1000000.0
+    w.sourceHash = baseSeed
+    var seed: int64 = baseSeed
+    qfwdFill(w.embedding, Qwen38MiniVocab * Qwen38MiniHidden, seed, 0.5)
+    qfwdFillAroundOne(w.layerNormW, Qwen38MiniLayerCount * Qwen38MiniHidden, seed)
+    qfwdFill(w.gdnQProj, Qwen38MiniLinearLayerCount * Qwen38MiniKeyHeads * Qwen38MiniHeadDim * Qwen38MiniHidden, seed, 0.25)
+    qfwdFill(w.gdnKProj, Qwen38MiniLinearLayerCount * Qwen38MiniKeyHeads * Qwen38MiniHeadDim * Qwen38MiniHidden, seed, 0.25)
+    qfwdFill(w.gdnVProj, Qwen38MiniLinearLayerCount * Qwen38MiniValueHeads * Qwen38MiniHeadDim * Qwen38MiniHidden, seed, 0.25)
+    qfwdFill(w.gdnGateAlpha, Qwen38MiniLinearLayerCount * Qwen38MiniKeyHeads * Qwen38MiniHidden, seed, 0.6)
+    qfwdFill(w.gdnGateBeta, Qwen38MiniLinearLayerCount * Qwen38MiniKeyHeads * Qwen38MiniHidden, seed, 0.6)
+    qfwdFill(w.gdnOutGate, Qwen38MiniLinearLayerCount * Qwen38MiniValueHeads * Qwen38MiniHeadDim * Qwen38MiniHidden, seed, 0.25)
+    qfwdFill(w.gdnOutProj, Qwen38MiniLinearLayerCount * Qwen38MiniValueHeads * Qwen38MiniHeadDim * Qwen38MiniHidden, seed, 0.25)
+    let kW = Qwen38MiniKeyHeads * Qwen38MiniHeadDim
+    let vW = Qwen38MiniValueHeads * Qwen38MiniHeadDim
+    qfwdFill(w.gdnConvW, Qwen38MiniLinearLayerCount * gdn.GatedDeltaNetConvKernel * (kW + kW + vW), seed, 0.5)
+    qfwdFill(w.fullQProj, Qwen38MiniFullLayerCount * Qwen38MiniHidden * Qwen38MiniHidden, seed, 0.25)
+    qfwdFill(w.fullKProj, Qwen38MiniFullLayerCount * Qwen38MiniHidden * Qwen38MiniHidden, seed, 0.25)
+    qfwdFill(w.fullVProj, Qwen38MiniFullLayerCount * Qwen38MiniHidden * Qwen38MiniHidden, seed, 0.25)
+    qfwdFill(w.fullOProj, Qwen38MiniFullLayerCount * Qwen38MiniHidden * Qwen38MiniHidden, seed, 0.25)
+    qfwdFillAroundOne(w.finalNormW, Qwen38MiniHidden, seed)
+    qfwdFill(w.lmHead, Qwen38MiniVocab * Qwen38MiniHidden, seed, 0.25)
+    qfwdFill(w.mtpEhProj, Qwen38MiniHidden * (Qwen38MiniHidden * 2), seed, 0.25)
+    let hashRes = Qwen38MiniWeightsHash(w)
+    if IsErr(hashRes):
+        return Err[Qwen38MiniWeights]("qwen38 forward weights: build hash")
+    w.weightsHash = Value(hashRes)
+    let valOk = Qwen38MiniWeightsValidate(w)
+    if IsErr(valOk):
+        return Err[Qwen38MiniWeights](Error(valOk))
+    return Ok[Qwen38MiniWeights](w)
+
+# --- shared dispatch gates: weights valid, plan contract-valid, and the mini
+# layer prefix must follow the plan's full-attention rhythm exactly ---
+
+@borrows
+fn qfwdGateChain(weights: Qwen38MiniWeights, plan: hx.Qwen38HybridLayerPlan): Result[bool] =
+    let wOk = Qwen38MiniWeightsValidate(weights)
+    if IsErr(wOk):
+        return Err[bool](Error(wOk))
+    let pOk = hx.Qwen38HybridLayerPlanValidateSelf(plan)
+    if IsErr(pOk):
+        return Err[bool](Error(pOk))
+    if weights.layerCount > plan.layerCount:
+        return Err[bool]("qwen38 forward: plan shorter than mini stack")
+    for i in 0..<weights.layerCount:
+        let wantFull = ((i + 1) % plan.fullAttentionInterval) == 0
+        if plan.isFullAttention[i] != wantFull:
+            return Err[bool]("qwen38 forward: mini prefix rhythm mismatch")
+    return Ok[bool](true)
+
+# --- numeric primitives ---
+
+@borrows
+fn qfwdRmsNormFill(outRow: var float64[], xRow: float64[], gain: float64[],
+                   gainBase: int32, h: int32, eps: float64): Result[bool] =
+    if h <= 0 || xRow.len < h || outRow.len < h || gain.len < gainBase + h:
+        return Err[bool]("qwen38 forward rmsnorm: shape")
+    var ms: float64 = 0.0
+    for i in 0..<h:
+        ms = ms + xRow[i] * xRow[i]
+    ms = ms / float64(h)
+    let inv = 1.0 / m.Sqrt(ms + eps)
+    for i in 0..<h:
+        outRow[i] = xRow[i] * inv * gain[gainBase + i]
+    return Ok[bool](true)
+
+# Build kernel-owned GDN params for one linear slot from the flat SoA store.
+@borrows
+fn qfwdGdnParamsAt(weights: Qwen38MiniWeights, slot: int32): Result[gdn.GatedDeltaNetParams] =
+    let h = Qwen38MiniHidden
+    let kW = Qwen38MiniKeyHeads * Qwen38MiniHeadDim
+    let vW = Qwen38MiniValueHeads * Qwen38MiniHeadDim
+    if slot < 0 || slot >= weights.linearLayerCount:
+        return Err[gdn.GatedDeltaNetParams]("qwen38 forward gdn params: slot")
+    var p: gdn.GatedDeltaNetParams
+    p.schema = gdn.GatedDeltaNetSchema
+    p.keyHeads = Qwen38MiniKeyHeads
+    p.valueHeads = Qwen38MiniValueHeads
+    p.headDim = Qwen38MiniHeadDim
+    p.hiddenSize = h
+    p.convKernel = gdn.GatedDeltaNetConvKernel
+    p.sourceHash = weights.sourceHash
+    let qBase = slot * kW * h
+    let vBase = slot * vW * h
+    let gBase = slot * Qwen38MiniKeyHeads * h
+    let cTotal = gdn.GatedDeltaNetConvKernel * (kW + kW + vW)
+    let cBase = slot * cTotal
+    for i in 0..<kW * h:
+        add(p.qProj, weights.gdnQProj[qBase + i])
+        add(p.kProj, weights.gdnKProj[qBase + i])
+    for i in 0..<vW * h:
+        add(p.vProj, weights.gdnVProj[vBase + i])
+        add(p.outGate, weights.gdnOutGate[vBase + i])
+        add(p.outProj, weights.gdnOutProj[vBase + i])
+    for i in 0..<Qwen38MiniKeyHeads * h:
+        add(p.gateAlpha, weights.gdnGateAlpha[gBase + i])
+        add(p.gateBeta, weights.gdnGateBeta[gBase + i])
+    for i in 0..<cTotal:
+        add(p.convW, weights.gdnConvW[cBase + i])
+    let valOk = gdn.GatedDeltaNetParamsValidate(p)
+    if IsErr(valOk):
+        return Err[gdn.GatedDeltaNetParams]("qwen38 forward gdn params: validate")
+    return Ok[gdn.GatedDeltaNetParams](p)
+
+# Streaming causal depthwise conv for one plane at absolute position tPos:
+# tap j reads source row tPos-(3-j); taps reaching before t=0 are skipped,
+# never added as zeros (identical boundary rule and tap order as
+# GatedDeltaNetConvSequenceFill so both routes agree bit-for-bit).
+@borrows
+fn qfwdStreamConvFill(convRow: var float64[], curRaw: float64[], hist: float64[],
+                      histBase: int32, width: int32, convW: float64[],
+                      convOffset: int32, tPos: int32): Result[bool] =
+    if width <= 0 || convRow.len < width || curRaw.len < width:
+        return Err[bool]("qwen38 forward stream conv: shape")
+    if convOffset < 0 || convOffset + gdn.GatedDeltaNetConvKernel * width > convW.len:
+        return Err[bool]("qwen38 forward stream conv: weight range")
+    for c in 0..<width:
+        var acc: float64 = 0.0
+        for j in 0..<gdn.GatedDeltaNetConvKernel:
+            let lag = (gdn.GatedDeltaNetConvKernel - 1) - j
+            if lag <= tPos:
+                var src: float64 = 0.0
+                if lag == 0:
+                    src = curRaw[c]
+                else:
+                    src = hist[histBase + (lag - 1) * width + c]
+                acc = acc + convW[convOffset + j * width + c] * src
+        convRow[c] = acc
+    return Ok[bool](true)
+
+@borrows
+fn qfwdShiftHist(hist: var float64[], histBase: int32, width: int32, curRaw: float64[]) =
+    # rows index lag-1; after the shift row0 holds the just-seen token and
+    # every stored row ages by one relative to the next position.
+    var r: int32 = gdn.GatedDeltaNetConvKernel - 2
+    while r >= 1:
+        for c in 0..<width:
+            hist[histBase + r * width + c] = hist[histBase + (r - 1) * width + c]
+        r = r - 1
+    for c in 0..<width:
+        hist[histBase + c] = curRaw[c]
+
+# --- incremental decode state ---
+# Mutable bulk state lives in caller-owned flat SoA arrays passed as plain
+# var parameters (single-component paths only: move-out-of-struct-field
+# liveness is rejected by the cold encoder here, and element-level var args
+# are a known silent-no-op hazard). Each layer kind runs in its own helper
+# with helper-local scratch rows of the exact kernel width; after any Err
+# result the buffers must not be reused.
+
+@borrows
+fn Qwen38MiniDecodeBuffersInit(stateData: var float64[], kCache: var float64[],
+                               vCache: var float64[], rawQHist: var float64[],
+                               rawKHist: var float64[], rawVHist: var float64[],
+                               weights: Qwen38MiniWeights): Result[bool] =
+    let wOk = Qwen38MiniWeightsValidate(weights)
+    if IsErr(wOk):
+        return Err[bool](Error(wOk))
+    let kW = Qwen38MiniKeyHeads * Qwen38MiniHeadDim
+    let vW = Qwen38MiniValueHeads * Qwen38MiniHeadDim
+    let histW = gdn.GatedDeltaNetConvKernel - 1
+    for i in 0..<weights.linearLayerCount * Qwen38MiniKeyHeads * Qwen38MiniHeadDim * Qwen38MiniHeadDim:
+        add(stateData, 0.0)
+    for i in 0..<Qwen38MiniMaxPositions * Qwen38MiniHidden:
+        add(kCache, 0.0)
+        add(vCache, 0.0)
+    for i in 0..<weights.linearLayerCount * histW * kW:
+        add(rawQHist, 0.0)
+        add(rawKHist, 0.0)
+    for i in 0..<weights.linearLayerCount * histW * vW:
+        add(rawVHist, 0.0)
+    return Ok[bool](true)
+
+# One linear layer: mini-dim projection -> streaming causal depthwise conv ->
+# kernel-owned GDN recurrence step. All scratch rows are helper-local with
+# their exact kernel widths; branchOut receives the layer output row.
+@borrows
+fn qfwdGdnLayerStep(branchOut: var float64[], normedRow: var float64[],
+                    stateData: var float64[], rawQHist: var float64[],
+                    rawKHist: var float64[], rawVHist: var float64[],
+                    params: gdn.GatedDeltaNetParams,
+                    pos: int32, slot: int32): Result[bool] =
+    let h = Qwen38MiniHidden
+    let kW = Qwen38MiniKeyHeads * Qwen38MiniHeadDim
+    let vW = Qwen38MiniValueHeads * Qwen38MiniHeadDim
+    let d = Qwen38MiniHeadDim
+    let kh = Qwen38MiniKeyHeads
+    let histW = gdn.GatedDeltaNetConvKernel - 1
+    if slot < 0 || slot >= Qwen38MiniLinearLayerCount:
+        return Err[bool]("qwen38 forward gdn step: slot")
+    var qRaw: float64[]
+    var kRaw: float64[]
+    var vRaw: float64[]
+    var qConv: float64[]
+    var kConv: float64[]
+    var vConv: float64[]
+    var alphaArr: float64[]
+    var betaArr: float64[]
+    var attnScratch: float64[]
+    var gateScratch: float64[]
+    for i in 0..<kW:
+        add(qRaw, 0.0)
+        add(kRaw, 0.0)
+        add(qConv, 0.0)
+        add(kConv, 0.0)
+    for i in 0..<vW:
+        add(vRaw, 0.0)
+        add(vConv, 0.0)
+        add(attnScratch, 0.0)
+        add(gateScratch, 0.0)
+    for i in 0..<kh:
+        add(alphaArr, 0.0)
+        add(betaArr, 0.0)
+    var stateTemp: gdn.GatedDeltaNetState
+    let initOk = gdn.GatedDeltaNetStateInit(stateTemp, kh, d)
+    if IsErr(initOk):
+        return Err[bool]("qwen38 forward gdn step: state temp init")
+    let projOk = gdn.GatedDeltaNetProjectTokenFill(qRaw, kRaw, vRaw, alphaArr,
+                                                   betaArr, params, normedRow)
+    if IsErr(projOk):
+        return Err[bool]("qwen38 forward: gdn project")
+    let qh = slot * histW * kW
+    let vh = slot * histW * vW
+    let convQOk = qfwdStreamConvFill(qConv, qRaw, rawQHist, qh, kW,
+                                     params.convW, 0, pos)
+    if IsErr(convQOk):
+        return Err[bool]("qwen38 forward: conv q")
+    let convKOk = qfwdStreamConvFill(kConv, kRaw, rawKHist, qh, kW,
+                                     params.convW,
+                                     gdn.GatedDeltaNetConvKernel * kW, pos)
+    if IsErr(convKOk):
+        return Err[bool]("qwen38 forward: conv k")
+    let convVOk = qfwdStreamConvFill(vConv, vRaw, rawVHist, vh, vW,
+                                     params.convW,
+                                     gdn.GatedDeltaNetConvKernel * (kW + kW), pos)
+    if IsErr(convVOk):
+        return Err[bool]("qwen38 forward: conv v")
+    qfwdShiftHist(rawQHist, qh, kW, qRaw)
+    qfwdShiftHist(rawKHist, qh, kW, kRaw)
+    qfwdShiftHist(rawVHist, vh, vW, vRaw)
+    let sb = slot * kh * d * d
+    for i in 0..<kh * d * d:
+        stateTemp.data[i] = stateData[sb + i]
+    let stepOk = gdn.GatedDeltaNetStepRecurrentFill(stateTemp, branchOut,
+                                                    params, qConv, kConv,
+                                                    vConv, alphaArr, betaArr,
+                                                    normedRow, 0,
+                                                    attnScratch, gateScratch)
+    if IsErr(stepOk):
+        return Err[bool]("qwen38 forward: gdn step")
+    for i in 0..<kh * d * d:
+        stateData[sb + i] = stateTemp.data[i]
+    return Ok[bool](true)
+
+# One full-attention layer: single head of full hidden width, scaled
+# dot-product attention over the stored KV prefix (causal by construction),
+# output projection. KV rows are appended at position pos.
+@borrows
+fn qfwdFullAttnLayer(branchOut: var float64[], normedRow: var float64[],
+                     kCache: var float64[], vCache: var float64[],
+                     weights: Qwen38MiniWeights,
+                     slotBase: int32, pos: int32): Result[bool] =
+    let h = Qwen38MiniHidden
+    var faQ: float64[]
+    var faK: float64[]
+    var faV: float64[]
+    var attnVec: float64[]
+    var scores: float64[]
+    for i in 0..<h:
+        add(faQ, 0.0)
+        add(faK, 0.0)
+        add(faV, 0.0)
+        add(attnVec, 0.0)
+    for i in 0..<Qwen38MiniMaxPositions:
+        add(scores, 0.0)
+    for o in 0..<h:
+        var sq: float64 = 0.0
+        var sk: float64 = 0.0
+        var sv: float64 = 0.0
+        for i in 0..<h:
+            sq = sq + weights.fullQProj[slotBase + o * h + i] * normedRow[i]
+            sk = sk + weights.fullKProj[slotBase + o * h + i] * normedRow[i]
+            sv = sv + weights.fullVProj[slotBase + o * h + i] * normedRow[i]
+        faQ[o] = sq
+        kCache[pos * h + o] = sk
+        vCache[pos * h + o] = sv
+    let invScale = 1.0 / m.Sqrt(float64(h))
+    var j: int32 = 0
+    while j <= pos:
+        var sc: float64 = 0.0
+        for i in 0..<h:
+            sc = sc + kCache[j * h + i] * faQ[i]
+        scores[j] = sc * invScale
+        j = j + 1
+    var bestIdx: int32 = 0
+    var bestRes = gdn.GdnDecomposeF64(scores[0])
+    if IsErr(bestRes):
+        return Err[bool]("qwen38 forward: attention score")
+    var bestBits = Value(bestRes)
+    j = 1
+    while j <= pos:
+        let candRes = gdn.GdnDecomposeF64(scores[j])
+        if IsErr(candRes):
+            return Err[bool]("qwen38 forward: attention score")
+        let candBits = Value(candRes)
+        if gdn.GdnKeyAtLeast(candBits, bestBits):
+            bestIdx = j
+            bestBits = candBits
+        j = j + 1
+    let mxVal = scores[bestIdx]
+    var sumExp: float64 = 0.0
+    j = 0
+    while j <= pos:
+        let wj = m.Exp(scores[j] - mxVal)
+        scores[j] = wj
+        sumExp = sumExp + wj
+        j = j + 1
+    j = 0
+    while j <= pos:
+        scores[j] = scores[j] / sumExp
+        j = j + 1
+    for o in 0..<h:
+        var acc: float64 = 0.0
+        j = 0
+        while j <= pos:
+            acc = acc + scores[j] * vCache[j * h + o]
+            j = j + 1
+        attnVec[o] = acc
+    for o in 0..<h:
+        var ao: float64 = 0.0
+        for i in 0..<h:
+            ao = ao + weights.fullOProj[slotBase + o * h + i] * attnVec[i]
+        branchOut[o] = ao
+    return Ok[bool](true)
+
+# One token through the frozen mini stack. Writes the final-norm hidden
+# (pre-lmHead) into hiddenOut. Callers that need logits multiply by lmHead.
+@borrows
+fn qfwdPushHiddenCore(posInOut: var int32,
+                      stateData: var float64[], kCache: var float64[],
+                      vCache: var float64[], rawQHist: var float64[],
+                      rawKHist: var float64[], rawVHist: var float64[],
+                      weights: Qwen38MiniWeights,
+                      plan: hx.Qwen38HybridLayerPlan,
+                      token: int32,
+                      hiddenOut: var float64[]): Result[bool] =
+    let gateOk = qfwdGateChain(weights, plan)
+    if IsErr(gateOk):
+        return Err[bool](Error(gateOk))
+    if token < 0 || token >= weights.vocabSize:
+        return Err[bool]("qwen38 forward: token id range")
+    if hiddenOut.len != Qwen38MiniHidden:
+        return Err[bool]("qwen38 forward: hidden out shape")
+    if posInOut >= Qwen38MiniMaxPositions:
+        return Err[bool]("qwen38 forward: position capacity")
+    let h = Qwen38MiniHidden
+    let d = Qwen38MiniHeadDim
+    let kh = Qwen38MiniKeyHeads
+    let stateLen = weights.linearLayerCount * kh * d * d
+    let cacheLen = Qwen38MiniMaxPositions * h
+    let kW = Qwen38MiniKeyHeads * Qwen38MiniHeadDim
+    let vW = Qwen38MiniValueHeads * Qwen38MiniHeadDim
+    let histW = gdn.GatedDeltaNetConvKernel - 1
+    let qkHistLen = weights.linearLayerCount * histW * kW
+    let vHistLen = weights.linearLayerCount * histW * vW
+    if stateData.len != stateLen || kCache.len != cacheLen || vCache.len != cacheLen ||
+       rawQHist.len != qkHistLen || rawKHist.len != qkHistLen || rawVHist.len != vHistLen:
+        return Err[bool]("qwen38 forward: decode buffer shape")
+    var pos: int32 = posInOut
+    var hidden: float64[]
+    var normed: float64[]
+    var branch: float64[]
+    var finalNormed: float64[]
+    for i in 0..<h:
+        add(hidden, weights.embedding[token * h + i])
+        add(normed, 0.0)
+        add(branch, 0.0)
+        add(finalNormed, 0.0)
+    var linearSlot: int32 = 0
+    var fullSlot: int32 = 0
+    for layer in 0..<weights.layerCount:
+        let normOk = qfwdRmsNormFill(normed, hidden, weights.layerNormW,
+                                     layer * h, h, weights.rmsNormEps)
+        if IsErr(normOk):
+            return Err[bool]("qwen38 forward: layer norm")
+        for i in 0..<h:
+            branch[i] = 0.0
+        if plan.isFullAttention[layer]:
+            let attnOk = qfwdFullAttnLayer(branch, normed, kCache, vCache,
+                                           weights, fullSlot * h * h, pos)
+            if IsErr(attnOk):
+                return Err[bool](Error(attnOk))
+            fullSlot = fullSlot + 1
+        else:
+            let pRes = qfwdGdnParamsAt(weights, linearSlot)
+            if IsErr(pRes):
+                return Err[bool]("qwen38 forward: gdn params")
+            let stepOk = qfwdGdnLayerStep(branch, normed, stateData, rawQHist,
+                                          rawKHist, rawVHist, Value(pRes),
+                                          pos, linearSlot)
+            if IsErr(stepOk):
+                return Err[bool](Error(stepOk))
+            linearSlot = linearSlot + 1
+        for i in 0..<h:
+            hidden[i] = hidden[i] + branch[i]
+    let finOk = qfwdRmsNormFill(finalNormed, hidden, weights.finalNormW, 0, h,
+                                weights.rmsNormEps)
+    if IsErr(finOk):
+        return Err[bool]("qwen38 forward: final norm")
+    for i in 0..<h:
+        hiddenOut[i] = finalNormed[i]
+    posInOut = pos + 1
+    return Ok[bool](true)
+
+@borrows
+fn Qwen38MiniPushToken(posInOut: var int32,
+                       stateData: var float64[], kCache: var float64[],
+                       vCache: var float64[], rawQHist: var float64[],
+                       rawKHist: var float64[], rawVHist: var float64[],
+                       weights: Qwen38MiniWeights,
+                       plan: hx.Qwen38HybridLayerPlan,
+                       token: int32,
+                       logitsOut: var float64[]): Result[bool] =
+    if logitsOut.len != weights.vocabSize:
+        return Err[bool]("qwen38 forward: logits out shape")
+    var hiddenRow: float64[]
+    for i in 0..<Qwen38MiniHidden:
+        add(hiddenRow, 0.0)
+    let coreOk = qfwdPushHiddenCore(posInOut, stateData, kCache, vCache,
+                                    rawQHist, rawKHist, rawVHist,
+                                    weights, plan, token, hiddenRow)
+    if IsErr(coreOk):
+        return Err[bool](Error(coreOk))
+    let h = Qwen38MiniHidden
+    for v in 0..<weights.vocabSize:
+        var acc: float64 = 0.0
+        for i in 0..<h:
+            acc = acc + weights.lmHead[v * h + i] * hiddenRow[i]
+        logitsOut[v] = acc
+    return Ok[bool](true)
+
+# --- public batch surfaces ---
+
+@borrows
+fn Qwen38MiniForwardLogitsFill(out: var float64[],
+                               weights: Qwen38MiniWeights,
+                               plan: hx.Qwen38HybridLayerPlan,
+                               tokenIds: int32[]): Result[bool] =
+    let gateOk = qfwdGateChain(weights, plan)
+    if IsErr(gateOk):
+        return Err[bool](Error(gateOk))
+    if tokenIds.len <= 0:
+        return Err[bool]("qwen38 forward: empty token sequence")
+    if out.len != weights.vocabSize:
+        return Err[bool]("qwen38 forward: logits out shape")
+    var stateData: float64[]
+    var kCache: float64[]
+    var vCache: float64[]
+    var rawQHist: float64[]
+    var rawKHist: float64[]
+    var rawVHist: float64[]
+    let bufOk = Qwen38MiniDecodeBuffersInit(stateData, kCache, vCache, rawQHist,
+                                            rawKHist, rawVHist, weights)
+    if IsErr(bufOk):
+        return Err[bool](Error(bufOk))
+    var pos: int32 = 0
+    var logitBuf: float64[]
+    for i in 0..<weights.vocabSize:
+        add(logitBuf, 0.0)
+    for t in 0..<tokenIds.len:
+        let pushOk = Qwen38MiniPushToken(pos, stateData, kCache, vCache,
+                                         rawQHist, rawKHist, rawVHist,
+                                         weights, plan, tokenIds[t], logitBuf)
+        if IsErr(pushOk):
+            return Err[bool](Error(pushOk))
+    for i in 0..<weights.vocabSize:
+        out[i] = logitBuf[i]
+    return Ok[bool](true)
+
+@borrows
+fn Qwen38MiniForwardLastHiddenFill(outHidden: var float64[],
+                                   weights: Qwen38MiniWeights,
+                                   plan: hx.Qwen38HybridLayerPlan,
+                                   tokenIds: int32[]): Result[bool] =
+    let gateOk = qfwdGateChain(weights, plan)
+    if IsErr(gateOk):
+        return Err[bool](Error(gateOk))
+    if tokenIds.len <= 0:
+        return Err[bool]("qwen38 forward: empty token sequence")
+    if outHidden.len != weights.hiddenSize:
+        return Err[bool]("qwen38 forward: hidden out shape")
+    var stateData: float64[]
+    var kCache: float64[]
+    var vCache: float64[]
+    var rawQHist: float64[]
+    var rawKHist: float64[]
+    var rawVHist: float64[]
+    let bufOk = Qwen38MiniDecodeBuffersInit(stateData, kCache, vCache, rawQHist,
+                                            rawKHist, rawVHist, weights)
+    if IsErr(bufOk):
+        return Err[bool](Error(bufOk))
+    var pos: int32 = 0
+    for t in 0..<tokenIds.len:
+        let pushOk = qfwdPushHiddenCore(pos, stateData, kCache, vCache,
+                                        rawQHist, rawKHist, rawVHist,
+                                        weights, plan, tokenIds[t], outHidden)
+        if IsErr(pushOk):
+            return Err[bool](Error(pushOk))
+    return Ok[bool](true)
+
+@borrows
+fn Qwen38MiniGreedyStep(weights: Qwen38MiniWeights,
+                        plan: hx.Qwen38HybridLayerPlan,
+                        tokenIds: int32[]): Result[int32] =
+    var logits: float64[]
+    for i in 0..<weights.vocabSize:
+        add(logits, 0.0)
+    let fwdOk = Qwen38MiniForwardLogitsFill(logits, weights, plan, tokenIds)
+    if IsErr(fwdOk):
+        return Err[int32](Error(fwdOk))
+    var bestIdx: int32 = 0
+    var bestRes = gdn.GdnDecomposeF64(logits[0])
+    if IsErr(bestRes):
+        return Err[int32]("qwen38 forward greedy: non finite logit")
+    var bestBits = Value(bestRes)
+    for v in 1..<weights.vocabSize:
+        let candRes = gdn.GdnDecomposeF64(logits[v])
+        if IsErr(candRes):
+            return Err[int32]("qwen38 forward greedy: non finite logit")
+        let candBits = Value(candRes)
+        if gdn.GdnKeyAtLeast(candBits, bestBits):
+            bestIdx = v
+            bestBits = candBits
+    return Ok[int32](bestIdx)

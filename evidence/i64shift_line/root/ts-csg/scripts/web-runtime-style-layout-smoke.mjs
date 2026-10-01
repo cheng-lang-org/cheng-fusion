@@ -1,0 +1,49 @@
+import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdirSync, rmSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { chengSmokeEnv, chengStyleSmokeMaxRssBytes } from "./cheng-smoke-env.mjs";
+
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const packageDir = resolve(scriptDir, "..");
+const repoRoot = resolve(packageDir, "..");
+const tmpDir = join(packageDir, "tmp", "web-runtime-style-layout");
+const exePath = join(tmpDir, "web_runtime_style_layout_smoke");
+const reportPath = join(tmpDir, "web_runtime_style_layout_smoke.report.txt");
+const cheng = join(repoRoot, "artifacts", "backend_driver", "cheng");
+
+rmSync(tmpDir, { recursive: true, force: true });
+mkdirSync(tmpDir, { recursive: true });
+
+execFileSync(cheng, [
+  "system-link-exec",
+  `--root:${repoRoot}`,
+  "--in:src/tests/web_runtime_style_layout_smoke.cheng",
+  "--emit:exe",
+  "--target:arm64-apple-darwin",
+  `--out:${exePath}`,
+  `--report-out:${reportPath}`,
+], {
+  cwd: repoRoot,
+  env: chengSmokeEnv({
+    CHENG_PROCESS_MAX_RSS_BYTES: chengStyleSmokeMaxRssBytes,
+    PROCESS_MAX_RSS_BYTES: chengStyleSmokeMaxRssBytes,
+    CHENG_MAX_RSS_BYTES: chengStyleSmokeMaxRssBytes,
+    MAX_RSS_BYTES: chengStyleSmokeMaxRssBytes,
+  }),
+  stdio: "inherit",
+});
+
+const run = spawnSync(exePath, [], {
+  cwd: repoRoot,
+  encoding: "utf8",
+});
+
+assert.equal(run.status, 0, `web_runtime_style_layout_smoke exited with status ${run.status}, signal ${run.signal}`);
+if (run.stdout) {
+  process.stdout.write(run.stdout);
+}
+if (run.stderr) {
+  console.error(`stderr: ${run.stderr}`);
+}

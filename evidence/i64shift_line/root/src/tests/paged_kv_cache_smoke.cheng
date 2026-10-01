@@ -1,0 +1,772 @@
+import std/result
+import std/os
+import std/rawbytes
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/device as device
+import cheng/inference/paged_kv_cache as pkv
+
+fn makeTensor(shape: int32[], scale: int32, data: int32[]): infer.TensorQ =
+    var out: infer.TensorQ
+    let res = infer.TensorFromDataFill(out, shape, scale, data)
+    assert(IsOk(res), " paged kv smoke: tensor")
+    return out
+
+fn assertTensorExact(tensor: infer.TensorQ, expected: int32[], label: str) =
+    assert(tensor.data.len == expected.len, label)
+    for i in 0..<expected.len:
+        assert(tensor.data[i] == expected[i], label)
+
+fn loadTensorI32FileRange(metal: device.Device,
+                          path: str,
+                          offsetBytes: int32,
+                          tensor: infer.TensorQ): Result[device.DeviceFileRangeBufferLoadResult] =
+    if os.FileExists(path):
+        let removed = os.RemoveFile(path)
+        if !removed:
+            return Err[device.DeviceFileRangeBufferLoadResult]("paged kv smoke: remove tensor file")
+    var bytes = rawbytes.BytesAlloc(offsetBytes + tensor.data.len * 4)
+    if bytes.data == nil:
+        return Err[device.DeviceFileRangeBufferLoadResult]("paged kv smoke: tensor file allocation")
+    for i in 0..<tensor.data.len:
+        device.DeviceWriteI32LE(bytes, offsetBytes + i * 4, tensor.data[i])
+    let writeOk = os.WriteFileBytesResult(path, bytes)
+    if IsErr(writeOk):
+        return Err[device.DeviceFileRangeBufferLoadResult](Error(writeOk))
+    return device.DeviceMetalLoadFileRangeBuffer(
+        metal,
+        path,
+        int64(offsetBytes),
+        int64(tensor.data.len * 4),
+        4,
+        kir.KernelDtypeI32
+    )
+
+fn main(): int32 =
+    let cacheRes = pkv.PagedKVInit(2, 2, 2, 1000, 1000)
+    assert(IsOk(cacheRes), " paged kv smoke: init")
+    var cache = Value(cacheRes)
+    var seq = pkv.PagedKVSequenceInit(7)
+
+    let append0 = pkv.PagedKVAppendToken(cache, seq, makeTensor([2], 1000, [1000, 0]), makeTensor([2], 1000, [10, 0]))
+    assert(IsOk(append0), " paged kv smoke: append0")
+    let append1 = pkv.PagedKVAppendToken(cache, seq, makeTensor([2], 1000, [0, 1000]), makeTensor([2], 1000, [0, 20]))
+    assert(IsOk(append1), " paged kv smoke: append1")
+    let append2 = pkv.PagedKVAppendToken(cache, seq, makeTensor([2], 1000, [1000, 1000]), makeTensor([2], 1000, [30, 40]))
+    assert(IsOk(append2), " paged kv smoke: append2")
+
+    assert(seq.tokenCount == 3, " paged kv smoke: token count")
+    assert(seq.blockPageIds.len == 2, " paged kv smoke: page count")
+    assert(cache.pages.len == 2, " paged kv smoke: cache pages")
+
+    var key: infer.TensorQ
+    var value: infer.TensorQ
+    let getRes = pkv.PagedKVGetToken(cache, seq, 2, key, value)
+    assert(IsOk(getRes), " paged kv smoke: get token")
+    assert(key.data[0] == 1000 && key.data[1] == 1000, " paged kv smoke: key value")
+    assert(value.data[0] == 30 && value.data[1] == 40, " paged kv smoke: value value")
+
+    let query = makeTensor([2], 1000, [1000, 1000])
+    var attnOut: infer.TensorQ
+    let attnRes = pkv.PagedKVAttentionQueryFill(attnOut, cache, seq, query, cache.keyDim, 1)
+    assert(IsOk(attnRes), " paged kv smoke: attention oracle")
+    assertTensorExact(attnOut, [18, 25], " paged kv smoke: attention softmax value")
+
+    var inputs: pkv.PagedKVAttentionInputTensors
+    let inputRes = pkv.PagedKVBuildAttentionInputTensorsFill(inputs, cache, seq)
+    assert(IsOk(inputRes), " paged kv smoke: attention input tensors")
+    let pagedProgram = kir.KernelIrPagedAttentionProgram(
+        seq.tokenCount,
+        cache.keyDim,
+        cache.valueDim,
+        cache.tokensPerPage,
+        cache.pages.len,
+        seq.blockPageIds.len,
+        kir.KernelDtypeFp16,
+        cache.keyScale
+    )
+    assert(IsOk(kir.KernelIrValidateProgram(pagedProgram)), " paged kv smoke: paged attention kernel ir")
+    let metalRes = device.DeviceProbeMetal()
+    assert(IsOk(metalRes), " paged kv smoke: metal probe")
+    let metal = Value(metalRes)
+
+    let queryLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_query_i32.bin", 4, query)
+    assert(IsOk(queryLoad), " paged kv smoke: query file range buffer")
+    let keysLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_keys_i32.bin", 3, inputs.keysPageMajor)
+    assert(IsOk(keysLoad), " paged kv smoke: keys file range buffer")
+    let valuesLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_values_i32.bin", 5, inputs.valuesPageMajor)
+    assert(IsOk(valuesLoad), " paged kv smoke: values file range buffer")
+    let pageTableLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_table_i32.bin", 2, inputs.pageTable)
+    assert(IsOk(pageTableLoad), " paged kv smoke: page table file range buffer")
+    let devicePageTableReceipt = pkv.PagedKVBuildDevicePageTableReceipt(
+        cache,
+        seq,
+        metal,
+        Value(pageTableLoad).buffer,
+        Value(pageTableLoad).receipt
+    )
+    assert(IsOk(devicePageTableReceipt), " paged kv smoke: device page table receipt")
+    assert(Value(devicePageTableReceipt).schema == pkv.PagedKVDevicePageTableReceiptSchema &&
+           Value(devicePageTableReceipt).seqId == seq.seqId &&
+           Value(devicePageTableReceipt).tokenCount == seq.tokenCount &&
+           Value(devicePageTableReceipt).blockCount == seq.blockPageIds.len &&
+           Value(devicePageTableReceipt).pageTableHash == pkv.PagedKVPageTableHash(seq) &&
+           Value(devicePageTableReceipt).pageTableLoadReceiptHash == Value(pageTableLoad).receipt.receiptHash &&
+           Value(devicePageTableReceipt).receiptHash == pkv.PagedKVDevicePageTableReceiptHash(Value(devicePageTableReceipt)),
+           " paged kv smoke: device page table receipt facts")
+    let deviceKvBuffersReceipt = pkv.PagedKVBuildDeviceKvBuffersReceipt(
+        cache,
+        seq,
+        metal,
+        Value(keysLoad).buffer,
+        Value(keysLoad).receipt,
+        Value(valuesLoad).buffer,
+        Value(valuesLoad).receipt
+    )
+    assert(IsOk(deviceKvBuffersReceipt), " paged kv smoke: device kv buffers receipt")
+    assert(Value(deviceKvBuffersReceipt).schema == pkv.PagedKVDeviceKvBuffersReceiptSchema &&
+           Value(deviceKvBuffersReceipt).seqId == seq.seqId &&
+           Value(deviceKvBuffersReceipt).tokenCount == seq.tokenCount &&
+           Value(deviceKvBuffersReceipt).blockCount == seq.blockPageIds.len &&
+           Value(deviceKvBuffersReceipt).pageTableHash == pkv.PagedKVPageTableHash(seq) &&
+           Value(deviceKvBuffersReceipt).keysLoadReceiptHash == Value(keysLoad).receipt.receiptHash &&
+           Value(deviceKvBuffersReceipt).valuesLoadReceiptHash == Value(valuesLoad).receipt.receiptHash &&
+           Value(deviceKvBuffersReceipt).receiptHash == pkv.PagedKVDeviceKvBuffersReceiptHash(Value(deviceKvBuffersReceipt)),
+           " paged kv smoke: device kv buffers receipt facts")
+    let page0KeyTensor = pkv.PagedKVBuildPageKeyTensor(cache.pages[0], cache.tokensPerPage, cache.keyDim, cache.keyScale)
+    assert(IsOk(page0KeyTensor), " paged kv smoke: page0 key tensor")
+    let page0ValueTensor = pkv.PagedKVBuildPageValueTensor(cache.pages[0], cache.tokensPerPage, cache.valueDim, cache.valueScale)
+    assert(IsOk(page0ValueTensor), " paged kv smoke: page0 value tensor")
+    let page1KeyTensor = pkv.PagedKVBuildPageKeyTensor(cache.pages[1], cache.tokensPerPage, cache.keyDim, cache.keyScale)
+    assert(IsOk(page1KeyTensor), " paged kv smoke: page1 key tensor")
+    let page1ValueTensor = pkv.PagedKVBuildPageValueTensor(cache.pages[1], cache.tokensPerPage, cache.valueDim, cache.valueScale)
+    assert(IsOk(page1ValueTensor), " paged kv smoke: page1 value tensor")
+    let page0KeyLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_page0_key_i32.bin", 0, Value(page0KeyTensor))
+    assert(IsOk(page0KeyLoad), " paged kv smoke: page0 key file range buffer")
+    let page0ValueLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_page0_value_i32.bin", 0, Value(page0ValueTensor))
+    assert(IsOk(page0ValueLoad), " paged kv smoke: page0 value file range buffer")
+    let page1KeyLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_page1_key_i32.bin", 0, Value(page1KeyTensor))
+    assert(IsOk(page1KeyLoad), " paged kv smoke: page1 key file range buffer")
+    let page1ValueLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_page1_value_i32.bin", 0, Value(page1ValueTensor))
+    assert(IsOk(page1ValueLoad), " paged kv smoke: page1 value file range buffer")
+    var keyPageBuffers: device.DeviceBuffer[]
+    var keyPageReceipts: device.DeviceFileRangeBufferLoadReceipt[]
+    var valuePageBuffers: device.DeviceBuffer[]
+    var valuePageReceipts: device.DeviceFileRangeBufferLoadReceipt[]
+    add(keyPageBuffers, Value(page0KeyLoad).buffer)
+    add(keyPageReceipts, Value(page0KeyLoad).receipt)
+    add(valuePageBuffers, Value(page0ValueLoad).buffer)
+    add(valuePageReceipts, Value(page0ValueLoad).receipt)
+    add(keyPageBuffers, Value(page1KeyLoad).buffer)
+    add(keyPageReceipts, Value(page1KeyLoad).receipt)
+    add(valuePageBuffers, Value(page1ValueLoad).buffer)
+    add(valuePageReceipts, Value(page1ValueLoad).receipt)
+    let devicePageBuffersReceipt = pkv.PagedKVBuildDevicePageBuffersReceipt(
+        cache,
+        seq,
+        metal,
+        keyPageBuffers,
+        keyPageReceipts,
+        valuePageBuffers,
+        valuePageReceipts
+    )
+    assert(IsOk(devicePageBuffersReceipt), " paged kv smoke: device page buffers receipt")
+    assert(Value(devicePageBuffersReceipt).schema == pkv.PagedKVDevicePageBuffersReceiptSchema &&
+           Value(devicePageBuffersReceipt).seqId == seq.seqId &&
+           Value(devicePageBuffersReceipt).tokenCount == seq.tokenCount &&
+           Value(devicePageBuffersReceipt).blockCount == seq.blockPageIds.len &&
+           Value(devicePageBuffersReceipt).cachePageCount == cache.pages.len &&
+           Value(devicePageBuffersReceipt).pageReceipts.len == cache.pages.len &&
+           Value(devicePageBuffersReceipt).pageReceipts[0].keyLoadReceiptHash == Value(page0KeyLoad).receipt.receiptHash &&
+           Value(devicePageBuffersReceipt).pageReceipts[1].valueLoadReceiptHash == Value(page1ValueLoad).receipt.receiptHash &&
+           Value(devicePageBuffersReceipt).pageAggregateHash == pkv.PagedKVDevicePageBuffersAggregateHash(Value(devicePageBuffersReceipt).pageReceipts) &&
+           Value(devicePageBuffersReceipt).receiptHash == pkv.PagedKVDevicePageBuffersReceiptHash(Value(devicePageBuffersReceipt)),
+           " paged kv smoke: device page buffers receipt facts")
+    var metalResidentOut: infer.TensorQ
+    let devicePagedReceipt = pkv.PagedKVDeviceMetalPagedAttentionBuffersFill(
+        metalResidentOut,
+        cache,
+        seq,
+        Value(devicePageTableReceipt),
+        Value(deviceKvBuffersReceipt),
+        Value(devicePageBuffersReceipt),
+        metal,
+        pagedProgram,
+        Value(queryLoad).buffer,
+        Value(queryLoad).receipt,
+        Value(keysLoad).buffer,
+        Value(keysLoad).receipt,
+        Value(valuesLoad).buffer,
+        Value(valuesLoad).receipt,
+        Value(pageTableLoad).buffer,
+        Value(pageTableLoad).receipt,
+        keyPageBuffers,
+        keyPageReceipts,
+        valuePageBuffers,
+        valuePageReceipts
+    )
+    assert(IsOk(devicePagedReceipt), " paged kv smoke: receipt-gated paged attention")
+    assertTensorExact(metalResidentOut, attnOut.data, " paged kv smoke: receipt-gated paged attention value")
+    assert(Value(devicePagedReceipt).inputHash > int64(0) &&
+           Value(devicePagedReceipt).outputHash > int64(0) &&
+           Value(devicePagedReceipt).trace == "kernel_ir_facts->paged_kv_device_kv_buffers_receipt->typed_metal_paged_attention_i32",
+           " paged kv smoke: receipt-gated paged attention receipt")
+    let residentResult = pkv.PagedKVDeviceMetalPagedAttentionBuffersToBufferFill(
+        cache,
+        seq,
+        Value(devicePageTableReceipt),
+        Value(deviceKvBuffersReceipt),
+        Value(devicePageBuffersReceipt),
+        metal,
+        pagedProgram,
+        Value(queryLoad).buffer,
+        Value(queryLoad).receipt,
+        Value(keysLoad).buffer,
+        Value(keysLoad).receipt,
+        Value(valuesLoad).buffer,
+        Value(valuesLoad).receipt,
+        Value(pageTableLoad).buffer,
+        Value(pageTableLoad).receipt,
+        keyPageBuffers,
+        keyPageReceipts,
+        valuePageBuffers,
+        valuePageReceipts
+    )
+    assert(IsOk(residentResult), " paged kv smoke: receipt-gated resident output")
+    assertTensorExact(Value(residentResult).output, attnOut.data, " paged kv smoke: receipt-gated resident output value")
+    assert(Value(residentResult).buffer.handle != uint64(0) &&
+           Value(residentResult).receipt.inputHash == Value(devicePagedReceipt).inputHash &&
+           Value(residentResult).receipt.outputHash == Value(devicePagedReceipt).outputHash,
+           " paged kv smoke: receipt-gated resident output receipt")
+    var nativePageOut: infer.TensorQ
+    let nativePageReceipt = pkv.PagedKVDeviceMetalPagedAttentionPageBuffersFill(
+        nativePageOut,
+        cache,
+        seq,
+        Value(devicePageTableReceipt),
+        Value(devicePageBuffersReceipt),
+        metal,
+        pagedProgram,
+        Value(queryLoad).buffer,
+        Value(queryLoad).receipt,
+        Value(pageTableLoad).buffer,
+        Value(pageTableLoad).receipt,
+        keyPageBuffers,
+        keyPageReceipts,
+        valuePageBuffers,
+        valuePageReceipts
+    )
+    assert(IsOk(nativePageReceipt), " paged kv smoke: native page-buffer paged attention")
+    assertTensorExact(nativePageOut, attnOut.data, " paged kv smoke: native page-buffer paged attention value")
+    assert(Value(nativePageReceipt).outputHash == Value(devicePagedReceipt).outputHash &&
+           Value(nativePageReceipt).trace == "kernel_ir_facts->paged_kv_device_page_buffers_receipt->native_page_buffers_typed_metal_paged_attention_i32",
+           " paged kv smoke: native page-buffer paged attention receipt")
+    let nativePageResident = pkv.PagedKVDeviceMetalPagedAttentionPageBuffersToBufferFill(
+        cache,
+        seq,
+        Value(devicePageTableReceipt),
+        Value(devicePageBuffersReceipt),
+        metal,
+        pagedProgram,
+        Value(queryLoad).buffer,
+        Value(queryLoad).receipt,
+        Value(pageTableLoad).buffer,
+        Value(pageTableLoad).receipt,
+        keyPageBuffers,
+        keyPageReceipts,
+        valuePageBuffers,
+        valuePageReceipts
+    )
+    assert(IsOk(nativePageResident), " paged kv smoke: native page-buffer resident output")
+    assertTensorExact(Value(nativePageResident).output, attnOut.data, " paged kv smoke: native page-buffer resident output value")
+    assert(Value(nativePageResident).buffer.handle != uint64(0) &&
+           Value(nativePageResident).receipt.inputHash == Value(nativePageReceipt).inputHash &&
+           Value(nativePageResident).receipt.outputHash == Value(nativePageReceipt).outputHash,
+           " paged kv smoke: native page-buffer resident output receipt")
+    var tensorKeyPages: infer.TensorQ[]
+    var tensorValuePages: infer.TensorQ[]
+    add(tensorKeyPages, Value(page0KeyTensor))
+    add(tensorValuePages, Value(page0ValueTensor))
+    add(tensorKeyPages, Value(page1KeyTensor))
+    add(tensorValuePages, Value(page1ValueTensor))
+    let tensorPageResident = pkv.PagedKVDeviceMetalPagedAttentionTensorPageBuffersToBufferFill(
+        cache,
+        seq,
+        metal,
+        pagedProgram,
+        query,
+        tensorKeyPages,
+        tensorValuePages,
+        inputs.pageTable,
+        0
+    )
+    assert(IsOk(tensorPageResident), " paged kv smoke: tensor page-buffer resident output")
+    assertTensorExact(Value(tensorPageResident).output, attnOut.data,
+        " paged kv smoke: tensor page-buffer resident output value")
+    assert(Value(tensorPageResident).buffer.handle != uint64(0) &&
+           Value(tensorPageResident).receipt.outputHash == Value(nativePageReceipt).outputHash &&
+           Value(tensorPageResident).receipt.trace == "kernel_ir_facts->paged_kv_tensor_page_buffers_receipt->resident_output_buffer",
+           " paged kv smoke: tensor page-buffer resident output receipt")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(tensorPageResident).buffer)),
+           " paged kv smoke: tensor page-buffer resident output release")
+    var badDevicePageTableReceipt = Value(devicePageTableReceipt)
+    badDevicePageTableReceipt.pageTableHash = badDevicePageTableReceipt.pageTableHash + int64(1)
+    badDevicePageTableReceipt.receiptHash = pkv.PagedKVDevicePageTableReceiptHash(badDevicePageTableReceipt)
+    assert(IsErr(pkv.PagedKVDeviceMetalPagedAttentionBuffersToBufferFill(
+        cache,
+        seq,
+        badDevicePageTableReceipt,
+        Value(deviceKvBuffersReceipt),
+        Value(devicePageBuffersReceipt),
+        metal,
+        pagedProgram,
+        Value(queryLoad).buffer,
+        Value(queryLoad).receipt,
+        Value(keysLoad).buffer,
+        Value(keysLoad).receipt,
+        Value(valuesLoad).buffer,
+        Value(valuesLoad).receipt,
+        Value(pageTableLoad).buffer,
+        Value(pageTableLoad).receipt,
+        keyPageBuffers,
+        keyPageReceipts,
+        valuePageBuffers,
+        valuePageReceipts
+    )), " paged kv smoke: device page table receipt drift hard fail")
+    var badKvBuffersReceipt = Value(deviceKvBuffersReceipt)
+    badKvBuffersReceipt.keysDataHash = badKvBuffersReceipt.keysDataHash + int64(1)
+    badKvBuffersReceipt.receiptHash = pkv.PagedKVDeviceKvBuffersReceiptHash(badKvBuffersReceipt)
+    assert(IsErr(pkv.PagedKVDeviceMetalPagedAttentionBuffersToBufferFill(
+        cache,
+        seq,
+        Value(devicePageTableReceipt),
+        badKvBuffersReceipt,
+        Value(devicePageBuffersReceipt),
+        metal,
+        pagedProgram,
+        Value(queryLoad).buffer,
+        Value(queryLoad).receipt,
+        Value(keysLoad).buffer,
+        Value(keysLoad).receipt,
+        Value(valuesLoad).buffer,
+        Value(valuesLoad).receipt,
+        Value(pageTableLoad).buffer,
+        Value(pageTableLoad).receipt,
+        keyPageBuffers,
+        keyPageReceipts,
+        valuePageBuffers,
+        valuePageReceipts
+    )), " paged kv smoke: device kv buffers receipt drift hard fail")
+    var badPageBuffersReceipt = Value(devicePageBuffersReceipt)
+    badPageBuffersReceipt.pageAggregateHash = badPageBuffersReceipt.pageAggregateHash + int64(1)
+    badPageBuffersReceipt.receiptHash = pkv.PagedKVDevicePageBuffersReceiptHash(badPageBuffersReceipt)
+    assert(IsErr(pkv.PagedKVDeviceMetalPagedAttentionBuffersToBufferFill(
+        cache,
+        seq,
+        Value(devicePageTableReceipt),
+        Value(deviceKvBuffersReceipt),
+        badPageBuffersReceipt,
+        metal,
+        pagedProgram,
+        Value(queryLoad).buffer,
+        Value(queryLoad).receipt,
+        Value(keysLoad).buffer,
+        Value(keysLoad).receipt,
+        Value(valuesLoad).buffer,
+        Value(valuesLoad).receipt,
+        Value(pageTableLoad).buffer,
+        Value(pageTableLoad).receipt,
+        keyPageBuffers,
+        keyPageReceipts,
+        valuePageBuffers,
+        valuePageReceipts
+    )), " paged kv smoke: device page buffers receipt drift hard fail")
+    assert(IsErr(pkv.PagedKVDeviceMetalPagedAttentionPageBuffersToBufferFill(
+        cache,
+        seq,
+        Value(devicePageTableReceipt),
+        badPageBuffersReceipt,
+        metal,
+        pagedProgram,
+        Value(queryLoad).buffer,
+        Value(queryLoad).receipt,
+        Value(pageTableLoad).buffer,
+        Value(pageTableLoad).receipt,
+        keyPageBuffers,
+        keyPageReceipts,
+        valuePageBuffers,
+        valuePageReceipts
+    )), " paged kv smoke: native page buffers receipt drift hard fail")
+
+    let wideCacheRes = pkv.PagedKVInit(1, 2, 2, 1000, 1000)
+    assert(IsOk(wideCacheRes), " paged kv smoke: wide init")
+    var wideCache = Value(wideCacheRes)
+    var wideSeq = pkv.PagedKVSequenceInit(17)
+    assert(IsOk(pkv.PagedKVAppendToken(wideCache, wideSeq, makeTensor([2], 1000, [1000, 0]), makeTensor([2], 1000, [10, 11]))),
+           " paged kv smoke: wide append0")
+    assert(IsOk(pkv.PagedKVAppendToken(wideCache, wideSeq, makeTensor([2], 1000, [0, 1000]), makeTensor([2], 1000, [20, 21]))),
+           " paged kv smoke: wide append1")
+    assert(IsOk(pkv.PagedKVAppendToken(wideCache, wideSeq, makeTensor([2], 1000, [1000, 1000]), makeTensor([2], 1000, [30, 31]))),
+           " paged kv smoke: wide append2")
+    assert(IsOk(pkv.PagedKVAppendToken(wideCache, wideSeq, makeTensor([2], 1000, [2000, 0]), makeTensor([2], 1000, [40, 41]))),
+           " paged kv smoke: wide append3")
+    assert(IsOk(pkv.PagedKVAppendToken(wideCache, wideSeq, makeTensor([2], 1000, [3000, 0]), makeTensor([2], 1000, [90, 91]))),
+           " paged kv smoke: wide append4")
+    assert(wideSeq.tokenCount == 5 &&
+           wideSeq.blockPageIds.len == 5 &&
+           wideCache.pages.len == 5,
+           " paged kv smoke: wide pages")
+    let wideQuery = makeTensor([2], 1000, [1000, 1000])
+    var wideOracle: infer.TensorQ
+    assert(IsOk(pkv.PagedKVAttentionQueryFill(wideOracle, wideCache, wideSeq, wideQuery, wideCache.keyDim, 1)),
+           " paged kv smoke: wide oracle")
+    assertTensorExact(wideOracle, [53, 54], " paged kv smoke: wide oracle softmax value")
+    var wideInputs: pkv.PagedKVAttentionInputTensors
+    assert(IsOk(pkv.PagedKVBuildAttentionInputTensorsFill(wideInputs, wideCache, wideSeq)),
+           " paged kv smoke: wide input tensors")
+    let widePagedProgram = kir.KernelIrPagedAttentionProgram(
+        wideSeq.tokenCount,
+        wideCache.keyDim,
+        wideCache.valueDim,
+        wideCache.tokensPerPage,
+        wideCache.pages.len,
+        wideSeq.blockPageIds.len,
+        kir.KernelDtypeFp16,
+        wideCache.keyScale
+    )
+    assert(IsOk(kir.KernelIrValidateProgram(widePagedProgram)),
+           " paged kv smoke: wide paged attention kernel ir")
+    let wideQueryLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_wide_query_i32.bin", 0, wideQuery)
+    assert(IsOk(wideQueryLoad), " paged kv smoke: wide query file range buffer")
+    let widePageTableLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_wide_table_i32.bin", 0, wideInputs.pageTable)
+    assert(IsOk(widePageTableLoad), " paged kv smoke: wide page table file range buffer")
+    let wideDevicePageTableReceipt = pkv.PagedKVBuildDevicePageTableReceipt(
+        wideCache,
+        wideSeq,
+        metal,
+        Value(widePageTableLoad).buffer,
+        Value(widePageTableLoad).receipt
+    )
+    assert(IsOk(wideDevicePageTableReceipt), " paged kv smoke: wide device page table receipt")
+    var wideKeyPageBuffers: device.DeviceBuffer[]
+    var wideKeyPageReceipts: device.DeviceFileRangeBufferLoadReceipt[]
+    var wideValuePageBuffers: device.DeviceBuffer[]
+    var wideValuePageReceipts: device.DeviceFileRangeBufferLoadReceipt[]
+    for pageOrdinal in 0..<wideCache.pages.len:
+        let widePageKeyTensor = pkv.PagedKVBuildPageKeyTensor(wideCache.pages[pageOrdinal], wideCache.tokensPerPage, wideCache.keyDim, wideCache.keyScale)
+        assert(IsOk(widePageKeyTensor), " paged kv smoke: wide page key tensor")
+        let widePageValueTensor = pkv.PagedKVBuildPageValueTensor(wideCache.pages[pageOrdinal], wideCache.tokensPerPage, wideCache.valueDim, wideCache.valueScale)
+        assert(IsOk(widePageValueTensor), " paged kv smoke: wide page value tensor")
+        let widePageKeyLoad = loadTensorI32FileRange(metal, Fmt"/tmp/cheng_paged_kv_wide_page{pageOrdinal}_key_i32.bin", 0, Value(widePageKeyTensor))
+        assert(IsOk(widePageKeyLoad), " paged kv smoke: wide page key file range buffer")
+        let widePageValueLoad = loadTensorI32FileRange(metal, Fmt"/tmp/cheng_paged_kv_wide_page{pageOrdinal}_value_i32.bin", 0, Value(widePageValueTensor))
+        assert(IsOk(widePageValueLoad), " paged kv smoke: wide page value file range buffer")
+        add(wideKeyPageBuffers, Value(widePageKeyLoad).buffer)
+        add(wideKeyPageReceipts, Value(widePageKeyLoad).receipt)
+        add(wideValuePageBuffers, Value(widePageValueLoad).buffer)
+        add(wideValuePageReceipts, Value(widePageValueLoad).receipt)
+    let wideDevicePageBuffersReceipt = pkv.PagedKVBuildDevicePageBuffersReceipt(
+        wideCache,
+        wideSeq,
+        metal,
+        wideKeyPageBuffers,
+        wideKeyPageReceipts,
+        wideValuePageBuffers,
+        wideValuePageReceipts
+    )
+    assert(IsOk(wideDevicePageBuffersReceipt), " paged kv smoke: wide device page buffers receipt")
+    var wideNativeOut: infer.TensorQ
+    let wideNativeReceipt = pkv.PagedKVDeviceMetalPagedAttentionPageBuffersFill(
+        wideNativeOut,
+        wideCache,
+        wideSeq,
+        Value(wideDevicePageTableReceipt),
+        Value(wideDevicePageBuffersReceipt),
+        metal,
+        widePagedProgram,
+        Value(wideQueryLoad).buffer,
+        Value(wideQueryLoad).receipt,
+        Value(widePageTableLoad).buffer,
+        Value(widePageTableLoad).receipt,
+        wideKeyPageBuffers,
+        wideKeyPageReceipts,
+        wideValuePageBuffers,
+        wideValuePageReceipts
+    )
+    assert(IsOk(wideNativeReceipt), " paged kv smoke: wide native page buffers")
+    assertTensorExact(wideNativeOut, wideOracle.data, " paged kv smoke: wide native page buffers value")
+    let wideNativeResident = pkv.PagedKVDeviceMetalPagedAttentionPageBuffersToBufferFill(
+        wideCache,
+        wideSeq,
+        Value(wideDevicePageTableReceipt),
+        Value(wideDevicePageBuffersReceipt),
+        metal,
+        widePagedProgram,
+        Value(wideQueryLoad).buffer,
+        Value(wideQueryLoad).receipt,
+        Value(widePageTableLoad).buffer,
+        Value(widePageTableLoad).receipt,
+        wideKeyPageBuffers,
+        wideKeyPageReceipts,
+        wideValuePageBuffers,
+        wideValuePageReceipts
+    )
+    assert(IsOk(wideNativeResident), " paged kv smoke: wide native resident page buffers")
+    assertTensorExact(Value(wideNativeResident).output, wideOracle.data, " paged kv smoke: wide native resident value")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(wideNativeResident).buffer)),
+           " paged kv smoke: wide native resident output release")
+    for i in 0..<wideKeyPageBuffers.len:
+        assert(IsOk(device.DeviceMetalReleaseBuffer(wideValuePageBuffers[i])),
+               " paged kv smoke: wide value page buffer release")
+        assert(IsOk(device.DeviceMetalReleaseBuffer(wideKeyPageBuffers[i])),
+               " paged kv smoke: wide key page buffer release")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(widePageTableLoad).buffer)),
+           " paged kv smoke: wide page table buffer release")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(wideQueryLoad).buffer)),
+           " paged kv smoke: wide query buffer release")
+
+    # #155-wide second shape: 7 pages -> two windows (4 + 3, asymmetric vs
+    # the 5-page fixture's 4 + 1), deliberately constructed so the GLOBAL
+    # max-scoring token sits in the *second* window (score 2121, tokens 4
+    # and 6) while the first window (scores 707/707/1414/1414) still
+    # contributes non-negligible softmax weight -- the old per-window
+    # hardmax-style merge would have returned window 1's local softmax
+    # alone ([600, 601], hand-verified independently), which is why this
+    # shape is a genuine cross-window discriminator, not a restatement of
+    # the 5-page case.
+    let wide7CacheRes = pkv.PagedKVInit(1, 2, 2, 1000, 1000)
+    assert(IsOk(wide7CacheRes), " paged kv smoke: wide7 init")
+    var wide7Cache = Value(wide7CacheRes)
+    var wide7Seq = pkv.PagedKVSequenceInit(19)
+    assert(IsOk(pkv.PagedKVAppendToken(wide7Cache, wide7Seq, makeTensor([2], 1000, [1000, 0]), makeTensor([2], 1000, [100, 101]))),
+           " paged kv smoke: wide7 append0")
+    assert(IsOk(pkv.PagedKVAppendToken(wide7Cache, wide7Seq, makeTensor([2], 1000, [0, 1000]), makeTensor([2], 1000, [200, 201]))),
+           " paged kv smoke: wide7 append1")
+    assert(IsOk(pkv.PagedKVAppendToken(wide7Cache, wide7Seq, makeTensor([2], 1000, [1000, 1000]), makeTensor([2], 1000, [300, 301]))),
+           " paged kv smoke: wide7 append2")
+    assert(IsOk(pkv.PagedKVAppendToken(wide7Cache, wide7Seq, makeTensor([2], 1000, [2000, 0]), makeTensor([2], 1000, [400, 401]))),
+           " paged kv smoke: wide7 append3")
+    assert(IsOk(pkv.PagedKVAppendToken(wide7Cache, wide7Seq, makeTensor([2], 1000, [3000, 0]), makeTensor([2], 1000, [500, 501]))),
+           " paged kv smoke: wide7 append4")
+    assert(IsOk(pkv.PagedKVAppendToken(wide7Cache, wide7Seq, makeTensor([2], 1000, [500, 500]), makeTensor([2], 1000, [600, 601]))),
+           " paged kv smoke: wide7 append5")
+    assert(IsOk(pkv.PagedKVAppendToken(wide7Cache, wide7Seq, makeTensor([2], 1000, [1500, 1500]), makeTensor([2], 1000, [700, 701]))),
+           " paged kv smoke: wide7 append6")
+    assert(wide7Seq.tokenCount == 7 &&
+           wide7Seq.blockPageIds.len == 7 &&
+           wide7Cache.pages.len == 7,
+           " paged kv smoke: wide7 pages")
+    let wide7Query = makeTensor([2], 1000, [1000, 1000])
+    var wide7Oracle: infer.TensorQ
+    assert(IsOk(pkv.PagedKVAttentionQueryFill(wide7Oracle, wide7Cache, wide7Seq, wide7Query, wide7Cache.keyDim, 1)),
+           " paged kv smoke: wide7 oracle")
+    assertTensorExact(wide7Oracle, [475, 476], " paged kv smoke: wide7 oracle softmax value")
+    var wide7Inputs: pkv.PagedKVAttentionInputTensors
+    assert(IsOk(pkv.PagedKVBuildAttentionInputTensorsFill(wide7Inputs, wide7Cache, wide7Seq)),
+           " paged kv smoke: wide7 input tensors")
+    let wide7PagedProgram = kir.KernelIrPagedAttentionProgram(
+        wide7Seq.tokenCount,
+        wide7Cache.keyDim,
+        wide7Cache.valueDim,
+        wide7Cache.tokensPerPage,
+        wide7Cache.pages.len,
+        wide7Seq.blockPageIds.len,
+        kir.KernelDtypeFp16,
+        wide7Cache.keyScale
+    )
+    assert(IsOk(kir.KernelIrValidateProgram(wide7PagedProgram)),
+           " paged kv smoke: wide7 paged attention kernel ir")
+    let wide7QueryLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_wide7_query_i32.bin", 0, wide7Query)
+    assert(IsOk(wide7QueryLoad), " paged kv smoke: wide7 query file range buffer")
+    let wide7PageTableLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_wide7_table_i32.bin", 0, wide7Inputs.pageTable)
+    assert(IsOk(wide7PageTableLoad), " paged kv smoke: wide7 page table file range buffer")
+    let wide7DevicePageTableReceipt = pkv.PagedKVBuildDevicePageTableReceipt(
+        wide7Cache,
+        wide7Seq,
+        metal,
+        Value(wide7PageTableLoad).buffer,
+        Value(wide7PageTableLoad).receipt
+    )
+    assert(IsOk(wide7DevicePageTableReceipt), " paged kv smoke: wide7 device page table receipt")
+    var wide7KeyPageBuffers: device.DeviceBuffer[]
+    var wide7KeyPageReceipts: device.DeviceFileRangeBufferLoadReceipt[]
+    var wide7ValuePageBuffers: device.DeviceBuffer[]
+    var wide7ValuePageReceipts: device.DeviceFileRangeBufferLoadReceipt[]
+    for pageOrdinal in 0..<wide7Cache.pages.len:
+        let wide7PageKeyTensor = pkv.PagedKVBuildPageKeyTensor(wide7Cache.pages[pageOrdinal], wide7Cache.tokensPerPage, wide7Cache.keyDim, wide7Cache.keyScale)
+        assert(IsOk(wide7PageKeyTensor), " paged kv smoke: wide7 page key tensor")
+        let wide7PageValueTensor = pkv.PagedKVBuildPageValueTensor(wide7Cache.pages[pageOrdinal], wide7Cache.tokensPerPage, wide7Cache.valueDim, wide7Cache.valueScale)
+        assert(IsOk(wide7PageValueTensor), " paged kv smoke: wide7 page value tensor")
+        let wide7PageKeyLoad = loadTensorI32FileRange(metal, Fmt"/tmp/cheng_paged_kv_wide7_page{pageOrdinal}_key_i32.bin", 0, Value(wide7PageKeyTensor))
+        assert(IsOk(wide7PageKeyLoad), " paged kv smoke: wide7 page key file range buffer")
+        let wide7PageValueLoad = loadTensorI32FileRange(metal, Fmt"/tmp/cheng_paged_kv_wide7_page{pageOrdinal}_value_i32.bin", 0, Value(wide7PageValueTensor))
+        assert(IsOk(wide7PageValueLoad), " paged kv smoke: wide7 page value file range buffer")
+        add(wide7KeyPageBuffers, Value(wide7PageKeyLoad).buffer)
+        add(wide7KeyPageReceipts, Value(wide7PageKeyLoad).receipt)
+        add(wide7ValuePageBuffers, Value(wide7PageValueLoad).buffer)
+        add(wide7ValuePageReceipts, Value(wide7PageValueLoad).receipt)
+    let wide7DevicePageBuffersReceipt = pkv.PagedKVBuildDevicePageBuffersReceipt(
+        wide7Cache,
+        wide7Seq,
+        metal,
+        wide7KeyPageBuffers,
+        wide7KeyPageReceipts,
+        wide7ValuePageBuffers,
+        wide7ValuePageReceipts
+    )
+    assert(IsOk(wide7DevicePageBuffersReceipt), " paged kv smoke: wide7 device page buffers receipt")
+    var wide7NativeOut: infer.TensorQ
+    let wide7NativeReceipt = pkv.PagedKVDeviceMetalPagedAttentionPageBuffersFill(
+        wide7NativeOut,
+        wide7Cache,
+        wide7Seq,
+        Value(wide7DevicePageTableReceipt),
+        Value(wide7DevicePageBuffersReceipt),
+        metal,
+        wide7PagedProgram,
+        Value(wide7QueryLoad).buffer,
+        Value(wide7QueryLoad).receipt,
+        Value(wide7PageTableLoad).buffer,
+        Value(wide7PageTableLoad).receipt,
+        wide7KeyPageBuffers,
+        wide7KeyPageReceipts,
+        wide7ValuePageBuffers,
+        wide7ValuePageReceipts
+    )
+    assert(IsOk(wide7NativeReceipt), " paged kv smoke: wide7 native page buffers")
+    assertTensorExact(wide7NativeOut, wide7Oracle.data, " paged kv smoke: wide7 native page buffers value")
+    let wide7NativeResident = pkv.PagedKVDeviceMetalPagedAttentionPageBuffersToBufferFill(
+        wide7Cache,
+        wide7Seq,
+        Value(wide7DevicePageTableReceipt),
+        Value(wide7DevicePageBuffersReceipt),
+        metal,
+        wide7PagedProgram,
+        Value(wide7QueryLoad).buffer,
+        Value(wide7QueryLoad).receipt,
+        Value(wide7PageTableLoad).buffer,
+        Value(wide7PageTableLoad).receipt,
+        wide7KeyPageBuffers,
+        wide7KeyPageReceipts,
+        wide7ValuePageBuffers,
+        wide7ValuePageReceipts
+    )
+    assert(IsOk(wide7NativeResident), " paged kv smoke: wide7 native resident page buffers")
+    assertTensorExact(Value(wide7NativeResident).output, wide7Oracle.data, " paged kv smoke: wide7 native resident value")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(wide7NativeResident).buffer)),
+           " paged kv smoke: wide7 native resident output release")
+    for i in 0..<wide7KeyPageBuffers.len:
+        assert(IsOk(device.DeviceMetalReleaseBuffer(wide7ValuePageBuffers[i])),
+               " paged kv smoke: wide7 value page buffer release")
+        assert(IsOk(device.DeviceMetalReleaseBuffer(wide7KeyPageBuffers[i])),
+               " paged kv smoke: wide7 key page buffer release")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(wide7PageTableLoad).buffer)),
+           " paged kv smoke: wide7 page table buffer release")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(wide7QueryLoad).buffer)),
+           " paged kv smoke: wide7 query buffer release")
+
+    var badPageKeyTensor = Value(page0KeyTensor)
+    badPageKeyTensor.data[0] = badPageKeyTensor.data[0] + 1
+    let badPageKeyLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_bad_page0_key_i32.bin", 0, badPageKeyTensor)
+    assert(IsOk(badPageKeyLoad), " paged kv smoke: bad page key file range buffer")
+    var badKeyPageBuffers: device.DeviceBuffer[]
+    var badKeyPageReceipts: device.DeviceFileRangeBufferLoadReceipt[]
+    for i in 0..<keyPageBuffers.len:
+        add(badKeyPageBuffers, keyPageBuffers[i])
+        add(badKeyPageReceipts, keyPageReceipts[i])
+    badKeyPageBuffers[0] = Value(badPageKeyLoad).buffer
+    badKeyPageReceipts[0] = Value(badPageKeyLoad).receipt
+    assert(IsErr(pkv.PagedKVBuildDevicePageBuffersReceipt(
+        cache,
+        seq,
+        metal,
+        badKeyPageBuffers,
+        badKeyPageReceipts,
+        valuePageBuffers,
+        valuePageReceipts
+    )), " paged kv smoke: bad page key content hard fail")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(badPageKeyLoad).buffer)),
+           " paged kv smoke: bad page key buffer release")
+    var badKeysTensor = inputs.keysPageMajor
+    badKeysTensor.data[0] = badKeysTensor.data[0] + 1
+    let badKeysLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_bad_keys_i32.bin", 1, badKeysTensor)
+    assert(IsOk(badKeysLoad), " paged kv smoke: bad keys file range buffer")
+    assert(IsErr(pkv.PagedKVBuildDeviceKvBuffersReceipt(
+        cache,
+        seq,
+        metal,
+        Value(badKeysLoad).buffer,
+        Value(badKeysLoad).receipt,
+        Value(valuesLoad).buffer,
+        Value(valuesLoad).receipt
+    )), " paged kv smoke: bad keys content hard fail")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(badKeysLoad).buffer)),
+           " paged kv smoke: bad keys buffer release")
+    var swappedSeq = pkv.PagedKVSequenceInit(seq.seqId)
+    swappedSeq.blockPageIds = [seq.blockPageIds[1], seq.blockPageIds[0]]
+    swappedSeq.tokenCount = seq.tokenCount
+    assert(IsErr(pkv.PagedKVBuildDevicePageTableReceipt(
+        cache,
+        swappedSeq,
+        metal,
+        Value(pageTableLoad).buffer,
+        Value(pageTableLoad).receipt
+    )), " paged kv smoke: swapped sequence page table hard fail")
+    var badTable = inputs.pageTable
+    badTable.data[0] = 99
+    let badPageTableLoad = loadTensorI32FileRange(metal, "/tmp/cheng_paged_kv_bad_table_i32.bin", 2, badTable)
+    assert(IsOk(badPageTableLoad), " paged kv smoke: bad page table file range buffer")
+    assert(IsErr(pkv.PagedKVBuildDevicePageTableReceipt(
+        cache,
+        seq,
+        metal,
+        Value(badPageTableLoad).buffer,
+        Value(badPageTableLoad).receipt
+    )), " paged kv smoke: bad page table must fail")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(badPageTableLoad).buffer)),
+           " paged kv smoke: bad page table buffer release")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(nativePageResident).buffer)),
+           " paged kv smoke: native page-buffer resident output release")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(residentResult).buffer)),
+           " paged kv smoke: resident output release")
+    for i in 0..<keyPageBuffers.len:
+        assert(IsOk(device.DeviceMetalReleaseBuffer(valuePageBuffers[i])),
+               " paged kv smoke: value page buffer release")
+        assert(IsOk(device.DeviceMetalReleaseBuffer(keyPageBuffers[i])),
+               " paged kv smoke: key page buffer release")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(pageTableLoad).buffer)),
+           " paged kv smoke: page table buffer release")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(valuesLoad).buffer)),
+           " paged kv smoke: values buffer release")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(keysLoad).buffer)),
+           " paged kv smoke: keys buffer release")
+    assert(IsOk(device.DeviceMetalReleaseBuffer(Value(queryLoad).buffer)),
+           " paged kv smoke: query buffer release")
+
+    var missingSeq = pkv.PagedKVSequenceInit(7)
+    missingSeq.blockPageIds = [999, seq.blockPageIds[1]]
+    missingSeq.tokenCount = seq.tokenCount
+    let missingRes = pkv.PagedKVAttentionQueryFill(attnOut, cache, missingSeq, query, cache.keyDim, 1)
+    assert(IsErr(missingRes), " paged kv smoke: missing page must fail")
+
+    var crossSeq = pkv.PagedKVSequenceInit(8)
+    crossSeq.blockPageIds = [seq.blockPageIds[0]]
+    crossSeq.tokenCount = 1
+    let crossRes = pkv.PagedKVAttentionQueryFill(attnOut, cache, crossSeq, query, cache.keyDim, 1)
+    assert(IsErr(crossRes), " paged kv smoke: cross sequence page must fail")
+
+    let badGet = pkv.PagedKVGetToken(cache, seq, 3, key, value)
+    assert(IsErr(badGet), " paged kv smoke: out of range must fail")
+
+    let receiptBefore = pkv.PagedKVReceiptFor(seq)
+    assert(receiptBefore.pageCount == 2, " paged kv smoke: receipt pages")
+    assert(receiptBefore.pageTableHash == pkv.PagedKVPageTableHash(seq), " paged kv smoke: receipt hash")
+
+    let evictRes = pkv.PagedKVEvictLastPage(cache, seq)
+    assert(IsOk(evictRes), " paged kv smoke: evict")
+    assert(seq.tokenCount == 2, " paged kv smoke: evict token count")
+    assert(seq.blockPageIds.len == 1, " paged kv smoke: evict page table")
+    assert(cache.pages.len == 1, " paged kv smoke: evict cache pages")
+
+    echo(" paged_kv_cache_smoke ok")
+    return 0

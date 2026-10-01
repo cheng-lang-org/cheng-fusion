@@ -1,0 +1,1496 @@
+#!/usr/bin/env python3
+"""Exclusive evidence producer/validator for the current backend2 driver."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import pathlib
+import re
+import stat
+import struct
+import sys
+
+
+FAIL_RC = 97
+SHA_RE = re.compile(r"[0-9a-f]{64}")
+KEY_RE = re.compile(r"[a-z0-9_.-]+")
+EXECUTION_INPUT_ROLES = ("command", "monitor_runtime", "monitor_python")
+EXECUTION_OUTPUT_ROLES = (
+    "report",
+    "stdout",
+    "stderr",
+    "resource_trace",
+    "phase_trace",
+)
+EXECUTION_REQUIRED_OUTPUT_ROLES = ("report", "stdout", "stderr")
+PHYSICAL_IDENTITY_FIELDS = (
+    "device",
+    "inode",
+    "mode",
+    "nlink",
+    "uid",
+    "gid",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+)
+
+
+class EvidenceError(Exception):
+    pass
+
+
+def fail(message: str) -> None:
+    raise EvidenceError(message)
+
+
+def frame(raw: bytes) -> bytes:
+    return struct.pack(">I", len(raw)) + raw
+
+
+def identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def stable_read(path: pathlib.Path, label: str, executable: bool = False) -> tuple[bytes, os.stat_result]:
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        fail(f"{label}_missing:{path}:{exc}")
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_nlink != 1
+        or (executable and before.st_mode & 0o111 == 0)
+    ):
+        fail(f"{label}_identity_invalid:{path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"{label}_open_failed:{path}:{exc}")
+    try:
+        opened = os.fstat(descriptor)
+        if identity(opened) != identity(before):
+            fail(f"{label}_open_race:{path}")
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            chunks.append(chunk)
+        closed = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        after = path.lstat()
+    except OSError as exc:
+        fail(f"{label}_removed_during_read:{path}:{exc}")
+    if identity(before) != identity(closed) or identity(before) != identity(after):
+        fail(f"{label}_read_race:{path}")
+    raw = b"".join(chunks)
+    if len(raw) != before.st_size or hashlib.sha256(raw).digest() != digest.digest():
+        fail(f"{label}_short_read:{path}")
+    return raw, before
+
+
+def exclusive_write(path: pathlib.Path, payload: bytes, mode: int = 0o400) -> None:
+    if not path.is_absolute():
+        fail(f"output_not_absolute:{path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, mode)
+    except OSError as exc:
+        fail(f"exclusive_output_create_failed:{path}:{exc}")
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                fail(f"output_short_write:{path}")
+            view = view[written:]
+        os.fsync(descriptor)
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or current.st_size != len(payload)
+        ):
+            fail(f"output_identity_invalid:{path}")
+    finally:
+        os.close(descriptor)
+    directory_descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def parse_rows(raw: bytes, label: str) -> tuple[dict[str, str], list[str]]:
+    if not raw or not raw.endswith(b"\n") or b"\0" in raw or b"\r" in raw:
+        fail(f"{label}_encoding_invalid")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"{label}_utf8_invalid:{exc}")
+    rows: dict[str, str] = {}
+    lines = text.splitlines()
+    for line in lines:
+        if "=" not in line:
+            fail(f"{label}_row_invalid")
+        key, value = line.split("=", 1)
+        if not KEY_RE.fullmatch(key) or key in rows:
+            fail(f"{label}_key_invalid_or_duplicate:{key}")
+        rows[key] = value
+    return rows, lines
+
+
+def canonical_uint(value: str, label: str) -> int:
+    if not re.fullmatch(r"0|[1-9][0-9]*", value):
+        fail(f"{label}_uint_invalid")
+    return int(value)
+
+
+def canonical_sha(value: str, label: str) -> str:
+    if not SHA_RE.fullmatch(value):
+        fail(f"{label}_sha_invalid")
+    return value
+
+
+def canonical_octal(value: str, label: str) -> int:
+    if not re.fullmatch(r"[1-7][0-7]*", value):
+        fail(f"{label}_octal_invalid")
+    parsed = int(value, 8)
+    if format(parsed, "o") != value:
+        fail(f"{label}_octal_noncanonical")
+    return parsed
+
+
+def physical_values(info: os.stat_result) -> dict[str, int]:
+    return {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": info.st_mode,
+        "nlink": info.st_nlink,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+    }
+
+
+def append_physical_rows(
+    lines: list[str],
+    prefix: str,
+    path: pathlib.Path,
+    raw: bytes,
+    info: os.stat_result,
+) -> None:
+    lines.extend(
+        (
+            prefix + "path_fshex=" + os.fsencode(path).hex(),
+            prefix + "sha256=" + hashlib.sha256(raw).hexdigest(),
+            prefix + "device=" + str(info.st_dev),
+            prefix + "inode=" + str(info.st_ino),
+            prefix + "mode=" + format(info.st_mode, "o"),
+            prefix + "nlink=" + str(info.st_nlink),
+            prefix + "uid=" + str(info.st_uid),
+            prefix + "gid=" + str(info.st_gid),
+            prefix + "size=" + str(info.st_size),
+            prefix + "mtime_ns=" + str(info.st_mtime_ns),
+            prefix + "ctime_ns=" + str(info.st_ctime_ns),
+        )
+    )
+
+
+def parse_physical_rows(
+    rows: dict[str, str],
+    prefix: str,
+    label: str,
+) -> tuple[pathlib.Path, str, dict[str, int]]:
+    path = pathlib.Path(
+        os.fsdecode(fshex_decode(rows.get(prefix + "path_fshex", ""), label + "_path"))
+    )
+    if not path.is_absolute() or str(path) != os.path.realpath(path):
+        fail(f"{label}_path_not_exact")
+    digest = canonical_sha(rows.get(prefix + "sha256", ""), label)
+    values: dict[str, int] = {}
+    for field in PHYSICAL_IDENTITY_FIELDS:
+        value = rows.get(prefix + field, "")
+        values[field] = (
+            canonical_octal(value, label + "_mode")
+            if field == "mode"
+            else canonical_uint(value, label + "_" + field)
+        )
+    return path, digest, values
+
+
+def verify_physical(
+    raw: bytes,
+    info: os.stat_result,
+    digest: str,
+    declared: dict[str, int],
+    label: str,
+) -> None:
+    actual = physical_values(info)
+    if hashlib.sha256(raw).hexdigest() != digest:
+        fail(f"{label}_sha_mismatch")
+    for field in PHYSICAL_IDENTITY_FIELDS:
+        if declared[field] != actual[field]:
+            fail(f"{label}_physical_identity_mismatch:{field}")
+
+
+def fshex_decode(value: str, label: str) -> bytes:
+    if not value or len(value) % 2 or not re.fullmatch(r"[0-9a-f]+", value):
+        fail(f"{label}_fshex_invalid")
+    try:
+        return bytes.fromhex(value)
+    except ValueError as exc:
+        fail(f"{label}_fshex_invalid:{exc}")
+
+
+def write_execution_manifests(arguments: list[str]) -> None:
+    if len(arguments) < 13:
+        fail("execution_manifest_arguments_missing")
+    argv_path = pathlib.Path(arguments[0])
+    env_path = pathlib.Path(arguments[1])
+    execution_path = pathlib.Path(arguments[2])
+    env_count = canonical_uint(arguments[3], "environment_count")
+    tail = arguments[4:]
+    if env_count > len(tail):
+        fail("execution_manifest_environment_partition_invalid")
+    env_pairs = tail[:env_count]
+    cursor = env_count
+    if (
+        cursor + 4 > len(tail)
+        or tail[cursor] != "--monitor-runtime"
+        or tail[cursor + 2] != "--monitor-python"
+    ):
+        fail("execution_manifest_monitor_authority_invalid")
+    monitor_runtime = pathlib.Path(tail[cursor + 1])
+    monitor_python = pathlib.Path(tail[cursor + 3])
+    cursor += 4
+    outputs: list[tuple[str, pathlib.Path]] = []
+    while cursor < len(tail) and tail[cursor] == "--output":
+        if cursor + 1 >= len(tail) or "=" not in tail[cursor + 1]:
+            fail("execution_manifest_output_declaration_invalid")
+        role, path_text = tail[cursor + 1].split("=", 1)
+        outputs.append((role, pathlib.Path(path_text)))
+        cursor += 2
+    if cursor >= len(tail) or tail[cursor] != "--":
+        fail("execution_manifest_command_separator_missing")
+    argv = tail[cursor + 1 :]
+    if not argv or not os.path.isabs(argv[0]):
+        fail("execution_manifest_command_invalid")
+    command = pathlib.Path(argv[0])
+    if str(command) != os.path.realpath(command):
+        fail("execution_manifest_command_path_not_exact")
+    if (
+        not monitor_runtime.is_absolute()
+        or str(monitor_runtime) != os.path.realpath(monitor_runtime)
+        or not monitor_python.is_absolute()
+        or str(monitor_python) != os.path.realpath(monitor_python)
+    ):
+        fail("execution_manifest_monitor_path_not_exact")
+    if len({argv_path, env_path, execution_path}) != 3:
+        fail("execution_manifest_output_alias")
+    argv_payload = bytearray(frame(b"cheng.guard.command_argv"))
+    argv_payload.extend(struct.pack(">I", len(argv)))
+    for value in argv:
+        argv_payload.extend(frame(os.fsencode(value)))
+    argv_sha = hashlib.sha256(argv_payload).hexdigest()
+    argv_lines = [
+        "schema=cheng.guard.argv_manifest",
+        f"count={len(argv)}",
+        f"sha256={argv_sha}",
+    ]
+    argv_lines.extend(
+        f"arg.{index}.fshex={os.fsencode(value).hex()}"
+        for index, value in enumerate(argv)
+    )
+    env: dict[str, str] = {}
+    for pair in env_pairs:
+        if "=" not in pair:
+            fail("execution_manifest_environment_pair_invalid")
+        key, value = pair.split("=", 1)
+        if (
+            not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+            or key.startswith("BEAT_C_GUARD_")
+            or key in env
+        ):
+            fail(f"execution_manifest_environment_key_invalid:{key}")
+        env[key] = value
+    keys = sorted(env, key=os.fsencode)
+    env_payload = bytearray(frame(b"cheng.guard.target_env"))
+    env_payload.extend(struct.pack(">I", len(keys)))
+    for key in keys:
+        env_payload.extend(frame(os.fsencode(key)))
+        env_payload.extend(frame(os.fsencode(env[key])))
+    env_sha = hashlib.sha256(env_payload).hexdigest()
+    env_lines = [
+        "schema=cheng.guard.env_manifest",
+        f"count={len(keys)}",
+        f"sha256={env_sha}",
+    ]
+    for index, key in enumerate(keys):
+        env_lines.extend(
+            (
+                f"entry.{index}.key_fshex={os.fsencode(key).hex()}",
+                f"entry.{index}.value_fshex={os.fsencode(env[key]).hex()}",
+            )
+        )
+
+    output_roles = [role for role, _ in outputs]
+    expected_order = [
+        role for role in EXECUTION_OUTPUT_ROLES if role in set(output_roles)
+    ]
+    if (
+        output_roles != expected_order
+        or len(output_roles) != len(set(output_roles))
+        or not set(EXECUTION_REQUIRED_OUTPUT_ROLES).issubset(output_roles)
+    ):
+        fail("execution_manifest_output_role_order_invalid")
+    output_paths: set[pathlib.Path] = set()
+    for role, output in outputs:
+        if (
+            role not in EXECUTION_OUTPUT_ROLES
+            or not output.is_absolute()
+            or str(output) != os.path.realpath(output)
+            or output in output_paths
+        ):
+            fail(f"execution_manifest_output_path_invalid:{role}")
+        try:
+            output.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            fail(f"execution_manifest_output_preflight_failed:{role}:{exc}")
+        else:
+            fail(f"execution_manifest_output_not_absent:{role}")
+        try:
+            parent = output.parent.lstat()
+        except OSError as exc:
+            fail(f"execution_manifest_output_parent_missing:{role}:{exc}")
+        if not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode):
+            fail(f"execution_manifest_output_parent_invalid:{role}")
+        output_paths.add(output)
+    if (
+        command in output_paths
+        or monitor_runtime in output_paths
+        or monitor_python in output_paths
+    ):
+        fail("execution_manifest_input_output_alias")
+
+    execution_lines = ["schema=cheng.guard.execution_manifest"]
+    for role, path, executable in (
+        ("command", command, True),
+        ("monitor_runtime", monitor_runtime, False),
+        ("monitor_python", monitor_python, True),
+    ):
+        raw, info = stable_read(path, "execution_" + role, executable)
+        append_physical_rows(
+            execution_lines,
+            "input." + role + ".",
+            path,
+            raw,
+            info,
+        )
+    execution_lines.append(f"output_count={len(outputs)}")
+    for index, (role, output) in enumerate(outputs):
+        prefix = f"output.{index}."
+        execution_lines.extend(
+            (
+                prefix + "role=" + role,
+                prefix + "path_fshex=" + os.fsencode(output).hex(),
+                prefix + "expected_kind=regular",
+                prefix + "expected_mode=100400",
+                prefix + "expected_nlink=1",
+                prefix + "expected_uid=" + str(os.geteuid()),
+                prefix + "expected_gid=" + str(os.getegid()),
+                prefix + "pre_run_status=absent",
+            )
+        )
+    execution_payload = ("\n".join(execution_lines) + "\n").encode()
+    execution_lines.append(
+        "manifest_payload_sha256=" + hashlib.sha256(execution_payload).hexdigest()
+    )
+    exclusive_write(argv_path, ("\n".join(argv_lines) + "\n").encode())
+    exclusive_write(env_path, ("\n".join(env_lines) + "\n").encode())
+    exclusive_write(execution_path, ("\n".join(execution_lines) + "\n").encode())
+
+
+def load_execution_manifest(path: pathlib.Path, kind: str) -> tuple[list[bytes] | dict[bytes, bytes], str]:
+    raw, _ = stable_read(path, kind + "_manifest")
+    rows, _ = parse_rows(raw, kind + "_manifest")
+    if kind == "argv":
+        if rows.get("schema") != "cheng.guard.argv_manifest":
+            fail("argv_manifest_schema_invalid")
+        count = canonical_uint(rows.get("count", ""), "argv_manifest_count")
+        expected = {"schema", "count", "sha256"} | {
+            f"arg.{index}.fshex" for index in range(count)
+        }
+        if set(rows) != expected:
+            fail("argv_manifest_key_set_invalid")
+        values = [
+            fshex_decode(rows[f"arg.{index}.fshex"], "argv_manifest_arg")
+            for index in range(count)
+        ]
+        payload = bytearray(frame(b"cheng.guard.command_argv"))
+        payload.extend(struct.pack(">I", count))
+        for value in values:
+            payload.extend(frame(value))
+        digest = hashlib.sha256(payload).hexdigest()
+        if rows["sha256"] != digest:
+            fail("argv_manifest_digest_invalid")
+        return values, digest
+    if rows.get("schema") != "cheng.guard.env_manifest":
+        fail("env_manifest_schema_invalid")
+    count = canonical_uint(rows.get("count", ""), "env_manifest_count")
+    expected = {"schema", "count", "sha256"}
+    for index in range(count):
+        expected.add(f"entry.{index}.key_fshex")
+        expected.add(f"entry.{index}.value_fshex")
+    if set(rows) != expected:
+        fail("env_manifest_key_set_invalid")
+    env: dict[bytes, bytes] = {}
+    ordered: list[bytes] = []
+    for index in range(count):
+        key = fshex_decode(rows[f"entry.{index}.key_fshex"], "env_manifest_key")
+        value = fshex_decode(rows[f"entry.{index}.value_fshex"], "env_manifest_value")
+        if key in env:
+            fail("env_manifest_key_duplicate")
+        env[key] = value
+        ordered.append(key)
+    if ordered != sorted(ordered):
+        fail("env_manifest_order_invalid")
+    payload = bytearray(frame(b"cheng.guard.target_env"))
+    payload.extend(struct.pack(">I", count))
+    for key in ordered:
+        payload.extend(frame(key))
+        payload.extend(frame(env[key]))
+    digest = hashlib.sha256(payload).hexdigest()
+    if rows["sha256"] != digest:
+        fail("env_manifest_digest_invalid")
+    return env, digest
+
+
+def load_execution_authority(path: pathlib.Path) -> dict[str, object]:
+    raw, _ = stable_read(path, "execution_authority_manifest")
+    rows, lines = parse_rows(raw, "execution_authority_manifest")
+    if (
+        rows.get("schema") != "cheng.guard.execution_manifest"
+        or not lines
+        or not lines[-1].startswith("manifest_payload_sha256=")
+        or rows.get("manifest_payload_sha256")
+        != hashlib.sha256(("\n".join(lines[:-1]) + "\n").encode()).hexdigest()
+    ):
+        fail("execution_authority_manifest_header_invalid")
+    count = canonical_uint(
+        rows.get("output_count", ""), "execution_authority_output_count"
+    )
+    expected_keys = {"schema", "output_count", "manifest_payload_sha256"}
+    expected_order = ["schema"]
+    inputs: dict[str, tuple[pathlib.Path, str, dict[str, int]]] = {}
+    for role in EXECUTION_INPUT_ROLES:
+        prefix = "input." + role + "."
+        expected_order.extend(
+            (
+                prefix + "path_fshex",
+                prefix + "sha256",
+                *(prefix + field for field in PHYSICAL_IDENTITY_FIELDS),
+            )
+        )
+        expected_keys.update(expected_order[-11:])
+        inputs[role] = parse_physical_rows(
+            rows, prefix, "execution_authority_" + role
+        )
+    expected_order.append("output_count")
+    outputs: list[dict[str, object]] = []
+    roles: list[str] = []
+    paths: set[pathlib.Path] = set()
+    for index in range(count):
+        prefix = f"output.{index}."
+        keys = (
+            prefix + "role",
+            prefix + "path_fshex",
+            prefix + "expected_kind",
+            prefix + "expected_mode",
+            prefix + "expected_nlink",
+            prefix + "expected_uid",
+            prefix + "expected_gid",
+            prefix + "pre_run_status",
+        )
+        expected_order.extend(keys)
+        expected_keys.update(keys)
+        role = rows.get(prefix + "role", "")
+        path_value = pathlib.Path(
+            os.fsdecode(
+                fshex_decode(
+                    rows.get(prefix + "path_fshex", ""),
+                    "execution_authority_output_path",
+                )
+            )
+        )
+        mode = canonical_octal(
+            rows.get(prefix + "expected_mode", ""),
+            "execution_authority_output_mode",
+        )
+        nlink = canonical_uint(
+            rows.get(prefix + "expected_nlink", ""),
+            "execution_authority_output_nlink",
+        )
+        uid = canonical_uint(
+            rows.get(prefix + "expected_uid", ""),
+            "execution_authority_output_uid",
+        )
+        gid = canonical_uint(
+            rows.get(prefix + "expected_gid", ""),
+            "execution_authority_output_gid",
+        )
+        if (
+            role not in EXECUTION_OUTPUT_ROLES
+            or role in roles
+            or not path_value.is_absolute()
+            or str(path_value) != os.path.realpath(path_value)
+            or path_value in paths
+            or rows.get(prefix + "expected_kind") != "regular"
+            or mode != stat.S_IFREG | 0o400
+            or nlink != 1
+            or uid != os.geteuid()
+            or gid != os.getegid()
+            or rows.get(prefix + "pre_run_status") != "absent"
+        ):
+            fail(f"execution_authority_output_invalid:{index}")
+        roles.append(role)
+        paths.add(path_value)
+        outputs.append(
+            {
+                "role": role,
+                "path": path_value,
+                "mode": mode,
+                "nlink": nlink,
+                "uid": uid,
+                "gid": gid,
+            }
+        )
+    filtered_roles = [
+        role for role in EXECUTION_OUTPUT_ROLES if role in set(roles)
+    ]
+    if (
+        roles != filtered_roles
+        or not set(EXECUTION_REQUIRED_OUTPUT_ROLES).issubset(roles)
+    ):
+        fail("execution_authority_output_role_order_invalid")
+    expected_order.append("manifest_payload_sha256")
+    if set(rows) != expected_keys or lines != [
+        key + "=" + rows[key] for key in expected_order
+    ]:
+        fail("execution_authority_manifest_shape_invalid")
+    return {"inputs": inputs, "outputs": outputs}
+
+
+def validate_execution(arguments: list[str]) -> None:
+    if len(arguments) != 5:
+        fail("validate_execution_arguments_invalid")
+    guard_path, argv_path, env_path, authority_path, command_path = map(
+        pathlib.Path, arguments
+    )
+    guard_raw, guard_info = stable_read(guard_path, "guard_report")
+    rows, _ = parse_rows(guard_raw, "guard_report")
+    argv, argv_sha = load_execution_manifest(argv_path, "argv")
+    env, env_sha = load_execution_manifest(env_path, "env")
+    authority = load_execution_authority(authority_path)
+    declared_inputs = authority["inputs"]
+    declared_outputs = authority["outputs"]
+    if not isinstance(declared_inputs, dict) or not isinstance(declared_outputs, list):
+        fail("execution_authority_internal_shape_invalid")
+
+    live_inputs: dict[str, tuple[pathlib.Path, bytes, os.stat_result]] = {}
+    for role in EXECUTION_INPUT_ROLES:
+        declared_path, declared_sha, declared_identity = declared_inputs[role]
+        executable = role in ("command", "monitor_python")
+        current_raw, current_info = stable_read(
+            declared_path, "execution_" + role, executable
+        )
+        verify_physical(
+            current_raw,
+            current_info,
+            declared_sha,
+            declared_identity,
+            "execution_" + role,
+        )
+        live_inputs[role] = (declared_path, current_raw, current_info)
+    declared_command, command_raw, command_info = live_inputs["command"]
+    command_sha = hashlib.sha256(command_raw).hexdigest()
+    if command_path != declared_command:
+        fail("guard_execution_command_argument_mismatch")
+    expected = {
+        "schema": "beat_c_process_memory_guard",
+        "status": "completed",
+        "rc": "0",
+        "abort_reason": "",
+        "expected_exit_code": "0",
+        "actual_exit_code": "0",
+        "exit_code_contract_status": "verified",
+        "command_identity_status": "available",
+        "command_identity_error": "",
+        "formal_command_identity_status": "required_verified",
+        "command_execution_snapshot_schema": "cheng.guard.command_snapshot",
+        "command_execution_mode": "private_single_link_snapshot",
+        "command_argv_schema": "cheng.guard.command_argv",
+        "target_env_schema": "cheng.guard.target_env",
+        "target_env_mode": "exact",
+        "target_env_requested_schema": "cheng.guard.target_env.requested",
+        "expected_command_sha256": command_sha,
+        "command_path": str(declared_command),
+        "command_sha256": command_sha,
+        "command_argv_count": str(len(argv)),
+        "command_argv_sha256": argv_sha,
+        "target_env_requested_count": str(len(env)),
+        "target_env_requested_sha256": env_sha,
+        "target_env_injected_parent_schema":
+            "cheng.guard.target_env.injected_parent",
+        "memory_guard_mode": "process_tree",
+        "memory_limit_bytes": "805306368",
+        "memory_measurement_status": "available",
+        "memory_measurement_error": "",
+        "observed_sample_limit_status": "proved",
+        "root_identity_sampled": "1",
+        "process_tree_escape_pid": "0",
+        "cleanup_status": "not_required",
+        "cleanup_error": "",
+        "output_artifact_schema": "cheng.guard.output_artifacts",
+        "output_path_history_status": "verified_clean",
+        "output_path_history_forbidden_events":
+            "delete,link,rename,revoke,unmount",
+    }
+    for key, value in expected.items():
+        if rows.get(key) != value:
+            fail(f"guard_execution_field_invalid:{key}")
+    if rows.get("expected_command_path") != str(declared_command):
+        fail("guard_execution_field_invalid:expected_command_path")
+    if not argv or os.fsdecode(argv[0]) != str(declared_command):
+        fail("guard_execution_argv_command_invalid")
+
+    actual_env = dict(env)
+    capability = rows.get("target_env_injected_parent_capability", "")
+    if (
+        not SHA_RE.fullmatch(capability)
+        or rows.get("target_env_injected_parent_capability_sha256")
+        != hashlib.sha256(capability.encode("ascii")).hexdigest()
+        or canonical_uint(
+            rows.get("target_env_injected_parent_monitor_pid", ""),
+            "guard_execution_parent_monitor_pid",
+        ) <= 0
+        or rows.get("target_env_injected_parent_limit_bytes") != "805306368"
+        or canonical_uint(
+            rows.get("target_env_injected_parent_proof_fd", ""),
+            "guard_execution_parent_proof_fd",
+        ) <= 2
+    ):
+        fail("guard_execution_injected_environment_authority_invalid")
+    injected = {
+        b"BEAT_C_GUARD_PARENT_CAPABILITY": capability.encode("ascii"),
+        b"BEAT_C_GUARD_PARENT_MONITOR_PID":
+            rows.get("target_env_injected_parent_monitor_pid", "").encode("ascii"),
+        b"BEAT_C_GUARD_PARENT_LIMIT_BYTES":
+            rows.get("target_env_injected_parent_limit_bytes", "").encode("ascii"),
+        b"BEAT_C_GUARD_PARENT_PROOF_FD":
+            rows.get("target_env_injected_parent_proof_fd", "").encode("ascii"),
+    }
+    for key, value in injected.items():
+        if not value or key in actual_env:
+            fail("guard_execution_injected_environment_invalid")
+        actual_env[key] = value
+    actual_env_payload = bytearray(frame(b"cheng.guard.target_env"))
+    actual_env_payload.extend(struct.pack(">I", len(actual_env)))
+    for key in sorted(actual_env):
+        actual_env_payload.extend(frame(key))
+        actual_env_payload.extend(frame(actual_env[key]))
+    if (
+        rows.get("target_env_count") != str(len(actual_env))
+        or rows.get("target_env_sha256")
+        != hashlib.sha256(actual_env_payload).hexdigest()
+    ):
+        fail("guard_execution_actual_environment_invalid")
+
+    for key, actual in (
+        ("command_device", command_info.st_dev),
+        ("command_inode", command_info.st_ino),
+        ("command_size", command_info.st_size),
+        ("command_mtime_ns", command_info.st_mtime_ns),
+        ("command_ctime_ns", command_info.st_ctime_ns),
+    ):
+        if rows.get(key) != str(actual):
+            fail(f"guard_execution_command_identity_invalid:{key}")
+    snapshot_path = pathlib.Path(rows.get("command_execution_snapshot_path", ""))
+    snapshot_raw, snapshot_info = stable_read(snapshot_path, "command_snapshot", True)
+    if (
+        not snapshot_path.is_absolute()
+        or str(snapshot_path) != os.path.realpath(snapshot_path)
+        or hashlib.sha256(snapshot_raw).hexdigest() != command_sha
+        or (snapshot_info.st_dev, snapshot_info.st_ino)
+        == (command_info.st_dev, command_info.st_ino)
+        or snapshot_info.st_mode != stat.S_IFREG | 0o500
+        or snapshot_info.st_nlink != 1
+        or snapshot_info.st_uid != os.geteuid()
+        or snapshot_info.st_gid != os.getegid()
+        or rows.get("command_execution_snapshot_sha256") != command_sha
+    ):
+        fail("guard_execution_snapshot_binding_invalid")
+    for key, actual in (
+        ("command_execution_snapshot_device", snapshot_info.st_dev),
+        ("command_execution_snapshot_inode", snapshot_info.st_ino),
+        ("command_execution_snapshot_size", snapshot_info.st_size),
+        ("command_execution_snapshot_mtime_ns", snapshot_info.st_mtime_ns),
+        ("command_execution_snapshot_ctime_ns", snapshot_info.st_ctime_ns),
+    ):
+        if rows.get(key) != str(actual):
+            fail(f"guard_execution_snapshot_identity_invalid:{key}")
+
+    runtime_path, runtime_raw, runtime_info = live_inputs["monitor_runtime"]
+    runtime_sha = hashlib.sha256(runtime_raw).hexdigest()
+    runtime_expected = {
+        "monitor_runtime_script_schema": "cheng.guard.monitor_runtime_script",
+        "monitor_runtime_script_path": str(runtime_path),
+        "monitor_runtime_script_sha256": runtime_sha,
+        "monitor_runtime_script_device": str(runtime_info.st_dev),
+        "monitor_runtime_script_inode": str(runtime_info.st_ino),
+        "monitor_runtime_script_mode": format(runtime_info.st_mode, "o"),
+        "monitor_runtime_script_nlink": str(runtime_info.st_nlink),
+        "monitor_runtime_script_size": str(runtime_info.st_size),
+        "monitor_runtime_script_mtime_ns": str(runtime_info.st_mtime_ns),
+        "monitor_runtime_script_ctime_ns": str(runtime_info.st_ctime_ns),
+        "monitor_runtime_script_invocation_status": "verified_o_nofollow_loader_fd9",
+        "monitor_runtime_script_stage_expected_sha256": runtime_sha,
+        "monitor_runtime_script_builtin_sha256": runtime_sha,
+        "monitor_runtime_script_expected_sha_match": "1",
+    }
+    for key, value in runtime_expected.items():
+        if rows.get(key) != value:
+            fail(f"guard_execution_runtime_identity_invalid:{key}")
+
+    python_path, python_raw, python_info = live_inputs["monitor_python"]
+    python_sha = hashlib.sha256(python_raw).hexdigest()
+    python_expected = {
+        "monitor_python_path": str(python_path),
+        "monitor_python_sha256": python_sha,
+        "monitor_python_device": str(python_info.st_dev),
+        "monitor_python_inode": str(python_info.st_ino),
+        "monitor_python_size": str(python_info.st_size),
+        "monitor_python_mtime_ns": str(python_info.st_mtime_ns),
+        "monitor_python_ctime_ns": str(python_info.st_ctime_ns),
+        "monitor_python_authority_status": "verified",
+    }
+    for key, value in python_expected.items():
+        if rows.get(key) != value:
+            fail(f"guard_execution_python_identity_invalid:{key}")
+
+    if (
+        rows.get("output_artifact_count") != str(len(declared_outputs))
+        or rows.get("output_path_history_watch_count")
+        != str(len(declared_outputs))
+    ):
+        fail("guard_execution_output_count_invalid")
+    output_inodes: set[tuple[int, int]] = set()
+    declared_output_roles: set[str] = set()
+    for output in declared_outputs:
+        role = output["role"]
+        path = output["path"]
+        declared_output_roles.add(role)
+        raw, info = stable_read(path, "execution_output_" + role)
+        if (
+            info.st_mode != output["mode"]
+            or info.st_nlink != output["nlink"]
+            or info.st_uid != output["uid"]
+            or info.st_gid != output["gid"]
+        ):
+            fail(f"guard_execution_output_physical_invalid:{role}")
+        inode = (info.st_dev, info.st_ino)
+        if inode in output_inodes:
+            fail(f"guard_execution_output_inode_alias:{role}")
+        output_inodes.add(inode)
+        if role == "report":
+            if (
+                path != guard_path
+                or rows.get("report_path") != str(path)
+                or rows.get("report_device") != str(info.st_dev)
+                or rows.get("report_inode") != str(info.st_ino)
+                or not raw
+            ):
+                fail("guard_execution_report_binding_invalid")
+            continue
+        if (
+            rows.get(role + "_status") != "available"
+            or rows.get(role + "_path") != str(path)
+            or rows.get(role + "_sha256") != hashlib.sha256(raw).hexdigest()
+            or rows.get(role + "_device") != str(info.st_dev)
+            or rows.get(role + "_inode") != str(info.st_ino)
+            or rows.get(role + "_size") != str(info.st_size)
+        ):
+            fail(f"guard_execution_output_binding_invalid:{role}")
+    for role in EXECUTION_OUTPUT_ROLES[1:]:
+        if role not in declared_output_roles and (
+            rows.get(role + "_status") != "disabled"
+            or rows.get(role + "_path") != ""
+            or rows.get(role + "_sha256") != ""
+            or rows.get(role + "_device") != "0"
+            or rows.get(role + "_inode") != "0"
+            or rows.get(role + "_size") != "0"
+        ):
+            fail(f"guard_execution_undeclared_output_invalid:{role}")
+
+    limit = 805306368
+    enforced_peak = canonical_uint(
+        rows.get("process_tree_enforced_peak_bytes", ""),
+        "guard_execution_enforced_peak",
+    )
+    if (
+        enforced_peak > limit
+        or canonical_uint(
+            rows.get("process_tree_enforced_sample_peak_bytes", ""),
+            "guard_execution_sample_peak",
+        )
+        != enforced_peak
+        or canonical_uint(
+            rows.get("process_tree_peak_process_count", ""),
+            "guard_execution_peak_process_count",
+        ) <= 0
+        or canonical_uint(
+            rows.get("memory_sample_count", ""),
+            "guard_execution_memory_sample_count",
+        ) <= 0
+    ):
+        fail("guard_execution_memory_contract_invalid")
+
+
+def raw_manifest(arguments: list[str]) -> None:
+    if len(arguments) < 4 or len(arguments) % 2:
+        fail("raw_manifest_arguments_invalid")
+    kind = arguments[0]
+    output = pathlib.Path(arguments[1])
+    if not KEY_RE.fullmatch(kind):
+        fail("raw_manifest_kind_invalid")
+    pairs = arguments[2:]
+    roles: list[tuple[str, pathlib.Path, bytes, os.stat_result]] = []
+    seen_roles: set[str] = set()
+    seen_inodes: set[tuple[int, int]] = set()
+    for index in range(0, len(pairs), 2):
+        role = pairs[index]
+        path = pathlib.Path(pairs[index + 1])
+        if not KEY_RE.fullmatch(role) or role in seen_roles or not path.is_absolute():
+            fail(f"raw_manifest_role_invalid:{role}")
+        raw, info = stable_read(path, "raw_manifest_artifact")
+        inode = (info.st_dev, info.st_ino)
+        if inode in seen_inodes:
+            fail(f"raw_manifest_inode_alias:{role}")
+        seen_roles.add(role)
+        seen_inodes.add(inode)
+        roles.append((role, path, raw, info))
+    lines = [
+        "schema=cheng.backend2.current_source_raw_manifest",
+        "status=PASS",
+        f"lock_kind={kind}",
+        f"artifact_count={len(roles)}",
+    ]
+    for index, (role, path, raw, info) in enumerate(roles):
+        prefix = f"artifact.{index}."
+        lines.extend(
+            (
+                prefix + "role=" + role,
+                prefix + "path_fshex=" + os.fsencode(path).hex(),
+                prefix + "sha256=" + hashlib.sha256(raw).hexdigest(),
+                prefix + "device=" + str(info.st_dev),
+                prefix + "inode=" + str(info.st_ino),
+                prefix + "size=" + str(info.st_size),
+                prefix + "mode=" + format(info.st_mode, "o"),
+                prefix + "mtime_ns=" + str(info.st_mtime_ns),
+                prefix + "ctime_ns=" + str(info.st_ctime_ns),
+            )
+        )
+    payload = ("\n".join(lines) + "\n").encode()
+    lines.append("manifest_payload_sha256=" + hashlib.sha256(payload).hexdigest())
+    exclusive_write(output, ("\n".join(lines) + "\n").encode())
+
+
+def validate_raw_manifest(path: pathlib.Path, expected_kind: str) -> None:
+    raw, _ = stable_read(path, "raw_manifest")
+    rows, lines = parse_rows(raw, "raw_manifest")
+    if (
+        rows.get("schema") != "cheng.backend2.current_source_raw_manifest"
+        or rows.get("status") != "PASS"
+        or rows.get("lock_kind") != expected_kind
+    ):
+        fail("raw_manifest_header_invalid")
+    if (
+        not lines[-1].startswith("manifest_payload_sha256=")
+        or rows.get("manifest_payload_sha256")
+        != hashlib.sha256(("\n".join(lines[:-1]) + "\n").encode()).hexdigest()
+    ):
+        fail("raw_manifest_payload_invalid")
+    count = canonical_uint(rows.get("artifact_count", ""), "raw_manifest_count")
+    expected_keys = {
+        "schema",
+        "status",
+        "lock_kind",
+        "artifact_count",
+        "manifest_payload_sha256",
+    }
+    columns = (
+        "role",
+        "path_fshex",
+        "sha256",
+        "device",
+        "inode",
+        "size",
+        "mode",
+        "mtime_ns",
+        "ctime_ns",
+    )
+    for index in range(count):
+        expected_keys.update(f"artifact.{index}.{column}" for column in columns)
+    if set(rows) != expected_keys:
+        fail("raw_manifest_key_set_invalid")
+    roles: set[str] = set()
+    paths: set[bytes] = set()
+    inodes: set[tuple[int, int]] = set()
+    for index in range(count):
+        prefix = f"artifact.{index}."
+        role = rows[prefix + "role"]
+        path_raw = fshex_decode(rows[prefix + "path_fshex"], "raw_manifest_path")
+        if (
+            not KEY_RE.fullmatch(role)
+            or role in roles
+            or path_raw in paths
+            or not os.path.isabs(path_raw)
+        ):
+            fail("raw_manifest_role_or_path_invalid")
+        path = pathlib.Path(os.fsdecode(path_raw))
+        artifact_raw, info = stable_read(path, "raw_manifest_artifact")
+        inode = (info.st_dev, info.st_ino)
+        if inode in inodes:
+            fail("raw_manifest_inode_alias")
+        expected = {
+            "sha256": hashlib.sha256(artifact_raw).hexdigest(),
+            "device": str(info.st_dev),
+            "inode": str(info.st_ino),
+            "size": str(info.st_size),
+            "mode": format(info.st_mode, "o"),
+            "mtime_ns": str(info.st_mtime_ns),
+            "ctime_ns": str(info.st_ctime_ns),
+        }
+        for column, value in expected.items():
+            if rows[prefix + column] != value:
+                fail(f"raw_manifest_artifact_binding_invalid:{role}:{column}")
+        roles.add(role)
+        paths.add(path_raw)
+        inodes.add(inode)
+
+
+def enumerate_tree(
+    root: pathlib.Path, excluded: set[pathlib.Path]
+) -> tuple[list[pathlib.Path], dict[bytes, tuple[int, ...]]]:
+    files: list[pathlib.Path] = []
+    directories: dict[bytes, tuple[int, ...]] = {}
+    root_real = pathlib.Path(os.path.realpath(root))
+    try:
+        root_info = root_real.lstat()
+    except OSError as exc:
+        fail(f"producer_root_missing:{exc}")
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        fail("producer_root_invalid")
+    for directory, names, filenames in os.walk(root_real, topdown=True, followlinks=False):
+        names.sort(key=os.fsencode)
+        filenames.sort(key=os.fsencode)
+        directory_path = pathlib.Path(directory)
+        relative_directory = directory_path.relative_to(root_real)
+        if relative_directory != pathlib.Path("."):
+            info = directory_path.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                fail(f"producer_directory_invalid:{directory_path}")
+            directories[os.fsencode(relative_directory)] = identity(info)
+        for name in names:
+            child = directory_path / name
+            info = child.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                fail(f"producer_directory_member_invalid:{child}")
+        for name in filenames:
+            path = directory_path / name
+            absolute = pathlib.Path(os.path.abspath(path))
+            if absolute in excluded:
+                continue
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                fail(f"producer_artifact_invalid:{path}")
+            files.append(path)
+    files.sort(key=lambda path: os.fsencode(path.relative_to(root_real)))
+    return files, directories
+
+
+def manifest_payload(
+    root: pathlib.Path,
+    official: pathlib.Path,
+    manifest: pathlib.Path,
+    receipt: pathlib.Path,
+) -> tuple[bytes, list[tuple[pathlib.Path, str, os.stat_result]]]:
+    excluded = {
+        pathlib.Path(os.path.realpath(path.parent)) / path.name
+        for path in (manifest, receipt)
+    }
+    first_files, first_directories = enumerate_tree(root, excluded)
+    artifacts: list[tuple[pathlib.Path, str, os.stat_result]] = []
+    seen_inodes: set[tuple[int, int]] = set()
+    root_real = pathlib.Path(os.path.realpath(root))
+    for path in first_files:
+        raw, info = stable_read(path, "producer_artifact")
+        inode = (info.st_dev, info.st_ino)
+        if inode in seen_inodes:
+            fail(f"producer_artifact_inode_alias:{path}")
+        seen_inodes.add(inode)
+        artifacts.append(
+            (path.relative_to(root_real), hashlib.sha256(raw).hexdigest(), info)
+        )
+    second_files, second_directories = enumerate_tree(root, excluded)
+    if (
+        [os.fsencode(path.relative_to(root_real)) for path in first_files]
+        != [os.fsencode(path.relative_to(root_real)) for path in second_files]
+        or first_directories != second_directories
+    ):
+        fail("producer_tree_changed_during_scan")
+    official_raw, official_info = stable_read(official, "official_driver", True)
+    if (official_info.st_dev, official_info.st_ino) in seen_inodes:
+        fail("official_driver_inode_alias")
+    lines = [
+        "schema=cheng.backend2.current_source_official_artifact_manifest",
+        "status=PASS",
+        "driver_role=production",
+        "producer_root_fshex=" + os.fsencode(root_real).hex(),
+        "official_driver_path_fshex=" + os.fsencode(pathlib.Path(os.path.realpath(official))).hex(),
+        "official_driver_sha256=" + hashlib.sha256(official_raw).hexdigest(),
+        "official_driver_device=" + str(official_info.st_dev),
+        "official_driver_inode=" + str(official_info.st_ino),
+        "official_driver_size=" + str(official_info.st_size),
+        "official_driver_mode=" + format(official_info.st_mode, "o"),
+        "official_driver_mtime_ns=" + str(official_info.st_mtime_ns),
+        "official_driver_ctime_ns=" + str(official_info.st_ctime_ns),
+        "directory_count=" + str(len(first_directories)),
+    ]
+    for index, relative in enumerate(sorted(first_directories)):
+        current = first_directories[relative]
+        prefix = f"directory.{index}."
+        lines.extend(
+            (
+                prefix + "path_fshex=" + relative.hex(),
+                prefix + "device=" + str(current[0]),
+                prefix + "inode=" + str(current[1]),
+                prefix + "mode=" + format(current[2], "o"),
+                prefix + "nlink=" + str(current[3]),
+                prefix + "mtime_ns=" + str(current[5]),
+                prefix + "ctime_ns=" + str(current[6]),
+            )
+        )
+    lines.append("artifact_count=" + str(len(artifacts)))
+    for index, (relative, digest, info) in enumerate(artifacts):
+        prefix = f"artifact.{index}."
+        lines.extend(
+            (
+                prefix + "path_fshex=" + os.fsencode(relative).hex(),
+                prefix + "sha256=" + digest,
+                prefix + "device=" + str(info.st_dev),
+                prefix + "inode=" + str(info.st_ino),
+                prefix + "size=" + str(info.st_size),
+                prefix + "mode=" + format(info.st_mode, "o"),
+                prefix + "mtime_ns=" + str(info.st_mtime_ns),
+                prefix + "ctime_ns=" + str(info.st_ctime_ns),
+            )
+        )
+    payload = ("\n".join(lines) + "\n").encode()
+    lines.append("manifest_payload_sha256=" + hashlib.sha256(payload).hexdigest())
+    return ("\n".join(lines) + "\n").encode(), artifacts
+
+
+def publish(arguments: list[str]) -> None:
+    if len(arguments) != 5:
+        fail("publish_arguments_invalid")
+    root, raw_root, official, manifest, receipt = map(pathlib.Path, arguments)
+    for path in (root, raw_root, official, manifest, receipt):
+        if not path.is_absolute():
+            fail(f"publish_path_not_absolute:{path}")
+    root_real = pathlib.Path(os.path.realpath(root))
+    raw_real = pathlib.Path(os.path.realpath(raw_root))
+    manifest = pathlib.Path(os.path.realpath(manifest.parent)) / manifest.name
+    receipt = pathlib.Path(os.path.realpath(receipt.parent)) / receipt.name
+    if raw_real.parent != root_real or raw_real.name != "raw":
+        fail("publish_raw_root_invalid")
+    if manifest.parent != root_real or receipt.parent != root_real:
+        fail("publish_output_parent_invalid")
+    summary = raw_real / "summary.kv"
+    postflight = raw_real / "postflight.kv"
+    fixed = raw_real / "backend-driver.gen2-gen3.fixed-point.kv"
+    epoch = raw_real / "backend2-epoch.raw-manifest.kv"
+    jobs = raw_real / "backend2-jobs.raw-manifest.kv"
+    gen2 = raw_real / "backend-driver.current"
+    gen3 = raw_real / "backend-driver.gen3"
+    required = (summary, postflight, fixed, epoch, jobs, gen2, gen3)
+    required_values: dict[pathlib.Path, tuple[bytes, os.stat_result]] = {}
+    for path in required:
+        required_values[path] = stable_read(
+            path, "publish_required", path in (gen2, gen3)
+        )
+    validate_raw_manifest(epoch, "backend2_epoch")
+    validate_raw_manifest(jobs, "backend2_jobs")
+    summary_rows, _ = parse_rows(required_values[summary][0], "summary")
+    expected_summary = {
+        "schema": "cheng.backend2.current_source_gate",
+        "status": "pass",
+        "source_postflight_status": "stable",
+        "gen2_gen3_raw_bytes_equal": "true",
+        "gen2_gen3_distinct_artifact_inodes": "true",
+        "backend2_epoch_status": "pass",
+        "backend2_jobs1_jobs4_raw_bytes_equal": "true",
+        "backend2_jobs1_jobs4_distinct_artifact_inodes": "true",
+        "exact_command_environment_guard_count": "9",
+        "official_artifact_unchanged": "true",
+    }
+    for key, value in expected_summary.items():
+        if summary_rows.get(key) != value:
+            fail(f"publish_summary_not_complete:{key}")
+    official_raw, official_info = stable_read(official, "official_driver", True)
+    gen2_raw, gen2_info = required_values[gen2]
+    gen3_raw, gen3_info = required_values[gen3]
+    if gen2_raw != gen3_raw or gen2_raw != official_raw:
+        fail("publish_driver_raw_bytes_mismatch")
+    inodes = {
+        (gen2_info.st_dev, gen2_info.st_ino),
+        (gen3_info.st_dev, gen3_info.st_ino),
+        (official_info.st_dev, official_info.st_ino),
+    }
+    if len(inodes) != 3:
+        fail("publish_driver_inode_independence_invalid")
+    manifest_raw, _ = manifest_payload(root_real, official, manifest, receipt)
+    exclusive_write(manifest, manifest_raw)
+    published_manifest_raw, manifest_info = stable_read(
+        manifest, "published_artifact_manifest"
+    )
+    if published_manifest_raw != manifest_raw:
+        fail("published_artifact_manifest_changed")
+    manifest_digest = hashlib.sha256(published_manifest_raw).hexdigest()
+    receipt_lines = [
+        "schema=cheng.backend2.current_source_official_publisher_receipt",
+        "status=PASS",
+        "driver_role=production",
+        "producer_root_fshex=" + os.fsencode(root_real).hex(),
+        "artifact_manifest_path_fshex=" + os.fsencode(manifest).hex(),
+        "artifact_manifest_sha256=" + manifest_digest,
+        "artifact_manifest_device=" + str(manifest_info.st_dev),
+        "artifact_manifest_inode=" + str(manifest_info.st_ino),
+        "artifact_manifest_size=" + str(manifest_info.st_size),
+        "artifact_manifest_mode=" + format(manifest_info.st_mode, "o"),
+        "artifact_manifest_mtime_ns=" + str(manifest_info.st_mtime_ns),
+        "artifact_manifest_ctime_ns=" + str(manifest_info.st_ctime_ns),
+        "official_driver_path_fshex=" + os.fsencode(pathlib.Path(os.path.realpath(official))).hex(),
+        "official_driver_sha256=" + hashlib.sha256(official_raw).hexdigest(),
+        "official_driver_device=" + str(official_info.st_dev),
+        "official_driver_inode=" + str(official_info.st_ino),
+        "gen2_path_fshex=" + os.fsencode(gen2).hex(),
+        "gen2_sha256=" + hashlib.sha256(gen2_raw).hexdigest(),
+        "gen2_device=" + str(gen2_info.st_dev),
+        "gen2_inode=" + str(gen2_info.st_ino),
+        "gen3_path_fshex=" + os.fsencode(gen3).hex(),
+        "gen3_sha256=" + hashlib.sha256(gen3_raw).hexdigest(),
+        "gen3_device=" + str(gen3_info.st_dev),
+        "gen3_inode=" + str(gen3_info.st_ino),
+        "summary_sha256=" + hashlib.sha256(required_values[summary][0]).hexdigest(),
+        "postflight_sha256=" + hashlib.sha256(required_values[postflight][0]).hexdigest(),
+        "fixed_point_sha256=" + hashlib.sha256(required_values[fixed][0]).hexdigest(),
+        "backend2_epoch_raw_manifest_sha256=" + hashlib.sha256(required_values[epoch][0]).hexdigest(),
+        "backend2_jobs_raw_manifest_sha256=" + hashlib.sha256(required_values[jobs][0]).hexdigest(),
+        "raw_bytes_fixed_point=true",
+        "independent_driver_inodes=true",
+    ]
+    receipt_payload = ("\n".join(receipt_lines) + "\n").encode()
+    receipt_lines.append(
+        "receipt_payload_sha256=" + hashlib.sha256(receipt_payload).hexdigest()
+    )
+    exclusive_write(receipt, ("\n".join(receipt_lines) + "\n").encode())
+    validate([str(receipt)])
+
+
+def validate_receipt_state(
+    receipt: pathlib.Path,
+    receipt_raw: bytes,
+    receipt_info: os.stat_result,
+) -> None:
+    if (
+        stat.S_IMODE(receipt_info.st_mode) != 0o400
+        or receipt_info.st_nlink != 1
+        or receipt_info.st_uid != os.geteuid()
+        or receipt_info.st_gid != os.getegid()
+    ):
+        fail("publisher_receipt_seal_invalid")
+    receipt_rows, receipt_lines = parse_rows(receipt_raw, "publisher_receipt")
+    if (
+        receipt_rows.get("schema")
+        != "cheng.backend2.current_source_official_publisher_receipt"
+        or receipt_rows.get("status") != "PASS"
+        or receipt_rows.get("driver_role") != "production"
+        or receipt_rows.get("raw_bytes_fixed_point") != "true"
+        or receipt_rows.get("independent_driver_inodes") != "true"
+    ):
+        fail("publisher_receipt_header_invalid")
+    expected_receipt_keys = {
+        "schema",
+        "status",
+        "driver_role",
+        "producer_root_fshex",
+        "artifact_manifest_path_fshex",
+        "artifact_manifest_sha256",
+        "artifact_manifest_device",
+        "artifact_manifest_inode",
+        "artifact_manifest_size",
+        "artifact_manifest_mode",
+        "artifact_manifest_mtime_ns",
+        "artifact_manifest_ctime_ns",
+        "official_driver_path_fshex",
+        "official_driver_sha256",
+        "official_driver_device",
+        "official_driver_inode",
+        "gen2_path_fshex",
+        "gen2_sha256",
+        "gen2_device",
+        "gen2_inode",
+        "gen3_path_fshex",
+        "gen3_sha256",
+        "gen3_device",
+        "gen3_inode",
+        "summary_sha256",
+        "postflight_sha256",
+        "fixed_point_sha256",
+        "backend2_epoch_raw_manifest_sha256",
+        "backend2_jobs_raw_manifest_sha256",
+        "raw_bytes_fixed_point",
+        "independent_driver_inodes",
+        "receipt_payload_sha256",
+    }
+    if set(receipt_rows) != expected_receipt_keys:
+        fail("publisher_receipt_key_set_invalid")
+    receipt_payload = ("\n".join(receipt_lines[:-1]) + "\n").encode()
+    if (
+        not receipt_lines[-1].startswith("receipt_payload_sha256=")
+        or receipt_rows.get("receipt_payload_sha256")
+        != hashlib.sha256(receipt_payload).hexdigest()
+    ):
+        fail("publisher_receipt_payload_invalid")
+    root = pathlib.Path(os.fsdecode(fshex_decode(receipt_rows.get("producer_root_fshex", ""), "producer_root")))
+    manifest = pathlib.Path(os.fsdecode(fshex_decode(receipt_rows.get("artifact_manifest_path_fshex", ""), "artifact_manifest_path")))
+    official = pathlib.Path(os.fsdecode(fshex_decode(receipt_rows.get("official_driver_path_fshex", ""), "official_driver_path")))
+    root = pathlib.Path(os.path.realpath(root))
+    manifest = pathlib.Path(os.path.realpath(manifest.parent)) / manifest.name
+    receipt_real = pathlib.Path(os.path.realpath(receipt.parent)) / receipt.name
+    if manifest.parent != root or receipt_real.parent != root:
+        fail("publisher_receipt_output_parent_invalid")
+    manifest_raw, manifest_info = stable_read(manifest, "artifact_manifest")
+    if hashlib.sha256(manifest_raw).hexdigest() != canonical_sha(
+        receipt_rows.get("artifact_manifest_sha256", ""), "artifact_manifest"
+    ):
+        fail("artifact_manifest_receipt_digest_mismatch")
+    for key, value in (
+        ("artifact_manifest_device", manifest_info.st_dev),
+        ("artifact_manifest_inode", manifest_info.st_ino),
+        ("artifact_manifest_size", manifest_info.st_size),
+        ("artifact_manifest_mode", format(manifest_info.st_mode, "o")),
+        ("artifact_manifest_mtime_ns", manifest_info.st_mtime_ns),
+        ("artifact_manifest_ctime_ns", manifest_info.st_ctime_ns),
+    ):
+        if receipt_rows.get(key) != str(value):
+            fail(f"artifact_manifest_receipt_identity_mismatch:{key}")
+    manifest_rows, manifest_lines = parse_rows(manifest_raw, "artifact_manifest")
+    if (
+        manifest_rows.get("schema")
+        != "cheng.backend2.current_source_official_artifact_manifest"
+        or manifest_rows.get("status") != "PASS"
+        or manifest_rows.get("driver_role") != "production"
+    ):
+        fail("artifact_manifest_header_invalid")
+    manifest_payload_raw = ("\n".join(manifest_lines[:-1]) + "\n").encode()
+    if (
+        not manifest_lines[-1].startswith("manifest_payload_sha256=")
+        or manifest_rows.get("manifest_payload_sha256")
+        != hashlib.sha256(manifest_payload_raw).hexdigest()
+    ):
+        fail("artifact_manifest_payload_invalid")
+    rebuilt, _ = manifest_payload(root, official, manifest, receipt)
+    if rebuilt != manifest_raw:
+        fail("artifact_manifest_tree_mismatch")
+    raw_root = root / "raw"
+    required_receipt_artifacts = {
+        "summary_sha256": raw_root / "summary.kv",
+        "postflight_sha256": raw_root / "postflight.kv",
+        "fixed_point_sha256":
+            raw_root / "backend-driver.gen2-gen3.fixed-point.kv",
+        "backend2_epoch_raw_manifest_sha256":
+            raw_root / "backend2-epoch.raw-manifest.kv",
+        "backend2_jobs_raw_manifest_sha256":
+            raw_root / "backend2-jobs.raw-manifest.kv",
+    }
+    for key, path in required_receipt_artifacts.items():
+        raw, _ = stable_read(path, "receipt_required_artifact")
+        if hashlib.sha256(raw).hexdigest() != canonical_sha(
+            receipt_rows.get(key, ""), key
+        ):
+            fail(f"publisher_receipt_required_artifact_invalid:{key}")
+    summary_raw, _ = stable_read(raw_root / "summary.kv", "summary")
+    summary_rows, _ = parse_rows(summary_raw, "summary")
+    expected_summary = {
+        "schema": "cheng.backend2.current_source_gate",
+        "status": "pass",
+        "source_postflight_status": "stable",
+        "gen2_gen3_raw_bytes_equal": "true",
+        "gen2_gen3_distinct_artifact_inodes": "true",
+        "backend2_epoch_status": "pass",
+        "backend2_jobs1_jobs4_raw_bytes_equal": "true",
+        "backend2_jobs1_jobs4_distinct_artifact_inodes": "true",
+        "exact_command_environment_guard_count": "9",
+        "official_artifact_unchanged": "true",
+    }
+    for key, value in expected_summary.items():
+        if summary_rows.get(key) != value:
+            fail(f"publisher_summary_invalid:{key}")
+    validate_raw_manifest(
+        raw_root / "backend2-epoch.raw-manifest.kv", "backend2_epoch"
+    )
+    validate_raw_manifest(
+        raw_root / "backend2-jobs.raw-manifest.kv", "backend2_jobs"
+    )
+    for role in ("official_driver", "gen2", "gen3"):
+        path = pathlib.Path(
+            os.fsdecode(fshex_decode(receipt_rows.get(role + "_path_fshex", ""), role + "_path"))
+        )
+        raw, info = stable_read(path, role, True)
+        if (
+            hashlib.sha256(raw).hexdigest()
+            != canonical_sha(receipt_rows.get(role + "_sha256", ""), role)
+            or receipt_rows.get(role + "_device") != str(info.st_dev)
+            or receipt_rows.get(role + "_inode") != str(info.st_ino)
+        ):
+            fail(f"{role}_receipt_binding_invalid")
+    gen2 = pathlib.Path(os.fsdecode(fshex_decode(receipt_rows["gen2_path_fshex"], "gen2_path")))
+    gen3 = pathlib.Path(os.fsdecode(fshex_decode(receipt_rows["gen3_path_fshex"], "gen3_path")))
+    values = [stable_read(path, "fixed_driver", True) for path in (gen2, gen3, official)]
+    if values[0][0] != values[1][0] or values[0][0] != values[2][0]:
+        fail("fixed_driver_bytes_changed")
+    if len({(value[1].st_dev, value[1].st_ino) for value in values}) != 3:
+        fail("fixed_driver_inode_alias")
+
+    terminal_raw, terminal_info = stable_read(receipt, "publisher_receipt_terminal")
+    if (
+        terminal_raw != receipt_raw
+        or identity(terminal_info) != identity(receipt_info)
+    ):
+        fail("publisher_receipt_terminal_drift")
+
+
+def validate(arguments: list[str]) -> None:
+    if len(arguments) != 1:
+        fail("validate_arguments_invalid")
+    receipt = pathlib.Path(arguments[0])
+    receipt_raw, receipt_info = stable_read(receipt, "publisher_receipt")
+    validate_receipt_state(receipt, receipt_raw, receipt_info)
+
+
+def validate_fd(arguments: list[str]) -> None:
+    if len(arguments) != 2 or not arguments[0].isascii() or not arguments[0].isdigit():
+        fail("validate_fd_arguments_invalid")
+    descriptor = int(arguments[0])
+    receipt = pathlib.Path(arguments[1])
+    try:
+        opened = os.fstat(descriptor)
+        named = receipt.lstat()
+    except OSError as exc:
+        fail(f"validate_fd_open_failed:{exc}")
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or identity(opened) != identity(named)
+    ):
+        fail("validate_fd_identity_invalid")
+    digest = hashlib.sha256()
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < opened.st_size:
+        chunk = os.pread(descriptor, min(1024 * 1024, opened.st_size - offset), offset)
+        if not chunk:
+            fail("validate_fd_short_read")
+        digest.update(chunk)
+        chunks.append(chunk)
+        offset += len(chunk)
+    terminal = os.fstat(descriptor)
+    receipt_raw = b"".join(chunks)
+    if (
+        identity(opened) != identity(terminal)
+        or len(receipt_raw) != opened.st_size
+        or hashlib.sha256(receipt_raw).digest() != digest.digest()
+    ):
+        fail("validate_fd_read_drift")
+    validate_receipt_state(receipt, receipt_raw, opened)
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        fail("subcommand_missing")
+    command = sys.argv[1]
+    arguments = sys.argv[2:]
+    if command == "execution-manifests":
+        write_execution_manifests(arguments)
+    elif command == "validate-execution":
+        validate_execution(arguments)
+    elif command == "raw-manifest":
+        raw_manifest(arguments)
+    elif command == "validate-raw-manifest":
+        if len(arguments) != 2:
+            fail("validate_raw_manifest_arguments_invalid")
+        validate_raw_manifest(pathlib.Path(arguments[0]), arguments[1])
+    elif command == "publish":
+        publish(arguments)
+    elif command == "validate":
+        validate(arguments)
+    elif command == "validate-fd":
+        validate_fd(arguments)
+    else:
+        fail(f"subcommand_invalid:{command}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except EvidenceError as error:
+        print(f"backend2_current_source_official_evidence_error={error}", file=sys.stderr)
+        raise SystemExit(FAIL_RC)
+    except Exception as error:
+        print(
+            f"backend2_current_source_official_evidence_error=internal:{type(error).__name__}:{error}",
+            file=sys.stderr,
+        )
+        raise SystemExit(FAIL_RC)

@@ -1,0 +1,195 @@
+# turn_server_main: standalone UDP+TCP TURN (RFC 5766) server entry (stage 4).
+#
+# Build:
+#   cheng --emit:exe --link-providers --in:src/apps/turn_server/turn_server_main.cheng --out:turn_server
+# Run (cmdline flags, the pure-lower runtime does NOT read live env):
+#   ./turn_server --secret:test --realm:unimaker.fun --port:3478 \
+#                 --min-port:49160 --max-port:49260 --log-level:info \
+#                 --max-connections:256 --userdb:/path/to/users.txt
+#
+# Both transports share host:port (RFC 5766 udp+tcp on 3478). UDP runs in a
+# detached thread (single-threaded event loop, stage 1); TCP runs in the main
+# thread (per-connection threads, stage 2). A metrics printer thread dumps
+# counters to stderr every --metrics-interval-ms. SIGTERM/SIGINT raise a stop
+# flag that breaks both loops for graceful shutdown.
+#
+# Every routine is a small single-purpose function (stage 0-2 codegen contract).
+
+import std/system
+import std/rawbytes
+import std/strings as strings
+import std/atomic as atomic
+import std/thread
+import std/os as os
+import std/stun/turn_relay as relay
+import std/stun/turn_server as tsrv
+import std/stun/turn_tcp_server as ttcp
+import std/stun/turn_tls_server as ttls
+import std/stun/turn_config as cfg
+import std/stun/turn_log as tlog
+import std/stun/turn_metrics as metrics
+import std/stun/turn_userdb as userdb
+import std/stun/turn_nonce as nonce
+import std/stun/turn_ratelimit as ratelimit
+import std/stun/turn_portalloc as portalloc
+import std/log as slog
+
+const
+    turnMaxPerIp = 8
+
+@importc("signal")
+fn cSignal(signum: int32, handler: ptr): ptr
+
+var
+    g_udpServer: relay.TurnServer
+    g_tcpServer: ttcp.TurnTcpServer
+    g_tlsServer: ttls.TurnTlsServer
+    g_tlsEnabled: bool
+    g_mainStop: atomic.I32
+    g_metricsMs: int32
+    g_logger: slog.Logger
+
+fn TurnServerSignalHandler(sig: int32) =
+    atomic.StoreI32(g_mainStop, 1)
+    tsrv.TurnServerRequestStop()
+    ttcp.TurnTcpServerStop(g_tcpServer)
+    if g_tlsEnabled:
+        ttls.TurnTlsServerStop(g_tlsServer)
+
+fn TurnServerInstallSignals() =
+    g_mainStop = atomic.NewI32(0)
+    let _ = cSignal(15, &TurnServerSignalHandler)
+    let _ = cSignal(2, &TurnServerSignalHandler)
+
+fn TurnServerApplyRateLimit(c: cfg.TurnConfig) =
+    let rl: ratelimit.TurnRateLimit = ratelimit.TurnRateLimitNew(turnMaxPerIp)
+    relay.TurnServerSetRateLimit(rl)
+
+fn TurnServerApplyNonce(c: cfg.TurnConfig, secretBytes: rawbytes.Bytes) =
+    let cache: nonce.TurnNonceCache = nonce.TurnNonceCacheNew()
+    relay.TurnServerSetNonce(c.nonceTtlSec, secretBytes, cache)
+
+fn TurnServerApplyPortCap(c: cfg.TurnConfig) =
+    let pa: portalloc.TurnPortAlloc = portalloc.TurnPortAllocNew(c.minPort, c.maxPort)
+    relay.TurnServerSetPortAlloc(pa)
+    let cap: int32 = c.maxPort - c.minPort + 1
+    relay.TurnServerSetMaxAllocs(cap)
+
+fn TurnServerApplyUserDb(c: cfg.TurnConfig): rawbytes.Bytes =
+    if strings.Len(c.userdbPath) <= 0:
+        return rawbytes.EmptyBytes()
+    let db: userdb.TurnUserDb = userdb.TurnLoadUserDb(c.userdbPath)
+    relay.TurnServerSetUserDb(db)
+    if !userdb.TurnUserDbLoaded(db):
+        tlog.TurnLogWarn(g_logger, c.userdbPath)
+        return rawbytes.EmptyBytes()
+    if userdb.TurnUserDbHasRestSecret(db):
+        return userdb.TurnLookupRestSecret(db)
+    return rawbytes.EmptyBytes()
+
+fn TurnServerApplyConfig(c: cfg.TurnConfig, secretBytes: rawbytes.Bytes) =
+    relay.TurnServerSetMetrics(true)
+    metrics.TurnMetricsReset()
+    TurnServerApplyPortCap(c)
+    TurnServerApplyRateLimit(c)
+    TurnServerApplyNonce(c, secretBytes)
+
+fn TurnServerMetricsEntry(raw: ptr) =
+    while atomic.LoadI32(g_mainStop) == 0:
+        let _ = os.SleepMs(g_metricsMs)
+        metrics.TurnMetricsPrint()
+
+fn TurnServerUdpEntry(raw: ptr) =
+    let _ = tsrv.TurnServerRunBound(g_udpServer)
+
+fn TurnServerTlsEntry(raw: ptr) =
+    let _ = ttls.TurnTlsServerRun(g_tlsServer)
+
+fn TurnServerLogStartup(c: cfg.TurnConfig) =
+    tlog.TurnLogStartup(g_logger, c.realm, c.minPort, c.maxPort, c.maxConnections)
+    if g_tlsEnabled:
+        let tlsP: int32 = c.tlsPort
+        tlog.TurnLogListen(g_logger, c.host, c.port, "udp+tcp+tls")
+        echo(Fmt"turn_server: tls listen {c.host}:{tlsP}")
+    else:
+        tlog.TurnLogListen(g_logger, c.host, c.port, "udp+tcp")
+
+fn TurnServerLogShutdown() =
+    tlog.TurnLogShutdown(g_logger)
+    metrics.TurnMetricsPrint()
+
+fn TurnServerLoadTlsCertSet(c: cfg.TurnConfig, out: var ttls.TurnTlsCertSet): int32 =
+    return ttls.TurnTlsLoadCertSet(c.certPath, c.keyPath, c.caPath, out)
+
+fn TurnServerSetupTls(c: cfg.TurnConfig, certSet: ttls.TurnTlsCertSet, software: rawbytes.Bytes, realm: rawbytes.Bytes, nonceBytes: rawbytes.Bytes, useSecret: rawbytes.Bytes): int32 =
+    var tlsServer: ttls.TurnTlsServer = ttls.TurnTlsServerNew(c.host, c.tlsPort, certSet.certDer, certSet.caDer, certSet.hasCa, certSet.rsaN, certSet.rsaD, certSet.rsaModLen, software, realm, nonceBytes, useSecret)
+    let tlsBc: int32 = ttls.TurnTlsServerBind(tlsServer)
+    if tlsBc != 0:
+        let tlsP: int32 = c.tlsPort
+        echo(Fmt"turn_server: tls bind {c.host}:{tlsP} failed rc={tlsBc}")
+        return tlsBc
+    g_tlsServer = tlsServer
+    g_tlsEnabled = true
+    return 0
+
+fn main(): int32 =
+    var c: cfg.TurnConfig = cfg.TurnLoadConfigRuntime()
+    if !cfg.TurnConfigIsValid(c):
+        let err: str = cfg.TurnConfigError(c)
+        echo(Fmt"turn_server: config invalid: {err}")
+        echo("usage: turn_server --secret:STR --realm:STR --port:3478 --min-port:49160 --max-port:49260 --log-level:info --max-connections:256 --userdb:PATH [--tls-port:5349 --cert:PEM --key:PEM --ca:PEM]")
+        return 1
+    g_logger = tlog.TurnLogNew(c.logLevel)
+    g_metricsMs = c.metricsIntervalMs
+    tsrv.TurnServerSetLogger(g_logger)
+    ttcp.TurnTcpServerSetLogger(g_logger)
+    ttls.TurnTlsServerSetLogger(g_logger)
+    let secretBytes: rawbytes.Bytes = rawbytes.BytesFromString(c.secret)
+    let dbSecret: rawbytes.Bytes = TurnServerApplyUserDb(c)
+    var useSecret: rawbytes.Bytes = secretBytes
+    if rawbytes.BytesLen(dbSecret) > 0:
+        useSecret = dbSecret
+    TurnServerApplyConfig(c, secretBytes)
+    let realm: rawbytes.Bytes = rawbytes.BytesFromString(c.realm)
+    let nonceBytes: rawbytes.Bytes = rawbytes.BytesFromString(c.nonce)
+    let software: rawbytes.Bytes = rawbytes.BytesFromString(c.software)
+    var udpServer: relay.TurnServer = relay.TurnServerNew(c.host, c.port, software, realm, nonceBytes, useSecret)
+    let udpBc: int32 = tsrv.TurnServerBind(udpServer)
+    if udpBc != 0:
+        echo(Fmt"turn_server: udp bind {c.host}:{c.port} failed rc={udpBc}")
+        return udpBc
+    var tcpServer: ttcp.TurnTcpServer = ttcp.TurnTcpServerNew(c.host, c.port, software, realm, nonceBytes, useSecret)
+    let tcpBc: int32 = ttcp.TurnTcpServerBind(tcpServer)
+    if tcpBc != 0:
+        echo(Fmt"turn_server: tcp bind {c.host}:{c.port} failed rc={tcpBc}")
+        return tcpBc
+    g_udpServer = udpServer
+    g_tcpServer = tcpServer
+    if cfg.TurnConfigTlsEnabled(c):
+        var certSet: ttls.TurnTlsCertSet
+        let certRc: int32 = TurnServerLoadTlsCertSet(c, certSet)
+        if certRc != 0:
+            echo(Fmt"turn_server: tls cert/key load failed rc={certRc}")
+            return certRc
+        let tlsRc: int32 = TurnServerSetupTls(c, certSet, software, realm, nonceBytes, useSecret)
+        if tlsRc != 0:
+            return tlsRc
+    TurnServerInstallSignals()
+    TurnServerLogStartup(c)
+    let udpThread = thread.StartPtr(&TurnServerUdpEntry, nil)
+    if udpThread == nil:
+        echo("turn_server: udp thread start failed")
+        return 1
+    let _ = thread.Detach(udpThread)
+    if g_tlsEnabled:
+        let tlsThread = thread.StartPtr(&TurnServerTlsEntry, nil)
+        if tlsThread == nil:
+            echo("turn_server: tls thread start failed")
+            return 1
+        let _ = thread.Detach(tlsThread)
+    let metricsThread = thread.StartPtr(&TurnServerMetricsEntry, nil)
+    if metricsThread != nil:
+        let _ = thread.Detach(metricsThread)
+    let _ = ttcp.TurnTcpServerRun(g_tcpServer)
+    TurnServerLogShutdown()
+    return 0

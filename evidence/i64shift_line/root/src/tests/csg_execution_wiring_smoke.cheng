@@ -1,0 +1,403 @@
+# CSG 执行层接线 smoke (任务 08 首切片 verify a-i)。
+#
+# 把 05 的权威准入 (CsgActionAuthorityAdmit 凭证消费) 接到 06 预留的
+# CsgTaskRuntimeCompleteExecute 唯一回执注入点上, 逐项验证:
+# a. 乱序事件: 回执先于派发到达 -> 拒绝且无副作用 (凭证未被消费)
+# b. 重复回执/重复派发同一动作 -> 第二次拒绝 (含 Unknown 未核实态下)
+# c. 迟到回执 (世代已推进) -> 拒绝 (世代双键失效; 凭证按世代过期)
+# d. 凭证化路径: 有效凭证 -> 执行 -> 状态变化+回执 Ok; 确认类动作走旧
+#    bool 面 -> 显式拒绝并指向凭证入口
+# e. 单副作用在途闸: 第一个在途时第二个动作派发 -> 显式拒绝
+# f. 授权撤销 (AuthorizationChanged/authVersion 前进) -> 在途外新派发拒绝
+# g. UnknownOutcome -> 核实记录存在、重发被拒、新回执事件可终态化
+# h. idle 无忙轮询: 无事件时推进步数不变 (注入时钟口径)
+# i. 回归: 四个既有 smoke 全绿由门禁单独覆盖; 本文件只证新接线
+#
+# 全局权威单例的世代/撤销状态按 a -> e/h -> b -> g -> d -> f -> c 顺序演进,
+# 每段消费/撤销互不影子化 (与 csg_authority_admission_smoke 同一口径)。
+
+import std/strings
+import std/result
+import cheng/core/runtime/csg_decision_contract as dc
+import cheng/core/runtime/csg_action_authority as auth
+import cheng/core/runtime/csg_task_runtime as rtmod
+import cheng/apps/libp2p_browser/session as sess
+import cheng/apps/libp2p_browser/computer_use_session as cuse
+
+fn fail(code: int32, msg: str): int32 =
+    echo(msg)
+    return code
+
+# ---- execute 图最小夹具: 槽位 + 候选 + 动作 + execute(+receipt) 行 ----
+
+fn addExecGraph(g: var dc.CsgDecisionGraph, execCount: int32): int32 =
+    let goalSlot = dc.CsgDecisionSlotAdd(g, dc.CsgDecisionSlotKindGoal)
+    let opSlot = dc.CsgDecisionSlotAdd(g, dc.CsgDecisionSlotKindActionModel)
+    let preSlot = dc.CsgDecisionSlotAdd(g, dc.CsgDecisionSlotKindPrecondition)
+    let effSlot = dc.CsgDecisionSlotAdd(g, dc.CsgDecisionSlotKindEffectContract)
+    let authSlot = dc.CsgDecisionSlotAdd(g, dc.CsgDecisionSlotKindAuthorization)
+    let caSlot = dc.CsgDecisionSlotAdd(g, dc.CsgDecisionSlotKindCommitAuthority)
+    let predSlot = dc.CsgDecisionSlotAdd(g, dc.CsgDecisionSlotKindPredicate)
+    var cand: dc.CsgDecisionCandidate
+    cand.goalRef = goalSlot
+    cand.operationRef = opSlot
+    var noParams: int32[]
+    cand.paramSlots = noParams
+    cand.preconditionRef = preSlot
+    cand.effectContractRef = effSlot
+    cand.generation = g.generation
+    dc.CsgDecisionCandidateAdd(g, cand)
+    var act: dc.CsgDecisionActionNode
+    act.candidateRef = 0
+    act.authorizationRef = authSlot
+    act.preconditionRef = preSlot
+    act.generation = g.generation
+    dc.CsgDecisionActionAdd(g, act)
+    var i: int32 = 0
+    while i < execCount:
+        var exe: dc.CsgDecisionExecuteNode
+        exe.actionRef = 0
+        exe.commitAuthorityRef = caSlot
+        exe.generation = g.generation
+        dc.CsgDecisionExecuteAdd(g, exe)
+        i = i + 1
+    return predSlot
+
+fn addReceiptRow(g: var dc.CsgDecisionGraph, predSlot: int32) =
+    var rcpt: dc.CsgDecisionReceiptNode
+    rcpt.executionRef = 0
+    rcpt.goalPredicateRef = predSlot
+    rcpt.generation = g.generation
+    dc.CsgDecisionReceiptAdd(g, rcpt)
+
+type
+    ExecRig =
+        rt: rtmod.CsgTaskRuntime
+        nodeExec0: int32
+        nodeExec1: int32
+        nodeRcpt: int32
+
+fn newExecRig(execCount: int32, withReceipt: bool): ExecRig =
+    var g = dc.CsgDecisionGraphNew(1, int64(100))
+    let predSlot = addExecGraph(g, execCount)
+    if withReceipt:
+        addReceiptRow(g, predSlot)
+    var rt = rtmod.CsgTaskRuntimeNew(1, int64(100), 64)
+    var ad = rtmod.CsgTaskRuntimeAdoptGraph(rt, g)
+    assert(!IsErr(ad), "rig: adopt")
+    var out: ExecRig
+    out.rt = rt
+    var i: int32 = 0
+    while i < execCount:
+        var re = rtmod.CsgTaskRuntimeRegisterNode(out.rt, dc.CsgDecisionNodeClassExecute, i, int64(0))
+        assert(!IsErr(re), "rig: register exec")
+        if i == 0:
+            out.nodeExec0 = Value(re)
+        if i == 1:
+            out.nodeExec1 = Value(re)
+        i = i + 1
+    if withReceipt:
+        var rr = rtmod.CsgTaskRuntimeRegisterNode(out.rt, dc.CsgDecisionNodeClassReceipt, 0, int64(0))
+        assert(!IsErr(rr), "rig: register receipt")
+        out.nodeRcpt = Value(rr)
+        var e0 = rtmod.CsgTaskRuntimeAddDependency(out.rt, out.nodeExec0, out.nodeRcpt)
+        assert(!IsErr(e0), "rig: edge exec0->receipt")
+    return out
+
+fn bindExec(rt: var rtmod.CsgTaskRuntime, node: int32, actionKind: str, effectClass: str, payload: str) =
+    var b = rtmod.CsgTaskRuntimeBindExecuteAuthority(rt, node, actionKind, effectClass, payload)
+    assert(!IsErr(b), "bind execute authority")
+
+fn postGoal(rt: var rtmod.CsgTaskRuntime, label: str) =
+    var p = rtmod.CsgTaskRuntimePostEvent(rt, rtmod.CsgTaskEventGoalCommit, int64(0), int64(0))
+    assert(!IsErr(p), label)
+
+fn runPassOk(rt: var rtmod.CsgTaskRuntime, label: str) =
+    var r = rtmod.CsgTaskRuntimeRunPass(rt)
+    assert(!IsErr(r), label)
+
+# ---- verify d 会话夹具 (与 libp2p_browser_cuse_smoke 同一 CLB4 形状) ----
+
+fn wiringFixture(): str =
+    var s: str = "CLB4\n400 600 5 1\n"
+    s = strings.ConcatStr(s, "4 10 20 120 32 -1 -16777216 14 1 -16777216 2 400 0 0 0 0 0 0 0 400 600\nbutton\n\nbutton\nbtnOk\nGo\nGo\nsans-serif\n\n\n")
+    s = strings.ConcatStr(s, "1 10 70 200 32 -1 -16777216 14 1 -16777216 2 400 0 0 0 0 0 0 0 400 600\ntext\n\ntext\nq\n\n\nsans-serif\n\n\n")
+    s = strings.ConcatStr(s, "6 10 120 180 32 -1 -16777216 14 1 -16777216 2 400 0 0 0 0 0 0 0 400 600\nselect\n\nselect-one\ns\n\n\nsans-serif\n\n0\ta\tAlpha%0A0\tb\tBeta%0A1\tc\tGamma\n")
+    s = strings.ConcatStr(s, "1 10 170 200 32 -1 -16777216 14 1 -16777216 2 400 0 0 0 0 0 0 0 400 600\ntext\n\ntext\nfrozen\n\n\nsans-serif\n\n\n")
+    s = strings.ConcatStr(s, "1 10 220 200 32 -1 -16777216 14 1 -16777216 2 400 0 0 0 0 0 0 0 400 600\nnumber\n\nnumber\nn\n\n\nsans-serif\n\n\n")
+    s = strings.ConcatStr(s, "CTL|0|3|0|button|Go\n")
+    s = strings.ConcatStr(s, "CTL|1|4|0||Quantity\n")
+    s = strings.ConcatStr(s, "CTL|2|5|0||Choose\n")
+    s = strings.ConcatStr(s, "CTL|3|6|1||Frozen\n")
+    s = strings.ConcatStr(s, "CTL|4|7|0||Count\n")
+    return s
+
+fn widgetValue(session: var sess.BrowserSession, ctlId: int32): str =
+    var found: str = ""
+    var i: int32 = 0
+    while i < session.widgets.len:
+        if session.widgets[i].ctlId == ctlId:
+            found = strings.ConcatStr(session.widgets[i].value, "")
+        i = i + 1
+    return found
+
+# ---- verify a: 乱序回执 -> 拒绝且无副作用 ----
+
+fn s1(): int32 =
+    if !auth.CsgActionAuthorityGrantConfirm("SetText", "42"):
+        return fail(11, "a: grant credential")
+    let credRow = auth.CsgActionAuthorityLastGrantedRow()
+    if credRow < 0:
+        return fail(12, "a: credential handle")
+    var rig = newExecRig(1, true)
+    bindExec(rig.rt, rig.nodeExec0, "SetText", "payment", "42")
+    # a: 回执先于派发 (节点尚 Idle) -> 注入显式拒绝
+    var early = rtmod.CsgTaskRuntimeCompleteExecute(rig.rt, rig.nodeExec0, rtmod.CsgTaskExecOutcomeOk)
+    if !IsErr(early):
+        return fail(13, "a: receipt before dispatch must be rejected")
+    # a: 拒绝无副作用 —— 随后真实派发照常过准入并一次性消费该凭证
+    postGoal(rig.rt, "a: goal commit")
+    runPassOk(rig.rt, "a: dispatch pass")
+    if rtmod.CsgTaskRuntimeNodeState(rig.rt, rig.nodeExec0) != rtmod.CsgTaskNodeStatePending:
+        return fail(14, "a: execute must be in flight after dispatch")
+    if rtmod.CsgTaskRuntimeExecCredRowAt(rig.rt, rig.nodeExec0) != credRow:
+        return fail(15, "a: dispatch must consume the granted credential row")
+    var dupErr: str = ""
+    if auth.CsgActionAuthorityAdmit("SetText", "payment", "42", dupErr):
+        return fail(16, "a: credential must be single-consumption")
+    if dupErr != auth.CsgActionAuthorityErrCredentialUsed:
+        return fail(17, "a: reuse verdict must be credential_used")
+    # a: 真实回执注入 -> Ok, receipt 节点绑定真实结局
+    var ce = rtmod.CsgTaskRuntimeCompleteExecute(rig.rt, rig.nodeExec0, rtmod.CsgTaskExecOutcomeOk)
+    if IsErr(ce):
+        return fail(18, "a: receipt after dispatch must be accepted")
+    postGoal(rig.rt, "a: receipt wave")
+    runPassOk(rig.rt, "a: receipt wave pass")
+    if rtmod.CsgTaskRuntimeRcptOutcomeAt(rig.rt, rig.nodeRcpt) != rtmod.CsgTaskExecOutcomeOk:
+        return fail(19, "a: receipt must bind execute outcome")
+    echo("verify-a ok: out-of-order receipt rejected, no side effect, credential consumed exactly once")
+    return 0
+
+# ---- verify e: 单副作用在途闸; verify h: idle 无忙轮询 ----
+
+fn s2(): int32 =
+    var rig = newExecRig(2, false)
+    bindExec(rig.rt, rig.nodeExec0, "Click", "search", "")
+    bindExec(rig.rt, rig.nodeExec1, "Toggle", "filter", "")
+    postGoal(rig.rt, "e: goal commit")
+    runPassOk(rig.rt, "e: dispatch pass")
+    if rtmod.CsgTaskRuntimeNodeState(rig.rt, rig.nodeExec0) != rtmod.CsgTaskNodeStatePending:
+        return fail(21, "e: first side effect must be in flight")
+    if rtmod.CsgTaskRuntimeNodeState(rig.rt, rig.nodeExec1) != rtmod.CsgTaskNodeStateTerminal:
+        return fail(22, "e: second side-effect dispatch must be explicitly rejected")
+    if rtmod.CsgTaskRuntimeInflightCount(rig.rt) != 1:
+        return fail(23, "e: exactly one side effect in flight")
+    if rtmod.CsgTaskRuntimeFailureCount(rig.rt) != 1:
+        return fail(24, "e: rejection must be an explicit failure record")
+    echo("verify-e ok: second side-effect dispatch explicitly rejected while one in flight")
+    # h: 无事件推进 -> 步数不变, 在途保持 pending (无忙轮询)
+    let stepsBefore = rtmod.CsgTaskRuntimeStepCount(rig.rt)
+    runPassOk(rig.rt, "h: idle pass")
+    if rtmod.CsgTaskRuntimeStepCount(rig.rt) != stepsBefore:
+        return fail(25, "h: idle pass must not advance steps")
+    if rtmod.CsgTaskRuntimeNodeState(rig.rt, rig.nodeExec0) != rtmod.CsgTaskNodeStatePending:
+        return fail(26, "h: in-flight must stay pending while idle")
+    echo("verify-h ok: idle pass advances zero steps (no busy polling)")
+    return 0
+
+# ---- verify b: 重复回执/重复派发同一动作 ----
+
+fn s3(): int32 =
+    if !auth.CsgActionAuthorityGrantConfirm("SetText", "77"):
+        return fail(31, "b: grant credential")
+    var rig = newExecRig(1, false)
+    bindExec(rig.rt, rig.nodeExec0, "SetText", "filter", "77")
+    postGoal(rig.rt, "b: goal commit")
+    runPassOk(rig.rt, "b: dispatch pass")
+    var ce = rtmod.CsgTaskRuntimeCompleteExecute(rig.rt, rig.nodeExec0, rtmod.CsgTaskExecOutcomeOk)
+    if IsErr(ce):
+        return fail(32, "b: first receipt ok")
+    var ce2 = rtmod.CsgTaskRuntimeCompleteExecute(rig.rt, rig.nodeExec0, rtmod.CsgTaskExecOutcomeOk)
+    if !IsErr(ce2):
+        return fail(33, "b: duplicate receipt must be rejected")
+    # b: 世代推进后节点复位再派发同键动作 -> 盲目重发显式拒绝
+    var ps = rtmod.CsgTaskRuntimePostEvent(rig.rt, rtmod.CsgTaskEventStateCommit, int64(200), int64(0))
+    if IsErr(ps):
+        return fail(34, "b: state commit")
+    runPassOk(rig.rt, "b: redispatch pass")
+    if rtmod.CsgTaskRuntimeNodeState(rig.rt, rig.nodeExec0) != rtmod.CsgTaskNodeStateTerminal:
+        return fail(35, "b: blind resend must be rejected")
+    if rtmod.CsgTaskRuntimeFailureCount(rig.rt) != 1:
+        return fail(36, "b: resend rejection must be explicit")
+    echo("verify-b ok: duplicate receipt and blind resend of executed action rejected")
+    return 0
+
+# ---- verify g: UnknownOutcome 核实路径 ----
+
+fn s4(): int32 =
+    var rig = newExecRig(1, false)
+    bindExec(rig.rt, rig.nodeExec0, "Click", "search", "")
+    postGoal(rig.rt, "g: goal commit")
+    runPassOk(rig.rt, "g: dispatch pass")
+    var ce = rtmod.CsgTaskRuntimeCompleteExecute(rig.rt, rig.nodeExec0, rtmod.CsgTaskExecOutcomeUnknown)
+    if IsErr(ce):
+        return fail(41, "g: unknown outcome is an explicit accepted state")
+    if rtmod.CsgTaskRuntimeVerifyRecordCount(rig.rt) != 1:
+        return fail(42, "g: minimal verify record must exist")
+    if rtmod.CsgTaskRuntimeVerifyRecordNodeAt(rig.rt, 0) != rig.nodeExec0:
+        return fail(43, "g: record bound to node")
+    if rtmod.CsgTaskRuntimeVerifyRecordResolvedAt(rig.rt, 0) != 0:
+        return fail(44, "g: record starts unresolved")
+    if rtmod.CsgTaskRuntimeVerifyRecordGenerationAt(rig.rt, 0) != int64(100):
+        return fail(45, "g: record bound to generation")
+    var ce2 = rtmod.CsgTaskRuntimeCompleteExecute(rig.rt, rig.nodeExec0, rtmod.CsgTaskExecOutcomeUnknown)
+    if !IsErr(ce2):
+        return fail(46, "g: duplicate receipt under unknown must be rejected")
+    # g: 世代推进后同键动作再派发 -> 拒绝 (未核实禁盲目重发)
+    var ps = rtmod.CsgTaskRuntimePostEvent(rig.rt, rtmod.CsgTaskEventStateCommit, int64(300), int64(0))
+    if IsErr(ps):
+        return fail(47, "g: state commit")
+    runPassOk(rig.rt, "g: redispatch pass")
+    if rtmod.CsgTaskRuntimeNodeState(rig.rt, rig.nodeExec0) != rtmod.CsgTaskNodeStateTerminal:
+        return fail(48, "g: unverified resend must be rejected")
+    # g: 核实只能经新回执事件, 且必须是真实终局
+    var ru = rtmod.CsgTaskRuntimeResolveExecuteUnknown(rig.rt, rig.nodeExec0, rtmod.CsgTaskExecOutcomeUnknown)
+    if !IsErr(ru):
+        return fail(49, "g: unknown cannot finalize unknown")
+    var ro = rtmod.CsgTaskRuntimeResolveExecuteUnknown(rig.rt, rig.nodeExec0, rtmod.CsgTaskExecOutcomeOk)
+    if IsErr(ro):
+        return fail(50, "g: resolution receipt event must finalize")
+    if rtmod.CsgTaskRuntimeVerifyRecordResolvedAt(rig.rt, 0) != 1:
+        return fail(51, "g: record resolved")
+    if rtmod.CsgTaskRuntimeVerifyRecordFinalAt(rig.rt, 0) != rtmod.CsgTaskExecOutcomeOk:
+        return fail(52, "g: record final outcome")
+    var ro2 = rtmod.CsgTaskRuntimeResolveExecuteUnknown(rig.rt, rig.nodeExec0, rtmod.CsgTaskExecOutcomeOk)
+    if !IsErr(ro2):
+        return fail(53, "g: second resolution must be rejected")
+    echo("verify-g ok: unknown recorded (action+credential+generation), resend rejected, receipt event finalizes")
+    return 0
+
+# ---- verify f: 授权撤销 -> 在途外新派发拒绝 ----
+
+fn s6(): int32 =
+    if !auth.CsgActionAuthorityGrantConfirm("Toggle", "1"):
+        return fail(61, "f: grant credential")
+    var rig = newExecRig(1, false)
+    bindExec(rig.rt, rig.nodeExec0, "Toggle", "external-publish", "1")
+    var pa = rtmod.CsgTaskRuntimePostEvent(rig.rt, rtmod.CsgTaskEventAuthorizationChanged, int64(0), int64(0))
+    if IsErr(pa):
+        return fail(62, "f: authorization event")
+    postGoal(rig.rt, "f: goal commit")
+    runPassOk(rig.rt, "f: dispatch pass")
+    if rtmod.CsgTaskRuntimeAuthVersion(rig.rt) != 1:
+        return fail(63, "f: auth version must advance")
+    if rtmod.CsgTaskRuntimeNodeState(rig.rt, rig.nodeExec0) != rtmod.CsgTaskNodeStateTerminal:
+        return fail(64, "f: revoked dispatch must be rejected")
+    if rtmod.CsgTaskRuntimeFailureCount(rig.rt) != 1:
+        return fail(65, "f: revocation rejection must be explicit")
+    var err: str = ""
+    if auth.CsgActionAuthorityAdmit("Toggle", "external-publish", "1", err):
+        return fail(66, "f: credential must stay revoked")
+    if err != auth.CsgActionAuthorityErrRevoked:
+        return fail(67, "f: verdict must be revoked")
+    echo("verify-f ok: authorization change revokes unconsumed credentials; new dispatch rejected")
+    return 0
+
+# ---- verify c: 迟到回执 (世代已推进 -> 世代双键失效) ----
+
+fn s7(): int32 =
+    if !auth.CsgActionAuthorityGrantConfirm("SelectFile", "/tmp/late"):
+        return fail(71, "c: grant credential")
+    var rig = newExecRig(1, false)
+    bindExec(rig.rt, rig.nodeExec0, "SelectFile", "external-publish", "/tmp/late")
+    postGoal(rig.rt, "c: goal commit")
+    runPassOk(rig.rt, "c: dispatch pass")
+    if rtmod.CsgTaskRuntimeNodeState(rig.rt, rig.nodeExec0) != rtmod.CsgTaskNodeStatePending:
+        return fail(72, "c: execute in flight")
+    # c: 世代推进 = 整快照重铸 + 权威世代同步前进 (旧世代凭证整批过期)
+    var ps = rtmod.CsgTaskRuntimePostEvent(rig.rt, rtmod.CsgTaskEventStateCommit, int64(500), int64(0))
+    if IsErr(ps):
+        return fail(73, "c: state commit")
+    runPassOk(rig.rt, "c: post-commit pass")
+    # c: 迟到回执 —— 世代双键已失效, 注入拒绝
+    var late = rtmod.CsgTaskRuntimeCompleteExecute(rig.rt, rig.nodeExec0, rtmod.CsgTaskExecOutcomeOk)
+    if !IsErr(late):
+        return fail(74, "c: late receipt must be rejected")
+    # c: 新世代再派发 -> 凭证按世代过期, 权威准入拒绝
+    if rtmod.CsgTaskRuntimeNodeState(rig.rt, rig.nodeExec0) != rtmod.CsgTaskNodeStateTerminal:
+        return fail(75, "c: stale-generation dispatch must be rejected")
+    var err: str = ""
+    if auth.CsgActionAuthorityAdmit("SelectFile", "external-publish", "/tmp/late", err):
+        return fail(76, "c: old credential must be stale")
+    if err != auth.CsgActionAuthorityErrStaleGeneration:
+        return fail(77, "c: verdict must be stale generation")
+    echo("verify-c ok: late receipt rejected on generation double-key; credential stale after commit")
+    return 0
+
+# ---- verify d: 凭证化路径 (会话面; 状态变化 + 回执 Ok / bool 面拒绝) ----
+
+fn s8(): int32 =
+    let src = wiringFixture()
+    var session = sess.BrowserSessionInit("wiring-peer", 400, 600)
+    if !sess.BrowserSessionOnPageSnapshot(session, "https://ex.test/wiring", src):
+        return fail(81, "d: session snapshot")
+    var err: str = ""
+    if !auth.CsgActionAuthorityGrantConfirm("SetNumber", "42"):
+        return fail(82, "d: grant credential")
+    let credRow = auth.CsgActionAuthorityLastGrantedRow()
+    # d: 句柄提名面 —— 越界句柄显式拒绝
+    if cuse.BrowserCuseActionWithCredential(session, 7, "SetNumber", "42", "payment", credRow + 1000, err) != -3:
+        return fail(83, "d: bogus credential handle must fail")
+    if err != auth.CsgActionAuthorityErrCredentialHandle:
+        return fail(84, "d: handle verdict")
+    # d: 有效凭证 -> 执行 -> 真实状态变化
+    if cuse.BrowserCuseActionWithCredential(session, 7, "SetNumber", "42", "payment", credRow, err) != 0:
+        echo(err)
+        return fail(85, "d: credential path must execute")
+    if widgetValue(session, 7) != "42":
+        return fail(86, "d: state must change")
+    if session.applyCtlId != 7 || session.applyAction != "SetNumber" || session.applyValue != "42":
+        return fail(87, "d: apply channel")
+    # d: 一次性 —— 同句柄二次消费拒绝
+    if cuse.BrowserCuseActionWithCredential(session, 7, "SetNumber", "42", "payment", credRow, err) != -3:
+        return fail(88, "d: credential reuse must fail")
+    if err != auth.CsgActionAuthorityErrCredentialUsed:
+        return fail(89, "d: reuse verdict")
+    # d: 确认类动作走旧 bool 面 -> 显式拒绝并指向凭证入口
+    if cuse.BrowserCuseAction(session, 3, "Click", "", "external-publish", true, err) != -7:
+        return fail(90, "d: confirm-class bool face must reject")
+    if err != "cuse_e_confirmation_credential_required":
+        return fail(91, "d: bool face must point to credential entry")
+    if session.applyReady:
+        return fail(92, "d: rejected bool face must not leave apply")
+    # d: 确认要求为 none 的动作布尔面保持可用
+    if cuse.BrowserCuseAction(session, 7, "SetNumber", "7", "", false, err) != 0:
+        echo(err)
+        return fail(93, "d: none-class bool face must stay usable")
+    echo("verify-d ok: credential path executes with state change; confirm-class bool face rejected")
+    return 0
+
+fn main(): int32 =
+    var rc = s1()
+    if rc != 0:
+        return rc
+    rc = s2()
+    if rc != 0:
+        return rc
+    rc = s3()
+    if rc != 0:
+        return rc
+    rc = s4()
+    if rc != 0:
+        return rc
+    rc = s6()
+    if rc != 0:
+        return rc
+    rc = s7()
+    if rc != 0:
+        return rc
+    rc = s8()
+    if rc != 0:
+        return rc
+    echo("csg_execution_wiring_smoke ok")
+    return 0

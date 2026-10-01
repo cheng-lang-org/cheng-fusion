@@ -16,7 +16,7 @@ import {dirname, join} from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
 import {validateToolSchemas} from "../cli.ts";
 import {handleMcpRequest, writeToStreamWithBackpressure} from "../src/cheng_fusion_mcp_server_m9009.ts";
-import {getChengFusionToolManifest, getChengFusionTools, initChengFusionToolRegistryModule} from "../src/cheng_fusion_tool_registry.ts";
+import {getChengFusionToolManifest, loadAllChengFusionTools} from "../src/cheng_fusion_tool_registry.ts";
 import {JSON_RPC_MAX_FRAME_BYTES, JsonRpcFrameDecoder} from "../src/json_rpc_frame_decoder.ts";
 import {resolveChengProjectRoot} from "../src/cheng_toolkit_m9000.ts";
 
@@ -205,8 +205,7 @@ async function testMcpCliParity(tempRoot: string) {
     const cliList = parseJson(cliListRun.stdout, "CLI list");
     assert.deepEqual(cliList, mcpList.result);
     assertTrue(cliList.tools.length > 0, `CLI list exactly matches MCP tools/list (${cliList.tools.length} tools)`);
-    initChengFusionToolRegistryModule();
-    const registryTools = getChengFusionTools();
+    const registryTools = await loadAllChengFusionTools();
     const registryManifest = getChengFusionToolManifest();
     const registryNames = registryTools.map((tool: any) => tool.name).sort();
     assert.equal(registryManifest.count, registryTools.length);
@@ -228,7 +227,12 @@ async function testMcpCliParity(tempRoot: string) {
     const inline = await runCli(["run", "cheng_crash_triage", "--input", JSON.stringify(input)]);
     assert.equal(inline.exitCode, 0, `CLI inline run failed: ${inline.stderr}`);
     const inlineResult = parseJson(inline.stdout, "CLI inline run");
-    assert.deepEqual(inlineResult, mcpCall.result);
+    // 会话化 MCP 给 tools/call 结果附加 _meta.chengFusionRuntimeIdentity(进程内会话身份,
+    // bindToolResponseToMcpRuntime); 无头 CLI 是无会话独立进程, 天然没有也不该有。
+    // 载荷等价性必须剥掉这层传输级会话绑定后再比(_meta 之外任何字段不等仍会红)。
+    const {_meta: mcpSessionMeta, ...mcpCallPayload} = mcpCall.result;
+    assertTrue(Boolean(mcpSessionMeta), "session-scoped MCP response carries runtime identity via _meta");
+    assert.deepEqual(inlineResult, mcpCallPayload);
     assertTrue(true, "CLI run result exactly matches real MCP tools/call result");
 
     const inputFile = join(tempRoot, "crash-input.json");

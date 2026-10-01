@@ -1,0 +1,103 @@
+# compile_skip_cache — warm-incremental compile-skip 缓存层 (Tier2 funcEmitCid).
+# 正典 §10.2 #10, spec docs/beat-c.md §8..
+#
+# 状态: env-gated no-op 先行 (CHENG_COMPILE_SKIP_CACHE_ROOT=="" → 整块跳过, 字节等价 HEAD)。
+# op-lane 接线窗建此文件后, 在 backend2_pipeline.cheng 接 cache query/store (spec §7)。
+#
+# 硬约束 (spec §5.3):
+#   - miss=硬崩绝不 fallback (Let it crash); hit=contentCid 二次校验; 空 cid 拒收。
+#   - §11.9 不与 backend2 slice0 stub 共设 schema。
+#   - cid 命中≠产物对 (4b-4 同构) → contentCid 二次校验防语义哈希漏覆盖。
+#
+# 7-tuple 契约 (backend2_types.cheng:12-21, 冻结):
+#   funcEmitCid = sha256(codegenEpochSalt, targetTriple, typedFnCanonicalHash,
+#                        sourcePathHash, callTargets(sorted), callImportcSymbols(sorted),
+#                        calleeAbiViews(per-fn 窄视图))
+#
+# spec §3 cid 修正 (op-lane 实现须遵循):
+#   - codegenEpochSalt = Backend2Version() 非 canonicalGraphCid (§3.1)
+#   - sourcePathHash 不含行号 (§3.2)
+#   - typedFnCanonicalHash 含体 α 增量, 移除运行时元数据 (§3.3)
+#   - callTargets/callImportcSymbols 字典序排 (§3.5)
+#   - env-gate 关闭=不计算 cid (§3.6, 非返回空串碰撞)
+
+import std/result
+import std/os
+import std/rawbytes
+import cheng/core/tooling/path as chengpath
+import cheng/core/backend2/backend2_types as b2t
+import cheng/core/backend2/backend2_cid as b2cid
+import cheng/core/backend2/backend2_frag_codec as b2fc
+
+# ---- env-gate (关 = 现有路径, 零回归) ----
+fn CompileSkipCacheEnabled(): bool =
+    return os.GetEnv("CHENG_COMPILE_SKIP_CACHE_ROOT") != ""
+
+# ---- 缓存路径: <root>/<targetTriple>/<cid[:2]>/<cid>.frag (spec §3.7/§4.2) ----
+@borrows
+fn CompileSkipCacheShardDir(cidHex: str, targetTriple: str): str =
+    let root = os.GetEnv("CHENG_COMPILE_SKIP_CACHE_ROOT")
+    let shard = chengpath.TextSlice(cidHex, 0, 2)
+    return root + "/" + targetTriple + "/" + shard
+
+@borrows
+fn CompileSkipCachePath(cidHex: str, targetTriple: str): str =
+    return CompileSkipCacheShardDir(cidHex, targetTriple) + "/" + cidHex + ".frag"
+
+# ---- 查缓存: miss=Err 走现有路径; hit=decode+cid校验+contentCid二次校验 (spec §4.3) ----
+@borrows
+fn CompileSkipCacheGet(cidHex: str, targetTriple: str): Result[b2t.FunctionFragment] =
+    if !CompileSkipCacheEnabled():
+        return Err[b2t.FunctionFragment]("compile-skip cache disabled (no-op)")
+    let p = CompileSkipCachePath(cidHex, targetTriple)
+    if !os.FileExists(p):
+        return Err[b2t.FunctionFragment]("compile-skip cache miss cid=" + cidHex)
+    var readRes: Result[Bytes] = os.ReadFileBytesResult(p)
+    if IsErr(readRes):
+        return Err[b2t.FunctionFragment]("compile-skip cache read failed cid=" + cidHex)
+    var bytes = Value(readRes)
+    # ReadFileBytesResult transfers one owned raw buffer. FragmentDecode copies
+    # every string/sequence field, so no returned fragment aliases this storage.
+    defer:
+        rawbytes.BytesFree(bytes)
+    var cursor: int32
+    var frag = b2fc.Backend2FragmentDecode(bytes, cursor)
+    if cursor != bytes.len:
+        return Err[b2t.FunctionFragment]("compile-skip cache trailing bytes cid=" + cidHex)
+    # cid/content mismatch = 产物损坏, 按 §4.3 hit 契约硬崩 (VerifyCid/VerifyContent panic),
+    # 绝不降级成 miss 回磁盘 (a3.md §H#1 定谳)。funcEmitCid 语义哈希命中 ≠ 产物对 (4b-4 同构),
+    # 故再重算 contentCid 比对存储值防篡改/伪造/语义哈希漏覆盖。
+    b2cid.Backend2FragmentVerifyCid(frag, cidHex)
+    b2cid.Backend2FragmentVerifyContent(frag)
+    return Ok[b2t.FunctionFragment](frag)
+
+# ---- 写缓存: 空 cid 拒收; 原子写 tmp+rename; 失败硬崩 (spec §4.3) ----
+@borrows
+fn CompileSkipCachePut(
+        frag: var b2t.FunctionFragment,
+        targetTriple: str): Result[bool] =
+    if !CompileSkipCacheEnabled():
+        return Ok[bool](true)
+    # 空 funcEmitCid/contentCid = panic (空键碰撞 = 任意函数命中他人机器码, spec §4.3/§9#4)。
+    b2cid.Backend2FragmentCacheKeyGuard(frag)
+    let finalPath = CompileSkipCachePath(frag.funcEmitCid, targetTriple)
+    os.MkdirAll(CompileSkipCacheShardDir(frag.funcEmitCid, targetTriple), 493)
+    var enc: Bytes = b2fc.Backend2FragmentEncode(frag)
+    let tmpPath = finalPath + ".tmp"
+    # 原子写 (内联 cas_store.cheng:64 casWriteBytesAtomic 模式; 内容寻址 => final 已在即成功)。
+    if os.FileExists(tmpPath):
+        os.RemoveFile(tmpPath)
+    var writeRes: Result[bool] = os.WriteFileBytesResult(tmpPath, enc)
+    rawbytes.BytesFree(enc)
+    if IsErr(writeRes):
+        os.RemoveFile(tmpPath)
+        return Err[bool]("compile-skip cache put: tmp write failed: " + tmpPath)
+    if !os.FileExists(tmpPath):
+        return Err[bool]("compile-skip cache put: tmp missing after write: " + tmpPath)
+    if os.RenameFile(tmpPath, finalPath):
+        return Ok[bool](true)
+    if os.FileExists(finalPath):
+        os.RemoveFile(tmpPath)
+        return Ok[bool](true)
+    os.RemoveFile(tmpPath)
+    return Err[bool]("compile-skip cache put: rename failed: " + finalPath)

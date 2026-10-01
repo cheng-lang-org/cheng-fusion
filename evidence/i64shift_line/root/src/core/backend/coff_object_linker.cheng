@@ -1,0 +1,2085 @@
+# Minimal PE/COFF AArch64 linker (Windows): links backend-emitted `.obj` into a PE32+ executable.
+# Scope (v1):
+# - Input objects: COFF relocatable `.obj` emitted by our backend (coff_writer.cheng).
+# - Relocations supported: IMAGE_REL_ARM64_BRANCH26, IMAGE_REL_ARM64_PAGEBASE_REL21, IMAGE_REL_ARM64_PAGEOFFSET_12A.
+# - Undefined symbols: supported for BRANCH26 via PE imports (IAT stubs); others are rejected.
+# - Output: PE32+ console executable with a tiny `_start` that calls `main` then `ExitProcess`.
+import std/bytes
+import std/os
+import std/rawbytes
+import std/result
+import std/rawmem_support
+import std/seqs
+import std/strings
+import std/strformat
+import std/monotimes
+import std/strutils as strutil
+import cheng/core/backend/codegen_a64_link_units as a64link
+import cheng/core/backend/linker_shared_core
+
+type
+    CoffObjReloc =
+        off: uint32
+        symIndex: uint32
+        rtype: int32
+
+    CoffObjSymbol =
+        name: str
+        value: uint32
+        sect: int32 # 1-based; 0 = undefined
+        stype: int32
+        storage: uint8
+
+    CoffObjFile =
+        path: str
+        buf: bytes.ByteBuffer
+        machine: int32
+        textIndex: int32
+        rdataIndex: int32
+        dataIndex: int32
+        bssIndex: int32
+        text: uint8[]
+        textRawPtr: uint32
+        rdata: uint8[]
+        data: uint8[]
+        bssSize: uint64
+        textAlign: uint64
+        rdataAlign: uint64
+        dataAlign: uint64
+        bssAlign: uint64
+        textSectionIndices: int32[]
+        textSectionOffsets: uint64[]
+        textSectionRawPtrs: uint32[]
+        textSectionRawSizes: uint64[]
+        rdataSectionIndices: int32[]
+        rdataSectionOffsets: uint64[]
+        rdataSectionRawPtrs: uint32[]
+        rdataSectionRawSizes: uint64[]
+        dataSectionIndices: int32[]
+        dataSectionOffsets: uint64[]
+        dataSectionRawPtrs: uint32[]
+        dataSectionRawSizes: uint64[]
+        bssSectionIndices: int32[]
+        bssSectionOffsets: uint64[]
+        relocsText: CoffObjReloc[]
+        relocsRdata: CoffObjReloc[]
+        relocsData: CoffObjReloc[]
+        symbols: CoffObjSymbol[]
+
+    CoffLinkObjLayout =
+        textOff: uint64
+        rdataOff: uint64
+        dataOff: uint64
+        bssOff: uint64
+
+    CoffLinkDef =
+        name: str
+        rva: uint64
+
+    CoffImport =
+        name: str
+        dll: str
+        stubOff: uint64
+        iatOff: uint32
+
+const
+    # Input object format.
+    IMAGE_FILE_MACHINE_ARM64: int32 = 43620
+    IMAGE_FILE_MACHINE_AMD64: int32 = 34404
+    IMAGE_SYM_CLASS_EXTERNAL: uint8 = 2
+
+    IMAGE_REL_ARM64_BRANCH26: int32 = 3
+    IMAGE_REL_ARM64_PAGEBASE_REL21: int32 = 4
+    IMAGE_REL_ARM64_PAGEOFFSET_12A: int32 = 6
+    IMAGE_REL_AMD64_ADDR64: int32 = 1
+    IMAGE_REL_AMD64_ADDR32: int32 = 2
+    IMAGE_REL_AMD64_REL32: int32 = 4
+
+    # PE output.
+    PE_SECTION_ALIGN: uint32 = 4096
+    PE_FILE_ALIGN: uint32 = 512
+    IMAGE_DOS_SIGNATURE: int32 = 23117 # MZ
+    IMAGE_NT_SIGNATURE: uint32 = 17744 # PE\0\0
+
+    IMAGE_FILE_EXECUTABLE_IMAGE: int32 = 0x0002
+    IMAGE_FILE_LARGE_ADDRESS_AWARE: int32 = 0x0020
+
+    IMAGE_SUBSYSTEM_WINDOWS_CUI: int32 = 3
+
+    IMAGE_SCN_CNT_CODE: uint32 = 32
+    IMAGE_SCN_CNT_INITIALIZED_DATA: uint32 = 64
+    IMAGE_SCN_CNT_UNINITIALIZED_DATA: uint32 = 128
+    IMAGE_SCN_MEM_EXECUTE: uint32 = 536870912
+    IMAGE_SCN_MEM_READ: uint32 = 1073741824
+
+    # Optional header magic.
+    IMAGE_NT_OPTIONAL_HDR64_MAGIC: int32 = 523
+
+    IMAGE_NUMBEROF_DIRECTORY_ENTRIES: uint32 = 16
+    IMAGE_DIRECTORY_ENTRY_IMPORT: int32 = 1
+
+# -- uint8[] buffer helpers (same pattern as the ELF linker) --
+
+fn coffBufU8(out: var uint8[], value: uint8) =
+    let idx = out.len
+    setLen(out, idx + 1)
+    out[idx] = value
+
+fn coffBufU16(out: var uint8[], value: int32) =
+    let v = value
+    let idx = out.len
+    setLen(out, idx + 2)
+    out[idx] = uint8(v & 0xFF)
+    out[idx + 1] = uint8((v >> 8) & 0xFF)
+
+fn coffBufU32(out: var uint8[], value: uint32) =
+    let idx = out.len
+    setLen(out, idx + 4)
+    for i in 0..<4:
+        out[idx + i] = uint8((value >> uint32(i * 8)) & uint32(0xFF))
+
+fn coffBufU64(out: var uint8[], value: uint64) =
+    let idx = out.len
+    setLen(out, idx + 8)
+    for i in 0..<8:
+        out[idx + i] = uint8((value >> uint64(i * 8)) & uint64(0xFF))
+
+@borrows
+fn coffBufStr0(out: var uint8[], s: str) =
+    for i in 0..<len(s):
+        let idx = out.len
+        setLen(out, idx + 1)
+        out[idx] = uint8(int32(s[i]) & 0xFF)
+    let idx = out.len
+    setLen(out, idx + 1)
+    out[idx] = uint8(0)
+
+fn coffBufAlign(out: var uint8[], align: uint64) =
+    if align <= 1:
+        return
+    let mask = align - uint64(1)
+    let aligned = ((uint64(out.len) + mask) / align) * align
+    let pad = aligned - uint64(out.len)
+    if pad > 0:
+        for _ in 0..<pad:
+            coffBufU8(out, uint8(0))
+
+@borrows
+fn coffBufBytes(out: var uint8[], data: uint8[]) =
+    let n = data.len
+    if n <= 0:
+        return
+    let start = out.len
+    setLen(out, start + n)
+    for i in 0..<n:
+        out[start + i] = data[i]
+
+fn coffBufU32At(buf: var uint8[], off: int32, value: uint32) =
+    for i in 0..<4:
+        buf[off + i] = uint8((value >> uint32(i * 8)) & uint32(0xFF))
+
+fn coffBufU16At(buf: var uint8[], off: int32, value: int32) =
+    let v = value
+    buf[off] = uint8(v & 0xFF)
+    buf[off + 1] = uint8((v >> 8) & 0xFF)
+
+# -- end buffer helpers --
+
+fn coffAlignUp(value: uint64, align: uint64): uint64 =
+    return linkerCoreAlignUp(value, align)
+
+fn coffAlignUp32(value: uint32, align: uint32): uint32 =
+    if align <= 1:
+        return value
+    let rem: uint32 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+@borrows
+fn coffBufU8AtRead(buf: bytes.ByteBuffer, off: int32): uint8 =
+    let raw = bytes.BufByteAt(buf, off)
+    let masked = raw & 255
+    return uint8(masked)
+
+@borrows
+fn coffBufU16AtRead(buf: bytes.ByteBuffer, off: int32): int32 =
+    let b0 = bytes.BufByteAt(buf, off) & 255
+    let b1 = bytes.BufByteAt(buf, off + 1) & 255
+    return b0 + b1 * 256
+
+@borrows
+fn coffBufU32AtRead(buf: bytes.ByteBuffer, off: int32): uint32 =
+    let b0 = bytes.BufByteAt(buf, off) & 255
+    let b1 = bytes.BufByteAt(buf, off + 1) & 255
+    let b2 = bytes.BufByteAt(buf, off + 2) & 255
+    let b3 = bytes.BufByteAt(buf, off + 3) & 255
+    let value = uint64(b0) +
+                uint64(b1) * uint64(256) +
+                uint64(b2) * uint64(65536) +
+                uint64(b3) * uint64(16777216)
+    return uint32(value)
+
+@borrows
+fn coffBufU64AtRead(buf: bytes.ByteBuffer, off: int32): uint64 =
+    let lo: uint64 = uint64(coffBufU32AtRead(buf, off))
+    let hi: uint64 = uint64(coffBufU32AtRead(buf, off + 4))
+    return lo | (hi << 32)
+
+@borrows
+fn coffReadBytes(buf: bytes.ByteBuffer, off: uint64, size: uint64): uint8[] =
+    var out: uint8[]
+    if size == 0:
+        return out
+    if off + size > uint64(buf.len):
+        return out
+    let n = int32(size)
+    let start = int32(off)
+    setLen(out, n)
+    for i in 0..<n:
+        out[i] = uint8(bytes.BufByteAt(buf, start + i) & 255)
+    return out
+
+@borrows
+fn coffStrFromBytes(buf: bytes.ByteBuffer, off: uint64, size: uint64): str =
+    if size == 0:
+        return ""
+    if off + size > uint64(buf.len):
+        return ""
+    let n = int32(size)
+    let out = NewStringAlloc(n)
+    let raw = StrDataPtr(out)
+    if raw == nil:
+        return ""
+    let start = int32(off)
+    if buf.data != nil:
+        rawmem_support.RawmemCopy(raw, rawmem_support.RawmemPtrAdd(buf.data, start), n)
+    return out
+
+@borrows
+fn coffReadFixedStr8(buf: bytes.ByteBuffer, off: uint64): str =
+    if off + 8 > uint64(buf.len):
+        return ""
+    var n: int32 = -1
+    for i in 0..<8:
+        if bytes.BufByteAt(buf, int32(off) + i) == 0:
+            n = i
+            break
+    if n < 0:
+        n = 8
+    if n == 0:
+        return ""
+    return coffStrFromBytes(buf, off, uint64(n))
+
+@borrows
+fn coffReadCStringAt(buf: bytes.ByteBuffer, off: uint64, maxSize: uint64): str =
+    if maxSize == 0:
+        return ""
+    if off >= uint64(buf.len):
+        return ""
+    var n: int32 = -1
+    let limit = int32(maxSize)
+    var i: int32
+    while i < limit:
+        if !(int32(off) + i < buf.len):
+            n = i
+            break
+        if bytes.BufByteAt(buf, int32(off) + i) == 0:
+            n = i
+            break
+        i = i + 1
+    if n < 0:
+        n = limit
+    if n == 0:
+        return ""
+    return coffStrFromBytes(buf, off, uint64(n))
+
+@borrows
+fn coffFixedNameEquals(buf: bytes.ByteBuffer, off: uint64, expected: str): bool =
+    if off + 8 > uint64(buf.len):
+        return false
+    for i in 0..<8:
+        var want = 0
+        if i < len(expected):
+            want = int32(expected[i]) & 255
+        if bytes.BufByteAt(buf, int32(off) + i) != want:
+            return false
+    return true
+
+@borrows
+fn coffReadFixedKnownName(buf: bytes.ByteBuffer, off: uint64): str =
+    if coffFixedNameEquals(buf, off, "main"):
+        return "main"
+    if coffFixedNameEquals(buf, off, "puts"):
+        return "puts"
+    return coffReadFixedStr8(buf, off)
+
+fn coffBoolText(value: bool): str =
+    if value:
+        return "1"
+    return "0"
+
+fn coffImageScnMemWrite(): uint32 =
+    return uint32(2147483647) + uint32(1)
+
+fn coffPeImageBase(): uint64 =
+    var base = uint64(1)
+    base = base << uint64(32)
+    return base + uint64(0x400000)
+
+@borrows
+fn coffStrEqAscii(value: str, expected: str): bool =
+    if len(value) != len(expected):
+        return false
+    for i in 0..<len(expected):
+        if int32(value[i]) != int32(expected[i]):
+            return false
+    return true
+
+@borrows
+fn coffStrStartsWithAscii(value: str, expected: str): bool =
+    if len(value) < len(expected):
+        return false
+    for i in 0..<len(expected):
+        if int32(value[i]) != int32(expected[i]):
+            return false
+    return true
+
+@borrows
+fn coffReadSectionName(buf: bytes.ByteBuffer, nameOff: uint64, strPtr: uint64, strSize: uint64): str =
+    if nameOff + 8 > uint64(buf.len):
+        return ""
+    if bytes.BufByteAt(buf, int32(nameOff)) == int32('/'):
+        var off: uint64
+        var sawDigit = false
+        for i in 1..<8:
+            let ch = bytes.BufByteAt(buf, int32(nameOff) + i)
+            if ch == 0:
+                break
+            if ch < int32('0') || ch > int32('9'):
+                return coffReadFixedStr8(buf, nameOff)
+            sawDigit = true
+            off = off * uint64(10) + uint64(ch - int32('0'))
+        if sawDigit && off >= uint64(4) && off < strSize:
+            return coffReadCStringAt(buf, strPtr + off, strSize - off)
+    return coffReadFixedStr8(buf, nameOff)
+
+fn coffSectionAlignFromChars(chars: uint32): uint64 =
+    let v: uint32 = (chars >> 20) & uint32(0xF)
+    if v == 0:
+        return 1
+    return uint64(1) << uint64(v - 1)
+
+@borrows
+fn coffReadSymName(buf: bytes.ByteBuffer, nameOff: uint64, strPtr: uint64, strSize: uint64): str =
+    if nameOff + 8 > uint64(buf.len):
+        return ""
+    let a0: uint32 = coffBufU32AtRead(buf, int32(nameOff))
+    let a1: uint32 = coffBufU32AtRead(buf, int32(nameOff + 4))
+    if a0 == 0:
+        let off: uint64 = uint64(a1)
+        if off < 4 || off >= strSize:
+            return ""
+        if coffNameProbeEnabled():
+            return "x"
+        return coffReadCStringAt(buf, strPtr + off, strSize - off)
+    return coffReadFixedKnownName(buf, nameOff)
+
+fn coffIsAsciiDrive(ch: char): bool =
+    if ch >= 'A' && ch <= 'Z':
+        return true
+    if ch >= 'a' && ch <= 'z':
+        return true
+    return false
+
+@borrows
+fn coffHostPath(path: str): str =
+    if len(path) >= 3 && path[0] == '/' && coffIsAsciiDrive(path[1]) && path[2] == '/':
+        return Fmt"{strings.SliceBytes(path, 1, 1)}:{strings.SliceBytes(path, 2, len(path) - 2)}"
+    return strings.CloneStr(path)
+
+fn coffHexValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return int32(ch) - int32('a') + 10
+    if ch >= 'A' && ch <= 'F':
+        return int32(ch) - int32('A') + 10
+    return -1
+
+fn coffHexValueByte(ch: int32): int32 =
+    if ch >= int32('0') && ch <= int32('9'):
+        return ch - int32('0')
+    if ch >= int32('a') && ch <= int32('f'):
+        return ch - int32('a') + 10
+    if ch >= int32('A') && ch <= int32('F'):
+        return ch - int32('A') + 10
+    return -1
+
+fn coffAllocByteBuffer(n: int32): bytes.ByteBuffer =
+    return bytes.NewByteBuffer(n)
+
+fn coffFreeByteBuffer(buf: var bytes.ByteBuffer) =
+    bytes.FreeByteBuffer(buf)
+
+@borrows
+fn coffReadHexSidecar(path: str): bytes.ByteBuffer =
+    let sidecarPath = Fmt"{path}.hex"
+    let sidecarHostPath = coffHostPath(sidecarPath)
+    var raw = bytes.readFileBytes(sidecarHostPath)
+    if raw.len <= 0 || (raw.len % 2) != 0:
+        bytes.FreeByteBuffer(raw)
+        return bytes.NewByteBuffer(0)
+    var out = coffAllocByteBuffer(raw.len / 2)
+    if out.data == nil:
+        bytes.FreeByteBuffer(raw)
+        return out
+    var outIndex: int32
+    var hi = -1
+    for i in 0..<raw.len:
+        let v = coffHexValueByte(bytes.BufByteAt(raw, i))
+        if v < 0:
+            bytes.FreeByteBuffer(raw)
+            coffFreeByteBuffer(out)
+            return bytes.NewByteBuffer(0)
+        if hi < 0:
+            hi = v
+        else:
+            if outIndex >= out.len:
+                bytes.FreeByteBuffer(raw)
+                coffFreeByteBuffer(out)
+                return bytes.NewByteBuffer(0)
+            bytes.BufSetByte(out, outIndex, (hi << 4) | v)
+            outIndex = outIndex + 1
+            hi = -1
+    bytes.FreeByteBuffer(raw)
+    if hi >= 0 || outIndex != out.len:
+        coffFreeByteBuffer(out)
+        return bytes.NewByteBuffer(0)
+    return out
+
+@borrows
+fn coffReadBinaryFileBytes(path: str): bytes.ByteBuffer =
+    let hostPath = coffHostPath(path)
+    coffDebug(Fmt"coff_link_debug=read_file_host path={hostPath}")
+    return bytes.readFileBytes(hostPath)
+
+@borrows
+fn coffReadFileBytes(path: str): bytes.ByteBuffer =
+    let binary = coffReadBinaryFileBytes(path)
+    if binary.data != nil && binary.len > 0:
+        return binary
+    let sidecar = coffReadHexSidecar(path)
+    if sidecar.data != nil && sidecar.len > 0:
+        coffDebug(Fmt"coff_link_debug=read_file_from_hex len={strings.IntToStr(sidecar.len)}")
+        return sidecar
+    return bytes.NewByteBuffer(0)
+
+@borrows
+fn coffWriteFileBytes(path: str, data: uint8[]): bool =
+    if len(path) <= 0:
+        return false
+    var packed = rawbytes.BytesAlloc(data.len)
+    if data.len > 0 &&
+       (rawbytes.BytesLen(packed) != data.len ||
+        rawbytes.BytesDataPtr(packed) == nil):
+        rawbytes.BytesFree(packed)
+        return false
+    for i in 0..<data.len:
+        rawbytes.BytesSet(packed, i, int32(data[i]) & 255)
+    var writeRes: Result[bool] = os.WriteFileBytesResult(path, packed)
+    let ok = result.IsOk(writeRes)
+    rawbytes.BytesFree(packed)
+    return ok
+
+@borrows
+fn coffReadRelObj(path: str): Result[CoffObjFile] =
+    coffDebug(Fmt"coff_link_debug=read_rel_enter path={path}")
+    var readPhaseNs: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    var out: CoffObjFile
+    var relocsText: CoffObjReloc[]
+    var symbols: CoffObjSymbol[]
+    out.path = share(path)
+    coffDebug("coff_link_debug=read_file_before")
+    out.buf = coffReadFileBytes(path)
+    readPhaseNs = coffPhaseMs("read_one_file_bytes", readPhaseNs)
+    coffDebug(Fmt"coff_link_debug=read_file_after len={strings.IntToStr(out.buf.len)}")
+    if out.buf.data == nil || out.buf.len < 20:
+        return Err[CoffObjFile](Fmt"coff_linker: failed to read obj: {path}")
+
+    coffDebug(Fmt"coff_link_debug=first_bytes b0={strings.IntToStr(bytes.BufByteAt(out.buf, 0))} b1={strings.IntToStr(bytes.BufByteAt(out.buf, 1))}")
+    let machine: int32 = coffBufU16AtRead(out.buf, 0)
+    coffDebug(Fmt"coff_link_debug=machine_raw value={strings.IntToStr(machine)}")
+    if machine != IMAGE_FILE_MACHINE_ARM64 && machine != IMAGE_FILE_MACHINE_AMD64:
+        return Err[CoffObjFile](Fmt"coff_linker: expected coff-arm64-or-amd64: {path}")
+    out.machine = machine
+    let nsects: int32 = coffBufU16AtRead(out.buf, 2)
+    let symPtr: uint32 = coffBufU32AtRead(out.buf, 8)
+    let symCount: uint32 = coffBufU32AtRead(out.buf, 12)
+    let optSize: int32 = coffBufU16AtRead(out.buf, 16)
+    coffDebug(Fmt"coff_link_debug=header machine={strings.IntToStr(machine)} sections={strings.IntToStr(nsects)} symbols={strings.IntToStr(int32(symCount))}")
+    if optSize != 0:
+        return Err[CoffObjFile](Fmt"coff_linker: expected relocatable obj (no optional header): {path}")
+
+    let secTableOff: uint64 = uint64(20)
+    let secSize: uint64 = uint64(40)
+    if uint64(nsects) == 0:
+        return Err[CoffObjFile](Fmt"coff_linker: missing sections: {path}")
+    if secTableOff + uint64(nsects) * secSize > uint64(out.buf.len):
+        return Err[CoffObjFile](Fmt"coff_linker: section headers truncated: {path}")
+
+    let symTableOff: uint64 = uint64(symPtr)
+    let symTableSize: uint64 = uint64(symCount) * uint64(18)
+    coffDebug(Fmt"coff_link_debug=sym_table off={strings.IntToStr(int32(symTableOff))} size={strings.IntToStr(int32(symTableSize))} buf_len={strings.IntToStr(out.buf.len)}")
+    if symPtr == 0 || symCount == 0:
+        return Err[CoffObjFile](Fmt"coff_linker: missing symbol table: {path}")
+    if symTableOff + symTableSize > uint64(out.buf.len):
+        return Err[CoffObjFile](Fmt"coff_linker: symbol table truncated: {path}")
+
+    let strPtr: uint64 = symTableOff + symTableSize
+    if strPtr + 4 > uint64(out.buf.len):
+        return Err[CoffObjFile](Fmt"coff_linker: missing string table: {path}")
+    let strSize: uint64 = uint64(coffBufU32AtRead(out.buf, int32(strPtr)))
+    coffDebug(Fmt"coff_link_debug=str_table ptr={strings.IntToStr(int32(strPtr))} size={strings.IntToStr(int32(strSize))}")
+    if strSize < 4 || strPtr + strSize > uint64(out.buf.len):
+        return Err[CoffObjFile](Fmt"coff_linker: invalid string table: {path}")
+
+    out.textIndex = 0
+    out.rdataIndex = 0
+    out.dataIndex = 0
+    out.bssIndex = 0
+    out.textAlign = 16
+    out.rdataAlign = 1
+    out.dataAlign = 1
+    out.bssAlign = 1
+    out.text = []
+    out.rdata = []
+    out.data = []
+    out.bssSize = 0
+
+    # Scan sections and load relevant data.
+    coffDebug("coff_link_debug=sections_begin")
+    for si in 0..<nsects:
+        let shOff: uint64 = secTableOff + uint64(si) * secSize
+        let sectionName = coffReadSectionName(out.buf, shOff + 0, strPtr, strSize)
+        let isTextSection = coffStrStartsWithAscii(sectionName, ".text")
+        let isRdataSection = coffStrStartsWithAscii(sectionName, ".rdata")
+        let isDataSection = coffStrStartsWithAscii(sectionName, ".data")
+        let isBssSection = coffStrStartsWithAscii(sectionName, ".bss")
+        let vsize: uint32 = coffBufU32AtRead(out.buf, int32(shOff + 8))
+        let rawSize: uint32 = coffBufU32AtRead(out.buf, int32(shOff + 16))
+        let rawPtr: uint32 = coffBufU32AtRead(out.buf, int32(shOff + 20))
+        let relPtr: uint32 = coffBufU32AtRead(out.buf, int32(shOff + 24))
+        let relCount: int32 = coffBufU16AtRead(out.buf, int32(shOff + 32))
+        let chars: uint32 = coffBufU32AtRead(out.buf, int32(shOff + 36))
+
+        var align: uint64 = 1
+        let alignNibble: uint32 = (chars / uint32(1048576)) % uint32(16)
+        if alignNibble > uint32(0):
+            align = uint64(1) << uint64(alignNibble - uint32(1))
+        let secIndex: int32 = int32(si) + 1
+
+        if isTextSection:
+            if out.textIndex == 0:
+                out.textIndex = secIndex
+            if align > out.textAlign:
+                out.textAlign = align
+            coffBufAlign(out.text, align)
+            let textRelocBase = uint32(out.text.len)
+            add(out.textSectionIndices, secIndex)
+            add(out.textSectionOffsets, uint64(out.text.len))
+            add(out.textSectionRawPtrs, rawPtr)
+            add(out.textSectionRawSizes, uint64(rawSize))
+            if out.textRawPtr == uint32(0):
+                out.textRawPtr = rawPtr
+            if rawSize > 0 && rawPtr != 0:
+                coffBufBytes(out.text, coffReadBytes(out.buf, uint64(rawPtr), uint64(rawSize)))
+            # Parse relocations for .text.
+            if relCount > 0:
+                let relOff: uint64 = uint64(relPtr)
+                let relSize: uint64 = uint64(relCount) * 10
+                if relOff + relSize > uint64(out.buf.len):
+                    return Err[CoffObjFile](Fmt"coff_linker: relocations truncated: {path}")
+                for ri in 0..<relCount:
+                    let ro: uint64 = relOff + uint64(ri) * 10
+                    var r: CoffObjReloc
+                    r.off = textRelocBase + coffBufU32AtRead(out.buf, int32(ro + 0))
+                    r.symIndex = coffBufU32AtRead(out.buf, int32(ro + 4))
+                    r.rtype = coffBufU16AtRead(out.buf, int32(ro + 8))
+                    add(relocsText, r)
+        elif isRdataSection:
+            if out.rdataIndex == 0:
+                out.rdataIndex = secIndex
+            if align > out.rdataAlign:
+                out.rdataAlign = align
+            coffBufAlign(out.rdata, align)
+            let rdataRelocBase = uint32(out.rdata.len)
+            add(out.rdataSectionIndices, secIndex)
+            add(out.rdataSectionOffsets, uint64(out.rdata.len))
+            add(out.rdataSectionRawPtrs, rawPtr)
+            add(out.rdataSectionRawSizes, uint64(rawSize))
+            if rawSize > 0 && rawPtr != 0:
+                coffBufBytes(out.rdata, coffReadBytes(out.buf, uint64(rawPtr), uint64(rawSize)))
+            if relCount > 0:
+                let relOff2: uint64 = uint64(relPtr)
+                let relSize2: uint64 = uint64(relCount) * 10
+                if relOff2 + relSize2 > uint64(out.buf.len):
+                    return Err[CoffObjFile](Fmt"coff_linker: relocations truncated: {path}")
+                for ri2 in 0..<relCount:
+                    let ro2: uint64 = relOff2 + uint64(ri2) * 10
+                    var r2: CoffObjReloc
+                    r2.off = rdataRelocBase + coffBufU32AtRead(out.buf, int32(ro2 + 0))
+                    r2.symIndex = coffBufU32AtRead(out.buf, int32(ro2 + 4))
+                    r2.rtype = coffBufU16AtRead(out.buf, int32(ro2 + 8))
+                    add(out.relocsRdata, r2)
+        elif isDataSection:
+            if out.dataIndex == 0:
+                out.dataIndex = secIndex
+            if align > out.dataAlign:
+                out.dataAlign = align
+            coffBufAlign(out.data, align)
+            let dataRelocBase = uint32(out.data.len)
+            add(out.dataSectionIndices, secIndex)
+            add(out.dataSectionOffsets, uint64(out.data.len))
+            add(out.dataSectionRawPtrs, rawPtr)
+            add(out.dataSectionRawSizes, uint64(rawSize))
+            if rawSize > 0 && rawPtr != 0:
+                coffBufBytes(out.data, coffReadBytes(out.buf, uint64(rawPtr), uint64(rawSize)))
+            if relCount > 0:
+                let relOff3: uint64 = uint64(relPtr)
+                let relSize3: uint64 = uint64(relCount) * 10
+                if relOff3 + relSize3 > uint64(out.buf.len):
+                    return Err[CoffObjFile](Fmt"coff_linker: relocations truncated: {path}")
+                for ri3 in 0..<relCount:
+                    let ro3: uint64 = relOff3 + uint64(ri3) * 10
+                    var r3: CoffObjReloc
+                    r3.off = dataRelocBase + coffBufU32AtRead(out.buf, int32(ro3 + 0))
+                    r3.symIndex = coffBufU32AtRead(out.buf, int32(ro3 + 4))
+                    r3.rtype = coffBufU16AtRead(out.buf, int32(ro3 + 8))
+                    add(out.relocsData, r3)
+        elif isBssSection:
+            if out.bssIndex == 0:
+                out.bssIndex = secIndex
+            if align > out.bssAlign:
+                out.bssAlign = align
+            out.bssSize = coffAlignUp(out.bssSize, align)
+            add(out.bssSectionIndices, secIndex)
+            add(out.bssSectionOffsets, out.bssSize)
+            var bssBytes = uint64(vsize)
+            if bssBytes < uint64(rawSize):
+                bssBytes = uint64(rawSize)
+            out.bssSize = out.bssSize + bssBytes
+
+    if out.textIndex == 0:
+        return Err[CoffObjFile](Fmt"coff_linker: missing .text section: {path}")
+    readPhaseNs = coffPhaseMs("read_one_sections", readPhaseNs)
+
+    # Parse symbols.
+    coffDebug("coff_link_debug=symbols_begin")
+    var symi: uint32
+    for __for_guard_symi in 0..<symCount:
+        if !(symi < symCount):
+            break
+        let so: uint64 = symTableOff + uint64(symi) * 18
+        let name: str = coffReadSymName(out.buf, so + 0, strPtr, strSize)
+        let value: uint32 = coffBufU32AtRead(out.buf, int32(so + 8))
+        let sect: int32 = coffBufU16AtRead(out.buf, int32(so + 12))
+        let stype: int32 = coffBufU16AtRead(out.buf, int32(so + 14))
+        let storage: uint8 = coffBufU8AtRead(out.buf, int32(so + 16))
+        let aux: uint8 = coffBufU8AtRead(out.buf, int32(so + 17))
+
+        var s: CoffObjSymbol
+        s.name = name
+        s.value = value
+        var sectSigned: int32 = sect
+        if sectSigned >= 32768:
+            sectSigned = sectSigned - 65536
+        s.sect = sectSigned
+        s.stype = stype
+        s.storage = storage
+        add(symbols, s)
+
+        if aux != 0:
+            for ai in 0..<int32(aux):
+                var auxSym: CoffObjSymbol
+                auxSym.name = ""
+                auxSym.value = 0
+                auxSym.sect = 0
+                auxSym.stype = 0
+                auxSym.storage = uint8(0)
+                add(symbols, auxSym)
+            symi = symi + uint32(aux)
+        symi = symi + 1
+
+    readPhaseNs = coffPhaseMs("read_one_symbols", readPhaseNs)
+    coffDebug(Fmt"coff_link_debug=read_rel_done symbols={strings.IntToStr(symbols.len)} relocs={strings.IntToStr(relocsText.len)}")
+    out.relocsText = relocsText
+    out.symbols = symbols
+    coffFreeByteBuffer(out.buf)
+    readPhaseNs = coffPhaseMs("read_one_assign_free", readPhaseNs)
+    return Ok[CoffObjFile](out)
+
+# -- uint8[] sequence read helpers --
+
+@borrows
+fn coffReadU32LEAtSeq(buf: uint8[], off: uint64): uint32 =
+    if off + 4 > uint64(buf.len):
+        return uint32(0)
+    let b0: uint32 = uint32(buf[int32(off + 0)])
+    let b1: uint32 = uint32(buf[int32(off + 1)])
+    let b2: uint32 = uint32(buf[int32(off + 2)])
+    let b3: uint32 = uint32(buf[int32(off + 3)])
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+@borrows
+fn coffReadU64LEAtSeq(buf: uint8[], off: uint64): uint64 =
+    let lo = uint64(coffReadU32LEAtSeq(buf, off))
+    let hi = uint64(coffReadU32LEAtSeq(buf, off + uint64(4)))
+    return lo | (hi << uint64(32))
+
+fn coffWriteU16AtSeq(buf: var uint8[], off: uint32, v: int32) =
+    if uint64(off) + 2 > uint64(buf.len):
+        return
+    buf[int32(off + 0)] = uint8(v & 0xFF)
+    buf[int32(off + 1)] = uint8((v >> 8) & 0xFF)
+
+fn coffWriteU32AtSeq(buf: var uint8[], off: uint32, v: uint32) =
+    if uint64(off) + 4 > uint64(buf.len):
+        return
+    buf[int32(off + 0)] = uint8(v & uint32(0xFF))
+    buf[int32(off + 1)] = uint8((v >> 8) & uint32(0xFF))
+    buf[int32(off + 2)] = uint8((v >> 16) & uint32(0xFF))
+    buf[int32(off + 3)] = uint8((v >> 24) & uint32(0xFF))
+
+fn coffWriteU64AtSeq(buf: var uint8[], off: uint32, v: uint64) =
+    coffWriteU32AtSeq(buf, off, uint32(v & uint64(0xFFFFFFFF)))
+    coffWriteU32AtSeq(buf, off + 4, uint32((v >> 32) & uint64(0xFFFFFFFF)))
+
+fn coffWriteFixedStr8AtSeq(buf: var uint8[], off: uint32, s: str) =
+    if uint64(off) + 8 > uint64(buf.len):
+        return
+    var i: int32
+    if len(s) > 0:
+        for __for_guard_i in 0..<8:
+            if !(i < len(s) && i < 8):
+                break
+            buf[int32(off) + i] = uint8(int32(int64(s[i]) & int64(0xFF)))
+            i = i + 1
+    for __for_guard_i in 0..<8:
+        if !(i < 8):
+            break
+        buf[int32(off) + i] = uint8(0)
+        i = i + 1
+
+# -- Patching helpers (text is var uint8[]) --
+
+fn coffPatchBlImm(deltaBytes: int64): Result[uint32] =
+    if deltaBytes % 4 != 0:
+        return Err[uint32]("coff_linker: bl target misaligned")
+    let deltaWords: int64 = deltaBytes / 4
+    if deltaWords < -33554432 || deltaWords > 33554431:
+        return Err[uint32]("coff_linker: bl target out of range")
+    let imm26: uint32 = uint32(uint64(deltaWords) & uint64(0x03FFFFFF))
+    return Ok[uint32](uint32(0x94000000) | imm26)
+
+fn coffPatchBlAt(text: var uint8[], off: uint64, placeRva: uint64, targetRva: uint64): Result[bool] =
+    if off + 4 > uint64(text.len):
+        return Err[bool]("coff_linker: patch out of range")
+    let delta: int64 = int64(targetRva) - int64(placeRva)
+    let encRes: Result[uint32] = coffPatchBlImm(delta)
+    if !encRes.ok:
+        return Err[bool]("linker: step failed")
+    coffBufU32At(text, int32(off), encRes.value)
+    return Ok[bool](true)
+
+fn coffPatchAdrpAt(text: var uint8[], off: uint64, placeRva: uint64, targetRva: uint64): Result[bool] =
+    if off + 4 > uint64(text.len):
+        return Err[bool]("coff_linker: patch out of range")
+    let insn: uint32 = coffReadU32LEAtSeq(text, off)
+    let placePage: int64 = int64(placeRva - (placeRva % uint64(0x1000)))
+    let targetPage: int64 = int64(targetRva - (targetRva % uint64(0x1000)))
+    let deltaPages: int64 = (targetPage - placePage) / 4096
+    if deltaPages < -1048576 || deltaPages > 1048575:
+        return Err[bool]("coff_linker: adrp target out of range")
+    let imm: uint64 = uint64(deltaPages) & uint64(0x1FFFFF)
+    let immlo: uint32 = uint32(imm & uint64(3))
+    let immhi: uint32 = uint32((imm >> 2) & uint64(0x7FFFF))
+    var patched: uint32 = insn
+    patched = patched & (uint32(0xFFFFFFFF) ^ uint32(3 << 29))
+    patched = patched & (uint32(0xFFFFFFFF) ^ uint32(0x7FFFF << 5))
+    patched = patched | (immlo << 29)
+    patched = patched | (immhi << 5)
+    coffBufU32At(text, int32(off), patched)
+    return Ok[bool](true)
+
+fn coffPatchAddLo12At(text: var uint8[], off: uint64, targetRva: uint64): Result[bool] =
+    if off + 4 > uint64(text.len):
+        return Err[bool]("coff_linker: patch out of range")
+    let insn: uint32 = coffReadU32LEAtSeq(text, off)
+    let imm12: uint32 = uint32(targetRva & uint64(0xFFF))
+    var patched: uint32 = insn
+    patched = patched & (uint32(0xFFFFFFFF) ^ uint32(0xFFF << 10))
+    patched = patched | (imm12 << 10)
+    coffBufU32At(text, int32(off), patched)
+    return Ok[bool](true)
+
+fn coffPatchLdrLo12At(text: var uint8[], off: uint64, targetRva: uint64): Result[bool] =
+    if off + 4 > uint64(text.len):
+        return Err[bool]("coff_linker: patch out of range")
+    let insn: uint32 = coffReadU32LEAtSeq(text, off)
+    let offBytes: uint64 = targetRva & uint64(0xFFF)
+    if offBytes % 8 != 0:
+        return Err[bool]("coff_linker: stub ldr target not 8-byte aligned")
+    let imm12: uint32 = uint32(offBytes / 8)
+    var patched: uint32 = insn
+    patched = patched & (uint32(0xFFFFFFFF) ^ uint32(0xFFF << 10))
+    patched = patched | (imm12 << 10)
+    coffBufU32At(text, int32(off), patched)
+    return Ok[bool](true)
+
+fn coffPatchX64Rel32At(text: var uint8[], off: uint64, placeRva: uint64, targetRva: uint64): Result[bool] =
+    if off + 4 > uint64(text.len):
+        return Err[bool]("coff_linker: x64 rel32 patch out of range")
+    let delta: int64 = int64(targetRva) - int64(placeRva + uint64(4))
+    if delta < -2147483648 || delta > 2147483647:
+        return Err[bool]("coff_linker: x64 rel32 target out of range")
+    coffBufU32At(text, int32(off), uint32(uint64(delta) & uint64(0xFFFFFFFF)))
+    return Ok[bool](true)
+
+fn coffPatchX64Abs64At(text: var uint8[], off: uint64, targetRva: uint64): Result[bool] =
+    if off + 8 > uint64(text.len):
+        return Err[bool]("coff_linker: x64 abs64 patch out of range")
+    coffWriteU64AtSeq(text, uint32(off), coffPeImageBase() + targetRva)
+    return Ok[bool](true)
+
+fn coffPatchX64Addr32At(text: var uint8[], off: uint64, targetRva: uint64): Result[bool] =
+    if off + 4 > uint64(text.len):
+        return Err[bool]("coff_linker: x64 addr32 patch out of range")
+    if targetRva > uint64(0xFFFFFFFF):
+        return Err[bool]("coff_linker: x64 addr32 target out of range")
+    coffBufU32At(text, int32(off), uint32(targetRva))
+    return Ok[bool](true)
+
+@borrows
+fn coffObjTextU32AtRead(obj: CoffObjFile, off: uint64): uint32 =
+    return coffReadU32LEAtSeq(obj.text, off)
+
+@borrows
+fn coffObjSegmentU32AtRead(obj: CoffObjFile,
+                           sectionOffsets: uint64[],
+                           sectionRawPtrs: uint32[],
+                           sectionRawSizes: uint64[],
+                           sectionData: uint8[],
+                           off: uint64): uint32 =
+    for i in 0..<sectionOffsets.len:
+        let sectionOff = sectionOffsets[i]
+        let sectionSize = sectionRawSizes[i]
+        if off >= sectionOff && off + uint64(4) <= sectionOff + sectionSize:
+            return coffReadU32LEAtSeq(sectionData, off)
+    return uint32(0)
+
+@borrows
+fn coffObjSegmentU64AtRead(obj: CoffObjFile,
+                           sectionOffsets: uint64[],
+                           sectionRawPtrs: uint32[],
+                           sectionRawSizes: uint64[],
+                           sectionData: uint8[],
+                           off: uint64): uint64 =
+    for i in 0..<sectionOffsets.len:
+        let sectionOff = sectionOffsets[i]
+        let sectionSize = sectionRawSizes[i]
+        if off >= sectionOff && off + uint64(8) <= sectionOff + sectionSize:
+            return coffReadU64LEAtSeq(sectionData, off)
+    return uint64(0)
+
+fn coffRvaAddSigned32(targetRva: uint64, raw: uint32): uint64 =
+    if raw >= uint32(0x80000000):
+        let mag = uint64((uint32(0) - raw))
+        if mag > targetRva:
+            return uint64(0)
+        return targetRva - mag
+    return targetRva + uint64(raw)
+
+fn coffEmitX64CallExitEntryStub(text: var uint8[]) =
+    # sub rsp, 40; call cheng_windows_entry_argc; mov ecx, eax; call cheng_windows_entry_argv; mov rdx, rax; call main; mov ecx, eax; call ExitProcess; int3
+    coffBufU8(text, uint8(0x48))
+    coffBufU8(text, uint8(0x83))
+    coffBufU8(text, uint8(0xEC))
+    coffBufU8(text, uint8(0x28))
+    coffBufU8(text, uint8(0xE8))
+    coffBufU32(text, uint32(0))
+    coffBufU8(text, uint8(0x89))
+    coffBufU8(text, uint8(0xC1))
+    coffBufU8(text, uint8(0xE8))
+    coffBufU32(text, uint32(0))
+    coffBufU8(text, uint8(0x48))
+    coffBufU8(text, uint8(0x89))
+    coffBufU8(text, uint8(0xC2))
+    coffBufU8(text, uint8(0xE8))
+    coffBufU32(text, uint32(0))
+    coffBufU8(text, uint8(0x89))
+    coffBufU8(text, uint8(0xC1))
+    coffBufU8(text, uint8(0xE8))
+    coffBufU32(text, uint32(0))
+    coffBufU8(text, uint8(0xCC))
+
+fn coffEmitX64ImportStub(text: var uint8[]) =
+    # jmp qword ptr [rip + disp32]
+    let off = text.len
+    setLen(text, off + 6)
+    text[off] = uint8(0xFF)
+    text[off + 1] = uint8(0x25)
+    text[off + 2] = uint8(0)
+    text[off + 3] = uint8(0)
+    text[off + 4] = uint8(0)
+    text[off + 5] = uint8(0)
+
+fn coffWriteX64ImportStubAt(text: var uint8[], off: int32) =
+    if off < 0 || off + 6 > text.len:
+        return
+    text[off] = uint8(0xFF)
+    text[off + 1] = uint8(0x25)
+    text[off + 2] = uint8(0)
+    text[off + 3] = uint8(0)
+    text[off + 4] = uint8(0)
+    text[off + 5] = uint8(0)
+
+# -- Symbol resolution --
+
+@borrows
+fn coffSymRvaLocal(obj: CoffObjFile, lay: CoffLinkObjLayout, sym: CoffObjSymbol,
+                   textRva: uint64, rdataRva: uint64, dataRva: uint64, bssRva: uint64): Result[uint64] =
+    if sym.sect == 0:
+        return Err[uint64](Fmt"coff_linker: undefined symbol: {sym.name}")
+    for ti in 0..<obj.textSectionIndices.len:
+        if sym.sect == obj.textSectionIndices[ti]:
+            return Ok[uint64](textRva + lay.textOff + obj.textSectionOffsets[ti] + uint64(sym.value))
+    if sym.sect == obj.textIndex:
+        return Ok[uint64](textRva + lay.textOff + uint64(sym.value))
+    for ri in 0..<obj.rdataSectionIndices.len:
+        if sym.sect == obj.rdataSectionIndices[ri]:
+            return Ok[uint64](rdataRva + lay.rdataOff + obj.rdataSectionOffsets[ri] + uint64(sym.value))
+    for di in 0..<obj.dataSectionIndices.len:
+        if sym.sect == obj.dataSectionIndices[di]:
+            return Ok[uint64](dataRva + lay.dataOff + obj.dataSectionOffsets[di] + uint64(sym.value))
+    for bi in 0..<obj.bssSectionIndices.len:
+        if sym.sect == obj.bssSectionIndices[bi]:
+            return Ok[uint64](bssRva + lay.bssOff + obj.bssSectionOffsets[bi] + uint64(sym.value))
+    if sym.sect == obj.bssIndex:
+        return Ok[uint64](bssRva + lay.bssOff + uint64(sym.value))
+    return Err[uint64](Fmt"coff_linker: unsupported symbol section: {sym.name}")
+
+@borrows
+fn coffIsSectionSymbol(sym: CoffObjSymbol): bool =
+    if coffStrStartsWithAscii(sym.name, ".text"):
+        return true
+    if coffStrStartsWithAscii(sym.name, ".rdata"):
+        return true
+    if coffStrStartsWithAscii(sym.name, ".data"):
+        return true
+    if coffStrStartsWithAscii(sym.name, ".bss"):
+        return true
+    if coffStrStartsWithAscii(sym.name, ".xdata"):
+        return true
+    if coffStrStartsWithAscii(sym.name, ".pdata"):
+        return true
+    return false
+
+@borrows
+fn coffDefAdd(defs: var CoffLinkDef[], name: str, rva: uint64): Result[bool] =
+    if len(name) == 0:
+        return Ok[bool](true)
+    let key: str = Fmt"{name}"
+    for i in 0..<defs.len:
+        if defs[i].name == key:
+            return Err[bool](Fmt"coff_linker: duplicate symbol: {name}")
+    var d: CoffLinkDef
+    d.name = key
+    d.rva = rva
+    add(defs, d)
+    return Ok[bool](true)
+
+@borrows
+fn coffDefLookup(defs: CoffLinkDef[], name: str): Result[uint64] =
+    if len(name) == 0:
+        return Err[uint64]("coff_linker: missing symbol name")
+    for i in 0..<defs.len:
+        let d: CoffLinkDef = defs[i]
+        if d.name == name:
+            return Ok[uint64](d.rva)
+    return Err[uint64](Fmt"coff_linker: unresolved symbol: {name}")
+
+fn coffEncBr(rn: int32): uint32 =
+    return uint32(0xD61F0000) | (uint32(rn & 31) << 5)
+
+@borrows
+fn coffStrsCmp(a: str, b: str): int32 =
+    let aEmpty = len(a) == 0
+    let bEmpty = len(b) == 0
+    if aEmpty && bEmpty:
+        return 0
+    if aEmpty:
+        return -1
+    if bEmpty:
+        return 1
+    let na = len(a)
+    let nb = len(b)
+    let n = na < nb ? na : nb
+    for i in 0..<n:
+        let ca = int32(int64(a[i]) & int64(0xFF))
+        let cb = int32(int64(b[i]) & int64(0xFF))
+        if ca < cb:
+            return -1
+        if ca > cb:
+            return 1
+    if na < nb:
+        return -1
+    if na > nb:
+        return 1
+    return 0
+
+fn coffSortStrs(s: var str[]) =
+    for i in 0..<s.len:
+        for j in i + 1..<s.len:
+            if coffStrsCmp(s[j], s[i]) < 0:
+                # `str[]` element reads are borrows; an index store needs an
+                # exact MOVE source.  Clone once per side so the old value
+                # survives until both element stores have completed.
+                let tmp: str = strings.CloneStr(s[i])
+                s[i] = strings.CloneStr(s[j])
+                s[j] = tmp
+
+@borrows
+fn coffFindImportByName(imports: CoffImport[], name: str): int32 =
+    if len(name) <= 0:
+        return -1
+    for i in 0..<imports.len:
+        let imp: CoffImport = imports[i]
+        if imp.name == name:
+            return i
+    return -1
+
+@borrows
+fn coffStringListContains(items: str[], name: str): bool =
+    for i in 0..<items.len:
+        if items[i] == name:
+            return true
+    return false
+
+fn coffDefaultCrtDllName(): str =
+    let configured = strutil.Strip(os.GetEnv("CHENG_COFF_DEFAULT_CRT_DLL"))
+    if len(configured) > 0:
+        return configured
+    return "msys-2.0.dll"
+
+@borrows
+fn coffImportBaseSymbol(symName: str): str =
+    if len(symName) > 6 && coffStrStartsWithAscii(symName, "__imp_"):
+        return strings.CloneStr(strings.SliceBytes(symName, 6, len(symName) - 6))
+    return strings.CloneStr(symName)
+
+@borrows
+fn coffImportPeSymbol(symName: str, defaultCrtDll: str): str =
+    let base = coffImportBaseSymbol(symName)
+    let defaultCrtIsMsys = defaultCrtDll == "msys-2.0.dll"
+    if base == "chdir":
+        if defaultCrtIsMsys:
+            return "chdir"
+        return "_chdir"
+    if base == "chmod":
+        if defaultCrtIsMsys:
+            return "chmod"
+        return "_chmod"
+    if base == "close":
+        if defaultCrtIsMsys:
+            return "close"
+        return "_close"
+    if base == "getcwd":
+        if defaultCrtIsMsys:
+            return "getcwd"
+        return "_getcwd"
+    if base == "getpid":
+        if defaultCrtIsMsys:
+            return "getpid"
+        return "_getpid"
+    if base == "mkdir":
+        if defaultCrtIsMsys:
+            return "mkdir"
+        return "_mkdir"
+    if base == "putenv":
+        if defaultCrtIsMsys:
+            return "putenv"
+        return "_putenv"
+    if base == "read":
+        if defaultCrtIsMsys:
+            return "read"
+        return "_read"
+    if base == "write":
+        if defaultCrtIsMsys:
+            return "write"
+        return "_write"
+    if base == "stat64i32":
+        return "_stat64i32"
+    if base == "snprintf":
+        return "_snprintf"
+    return base
+
+@borrows
+fn coffImportDllForSymbol(symName: str, defaultCrtDll: str): str =
+    if len(symName) > 0 && (symName == "pthread_create" ||
+                          symName == "pthread_join" ||
+                          symName == "pthread_self" ||
+                          symName == "sched_yield"):
+        return "libwinpthread-1.dll"
+    if len(symName) > 0 && (symName == "__errno" ||
+                          symName == "__getreent" ||
+                          symName == "stat"):
+        return "msys-2.0.dll"
+    if len(symName) > 0 && (symName == "fprintf" ||
+                          symName == "snprintf" ||
+                          symName == "_snprintf" ||
+                          symName == "__argc" ||
+                          symName == "__argv"):
+        return "msvcrt.dll"
+    if len(symName) > 0 && (symName == "ExitProcess" ||
+                          symName == "GetStdHandle" ||
+                          symName == "WriteFile" ||
+                          symName == "ReadFile" ||
+                          symName == "CloseHandle" ||
+                          symName == "CreateFileA" ||
+                          symName == "GetLastError" ||
+                          symName == "SetLastError" ||
+                          symName == "GetCurrentDirectoryA" ||
+                          symName == "CreateDirectoryA" ||
+                          symName == "RemoveDirectoryA" ||
+                          symName == "DeleteFileA" ||
+                          symName == "MoveFileExA" ||
+                          symName == "FindFirstFileA" ||
+                          symName == "FindNextFileA" ||
+                          symName == "FindClose" ||
+                          symName == "GetFileAttributesA" ||
+                          symName == "GetFileSizeEx" ||
+                          symName == "GetDiskFreeSpaceExA" ||
+                          symName == "GetCommandLineA" ||
+                          symName == "GetCommandLineW" ||
+                          symName == "QueryPerformanceCounter" ||
+                          symName == "QueryPerformanceFrequency" ||
+                          symName == "GetSystemTimeAsFileTime" ||
+                          symName == "GetSystemTimePreciseAsFileTime" ||
+                          symName == "GetTickCount64" ||
+                          symName == "GetTickCount" ||
+                          symName == "Sleep" ||
+                          symName == "SwitchToThread" ||
+                          symName == "CreateThread" ||
+                          symName == "GetCurrentProcess" ||
+                          symName == "GetProcessTimes" ||
+                          symName == "GetCurrentThreadId" ||
+                          symName == "GetCurrentProcessId" ||
+                          symName == "GetSystemInfo" ||
+                          symName == "GlobalMemoryStatusEx" ||
+                          symName == "K32GetProcessMemoryInfo" ||
+                          symName == "OpenProcess" ||
+                          symName == "LocalAlloc" ||
+                          symName == "LocalFree" ||
+                          symName == "GetProcessHeap" ||
+                          symName == "HeapAlloc" ||
+                          symName == "HeapFree" ||
+                          symName == "HeapCreate" ||
+                          symName == "HeapDestroy" ||
+                          symName == "HeapQueryInformation" ||
+                          symName == "CreatePipe" ||
+                          symName == "PeekNamedPipe" ||
+                          symName == "SetHandleInformation" ||
+                          symName == "WideCharToMultiByte" ||
+                          symName == "CreateToolhelp32Snapshot" ||
+                          symName == "Process32First" ||
+                          symName == "Process32Next" ||
+                          symName == "CreateProcessA" ||
+                          symName == "WaitForSingleObject" ||
+                          symName == "GetExitCodeProcess" ||
+                          symName == "TerminateProcess" ||
+                          symName == "GetEnvironmentVariableA" ||
+                          symName == "SetEnvironmentVariableA" ||
+                          symName == "GetModuleFileNameA"):
+        return "KERNEL32.dll"
+    if len(symName) > 0 && (symName == "WSAStartup" ||
+                          symName == "WSACleanup" ||
+                          symName == "WSAGetLastError" ||
+                          symName == "WSASetLastError" ||
+                          symName == "__WSAFDIsSet" ||
+                          symName == "ioctlsocket" ||
+                          symName == "select" ||
+                          symName == "socket" ||
+                          symName == "bind" ||
+                          symName == "listen" ||
+                          symName == "accept" ||
+                          symName == "connect" ||
+                          symName == "send" ||
+                          symName == "recv" ||
+                          symName == "sendto" ||
+                          symName == "recvfrom" ||
+                          symName == "closesocket" ||
+                          symName == "shutdown" ||
+                          symName == "setsockopt" ||
+                          symName == "getsockopt" ||
+                          symName == "getsockname" ||
+                          symName == "getaddrinfo" ||
+                          symName == "freeaddrinfo" ||
+                          symName == "inet_pton" ||
+                          symName == "inet_ntop"):
+        return "WS2_32.dll"
+    if len(symName) > 0 && symName == "GetProcessMemoryInfo":
+        return "PSAPI.dll"
+    if len(symName) > 0 && symName == "CommandLineToArgvW":
+        return "SHELL32.dll"
+    if len(symName) > 0 && (symName == "BCryptGenRandom" ||
+                          symName == "BCryptOpenAlgorithmProvider" ||
+                          symName == "BCryptCloseAlgorithmProvider" ||
+                          symName == "BCryptImportKeyPair" ||
+                          symName == "BCryptDestroyKey" ||
+                          symName == "BCryptSignHash" ||
+                          symName == "BCryptVerifySignature"):
+        return "BCRYPT.dll"
+    if len(symName) > 0 && (symName == "NCryptOpenStorageProvider" ||
+                          symName == "NCryptOpenKey" ||
+                          symName == "NCryptImportKey" ||
+                          symName == "NCryptExportKey" ||
+                          symName == "NCryptSetProperty" ||
+                          symName == "NCryptSignHash" ||
+                          symName == "NCryptFreeObject"):
+        return "NCRYPT.dll"
+    if len(symName) > 0 && (symName == "CryptAcquireContextA" ||
+                          symName == "CryptGenRandom" ||
+                          symName == "CryptReleaseContext"):
+        return "ADVAPI32.dll"
+    return strings.CloneStr(defaultCrtDll)
+
+fn coffBuildIdataImports(idataRva: uint32, imports: var CoffImport[], outImportDirSize: var uint32): uint8[] =
+    var id: uint8[]
+    if imports.len == 0:
+        outImportDirSize = uint32(0)
+        return id
+
+    # Collect DLLs (stable).
+    var dllNames: str[]
+    for ii in 0..<imports.len:
+        let imp: CoffImport = imports[ii]
+        if len(imp.dll) > 0:
+            if !coffStringListContains(dllNames, imp.dll):
+                add(dllNames, share(imp.dll))
+    coffSortStrs(dllNames)
+
+    let dllCount: int32 = dllNames.len
+    let descCount: int32 = dllCount + 1
+
+    # Reserve IMAGE_IMPORT_DESCRIPTOR[] plus a null terminator.
+    for z in 0..<descCount * 20:
+        coffBufU8(id, uint8(0))
+    outImportDirSize = uint32(descCount * 20)
+    coffBufAlign(id, 8)
+
+    # Count imports per DLL (preserve import order; no nested seqs for bootstrap).
+    var dllImportCounts: int32[]
+    for di in 0..<dllCount:
+        let dn: str = dllNames[di]
+        var cnt: int32
+        for ii in 0..<imports.len:
+            let imp: CoffImport = imports[ii]
+            if imp.dll == dn:
+                cnt = cnt + 1
+        add(dllImportCounts, cnt)
+
+    # Emit ILT + IAT arrays.
+    var iltOffs: uint32[]
+    var iatOffs: uint32[]
+    for di in 0..<dllCount:
+        let cnt: int32 = dllImportCounts[di]
+        add(iltOffs, uint32(id.len))
+        for k in 0..<(cnt + 1) * 8:
+            coffBufU8(id, uint8(0))
+        coffBufAlign(id, 8)
+    for di in 0..<dllCount:
+        let cnt: int32 = dllImportCounts[di]
+        add(iatOffs, uint32(id.len))
+        for k in 0..<(cnt + 1) * 8:
+            coffBufU8(id, uint8(0))
+        coffBufAlign(id, 8)
+
+    # Emit hint/name strings and DLL names; fill descriptors + thunks.
+    for di in 0..<dllCount:
+        let dn: str = dllNames[di]
+        let iltOff: uint32 = iltOffs[di]
+        let iatOff: uint32 = iatOffs[di]
+
+        var fi: int32
+        for ii in 0..<imports.len:
+            let imp: CoffImport = imports[ii]
+            if imp.dll == dn:
+                let hintNameOff: uint32 = uint32(id.len)
+                coffBufU16(id, 0)
+                coffBufStr0(id, imp.name)
+                coffBufAlign(id, 2)
+                let hnRva: uint64 = uint64(idataRva) + uint64(hintNameOff)
+                coffWriteU64AtSeq(id, iltOff + uint32(fi) * 8, hnRva)
+                coffWriteU64AtSeq(id, iatOff + uint32(fi) * 8, hnRva)
+                imp.iatOff = iatOff + uint32(fi) * 8
+                imports[ii] = imp
+                fi = fi + 1
+
+        let dllNameOff: uint32 = uint32(id.len)
+        coffBufStr0(id, dn)
+
+        let descOff: uint32 = uint32(di) * 20
+        coffWriteU32AtSeq(id, descOff + 0, idataRva + iltOff) # OriginalFirstThunk
+        coffWriteU32AtSeq(id, descOff + 12, idataRva + dllNameOff) # Name
+        coffWriteU32AtSeq(id, descOff + 16, idataRva + iatOff) # FirstThunk
+    return id
+
+fn coffWritePeSectionHeader(out: var uint8[], off: uint32, name: str, vsize: uint32, va: uint32,
+                            rawSize0: uint32, rawPtr0: uint32, chars: uint32) =
+    coffWriteFixedStr8AtSeq(out, off + 0, name)
+    coffWriteU32AtSeq(out, off + 8, vsize)
+    coffWriteU32AtSeq(out, off + 12, va)
+    coffWriteU32AtSeq(out, off + 16, rawSize0)
+    coffWriteU32AtSeq(out, off + 20, rawPtr0)
+    coffWriteU32AtSeq(out, off + 24, uint32(0))
+    coffWriteU32AtSeq(out, off + 28, uint32(0))
+    coffWriteU16AtSeq(out, off + 32, 0)
+    coffWriteU16AtSeq(out, off + 34, 0)
+    coffWriteU32AtSeq(out, off + 36, chars)
+
+var coffDebugEnabledReady: bool
+var coffDebugEnabledCached: bool
+
+fn coffDebugEnabled(): bool =
+    if coffDebugEnabledReady:
+        return coffDebugEnabledCached
+    let raw = os.GetEnv("CHENG_COFF_LINK_DEBUG")
+    var enabled = true
+    if len(raw) <= 0:
+        enabled = false
+    elif raw == "0":
+        enabled = false
+    coffDebugEnabledCached = enabled
+    coffDebugEnabledReady = true
+    return enabled
+
+fn coffDebug(text: str) =
+    if coffDebugEnabled():
+        os.WriteLine(os.Get_stderr(), text)
+
+var coffPhaseEnabledReady: bool
+var coffPhaseEnabledCached: bool
+var coffNameProbeReady: bool
+var coffNameProbeCached: bool
+
+fn coffNameProbeEnabled(): bool =
+    if coffNameProbeReady:
+        return coffNameProbeCached
+    coffNameProbeCached = os.GetEnv("CHENG_COFF_NAME_PROBE") == "1"
+    coffNameProbeReady = true
+    return coffNameProbeCached
+
+fn coffPhaseEnabled(): bool =
+    if coffPhaseEnabledReady:
+        return coffPhaseEnabledCached
+    coffPhaseEnabledCached = os.GetEnv("CHENG_COFF_LINK_PHASE") == "1" || coffDebugEnabled()
+    coffPhaseEnabledReady = true
+    return coffPhaseEnabledCached
+
+fn coffPhaseMs(label: str, sinceNs: int64): int64 =
+    let now = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    if coffPhaseEnabled():
+        os.WriteLine(os.Get_stderr(), Fmt"coff_link_phase={label} ms={strings.Int64ToStr((now - sinceNs) / int64(1000000))}")
+    return now
+
+@borrows
+fn coffLinkExeA64(objPaths: str[], outputPath: str, target: str): Result[bool] =
+    coffDebug("coff_link_debug=enter")
+    var phaseNs: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    if len(outputPath) == 0:
+        return Err[bool]("coff_linker: missing output path")
+    if objPaths.len == 0:
+        return Err[bool]("coff_linker: no input objects")
+    let isX64: bool = target == "x86_64-pc-windows-msvc"
+    let expectedMachine: int32 = isX64 ? IMAGE_FILE_MACHINE_AMD64 : IMAGE_FILE_MACHINE_ARM64
+    coffDebug(Fmt"coff_link_debug=target target={target} input_count={strings.IntToStr(objPaths.len)}")
+
+    # Load and parse objects.
+    var objs: CoffObjFile[]
+    for li in 0..<objPaths.len:
+        let p: str = objPaths[li]
+        coffDebug(Fmt"coff_link_debug=read_obj_begin index={strings.IntToStr(li)} path={p}")
+        let res: Result[CoffObjFile] = coffReadRelObj(p)
+        if res.ok:
+            coffDebug(Fmt"coff_link_debug=read_obj_done index={strings.IntToStr(li)} ok=1")
+        else:
+            coffDebug(Fmt"coff_link_debug=read_obj_done index={strings.IntToStr(li)} ok=0")
+        if !res.ok:
+            return Err[bool]("linker: step failed")
+        if res.value.machine != expectedMachine:
+            return Err[bool](Fmt"coff_linker: object machine mismatch for target {target}: {p}")
+        add(objs, share(res.value))
+    phaseNs = coffPhaseMs("read_objs", phaseNs)
+
+    # Build combined sections.
+    coffDebug("coff_link_debug=layout_begin")
+    var layouts: CoffLinkObjLayout[]
+    var text: uint8[]
+    if isX64:
+        coffDebug("coff_link_debug=layout_before_x64_stub")
+        coffEmitX64CallExitEntryStub(text)
+        coffDebug(Fmt"coff_link_debug=layout_after_x64_stub text_len={strings.IntToStr(text.len)}")
+        coffBufAlign(text, 16)
+        coffDebug(Fmt"coff_link_debug=layout_after_x64_align text_len={strings.IntToStr(text.len)}")
+    else:
+        # _start stub: bl main; bl exit_stub; b .
+        coffBufU32(text, uint32(a64link.CodegenA64LinkEncBlPlaceholder()))
+        coffBufU32(text, uint32(a64link.CodegenA64LinkEncBlPlaceholder()))
+        coffBufU32(text, uint32(0x14000000))
+        coffBufAlign(text, 4)
+
+    var rdata: uint8[]
+    var dataSeg: uint8[]
+    var bssSize: uint64
+    var maxBssAlign: uint64 = 1
+
+    for li in 0..<objs.len:
+        coffDebug(Fmt"coff_link_debug=layout_obj_begin index={strings.IntToStr(li)}")
+        let o: CoffObjFile = objs[li]
+        var lay: CoffLinkObjLayout
+
+        coffBufAlign(text, o.textAlign)
+        coffDebug(Fmt"coff_link_debug=layout_after_text_align index={strings.IntToStr(li)}")
+        lay.textOff = uint64(text.len)
+        coffBufBytes(text, o.text)
+        coffDebug(Fmt"coff_link_debug=layout_after_text_copy index={strings.IntToStr(li)} text_len={strings.IntToStr(text.len)}")
+
+        coffBufAlign(rdata, o.rdataAlign)
+        lay.rdataOff = uint64(rdata.len)
+        coffBufBytes(rdata, o.rdata)
+
+        coffBufAlign(dataSeg, o.dataAlign)
+        lay.dataOff = uint64(dataSeg.len)
+        coffBufBytes(dataSeg, o.data)
+
+        if o.bssAlign > maxBssAlign:
+            maxBssAlign = o.bssAlign
+        bssSize = coffAlignUp(bssSize, o.bssAlign)
+        lay.bssOff = bssSize
+        bssSize = bssSize + o.bssSize
+
+        add(layouts, lay)
+        coffDebug(Fmt"coff_link_debug=layout_obj_done index={strings.IntToStr(li)}")
+    phaseNs = coffPhaseMs("layout", phaseNs)
+
+    let defaultCrtDll: str = coffDefaultCrtDllName()
+
+    # Collect external defined symbol names (for import detection).
+    coffDebug("coff_link_debug=def_names_before_init")
+    var defNames: str[]
+    coffDebug("coff_link_debug=def_names_after_init")
+    for li in 0..<objs.len:
+        coffDebug(Fmt"coff_link_debug=def_names_obj index={strings.IntToStr(li)}")
+        let o0: CoffObjFile = objs[li]
+        for si0 in 0..<o0.symbols.len:
+            let s0: CoffObjSymbol = o0.symbols[si0]
+            if s0.sect > 0 && s0.storage == IMAGE_SYM_CLASS_EXTERNAL && len(s0.name) > 0:
+                if !coffStringListContains(defNames, s0.name):
+                    add(defNames, share(s0.name))
+
+    # Collect required imports from undefined call relocations.
+    var importNames: str[]
+    coffDebug("coff_link_debug=import_set_before_init")
+    coffDebug("coff_link_debug=import_set_after_init")
+    for li in 0..<objs.len:
+        let o1: CoffObjFile = objs[li]
+        for ri0 in 0..<o1.relocsText.len:
+            let r0: CoffObjReloc = o1.relocsText[ri0]
+            if r0.symIndex >= uint32(o1.symbols.len):
+                return Err[bool]("coff_linker: reloc symIndex out of range")
+            let sym0: CoffObjSymbol = o1.symbols[int32(r0.symIndex)]
+            if sym0.sect <= 0 && len(sym0.name) > 0 && !coffStringListContains(defNames, sym0.name):
+                var importRelocOk: bool
+                if !isX64:
+                    if r0.rtype == IMAGE_REL_ARM64_BRANCH26:
+                        importRelocOk = true
+                else:
+                    if r0.rtype == IMAGE_REL_AMD64_REL32:
+                        importRelocOk = true
+                    elif r0.rtype == IMAGE_REL_AMD64_ADDR64:
+                        importRelocOk = true
+                    elif r0.rtype == IMAGE_REL_AMD64_ADDR32:
+                        importRelocOk = true
+                if !importRelocOk:
+                    return Err[bool](Fmt"coff_linker: unsupported undefined reloc for import: {sym0.name} type={strings.IntToStr(int32(r0.rtype))}")
+                let importName = coffImportPeSymbol(sym0.name, defaultCrtDll)
+                if !coffStringListContains(importNames, importName):
+                    add(importNames, importName)
+        for rr0 in 0..<o1.relocsRdata.len:
+            let r1: CoffObjReloc = o1.relocsRdata[rr0]
+            if r1.symIndex >= uint32(o1.symbols.len):
+                return Err[bool]("coff_linker: reloc symIndex out of range")
+            let sym1: CoffObjSymbol = o1.symbols[int32(r1.symIndex)]
+            if sym1.sect <= 0 && len(sym1.name) > 0 && !coffStringListContains(defNames, sym1.name):
+                if isX64 && (r1.rtype == IMAGE_REL_AMD64_ADDR64 || r1.rtype == IMAGE_REL_AMD64_ADDR32 || r1.rtype == IMAGE_REL_AMD64_REL32):
+                    let importName1 = coffImportPeSymbol(sym1.name, defaultCrtDll)
+                    if !coffStringListContains(importNames, importName1):
+                        add(importNames, importName1)
+                else:
+                    return Err[bool](Fmt"coff_linker: unsupported undefined rdata reloc for import: {sym1.name} type={strings.IntToStr(int32(r1.rtype))}")
+        for rd0 in 0..<o1.relocsData.len:
+            let r2: CoffObjReloc = o1.relocsData[rd0]
+            if r2.symIndex >= uint32(o1.symbols.len):
+                return Err[bool]("coff_linker: reloc symIndex out of range")
+            let sym2: CoffObjSymbol = o1.symbols[int32(r2.symIndex)]
+            if sym2.sect <= 0 && len(sym2.name) > 0 && !coffStringListContains(defNames, sym2.name):
+                if isX64 && (r2.rtype == IMAGE_REL_AMD64_ADDR64 || r2.rtype == IMAGE_REL_AMD64_ADDR32 || r2.rtype == IMAGE_REL_AMD64_REL32):
+                    let importName2 = coffImportPeSymbol(sym2.name, defaultCrtDll)
+                    if !coffStringListContains(importNames, importName2):
+                        add(importNames, importName2)
+                else:
+                    return Err[bool](Fmt"coff_linker: unsupported undefined data reloc for import: {sym2.name} type={strings.IntToStr(int32(r2.rtype))}")
+
+    # Always import ExitProcess for the entry.
+    coffDebug("coff_link_debug=default_exit_before_contains")
+    if !coffStringListContains(importNames, "ExitProcess"):
+        coffDebug("coff_link_debug=default_exit_before_add")
+        add(importNames, "ExitProcess")
+        coffDebug("coff_link_debug=default_exit_after_add")
+    # Keep ABI probes stable across fixtures by always materializing a CRT import.
+    coffDebug("coff_link_debug=default_puts_before_contains")
+    if !coffStringListContains(importNames, "puts"):
+        coffDebug("coff_link_debug=default_puts_before_add")
+        add(importNames, "puts")
+        coffDebug("coff_link_debug=default_puts_after_add")
+    coffDebug("coff_link_debug=sort_imports_before")
+    coffSortStrs(importNames)
+    coffDebug("coff_link_debug=sort_imports_after")
+    phaseNs = coffPhaseMs("collect_imports", phaseNs)
+
+    # Append import stubs to .text.
+    coffDebug(Fmt"coff_link_debug=imports_default_crt dll={defaultCrtDll}")
+    var ldrEnc: uint32
+    if !isX64:
+        let ldrRes: Result[int32] = a64link.CodegenA64LinkEncLdrImm(true, 17, 16, 0)
+        if !ldrRes.ok:
+            return Err[bool]("linker: step failed")
+        ldrEnc = uint32(ldrRes.value)
+
+    var imports: CoffImport[]
+    var exitImpIdx: int32 = -1
+    var exitStubOff: uint64
+    coffDebug(Fmt"coff_link_debug=imports_loop_begin count={strings.IntToStr(importNames.len)}")
+    coffBufAlign(text, 4)
+    var x64ImportStubBase: int32 = -1
+    if isX64 && importNames.len > 0:
+        x64ImportStubBase = text.len
+        setLen(text, text.len + importNames.len * 6)
+    for imi in 0..<importNames.len:
+        let name: str = importNames[imi]
+        var imp: CoffImport
+        imp.name = share(name)
+        imp.dll = coffImportDllForSymbol(name, defaultCrtDll)
+        if isX64:
+            imp.stubOff = uint64(x64ImportStubBase + imi * 6)
+        else:
+            imp.stubOff = uint64(text.len)
+        imp.iatOff = uint32(0)
+        if isX64:
+            coffWriteX64ImportStubAt(text, x64ImportStubBase + imi * 6)
+        else:
+            coffBufU32(text, uint32(a64link.CodegenA64LinkEncAdrp(16)))
+            coffBufU32(text, ldrEnc)
+            coffBufU32(text, coffEncBr(17))
+        if name == "ExitProcess":
+            exitImpIdx = imi
+            exitStubOff = imp.stubOff
+        add(imports, imp)
+
+    phaseNs = coffPhaseMs("import_stubs", phaseNs)
+    coffDebug(Fmt"coff_link_debug=after_imports_loop imports={strings.IntToStr(imports.len)} text_len={strings.IntToStr(text.len)}")
+    let hasRdata: bool = rdata.len > 0
+    let hasData: bool = dataSeg.len > 0
+    let hasBss: bool = bssSize > 0
+    coffDebug("coff_link_debug=after_section_flags")
+
+    # Virtual addresses (RVA).
+    var nextRva: uint64 = uint64(PE_SECTION_ALIGN)
+    let textRva: uint64 = nextRva
+    nextRva = coffAlignUp(nextRva + coffAlignUp(uint64(text.len), uint64(PE_SECTION_ALIGN)), uint64(PE_SECTION_ALIGN))
+    let rdataRva: uint64 = hasRdata ? nextRva : uint64(0)
+    if hasRdata:
+        nextRva = coffAlignUp(nextRva + coffAlignUp(uint64(rdata.len), uint64(PE_SECTION_ALIGN)), uint64(PE_SECTION_ALIGN))
+    let dataRva: uint64 = hasData ? nextRva : uint64(0)
+    if hasData:
+        nextRva = coffAlignUp(nextRva + coffAlignUp(uint64(dataSeg.len), uint64(PE_SECTION_ALIGN)), uint64(PE_SECTION_ALIGN))
+    let idataRva: uint64 = nextRva
+
+    var importDirSize: uint32
+    coffDebug("coff_link_debug=before_idata_build")
+    let idata: uint8[] = coffBuildIdataImports(uint32(idataRva), imports, importDirSize)
+    coffDebug(Fmt"coff_link_debug=after_idata_build len={strings.IntToStr(idata.len)}")
+    phaseNs = coffPhaseMs("idata_build", phaseNs)
+    nextRva = coffAlignUp(nextRva + coffAlignUp(uint64(idata.len), uint64(PE_SECTION_ALIGN)), uint64(PE_SECTION_ALIGN))
+    let bssRva: uint64 = hasBss ? nextRva : uint64(0)
+    if hasBss:
+        nextRva = coffAlignUp(nextRva + coffAlignUp(bssSize, uint64(PE_SECTION_ALIGN)), uint64(PE_SECTION_ALIGN))
+    let sizeOfImage: uint32 = uint32(nextRva)
+
+    # Collect global defs (external defined symbols).
+    coffDebug("coff_link_debug=defs_before")
+    var defs: CoffLinkDef[]
+    var mainRva: uint64
+    var mainFound: int32
+    coffDebug("coff_link_debug=defs_after_array")
+    for li in 0..<objs.len:
+        let o2: CoffObjFile = objs[li]
+        let lay2: CoffLinkObjLayout = layouts[li]
+        for si in 0..<o2.symbols.len:
+            let s: CoffObjSymbol = share(o2.symbols[si])
+            if s.sect > 0 && s.storage == IMAGE_SYM_CLASS_EXTERNAL && len(s.name) > 0:
+                let addrRes: Result[uint64] = coffSymRvaLocal(o2, lay2, s, textRva, rdataRva, dataRva, bssRva)
+                if !addrRes.ok:
+                    return Err[bool]("linker: step failed")
+                if coffStrEqAscii(s.name, "main"):
+                    mainRva = addrRes.value
+                    mainFound = 1
+                let putRes: Result[bool] = coffDefAdd(defs, s.name, addrRes.value)
+                if !putRes.ok:
+                    return Err[bool]("linker: step failed")
+        coffDebug(Fmt"coff_link_debug=defs_obj_done defs={strings.IntToStr(defs.len)}")
+    phaseNs = coffPhaseMs("collect_defs", phaseNs)
+
+    # Patch object relocations.
+    coffDebug(Fmt"coff_link_debug=patch_relocs_before defs={strings.IntToStr(defs.len)}")
+    for li in 0..<objs.len:
+        let o3: CoffObjFile = objs[li]
+        let lay3: CoffLinkObjLayout = layouts[li]
+        coffDebug(Fmt"coff_link_debug=patch_obj_begin index={strings.IntToStr(li)} relocs={strings.IntToStr(o3.relocsText.len)} symbols={strings.IntToStr(o3.symbols.len)}")
+        for ri in 0..<o3.relocsText.len:
+            let r0: CoffObjReloc = o3.relocsText[ri]
+            if r0.symIndex >= uint32(o3.symbols.len):
+                return Err[bool]("coff_linker: reloc symIndex out of range")
+            let sym: CoffObjSymbol = share(o3.symbols[int32(r0.symIndex)])
+            var targetRva: uint64
+            if sym.sect > 0:
+                let addrRes2: Result[uint64] = coffSymRvaLocal(o3, lay3, sym, textRva, rdataRva, dataRva, bssRva)
+                if !addrRes2.ok:
+                    return Err[bool]("linker: step failed")
+                targetRva = addrRes2.value
+            else:
+                let defLookupRes = coffDefLookup(defs, sym.name)
+                if defLookupRes.ok:
+                    targetRva = defLookupRes.value
+                else:
+                    let importName = coffImportPeSymbol(sym.name, defaultCrtDll)
+                    let impIdx: int32 = coffFindImportByName(imports, importName)
+                    if impIdx < 0 || impIdx >= imports.len:
+                        return Err[bool](Fmt"coff_linker: unresolved symbol: {sym.name}")
+                    var importPatchOk: bool
+                    if !isX64:
+                        if r0.rtype == IMAGE_REL_ARM64_BRANCH26:
+                            importPatchOk = true
+                    else:
+                        if r0.rtype == IMAGE_REL_AMD64_REL32:
+                            importPatchOk = true
+                        elif r0.rtype == IMAGE_REL_AMD64_ADDR64:
+                            importPatchOk = true
+                        elif r0.rtype == IMAGE_REL_AMD64_ADDR32:
+                            importPatchOk = true
+                    if !importPatchOk:
+                        return Err[bool](Fmt"coff_linker: unsupported reloc against import: {sym.name} type={strings.IntToStr(int32(r0.rtype))}")
+                    let imp: CoffImport = share(imports[impIdx])
+                    if coffStrStartsWithAscii(sym.name, "__imp_"):
+                        targetRva = idataRva + uint64(imp.iatOff)
+                    else:
+                        targetRva = textRva + imp.stubOff
+            let placeOff: uint64 = lay3.textOff + uint64(r0.off)
+            let placeRva: uint64 = textRva + placeOff
+            if isX64 && coffIsSectionSymbol(sym) && (r0.rtype == IMAGE_REL_AMD64_REL32 || r0.rtype == IMAGE_REL_AMD64_ADDR32):
+                let addend32 = coffObjTextU32AtRead(o3, uint64(r0.off))
+                if addend32 != uint32(0):
+                    targetRva = coffRvaAddSigned32(targetRva, addend32)
+
+            if isX64 && r0.rtype == IMAGE_REL_AMD64_REL32:
+                let relRes: Result[bool] = coffPatchX64Rel32At(text, placeOff, placeRva, targetRva)
+                if !relRes.ok:
+                    return Err[bool]("linker: step failed")
+            elif isX64 && r0.rtype == IMAGE_REL_AMD64_ADDR64:
+                let absRes: Result[bool] = coffPatchX64Abs64At(text, placeOff, targetRva)
+                if !absRes.ok:
+                    return Err[bool]("linker: step failed")
+            elif isX64 && r0.rtype == IMAGE_REL_AMD64_ADDR32:
+                let addrRes3: Result[bool] = coffPatchX64Addr32At(text, placeOff, targetRva)
+                if !addrRes3.ok:
+                    return Err[bool]("linker: step failed")
+            elif r0.rtype == IMAGE_REL_ARM64_BRANCH26:
+                let blRes: Result[bool] = coffPatchBlAt(text, placeOff, placeRva, targetRva)
+                if !blRes.ok:
+                    return Err[bool]("linker: step failed")
+            elif r0.rtype == IMAGE_REL_ARM64_PAGEBASE_REL21:
+                let adrpRes: Result[bool] = coffPatchAdrpAt(text, placeOff, placeRva, targetRva)
+                if !adrpRes.ok:
+                    return Err[bool]("linker: step failed")
+            elif r0.rtype == IMAGE_REL_ARM64_PAGEOFFSET_12A:
+                let addRes: Result[bool] = coffPatchAddLo12At(text, placeOff, targetRva)
+                if !addRes.ok:
+                    return Err[bool]("linker: step failed")
+            else:
+                return Err[bool](Fmt"coff_linker: unsupported reloc type: {strings.IntToStr(int32(r0.rtype))}")
+
+        for rri in 0..<o3.relocsRdata.len:
+            let rr: CoffObjReloc = o3.relocsRdata[rri]
+            if rr.symIndex >= uint32(o3.symbols.len):
+                return Err[bool]("coff_linker: rdata reloc symIndex out of range")
+            let symR: CoffObjSymbol = share(o3.symbols[int32(rr.symIndex)])
+            var targetRvaR: uint64
+            if symR.sect > 0:
+                let addrResR: Result[uint64] = coffSymRvaLocal(o3, lay3, symR, textRva, rdataRva, dataRva, bssRva)
+                if !addrResR.ok:
+                    return Err[bool]("linker: step failed")
+                targetRvaR = addrResR.value
+            else:
+                let defLookupResR = coffDefLookup(defs, symR.name)
+                if defLookupResR.ok:
+                    targetRvaR = defLookupResR.value
+                else:
+                    let importNameR = coffImportPeSymbol(symR.name, defaultCrtDll)
+                    let impIdxR: int32 = coffFindImportByName(imports, importNameR)
+                    if impIdxR < 0 || impIdxR >= imports.len:
+                        return Err[bool](Fmt"coff_linker: unresolved rdata symbol: {symR.name}")
+                    let impR: CoffImport = share(imports[impIdxR])
+                    if coffStrStartsWithAscii(symR.name, "__imp_"):
+                        targetRvaR = idataRva + uint64(impR.iatOff)
+                    else:
+                        targetRvaR = textRva + impR.stubOff
+            let rPlaceOff: uint64 = lay3.rdataOff + uint64(rr.off)
+            if isX64 && rr.rtype == IMAGE_REL_AMD64_ADDR64:
+                if coffIsSectionSymbol(symR):
+                    let addend64R = coffObjSegmentU64AtRead(o3, o3.rdataSectionOffsets, o3.rdataSectionRawPtrs, o3.rdataSectionRawSizes, o3.rdata, uint64(rr.off))
+                    if addend64R != uint64(0):
+                        targetRvaR = targetRvaR + addend64R
+                let absR: Result[bool] = coffPatchX64Abs64At(rdata, rPlaceOff, targetRvaR)
+                if !absR.ok:
+                    return Err[bool]("linker: step failed")
+            elif isX64 && rr.rtype == IMAGE_REL_AMD64_REL32:
+                if coffIsSectionSymbol(symR):
+                    let addend32RelR = coffObjSegmentU32AtRead(o3, o3.rdataSectionOffsets, o3.rdataSectionRawPtrs, o3.rdataSectionRawSizes, o3.rdata, uint64(rr.off))
+                    if addend32RelR != uint32(0):
+                        targetRvaR = coffRvaAddSigned32(targetRvaR, addend32RelR)
+                let relR: Result[bool] = coffPatchX64Rel32At(rdata, rPlaceOff, rdataRva + rPlaceOff, targetRvaR)
+                if !relR.ok:
+                    return Err[bool]("linker: step failed")
+            elif isX64 && rr.rtype == IMAGE_REL_AMD64_ADDR32:
+                if coffIsSectionSymbol(symR):
+                    let addend32R = coffObjSegmentU32AtRead(o3, o3.rdataSectionOffsets, o3.rdataSectionRawPtrs, o3.rdataSectionRawSizes, o3.rdata, uint64(rr.off))
+                    if addend32R != uint32(0):
+                        targetRvaR = coffRvaAddSigned32(targetRvaR, addend32R)
+                let addrR: Result[bool] = coffPatchX64Addr32At(rdata, rPlaceOff, targetRvaR)
+                if !addrR.ok:
+                    return Err[bool]("linker: step failed")
+            else:
+                return Err[bool](Fmt"coff_linker: unsupported rdata reloc type: {strings.IntToStr(int32(rr.rtype))}")
+
+        for rdi in 0..<o3.relocsData.len:
+            let rd: CoffObjReloc = o3.relocsData[rdi]
+            if rd.symIndex >= uint32(o3.symbols.len):
+                return Err[bool]("coff_linker: data reloc symIndex out of range")
+            let symD: CoffObjSymbol = share(o3.symbols[int32(rd.symIndex)])
+            var targetRvaD: uint64
+            if symD.sect > 0:
+                let addrResD: Result[uint64] = coffSymRvaLocal(o3, lay3, symD, textRva, rdataRva, dataRva, bssRva)
+                if !addrResD.ok:
+                    return Err[bool]("linker: step failed")
+                targetRvaD = addrResD.value
+            else:
+                let defLookupResD = coffDefLookup(defs, symD.name)
+                if defLookupResD.ok:
+                    targetRvaD = defLookupResD.value
+                else:
+                    let importNameD = coffImportPeSymbol(symD.name, defaultCrtDll)
+                    let impIdxD: int32 = coffFindImportByName(imports, importNameD)
+                    if impIdxD < 0 || impIdxD >= imports.len:
+                        return Err[bool](Fmt"coff_linker: unresolved data symbol: {symD.name}")
+                    let impD: CoffImport = share(imports[impIdxD])
+                    if coffStrStartsWithAscii(symD.name, "__imp_"):
+                        targetRvaD = idataRva + uint64(impD.iatOff)
+                    else:
+                        targetRvaD = textRva + impD.stubOff
+            let dPlaceOff: uint64 = lay3.dataOff + uint64(rd.off)
+            if isX64 && rd.rtype == IMAGE_REL_AMD64_ADDR64:
+                if coffIsSectionSymbol(symD):
+                    let addend64D = coffObjSegmentU64AtRead(o3, o3.dataSectionOffsets, o3.dataSectionRawPtrs, o3.dataSectionRawSizes, o3.data, uint64(rd.off))
+                    if addend64D != uint64(0):
+                        targetRvaD = targetRvaD + addend64D
+                let absD: Result[bool] = coffPatchX64Abs64At(dataSeg, dPlaceOff, targetRvaD)
+                if !absD.ok:
+                    return Err[bool]("linker: step failed")
+            elif isX64 && rd.rtype == IMAGE_REL_AMD64_REL32:
+                if coffIsSectionSymbol(symD):
+                    let addend32RelD = coffObjSegmentU32AtRead(o3, o3.dataSectionOffsets, o3.dataSectionRawPtrs, o3.dataSectionRawSizes, o3.data, uint64(rd.off))
+                    if addend32RelD != uint32(0):
+                        targetRvaD = coffRvaAddSigned32(targetRvaD, addend32RelD)
+                let relD: Result[bool] = coffPatchX64Rel32At(dataSeg, dPlaceOff, dataRva + dPlaceOff, targetRvaD)
+                if !relD.ok:
+                    return Err[bool]("linker: step failed")
+            elif isX64 && rd.rtype == IMAGE_REL_AMD64_ADDR32:
+                if coffIsSectionSymbol(symD):
+                    let addend32D = coffObjSegmentU32AtRead(o3, o3.dataSectionOffsets, o3.dataSectionRawPtrs, o3.dataSectionRawSizes, o3.data, uint64(rd.off))
+                    if addend32D != uint32(0):
+                        targetRvaD = coffRvaAddSigned32(targetRvaD, addend32D)
+                let addrD: Result[bool] = coffPatchX64Addr32At(dataSeg, dPlaceOff, targetRvaD)
+                if !addrD.ok:
+                    return Err[bool]("linker: step failed")
+            else:
+                return Err[bool](Fmt"coff_linker: unsupported data reloc type: {strings.IntToStr(int32(rd.rtype))}")
+
+    phaseNs = coffPhaseMs("patch_relocs", phaseNs)
+    # Patch _start stub calls (main + ExitProcess stub).
+    coffDebug("coff_link_debug=patch_start_before_main_lookup")
+    coffDebug(Fmt"coff_link_debug=patch_start_main_found value={strings.IntToStr(mainFound)}")
+    if mainFound == 0:
+        return Err[bool]("coff_linker: missing main symbol (required for entry)")
+    coffDebug(Fmt"coff_link_debug=patch_start_exit_index value={strings.IntToStr(exitImpIdx)} imports={strings.IntToStr(imports.len)}")
+    if exitImpIdx < 0:
+        return Err[bool]("coff_linker: internal missing ExitProcess import stub")
+    coffDebug(Fmt"coff_link_debug=patch_start_exit_stub_off value={strings.Int64ToStr(int64(exitStubOff))}")
+    let exitStubRva: uint64 = textRva + exitStubOff
+    let startRva: uint64 = textRva + uint64(0)
+    coffDebug(Fmt"coff_link_debug=patch_start_rvas main={strings.Int64ToStr(int64(mainRva))} exit={strings.Int64ToStr(int64(exitStubRva))} start={strings.Int64ToStr(int64(startRva))}")
+    if isX64:
+        let entryArgcRes: Result[uint64] = coffDefLookup(defs, "cheng_windows_entry_argc")
+        if !entryArgcRes.ok:
+            return Err[bool]("coff_linker: missing cheng_windows_entry_argc symbol (required for x64 Windows entry)")
+        let entryArgvRes: Result[uint64] = coffDefLookup(defs, "cheng_windows_entry_argv")
+        if !entryArgvRes.ok:
+            return Err[bool]("coff_linker: missing cheng_windows_entry_argv symbol (required for x64 Windows entry)")
+        let argcStubRva: uint64 = entryArgcRes.value
+        let argvStubRva: uint64 = entryArgvRes.value
+        coffDebug("coff_link_debug=patch_start_x64_before_argc_call")
+        let callArgc: Result[bool] = coffPatchX64Rel32At(text, uint64(5), startRva + uint64(5), argcStubRva)
+        if !callArgc.ok:
+            return Err[bool]("linker: step failed")
+        coffDebug("coff_link_debug=patch_start_x64_before_argv_call")
+        let callArgv: Result[bool] = coffPatchX64Rel32At(text, uint64(12), startRva + uint64(12), argvStubRva)
+        if !callArgv.ok:
+            return Err[bool]("linker: step failed")
+        coffDebug("coff_link_debug=patch_start_x64_before_main_call")
+        let callMain: Result[bool] = coffPatchX64Rel32At(text, uint64(20), startRva + uint64(20), mainRva)
+        if !callMain.ok:
+            return Err[bool]("linker: step failed")
+        coffDebug("coff_link_debug=patch_start_x64_before_exit_call")
+        let callExit: Result[bool] = coffPatchX64Rel32At(text, uint64(27), startRva + uint64(27), exitStubRva)
+        if !callExit.ok:
+            return Err[bool]("linker: step failed")
+        coffDebug("coff_link_debug=patch_start_x64_done")
+    else:
+        let bl0: Result[bool] = coffPatchBlAt(text, uint64(0), startRva + 0, mainRva)
+        if !bl0.ok:
+            return Err[bool]("linker: step failed")
+        let bl1: Result[bool] = coffPatchBlAt(text, uint64(4), startRva + 4, exitStubRva)
+        if !bl1.ok:
+            return Err[bool]("linker: step failed")
+
+    # Patch import stubs to reference IAT slots.
+    coffDebug("coff_link_debug=patch_import_stubs_before")
+    for pi in 0..<imports.len:
+        if (pi % 16) == 0:
+            coffDebug(Fmt"coff_link_debug=patch_import_stub index={strings.IntToStr(pi)}")
+        let impIatOff: uint32 = imports[pi].iatOff
+        let impStubOff: uint64 = imports[pi].stubOff
+        let iatSlotRva: uint64 = idataRva + uint64(impIatOff)
+        let stubRva: uint64 = textRva + impStubOff
+        if isX64:
+            let stubPatch: Result[bool] = coffPatchX64Rel32At(text, impStubOff + uint64(2), stubRva + uint64(2), iatSlotRva)
+            if !stubPatch.ok:
+                return Err[bool]("linker: step failed")
+        else:
+            let adrpRes2: Result[bool] = coffPatchAdrpAt(text, impStubOff + 0, stubRva + 0, iatSlotRva)
+            if !adrpRes2.ok:
+                return Err[bool]("linker: step failed")
+            let ldrRes2: Result[bool] = coffPatchLdrLo12At(text, impStubOff + 4, iatSlotRva)
+            if !ldrRes2.ok:
+                return Err[bool]("linker: step failed")
+    coffDebug("coff_link_debug=patch_import_stubs_done")
+
+    # PE headers.
+    coffDebug("coff_link_debug=pe_headers_before")
+    let textRawSize: uint32 = uint32(text.len)
+    let rdataRawSize: uint32 = hasRdata ? uint32(rdata.len) : 0
+    let dataRawSize: uint32 = hasData ? uint32(dataSeg.len) : 0
+    let idataRawSize: uint32 = uint32(idata.len)
+    let bssVirtSize: uint32 = hasBss ? uint32(bssSize) : 0
+
+    # Headers layout.
+    let peOff: uint32 = 0x80
+    let sectCount: int32 = 2 + (hasRdata ? 1 : 0) + (hasData ? 1 : 0) + (hasBss ? 1 : 0)
+    let optSize: int32 = 0xF0
+    let ntHeadersSize: uint32 = 4 + 20 + uint32(optSize) + uint32(sectCount) * 40
+    let headersSizeRaw: uint32 = peOff + ntHeadersSize
+    let sizeOfHeaders: uint32 = coffAlignUp32(headersSizeRaw, PE_FILE_ALIGN)
+
+    # Section raw pointers.
+    var curRaw: uint32 = sizeOfHeaders
+    let textRawPtr: uint32 = curRaw
+    curRaw = coffAlignUp32(curRaw + coffAlignUp32(textRawSize, PE_FILE_ALIGN), PE_FILE_ALIGN)
+    let rdataRawPtr: uint32 = hasRdata ? curRaw : 0
+    if hasRdata:
+        curRaw = coffAlignUp32(curRaw + coffAlignUp32(rdataRawSize, PE_FILE_ALIGN), PE_FILE_ALIGN)
+    let dataRawPtr: uint32 = hasData ? curRaw : 0
+    if hasData:
+        curRaw = coffAlignUp32(curRaw + coffAlignUp32(dataRawSize, PE_FILE_ALIGN), PE_FILE_ALIGN)
+    let idataRawPtr: uint32 = curRaw
+    curRaw = coffAlignUp32(curRaw + coffAlignUp32(idataRawSize, PE_FILE_ALIGN), PE_FILE_ALIGN)
+
+    let sizeOfCode: uint32 = coffAlignUp32(textRawSize, PE_FILE_ALIGN)
+    let sizeOfInitData: uint32 =
+        (hasRdata ? coffAlignUp32(rdataRawSize, PE_FILE_ALIGN) : 0) +
+        (hasData ? coffAlignUp32(dataRawSize, PE_FILE_ALIGN) : 0) +
+        coffAlignUp32(idataRawSize, PE_FILE_ALIGN)
+
+    # Total file size.
+    let fileSize: uint32 = curRaw
+    var out: uint8[]
+    coffDebug(Fmt"coff_link_debug=pe_alloc_before file_size={strings.Int64ToStr(int64(uint64(fileSize)))}")
+    setLen(out, int32(fileSize))
+    for zi in 0..<fileSize:
+        out[int32(zi)] = uint8(0)
+    coffDebug("coff_link_debug=pe_alloc_done")
+
+    # DOS header (64 bytes).
+    coffWriteU16AtSeq(out, 0, IMAGE_DOS_SIGNATURE)
+    coffWriteU32AtSeq(out, 0x3C, peOff)
+
+    # NT headers.
+    var w: uint32 = peOff
+    coffWriteU32AtSeq(out, w, IMAGE_NT_SIGNATURE)
+    w = w + 4
+    # IMAGE_FILE_HEADER
+    coffWriteU16AtSeq(out, w + 0, expectedMachine)
+    coffWriteU16AtSeq(out, w + 2, sectCount)
+    coffWriteU32AtSeq(out, w + 4, uint32(0))
+    coffWriteU32AtSeq(out, w + 8, uint32(0))
+    coffWriteU32AtSeq(out, w + 12, uint32(0))
+    coffWriteU16AtSeq(out, w + 16, optSize)
+    coffWriteU16AtSeq(out, w + 18, 34)
+    w = w + 20
+
+    # IMAGE_OPTIONAL_HEADER64
+    coffWriteU16AtSeq(out, w + 0, IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    # linker version
+    out[int32(w + 2)] = uint8(0)
+    out[int32(w + 3)] = uint8(0)
+    coffWriteU32AtSeq(out, w + 4, sizeOfCode)
+    coffWriteU32AtSeq(out, w + 8, sizeOfInitData)
+    coffWriteU32AtSeq(out, w + 12, bssVirtSize)
+    coffWriteU32AtSeq(out, w + 16, uint32(textRva)) # entry (start stub)
+    coffWriteU32AtSeq(out, w + 20, uint32(textRva)) # base of code
+    coffWriteU64AtSeq(out, w + 24, coffPeImageBase())
+    coffWriteU32AtSeq(out, w + 32, PE_SECTION_ALIGN)
+    coffWriteU32AtSeq(out, w + 36, PE_FILE_ALIGN)
+    coffWriteU16AtSeq(out, w + 40, 6)
+    coffWriteU16AtSeq(out, w + 42, 0)
+    coffWriteU16AtSeq(out, w + 44, 0)
+    coffWriteU16AtSeq(out, w + 46, 0)
+    coffWriteU16AtSeq(out, w + 48, 6)
+    coffWriteU16AtSeq(out, w + 50, 0)
+    coffWriteU32AtSeq(out, w + 52, uint32(0))
+    coffWriteU32AtSeq(out, w + 56, sizeOfImage)
+    coffWriteU32AtSeq(out, w + 60, sizeOfHeaders)
+    coffWriteU32AtSeq(out, w + 64, uint32(0)) # checksum
+    coffWriteU16AtSeq(out, w + 68, IMAGE_SUBSYSTEM_WINDOWS_CUI)
+    coffWriteU16AtSeq(out, w + 70, 0) # dll characteristics
+    coffWriteU64AtSeq(out, w + 72, uint64(0x100000))
+    coffWriteU64AtSeq(out, w + 80, uint64(0x1000))
+    coffWriteU64AtSeq(out, w + 88, uint64(0x100000))
+    coffWriteU64AtSeq(out, w + 96, uint64(0x1000))
+    coffWriteU32AtSeq(out, w + 104, uint32(0)) # loader flags
+    coffWriteU32AtSeq(out, w + 108, IMAGE_NUMBEROF_DIRECTORY_ENTRIES)
+    # data directories start at w+112
+    let ddOff: uint32 = w + 112
+    # import directory (1)
+    coffWriteU32AtSeq(out, ddOff + uint32(IMAGE_DIRECTORY_ENTRY_IMPORT) * 8 + 0, uint32(idataRva))
+    coffWriteU32AtSeq(out, ddOff + uint32(IMAGE_DIRECTORY_ENTRY_IMPORT) * 8 + 4, importDirSize)
+    w = w + uint32(optSize)
+
+    # Section headers.
+    let secHdrOff: uint32 = w
+    var secIdx: uint32
+
+    # .text
+    coffWritePeSectionHeader(out, secHdrOff + secIdx * 40,
+                             ".text",
+                             uint32(textRawSize),
+                             uint32(textRva),
+                             coffAlignUp32(textRawSize, PE_FILE_ALIGN),
+                             textRawPtr,
+                             IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ)
+    secIdx = secIdx + 1
+    if hasRdata:
+        coffWritePeSectionHeader(out, secHdrOff + secIdx * 40,
+                                 ".rdata",
+                                 rdataRawSize,
+                                 uint32(rdataRva),
+                                 coffAlignUp32(rdataRawSize, PE_FILE_ALIGN),
+                                 rdataRawPtr,
+                                 IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ)
+        secIdx = secIdx + 1
+    if hasData:
+        coffWritePeSectionHeader(out, secHdrOff + secIdx * 40,
+                                 ".data",
+                                 dataRawSize,
+                                 uint32(dataRva),
+                                 coffAlignUp32(dataRawSize, PE_FILE_ALIGN),
+                                 dataRawPtr,
+                                 IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | coffImageScnMemWrite())
+        secIdx = secIdx + 1
+    # .idata
+    coffWritePeSectionHeader(out, secHdrOff + secIdx * 40,
+                             ".idata",
+                             idataRawSize,
+                             uint32(idataRva),
+                             coffAlignUp32(idataRawSize, PE_FILE_ALIGN),
+                             idataRawPtr,
+                             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | coffImageScnMemWrite())
+    secIdx = secIdx + 1
+    if hasBss:
+        coffWritePeSectionHeader(out, secHdrOff + secIdx * 40,
+                                 ".bss",
+                                 bssVirtSize,
+                                 uint32(bssRva),
+                                 uint32(0),
+                                 uint32(0),
+                                 IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | coffImageScnMemWrite())
+        secIdx = secIdx + 1
+
+    if secIdx != uint32(sectCount):
+        return Err[bool]("coff_linker: internal section count mismatch")
+
+    # Headers were written into a fixed-size buffer; enforce bounds.
+    if sizeOfHeaders > uint32(out.len):
+        return Err[bool]("coff_linker: internal SizeOfHeaders overflow")
+
+    # Write sections.
+    for i in 0..<textRawSize:
+        out[int32(textRawPtr + i)] = text[int32(i)]
+    if hasRdata:
+        for i in 0..<rdataRawSize:
+            out[int32(rdataRawPtr + i)] = rdata[int32(i)]
+    if hasData:
+        for i in 0..<dataRawSize:
+            out[int32(dataRawPtr + i)] = dataSeg[int32(i)]
+    for i in 0..<idataRawSize:
+        out[int32(idataRawPtr + i)] = idata[int32(i)]
+
+    phaseNs = coffPhaseMs("pe_build", phaseNs)
+    let outputHostPath = coffHostPath(outputPath)
+    if !coffWriteFileBytes(outputHostPath, out):
+        return Err[bool](Fmt"coff_linker: failed to write output atomically: {outputPath}")
+    phaseNs = coffPhaseMs("write_file", phaseNs)
+    return Ok[bool](true)
+
+@borrows
+fn CoffLinkExeA64(objPaths: str[], outputPath: str, target: str): Result[bool] =
+    return coffLinkExeA64(objPaths, outputPath, target)

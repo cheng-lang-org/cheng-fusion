@@ -225,11 +225,15 @@ receiptToolchainFixtureValue.counts.normalizedScopeFactCount = 0;
 receiptToolchainFixtureValue.counts.importEdgeCount = 0;
 receiptToolchainFixtureValue.counts.typeEnumVariantCount = 0;
 receiptToolchainFixtureValue.counts.declarationCount = 0;
+receiptToolchainFixtureValue.counts.forwardingProductionCount = 0;
+receiptToolchainFixtureValue.counts.forwardingProductionChildCount = 0;
 receiptToolchainFixtureValue.normalizedStatementFacts = [];
 receiptToolchainFixtureValue.normalizedScopeFacts = [];
 receiptToolchainFixtureValue.importEdges = [];
 receiptToolchainFixtureValue.typeEnumVariants = [];
 receiptToolchainFixtureValue.declarations = [];
+receiptToolchainFixtureValue.forwardingProductions = [];
+receiptToolchainFixtureValue.forwardingProductionChildren = [];
 const receiptToolchainFixture =
   JSON.stringify(receiptToolchainFixtureValue);
 validateDriverReceiptToolchainIdentity(receiptToolchainFixture);
@@ -278,6 +282,12 @@ const sourceBytes = Buffer.from("let value = 1\n");
 const receiptBytes = Buffer.from("{\"stage\":\"parser\"}\n");
 const driverSha256 = "1".repeat(64);
 const traceSha256 = "2".repeat(64);
+const parserBindingSha256 = "e".repeat(64);
+const parserNodeMapSha256 = "f".repeat(64);
+const parserNodeMapPath = join(
+  frozenParent,
+  "ebnf_parser_node_map.json",
+);
 const officialCurrentBuild = {
   bindingPath: join(frozenParent, "current-official-binding.kv"),
   bindingSha256: "a".repeat(64),
@@ -389,6 +399,10 @@ const manifest = {
     sha256: "8".repeat(64),
   },
   harness: {path: harnessPath, sha256: "9".repeat(64)},
+  parserNodeMap: {
+    path: parserNodeMapPath,
+    sha256: parserNodeMapSha256,
+  },
   dependencyClosure: {
     fileCount: closureRows.length,
     sha256: sha256(canonicalJson(closureRows)),
@@ -433,6 +447,9 @@ const manifest = {
       driverRole: "receipt_driver_a",
       driverSha256,
       parserTraceRootSha256: traceSha256,
+      parserBindingSha256,
+      parserBindingRequiredResultCount: 971,
+      parserBindingHitCount: 1,
     },
     {
       path: "/frozen/receipt-b.json",
@@ -443,6 +460,9 @@ const manifest = {
       driverRole: "receipt_driver_b",
       driverSha256,
       parserTraceRootSha256: traceSha256,
+      parserBindingSha256,
+      parserBindingRequiredResultCount: 971,
+      parserBindingHitCount: 1,
     },
   ],
 };
@@ -453,6 +473,8 @@ const validationInput = {
   formalEbnfSha256: manifest.formalEbnfSha256,
   parserPath: manifest.parser.path,
   parserSha256: manifest.parser.sha256,
+  parserNodeMapPath,
+  parserNodeMapSha256,
   receiptProducerPath: manifest.receiptProducer.path,
   receiptProducerSha256: manifest.receiptProducer.sha256,
   driverEntryPath: manifest.driverEntry.path,
@@ -665,6 +687,26 @@ changedReceiptTrace.receipts[1].parserTraceRootSha256 = "0".repeat(64);
 assert.throws(
   () => validateParserProductionReceiptHarnessIdentity(
     changedReceiptTrace,
+    validationInput,
+  ),
+  /harness_receipt_fixed_point_invalid/,
+);
+
+const changedParserNodeMap = clone(manifest);
+changedParserNodeMap.parserNodeMap.sha256 = "0".repeat(64);
+assert.throws(
+  () => validateParserProductionReceiptHarnessIdentity(
+    changedParserNodeMap,
+    validationInput,
+  ),
+  /harness_parser_node_map_identity_invalid/,
+);
+
+const changedReceiptBinding = clone(manifest);
+changedReceiptBinding.receipts[1].parserBindingSha256 = "0".repeat(64);
+assert.throws(
+  () => validateParserProductionReceiptHarnessIdentity(
+    changedReceiptBinding,
     validationInput,
   ),
   /harness_receipt_fixed_point_invalid/,

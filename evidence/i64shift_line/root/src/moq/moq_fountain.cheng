@@ -1,0 +1,2722 @@
+import std/rawbytes
+import std/result
+import std/strings
+import std/strformat
+import std/rawmem_support
+import std/crypto/sha256
+import cheng/std/bytes_layout as layout
+import std/strutils as strutil
+import std/os as os
+import std/times as times
+import std/system as sysrt
+import std/thread
+import std/atomic
+
+# Phase-timing state. Default OFF => MoqFountainEmitLog stays a near-no-op
+# (one int compare + return) and never touches the clock, so publish cid/output
+# bytes are unchanged. Set CHENG_MOQ_TIMING=1 to print per-phase deltas to stdout.
+var
+    moqFountainTimingState: int32
+    moqFountainTimingLastNs: int64
+
+fn moqFountainTimingOn(): bool =
+    if moqFountainTimingState == 0:
+        if len(os.GetEnv("CHENG_MOQ_TIMING")) > 0:
+            moqFountainTimingState = 1
+        else:
+            moqFountainTimingState = 2
+        moqFountainTimingLastNs = times.MonotimeNs()
+    return moqFountainTimingState == 1
+
+@borrows
+fn MoqFountainSetTracePath(path: str) =
+    path
+
+fn MoqFountainClearTracePath() =
+    return
+
+fn MoqFountainAppendTraceLine(stream: ptr, line: str): Result[bool] =
+    stream
+    line
+    return Ok[bool](true)
+
+@borrows
+fn MoqFountainEmitLog(message: str) =
+    if !moqFountainTimingOn():
+        return
+    let nowNs: int64 = times.MonotimeNs()
+    let deltaNs: int64 = nowNs - moqFountainTimingLastNs
+    let deltaUs: int64 = deltaNs / int64(1000)
+    moqFountainTimingLastNs = nowNs
+    sysrt.puts(sysrt.panicCString(Fmt"[moq-timing] +{strings.Int64ToStr(deltaUs)}us {message}"))
+
+# Throwaway profiling-only instrumentation (2026-07-14 ingest hotspot measurement).
+# Separate env gate (CHENG_INGEST_PROFILE=1) from CHENG_MOQ_TIMING so this can be
+# enabled WITHOUT also turning on MoqFountainEmitLog's per-droplet call sites inside
+# MoqFountainBuildObject (those run per-worker-thread under thread.ParallelFor and
+# fan out to thousands of unsynchronized calls each doing a puts() syscall — turning
+# them on made a single run take >45s and starved the box, see profiling notes).
+# This gate only wraps: (a) top-level MoqFountainBuild/Fill checkpoints (main-thread
+# only, called ~9 times per build, safe to println), and (b) per-object CPU-time
+# buckets inside the parallel worker. (b) deliberately avoids touching any ARC ref
+# from worker threads (Cheng ARC retain/release is non-atomic per the worker-safety
+# note below) — first cut used an atomic.I32 ref passed into worker threads and every
+# call's implicit ARC retain on that shared ref raced across threads, silently
+# corrupting it (reads always came back 0, no crash). Fixed by using the SAME
+# pattern already proven in this file for moqFountainParResults: a plain int32[]
+# pre-sized to objectCount before ParallelFor, each worker writes only its own
+# objectIndex-disjoint slot (no shared mutable state, no refcount touched), and the
+# main thread sums serially after ParallelFor joins.
+var
+    moqFountainProfileState: int32
+    moqFountainProfileLastNs: int64
+    moqFountainProfObjectCidUs: int32[]
+    moqFountainProfBlockSplitUs: int32[]
+    moqFountainProfSourceLoopUs: int32[]
+    moqFountainProfRepairLoopUs: int32[]
+    moqFountainProfAssemblyUs: int32[]
+
+fn moqFountainProfileOn(): bool =
+    if moqFountainProfileState == 0:
+        if len(os.GetEnv("CHENG_INGEST_PROFILE")) > 0:
+            moqFountainProfileState = 1
+        else:
+            moqFountainProfileState = 2
+        moqFountainProfileLastNs = times.MonotimeNs()
+    return moqFountainProfileState == 1
+
+# Main-thread-only coarse checkpoint print (same shape as MoqFountainEmitLog, but on
+# the independent CHENG_INGEST_PROFILE gate).
+@borrows
+fn MoqFountainProfileMark(message: str) =
+    if !moqFountainProfileOn():
+        return
+    let nowNs: int64 = times.MonotimeNs()
+    let deltaNs: int64 = nowNs - moqFountainProfileLastNs
+    let deltaUs: int64 = deltaNs / int64(1000)
+    moqFountainProfileLastNs = nowNs
+    sysrt.puts(sysrt.panicCString(Fmt"[ingest-profile] +{strings.Int64ToStr(deltaUs)}us {message}"))
+
+# Main-thread-only: (re)size the four per-object bucket arrays to objectCount right
+# before ParallelFor, mirroring moqFountainParResults's own setLen call.
+fn moqFountainProfileResetObjectBuckets(objectCount: int32) =
+    if !moqFountainProfileOn():
+        return
+    setLen(moqFountainProfObjectCidUs, objectCount)
+    setLen(moqFountainProfBlockSplitUs, objectCount)
+    setLen(moqFountainProfSourceLoopUs, objectCount)
+    setLen(moqFountainProfRepairLoopUs, objectCount)
+    setLen(moqFountainProfAssemblyUs, objectCount)
+
+# Worker-thread-safe: writes into this object's own disjoint slot. No shared
+# mutable state besides plain int32 array elements at a private index.
+fn moqFountainProfileWrite(bucket: var int32[], objectIndex: int32, sinceNs: int64, nowNs: int64) =
+    if !moqFountainProfileOn():
+        return
+    if objectIndex < 0 || objectIndex >= bucket.len:
+        return
+    bucket[objectIndex] = int32((nowNs - sinceNs) / int64(1000))
+
+fn moqFountainProfileClockNs(): int64 =
+    if !moqFountainProfileOn():
+        return int64(0)
+    return times.MonotimeNs()
+
+fn moqFountainProfileSumI32(values: var int32[]): int64 =
+    var total: int64 = int64(0)
+    var i: int32
+    for i in i..<values.len:
+        total = total + int64(values[i])
+    return total
+
+fn MoqFountainProfileSummaryLine(): str =
+    if !moqFountainProfileOn():
+        return ""
+    return strutil.Join(["[ingest-profile] object_loop_breakdown (sum of per-object CPU-us across all worker threads, NOT wall time)",
+        " object_cid_sha256_us=", strings.Int64ToStr(moqFountainProfileSumI32(moqFountainProfObjectCidUs)),
+        " block_split_pad_us=", strings.Int64ToStr(moqFountainProfileSumI32(moqFountainProfBlockSplitUs)),
+        " source_droplet_loop_us=", strings.Int64ToStr(moqFountainProfileSumI32(moqFountainProfSourceLoopUs)),
+        " repair_droplet_loop_us=", strings.Int64ToStr(moqFountainProfileSumI32(moqFountainProfRepairLoopUs)),
+        " object_assembly_us=", strings.Int64ToStr(moqFountainProfileSumI32(moqFountainProfAssemblyUs))], "")
+
+@borrows
+fn MoqFountainByteBufAppendText(buf: var layout.ByteBuf, text: str) =
+    if len(text) <= 0:
+        return
+    layout.ByteBufAppendBytes(buf, BytesSlice(BytesFromString(text), 0, len(text)))
+
+fn MoqFountainByteBufBytes(buf: var layout.ByteBuf): Bytes =
+    if buf.len <= 0:
+        return emptyBytes()
+    var out = BytesAlloc(buf.len)
+    rawmem_support.RawmemCopy(out.data, buf.storage.data, buf.len)
+    return out
+
+# Append `count` bytes of `data` starting at `offset` as one bulk copy (view,
+# no intermediate allocation). Caller must keep `data` alive across the call.
+@borrows
+fn moqFountainByteBufAppendView(buf: var layout.ByteBuf, data: Bytes, offset: int32, count: int32) =
+    if count <= 0:
+        return
+    var view: Bytes
+    view.data = rawmem_support.RawmemPtrAdd(data.data, offset)
+    view.len = count
+    layout.ByteBufAppendBytes(buf, view)
+
+# Decimal int32 append with zero heap allocation: digits are formatted into a
+# small scratch buffer and appended as a view, byte-for-byte identical to
+# appending strings.IntToStr(value) ("0" for zero, '-' prefix for negatives,
+# "-2147483648" for the int32 minimum). The scratch is shared, so this is only
+# used on the ingest main thread AFTER the parallel object build has joined
+# (catalog / rebuild-template serialization) — never from a build worker.
+var
+    moqFountainIntScratch: Bytes
+
+fn moqFountainIntScratchGet(): Bytes =
+    if moqFountainIntScratch.data == nil:
+        moqFountainIntScratch = BytesAlloc(16)
+    return moqFountainIntScratch
+
+fn MoqFountainByteBufAppendInt(buf: var layout.ByteBuf, value: int32) =
+    var v = value
+    if v < 0:
+        if v < 0 - 2147483647:
+            MoqFountainByteBufAppendText(buf, "-2147483648")
+            return
+        layout.ByteBufAppendByte(buf, int32('-'))
+        v = 0 - v
+    let scratch = moqFountainIntScratchGet()
+    var cursor = 16
+    if v == 0:
+        cursor = 15
+        BytesSet(scratch, cursor, int32('0'))
+    while v != 0:
+        let q = v / 10
+        cursor = cursor - 1
+        BytesSet(scratch, cursor, int32('0') + (v - q * 10))
+        v = q
+    moqFountainByteBufAppendView(buf, scratch, cursor, 16 - cursor)
+
+# Same bytes as appending MoqFountainJoinIntCsv(values) (empty -> nothing,
+# "," between values, none trailing) without materializing the joined string.
+@borrows
+fn MoqFountainByteBufAppendIntCsv(buf: var layout.ByteBuf, values: int32[]) =
+    var i: int32
+    for i in i..<values.len:
+        if i > 0:
+            layout.ByteBufAppendByte(buf, int32(','))
+        MoqFountainByteBufAppendInt(buf, values[i])
+
+@borrows
+fn MoqFountainCopyBytesRange(data: Bytes,
+                             offset: int32,
+                             count: int32): Bytes =
+    if count <= 0:
+        return emptyBytes()
+    if offset < 0:
+        return emptyBytes()
+    if offset >= BytesLen(data):
+        return emptyBytes()
+    var take = count
+    if offset + take > BytesLen(data):
+        take = BytesLen(data) - offset
+    if take <= 0:
+        return emptyBytes()
+    var out = BytesAlloc(take)
+    rawmem_support.RawmemCopy(out.data,
+                              rawmem_support.RawmemPtrAdd(data.data, offset),
+                              take)
+    return out
+
+type MoqFountainDroplet =
+    objectIndex: int32
+    dropletIndex: int32
+    kindCode: int32
+    key: str
+    peerId: str
+    cid: str
+    degree: int32
+    blockIndexes: int32[]
+    payload: Bytes
+
+type MoqFountainObject =
+    objectIndex: int32
+    groupId: str
+    objectId: str
+    priority: int32
+    byteOffset: int32
+    byteLength: int32
+    objectCid: str
+    sourceBlockBytes: int32
+    sourceBlockCount: int32
+    repairDropletCount: int32
+    droplets: MoqFountainDroplet[]
+
+type MoqFountainEquation =
+    coeffs: int32[]
+    payload: Bytes
+
+type MoqFountainBuildResult =
+    ownerPeerId: str
+    mimeType: str
+    bundleCid: str
+    blobCid: str
+    catalogKey: str
+    catalogCid: str
+    catalogSizeBytes: int32
+    catalogPayload: Bytes
+    rebuildTemplateKey: str
+    rebuildTemplateCid: str
+    rebuildTemplateSizeBytes: int32
+    rebuildTemplatePayload: Bytes
+    blobByteLen: int32
+    objectTargetBytes: int32
+    sourceBlockBytes: int32
+    objectCount: int32
+    remoteAckPeerIds: str[]
+    objects: MoqFountainObject[]
+    droplets: MoqFountainDroplet[]
+
+type MoqFountainRebuildObjectHeader =
+    byteLength: int32
+    sourceBlockBytes: int32
+    sourceBlockCount: int32
+    objectCid: str
+
+type MoqFountainRebuildAcc =
+    coeffData: int32[]
+    payloadRows: Bytes[]
+
+type MoqFountainRebuildResult =
+    blob: Bytes
+    blobCid: str
+    blobByteLen: int32
+
+const MoqFountainCatalogMagic = "unimaker.moq.fountain.catalog.v1"
+const MoqFountainTransport = "moq"
+const MoqFountainLayout = "lt_xor_v1"
+const MoqFountainDropletKindSource = 1
+const MoqFountainDropletKindRepair = 2
+
+@borrows
+fn MoqFountainErrorWire(errorText: str): str =
+    var rows: str[]
+    rows = []
+    add(rows, "ok=0")
+    add(rows, MoqFountainFmt2("error=", errorText))
+    return MoqFountainLinesWithNewline(rows)
+
+fn MoqFountainMaxInt32(left: int32, right: int32): int32 =
+    if left >= right:
+        return left
+    return right
+
+fn MoqFountainMinInt32(left: int32, right: int32): int32 =
+    if left <= right:
+        return left
+    return right
+
+fn MoqFountainNormalizePositiveInt(value: int32, fallback: int32): int32 =
+    var out = value
+    if out <= 0:
+        out = fallback
+    if out <= 0:
+        return 1
+    return out
+
+fn MoqFountainHexValue(ch: int32): int32 =
+    if ch >= int32('0') && ch <= int32('9'):
+        return ch - int32('0')
+    if ch >= int32('a') && ch <= int32('f'):
+        return 10 + ch - int32('a')
+    if ch >= int32('A') && ch <= int32('F'):
+        return 10 + ch - int32('A')
+    return -1
+
+@borrows
+fn MoqFountainBytesFromHex(text: str): Result[Bytes] =
+    if len(text) <= 0:
+        return Ok[Bytes](BytesAlloc(0))
+    if (len(text) % 2) != 0:
+        return Err[Bytes]("moq_fountain_invalid_hex_length")
+    let n = len(text) / 2
+    var check: int32
+    while check < n:
+        let hi = MoqFountainHexValue(Int32(text[check * 2]))
+        let lo = MoqFountainHexValue(Int32(text[check * 2 + 1]))
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("moq_fountain_invalid_hex")
+        check = check + 1
+    var out: Bytes
+    out = BytesAlloc(n)
+    let p = BytesDataPtr(out)
+    var i: int32
+    while i < n:
+        let hi = MoqFountainHexValue(Int32(text[i * 2]))
+        let lo = MoqFountainHexValue(Int32(text[i * 2 + 1]))
+        rawmem_support.RawmemWriteI8(p, i, Int8((hi << 4) | lo))
+        i = i + 1
+    return Ok[Bytes](BytesTake(out))
+
+@borrows
+fn MoqFountainSha256HexBytes(data: Bytes): str =
+    var digest = sha256.Sha256Digest(data)
+    let out = BytesToHex(digest)
+    BytesFree(digest)
+    return out
+
+# Scratch variants for the parallel object builders: one set of buffers per
+# object (worker-local by ParallelFor construction) replaces the per-block
+# digest+hex allocations that serialized on the runtime allocator lock.
+@borrows
+fn MoqFountainHex32ToStr(digest: Bytes, hexScratch: var Bytes): str =
+    var i: int32
+    while i < 32:
+        let v = BytesGet(digest, i) & 255
+        let hi = (v >> 4) & 15
+        let lo = v & 15
+        var hiChar: int32 = Int32('0') + hi
+        var loChar: int32 = Int32('0') + lo
+        if hi >= 10:
+            hiChar = Int32('a') + (hi - 10)
+        if lo >= 10:
+            loChar = Int32('a') + (lo - 10)
+        BytesSet(hexScratch, i * 2, hiChar)
+        BytesSet(hexScratch, i * 2 + 1, loChar)
+        i = i + 1
+    return BytesToString(hexScratch)
+
+@borrows
+fn MoqFountainSha256HexBytesScratch(data: Bytes,
+                                    stateScratch: var Bytes,
+                                    msgScratch: var Bytes,
+                                    digestScratch: var Bytes,
+                                    hexScratch: var Bytes): str =
+    sha256.Sha256DigestInto(data, stateScratch, msgScratch, digestScratch)
+    return MoqFountainHex32ToStr(digestScratch, hexScratch)
+
+@borrows
+fn MoqFountainSha256HexText(text: str): str =
+    return MoqFountainSha256HexBytes(BytesSlice(BytesFromString(text), 0, len(text)))
+
+@borrows
+fn MoqFountainAsciiTrimLeft(text: str): int32 =
+    var idx: int32
+    while idx < len(text):
+        let code = Int32(text[idx])
+        if code == 32 || code == 10 || code == 13 || code == 9:
+            idx = idx + 1
+            continue
+        break
+    return idx
+
+@borrows
+fn MoqFountainAsciiTrimRight(text: str): int32 =
+    var idx: int32 = len(text)
+    while idx > 0:
+        let code = Int32(text[idx - 1])
+        if code == 32 || code == 10 || code == 13 || code == 9:
+            idx = idx - 1
+            continue
+        break
+    return idx
+
+@borrows
+fn MoqFountainTrimAscii(text: str): str =
+    let start = MoqFountainAsciiTrimLeft(text)
+    let stop = MoqFountainAsciiTrimRight(text)
+    var sliceStart: int32
+    var sliceCount: int32
+    if stop > start:
+        sliceStart = start
+        sliceCount = stop - start
+    return strings.CloneStrRange(text, sliceStart, sliceCount)
+
+@borrows
+fn MoqFountainTextContains(haystack: str, needle: str): bool =
+    let haystackLen = len(haystack)
+    let needleLen = len(needle)
+    if needleLen <= 0:
+        return true
+    if haystackLen < needleLen:
+        return false
+    var start: int32
+    while start <= haystackLen - needleLen:
+        var matched = true
+        var idx: int32
+        for idx in idx..<needleLen:
+            if Int32(haystack[start + idx]) != Int32(needle[idx]):
+                matched = false
+                break
+        if matched:
+            return true
+        start = start + 1
+
+    return false
+
+@borrows
+fn MoqFountainSplitCsv(text: str): str[] =
+    var out: str[]
+    out = []
+    if len(text) <= 0:
+        return out
+    var start: int32
+    var idx: int32
+    while idx <= len(text):
+        let atEnd = idx >= len(text)
+        var hitSplit = atEnd
+        if !hitSplit:
+            if Int32(text[idx]) == 44:
+                hitSplit = true
+        if hitSplit:
+            var item = ""
+            if idx > start:
+                item = strings.SliceBytes(text, start, idx - start)
+            add(out, item)
+            start = idx + 1
+        idx = idx + 1
+    return out
+
+@borrows
+fn MoqFountainNormalizePeerCsv(peerCsv: str): str[] =
+    var out: str[]
+    out = []
+    if len(peerCsv) <= 0:
+        return out
+    var seen = ","
+    var start: int32
+    var i: int32
+    while i <= len(peerCsv):
+        let atEnd = i >= len(peerCsv)
+        var hitSplit = atEnd
+        if !hitSplit:
+            if Int32(peerCsv[i]) == 44:
+                hitSplit = true
+        if !hitSplit:
+            i = i + 1
+            continue
+        var raw = ""
+        if i > start:
+            raw = strings.SliceBytes(peerCsv, start, i - start)
+        let candidate = MoqFountainTrimAscii(raw)
+        if len(candidate) > 0:
+            let marker = MoqFountainFmt3(",", candidate, ",")
+            if !MoqFountainTextContains(seen, marker):
+                add(out, candidate)
+                seen = MoqFountainFmt2(seen, marker)
+        start = i + 1
+        i = i + 1
+    return out
+
+@borrows
+fn MoqFountainJoinTexts(parts: str[], sep: str): str =
+    if parts.len <= 0:
+        return ""
+    let sepLen = len(sep)
+    var totalLen: int32
+    var idx: int32
+    for idx in idx..<parts.len:
+        totalLen = totalLen + len(parts[idx])
+        if idx + 1 < parts.len:
+            totalLen = totalLen + sepLen
+    var buf = layout.ByteBufInit(totalLen)
+    idx = 0
+    for idx in idx..<parts.len:
+        if idx > 0 && sepLen > 0:
+            MoqFountainByteBufAppendText(buf, sep)
+        MoqFountainByteBufAppendText(buf, parts[idx])
+    return BytesToString(MoqFountainByteBufBytes(buf))
+
+@borrows
+fn MoqFountainAppendRawLine(buf: var layout.ByteBuf, key: str, value: str) =
+    MoqFountainByteBufAppendText(buf, key)
+    layout.ByteBufAppendByte(buf, int32('='))
+    MoqFountainByteBufAppendText(buf, value)
+    layout.ByteBufAppendByte(buf, int32('\n'))
+
+fn MoqFountainAppendIntLine(buf: var layout.ByteBuf, key: str, value: int32) =
+    MoqFountainAppendRawLine(buf, key, strings.IntToStr(value))
+
+@borrows
+fn MoqFountainJoinCsv(values: str[]): str =
+    if values.len <= 0:
+        return ""
+    return MoqFountainJoinTexts(values, ",")
+
+@borrows
+fn MoqFountainJoinIntCsv(values: int32[]): str =
+    var rows: str[]
+    rows = []
+    var i: int32
+    for i in i..<values.len:
+        add(rows, strings.IntToStr(values[i]))
+    return MoqFountainJoinTexts(rows, ",")
+
+@borrows
+fn MoqFountainFmt2(left: str, right: str): str =
+    MoqFountainEmitLog("moq_fmt2:start")
+    var buf = layout.ByteBufInit(len(left) + len(right))
+    MoqFountainEmitLog("moq_fmt2:add_left_begin")
+    MoqFountainByteBufAppendText(buf, left)
+    MoqFountainEmitLog("moq_fmt2:add_left_done")
+    MoqFountainEmitLog("moq_fmt2:add_right_begin")
+    MoqFountainByteBufAppendText(buf, right)
+    MoqFountainEmitLog("moq_fmt2:add_right_done")
+    return BytesToString(MoqFountainByteBufBytes(buf))
+
+@borrows
+fn MoqFountainFmt3(first: str, second: str, third: str): str =
+    MoqFountainEmitLog("moq_fmt3:start")
+    var buf = layout.ByteBufInit(len(first) + len(second) + len(third))
+    MoqFountainEmitLog("moq_fmt3:add_first_begin")
+    MoqFountainByteBufAppendText(buf, first)
+    MoqFountainEmitLog("moq_fmt3:add_first_done")
+    MoqFountainEmitLog("moq_fmt3:add_second_begin")
+    MoqFountainByteBufAppendText(buf, second)
+    MoqFountainEmitLog("moq_fmt3:add_second_done")
+    MoqFountainEmitLog("moq_fmt3:add_third_begin")
+    MoqFountainByteBufAppendText(buf, third)
+    MoqFountainEmitLog("moq_fmt3:add_third_done")
+    return BytesToString(MoqFountainByteBufBytes(buf))
+
+@borrows
+fn MoqFountainCatalogJson(ownerPeerId: str,
+                          mimeType: str,
+                          blobCid: str,
+                          blobByteLen: int32,
+                          bundleCid: str,
+                          objectTargetBytes: int32,
+                          sourceBlockBytes: int32,
+                          objects: MoqFountainObject[]): str =
+    MoqFountainEmitLog("moq_catalog_json:start")
+    var catalogMagic = MoqFountainJsonQuote(MoqFountainCatalogMagic)
+    var transportText = MoqFountainJsonQuote(MoqFountainTransport)
+    var layoutText = MoqFountainJsonQuote(MoqFountainLayout)
+    var ownerPeerText = ""
+    MoqFountainEmitLog("moq_catalog_json:owner_begin")
+    ownerPeerText = MoqFountainJsonQuote(ownerPeerId)
+    MoqFountainEmitLog("moq_catalog_json:owner_done")
+    var mimeTypeText = ""
+    MoqFountainEmitLog("moq_catalog_json:mime_begin")
+    mimeTypeText = MoqFountainJsonQuote(mimeType)
+    MoqFountainEmitLog("moq_catalog_json:mime_done")
+    var blobCidText = ""
+    MoqFountainEmitLog("moq_catalog_json:blob_cid_begin")
+    blobCidText = MoqFountainJsonQuote(blobCid)
+    MoqFountainEmitLog("moq_catalog_json:blob_cid_done")
+    var trackIdRaw = ""
+    MoqFountainEmitLog("moq_catalog_json:track_raw_begin")
+    trackIdRaw = MoqFountainFmt2("track:", bundleCid)
+    MoqFountainEmitLog("moq_catalog_json:track_raw_done")
+    var trackIdText = ""
+    MoqFountainEmitLog("moq_catalog_json:track_begin")
+    trackIdText = MoqFountainJsonQuote(trackIdRaw)
+    MoqFountainEmitLog("moq_catalog_json:track_done")
+    var bundleCidText = ""
+    MoqFountainEmitLog("moq_catalog_json:bundle_begin")
+    bundleCidText = MoqFountainJsonQuote(bundleCid)
+    MoqFountainEmitLog("moq_catalog_json:bundle_done")
+    var blobByteLenText = ""
+    blobByteLenText = strings.IntToStr(blobByteLen)
+    var objectTargetBytesText = ""
+    objectTargetBytesText = strings.IntToStr(objectTargetBytes)
+    var sourceBlockBytesText = ""
+    sourceBlockBytesText = strings.IntToStr(sourceBlockBytes)
+    var objectCountText = ""
+    objectCountText = strings.IntToStr(objects.len)
+    # Pre-size for the whole catalog (~230B per object + ~260B per droplet):
+    # the previous fixed 512-byte start forced ~12 doubling regrow+copy rounds
+    # for a ~1.4MB catalog (~2.8MB of avoidable memcpy).
+    var catalogDropletTotal: int32
+    var catalogSizeIdx: int32
+    for catalogSizeIdx in catalogSizeIdx..<objects.len:
+        catalogDropletTotal = catalogDropletTotal + objects[catalogSizeIdx].droplets.len
+    var buf = layout.ByteBufInit(768 + objects.len * 320 + catalogDropletTotal * 288)
+    MoqFountainByteBufAppendText(buf, "{")
+    MoqFountainByteBufAppendText(buf, "\"magic\":")
+    MoqFountainByteBufAppendText(buf, catalogMagic)
+    MoqFountainByteBufAppendText(buf, ",\"version\":1,")
+    MoqFountainByteBufAppendText(buf, "\"transport\":")
+    MoqFountainByteBufAppendText(buf, transportText)
+    MoqFountainByteBufAppendText(buf, ",\"fountainLayout\":")
+    MoqFountainByteBufAppendText(buf, layoutText)
+    MoqFountainByteBufAppendText(buf, ",\"ownerPeerId\":")
+    MoqFountainByteBufAppendText(buf, ownerPeerText)
+    MoqFountainByteBufAppendText(buf, ",\"mimeType\":")
+    MoqFountainByteBufAppendText(buf, mimeTypeText)
+    MoqFountainByteBufAppendText(buf, ",\"blobCid\":")
+    MoqFountainByteBufAppendText(buf, blobCidText)
+    MoqFountainByteBufAppendText(buf, ",\"blobByteLen\":")
+    MoqFountainByteBufAppendText(buf, blobByteLenText)
+    MoqFountainByteBufAppendText(buf, ",\"trackId\":")
+    MoqFountainByteBufAppendText(buf, trackIdText)
+    MoqFountainByteBufAppendText(buf, ",\"bundleCid\":")
+    MoqFountainByteBufAppendText(buf, bundleCidText)
+    MoqFountainByteBufAppendText(buf, ",\"objectTargetBytes\":")
+    MoqFountainByteBufAppendText(buf, objectTargetBytesText)
+    MoqFountainByteBufAppendText(buf, ",\"sourceBlockBytes\":")
+    MoqFountainByteBufAppendText(buf, sourceBlockBytesText)
+    MoqFountainByteBufAppendText(buf, ",\"objectCount\":")
+    MoqFountainByteBufAppendText(buf, objectCountText)
+    MoqFountainByteBufAppendText(buf, ",\"objects\":[")
+    MoqFountainEmitLog("moq_catalog_json:objects_begin")
+    var objectIndex: int32
+    for objectIndex in objectIndex..<objects.len:
+        if objectIndex > 0:
+            MoqFountainByteBufAppendText(buf, ",")
+        MoqFountainObjectJsonInto(buf, objects[objectIndex])
+    MoqFountainByteBufAppendText(buf, "]}")
+    return BytesToString(MoqFountainByteBufBytes(buf))
+
+@borrows
+fn MoqFountainCatalogBytes(ownerPeerId: str,
+                           mimeType: str,
+                           blobCid: str,
+                           blobByteLen: int32,
+                           bundleCid: str,
+                           objectTargetBytes: int32,
+                           sourceBlockBytes: int32,
+                           objects: MoqFountainObject[]): Bytes =
+    let text = MoqFountainCatalogJson(ownerPeerId,
+                                      mimeType,
+                                      blobCid,
+                                      blobByteLen,
+                                      bundleCid,
+                                      objectTargetBytes,
+                                      sourceBlockBytes,
+                                      objects)
+    return BytesSlice(BytesFromString(text), 0, len(text))
+
+@borrows
+fn MoqFountainConcatAssign(out: var str, part: str) =
+    let prefix = out
+    out = MoqFountainFmt2(prefix, part)
+
+@borrows
+fn MoqFountainPrefixKey(prefix: str, key: str): str =
+    return MoqFountainFmt2(prefix, key)
+
+@borrows
+fn MoqFountainLinesWithNewline(rows: str[]): str =
+    if rows.len <= 0:
+        return "\n"
+    var cap: int32 = 1
+    var i: int32
+    for i in i..<rows.len:
+        cap = cap + len(rows[i]) + 1
+    var buf = layout.ByteBufInit(cap)
+    i = 0
+    for i in i..<rows.len:
+        MoqFountainByteBufAppendText(buf, rows[i])
+        layout.ByteBufAppendByte(buf, int32('\n'))
+    return BytesToString(MoqFountainByteBufBytes(buf))
+
+@borrows
+fn MoqFountainBuildBundleSeed(ownerPeerId: str,
+                              blobCid: str,
+                              mimeType: str,
+                              peers: str[],
+                              objectTargetBytes: int32,
+                              sourceBlockBytes: int32,
+                              repairDropletCount: int32): str =
+    MoqFountainEmitLog("moq_build_bundle_seed:join_begin")
+    let peerCsv = MoqFountainJoinCsv(peers)
+    MoqFountainEmitLog("moq_build_bundle_seed:join_done")
+    let objectTargetBytesText = strings.IntToStr(objectTargetBytes)
+    let sourceBlockBytesText = strings.IntToStr(sourceBlockBytes)
+    let repairDropletCountText = strings.IntToStr(repairDropletCount)
+    var buf = layout.ByteBufInit(len(ownerPeerId) + len(blobCid) + len(mimeType) + len(peerCsv) + len(objectTargetBytesText) + len(sourceBlockBytesText) + len(repairDropletCountText) + 6)
+    MoqFountainByteBufAppendText(buf, ownerPeerId)
+    MoqFountainByteBufAppendText(buf, "|")
+    MoqFountainByteBufAppendText(buf, blobCid)
+    MoqFountainByteBufAppendText(buf, "|")
+    MoqFountainByteBufAppendText(buf, mimeType)
+    MoqFountainByteBufAppendText(buf, "|")
+    MoqFountainByteBufAppendText(buf, peerCsv)
+    MoqFountainByteBufAppendText(buf, "|")
+    MoqFountainByteBufAppendText(buf, objectTargetBytesText)
+    MoqFountainByteBufAppendText(buf, "|")
+    MoqFountainByteBufAppendText(buf, sourceBlockBytesText)
+    MoqFountainByteBufAppendText(buf, "|")
+    MoqFountainByteBufAppendText(buf, repairDropletCountText)
+    let payload = MoqFountainByteBufBytes(buf)
+    return BytesToString(payload)
+
+@borrows
+fn MoqFountainSourceDropletKey(bundleCid: str,
+                               objectIndex: int32,
+                               sourceDropletIndex: int32): str =
+    MoqFountainEmitLog("moq_source_key:enter")
+    let objectIndexText = strings.IntToStr(objectIndex)
+    MoqFountainEmitLog("moq_source_key:object_index_text")
+    let sourceDropletIndexText = strings.IntToStr(sourceDropletIndex)
+    MoqFountainEmitLog("moq_source_key:source_index_text")
+    var buf = layout.ByteBufInit(len(bundleCid) + len(objectIndexText) + len(sourceDropletIndexText) + 11)
+    MoqFountainByteBufAppendText(buf, "moqdrop-")
+    MoqFountainByteBufAppendText(buf, bundleCid)
+    MoqFountainByteBufAppendText(buf, "-o")
+    MoqFountainByteBufAppendText(buf, objectIndexText)
+    MoqFountainByteBufAppendText(buf, "-s")
+    MoqFountainByteBufAppendText(buf, sourceDropletIndexText)
+    return BytesToString(MoqFountainByteBufBytes(buf))
+
+@borrows
+fn MoqFountainRepairDropletKey(bundleCid: str,
+                               objectIndex: int32,
+                               repairIndex: int32): str =
+    MoqFountainEmitLog("moq_repair_key:enter")
+    let objectIndexText = strings.IntToStr(objectIndex)
+    MoqFountainEmitLog("moq_repair_key:object_index_text")
+    let repairIndexText = strings.IntToStr(repairIndex)
+    MoqFountainEmitLog("moq_repair_key:repair_index_text")
+    var buf = layout.ByteBufInit(len(bundleCid) + len(objectIndexText) + len(repairIndexText) + 11)
+    MoqFountainByteBufAppendText(buf, "moqdrop-")
+    MoqFountainByteBufAppendText(buf, bundleCid)
+    MoqFountainByteBufAppendText(buf, "-o")
+    MoqFountainByteBufAppendText(buf, objectIndexText)
+    MoqFountainByteBufAppendText(buf, "-r")
+    MoqFountainByteBufAppendText(buf, repairIndexText)
+    return BytesToString(MoqFountainByteBufBytes(buf))
+
+fn MoqFountainRepairDegreeSeed(bundleCid: str,
+                               objectIndex: int32,
+                               repairIndex: int32): str =
+    MoqFountainEmitLog("moq_repair_degree_seed:enter")
+    let objectIndexText = strings.IntToStr(objectIndex)
+    MoqFountainEmitLog("moq_repair_degree_seed:object_index_text")
+    let repairIndexText = strings.IntToStr(repairIndex)
+    MoqFountainEmitLog("moq_repair_degree_seed:repair_index_text")
+    var buf = layout.ByteBufInit(len(bundleCid) + len(objectIndexText) + len(repairIndexText) + 4)
+    MoqFountainByteBufAppendText(buf, bundleCid)
+    MoqFountainByteBufAppendText(buf, "|o")
+    MoqFountainByteBufAppendText(buf, objectIndexText)
+    MoqFountainByteBufAppendText(buf, "|r")
+    MoqFountainByteBufAppendText(buf, repairIndexText)
+    return BytesToString(MoqFountainByteBufBytes(buf))
+
+fn MoqFountainRepairSeed(bundleCid: str,
+                         objectIndex: int32,
+                         repairIndex: int32): str =
+    MoqFountainEmitLog("moq_repair_seed:enter")
+    let objectIndexText = strings.IntToStr(objectIndex)
+    MoqFountainEmitLog("moq_repair_seed:object_index_text")
+    let repairIndexText = strings.IntToStr(repairIndex)
+    MoqFountainEmitLog("moq_repair_seed:repair_index_text")
+    var buf = layout.ByteBufInit(len(bundleCid) + len(objectIndexText) + len(repairIndexText) + 9)
+    MoqFountainByteBufAppendText(buf, bundleCid)
+    MoqFountainByteBufAppendText(buf, "|repair|")
+    MoqFountainByteBufAppendText(buf, objectIndexText)
+    MoqFountainByteBufAppendText(buf, "|")
+    MoqFountainByteBufAppendText(buf, repairIndexText)
+    return BytesToString(MoqFountainByteBufBytes(buf))
+
+fn MoqFountainObjectIdText(objectIndex: int32): str =
+    MoqFountainEmitLog("moq_object_id:enter")
+    let objectIndexText = strings.IntToStr(objectIndex)
+    MoqFountainEmitLog("moq_object_id:object_index_text")
+    var buf = layout.ByteBufInit(len(objectIndexText) + 7)
+    MoqFountainByteBufAppendText(buf, "object-")
+    MoqFountainByteBufAppendText(buf, objectIndexText)
+    return BytesToString(MoqFountainByteBufBytes(buf))
+
+fn MoqFountainHexDigitCode(value: int32): int32 =
+    if value < 10:
+        return int32('0') + value
+    return int32('a') + value - 10
+
+fn MoqFountainHex4(value: int32): str =
+    var out = BytesAlloc(4)
+    BytesSet(out, 0, MoqFountainHexDigitCode((value >> 12) & 15))
+    BytesSet(out, 1, MoqFountainHexDigitCode((value >> 8) & 15))
+    BytesSet(out, 2, MoqFountainHexDigitCode((value >> 4) & 15))
+    BytesSet(out, 3, MoqFountainHexDigitCode(value & 15))
+    return BytesToString(out)
+
+# Append the JSON-quoted form of `text` straight into `buf` (opening quote,
+# escaped body, closing quote). Emits the exact same bytes the string-returning
+# MoqFountainJsonQuote produced, without the per-call allocate + BytesToString.
+fn moqFountainJsonNeedsEscape(code: int32): bool =
+    if code == 34:
+        return true
+    if code == 92:
+        return true
+    if code < 32:
+        return true
+    return false
+
+fn moqFountainJsonEscapeInto(buf: var layout.ByteBuf, code: int32) =
+    if code == 34:
+        layout.ByteBufAppendByte(buf, 92)
+        layout.ByteBufAppendByte(buf, 34)
+    elif code == 92:
+        layout.ByteBufAppendByte(buf, 92)
+        layout.ByteBufAppendByte(buf, 92)
+    elif code == 8:
+        layout.ByteBufAppendByte(buf, 92)
+        layout.ByteBufAppendByte(buf, int32('b'))
+    elif code == 12:
+        layout.ByteBufAppendByte(buf, 92)
+        layout.ByteBufAppendByte(buf, int32('f'))
+    elif code == 10:
+        layout.ByteBufAppendByte(buf, 92)
+        layout.ByteBufAppendByte(buf, int32('n'))
+    elif code == 13:
+        layout.ByteBufAppendByte(buf, 92)
+        layout.ByteBufAppendByte(buf, int32('r'))
+    elif code == 9:
+        layout.ByteBufAppendByte(buf, 92)
+        layout.ByteBufAppendByte(buf, int32('t'))
+    else:
+        layout.ByteBufAppendByte(buf, 92)
+        layout.ByteBufAppendByte(buf, int32('u'))
+        let hexText = MoqFountainHex4(code)
+        layout.ByteBufAppendByte(buf, int32(hexText[0]) & 255)
+        layout.ByteBufAppendByte(buf, int32(hexText[1]) & 255)
+        layout.ByteBufAppendByte(buf, int32(hexText[2]) & 255)
+        layout.ByteBufAppendByte(buf, int32(hexText[3]) & 255)
+
+@borrows
+fn MoqFountainJsonQuoteInto(buf: var layout.ByteBuf, text: str) =
+    layout.ByteBufAppendByte(buf, 34)
+    let n = len(text)
+    var runStart: int32
+    var idx: int32
+    for idx in idx..<n:
+        let code = Int32(text[idx]) & 255
+        if moqFountainJsonNeedsEscape(code):
+            if idx > runStart:
+                MoqFountainByteBufAppendText(buf, strings.SliceBytes(text, runStart, idx - runStart))
+            moqFountainJsonEscapeInto(buf, code)
+            runStart = idx + 1
+    if n > runStart:
+        MoqFountainByteBufAppendText(buf, strings.SliceBytes(text, runStart, n - runStart))
+    layout.ByteBufAppendByte(buf, 34)
+
+@borrows
+fn MoqFountainJsonQuote(text: str): str =
+    var buf = layout.ByteBufInit(len(text) + 2)
+    MoqFountainJsonQuoteInto(buf, text)
+    return BytesToString(MoqFountainByteBufBytes(buf))
+
+@borrows
+fn MoqFountainJoinIntJsonInto(buf: var layout.ByteBuf, values: int32[]) =
+    if values.len <= 0:
+        MoqFountainByteBufAppendText(buf, "[]")
+        return
+    MoqFountainByteBufAppendText(buf, "[")
+    var i: int32
+    for i in i..<values.len:
+        if i > 0:
+            MoqFountainByteBufAppendText(buf, ",")
+        MoqFountainByteBufAppendInt(buf, values[i])
+    MoqFountainByteBufAppendText(buf, "]")
+
+@borrows
+fn MoqFountainContainsInt(values: int32[], want: int32): bool =
+    var i: int32
+    for i in i..<values.len:
+        if values[i] == want:
+            return true
+    return false
+
+fn MoqFountainSortInts(values0: int32[]): int32[] =
+    var values = values0
+    var i: int32
+    for i in range(values.len):
+
+        for j in i + 1..<values.len:
+            if values[j] < values[i]:
+                let tmp = values[i]
+                values[i] = values[j]
+                values[j] = tmp
+
+    return values
+
+@borrows
+fn MoqFountainHashSeed(text: str): int32 =
+    let digestHex = MoqFountainSha256HexText(text)
+    if len(digestHex) < 8:
+        return 1
+    var out: int32
+    var i: int32
+    for i in i..<8:
+        let nibble = MoqFountainHexValue(Int32(digestHex[i]))
+        if nibble < 0:
+            return 1
+        out = (out << 4) | nibble
+    if out == 0:
+        return 1
+    return out
+
+fn MoqFountainDropletKindText(kindCode: int32): str =
+    if kindCode == MoqFountainDropletKindSource:
+        return "source"
+    if kindCode == MoqFountainDropletKindRepair:
+        return "repair"
+    return "unknown"
+
+fn MoqFountainDropletIndexTextOf(droplet: MoqFountainDroplet): str =
+    var out = ""
+    out = strings.IntToStr(droplet.dropletIndex)
+    return out
+
+@borrows
+fn MoqFountainDropletKeyOf(droplet: MoqFountainDroplet): str =
+    return strings.CloneStr(droplet.key)
+
+@borrows
+fn MoqFountainDropletPeerIdOf(droplet: MoqFountainDroplet): str =
+    return strings.CloneStr(droplet.peerId)
+
+@borrows
+fn MoqFountainDropletCidOf(droplet: MoqFountainDroplet): str =
+    return strings.CloneStr(droplet.cid)
+
+@borrows
+fn MoqFountainDropletBlockIndexesTextOf(droplet: MoqFountainDroplet): str =
+    return MoqFountainJoinIntCsv(droplet.blockIndexes)
+
+# Append the object/droplet catalog JSON straight into `buf`. The previous
+# form returned a fresh string at every nesting level (droplet -> droplets ->
+# object), each an allocate+copy+copy round trip; direct appends emit the exact
+# same bytes with the parent's single buffer.
+@borrows
+fn MoqFountainDropletJsonInto(buf: var layout.ByteBuf, droplet: MoqFountainDroplet) =
+    MoqFountainByteBufAppendText(buf, "{")
+    MoqFountainByteBufAppendText(buf, "\"objectIndex\":")
+    MoqFountainByteBufAppendInt(buf, droplet.objectIndex)
+    MoqFountainByteBufAppendText(buf, ",\"dropletIndex\":")
+    MoqFountainByteBufAppendInt(buf, droplet.dropletIndex)
+    MoqFountainByteBufAppendText(buf, ",\"kind\":")
+    MoqFountainJsonQuoteInto(buf, MoqFountainDropletKindText(droplet.kindCode))
+    MoqFountainByteBufAppendText(buf, ",\"key\":")
+    MoqFountainJsonQuoteInto(buf, droplet.key)
+    MoqFountainByteBufAppendText(buf, ",\"peerId\":")
+    MoqFountainJsonQuoteInto(buf, droplet.peerId)
+    MoqFountainByteBufAppendText(buf, ",\"cid\":")
+    MoqFountainJsonQuoteInto(buf, droplet.cid)
+    MoqFountainByteBufAppendText(buf, ",\"degree\":")
+    MoqFountainByteBufAppendInt(buf, droplet.degree)
+    MoqFountainByteBufAppendText(buf, ",\"blockIndexes\":")
+    MoqFountainJoinIntJsonInto(buf, droplet.blockIndexes)
+    MoqFountainByteBufAppendText(buf, "}")
+
+@borrows
+fn MoqFountainDropletsJsonInto(buf: var layout.ByteBuf, droplets: MoqFountainDroplet[]) =
+    var idx: int32
+    for idx in idx..<droplets.len:
+        if idx > 0:
+            MoqFountainByteBufAppendText(buf, ",")
+        MoqFountainDropletJsonInto(buf, droplets[idx])
+
+@borrows
+fn MoqFountainObjectJsonInto(buf: var layout.ByteBuf, item: MoqFountainObject) =
+    MoqFountainByteBufAppendText(buf, "{")
+    MoqFountainByteBufAppendText(buf, "\"objectIndex\":")
+    MoqFountainByteBufAppendInt(buf, item.objectIndex)
+    MoqFountainByteBufAppendText(buf, ",\"groupId\":")
+    MoqFountainJsonQuoteInto(buf, item.groupId)
+    MoqFountainByteBufAppendText(buf, ",\"objectId\":")
+    MoqFountainJsonQuoteInto(buf, item.objectId)
+    MoqFountainByteBufAppendText(buf, ",\"priority\":")
+    MoqFountainByteBufAppendInt(buf, item.priority)
+    MoqFountainByteBufAppendText(buf, ",\"byteOffset\":")
+    MoqFountainByteBufAppendInt(buf, item.byteOffset)
+    MoqFountainByteBufAppendText(buf, ",\"byteLength\":")
+    MoqFountainByteBufAppendInt(buf, item.byteLength)
+    MoqFountainByteBufAppendText(buf, ",\"objectCid\":")
+    MoqFountainJsonQuoteInto(buf, item.objectCid)
+    MoqFountainByteBufAppendText(buf, ",\"sourceBlockBytes\":")
+    MoqFountainByteBufAppendInt(buf, item.sourceBlockBytes)
+    MoqFountainByteBufAppendText(buf, ",\"sourceBlockCount\":")
+    MoqFountainByteBufAppendInt(buf, item.sourceBlockCount)
+    MoqFountainByteBufAppendText(buf, ",\"repairDropletCount\":")
+    MoqFountainByteBufAppendInt(buf, item.repairDropletCount)
+    MoqFountainByteBufAppendText(buf, ",\"droplets\":[")
+    MoqFountainDropletsJsonInto(buf, item.droplets)
+    MoqFountainByteBufAppendText(buf, "]}")
+
+@borrows
+fn MoqFountainParseInt32Text(text: str): int32 =
+    if strings.Len(text) <= 0:
+        return 0
+    var i: int32
+    var sign: int32 = 1
+    let first = Int32(text[0])
+    if first == 43:
+        i = 1
+    elif first == 45:
+        sign = -1
+        i = 1
+    var value: int32
+    var hadDigit = false
+    let n = strings.Len(text)
+    for i in i..<n:
+        let ch = Int32(text[i])
+        if ch < 48 || ch > 57:
+            break
+        hadDigit = true
+        value = value * 10 + (ch - 48)
+    if !hadDigit:
+        return 0
+    return sign * value
+
+@borrows
+fn MoqFountainParseInt32Wire(requestWire: str, key: str): Result[int32] =
+    let rawRes = MoqFountainWireFindValue(requestWire, key)
+    if IsErr(rawRes):
+        let errorText = Error(rawRes)
+        return Err[int32](errorText)
+    let rawValue = Value(rawRes)
+    let parsed = MoqFountainParseInt32Text(rawValue)
+    return Ok[int32](parsed)
+
+fn MoqFountainAppendDroplets(out: var MoqFountainDroplet[],
+                             droplets: MoqFountainDroplet[]) =
+    var idx: int32
+    for idx in idx..<droplets.len:
+        add(out, droplets[idx])
+
+fn MoqFountainNextSeed(state0: int32): int32 =
+    var state = state0
+    if state == 0:
+        state = 1
+    state = state ^ (state << 13)
+    state = state ^ (state >> 17)
+    state = state ^ (state << 5)
+    if state == 0:
+        return 1
+    return state
+
+fn MoqFountainPositiveMod(value: int32, modBy: int32): int32 =
+    if modBy <= 0:
+        return 0
+    let normalized = value & 2147483647
+    return normalized % modBy
+
+fn MoqFountainChooseUniqueBlockIndexesInto(out: var int32[],
+                                           blockCount: int32,
+                                           degree0: int32,
+                                           seedText: str) =
+    out = []
+    if blockCount <= 0:
+        return
+    let degree = MoqFountainMinInt32(blockCount, MoqFountainMaxInt32(1, degree0))
+    var candidates: int32[]
+    candidates = []
+    var fillIndex: int32
+    for fillIndex in fillIndex..<blockCount:
+        add(candidates, fillIndex)
+    var seed = MoqFountainHashSeed(seedText)
+    var remaining = blockCount
+    while out.len < degree && remaining > 0:
+        seed = MoqFountainNextSeed(seed)
+        let slot = MoqFountainPositiveMod(seed, remaining)
+        add(out, candidates[slot])
+        candidates[slot] = candidates[remaining - 1]
+        remaining = remaining - 1
+
+@borrows
+fn MoqFountainPadBlock(data: Bytes, blockBytes: int32): Bytes =
+    var out = BytesAlloc(blockBytes)
+    let copyLen = MoqFountainMinInt32(BytesLen(data), blockBytes)
+    if copyLen > 0:
+        rawmem_support.RawmemCopy(out.data, data.data, copyLen)
+    return out
+
+@borrows
+fn MoqFountainXorInto(target: var Bytes, source: Bytes): Result[bool] =
+    if BytesLen(target) != BytesLen(source):
+        return Err[bool]("moq_fountain_xor_length_mismatch")
+    # Word-wise XOR: little-endian u32 load/xor/store is byte-identical to the
+    # former per-byte loop (LE assembly preserves per-byte positions) at 1/4 the
+    # bounds-checked byte ops. Repair droplets XOR up to sourceBlockCount-1
+    # blocks of sourceBlockBytes each, so this is the repair-loop hot spot.
+    let n = BytesLen(target)
+    var i: int32
+    while i + 4 <= n:
+        let word = sha256.LoadU32LE(target, i) ^ sha256.LoadU32LE(source, i)
+        sha256.StoreU32LE(target, i, word)
+        i = i + 4
+    while i < n:
+        BytesSet(target, i, BytesGet(target, i) ^ BytesGet(source, i))
+        i = i + 1
+    return Ok[bool](true)
+
+@borrows
+fn MoqFountainXorBytes(left: Bytes, right: Bytes): Result[Bytes] =
+    if BytesLen(left) != BytesLen(right):
+        return Err[Bytes]("moq_fountain_xor_length_mismatch")
+    var out = BytesAlloc(BytesLen(left))
+    var i: int32
+    let n = BytesLen(left)
+    for i in i..<n:
+        BytesSet(out, i, BytesGet(left, i) ^ BytesGet(right, i))
+    return Ok[Bytes](out)
+
+# ---- Per-object scratch droplet builders (parallel build hot path) ----
+#
+# The generic builders above (MoqFountainSourceDropletKey / MoqFountainRepairSeed /
+# MoqFountainHashSeed / MoqFountainChooseUniqueBlockIndexesInto) allocate several
+# short-lived strings/arrays PER DROPLET (IntToStr, ByteBuf, seed text, digest
+# hex, candidates). Under thread.ParallelFor every one of those allocations
+# serializes on the runtime allocator lock across all workers — measured as the
+# dominant parallel_for_wall cost (per-droplet CPU time rose ~25x versus the same
+# work running serially). The scratch variants below emit byte-identical
+# keys/seeds/indexes while allocating only the one value each droplet must own
+# (its key str / blockIndexes array); everything else reuses per-object scratch
+# that is worker-local by ParallelFor construction. The allocating builders stay
+# untouched for the decode/rebuild path and external callers.
+
+@borrows
+fn moqFountainScratchAppendText(scratch: Bytes, len: var int32, text: str) =
+    let n = strings.Len(text)
+    if n <= 0:
+        return
+    if len + n > BytesLen(scratch):
+        panic("moq_fountain_scratch_overflow")
+    var i: int32
+    while i < n:
+        rawmem_support.RawmemWriteI8(scratch.data, len + i, Int8(Int32(text[i])))
+        i = i + 1
+    len = len + n
+
+@borrows
+fn moqFountainScratchAppendUint(scratch: Bytes, len: var int32, value0: int32) =
+    # Decimal digits, byte-identical to strings.IntToStr(value0) for value0 >= 0
+    # (hot-path indexes are always non-negative; negatives fall back to IntToStr).
+    if value0 < 0:
+        moqFountainScratchAppendText(scratch, len, strings.IntToStr(value0))
+        return
+    var value = value0
+    var scale: int32 = 1
+    while scale < 1000000000 && value >= scale * 10:
+        scale = scale * 10
+    while scale > 0:
+        let digit = value / scale
+        if len >= BytesLen(scratch):
+            panic("moq_fountain_scratch_overflow")
+        rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(scratch.data, len), int32('0') + digit, 1)
+        len = len + 1
+        value = value - digit * scale
+        scale = scale / 10
+
+@borrows
+fn moqFountainScratchStr(scratch: Bytes, len: int32): str =
+    return BytesToString(BytesSliceView(scratch, 0, len))
+
+# Scratch capacity contract: every key/seed shape below writes at most
+# len(bundleCid) + len(objectIndexText) + 22 bytes ("moqdrop-" 8 + "-o" 2 +
+# "-s"/"-r" 2 + up to 10 uint digits; seed shapes are shorter), so a scratch of
+# len(bundleCid) + len(objectIndexText) + 32 always suffices.
+
+@borrows
+fn moqFountainSourceDropletKeyScratch(scratch: Bytes,
+                                      bundleCid: str,
+                                      objectIndexText: str,
+                                      sourceDropletIndex: int32): str =
+    var len: int32
+    moqFountainScratchAppendText(scratch, len, "moqdrop-")
+    moqFountainScratchAppendText(scratch, len, bundleCid)
+    moqFountainScratchAppendText(scratch, len, "-o")
+    moqFountainScratchAppendText(scratch, len, objectIndexText)
+    moqFountainScratchAppendText(scratch, len, "-s")
+    moqFountainScratchAppendUint(scratch, len, sourceDropletIndex)
+    return moqFountainScratchStr(scratch, len)
+
+@borrows
+fn moqFountainRepairDropletKeyScratch(scratch: Bytes,
+                                      bundleCid: str,
+                                      objectIndexText: str,
+                                      repairIndex: int32): str =
+    var len: int32
+    moqFountainScratchAppendText(scratch, len, "moqdrop-")
+    moqFountainScratchAppendText(scratch, len, bundleCid)
+    moqFountainScratchAppendText(scratch, len, "-o")
+    moqFountainScratchAppendText(scratch, len, objectIndexText)
+    moqFountainScratchAppendText(scratch, len, "-r")
+    moqFountainScratchAppendUint(scratch, len, repairIndex)
+    return moqFountainScratchStr(scratch, len)
+
+# Write the degree-seed text (bundleCid|o<obj>|r<repair>) into scratch, return
+# its length. Byte-identical to MoqFountainRepairDegreeSeed's returned string.
+@borrows
+fn moqFountainRepairDegreeSeedInto(scratch: Bytes,
+                                   bundleCid: str,
+                                   objectIndexText: str,
+                                   repairIndex: int32): int32 =
+    var len: int32
+    moqFountainScratchAppendText(scratch, len, bundleCid)
+    moqFountainScratchAppendText(scratch, len, "|o")
+    moqFountainScratchAppendText(scratch, len, objectIndexText)
+    moqFountainScratchAppendText(scratch, len, "|r")
+    moqFountainScratchAppendUint(scratch, len, repairIndex)
+    return len
+
+# Write the repair-seed text (bundleCid|repair|<obj>|<repair>) into scratch,
+# return its length. Byte-identical to MoqFountainRepairSeed's returned string.
+@borrows
+fn moqFountainRepairSeedInto(scratch: Bytes,
+                             bundleCid: str,
+                             objectIndexText: str,
+                             repairIndex: int32): int32 =
+    var len: int32
+    moqFountainScratchAppendText(scratch, len, bundleCid)
+    moqFountainScratchAppendText(scratch, len, "|repair|")
+    moqFountainScratchAppendText(scratch, len, objectIndexText)
+    moqFountainScratchAppendText(scratch, len, "|")
+    moqFountainScratchAppendUint(scratch, len, repairIndex)
+    return len
+
+# Byte-identical to MoqFountainHashSeed(seedText) for the seed bytes in
+# seedBytes[0..seedLen): the original folds the first 8 digest hex chars
+# (nibble-wise out=(out<<4)|nibble); the first 8 hex chars ARE the first 4
+# digest bytes, so folding byte-wise out=(out<<8)|byte yields the same int32
+# (same shift-accumulate bit pattern, same int32 wrap). Zero allocation.
+@borrows
+fn moqFountainHashSeedScratch(seedBytes: Bytes,
+                              seedLen: int32,
+                              stateScratch: var Bytes,
+                              msgScratch: var Bytes,
+                              digestScratch: var Bytes): int32 =
+    let seedView = BytesSliceView(seedBytes, 0, seedLen)
+    sha256.Sha256DigestInto(seedView, stateScratch, msgScratch, digestScratch)
+    var out: int32
+    var i: int32
+    for i in i..<4:
+        out = (out << 8) | (BytesGet(digestScratch, i) & 255)
+    if out == 0:
+        return 1
+    return out
+
+# Scratch variant of MoqFountainChooseUniqueBlockIndexesInto: same xorshift slot
+# walk (seed precomputed by the caller) => identical index sets in identical
+# order. `out` must be a fresh empty array (becomes the droplet-owned
+# blockIndexes); `candidates` is per-object scratch with len >= blockCount,
+# refilled 0..blockCount-1 on every call.
+fn moqFountainChooseUniqueBlockIndexesScratch(out: var int32[],
+                                              candidates: var int32[],
+                                              blockCount: int32,
+                                              degree0: int32,
+                                              seed: int32) =
+    if blockCount <= 0:
+        return
+    let degree = MoqFountainMinInt32(blockCount, MoqFountainMaxInt32(1, degree0))
+    setLen(out, degree)
+    var outLen: int32
+    var fillIndex: int32
+    for fillIndex in fillIndex..<blockCount:
+        candidates[fillIndex] = fillIndex
+    var seedState = seed
+    var remaining = blockCount
+    while outLen < degree && remaining > 0:
+        seedState = MoqFountainNextSeed(seedState)
+        let slot = MoqFountainPositiveMod(seedState, remaining)
+        out[outLen] = candidates[slot]
+        outLen = outLen + 1
+        candidates[slot] = candidates[remaining - 1]
+        remaining = remaining - 1
+
+@borrows
+fn moqFountainPickPeer(peers: str[], slot: int32): str =
+    var i: int32
+    for i in i..<peers.len:
+        if i == slot:
+            return strings.CloneStr(peers[i])
+    return ""
+
+@borrows
+fn moqFountainFillSourceDroplets(blocks: Bytes[],
+                                  objectIndex: int32,
+                                  objectIndexText: str,
+                                  peers: str[],
+                                  bundleCid: str,
+                                  keyScratch: Bytes,
+                                  shaStateScratch: var Bytes,
+                                  shaMsgScratch: var Bytes,
+                                  shaDigestScratch: var Bytes,
+                                  shaHexScratch: var Bytes,
+                                  objectDroplets: var MoqFountainDroplet[]) =
+    var sourceDropletIndex: int32
+    for sourceDropletIndex in range(blocks.len):
+        let payload = MoqFountainCopyBytesRange(blocks[sourceDropletIndex], 0, BytesLen(blocks[sourceDropletIndex]))
+        var indexes: int32[]
+        indexes = []
+        setLen(indexes, 1)
+        indexes[0] = sourceDropletIndex
+        let peerSlot = (objectIndex + sourceDropletIndex) % peers.len
+        objectDroplets[sourceDropletIndex] = MoqFountainDroplet(
+            objectIndex: objectIndex,
+            dropletIndex: sourceDropletIndex,
+            kindCode: MoqFountainDropletKindSource,
+            key: moqFountainSourceDropletKeyScratch(keyScratch, bundleCid, objectIndexText, sourceDropletIndex),
+            peerId: moqFountainPickPeer(peers, peerSlot),
+            cid: MoqFountainSha256HexBytesScratch(payload, shaStateScratch, shaMsgScratch, shaDigestScratch, shaHexScratch),
+            degree: 1,
+            blockIndexes: indexes,
+            payload: payload
+        )
+
+@borrows
+fn moqFountainFillRepairDroplets(blocks: Bytes[],
+                                  objectIndex: int32,
+                                  objectIndexText: str,
+                                  peers: str[],
+                                  bundleCid: str,
+                                  sourceBlockCount: int32,
+                                  repairDropletCount: int32,
+                                  keyScratch: Bytes,
+                                  shaStateScratch: var Bytes,
+                                  shaMsgScratch: var Bytes,
+                                  shaDigestScratch: var Bytes,
+                                  shaHexScratch: var Bytes,
+                                  objectDroplets: var MoqFountainDroplet[]): Result[bool] =
+    var repairCandidates: int32[]
+    repairCandidates = []
+    if repairDropletCount > 0 && sourceBlockCount > 0:
+        setLen(repairCandidates, sourceBlockCount)
+    var repairIndex: int32
+    for repairIndex in range(repairDropletCount):
+        var degreeBase: int32 = 1
+        if sourceBlockCount > 1:
+            let degreeSeedLen = moqFountainRepairDegreeSeedInto(keyScratch, bundleCid, objectIndexText, repairIndex)
+            degreeBase = 2 + MoqFountainPositiveMod(moqFountainHashSeedScratch(keyScratch,
+                                                                               degreeSeedLen,
+                                                                               shaStateScratch,
+                                                                               shaMsgScratch,
+                                                                               shaDigestScratch),
+                                                    sourceBlockCount - 1)
+        let repairSeedLen = moqFountainRepairSeedInto(keyScratch, bundleCid, objectIndexText, repairIndex)
+        var blockIndexes: int32[]
+        blockIndexes = []
+        moqFountainChooseUniqueBlockIndexesScratch(blockIndexes,
+                                                   repairCandidates,
+                                                   sourceBlockCount,
+                                                   degreeBase,
+                                                   moqFountainHashSeedScratch(keyScratch,
+                                                                              repairSeedLen,
+                                                                              shaStateScratch,
+                                                                              shaMsgScratch,
+                                                                              shaDigestScratch))
+        if blockIndexes.len <= 0:
+            return Err[bool]("moq_fountain_empty_repair_block_set")
+        let firstBlockIndex = blockIndexes[0]
+        if firstBlockIndex < 0 || firstBlockIndex >= blocks.len:
+            return Err[bool]("moq_fountain_block_index_out_of_range")
+        var payload = MoqFountainCopyBytesRange(blocks[firstBlockIndex], 0, BytesLen(blocks[firstBlockIndex]))
+        var blockPick: int32 = 1
+        while blockPick < blockIndexes.len:
+            let wantedIndex = blockIndexes[blockPick]
+            if wantedIndex < 0 || wantedIndex >= blocks.len:
+                return Err[bool]("moq_fountain_block_index_out_of_range")
+            let xorOk = MoqFountainXorInto(payload, blocks[wantedIndex])
+            if IsErr(xorOk):
+                return Err[bool](Error(xorOk))
+            blockPick = blockPick + 1
+        let dropletIndex = sourceBlockCount + repairIndex
+        let peerSlot = (objectIndex + dropletIndex) % peers.len
+        objectDroplets[dropletIndex] = MoqFountainDroplet(
+            objectIndex: objectIndex,
+            dropletIndex: dropletIndex,
+            kindCode: MoqFountainDropletKindRepair,
+            key: moqFountainRepairDropletKeyScratch(keyScratch, bundleCid, objectIndexText, repairIndex),
+            peerId: moqFountainPickPeer(peers, peerSlot),
+            cid: MoqFountainSha256HexBytesScratch(payload, shaStateScratch, shaMsgScratch, shaDigestScratch, shaHexScratch),
+            degree: blockIndexes.len,
+            blockIndexes: blockIndexes,
+            payload: payload
+        )
+    return Ok[bool](true)
+
+@borrows
+fn MoqFountainBuildObject(objectBytes: Bytes,
+                          objectIndex: int32,
+                          byteOffset: int32,
+                          peers: str[],
+                          bundleCid: str,
+                          sourceBlockBytes: int32,
+                          repairDropletCount: int32): Result[MoqFountainObject] =
+    let objectByteLen = BytesLen(objectBytes)
+    MoqFountainEmitLog("moq_build_object:start")
+    let profT0: int64 = moqFountainProfileClockNs()
+    let objectIndexText = strings.IntToStr(objectIndex)
+    # Per-object scratch reused by every droplet of this object (worker-local by
+    # ParallelFor construction): key/seed text bytes + SHA256 state/msg/digest/hex.
+    # msg must fit max(object payload, seed text) + 72 per the Sha256DigestInto
+    # contract, hence the max with keyScratchCap.
+    let keyScratchCap = len(bundleCid) + len(objectIndexText) + 32
+    var keyScratch: Bytes = BytesAlloc(keyScratchCap)
+    var shaStateScratch: Bytes = BytesAlloc(32)
+    # The droplet payloads this scratch digests are the PADDED blocks
+    # (MoqFountainPadBlock always yields sourceBlockBytes), so the msg scratch
+    # must fit sourceBlockBytes -- NOT objectByteLen (the last partial object
+    # can be smaller than one padded block; the old sizing overflowed the
+    # scratch by up to sourceBlockBytes-objectByteLen bytes per droplet digest,
+    # corrupting the heap: linux traps on the bounds check, mac was latent).
+    var shaMsgScratch: Bytes = BytesAlloc(MoqFountainMaxInt32(MoqFountainMaxInt32(objectByteLen, sourceBlockBytes), keyScratchCap) + 72)
+    var shaDigestScratch: Bytes = BytesAlloc(32)
+    var shaHexScratch: Bytes = BytesAlloc(64)
+    let objectCid = MoqFountainSha256HexBytesScratch(objectBytes,
+                                                     shaStateScratch,
+                                                     shaMsgScratch,
+                                                     shaDigestScratch,
+                                                     shaHexScratch)
+    MoqFountainEmitLog("moq_build_object:object_cid")
+    let profT1: int64 = moqFountainProfileClockNs()
+    moqFountainProfileWrite(moqFountainProfObjectCidUs, objectIndex, profT0, profT1)
+    let sourceBlockCount = (objectByteLen + sourceBlockBytes - 1) / sourceBlockBytes
+    MoqFountainEmitLog("moq_build_object:source_block_count")
+    # Pre-sized arrays + index assignment replace add-growth: growing these to 64+
+    # slots reallocs and recopies every prior struct slot (with ARC traffic on each
+    # ref field) under the shared runtime allocator lock.
+    var blocks: Bytes[]
+    blocks = []
+    setLen(blocks, sourceBlockCount)
+    var blockIndex: int32
+    for blockIndex in blockIndex..<sourceBlockCount:
+        let blockOffset = blockIndex * sourceBlockBytes
+        let blockLen = MoqFountainMinInt32(sourceBlockBytes, objectByteLen - blockOffset)
+        let blockBytes = MoqFountainCopyBytesRange(objectBytes, blockOffset, blockLen)
+        blocks[blockIndex] = MoqFountainPadBlock(blockBytes, sourceBlockBytes)
+    MoqFountainEmitLog("moq_build_object:blocks_ready")
+    let profT2: int64 = moqFountainProfileClockNs()
+    moqFountainProfileWrite(moqFountainProfBlockSplitUs, objectIndex, profT1, profT2)
+    var objectDroplets: MoqFountainDroplet[]
+    objectDroplets = []
+    setLen(objectDroplets, sourceBlockCount + repairDropletCount)
+    moqFountainFillSourceDroplets(blocks,
+                                    objectIndex,
+                                    objectIndexText,
+                                    peers,
+                                    bundleCid,
+                                    keyScratch,
+                                    shaStateScratch,
+                                    shaMsgScratch,
+                                    shaDigestScratch,
+                                    shaHexScratch,
+                                    objectDroplets)
+    MoqFountainEmitLog("moq_build_object:source_droplets_ready")
+    let profT3: int64 = moqFountainProfileClockNs()
+    moqFountainProfileWrite(moqFountainProfSourceLoopUs, objectIndex, profT2, profT3)
+    let repairOk = moqFountainFillRepairDroplets(blocks,
+                                                  objectIndex,
+                                                  objectIndexText,
+                                                  peers,
+                                                  bundleCid,
+                                                  sourceBlockCount,
+                                                  repairDropletCount,
+                                                  keyScratch,
+                                                  shaStateScratch,
+                                                  shaMsgScratch,
+                                                  shaDigestScratch,
+                                                  shaHexScratch,
+                                                  objectDroplets)
+    if IsErr(repairOk):
+        return Err[MoqFountainObject](Error(repairOk))
+    MoqFountainEmitLog("moq_build_object:repair_ready")
+    let profT4: int64 = moqFountainProfileClockNs()
+    moqFountainProfileWrite(moqFountainProfRepairLoopUs, objectIndex, profT3, profT4)
+    MoqFountainEmitLog("moq_build_object:object_id_begin")
+    let objectIdText = MoqFountainObjectIdText(objectIndex)
+    MoqFountainEmitLog("moq_build_object:object_id_done")
+    MoqFountainEmitLog("moq_build_object:object_out_begin")
+    let objectOut = MoqFountainObject(
+        objectIndex: objectIndex,
+        groupId: bundleCid,
+        objectId: objectIdText,
+        priority: objectIndex,
+        byteOffset: byteOffset,
+        byteLength: objectByteLen,
+        objectCid: objectCid,
+        sourceBlockBytes: sourceBlockBytes,
+        sourceBlockCount: sourceBlockCount,
+        repairDropletCount: repairDropletCount,
+        droplets: objectDroplets
+    )
+    MoqFountainEmitLog("moq_build_object:object_out_done")
+    MoqFountainEmitLog("moq_build_object:done")
+    let profT5: int64 = moqFountainProfileClockNs()
+    moqFountainProfileWrite(moqFountainProfAssemblyUs, objectIndex, profT4, profT5)
+    return Ok[MoqFountainObject](objectOut)
+
+@borrows
+fn moqFountainRawAppendText(p: ptr, pos: var int32, cap: int32, text: str) =
+    let n = strings.Len(text)
+    if n <= 0:
+        return
+    if pos + n > cap:
+        panic("moq_fountain_rebuild_overflow")
+    var i: int32
+    while i < n:
+        rawmem_support.RawmemWriteI8(p, pos + i, Int8(Int32(text[i])))
+        i = i + 1
+    pos = pos + n
+
+@borrows
+fn moqFountainRawAppendByte(p: ptr, pos: var int32, cap: int32, code: int32) =
+    if pos + 1 > cap:
+        panic("moq_fountain_rebuild_overflow")
+    rawmem_support.RawmemWriteI8(p, pos, Int8(code))
+    pos = pos + 1
+
+@borrows
+fn moqFountainRawAppendIntCsv(p: ptr, pos: var int32, cap: int32, values: int32[]) =
+    var i: int32
+    for i in i..<values.len:
+        if i > 0:
+            moqFountainRawAppendByte(p, pos, cap, int32(','))
+        moqFountainRawAppendText(p, pos, cap, strings.IntToStr(values[i]))
+
+@borrows
+fn moqFountainRawAppendKv(p: ptr, pos: var int32, cap: int32, key: str, value: str) =
+    moqFountainRawAppendText(p, pos, cap, key)
+    moqFountainRawAppendText(p, pos, cap, value)
+    moqFountainRawAppendByte(p, pos, cap, int32('\n'))
+
+@borrows
+fn moqFountainRawAppendIndexedPrefix(p: ptr, pos: var int32, cap: int32, group: str, row: int32, field: str) =
+    moqFountainRawAppendText(p, pos, cap, group)
+    moqFountainRawAppendByte(p, pos, cap, int32('.'))
+    moqFountainRawAppendText(p, pos, cap, strings.IntToStr(row))
+    moqFountainRawAppendByte(p, pos, cap, int32('.'))
+    moqFountainRawAppendText(p, pos, cap, field)
+    moqFountainRawAppendByte(p, pos, cap, int32('='))
+
+@borrows
+fn moqFountainRawAppendIndexedInt(p: ptr, pos: var int32, cap: int32, group: str, row: int32, field: str, value: int32) =
+    moqFountainRawAppendIndexedPrefix(p, pos, cap, group, row, field)
+    moqFountainRawAppendText(p, pos, cap, strings.IntToStr(value))
+    moqFountainRawAppendByte(p, pos, cap, int32('\n'))
+
+@borrows
+fn moqFountainRawAppendIndexedText(p: ptr, pos: var int32, cap: int32, group: str, row: int32, field: str, value: str) =
+    moqFountainRawAppendIndexedPrefix(p, pos, cap, group, row, field)
+    moqFountainRawAppendText(p, pos, cap, value)
+    moqFountainRawAppendByte(p, pos, cap, int32('\n'))
+
+@borrows
+fn moqFountainRawAppendObjectRows(p: ptr, pos: var int32, cap: int32, objects: MoqFountainObject[]) =
+    var row: int32
+    for row in row..<objects.len:
+        moqFountainRawAppendIndexedInt(p, pos, cap, "object", row, "object_index", objects[row].objectIndex)
+        moqFountainRawAppendIndexedInt(p, pos, cap, "object", row, "byte_length", objects[row].byteLength)
+        moqFountainRawAppendIndexedInt(p, pos, cap, "object", row, "source_block_bytes", objects[row].sourceBlockBytes)
+        moqFountainRawAppendIndexedInt(p, pos, cap, "object", row, "source_block_count", objects[row].sourceBlockCount)
+        moqFountainRawAppendIndexedText(p, pos, cap, "object", row, "object_cid", objects[row].objectCid)
+
+@borrows
+fn moqFountainRawAppendDropletRows(p: ptr, pos: var int32, cap: int32, droplets: MoqFountainDroplet[]) =
+    var row: int32
+    for row in row..<droplets.len:
+        moqFountainRawAppendIndexedInt(p, pos, cap, "droplet", row, "object_index", droplets[row].objectIndex)
+        moqFountainRawAppendIndexedInt(p, pos, cap, "droplet", row, "droplet_index", droplets[row].dropletIndex)
+        moqFountainRawAppendIndexedText(p, pos, cap, "droplet", row, "key", droplets[row].key)
+        moqFountainRawAppendIndexedText(p, pos, cap, "droplet", row, "peer_id", droplets[row].peerId)
+        moqFountainRawAppendIndexedText(p, pos, cap, "droplet", row, "cid", droplets[row].cid)
+        moqFountainRawAppendIndexedPrefix(p, pos, cap, "droplet", row, "block_indexes")
+        moqFountainRawAppendIntCsv(p, pos, cap, droplets[row].blockIndexes)
+        moqFountainRawAppendByte(p, pos, cap, int32('\n'))
+
+@borrows
+fn MoqFountainRebuildTemplateBytes(blobCid: str,
+                                    blobByteLen: int32,
+                                    objects: MoqFountainObject[],
+                                    droplets: MoqFountainDroplet[]): Bytes =
+    let cap = MoqFountainMaxInt32(256, droplets.len * 512 + objects.len * 256 + 256)
+    var storage: Bytes
+    storage = BytesAlloc(cap)
+    let p = BytesDataPtr(storage)
+    var pos: int32
+    moqFountainRawAppendKv(p, pos, cap, "blob_cid=", blobCid)
+    moqFountainRawAppendKv(p, pos, cap, "blob_byte_len=", strings.IntToStr(blobByteLen))
+    moqFountainRawAppendKv(p, pos, cap, "object_count=", strings.IntToStr(objects.len))
+    moqFountainRawAppendKv(p, pos, cap, "droplet_count=", strings.IntToStr(droplets.len))
+    moqFountainRawAppendObjectRows(p, pos, cap, objects)
+    moqFountainRawAppendDropletRows(p, pos, cap, droplets)
+    return BytesSlice(storage, 0, pos)
+
+fn MoqFountainBuildResultFillFromParts(out: var MoqFountainBuildResult,
+                                       ownerPeerId: str,
+                                       mimeType: str,
+                                       bundleCid: str,
+                                       blobCid: str,
+                                       blobByteLen: int32,
+                                       objectTargetBytes: int32,
+                                       sourceBlockBytes: int32,
+                                       remoteAckPeerIds: str[],
+                                       objects: MoqFountainObject[],
+                                       droplets: MoqFountainDroplet[]): Result[bool] =
+    MoqFountainEmitLog("moq_build_fill:start")
+    MoqFountainProfileMark("moq_build_fill:start")
+    var catalogPayload: Bytes
+    catalogPayload = MoqFountainCatalogBytes(ownerPeerId,
+                                                 mimeType,
+                                                 blobCid,
+                                                 blobByteLen,
+                                                 bundleCid,
+                                                 objectTargetBytes,
+                                                 sourceBlockBytes,
+                                                 objects)
+    MoqFountainEmitLog("moq_build_fill:catalog_ready")
+    MoqFountainProfileMark("moq_build_fill:catalog_ready")
+    if BytesLen(catalogPayload) <= 0:
+        return Err[bool]("moq_fountain_empty_catalog_payload")
+    var rebuildTemplatePayload: Bytes
+    rebuildTemplatePayload = MoqFountainRebuildTemplateBytes(blobCid,
+                                                              blobByteLen,
+                                                              objects,
+                                                              droplets)
+    MoqFountainEmitLog("moq_build_fill:rebuild_template_ready")
+    MoqFountainProfileMark("moq_build_fill:rebuild_template_ready")
+    if BytesLen(rebuildTemplatePayload) <= 0:
+        return Err[bool]("moq_fountain_empty_rebuild_template")
+    out.catalogKey = MoqFountainFmt2("moqcatalog-", bundleCid)
+    out.rebuildTemplateKey = MoqFountainFmt2("moqrebuild-", bundleCid)
+    out.ownerPeerId = ownerPeerId
+    out.mimeType = mimeType
+    out.bundleCid = bundleCid
+    out.blobCid = blobCid
+    out.catalogCid = MoqFountainSha256HexBytes(catalogPayload)
+    out.catalogSizeBytes = BytesLen(catalogPayload)
+    out.catalogPayload = catalogPayload
+    out.rebuildTemplateCid = MoqFountainSha256HexBytes(rebuildTemplatePayload)
+    out.rebuildTemplateSizeBytes = BytesLen(rebuildTemplatePayload)
+    out.rebuildTemplatePayload = rebuildTemplatePayload
+    out.blobByteLen = blobByteLen
+    out.objectTargetBytes = objectTargetBytes
+    out.sourceBlockBytes = sourceBlockBytes
+    out.objectCount = objects.len
+    out.remoteAckPeerIds = remoteAckPeerIds
+    out.objects = objects
+    out.droplets = droplets
+    MoqFountainEmitLog("moq_build_fill:done")
+    return Ok[bool](true)
+
+# ---- Parallel object-build worker ----
+#
+# The per-object work (object cid hash + per-source-block hashes + repair XOR/cid)
+# is embarrassingly parallel: each object is a pure function of its own byte range,
+# its index, and the immutable (bundleCid, peers, block params). Splitting it across
+# a thread pool is the single biggest publish-latency lever for large assets (the
+# 5.9MB asset spends ~1s of its ingest here on the scalar SHA256).
+#
+# Thread-safety discipline (Cheng ARC refcounts are NON-atomic — memRetain, not
+# memRetainAtomic): every string a worker stores into its result must be uniquely
+# owned by that one worker, so no two threads ever touch the same refcount. The
+# shared blob is a plain {ptr,len} value (no refcount, read-only memcpy — safe to
+# read concurrently); bundleCid and each peer id are pre-copied per object below so
+# the worker's groupId/key/peerId stores only ever bump a private copy's count.
+# Results are written into distinct pre-sized slots (the proven backend fork-join
+# pattern: workers read shared indexed arrays + write per-index result slots).
+var
+    moqFountainParBlob: Bytes
+    moqFountainParBlobLen: int32
+    moqFountainParObjectTargetBytes: int32
+    moqFountainParSourceBlockBytes: int32
+    moqFountainParRepairDropletCount: int32
+    moqFountainParPeersLen: int32
+    moqFountainParBundleCids: str[]
+    moqFountainParPeersFlat: str[]
+    moqFountainParResults: MoqFountainObject[]
+    moqFountainParErrs: str[]
+    moqFountainParErrFlag: atomic.I32
+
+fn moqFountainClonePeersForObject(index: int32): str[] =
+    var peersLocal: str[]
+    peersLocal = []
+    let peerCount = moqFountainParPeersLen
+    setLen(peersLocal, peerCount)
+    let peerBase = index * peerCount
+    var localPeerIdx: int32
+    for localPeerIdx in localPeerIdx..<peerCount:
+        peersLocal[localPeerIdx] = strings.CloneStr(moqFountainParPeersFlat[peerBase + localPeerIdx])
+    return peersLocal
+
+fn moqFountainWriteErrAt(index: int32, err: str, errs: var str[]) =
+    errs[index] = strings.CloneStr(err)
+
+fn moqFountainWriteObjectAt(index: int32, object: MoqFountainObject, results: var MoqFountainObject[]) =
+    results[index] = object
+
+fn moqFountainStoreObjectErr(index: int32, err: str) =
+    var errs: str[]
+    errs = moqFountainParErrs
+    moqFountainWriteErrAt(index, err, errs)
+    moqFountainParErrs = errs
+    let _ = atomic.AddI32(moqFountainParErrFlag, 1)
+
+fn moqFountainStoreObjectResult(index: int32, object: MoqFountainObject) =
+    var results: MoqFountainObject[]
+    results = moqFountainParResults
+    moqFountainWriteObjectAt(index, object, results)
+    moqFountainParResults = results
+
+fn moqFountainObjectWorker(raw: ptr, index: int32, worker: int32): int32 =
+    let _ = raw
+    let _ = worker
+    if atomic.LoadI32(moqFountainParErrFlag) != 0:
+        return 0
+    let byteOffset = index * moqFountainParObjectTargetBytes
+    var objectByteLen = moqFountainParObjectTargetBytes
+    if byteOffset + objectByteLen > moqFountainParBlobLen:
+        objectByteLen = moqFountainParBlobLen - byteOffset
+    let objectBytes = MoqFountainCopyBytesRange(moqFountainParBlob, byteOffset, objectByteLen)
+    let peersLocal = moqFountainClonePeersForObject(index)
+    let objectRes = MoqFountainBuildObject(objectBytes,
+                                           index,
+                                           byteOffset,
+                                           peersLocal,
+                                           strings.CloneStr(moqFountainParBundleCids[index]),
+                                           moqFountainParSourceBlockBytes,
+                                           moqFountainParRepairDropletCount)
+    if IsErr(objectRes):
+        moqFountainStoreObjectErr(index, Error(objectRes))
+        return 0
+    moqFountainStoreObjectResult(index, Value(objectRes))
+    return 0
+
+fn moqFountainResetParScratch() =
+    moqFountainParBlob = emptyBytes()
+    moqFountainParBlobLen = 0
+    moqFountainParPeersLen = 0
+    # NOTE(lane linux x86_64 release bug): resetting the three array globals to
+    # [] drops their seq buffers; the linux backend stack-materialized one of
+    # those buffers and its drop-release hits registry_miss and panics. A
+    # single-ingest publisher overwrites all three on the next build, so the
+    # reset is redundant here; RESTORE these three resets once the lane's
+    # release lowering lands.
+    moqFountainParErrFlag = nil
+
+@borrows
+fn moqFountainBuildParallelObjects(blobBytes: Bytes,
+                                    blobLen: int32,
+                                    objectTargetBytes: int32,
+                                    sourceBlockBytes: int32,
+                                    repairDropletCount: int32,
+                                    peers: str[],
+                                    bundleCid: str,
+                                    objectCount: int32,
+                                    objects: var MoqFountainObject[],
+                                    allDroplets: var MoqFountainDroplet[]): Result[bool] =
+    var bundleCidCopies: str[]
+    bundleCidCopies = []
+    var peersFlat: str[]
+    peersFlat = []
+    var resultsScratch: MoqFountainObject[]
+    setLen(resultsScratch, objectCount)
+    var errsScratch: str[]
+    setLen(errsScratch, objectCount)
+    var copyIdx: int32
+    for copyIdx in copyIdx..<objectCount:
+        add(bundleCidCopies, sysrt.systemToStringStr(bundleCid))
+        var peerCopyIdx: int32
+        for peerCopyIdx in peerCopyIdx..<peers.len:
+            add(peersFlat, sysrt.systemToStringStr(peers[peerCopyIdx]))
+    moqFountainParBlob = BytesSlice(blobBytes, 0, BytesLen(blobBytes))
+    moqFountainParBlobLen = blobLen
+    moqFountainParObjectTargetBytes = objectTargetBytes
+    moqFountainParSourceBlockBytes = sourceBlockBytes
+    moqFountainParRepairDropletCount = repairDropletCount
+    moqFountainParPeersLen = peers.len
+    moqFountainParBundleCids = bundleCidCopies
+    moqFountainParPeersFlat = peersFlat
+    moqFountainParResults = resultsScratch
+    moqFountainParErrs = errsScratch
+    moqFountainParErrFlag = atomic.NewI32(0)
+    if moqFountainParErrFlag == nil:
+        moqFountainResetParScratch()
+        return Err[bool]("moq_fountain_par_atomic_alloc_failed")
+    MoqFountainProfileMark("moq_build:object_loop_prep_done")
+    moqFountainProfileResetObjectBuckets(objectCount)
+    let pool = thread.PoolNew(0)
+    MoqFountainProfileMark("moq_build:pool_new_done")
+    thread.ParallelFor(pool, objectCount, &moqFountainObjectWorker, nil)
+    MoqFountainProfileMark("moq_build:parallel_for_wall_done")
+    if atomic.LoadI32(moqFountainParErrFlag) != 0:
+        var firstErr: str = "moq_fountain_object_build_failed"
+        var scanIdx: int32
+        for scanIdx in scanIdx..<objectCount:
+            if len(moqFountainParErrs[scanIdx]) > 0:
+                firstErr = moqFountainParErrs[scanIdx]
+                break
+        moqFountainResetParScratch()
+        return Err[bool](firstErr)
+    var totalDroplets: int32
+    var countIdx: int32
+    for countIdx in countIdx..<objectCount:
+        totalDroplets = totalDroplets + moqFountainParResults[countIdx].droplets.len
+    setLen(objects, objectCount)
+    setLen(allDroplets, totalDroplets)
+    var dropletOut: int32
+    var gatherIdx: int32
+    for gatherIdx in gatherIdx..<objectCount:
+        objects[gatherIdx] = moqFountainParResults[gatherIdx]
+        let objectDroplets = moqFountainParResults[gatherIdx].droplets
+        var dropletIdx: int32
+        for dropletIdx in dropletIdx..<objectDroplets.len:
+            allDroplets[dropletOut] = objectDroplets[dropletIdx]
+            dropletOut = dropletOut + 1
+    moqFountainResetParScratch()
+    MoqFountainProfileMark("moq_build:gather_droplets_done")
+    return Ok[bool](true)
+
+fn MoqFountainBuild(blobBytes: Bytes,
+                    ownerPeerId: str,
+                    remotePeersCsv: str,
+                    mimeType0: str,
+                    objectTargetBytes0: int32,
+                    sourceBlockBytes0: int32,
+                    repairDropletCount0: int32): Result[MoqFountainBuildResult] =
+    MoqFountainEmitLog("moq_build:enter")
+    MoqFountainProfileMark("moq_build:enter")
+    if BytesLen(blobBytes) <= 0:
+        return Err[MoqFountainBuildResult]("moq_fountain_empty_blob")
+    let peers = MoqFountainNormalizePeerCsv(remotePeersCsv)
+    MoqFountainEmitLog("moq_build:peers_ready")
+    if peers.len <= 0:
+        return Err[MoqFountainBuildResult]("video_publish_insufficient_storage_peers")
+    let objectTargetBytes = MoqFountainNormalizePositiveInt(objectTargetBytes0, 512 * 1024)
+    let sourceBlockBytes = MoqFountainNormalizePositiveInt(sourceBlockBytes0, 128 * 1024)
+    let repairDropletCount = MoqFountainNormalizePositiveInt(repairDropletCount0, 2)
+    let mimeType = if len(mimeType0) > 0: mimeType0 else: "video/mp4"
+    MoqFountainEmitLog("moq_build:params_ready")
+    MoqFountainEmitLog("moq_build:blob_cid_begin")
+    let blobCid = MoqFountainSha256HexBytes(blobBytes)
+    MoqFountainEmitLog("moq_build:blob_cid_done")
+    MoqFountainProfileMark("moq_build:blob_cid_done")
+    MoqFountainEmitLog("moq_build:bundle_seed_begin")
+    let bundleSeed = MoqFountainBuildBundleSeed(ownerPeerId,
+                                                blobCid,
+                                                mimeType,
+                                                peers,
+                                                objectTargetBytes,
+                                                sourceBlockBytes,
+                                                repairDropletCount)
+    MoqFountainEmitLog("moq_build:bundle_seed_done")
+    if len(bundleSeed) <= 0:
+        return Err[MoqFountainBuildResult]("moq_fountain_empty_bundle_seed")
+    MoqFountainEmitLog("moq_build:bundle_cid_begin")
+    let bundleCid = MoqFountainSha256HexText(bundleSeed)
+    MoqFountainEmitLog("moq_build:bundle_cid_done")
+    MoqFountainProfileMark("moq_build:bundle_seed_and_cid_done")
+    if len(bundleCid) <= 0:
+        return Err[MoqFountainBuildResult]("moq_fountain_empty_bundle_cid")
+    var objects: MoqFountainObject[]
+    objects = []
+    var allDroplets: MoqFountainDroplet[]
+    allDroplets = []
+    let blobLen = BytesLen(blobBytes)
+    var objectCount: int32
+    if blobLen > 0:
+        objectCount = (blobLen + objectTargetBytes - 1) / objectTargetBytes
+    MoqFountainEmitLog("moq_build:object_loop_begin")
+    if objectCount > 0:
+        let parRes = moqFountainBuildParallelObjects(blobBytes,
+                                                       blobLen,
+                                                       objectTargetBytes,
+                                                       sourceBlockBytes,
+                                                       repairDropletCount,
+                                                       peers,
+                                                       bundleCid,
+                                                       objectCount,
+                                                       objects,
+                                                       allDroplets)
+        if IsErr(parRes):
+            return Err[MoqFountainBuildResult](Error(parRes))
+    MoqFountainEmitLog("moq_build:object_done")
+    MoqFountainProfileMark("moq_build:object_loop_total_done")
+    return moqFountainBuildFinishResult(blobBytes,
+                                         ownerPeerId,
+                                         mimeType,
+                                         bundleCid,
+                                         blobCid,
+                                         objectTargetBytes,
+                                         sourceBlockBytes,
+                                         peers,
+                                         objects,
+                                         allDroplets)
+
+fn moqFountainBuildFinishResult(blobBytes: Bytes,
+                                  ownerPeerId: str,
+                                  mimeType: str,
+                                  bundleCid: str,
+                                  blobCid: str,
+                                  objectTargetBytes: int32,
+                                  sourceBlockBytes: int32,
+                                  peers: str[],
+                                  objects: MoqFountainObject[],
+                                  allDroplets: MoqFountainDroplet[]): Result[MoqFountainBuildResult] =
+    var out: MoqFountainBuildResult
+    MoqFountainEmitLog("moq_build:fill_begin")
+    let fillOk = MoqFountainBuildResultFillFromParts(out,
+                                                     ownerPeerId,
+                                                     mimeType,
+                                                     bundleCid,
+                                                     blobCid,
+                                                     BytesLen(blobBytes),
+                                                     objectTargetBytes,
+                                                     sourceBlockBytes,
+                                                     peers,
+                                                     objects,
+                                                     allDroplets)
+    if IsErr(fillOk):
+        return Err[MoqFountainBuildResult](Error(fillOk))
+    MoqFountainEmitLog("moq_build:fill_done")
+    MoqFountainProfileMark("moq_build:fill_done")
+    if moqFountainProfileOn():
+        sysrt.puts(sysrt.panicCString(MoqFountainProfileSummaryLine()))
+    return Ok[MoqFountainBuildResult](out)
+
+fn MoqFountainAppendWireLine(out: var str, line: str) =
+    let lineText = MoqFountainFmt2(line, "\n")
+    out = MoqFountainFmt2(out, lineText)
+
+fn MoqFountainRebuildTemplateWireFromParts(blobCid: str,
+                                            blobByteLen: int32,
+                                            objects: MoqFountainObject[],
+                                            droplets: MoqFountainDroplet[]): str =
+    var rows: str[]
+    rows = []
+    add(rows, MoqFountainFmt2("blob_cid=", blobCid))
+    add(rows, MoqFountainFmt2("blob_byte_len=", strings.IntToStr(blobByteLen)))
+    add(rows, MoqFountainFmt2("object_count=", strings.IntToStr(objects.len)))
+    add(rows, MoqFountainFmt2("droplet_count=", strings.IntToStr(droplets.len)))
+    var objectRow: int32
+    for objectRow in objectRow..<objects.len:
+        let item = objects[objectRow]
+        let objectRowText = strings.IntToStr(objectRow)
+        let prefix = MoqFountainFmt3("object.", objectRowText, ".")
+        let objectIndexText = strings.IntToStr(item.objectIndex)
+        let objectByteLengthText = strings.IntToStr(item.byteLength)
+        let objectSourceBlockBytesText = strings.IntToStr(item.sourceBlockBytes)
+        let objectSourceBlockCountText = strings.IntToStr(item.sourceBlockCount)
+        add(rows, MoqFountainFmt3(prefix, "object_index=", objectIndexText))
+        add(rows, MoqFountainFmt3(prefix, "byte_length=", objectByteLengthText))
+        add(rows, MoqFountainFmt3(prefix, "source_block_bytes=", objectSourceBlockBytesText))
+        add(rows, MoqFountainFmt3(prefix, "source_block_count=", objectSourceBlockCountText))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "object_cid="), item.objectCid))
+    var dropletRow: int32
+    for dropletRow in dropletRow..<droplets.len:
+        let item = droplets[dropletRow]
+        let dropletRowText = strings.IntToStr(dropletRow)
+        let prefix = MoqFountainFmt3("droplet.", dropletRowText, ".")
+        let dropletObjectIndexText = strings.IntToStr(item.objectIndex)
+        let dropletIndexText = MoqFountainDropletIndexTextOf(item)
+        let dropletKey = MoqFountainDropletKeyOf(item)
+        let dropletPeerId = MoqFountainDropletPeerIdOf(item)
+        let dropletCid = MoqFountainDropletCidOf(item)
+        let blockIndexesText = MoqFountainDropletBlockIndexesTextOf(item)
+        add(rows, MoqFountainFmt3(prefix, "object_index=", dropletObjectIndexText))
+        add(rows, MoqFountainFmt3(prefix, "droplet_index=", dropletIndexText))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "key="), dropletKey))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "peer_id="), dropletPeerId))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "cid="), dropletCid))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "block_indexes="), blockIndexesText))
+    return MoqFountainLinesWithNewline(rows)
+
+fn MoqFountainBuildWireFromParts(ownerPeerId: str,
+                                 mimeType: str,
+                                 bundleCid: str,
+                                 blobCid: str,
+                                 blobByteLen: int32,
+                                 objectTargetBytes: int32,
+                                 sourceBlockBytes: int32,
+                                 remoteAckPeerIds: str[],
+                                 objects: MoqFountainObject[],
+                                 droplets: MoqFountainDroplet[]): str =
+    var catalogPayload: Bytes
+    catalogPayload = MoqFountainCatalogBytes(ownerPeerId,
+                                                 mimeType,
+                                                 blobCid,
+                                                 blobByteLen,
+                                                 bundleCid,
+                                                 objectTargetBytes,
+                                                 sourceBlockBytes,
+                                                 objects)
+    let catalogCid = MoqFountainSha256HexBytes(catalogPayload)
+    let rebuildTemplateText = MoqFountainRebuildTemplateWireFromParts(blobCid,
+                                                                      blobByteLen,
+                                                                      objects,
+                                                                      droplets)
+    let rebuildTemplatePayload = BytesSlice(BytesFromString(rebuildTemplateText), 0, strings.Len(rebuildTemplateText))
+    let rebuildTemplateCid = MoqFountainSha256HexBytes(rebuildTemplatePayload)
+    var rows: str[]
+    rows = []
+    add(rows, "ok=1")
+    add(rows, MoqFountainFmt2("owner_peer_id=", ownerPeerId))
+    add(rows, MoqFountainFmt2("mime_type=", mimeType))
+    add(rows, MoqFountainFmt2("bundle_cid=", bundleCid))
+    add(rows, MoqFountainFmt2("blob_cid=", blobCid))
+    let catalogKey = MoqFountainFmt2("moqcatalog-", bundleCid)
+    add(rows, MoqFountainFmt2("catalog_key=", catalogKey))
+    add(rows, MoqFountainFmt2("catalog_cid=", catalogCid))
+    add(rows, MoqFountainFmt2("catalog_size_bytes=", strings.IntToStr(BytesLen(catalogPayload))))
+    add(rows, MoqFountainFmt2("catalog_payload_hex=", BytesToHex(catalogPayload)))
+    let rebuildTemplateKey = MoqFountainFmt2("moqrebuild-", bundleCid)
+    add(rows, MoqFountainFmt2("rebuild_template_key=", rebuildTemplateKey))
+    add(rows, MoqFountainFmt2("rebuild_template_cid=", rebuildTemplateCid))
+    add(rows, MoqFountainFmt2("rebuild_template_size_bytes=", strings.IntToStr(BytesLen(rebuildTemplatePayload))))
+    add(rows, MoqFountainFmt2("rebuild_template_payload_hex=", BytesToHex(rebuildTemplatePayload)))
+    add(rows, MoqFountainFmt2("blob_byte_len=", strings.IntToStr(blobByteLen)))
+    add(rows, MoqFountainFmt2("object_target_bytes=", strings.IntToStr(objectTargetBytes)))
+    add(rows, MoqFountainFmt2("source_block_bytes=", strings.IntToStr(sourceBlockBytes)))
+    add(rows, MoqFountainFmt2("object_count=", strings.IntToStr(objects.len)))
+    let remoteAckCsv = MoqFountainJoinCsv(remoteAckPeerIds)
+    add(rows, MoqFountainFmt2("remote_ack_peer_ids=", remoteAckCsv))
+    var objectRow: int32
+    for objectRow in objectRow..<objects.len:
+        let item = objects[objectRow]
+        let objectRowText = strings.IntToStr(objectRow)
+        let prefix = MoqFountainFmt3("object.", objectRowText, ".")
+        let objectIndexText = strings.IntToStr(item.objectIndex)
+        let objectPriorityText = strings.IntToStr(item.priority)
+        let objectByteOffsetText = strings.IntToStr(item.byteOffset)
+        let objectByteLengthText = strings.IntToStr(item.byteLength)
+        let objectSourceBlockBytesText = strings.IntToStr(item.sourceBlockBytes)
+        let objectSourceBlockCountText = strings.IntToStr(item.sourceBlockCount)
+        let objectRepairDropletCountText = strings.IntToStr(item.repairDropletCount)
+        add(rows, MoqFountainFmt3(prefix, "object_index=", objectIndexText))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "group_id="), item.groupId))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "object_id="), item.objectId))
+        add(rows, MoqFountainFmt3(prefix, "priority=", objectPriorityText))
+        add(rows, MoqFountainFmt3(prefix, "byte_offset=", objectByteOffsetText))
+        add(rows, MoqFountainFmt3(prefix, "byte_length=", objectByteLengthText))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "object_cid="), item.objectCid))
+        add(rows, MoqFountainFmt3(prefix, "source_block_bytes=", objectSourceBlockBytesText))
+        add(rows, MoqFountainFmt3(prefix, "source_block_count=", objectSourceBlockCountText))
+        add(rows, MoqFountainFmt3(prefix, "repair_droplet_count=", objectRepairDropletCountText))
+    add(rows, MoqFountainFmt2("droplet_count=", strings.IntToStr(droplets.len)))
+    var dropletRow: int32
+    for dropletRow in dropletRow..<droplets.len:
+        let droplet = droplets[dropletRow]
+        let dropletRowText = strings.IntToStr(dropletRow)
+        let prefix = MoqFountainFmt3("droplet.", dropletRowText, ".")
+        let dropletObjectIndexText = strings.IntToStr(droplet.objectIndex)
+        let dropletIndexText = MoqFountainDropletIndexTextOf(droplet)
+        let dropletDegreeText = strings.IntToStr(droplet.degree)
+        let dropletKindText = MoqFountainDropletKindText(droplet.kindCode)
+        let dropletBlockIndexesText = MoqFountainDropletBlockIndexesTextOf(droplet)
+        let dropletPayloadHex = BytesToHex(droplet.payload)
+        add(rows, MoqFountainFmt3(prefix, "object_index=", dropletObjectIndexText))
+        add(rows, MoqFountainFmt3(prefix, "droplet_index=", dropletIndexText))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "kind="), dropletKindText))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "key="), MoqFountainDropletKeyOf(droplet)))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "peer_id="), MoqFountainDropletPeerIdOf(droplet)))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "cid="), MoqFountainDropletCidOf(droplet)))
+        add(rows, MoqFountainFmt3(prefix, "degree=", dropletDegreeText))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "block_indexes="), dropletBlockIndexesText))
+        add(rows, MoqFountainFmt2(MoqFountainPrefixKey(prefix, "payload_hex="), dropletPayloadHex))
+    let wire = MoqFountainLinesWithNewline(rows)
+    BytesFree(catalogPayload)
+    return wire
+
+fn MoqFountainBuildResultToWire(result: MoqFountainBuildResult): str =
+    return MoqFountainBuildWireFromParts(result.ownerPeerId,
+                                         result.mimeType,
+                                         result.bundleCid,
+                                         result.blobCid,
+                                         result.blobByteLen,
+                                         result.objectTargetBytes,
+                                         result.sourceBlockBytes,
+                                         result.remoteAckPeerIds,
+                                         result.objects,
+                                         result.droplets)
+
+fn MoqFountainBuildToWire(blobBytes: Bytes,
+                          ownerPeerId: str,
+                          remotePeersCsv: str,
+                          mimeType0: str,
+                          objectTargetBytes0: int32,
+                          sourceBlockBytes0: int32,
+                          repairDropletCount0: int32): str =
+    let buildRes = MoqFountainBuild(blobBytes,
+                                    ownerPeerId,
+                                    remotePeersCsv,
+                                    mimeType0,
+                                    objectTargetBytes0,
+                                    sourceBlockBytes0,
+                                    repairDropletCount0)
+    if IsErr(buildRes):
+        return MoqFountainErrorWire(Error(buildRes))
+    return MoqFountainBuildResultToWire(Value(buildRes))
+
+@borrows
+fn MoqFountainWireFindValue(wire: str, key: str): Result[str] =
+    var lineStart: int32
+    let n = strings.Len(wire)
+    let keyLen = strings.Len(key)
+    while lineStart < n:
+        var lineEnd: int32
+        lineEnd = lineStart
+        var eqPos: int32 = -1
+        while lineEnd < n:
+            if Int32(wire[lineEnd]) == 61 && eqPos < 0:
+                eqPos = lineEnd
+            if Int32(wire[lineEnd]) == 10:
+                break
+            lineEnd = lineEnd + 1
+
+        if eqPos >= lineStart && (eqPos - lineStart) == keyLen:
+            var matched = true
+            var keyIdx: int32
+            for keyIdx in keyIdx..<keyLen:
+                if Int32(wire[lineStart + keyIdx]) != Int32(key[keyIdx]):
+                    matched = false
+                    break
+            if matched:
+                let valueStart = eqPos + 1
+                var valueLen: int32
+                if lineEnd > valueStart:
+                    valueLen = lineEnd - valueStart
+                return Ok[str](strings.CloneStrRange(wire, valueStart, valueLen))
+        lineStart = lineEnd + 1
+    return Err[str](MoqFountainFmt2("moq_fountain_missing_wire_field:", key))
+
+fn MoqFountainWireHasDuplicateDropletKeys(requestWire: str): Result[bool] =
+    let dropletCountRes = MoqFountainParseInt32Wire(requestWire, "droplet_count")
+    if IsErr(dropletCountRes):
+        return Err[bool](Error(dropletCountRes))
+    let dropletCount = Value(dropletCountRes)
+    if dropletCount <= 0:
+        return Err[bool]("moq_fountain_empty_droplet_set")
+    var seen = "\n"
+    var dropletRow: int32
+    for dropletRow in range(dropletCount):
+        let prefix = MoqFountainFmt3("droplet.", strings.IntToStr(dropletRow), ".")
+        let keyRes = MoqFountainWireFindValue(requestWire, MoqFountainPrefixKey(prefix, "key"))
+        if IsErr(keyRes):
+            return Err[bool](Error(keyRes))
+        let key = Value(keyRes)
+        if len(key) <= 0:
+            return Err[bool]("moq_fountain_empty_droplet_key")
+        let marker = MoqFountainFmt3("\n", key, "\n")
+        if MoqFountainTextContains(seen, marker):
+            return Ok[bool](true)
+        seen = MoqFountainFmt2(seen, MoqFountainFmt2(key, "\n"))
+    return Ok[bool](false)
+
+fn MoqFountainValidateWireStrict(requestWire: str): Result[bool] =
+    let duplicateRes = MoqFountainWireHasDuplicateDropletKeys(requestWire)
+    if IsErr(duplicateRes):
+        return Err[bool](Error(duplicateRes))
+    if Value(duplicateRes):
+        return Err[bool]("moq_fountain_duplicate_droplet_key")
+    return Ok[bool](true)
+
+fn MoqFountainDecodeBlockIndexes(csv: str): int32[] =
+    let parts = MoqFountainSplitCsv(csv)
+    var out: int32[]
+    out = []
+    var i: int32
+    for i in i..<parts.len:
+        let item = MoqFountainTrimAscii(parts[i])
+        if len(item) <= 0:
+            continue
+        add(out, MoqFountainParseInt32Text(item))
+    return out
+
+@borrows
+fn MoqFountainCloneInt32Array(values: int32[]): int32[] =
+    var out: int32[]
+    out = []
+    var i: int32
+    for i in i..<values.len:
+        add(out, values[i])
+    return out
+
+@borrows
+fn MoqFountainCloneBytesArray(values: Bytes[]): Bytes[] =
+    var out: Bytes[]
+    out = []
+    var i: int32
+    for i in i..<values.len:
+        add(out, BytesSlice(values[i], 0, BytesLen(values[i])))
+    return out
+
+fn MoqFountainCoeffOffset(row: int32, col: int32, colCount: int32): int32 =
+    return row * colCount + col
+
+@borrows
+fn MoqFountainCoeffGet(coeffData: int32[],
+                       row: int32,
+                       col: int32,
+                       colCount: int32): int32 =
+    return coeffData[MoqFountainCoeffOffset(row, col, colCount)]
+
+fn MoqFountainCoeffSet(coeffData: var int32[],
+                       row: int32,
+                       col: int32,
+                       colCount: int32,
+                       value: int32) =
+    coeffData[MoqFountainCoeffOffset(row, col, colCount)] = value
+
+fn MoqFountainCoeffSwapRows(coeffData: var int32[],
+                            leftRow: int32,
+                            rightRow: int32,
+                            colCount: int32) =
+    var col: int32
+    for col in col..<colCount:
+        let leftValue = MoqFountainCoeffGet(coeffData, leftRow, col, colCount)
+        let rightValue = MoqFountainCoeffGet(coeffData, rightRow, col, colCount)
+        MoqFountainCoeffSet(coeffData, leftRow, col, colCount, rightValue)
+        MoqFountainCoeffSet(coeffData, rightRow, col, colCount, leftValue)
+
+@borrows
+fn MoqFountainCopyBlockIntoFlat(target: var Bytes,
+                                blockBytes: int32,
+                                blockIndex: int32,
+                                source: Bytes): Result[bool] =
+    if BytesLen(source) != blockBytes:
+        return Err[bool]("moq_fountain_invalid_solved_block")
+    let offset = blockIndex * blockBytes
+    var idx: int32
+    for idx in idx..<blockBytes:
+        BytesSet(target, offset + idx, BytesGet(source, idx))
+    return Ok[bool](true)
+
+@borrows
+fn moqFountainSolveFindPivot(coeffData: int32[],
+                               pivotRow: int32,
+                               col: int32,
+                               rowCount: int32,
+                               sourceBlockCount: int32): int32 =
+    var row: int32 = pivotRow
+    for row in row..<rowCount:
+        if MoqFountainCoeffGet(coeffData, row, col, sourceBlockCount) != 0:
+            return row
+    return -1
+
+fn moqFountainSolveSwapRows(pivotRow: int32,
+                              found: int32,
+                              sourceBlockCount: int32,
+                              coeffData: var int32[],
+                              payloadRows: var Bytes[]) =
+    var swapCol: int32
+    for swapCol in swapCol..<sourceBlockCount:
+        let leftOff = MoqFountainCoeffOffset(pivotRow, swapCol, sourceBlockCount)
+        let rightOff = MoqFountainCoeffOffset(found, swapCol, sourceBlockCount)
+        let leftValue = coeffData[leftOff]
+        coeffData[leftOff] = coeffData[rightOff]
+        coeffData[rightOff] = leftValue
+    let tempPayload = BytesSlice(payloadRows[pivotRow], 0, BytesLen(payloadRows[pivotRow]))
+    let foundPayload = BytesSlice(payloadRows[found], 0, BytesLen(payloadRows[found]))
+    payloadRows[pivotRow] = foundPayload
+    payloadRows[found] = tempPayload
+
+fn moqFountainSolveXorRowInto(row: int32,
+                                pivotRow: int32,
+                                sourceBlockCount: int32,
+                                coeffData: var int32[],
+                                payloadRows: var Bytes[]): Result[bool] =
+    var coeffIndex: int32
+    for coeffIndex in coeffIndex..<sourceBlockCount:
+        let nextValue = MoqFountainCoeffGet(coeffData, row, coeffIndex, sourceBlockCount) ^
+                        MoqFountainCoeffGet(coeffData, pivotRow, coeffIndex, sourceBlockCount)
+        coeffData[MoqFountainCoeffOffset(row, coeffIndex, sourceBlockCount)] = nextValue
+    var rowPayload = BytesSlice(payloadRows[row], 0, BytesLen(payloadRows[row]))
+    let xorOk = MoqFountainXorInto(rowPayload, payloadRows[pivotRow])
+    if IsErr(xorOk):
+        return xorOk
+    payloadRows[row] = rowPayload
+    return Ok[bool](true)
+
+fn moqFountainSolveEliminateOthers(pivotRow: int32,
+                                     col: int32,
+                                     rowCount: int32,
+                                     sourceBlockCount: int32,
+                                     coeffData: var int32[],
+                                     payloadRows: var Bytes[]): Result[bool] =
+    var row: int32
+    for row in range(rowCount):
+        if row != pivotRow:
+            if MoqFountainCoeffGet(coeffData, row, col, sourceBlockCount) != 0:
+                let xorOk = moqFountainSolveXorRowInto(row, pivotRow, sourceBlockCount, coeffData, payloadRows)
+                if IsErr(xorOk):
+                    return xorOk
+    return Ok[bool](true)
+
+@borrows
+fn moqFountainSolveFindUnitRow(solvedBlock: int32,
+                                 rowCount: int32,
+                                 sourceBlockCount: int32,
+                                 coeffData: int32[]): int32 =
+    var row: int32
+    for row in row..<rowCount:
+        var unit = true
+        var coeffIndex: int32
+        for coeffIndex in coeffIndex..<sourceBlockCount:
+            var expected: int32
+            if coeffIndex == solvedBlock:
+                expected = 1
+            if MoqFountainCoeffGet(coeffData, row, coeffIndex, sourceBlockCount) != expected:
+                unit = false
+                coeffIndex = sourceBlockCount
+        if unit:
+            return row
+    return -1
+
+fn moqFountainSolveCopyAllBlocks(rowCount: int32,
+                                   sourceBlockCount: int32,
+                                   blockBytes: int32,
+                                   coeffData: int32[],
+                                   payloadRows: Bytes[],
+                                   solvedFlat: var Bytes): Result[bool] =
+    var solvedBlock: int32
+    for solvedBlock in solvedBlock..<sourceBlockCount:
+        let foundUnitRow = moqFountainSolveFindUnitRow(solvedBlock, rowCount, sourceBlockCount, coeffData)
+        if foundUnitRow < 0:
+            return Err[bool]("moq_fountain_invalid_solved_block")
+        let source = BytesSlice(payloadRows[foundUnitRow], 0, BytesLen(payloadRows[foundUnitRow]))
+        let copyOk = MoqFountainCopyBlockIntoFlat(solvedFlat, blockBytes, solvedBlock, source)
+        if IsErr(copyOk):
+            return copyOk
+    return Ok[bool](true)
+
+@borrows
+fn moqFountainSolveFlattenObject(sourceBlockCount: int32,
+                                   blockBytes: int32,
+                                   byteLength: int32,
+                                   solvedFlat: Bytes): Bytes =
+    var objectBytes = BytesAlloc(byteLength)
+    var writeOffset: int32
+    var blockIndex: int32
+    for blockIndex in range(sourceBlockCount):
+        if writeOffset < byteLength:
+            let copyLen = MoqFountainMinInt32(blockBytes, byteLength - writeOffset)
+            let blockOffset = blockIndex * blockBytes
+            var copyIndex: int32
+            for copyIndex in copyIndex..<copyLen:
+                BytesSet(objectBytes, writeOffset + copyIndex, BytesGet(solvedFlat, blockOffset + copyIndex))
+            writeOffset = writeOffset + copyLen
+    return objectBytes
+
+@borrows
+fn MoqFountainSolveObjectBytes(sourceBlockCount: int32,
+                               blockBytes: int32,
+                               byteLength: int32,
+                               coeffData0: int32[],
+                               payloadRows0: Bytes[]): Result[Bytes] =
+    if sourceBlockCount <= 0:
+        return Err[Bytes]("moq_fountain_invalid_object")
+    let rowCount = payloadRows0.len
+    if rowCount <= 0:
+        return Err[Bytes]("moq_fountain_insufficient_droplets")
+    if coeffData0.len != rowCount * sourceBlockCount:
+        return Err[Bytes]("moq_fountain_invalid_coeff_matrix")
+    var coeffData = MoqFountainCloneInt32Array(coeffData0)
+    var payloadRows = MoqFountainCloneBytesArray(payloadRows0)
+    let solvedFlatLen = sourceBlockCount * blockBytes
+    var solvedFlat = BytesAlloc(solvedFlatLen)
+    var solvedMask = BytesAlloc(sourceBlockCount)
+    var solvedCount: int32
+    var pivotRow: int32
+    var col: int32
+    while col < sourceBlockCount && pivotRow < rowCount:
+        let found = moqFountainSolveFindPivot(coeffData, pivotRow, col, rowCount, sourceBlockCount)
+        if found >= 0:
+            if found != pivotRow:
+                moqFountainSolveSwapRows(pivotRow, found, sourceBlockCount, coeffData, payloadRows)
+            let elimOk = moqFountainSolveEliminateOthers(pivotRow, col, rowCount, sourceBlockCount, coeffData, payloadRows)
+            if IsErr(elimOk):
+                return Err[Bytes](Error(elimOk))
+            if BytesGet(solvedMask, col) == 0:
+                solvedCount = solvedCount + 1
+            BytesSet(solvedMask, col, 1)
+            pivotRow = pivotRow + 1
+        col = col + 1
+    if solvedCount < sourceBlockCount:
+        return Err[Bytes]("moq_fountain_insufficient_droplets")
+    var i: int32
+    for i in i..<sourceBlockCount:
+        if BytesGet(solvedMask, i) == 0:
+            return Err[Bytes]("moq_fountain_invalid_solved_block")
+    let copyOk = moqFountainSolveCopyAllBlocks(rowCount,
+                                                 sourceBlockCount,
+                                                 blockBytes,
+                                                 coeffData,
+                                                 payloadRows,
+                                                 solvedFlat)
+    if IsErr(copyOk):
+        return Err[Bytes](Error(copyOk))
+    return Ok[Bytes](moqFountainSolveFlattenObject(sourceBlockCount, blockBytes, byteLength, solvedFlat))
+
+@borrows
+fn MoqFountainConcatObjectBytes(objectBytesList: Bytes[], blobByteLen: int32): Bytes =
+    var rebuilt: Bytes
+    rebuilt = BytesAlloc(blobByteLen)
+    let rebuiltPtr = BytesDataPtr(rebuilt)
+    var blobOffset: int32
+    var objectIndex: int32
+    while objectIndex < objectBytesList.len:
+        let objectLen = BytesLen(objectBytesList[objectIndex])
+        var copyIndex: int32
+        while copyIndex < objectLen:
+            if blobOffset + copyIndex >= blobByteLen:
+                break
+            rawmem_support.RawmemWriteI8(rebuiltPtr,
+                                          blobOffset + copyIndex,
+                                          Int8(BytesGet(objectBytesList[objectIndex], copyIndex)))
+            copyIndex = copyIndex + 1
+        blobOffset = blobOffset + objectLen
+        objectIndex = objectIndex + 1
+    return BytesTake(rebuilt)
+
+@borrows
+fn MoqFountainRebuildTakeDropletPayload(requestWire: str,
+                                         prefix: str,
+                                         sourceBlockBytes: int32): Result[Bytes] =
+    let payloadHexRes = MoqFountainWireFindValue(requestWire, MoqFountainPrefixKey(prefix, "payload_hex"))
+    if IsErr(payloadHexRes):
+        return Err[Bytes](Error(payloadHexRes))
+    let payloadRes = MoqFountainBytesFromHex(Value(payloadHexRes))
+    if IsErr(payloadRes):
+        return Err[Bytes](Error(payloadRes))
+    let payload = Value(payloadRes)
+    if BytesLen(payload) != sourceBlockBytes:
+        return Err[Bytes]("moq_fountain_payload_size_mismatch")
+    let cidRes = MoqFountainWireFindValue(requestWire, MoqFountainPrefixKey(prefix, "cid"))
+    if IsErr(cidRes):
+        return Err[Bytes](Error(cidRes))
+    let cid = Value(cidRes)
+    if strings.Len(cid) > 0 && cid != MoqFountainSha256HexBytes(payload):
+        return Err[Bytes]("moq_fountain_payload_cid_mismatch")
+    return Ok[Bytes](payload)
+
+fn MoqFountainRebuildRowCoeffPatch(sourceBlockCount: int32,
+                                    blockIndexes: int32[]): Result[int32[]] =
+    var row: int32[]
+    row = []
+    var coeffIndex: int32
+    for coeffIndex in coeffIndex..<sourceBlockCount:
+        add(row, 0)
+    var blockIndex: int32
+    for blockIndex in blockIndex..<blockIndexes.len:
+        let idx = blockIndexes[blockIndex]
+        if idx < 0 || idx >= sourceBlockCount:
+            return Err[int32[]]("moq_fountain_block_index_out_of_range")
+        let cur = row[idx]
+        row[idx] = cur ^ 1
+    return Ok[int32[]](row)
+
+fn MoqFountainInt32Concat(left: int32[], right: int32[]): int32[] =
+    var out: int32[]
+    out = []
+    var i: int32
+    for i in i..<left.len:
+        add(out, left[i])
+    var j: int32
+    for j in j..<right.len:
+        add(out, right[j])
+    return out
+
+@borrows
+fn MoqFountainRebuildParseObjectHeader(requestWire: str,
+                                        objectIndex: int32): Result[MoqFountainRebuildObjectHeader] =
+    let objectPrefix = MoqFountainFmt3("object.", strings.IntToStr(objectIndex), ".")
+    let byteLengthRes = MoqFountainParseInt32Wire(requestWire, MoqFountainPrefixKey(objectPrefix, "byte_length"))
+    if IsErr(byteLengthRes):
+        return Err[MoqFountainRebuildObjectHeader](Error(byteLengthRes))
+    let sourceBlockBytesRes = MoqFountainParseInt32Wire(requestWire, MoqFountainPrefixKey(objectPrefix, "source_block_bytes"))
+    if IsErr(sourceBlockBytesRes):
+        return Err[MoqFountainRebuildObjectHeader](Error(sourceBlockBytesRes))
+    let sourceBlockCountRes = MoqFountainParseInt32Wire(requestWire, MoqFountainPrefixKey(objectPrefix, "source_block_count"))
+    if IsErr(sourceBlockCountRes):
+        return Err[MoqFountainRebuildObjectHeader](Error(sourceBlockCountRes))
+    let objectCidRes = MoqFountainWireFindValue(requestWire, MoqFountainPrefixKey(objectPrefix, "object_cid"))
+    if IsErr(objectCidRes):
+        return Err[MoqFountainRebuildObjectHeader](Error(objectCidRes))
+    return Ok[MoqFountainRebuildObjectHeader](MoqFountainRebuildObjectHeader(
+        byteLength: Value(byteLengthRes),
+        sourceBlockBytes: Value(sourceBlockBytesRes),
+        sourceBlockCount: Value(sourceBlockCountRes),
+        objectCid: Value(objectCidRes)
+    ))
+
+fn moqFountainRebuildAccEmpty(): MoqFountainRebuildAcc =
+    var coeffData: int32[]
+    coeffData = []
+    var payloadRows: Bytes[]
+    payloadRows = []
+    return MoqFountainRebuildAcc(
+        coeffData: coeffData,
+        payloadRows: payloadRows
+    )
+
+fn moqFountainBytesArrayPrepend(head: Bytes, tail: Bytes[]): Bytes[] =
+    var out: Bytes[]
+    out = []
+    add(out, BytesSlice(head, 0, BytesLen(head)))
+    var i: int32
+    for i in i..<tail.len:
+        add(out, BytesSlice(tail[i], 0, BytesLen(tail[i])))
+    return out
+
+@borrows
+fn moqFountainRebuildCollectAccFrom(requestWire: str,
+                                      objectIndex: int32,
+                                      dropletCount: int32,
+                                      sourceBlockBytes: int32,
+                                      sourceBlockCount: int32,
+                                      dropletRow: int32): Result[MoqFountainRebuildAcc] =
+    if dropletRow >= dropletCount:
+        return Ok[MoqFountainRebuildAcc](moqFountainRebuildAccEmpty())
+    let prefix = MoqFountainFmt3("droplet.", strings.IntToStr(dropletRow), ".")
+    let candidateObjectIndexRes = MoqFountainParseInt32Wire(requestWire, MoqFountainPrefixKey(prefix, "object_index"))
+    if IsErr(candidateObjectIndexRes):
+        return Err[MoqFountainRebuildAcc](Error(candidateObjectIndexRes))
+    if Value(candidateObjectIndexRes) != objectIndex:
+        return moqFountainRebuildCollectAccFrom(requestWire,
+                                                 objectIndex,
+                                                 dropletCount,
+                                                 sourceBlockBytes,
+                                                 sourceBlockCount,
+                                                 dropletRow + 1)
+    let payloadRes = MoqFountainRebuildTakeDropletPayload(requestWire, prefix, sourceBlockBytes)
+    if IsErr(payloadRes):
+        return Err[MoqFountainRebuildAcc](Error(payloadRes))
+    let blockIndexesRes = MoqFountainWireFindValue(requestWire, MoqFountainPrefixKey(prefix, "block_indexes"))
+    if IsErr(blockIndexesRes):
+        return Err[MoqFountainRebuildAcc](Error(blockIndexesRes))
+    let blockIndexes = MoqFountainDecodeBlockIndexes(Value(blockIndexesRes))
+    let rowRes = MoqFountainRebuildRowCoeffPatch(sourceBlockCount, blockIndexes)
+    if IsErr(rowRes):
+        return Err[MoqFountainRebuildAcc](Error(rowRes))
+    let restRes = moqFountainRebuildCollectAccFrom(requestWire,
+                                                    objectIndex,
+                                                    dropletCount,
+                                                    sourceBlockBytes,
+                                                    sourceBlockCount,
+                                                    dropletRow + 1)
+    if IsErr(restRes):
+        return restRes
+    let rest = Value(restRes)
+    return Ok[MoqFountainRebuildAcc](MoqFountainRebuildAcc(
+        coeffData: MoqFountainInt32Concat(Value(rowRes), MoqFountainCloneInt32Array(rest.coeffData)),
+        payloadRows: moqFountainBytesArrayPrepend(Value(payloadRes), MoqFountainCloneBytesArray(rest.payloadRows))
+    ))
+
+@borrows
+fn MoqFountainRebuildCollectAcc(requestWire: str,
+                                 objectIndex: int32,
+                                 dropletCount: int32,
+                                 sourceBlockBytes: int32,
+                                 sourceBlockCount: int32): Result[MoqFountainRebuildAcc] =
+    return moqFountainRebuildCollectAccFrom(requestWire,
+                                             objectIndex,
+                                             dropletCount,
+                                             sourceBlockBytes,
+                                             sourceBlockCount,
+                                             0)
+
+@borrows
+fn MoqFountainRebuildOneObject(requestWire: str,
+                                objectIndex: int32,
+                                dropletCount: int32): Result[Bytes] =
+    let headerRes = MoqFountainRebuildParseObjectHeader(requestWire, objectIndex)
+    if IsErr(headerRes):
+        return Err[Bytes](Error(headerRes))
+    let header = Value(headerRes)
+    let accRes = MoqFountainRebuildCollectAcc(requestWire,
+                                               objectIndex,
+                                               dropletCount,
+                                               header.sourceBlockBytes,
+                                               header.sourceBlockCount)
+    if IsErr(accRes):
+        return Err[Bytes](Error(accRes))
+    let acc = Value(accRes)
+    let solvedRes = MoqFountainSolveObjectBytes(header.sourceBlockCount,
+                                               header.sourceBlockBytes,
+                                               header.byteLength,
+                                               acc.coeffData,
+                                               acc.payloadRows)
+    if IsErr(solvedRes):
+        return Err[Bytes](Error(solvedRes))
+    let objectBytes = Value(solvedRes)
+    if header.objectCid != MoqFountainSha256HexBytes(objectBytes):
+        return Err[Bytes]("moq_fountain_object_cid_mismatch")
+    return Ok[Bytes](objectBytes)
+
+fn moqFountainEmptyBytesArray(): Bytes[] =
+    var empty: Bytes[]
+    empty = []
+    return empty
+
+@borrows
+fn moqFountainRebuildObjectBytesFrom(requestWire: str,
+                                       objectCount: int32,
+                                       dropletCount: int32,
+                                       objectIndex: int32): Result[Bytes[]] =
+    if objectIndex >= objectCount:
+        return Ok[Bytes[]](moqFountainEmptyBytesArray())
+    let headRes = MoqFountainRebuildOneObject(requestWire, objectIndex, dropletCount)
+    if IsErr(headRes):
+        return Err[Bytes[]](Error(headRes))
+    let tailRes = moqFountainRebuildObjectBytesFrom(requestWire, objectCount, dropletCount, objectIndex + 1)
+    if IsErr(tailRes):
+        return tailRes
+    return Ok[Bytes[]](moqFountainBytesArrayPrepend(Value(headRes), Value(tailRes)))
+
+@borrows
+fn MoqFountainRebuildFromWire(requestWire: str): Result[MoqFountainRebuildResult] =
+    let blobCidRes = MoqFountainWireFindValue(requestWire, "blob_cid")
+    if IsErr(blobCidRes):
+        return Err[MoqFountainRebuildResult](Error(blobCidRes))
+    let blobByteLenRes = MoqFountainParseInt32Wire(requestWire, "blob_byte_len")
+    if IsErr(blobByteLenRes):
+        return Err[MoqFountainRebuildResult](Error(blobByteLenRes))
+    let objectCountRes = MoqFountainParseInt32Wire(requestWire, "object_count")
+    if IsErr(objectCountRes):
+        return Err[MoqFountainRebuildResult](Error(objectCountRes))
+    let dropletCountRes = MoqFountainParseInt32Wire(requestWire, "droplet_count")
+    if IsErr(dropletCountRes):
+        return Err[MoqFountainRebuildResult](Error(dropletCountRes))
+    let blobCid = Value(blobCidRes)
+    let blobByteLen = Value(blobByteLenRes)
+    let objectCount = Value(objectCountRes)
+    let dropletCount = Value(dropletCountRes)
+    let objectBytesListRes = moqFountainRebuildObjectBytesFrom(requestWire, objectCount, dropletCount, 0)
+    if IsErr(objectBytesListRes):
+        return Err[MoqFountainRebuildResult](Error(objectBytesListRes))
+    let objectBytesList = Value(objectBytesListRes)
+    let blob = MoqFountainConcatObjectBytes(objectBytesList, blobByteLen)
+    if blobCid != MoqFountainSha256HexBytes(blob):
+        return Err[MoqFountainRebuildResult]("moq_fountain_blob_cid_mismatch")
+    return Ok[MoqFountainRebuildResult](MoqFountainRebuildResult(
+        blob: blob,
+        blobCid: blobCid,
+        blobByteLen: blobByteLen
+    ))
+
+@borrows
+fn MoqFountainRebuildFromWireStrict(requestWire: str): Result[MoqFountainRebuildResult] =
+    let validateRes = MoqFountainValidateWireStrict(requestWire)
+    if IsErr(validateRes):
+        return Err[MoqFountainRebuildResult](Error(validateRes))
+    return MoqFountainRebuildFromWire(requestWire)
+
+fn MoqFountainRebuildResultToWire(outputPath: str,
+                                  result: MoqFountainRebuildResult): str =
+    let rows = [
+        "ok=1",
+        MoqFountainFmt2("output_path=", outputPath),
+        MoqFountainFmt2("blob_cid=", result.blobCid),
+        MoqFountainFmt2("blob_byte_len=", strings.IntToStr(result.blobByteLen))
+    ]
+    return MoqFountainLinesWithNewline(rows)
+
+fn MoqFountainBrowserRebuildResultToWire(result: MoqFountainRebuildResult): str =
+    var rows: str[]
+    rows = []
+    add(rows, "ok=1")
+    add(rows, MoqFountainFmt2("blob_cid=", result.blobCid))
+    add(rows, MoqFountainFmt2("blob_byte_len=", strings.IntToStr(result.blobByteLen)))
+    add(rows, MoqFountainFmt2("blob_hex=", BytesToHex(result.blob)))
+    return MoqFountainLinesWithNewline(rows)
+
+fn MoqFountainRebuildToWire(requestWire: str): str =
+    let rebuiltRes = MoqFountainRebuildFromWire(requestWire)
+    if IsErr(rebuiltRes):
+        let errorText = Error(rebuiltRes)
+        return MoqFountainErrorWire(errorText)
+    let rebuilt = Value(rebuiltRes)
+    return MoqFountainBrowserRebuildResultToWire(rebuilt)

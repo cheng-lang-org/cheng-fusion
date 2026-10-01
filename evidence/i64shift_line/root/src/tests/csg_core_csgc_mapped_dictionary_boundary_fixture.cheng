@@ -1,0 +1,834 @@
+import std/os
+import std/rawbytes
+import std/result
+import std/strings
+import std/strutils
+import std/system
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
+import cheng/core/csg_core/csgc
+import cheng/core/csg_core/csgc_mapped_reader as mapped_reader
+import cheng/core/csg_core/merkle_store_codec
+
+const
+    BoundaryHeaderSize: int32 = 64
+    BoundaryDirectoryPrefixSize: int32 = 8
+    BoundarySectionDigestSize: int32 = 32
+    BoundarySectionDictionary: int32 = 1
+    BoundarySectionFactKind: int32 = 2
+    BoundarySectionHashDomain: str = "csg_core.csgc.section"
+    BoundaryFactKind: str = "csg.boundary"
+    BoundaryRelativePath: str = "object.csgc"
+    BoundaryHashDomain: str =
+        "csg_core.store.canonical_csgc_object"
+    # Four repeated quoted tokens sort before the generated values:
+    # "copy", "csg.boundary", "kind", and "token".  Together with
+    # 124 long values they occupy final dictionary indexes 0..127.
+    BoundaryLongCandidateCount: int32 = 124
+    BoundaryTargetDictionaryIndex: int32 = 128
+    BoundaryTargetToken: str = "\"z\""
+    BoundaryFirstFact: str =
+        "{\"copy\":0,\"kind\":\"csg.boundary\",\"token\":\"z\"}"
+
+type
+    boundaryVarintRead =
+        ok: bool
+        value: int32
+        nextOffset: int32
+
+    boundarySection =
+        tag: int32
+        kind: str
+        payloadOffset: int32
+        payloadLength: int32
+        itemCount: int32
+        offsetFieldOffset: int32
+        lengthFieldOffset: int32
+        itemCountFieldOffset: int32
+        digestOffset: int32
+
+    boundaryDirectory =
+        ok: bool
+        bodySize: int32
+        directorySize: int32
+        sections: boundarySection[]
+        error: str
+
+    boundaryPayload =
+        ok: bool
+        bytes: rawbytes.Bytes
+        replacements: int32
+        error: str
+
+    boundaryObjects =
+        ok: bool
+        canonical: rawbytes.Bytes
+        legacy: rawbytes.Bytes
+        error: str
+
+    boundaryPrepared =
+        ok: bool
+        canonicalCid: str
+        canonicalFinalName: str
+        legacyCid: str
+        legacyFinalName: str
+        error: str
+
+@borrows
+fn boundaryPayloadFail(message: str): boundaryPayload =
+    var out: boundaryPayload
+    out.error = strings.CloneStr(message)
+    return out
+
+@borrows
+fn boundaryPreparedFail(message: str): boundaryPrepared =
+    var out: boundaryPrepared
+    out.error = strings.CloneStr(message)
+    return out
+
+@borrows
+fn boundaryObjectsFail(message: str): boundaryObjects =
+    var out: boundaryObjects
+    out.error = strings.CloneStr(message)
+    return out
+
+fn boundaryWriteU32(
+        bytes: var rawbytes.Bytes,
+        offset: int32,
+        value: int32) =
+    rawbytes.BytesSet(bytes, offset, value & 255)
+    rawbytes.BytesSet(bytes, offset + 1, (value >> 8) & 255)
+    rawbytes.BytesSet(bytes, offset + 2, (value >> 16) & 255)
+    rawbytes.BytesSet(bytes, offset + 3, (value >> 24) & 255)
+
+@borrows
+fn boundaryReadU32(
+        bytes: rawbytes.Bytes,
+        offset: int32): int32 =
+    if offset < 0 || offset > rawbytes.BytesLen(bytes) - 4:
+        return -1
+    return (rawbytes.BytesGet(bytes, offset) & 255) |
+        ((rawbytes.BytesGet(bytes, offset + 1) & 255) << 8) |
+        ((rawbytes.BytesGet(bytes, offset + 2) & 255) << 16) |
+        ((rawbytes.BytesGet(bytes, offset + 3) & 255) << 24)
+
+@borrows
+fn boundaryReadVarint(
+        bytes: rawbytes.Bytes,
+        offset: int32,
+        limit: int32): boundaryVarintRead =
+    var out: boundaryVarintRead
+    var cursor = offset
+    var value: int32
+    var shift: int32
+    while cursor < limit:
+        let item = rawbytes.BytesGet(bytes, cursor) & 255
+        if shift > 28 ||
+           (shift == 28 && (item & 127) > 7):
+            return out
+        value = value | ((item & 127) << shift)
+        cursor = cursor + 1
+        if (item & 128) == 0:
+            out.ok = true
+            out.value = value
+            out.nextOffset = cursor
+            return out
+        shift = shift + 7
+    return out
+
+fn boundaryAppendU32(
+        buffer: var layout.ByteBuf,
+        value: int32) =
+    layout.ByteBufAppendByte(buffer, value & 255)
+    layout.ByteBufAppendByte(buffer, (value >> 8) & 255)
+    layout.ByteBufAppendByte(buffer, (value >> 16) & 255)
+    layout.ByteBufAppendByte(buffer, (value >> 24) & 255)
+
+fn boundaryAppendVarint(
+        buffer: var layout.ByteBuf,
+        value: int32) =
+    var remaining = value
+    while remaining >= 128:
+        layout.ByteBufAppendByte(
+            buffer, (remaining & 127) | 128)
+        remaining = remaining >> 7
+    layout.ByteBufAppendByte(buffer, remaining & 127)
+
+@borrows
+fn boundaryAppendString(
+        buffer: var layout.ByteBuf,
+        value: str) =
+    boundaryAppendVarint(buffer, value.len)
+    let bytes = rawbytes.BytesFromString(value)
+    layout.ByteBufAppendBytes(buffer, bytes)
+
+@borrows
+fn boundaryUtf8Compare(left: str, right: str): int32 =
+    let common = left.len < right.len ? left.len : right.len
+    for i in 0..<common:
+        let leftByte = int32(left[i]) & 255
+        let rightByte = int32(right[i]) & 255
+        if leftByte < rightByte:
+            return -1
+        if leftByte > rightByte:
+            return 1
+    if left.len < right.len:
+        return -1
+    if left.len > right.len:
+        return 1
+    return 0
+
+fn boundaryCandidateValue(index: int32): str =
+    let ordinal = strings.IntToStr(index)
+    if index < 10:
+        return strings.ConcatStr("a00", strings.ConcatStr(ordinal, "long"))
+    if index < 100:
+        return strings.ConcatStr("a0", strings.ConcatStr(ordinal, "long"))
+    return strings.ConcatStr("a", strings.ConcatStr(ordinal, "long"))
+
+@borrows
+fn boundaryFact(tokenValue: str, copyIndex: int32): str =
+    let prefix = strings.ConcatStr(
+        "{\"copy\":", strings.IntToStr(copyIndex))
+    let middle = strings.ConcatStr(
+        prefix, ",\"kind\":\"csg.boundary\",\"token\":\"")
+    return strings.ConcatStr(
+        strings.ConcatStr(middle, tokenValue), "\"}")
+
+fn boundaryLines(): str[] =
+    # Put the short target first in encounter order.  The retired algorithm
+    # charged this early row's encounter index and admitted it; the canonical
+    # algorithm must charge its final UTF-8-sorted index 128 and inline it.
+    let firstFact = boundaryFact("z", 0)
+    assert(firstFact == BoundaryFirstFact,
+           "boundary first canonical JSON shape drift")
+    var lines = [
+        firstFact,
+        boundaryFact("z", 1)
+    ]
+    for candidateIndex in 0..<BoundaryLongCandidateCount:
+        let value = boundaryCandidateValue(candidateIndex)
+        add(lines, boundaryFact(value, 0))
+        add(lines, boundaryFact(value, 1))
+    return lines
+
+@borrows
+fn boundaryWalkDirectory(
+        bytes: rawbytes.Bytes): boundaryDirectory =
+    var out: boundaryDirectory
+    let totalLength = rawbytes.BytesLen(bytes)
+    if totalLength < BoundaryHeaderSize + BoundaryDirectoryPrefixSize:
+        out.error = "boundary_directory_truncated"
+        return out
+    out.bodySize = boundaryReadU32(bytes, 16)
+    out.directorySize = boundaryReadU32(bytes, BoundaryHeaderSize)
+    let sectionCount = boundaryReadU32(bytes, BoundaryHeaderSize + 4)
+    if out.bodySize != totalLength - BoundaryHeaderSize ||
+       out.directorySize < BoundaryDirectoryPrefixSize ||
+       sectionCount != 2:
+        out.error = "boundary_directory_shape_invalid"
+        return out
+    var cursor = BoundaryHeaderSize + BoundaryDirectoryPrefixSize
+    let directoryEnd = BoundaryHeaderSize + out.directorySize
+    var expectedPayloadOffset = out.directorySize
+    for sectionIndex in 0..<sectionCount:
+        if cursor >= directoryEnd:
+            out.error = "boundary_directory_entry_truncated"
+            return out
+        let tag = rawbytes.BytesGet(bytes, cursor) & 255
+        cursor = cursor + 1
+        let kindLength = boundaryReadVarint(bytes, cursor, directoryEnd)
+        if !kindLength.ok || kindLength.value < 0 ||
+           kindLength.value > directoryEnd - kindLength.nextOffset:
+            out.error = "boundary_directory_kind_invalid"
+            return out
+        cursor = kindLength.nextOffset
+        let kindBytes = rawbytes.BytesSliceView(
+            bytes, cursor, kindLength.value)
+        let kind = rawbytes.BytesToString(kindBytes)
+        cursor = cursor + kindLength.value
+        if cursor > directoryEnd - 12 - BoundarySectionDigestSize:
+            out.error = "boundary_directory_fields_truncated"
+            return out
+        var section: boundarySection
+        section.tag = tag
+        section.kind = kind
+        section.offsetFieldOffset = cursor
+        section.lengthFieldOffset = cursor + 4
+        section.itemCountFieldOffset = cursor + 8
+        section.digestOffset = cursor + 12
+        section.payloadOffset = boundaryReadU32(bytes, cursor)
+        section.payloadLength = boundaryReadU32(bytes, cursor + 4)
+        section.itemCount = boundaryReadU32(bytes, cursor + 8)
+        cursor = cursor + 12 + BoundarySectionDigestSize
+        if section.payloadOffset != expectedPayloadOffset ||
+           section.payloadLength < 4 ||
+           section.payloadLength > out.bodySize - section.payloadOffset:
+            out.error = "boundary_directory_payload_invalid"
+            return out
+        expectedPayloadOffset =
+            section.payloadOffset + section.payloadLength
+        if sectionIndex == 0:
+            if section.tag != BoundarySectionDictionary ||
+               section.kind.len != 0:
+                out.error = "boundary_dictionary_section_invalid"
+                return out
+        else:
+            if section.tag != BoundarySectionFactKind ||
+               section.kind != BoundaryFactKind:
+                out.error = "boundary_fact_section_invalid"
+                return out
+        add(out.sections, section)
+    if cursor != directoryEnd || expectedPayloadOffset != out.bodySize:
+        out.error = "boundary_directory_coverage_invalid"
+        return out
+    out.ok = true
+    return out
+
+@borrows
+fn boundaryAppendDigestText(
+        buffer: var layout.ByteBuf,
+        value: str) =
+    boundaryAppendU32(buffer, value.len)
+    let bytes = rawbytes.BytesFromString(value)
+    layout.ByteBufAppendBytes(buffer, bytes)
+
+@borrows
+fn boundarySectionDigest(
+        bytes: rawbytes.Bytes,
+        section: boundarySection): layout.FixedBytes32 =
+    var prefix = layout.ByteBufInit(96 + section.kind.len)
+    boundaryAppendDigestText(prefix, BoundarySectionHashDomain)
+    layout.ByteBufAppendByte(prefix, section.tag)
+    boundaryAppendDigestText(prefix, section.kind)
+    boundaryAppendU32(prefix, section.itemCount)
+    boundaryAppendU32(prefix, section.payloadLength)
+    let allBytes = layout.ByteSpanFromBytes(bytes)
+    let payload = layout.ByteSpanSlice(
+        allBytes,
+        BoundaryHeaderSize + section.payloadOffset,
+        section.payloadLength)
+    let digest = hash256.Sha256FixedTwo(
+        layout.ByteBufView(prefix), payload)
+    layout.ByteBufFree(prefix)
+    return digest
+
+fn boundaryWriteDigest(
+        bytes: var rawbytes.Bytes,
+        offset: int32,
+        digest: layout.FixedBytes32) =
+    for i in 0..<BoundarySectionDigestSize:
+        rawbytes.BytesSet(
+            bytes, offset + i, int32(digest.data[i]) & 255)
+
+@borrows
+fn boundaryDigestsMatch(
+        bytes: rawbytes.Bytes,
+        directory: boundaryDirectory): bool =
+    for sectionIndex in 0..<directory.sections.len:
+        let digest = boundarySectionDigest(
+            bytes, directory.sections[sectionIndex])
+        for digestIndex in 0..<BoundarySectionDigestSize:
+            if (rawbytes.BytesGet(
+                    bytes,
+                    directory.sections[sectionIndex].digestOffset +
+                        digestIndex) & 255) !=
+               (int32(digest.data[digestIndex]) & 255):
+                return false
+    return true
+
+@borrows
+fn boundaryBuildLegacyDictionary(
+        entries: str[]): boundaryPayload =
+    var buffer = layout.ByteBufInit(4096)
+    boundaryAppendU32(buffer, entries.len + 1)
+    var inserted: int32
+    for entryIndex in 0..<entries.len:
+        if entryIndex == BoundaryTargetDictionaryIndex:
+            boundaryAppendString(buffer, BoundaryTargetToken)
+            inserted = inserted + 1
+        boundaryAppendString(buffer, entries[entryIndex])
+    if inserted != 1:
+        layout.ByteBufFree(buffer)
+        return boundaryPayloadFail(
+            "boundary_legacy_dictionary_insertion_failed")
+    var out: boundaryPayload
+    out.ok = true
+    out.bytes = layout.ByteBufToBytes(buffer)
+    layout.ByteBufFree(buffer)
+    return out
+
+@borrows
+fn boundaryBuildLegacyFacts(
+        canonical: rawbytes.Bytes,
+        section: boundarySection,
+        dictionaryEntryCount: int32): boundaryPayload =
+    let start = BoundaryHeaderSize + section.payloadOffset
+    let finish = start + section.payloadLength
+    let factCount = boundaryReadU32(canonical, start)
+    if factCount != section.itemCount:
+        return boundaryPayloadFail("boundary_fact_count_invalid")
+    var buffer = layout.ByteBufInit(section.payloadLength)
+    boundaryAppendU32(buffer, factCount)
+    var cursor = start + 4
+    var replacements: int32
+    var remappedReferences: int32
+    for factIndex in 0..<factCount:
+        let tokenCount = boundaryReadVarint(canonical, cursor, finish)
+        if !tokenCount.ok || tokenCount.value < 0:
+            layout.ByteBufFree(buffer)
+            return boundaryPayloadFail("boundary_token_count_invalid")
+        boundaryAppendVarint(buffer, tokenCount.value)
+        cursor = tokenCount.nextOffset
+        for tokenIndex in 0..<tokenCount.value:
+            if cursor >= finish:
+                layout.ByteBufFree(buffer)
+                return boundaryPayloadFail("boundary_token_truncated")
+            let tag = rawbytes.BytesGet(canonical, cursor) & 255
+            cursor = cursor + 1
+            let payload = boundaryReadVarint(canonical, cursor, finish)
+            if !payload.ok || payload.value < 0:
+                layout.ByteBufFree(buffer)
+                return boundaryPayloadFail("boundary_token_payload_invalid")
+            cursor = payload.nextOffset
+            if tag == csgc.CsgCoreCsgcTokenDictRef:
+                if payload.value >= dictionaryEntryCount:
+                    layout.ByteBufFree(buffer)
+                    return boundaryPayloadFail(
+                        "boundary_dictionary_reference_out_of_range")
+                var remappedIndex = payload.value
+                if remappedIndex >= BoundaryTargetDictionaryIndex:
+                    remappedIndex = remappedIndex + 1
+                    remappedReferences = remappedReferences + 1
+                layout.ByteBufAppendByte(buffer, tag)
+                boundaryAppendVarint(buffer, remappedIndex)
+            elif tag == csgc.CsgCoreCsgcTokenInlineUtf8:
+                if payload.value > finish - cursor:
+                    layout.ByteBufFree(buffer)
+                    return boundaryPayloadFail(
+                        "boundary_inline_token_truncated")
+                let isTarget = payload.value == 3 &&
+                    (rawbytes.BytesGet(canonical, cursor) & 255) == 34 &&
+                    (rawbytes.BytesGet(canonical, cursor + 1) & 255) == 122 &&
+                    (rawbytes.BytesGet(canonical, cursor + 2) & 255) == 34
+                if isTarget:
+                    layout.ByteBufAppendByte(
+                        buffer, csgc.CsgCoreCsgcTokenDictRef)
+                    boundaryAppendVarint(
+                        buffer, BoundaryTargetDictionaryIndex)
+                    replacements = replacements + 1
+                else:
+                    layout.ByteBufAppendByte(buffer, tag)
+                    boundaryAppendVarint(buffer, payload.value)
+                    let tokenBytes = rawbytes.BytesSliceView(
+                        canonical, cursor, payload.value)
+                    layout.ByteBufAppendBytes(buffer, tokenBytes)
+                cursor = cursor + payload.value
+            else:
+                layout.ByteBufFree(buffer)
+                return boundaryPayloadFail(
+                    "boundary_token_tag_invalid")
+    if cursor != finish || replacements != 2:
+        layout.ByteBufFree(buffer)
+        return boundaryPayloadFail(
+            "boundary_target_replacement_count_invalid")
+    if remappedReferences <= 0:
+        layout.ByteBufFree(buffer)
+        return boundaryPayloadFail(
+            "boundary_dictionary_remap_not_exercised")
+    var out: boundaryPayload
+    out.ok = true
+    out.bytes = layout.ByteBufToBytes(buffer)
+    out.replacements = replacements
+    layout.ByteBufFree(buffer)
+    return out
+
+@borrows
+fn boundaryBuildLegacyObject(
+        canonical: rawbytes.Bytes,
+        dictionaryEntries: str[]): boundaryPayload =
+    var directory = boundaryWalkDirectory(canonical)
+    if !directory.ok || directory.sections.len != 2 ||
+       !boundaryDigestsMatch(canonical, directory):
+        return boundaryPayloadFail(
+            "boundary_canonical_directory_invalid")
+    var dictionary = boundaryBuildLegacyDictionary(dictionaryEntries)
+    if !dictionary.ok:
+        return dictionary
+    var facts = boundaryBuildLegacyFacts(
+        canonical, directory.sections[1], dictionaryEntries.len)
+    if !facts.ok:
+        rawbytes.BytesFree(dictionary.bytes)
+        return facts
+    let oldDictionaryLength = directory.sections[0].payloadLength
+    let oldFactLength = directory.sections[1].payloadLength
+    let dictionaryDelta =
+        rawbytes.BytesLen(dictionary.bytes) - oldDictionaryLength
+    let factDelta = rawbytes.BytesLen(facts.bytes) - oldFactLength
+    if dictionaryDelta != 4:
+        rawbytes.BytesFree(dictionary.bytes)
+        rawbytes.BytesFree(facts.bytes)
+        return boundaryPayloadFail(
+            "boundary_legacy_dictionary_size_invalid")
+    let prefixLength = BoundaryHeaderSize + directory.directorySize
+    let dictionaryLength = rawbytes.BytesLen(dictionary.bytes)
+    let factLength = rawbytes.BytesLen(facts.bytes)
+    if dictionaryLength > 2147483647 - directory.directorySize:
+        rawbytes.BytesFree(dictionary.bytes)
+        rawbytes.BytesFree(facts.bytes)
+        return boundaryPayloadFail(
+            "boundary_legacy_fact_offset_overflow")
+    let newFactOffset = directory.directorySize + dictionaryLength
+    if factLength > 2147483647 - newFactOffset:
+        rawbytes.BytesFree(dictionary.bytes)
+        rawbytes.BytesFree(facts.bytes)
+        return boundaryPayloadFail(
+            "boundary_legacy_body_size_overflow")
+    let newBodySize = newFactOffset + factLength
+    if newBodySize > 2147483647 - BoundaryHeaderSize:
+        rawbytes.BytesFree(dictionary.bytes)
+        rawbytes.BytesFree(facts.bytes)
+        return boundaryPayloadFail(
+            "boundary_legacy_object_size_overflow")
+    let newTotalLength = BoundaryHeaderSize + newBodySize
+    if newTotalLength - rawbytes.BytesLen(canonical) !=
+       dictionaryDelta + factDelta:
+        rawbytes.BytesFree(dictionary.bytes)
+        rawbytes.BytesFree(facts.bytes)
+        return boundaryPayloadFail(
+            "boundary_legacy_size_delta_invalid")
+    var legacy = rawbytes.BytesAlloc(newTotalLength)
+    rawbytes.BytesCopyRangeInto(
+        legacy, 0, canonical, 0, prefixLength)
+    boundaryWriteU32(legacy, 16, newBodySize)
+    let dictionaryStart = BoundaryHeaderSize +
+        directory.sections[0].payloadOffset
+    rawbytes.BytesCopyRangeInto(
+        legacy,
+        dictionaryStart,
+        dictionary.bytes,
+        0,
+        rawbytes.BytesLen(dictionary.bytes))
+    rawbytes.BytesCopyRangeInto(
+        legacy,
+        BoundaryHeaderSize + newFactOffset,
+        facts.bytes,
+        0,
+        rawbytes.BytesLen(facts.bytes))
+    var dictionarySection: boundarySection
+    dictionarySection.tag = directory.sections[0].tag
+    dictionarySection.kind =
+        strings.CloneStr(directory.sections[0].kind)
+    dictionarySection.payloadOffset =
+        directory.sections[0].payloadOffset
+    dictionarySection.payloadLength =
+        directory.sections[0].payloadLength
+    dictionarySection.itemCount = directory.sections[0].itemCount
+    dictionarySection.offsetFieldOffset =
+        directory.sections[0].offsetFieldOffset
+    dictionarySection.lengthFieldOffset =
+        directory.sections[0].lengthFieldOffset
+    dictionarySection.itemCountFieldOffset =
+        directory.sections[0].itemCountFieldOffset
+    dictionarySection.digestOffset =
+        directory.sections[0].digestOffset
+    dictionarySection.payloadLength = rawbytes.BytesLen(dictionary.bytes)
+    dictionarySection.itemCount = dictionaryEntries.len + 1
+    var factSection: boundarySection
+    factSection.tag = directory.sections[1].tag
+    factSection.kind = strings.CloneStr(directory.sections[1].kind)
+    factSection.payloadOffset = directory.sections[1].payloadOffset
+    factSection.payloadLength = directory.sections[1].payloadLength
+    factSection.itemCount = directory.sections[1].itemCount
+    factSection.offsetFieldOffset =
+        directory.sections[1].offsetFieldOffset
+    factSection.lengthFieldOffset =
+        directory.sections[1].lengthFieldOffset
+    factSection.itemCountFieldOffset =
+        directory.sections[1].itemCountFieldOffset
+    factSection.digestOffset = directory.sections[1].digestOffset
+    factSection.payloadOffset = newFactOffset
+    factSection.payloadLength = rawbytes.BytesLen(facts.bytes)
+    boundaryWriteU32(
+        legacy,
+        dictionarySection.lengthFieldOffset,
+        dictionarySection.payloadLength)
+    boundaryWriteU32(
+        legacy,
+        dictionarySection.itemCountFieldOffset,
+        dictionarySection.itemCount)
+    boundaryWriteU32(
+        legacy,
+        factSection.offsetFieldOffset,
+        factSection.payloadOffset)
+    boundaryWriteU32(
+        legacy,
+        factSection.lengthFieldOffset,
+        factSection.payloadLength)
+    boundaryWriteDigest(
+        legacy,
+        dictionarySection.digestOffset,
+        boundarySectionDigest(legacy, dictionarySection))
+    boundaryWriteDigest(
+        legacy,
+        factSection.digestOffset,
+        boundarySectionDigest(legacy, factSection))
+    rawbytes.BytesFree(dictionary.bytes)
+    rawbytes.BytesFree(facts.bytes)
+
+    let legacyDirectory = csgc.CsgCoreCsgcParseSectionDirectory(legacy)
+    let legacyDictionary = csgc.CsgCoreCsgcDecodeDictionary(legacy)
+    let legacyDecoded = csgc.CsgCoreCsgcDecodeLines(legacy)
+    if !legacyDirectory.ok:
+        let error = strings.ConcatStr(
+            "boundary_legacy_directory_invalid ",
+            legacyDirectory.error)
+        rawbytes.BytesFree(legacy)
+        return boundaryPayloadFail(error)
+    if !legacyDictionary.ok:
+        let error = strings.ConcatStr(
+            "boundary_legacy_dictionary_invalid ",
+            legacyDictionary.error)
+        rawbytes.BytesFree(legacy)
+        return boundaryPayloadFail(error)
+    if legacyDictionary.entries.len <= BoundaryTargetDictionaryIndex ||
+       legacyDictionary.entries[BoundaryTargetDictionaryIndex] !=
+           BoundaryTargetToken:
+        rawbytes.BytesFree(legacy)
+        return boundaryPayloadFail(
+            "boundary_legacy_target_index_invalid")
+    if legacyDecoded.ok:
+        rawbytes.BytesFree(legacy)
+        return boundaryPayloadFail(
+            "boundary_legacy_object_was_canonical")
+    if legacyDecoded.error != "non_canonical_dictionary":
+        let error = strings.ConcatStr(
+            "boundary_legacy_wrong_decode_error ", legacyDecoded.error)
+        rawbytes.BytesFree(legacy)
+        return boundaryPayloadFail(error)
+    var out: boundaryPayload
+    out.ok = true
+    out.bytes = legacy
+    out.replacements = facts.replacements
+    return out
+
+@borrows
+fn boundaryFinalName(objectCid: str): str =
+    if objectCid.len != 71 ||
+       !strings.HasPrefix(objectCid, "sha256:"):
+        return ""
+    let ownedCid = strings.CloneStr(objectCid)
+    return strutils.SliceStr(ownedCid, 7, 70)
+
+@borrows
+fn boundaryPersist(
+        parentPath: str,
+        stagingName: str,
+        finalName: str,
+        expectedCid: str,
+        bytes: var rawbytes.Bytes): bool =
+    let actualCid =
+        merkle_store_codec.CsgCoreMerkleStoreCanonicalCsgcObjectCid(
+            bytes)
+    if actualCid != expectedCid:
+        return false
+    let begun = os.AtomicTreeBegin(parentPath, stagingName, finalName)
+    if IsErr(begun):
+        return false
+    let tree = Value(begun)
+    let written = os.AtomicTreeWriteExclusiveSync(
+        tree, BoundaryRelativePath, bytes)
+    if IsErr(written):
+        let _ = os.AtomicTreeAbort(tree)
+        return false
+    let sealed = os.AtomicTreeSealReadOnly(
+        tree, BoundaryRelativePath)
+    if IsErr(sealed):
+        let _ = os.AtomicTreeAbort(tree)
+        return false
+    let exact = os.AtomicTreeVerifyExact(
+        tree, [], [BoundaryRelativePath])
+    if IsErr(exact):
+        let _ = os.AtomicTreeAbort(tree)
+        return false
+    let committed = os.AtomicTreeCommitNoReplace(tree)
+    if IsErr(committed):
+        let _ = os.AtomicTreeAbort(tree)
+        return false
+    if Value(committed) != os.AtomicTreeCommitted:
+        let _ = os.AtomicTreeAbort(tree)
+        return false
+    return IsOk(os.AtomicTreeClose(tree))
+
+@borrows
+fn boundaryBuildObjects(): boundaryObjects =
+    let lines = boundaryLines()
+    var canonical = csgc.CsgCoreCsgcEncodeCanonicalLines(lines)
+    if !canonical.ok:
+        return boundaryObjectsFail(
+            strings.ConcatStr(
+                "boundary_canonical_encode_failed ", canonical.error))
+    if canonical.factCount !=
+           2 * (BoundaryLongCandidateCount + 1):
+        rawbytes.BytesFree(canonical.bytes)
+        return boundaryObjectsFail(
+            "boundary_canonical_fact_count_failed")
+    let dictionary = csgc.CsgCoreCsgcDecodeDictionary(canonical.bytes)
+    if !dictionary.ok:
+        rawbytes.BytesFree(canonical.bytes)
+        return boundaryObjectsFail("boundary_dictionary_decode_failed")
+    var insertionIndex: int32
+    var targetPresent = false
+    for entryIndex in 0..<dictionary.entries.len:
+        let order = boundaryUtf8Compare(
+            dictionary.entries[entryIndex], BoundaryTargetToken)
+        if order < 0:
+            insertionIndex = insertionIndex + 1
+        elif order == 0:
+            targetPresent = true
+    if targetPresent ||
+       insertionIndex != BoundaryTargetDictionaryIndex ||
+       canonical.dictionaryCount != dictionary.entries.len:
+        rawbytes.BytesFree(canonical.bytes)
+        return boundaryObjectsFail(
+            "boundary_final_sorted_index_selection_failed")
+    var legacy = boundaryBuildLegacyObject(
+        canonical.bytes, dictionary.entries)
+    if !legacy.ok || legacy.replacements != 2:
+        rawbytes.BytesFree(canonical.bytes)
+        return boundaryObjectsFail(legacy.error)
+    var out: boundaryObjects
+    out.ok = true
+    out.canonical = rawbytes.BytesTake(canonical.bytes)
+    out.legacy = rawbytes.BytesTake(legacy.bytes)
+    return out
+
+@borrows
+fn boundaryPrepare(parentPath: str): boundaryPrepared =
+    var objects = boundaryBuildObjects()
+    if !objects.ok:
+        return boundaryPreparedFail(objects.error)
+    let canonicalCid =
+        merkle_store_codec.CsgCoreMerkleStoreCanonicalCsgcObjectCid(
+            objects.canonical)
+    let legacyCid =
+        merkle_store_codec.CsgCoreMerkleStoreCanonicalCsgcObjectCid(
+            objects.legacy)
+    let canonicalFinalName = boundaryFinalName(canonicalCid)
+    let legacyFinalName = boundaryFinalName(legacyCid)
+    if canonicalFinalName.len != 64 || legacyFinalName.len != 64 ||
+       canonicalCid == legacyCid:
+        rawbytes.BytesFree(objects.canonical)
+        rawbytes.BytesFree(objects.legacy)
+        return boundaryPreparedFail("boundary_object_identity_invalid")
+    if !boundaryPersist(
+           parentPath,
+           "staging-boundary-canonical",
+           canonicalFinalName,
+           canonicalCid,
+           objects.canonical) ||
+       !boundaryPersist(
+           parentPath,
+           "staging-boundary-legacy",
+           legacyFinalName,
+           legacyCid,
+           objects.legacy):
+        rawbytes.BytesFree(objects.canonical)
+        rawbytes.BytesFree(objects.legacy)
+        return boundaryPreparedFail("boundary_persist_failed")
+    rawbytes.BytesFree(objects.canonical)
+    rawbytes.BytesFree(objects.legacy)
+    var out: boundaryPrepared
+    out.ok = true
+    out.canonicalCid = canonicalCid
+    out.canonicalFinalName = canonicalFinalName
+    out.legacyCid = legacyCid
+    out.legacyFinalName = legacyFinalName
+    return out
+
+fn CsgCoreCsgcMappedDictionaryBoundaryWriterOnly(): int32 =
+    var objects = boundaryBuildObjects()
+    assert(objects.ok,
+           strings.ConcatStr(
+               "mapped dictionary boundary writer: ", objects.error))
+    assert(rawbytes.BytesLen(objects.canonical) > BoundaryHeaderSize &&
+           rawbytes.BytesLen(objects.legacy) > BoundaryHeaderSize,
+           "mapped dictionary boundary writer: object bytes")
+    rawbytes.BytesFree(objects.canonical)
+    rawbytes.BytesFree(objects.legacy)
+    echo("CSG_CORE_CSGC_DICTIONARY_128_129_WRITER_OK")
+    return 0
+
+fn CsgCoreCsgcMappedDictionaryBoundaryPositive(
+        parentPath: str): int32 =
+    var owner: system.RuntimeAllocationLedgerSessionCapability
+    assert(mapped_reader.CsgCoreCsgcMappedSessionOwnerBegin(
+               mapped_reader.CsgCoreCsgcMappedAllocationBackingLimit,
+               owner),
+           "mapped dictionary boundary: owner begin")
+    var prepared = boundaryPrepare(parentPath)
+    assert(prepared.ok,
+           strings.ConcatStr(
+               "mapped dictionary boundary: prepare ", prepared.error))
+    let canonicalFinalName =
+        strings.CloneStr(prepared.canonicalFinalName)
+    let canonicalCid = strings.CloneStr(prepared.canonicalCid)
+    let opened =
+        mapped_reader.CsgCoreCsgcMappedReaderOpenProductionOwned(
+            owner,
+            parentPath,
+            canonicalFinalName,
+            BoundaryRelativePath,
+            BoundaryHashDomain,
+            canonicalCid)
+    assert(IsOk(opened),
+           "mapped dictionary boundary: canonical object rejected")
+    var reader = Value(opened)
+    let factCount =
+        mapped_reader.CsgCoreCsgcMappedReaderFactCount(reader)
+    assert(IsOk(factCount) &&
+           Value(factCount) ==
+               2 * (BoundaryLongCandidateCount + 1),
+           "mapped dictionary boundary: fact count")
+    assert(IsOk(
+           mapped_reader.CsgCoreCsgcMappedReaderSessionClose(
+               reader, owner)),
+           "mapped dictionary boundary: reader close")
+    prepared.canonicalCid = ""
+    prepared.canonicalFinalName = ""
+    prepared.legacyCid = ""
+    prepared.legacyFinalName = ""
+    prepared.error = ""
+    let closed =
+        mapped_reader.CsgCoreCsgcMappedSessionOwnerClose(owner)
+    assert(closed.ok && closed.receipt.complete && closed.receipt.closed,
+           "mapped dictionary boundary: owner close")
+    echo("CSG_CORE_CSGC_MAPPED_DICTIONARY_128_129_OK")
+    return 0
+
+fn CsgCoreCsgcMappedDictionaryBoundaryLegacyReject(
+        parentPath: str): int32 =
+    var owner: system.RuntimeAllocationLedgerSessionCapability
+    assert(mapped_reader.CsgCoreCsgcMappedSessionOwnerBegin(
+               mapped_reader.CsgCoreCsgcMappedAllocationBackingLimit,
+               owner),
+           "mapped dictionary boundary legacy: owner begin")
+    var prepared = boundaryPrepare(parentPath)
+    assert(prepared.ok,
+           strings.ConcatStr(
+               "mapped dictionary boundary legacy: prepare ",
+               prepared.error))
+    let legacyFinalName = strings.CloneStr(prepared.legacyFinalName)
+    let legacyCid = strings.CloneStr(prepared.legacyCid)
+    let opened =
+        mapped_reader.CsgCoreCsgcMappedReaderOpenProductionOwned(
+            owner,
+            parentPath,
+            legacyFinalName,
+            BoundaryRelativePath,
+            BoundaryHashDomain,
+            legacyCid)
+    if IsErr(opened):
+        return 7
+    echo("CSG_CORE_CSGC_MAPPED_DICTIONARY_128_129_BYPASSED")
+    return 9

@@ -8,7 +8,7 @@ import {accessSync, chmodSync, closeSync, constants, fstatSync, fsyncSync, lstat
 import {tmpdir} from "node:os";
 import {isAbsolute, join, resolve} from "node:path";
 import {b as defineModuleInitializer} from "./runtime.ts";
-import {createChengTextTool,jsonResult,resolveChengProjectRoot,runChengDriver,takeTrailingText,initChengToolkitModule,zodSchema} from "./cheng_toolkit_m9000.ts";
+import {createChengTextTool,jsonResult,resolveChengProjectRoot,runChengDriver,takeTrailingText,mkdtempInRootSrc,initChengToolkitModule,zodSchema} from "./cheng_toolkit_m9000.ts";
 
 var chengExecDiffInputSchema,ChengExecDiffTool;
 
@@ -498,7 +498,7 @@ var initChengExecDiffModule = defineModuleInitializer(() => {
       const timeoutMs = input.timeoutSec ? Math.round(input.timeoutSec * 1000) : undefined;
       const maxBuffer = input.maxOutputBytes || (1 << 30);
       const fixtures = Array.isArray(input.fixture) ? input.fixture : [input.fixture];
-      const tempDir = mkdtempSync(join(tmpdir(), "cheng-exec-diff-"));
+      const tempDir = mkdtempInRootSrc(root);
       try {
         chmodSync(tempDir, 0o700);
         const inputBudget = {used: 0, limit: MAX_TOTAL_INPUT_BYTES};

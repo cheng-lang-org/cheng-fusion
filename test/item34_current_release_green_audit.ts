@@ -3,22 +3,25 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   lstatSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   CHENG_CURRENT_RELEASE_AUDIT_SCHEMA,
   CHENG_CURRENT_RELEASE_MANIFEST_SCHEMA,
   assembleCurrentReleaseManifest,
   auditCurrentReleaseGreen,
+  inspectCurrentReleaseSemanticPublisherArtifacts,
   inspectCurrentReleasePublisherEnvelope,
   pinCurrentExecutionPolicyClosure,
   pinCurrentParserHarnessClosure,
@@ -48,12 +51,19 @@ import {
   CHENG_CURRENT_DRIVER_GENERATION_ENVIRONMENT_SCHEMA,
   CHENG_CURRENT_DRIVER_GENERATION_RECEIPT_SCHEMA,
   CHENG_CURRENT_SEMANTIC_INPUT_SPECS,
+  currentPublishedCandidateReceiptBindingCid,
+  currentReleaseDomainCid,
   currentGenerationExecutionRaw32,
   parseCurrentGenerationEnvironment,
+  validateCurrentPublishedCandidateExecutionReceipt,
+  validateCurrentSourceMembershipFocusedEvidence,
   validateCurrentDriverGenerationReceipt,
   type CurrentGenerationExecution,
 } from "../src/cheng_current_release_evidence_validator.ts";
-import { SEMANTIC_SNAPSHOT_AUDIT_INPUT_SPECS } from "../src/cheng_semantic_snapshot_audit.ts";
+import {
+  SEMANTIC_SNAPSHOT_AUDIT_INPUT_SPECS,
+  semanticSnapshotPublishedCandidateReceiptBindingCid,
+} from "../src/cheng_semantic_snapshot_audit.ts";
 import { canonicalJson } from "../src/cheng_semantic_matrix_m9023.ts";
 import { parseUniqueCurrentJson } from "../src/current_schema_json.ts";
 
@@ -68,12 +78,176 @@ function sealKv(lines: readonly string[], payloadKey: string): string {
     .digest("hex")}\n`;
 }
 
-function writePublisherEnvelopeFixture(root: string): string {
-  const artifacts = [
+function mutateSealedKvField(
+  path: string,
+  key: string,
+  value: string,
+  payloadKey: string,
+): void {
+  const lines = readFileSync(path, "utf8").trimEnd().split("\n");
+  if (lines.at(-1)?.startsWith(`${payloadKey}=`) !== true) {
+    throw new Error("mutation_payload_key_missing");
+  }
+  const payload = lines.slice(0, -1);
+  const index = payload.findIndex((line) => line.startsWith(`${key}=`));
+  if (index < 0 || payload.filter((line) => line.startsWith(`${key}=`)).length !== 1) {
+    throw new Error("mutation_field_count_invalid");
+  }
+  payload[index] = `${key}=${value}`;
+  chmodSync(path, 0o600);
+  writeFileSync(path, sealKv(payload, payloadKey));
+  chmodSync(path, 0o400);
+}
+
+function mutateSealedKvFields(
+  path: string,
+  values: ReadonlyMap<string, string>,
+  payloadKey: string,
+): void {
+  const lines = readFileSync(path, "utf8").trimEnd().split("\n");
+  if (lines.at(-1)?.startsWith(`${payloadKey}=`) !== true) {
+    throw new Error("mutation_payload_key_missing");
+  }
+  const payload = lines.slice(0, -1);
+  for (const [key, value] of values) {
+    const indices = payload
+      .map((line, index) => (line.startsWith(`${key}=`) ? index : -1))
+      .filter((index) => index >= 0);
+    if (indices.length !== 1) {
+      throw new Error(`mutation_field_count_invalid:${key}`);
+    }
+    payload[indices[0]!] = `${key}=${value}`;
+  }
+  chmodSync(path, 0o600);
+  writeFileSync(path, sealKv(payload, payloadKey));
+  chmodSync(path, 0o400);
+}
+
+function mutateManifestFieldAndRebind(
+  root: string,
+  receiptPath: string,
+  key: string,
+): void {
+  const manifestPath = join(root, "artifact-manifest.kv");
+  const current = readFileSync(manifestPath, "utf8")
+    .split("\n")
+    .find((line) => line.startsWith(`${key}=`));
+  if (current === undefined) {
+    throw new Error(`manifest_mutation_field_missing:${key}`);
+  }
+  const value = BigInt(current.slice(key.length + 1)) + 1n;
+  mutateSealedKvField(
+    manifestPath,
+    key,
+    value.toString(),
+    "manifest_payload_sha256",
+  );
+  const stat = lstatSync(manifestPath, { bigint: true });
+  const raw = readFileSync(manifestPath);
+  mutateSealedKvFields(
+    receiptPath,
+    new Map([
+      [
+        "artifact_manifest_sha256",
+        createHash("sha256").update(raw).digest("hex"),
+      ],
+      ["artifact_manifest_device", stat.dev.toString()],
+      ["artifact_manifest_inode", stat.ino.toString()],
+      ["artifact_manifest_size", stat.size.toString()],
+      ["artifact_manifest_mode", stat.mode.toString(8)],
+      ["artifact_manifest_nlink", stat.nlink.toString()],
+      ["artifact_manifest_uid", stat.uid.toString()],
+      ["artifact_manifest_gid", stat.gid.toString()],
+      ["artifact_manifest_mtime_ns", stat.mtimeNs.toString()],
+      ["artifact_manifest_ctime_ns", stat.ctimeNs.toString()],
+    ]),
+    "receipt_payload_sha256",
+  );
+}
+
+function publisherAnchorPath(root: string): string {
+  return join(
+    dirname(root),
+    `.cheng-current-publisher-${Buffer.from(
+      basename(root),
+      "utf8",
+    ).toString("hex")}-control`,
+  );
+}
+
+function removePublisherFixture(root: string): void {
+  rmSync(root, { recursive: true, force: true });
+  rmSync(publisherAnchorPath(root), { recursive: true, force: true });
+}
+
+type PublisherSourceClosureSchema =
+  | "current"
+  | "legacy"
+  | "dual"
+  | "missing";
+
+function writePublisherEnvelopeFixture(
+  root: string,
+  sourceClosureSchema: PublisherSourceClosureSchema = "current",
+  additionalArtifacts: readonly (readonly [string, string])[] = [],
+  sortArtifacts = true,
+): string {
+  const anchorPath = publisherAnchorPath(root);
+  mkdirSync(anchorPath, { mode: 0o700 });
+  const anchorStat = lstatSync(anchorPath, { bigint: true });
+  const runtimeOutputRoot = join(root, "runtime");
+  mkdirSync(runtimeOutputRoot, { mode: 0o700 });
+  const runtimeFormalRaw = sealKv(
+    [
+      "darwin_current_release_runtime_validation=PASS",
+      "driver_role=production",
+      "target=arm64-apple-darwin",
+      `publish_root_fshex=${Buffer.from(root).toString("hex")}`,
+      `runtime_output_root_fshex=${Buffer.from(runtimeOutputRoot).toString("hex")}`,
+      `runtime_validator_sha256=${hash("runtime-formal:validator")}`,
+      `identity_manifest_sha256=${hash("runtime-formal:identity")}`,
+      `formal_inputs_sha256=${hash("runtime-formal:inputs")}`,
+      "published_process_count=1",
+      `process_argv_raw32=${hash("runtime-formal:argv")}`,
+      `process_env_raw32=${hash("runtime-formal:env")}`,
+      `process_guard_raw32=${hash("runtime-formal:guard")}`,
+      `process_physical_sha256=${hash("runtime-formal:physical")}`,
+      `process_logical_sha256=${hash("runtime-formal:logical")}`,
+      `process_path_role_sha256=${hash("runtime-formal:path-role")}`,
+      `process_support_path_role_sha256=${hash("runtime-formal:support-path-role")}`,
+      `primary_receipt_sha256=${hash("runtime-formal:primary")}`,
+      `backend2_receipt_sha256=${hash("runtime-formal:backend2")}`,
+      `exec_diff_receipt_sha256=${hash("runtime-formal:exec-diff")}`,
+      `performance_evidence_sha256=${hash("runtime-formal:performance")}`,
+    ],
+    "receipt_payload_sha256",
+  );
+  const artifacts: (readonly [string, string])[] = [
     ["binding.kv", "binding\n"],
     ["completion-index.kv", "completion\n"],
     ["contract.kv", "contract\n"],
-  ] as const;
+    ["darwin-runtime-formal-validation.kv", runtimeFormalRaw],
+    ...additionalArtifacts,
+  ];
+  if (sortArtifacts) {
+    artifacts.sort((left, right) =>
+      Buffer.compare(Buffer.from(left[0]), Buffer.from(right[0])),
+    );
+  }
+  const directories = new Set<string>(["runtime"]);
+  for (const [name] of artifacts) {
+    let directory = dirname(name);
+    while (directory !== ".") {
+      directories.add(directory);
+      directory = dirname(directory);
+    }
+  }
+  const orderedDirectories = [...directories].sort((left, right) =>
+    Buffer.compare(Buffer.from(left), Buffer.from(right)),
+  );
+  for (const directory of orderedDirectories) {
+    mkdirSync(join(root, directory), { recursive: true });
+  }
   for (const [name, raw] of artifacts) {
     writeFileSync(join(root, name), raw, { flag: "wx", mode: 0o400 });
   }
@@ -82,9 +256,23 @@ function writePublisherEnvelopeFixture(root: string): string {
     "status=PASS",
     "driver_role=production",
     `producer_root_fshex=${Buffer.from(root).toString("hex")}`,
-    "directory_count=0",
-    `artifact_count=${artifacts.length}`,
+    `directory_count=${orderedDirectories.length}`,
   ];
+  for (const [index, name] of orderedDirectories.entries()) {
+    const stat = lstatSync(join(root, name), { bigint: true });
+    manifestLines.push(
+      `directory.${index}.path_fshex=${Buffer.from(name).toString("hex")}`,
+      `directory.${index}.device=${stat.dev}`,
+      `directory.${index}.inode=${stat.ino}`,
+      `directory.${index}.mode=${stat.mode.toString(8)}`,
+      `directory.${index}.nlink=${stat.nlink}`,
+      `directory.${index}.uid=${stat.uid}`,
+      `directory.${index}.gid=${stat.gid}`,
+      `directory.${index}.mtime_ns=${stat.mtimeNs}`,
+      `directory.${index}.ctime_ns=${stat.ctimeNs}`,
+    );
+  }
+  manifestLines.push(`artifact_count=${artifacts.length}`);
   for (const [index, [name]] of artifacts.entries()) {
     const path = join(root, name);
     const stat = lstatSync(path, { bigint: true });
@@ -96,6 +284,9 @@ function writePublisherEnvelopeFixture(root: string): string {
       `artifact.${index}.inode=${stat.ino}`,
       `artifact.${index}.size=${stat.size}`,
       `artifact.${index}.mode=${stat.mode.toString(8)}`,
+      `artifact.${index}.nlink=${stat.nlink}`,
+      `artifact.${index}.uid=${stat.uid}`,
+      `artifact.${index}.gid=${stat.gid}`,
       `artifact.${index}.mtime_ns=${stat.mtimeNs}`,
       `artifact.${index}.ctime_ns=${stat.ctimeNs}`,
     );
@@ -108,8 +299,34 @@ function writePublisherEnvelopeFixture(root: string): string {
   );
   const manifestStat = lstatSync(manifestPath, { bigint: true });
   const manifestRaw = readFileSync(manifestPath);
+  const runtimeFormalPath = join(
+    root,
+    "darwin-runtime-formal-validation.kv",
+  );
+  const runtimeFormalStat = lstatSync(runtimeFormalPath, { bigint: true });
+  const runtimeFormalRaw32 = createHash("sha256")
+    .update(readFileSync(runtimeFormalPath))
+    .digest("hex");
   const artifactRaw32 = (name: string) =>
     createHash("sha256").update(readFileSync(join(root, name))).digest("hex");
+  const sourceClosureRows = [
+    ...(
+      sourceClosureSchema === "current" ||
+      sourceClosureSchema === "dual"
+        ? [`source_closure_cid=${hash("publisher-fixture:source_closure_cid")}`]
+        : []
+    ),
+    ...(
+      sourceClosureSchema === "legacy" ||
+      sourceClosureSchema === "dual"
+        ? [
+            `source_closure_sha256=${hash(
+              "publisher-fixture:source_closure_sha256",
+            )}`,
+          ]
+        : []
+    ),
+  ];
   const receiptLines = [
     "schema=cheng.backend2.current_source_release_publisher_receipt",
     "status=PASS",
@@ -118,21 +335,47 @@ function writePublisherEnvelopeFixture(root: string): string {
     "driver_role=production",
     "release_marker=RELEASE_GREEN",
     `producer_root_fshex=${Buffer.from(root).toString("hex")}`,
+    `publication_anchor_path_fshex=${Buffer.from(anchorPath).toString("hex")}`,
+    "publication_anchor_status=EMPTY_RETAINED",
+    `publication_anchor_device=${anchorStat.dev}`,
+    `publication_anchor_inode=${anchorStat.ino}`,
+    `publication_anchor_mode=${anchorStat.mode.toString(8)}`,
+    `publication_anchor_uid=${anchorStat.uid}`,
+    `publication_anchor_gid=${anchorStat.gid}`,
     `artifact_manifest_path_fshex=${Buffer.from(manifestPath).toString("hex")}`,
     `artifact_manifest_sha256=${createHash("sha256").update(manifestRaw).digest("hex")}`,
     `artifact_manifest_device=${manifestStat.dev}`,
     `artifact_manifest_inode=${manifestStat.ino}`,
     `artifact_manifest_size=${manifestStat.size}`,
     `artifact_manifest_mode=${manifestStat.mode.toString(8)}`,
+    `artifact_manifest_nlink=${manifestStat.nlink}`,
+    `artifact_manifest_uid=${manifestStat.uid}`,
+    `artifact_manifest_gid=${manifestStat.gid}`,
     `artifact_manifest_mtime_ns=${manifestStat.mtimeNs}`,
     `artifact_manifest_ctime_ns=${manifestStat.ctimeNs}`,
+    `darwin_runtime_formal_validation_path_fshex=${Buffer.from(runtimeFormalPath).toString("hex")}`,
+    `darwin_runtime_formal_validation_sha256=${runtimeFormalRaw32}`,
+    `darwin_runtime_formal_validation_device=${runtimeFormalStat.dev}`,
+    `darwin_runtime_formal_validation_inode=${runtimeFormalStat.ino}`,
+    `darwin_runtime_formal_validation_size=${runtimeFormalStat.size}`,
+    `darwin_runtime_formal_validation_mode=${runtimeFormalStat.mode.toString(8)}`,
+    `darwin_runtime_formal_validation_nlink=${runtimeFormalStat.nlink}`,
+    `darwin_runtime_formal_validation_uid=${runtimeFormalStat.uid}`,
+    `darwin_runtime_formal_validation_gid=${runtimeFormalStat.gid}`,
+    `darwin_runtime_formal_validation_mtime_ns=${runtimeFormalStat.mtimeNs}`,
+    `darwin_runtime_formal_validation_ctime_ns=${runtimeFormalStat.ctimeNs}`,
+    "darwin_runtime_formal_process_count=1",
+    `darwin_runtime_formal_physical_sha256=${hash("runtime-formal:physical")}`,
+    `darwin_runtime_formal_logical_sha256=${hash("runtime-formal:logical")}`,
+    `darwin_runtime_formal_path_role_sha256=${hash("runtime-formal:path-role")}`,
+    `darwin_runtime_formal_support_path_role_sha256=${hash("runtime-formal:support-path-role")}`,
     `artifact_count=${artifacts.length}`,
-    "directory_count=0",
+    `directory_count=${orderedDirectories.length}`,
     `contract_sha256=${artifactRaw32("contract.kv")}`,
     `binding_sha256=${artifactRaw32("binding.kv")}`,
     `completion_index_sha256=${artifactRaw32("completion-index.kv")}`,
+    ...sourceClosureRows,
     ...[
-      "source_closure_sha256",
       "performance_source_sha256",
       "official_driver_sha256",
       "seven_stage_execution_raw32",
@@ -155,6 +398,19 @@ function writePublisherEnvelopeFixture(root: string): string {
   );
   return receiptPath;
 }
+
+const SEMANTIC_PUBLISHER_ARTIFACTS = Object.freeze([
+  ["semantic-snapshot-audit.json", "semantic audit\n"],
+  ["semantic-snapshot-bitmap-receipt.json", "semantic bitmap\n"],
+  ["published-candidate.stdout.txt", "published stdout\n"],
+  ["source-membership-focused.stdout.txt", "membership focused stdout\n"],
+  ["published-source-closure.bin", "source closure\n"],
+  ["published-candidate.o", "object\n"],
+  ["published-binding.bin", "binding raw\n"],
+  ["published-query-projection.bin", "query projection\n"],
+  ["published-open-document-universe.bin", "open document universe\n"],
+  ["published-snapshot.bin", "snapshot\n"],
+] as const);
 
 const CURRENT_BINDING_PATH = "/tmp/current-official-binding.kv";
 const CURRENT_PRIVATE_SOURCE_MANIFEST =
@@ -201,6 +457,211 @@ assert.deepEqual(
   CHENG_CURRENT_SEMANTIC_INPUT_SPECS,
   SEMANTIC_SNAPSHOT_AUDIT_INPUT_SPECS.map((row) => [row.path, row.role]),
 );
+const semanticInputAuthority =
+  SEMANTIC_SNAPSHOT_AUDIT_INPUT_SPECS.map(
+    (row) => [row.path, row.role],
+  );
+const missingFormalSpecInput =
+  CHENG_CURRENT_SEMANTIC_INPUT_SPECS.filter(
+    ([path]) => path !== "docs/cheng-formal-spec.md",
+  );
+assert.throws(
+  () => assert.deepEqual(
+    missingFormalSpecInput,
+    semanticInputAuthority,
+  ),
+  /Expected values to be strictly deep-equal/,
+  "删除 formal spec 必须破坏唯一 semantic input authority",
+);
+const wrongFormalSpecRole =
+  CHENG_CURRENT_SEMANTIC_INPUT_SPECS.map(
+    ([path, role]) => path === "docs/cheng-formal-spec.md"
+      ? [path, "core_source"]
+      : [path, role],
+  );
+assert.throws(
+  () => assert.deepEqual(
+    wrongFormalSpecRole,
+    semanticInputAuthority,
+  ),
+  /Expected values to be strictly deep-equal/,
+  "替换 formal spec role 必须破坏唯一 semantic input authority",
+);
+
+const focusedInputSpecs = [
+  ["cheng-package.toml", "project_manifest"],
+  ["src/core/tooling/semantic_snapshot.cheng", "core_source"],
+  ["src/core/tooling/semantic_snapshot_production.cheng", "production_source"],
+  [
+    "src/core/tooling/semantic_snapshot_query_projection.cheng",
+    "query_projection_source",
+  ],
+  [
+    "src/core/tooling/compiler_snapshot_builder.cheng",
+    "snapshot_builder_source",
+  ],
+  [
+    "src/core/tooling/semantic_snapshot_incremental_plan.cheng",
+    "incremental_plan_source",
+  ],
+  ["src/core/tooling/lsp_server.cheng", "lsp_producer_source"],
+  [
+    "src/tests/semantic_snapshot_source_membership_event_smoke.cheng",
+    "source_membership_smoke_source",
+  ],
+  [
+    "src/tests/semantic_snapshot_candidate_job_smoke.cheng",
+    "candidate_job_smoke_source",
+  ],
+  [
+    "src/tests/lsp_multifile_exact_snapshot_acceptance_smoke.cheng",
+    "lsp_multifile_smoke_source",
+  ],
+  [
+    "tools/lsp_candidate_job_scheduler_contract.py",
+    "candidate_scheduler_contract_source",
+  ],
+  ["bootstrap/cheng_cold.c", "cold_compiler_source"],
+  ["tools/beat_c_process_group_guard.sh", "process_tree_guard"],
+  [
+    "tools/semantic_snapshot_source_membership_event_gate.sh",
+    "source_membership_gate_source",
+  ],
+] as const;
+const focusedMutationIds = [
+  "binding_stable_row",
+  "cancelled_completion_receipt_mismatch",
+  "completion_receipt_mismatch",
+  "duplicate_active",
+  "duplicate_add",
+  "duplicate_remove",
+  "late_completion_receipt_mismatch",
+  "lsp_current_event_receipt_publisher",
+  "lsp_current_event_receipt_query",
+  "lsp_duplicate_delete",
+  "lsp_entry_delete",
+  "lsp_stale_rename",
+  "missing_active",
+  "presence_state",
+  "remove_unknown",
+  "rename_peer",
+  "rename_target_present",
+  "reordered_active",
+  "tombstone_inclusion",
+  "wrong_active_cid",
+] as const;
+const focusedInputArtifacts = focusedInputSpecs.map(([relativePath, role]) => {
+  const raw = readFileSync(join(CHENG_CURRENT_ROOT, relativePath));
+  return { relativePath, role, raw };
+});
+const focusedInputLines = focusedInputArtifacts.map((artifact) =>
+  `input role=${artifact.role} path=${artifact.relativePath} ` +
+  `bytes=${artifact.raw.length} sha256=${createHash("sha256")
+    .update(artifact.raw)
+    .digest("hex")}`
+);
+const focusedClosureCid = createHash("sha256")
+  .update(`${focusedInputLines.join("\n")}\n`)
+  .digest("hex");
+const focusedMutationLines = focusedMutationIds.map((id) => {
+  const bytes = `membership_event|case=${id}|authority=current`;
+  return `semantic_snapshot_source_membership_mutation id=${id} ` +
+    `cid=${createHash("sha256").update(bytes).digest("hex")} bytes=${bytes}`;
+});
+const focusedStdoutText = [
+  "semantic_snapshot_source_membership_event_gate_schema=cheng.semantic_snapshot.source_membership_event_gate",
+  "semantic_snapshot_source_membership_event_gate_status=passed",
+  `semantic_snapshot_source_membership_event_gate_mutations=${focusedMutationIds.length}`,
+  `semantic_snapshot_source_membership_event_gate_unique_mutation_cids=${focusedMutationIds.length}`,
+  `semantic_snapshot_source_membership_event_gate_source_closure_cid=${focusedClosureCid}`,
+  `semantic_snapshot_source_membership_event_gate_input_count=${focusedInputSpecs.length}`,
+  ...focusedInputLines,
+  ...focusedMutationLines,
+  "semantic_snapshot_source_membership_event_smoke: ok",
+  "semantic_snapshot_candidate_job_smoke: ok cancelled=1 late=1 duplicate=1",
+  "lsp_source_membership_event_status=pass rename_source_version=4 delete_source_version=5 stable_rows=4 active_rows=2 published=1",
+].join("\n") + "\n";
+const focusedSourceSetCid = hash("focused-source-set");
+assert.match(
+  validateCurrentSourceMembershipFocusedEvidence(
+    Buffer.from(focusedStdoutText),
+    focusedInputArtifacts,
+    focusedSourceSetCid,
+  ),
+  /^[0-9a-f]{64}$/,
+);
+for (const [label, mutated, expected] of [
+  [
+    "role",
+    focusedStdoutText.replace(
+      "role=incremental_plan_source",
+      "role=production_source",
+    ),
+    /input_5_drift/,
+  ],
+  [
+    "closure",
+    focusedStdoutText.replace(focusedClosureCid, hash("wrong-closure")),
+    /closure_cid_drift/,
+  ],
+  [
+    "mutation-bytes",
+    focusedStdoutText.replace(
+      "case=lsp_current_event_receipt_query|authority=current",
+      "case=lsp_current_event_receipt_query|authority=stale",
+    ),
+    /mutation_8_invalid/,
+  ],
+  [
+    "mutation-id",
+    focusedStdoutText.replace(
+      "id=lsp_current_event_receipt_publisher",
+      "id=lsp_current_event_receipt_query",
+    ),
+    /mutation_7_invalid/,
+  ],
+  [
+    "terminal",
+    focusedStdoutText.replace(
+      "delete_source_version=5",
+      "delete_source_version=6",
+    ),
+    /lsp_terminal_invalid/,
+  ],
+] as const) {
+  assert.throws(
+    () => validateCurrentSourceMembershipFocusedEvidence(
+      Buffer.from(mutated),
+      focusedInputArtifacts,
+      focusedSourceSetCid,
+    ),
+    expected,
+    label,
+  );
+}
+const mutatedFocusedInputs = focusedInputArtifacts.map((artifact, index) =>
+  index === 5
+    ? { ...artifact, raw: Buffer.concat([artifact.raw, Buffer.from("\n")]) }
+    : artifact
+);
+assert.throws(
+  () => validateCurrentSourceMembershipFocusedEvidence(
+    Buffer.from(focusedStdoutText),
+    mutatedFocusedInputs,
+    focusedSourceSetCid,
+  ),
+  /input_5_drift/,
+);
+assert.equal(
+  readFileSync(
+    join(
+      CHENG_CURRENT_ROOT,
+      "src/core/tooling/semantic_snapshot_production.cheng",
+    ),
+    "utf8",
+  ).includes("fn SemanticSnapshotProductionJobCompletionAdmitInto("),
+  false,
+);
 
 const publisherFixtureRoot = realpathSync.native(
   mkdtempSync(join(tmpdir(), "cheng-current-release-publisher-envelope-")),
@@ -209,13 +670,33 @@ try {
   const receiptPath = writePublisherEnvelopeFixture(publisherFixtureRoot);
   const envelope = inspectCurrentReleasePublisherEnvelope(receiptPath);
   assert.equal(envelope.producerRoot, publisherFixtureRoot);
-  assert.equal(envelope.artifacts.length, 3);
+  assert.equal(envelope.artifacts.length, 4);
+  assert.equal(
+    envelope.runtimeFormalPhysicalRaw32,
+    hash("runtime-formal:physical"),
+  );
+  assert.equal(
+    envelope.runtimeFormalLogicalRaw32,
+    hash("runtime-formal:logical"),
+  );
+  assert.equal(
+    envelope.runtimeFormalPathRoleRaw32,
+    hash("runtime-formal:path-role"),
+  );
+  assert.equal(
+    envelope.runtimeFormalSupportPathRoleRaw32,
+    hash("runtime-formal:support-path-role"),
+  );
   assert.deepEqual(
     envelope.artifacts.map((artifact) => artifact.path),
     [
       join(publisherFixtureRoot, "binding.kv"),
       join(publisherFixtureRoot, "completion-index.kv"),
       join(publisherFixtureRoot, "contract.kv"),
+      join(
+        publisherFixtureRoot,
+        "darwin-runtime-formal-validation.kv",
+      ),
     ],
   );
   await assert.rejects(
@@ -228,6 +709,37 @@ try {
     }),
     /current_release_publisher_validator_red/,
   );
+  const anchorPath = publisherAnchorPath(publisherFixtureRoot);
+  chmodSync(anchorPath, 0o755);
+  assert.throws(
+    () => inspectCurrentReleasePublisherEnvelope(receiptPath),
+    /publisher_anchor_identity_invalid/,
+  );
+  chmodSync(anchorPath, 0o700);
+  writeFileSync(join(anchorPath, "foreign"), "foreign\n", {
+    flag: "wx",
+    mode: 0o400,
+  });
+  assert.throws(
+    () => inspectCurrentReleasePublisherEnvelope(receiptPath),
+    /publisher_anchor_identity_invalid/,
+  );
+  rmSync(join(anchorPath, "foreign"));
+  const savedAnchor = `${anchorPath}.saved`;
+  renameSync(anchorPath, savedAnchor);
+  mkdirSync(anchorPath, { mode: 0o700 });
+  assert.throws(
+    () => inspectCurrentReleasePublisherEnvelope(receiptPath),
+    /publisher_anchor_identity_invalid/,
+  );
+  rmSync(anchorPath, { recursive: true, force: true });
+  renameSync(savedAnchor, anchorPath);
+  chmodSync(publisherFixtureRoot, 0o755);
+  assert.throws(
+    () => inspectCurrentReleasePublisherEnvelope(receiptPath),
+    /publisher_root_invalid/,
+  );
+  chmodSync(publisherFixtureRoot, 0o700);
   writeFileSync(join(publisherFixtureRoot, "unmanifested.bin"), "drift\n", {
     flag: "wx",
     mode: 0o400,
@@ -237,7 +749,211 @@ try {
     /publisher_tree_manifest_drift/,
   );
 } finally {
-  rmSync(publisherFixtureRoot, { recursive: true, force: true });
+  removePublisherFixture(publisherFixtureRoot);
+}
+
+const semanticPublisherRoot = realpathSync.native(
+  mkdtempSync(join(tmpdir(), "cheng-current-release-semantic-publisher-")),
+);
+try {
+  const receiptPath = writePublisherEnvelopeFixture(
+    semanticPublisherRoot,
+    "current",
+    SEMANTIC_PUBLISHER_ARTIFACTS,
+  );
+  const artifacts =
+    inspectCurrentReleaseSemanticPublisherArtifacts(receiptPath);
+  assert.deepEqual(
+    artifacts.map((artifact) => artifact.role),
+    [
+      "semanticSnapshotAudit",
+      "semanticSnapshotBitmapReceipt",
+      "semanticPublishedStdout",
+      "semanticSourceMembershipFocusedStdout",
+      "semanticSourceClosure",
+      "semanticPublishedObject",
+      "semanticBinding",
+      "semanticQueryProjection",
+      "semanticOpenDocumentUniverse",
+      "semanticSnapshotArtifact",
+    ],
+  );
+  assert.deepEqual(
+    artifacts.map((artifact) => artifact.path),
+    SEMANTIC_PUBLISHER_ARTIFACTS.map(([name]) =>
+      join(semanticPublisherRoot, name),
+    ),
+  );
+  for (const artifact of artifacts) {
+    assert.equal(
+      artifact.bytesRaw32,
+      createHash("sha256").update(readFileSync(artifact.path)).digest("hex"),
+    );
+  }
+} finally {
+  removePublisherFixture(semanticPublisherRoot);
+}
+
+for (const [name, additionalArtifacts, expected] of [
+  [
+    "missing",
+    SEMANTIC_PUBLISHER_ARTIFACTS.slice(0, -1),
+    /artifact_role_count_invalid:published-snapshot\.bin:0/,
+  ],
+  [
+    "nested",
+    SEMANTIC_PUBLISHER_ARTIFACTS.map(([path, raw]) =>
+      path === "published-snapshot.bin"
+        ? ([`nested/${path}`, raw] as const)
+        : ([path, raw] as const),
+    ),
+    /artifact_role_path_invalid:published-snapshot\.bin/,
+  ],
+  [
+    "duplicate-basename",
+    [
+      ...SEMANTIC_PUBLISHER_ARTIFACTS,
+      ["nested/published-snapshot.bin", "duplicate snapshot\n"] as const,
+    ],
+    /artifact_role_count_invalid:published-snapshot\.bin:2/,
+  ],
+  [
+    "empty",
+    SEMANTIC_PUBLISHER_ARTIFACTS.map(([path, raw]) =>
+      path === "published-snapshot.bin"
+        ? ([path, ""] as const)
+        : ([path, raw] as const),
+    ),
+    /publisher_artifact_.*_raw32_invalid/,
+  ],
+] as const) {
+  const root = realpathSync.native(
+    mkdtempSync(join(tmpdir(), `cheng-current-release-semantic-${name}-`)),
+  );
+  try {
+    const receiptPath = writePublisherEnvelopeFixture(
+      root,
+      "current",
+      additionalArtifacts,
+    );
+    assert.throws(
+      () => inspectCurrentReleaseSemanticPublisherArtifacts(receiptPath),
+      expected,
+      name,
+    );
+  } finally {
+    removePublisherFixture(root);
+  }
+}
+
+const semanticOrderRoot = realpathSync.native(
+  mkdtempSync(join(tmpdir(), "cheng-current-release-semantic-order-")),
+);
+try {
+  const receiptPath = writePublisherEnvelopeFixture(
+    semanticOrderRoot,
+    "current",
+    [...SEMANTIC_PUBLISHER_ARTIFACTS].reverse(),
+    false,
+  );
+  assert.throws(
+    () => inspectCurrentReleaseSemanticPublisherArtifacts(receiptPath),
+    /publisher_artifact_order_invalid/,
+  );
+} finally {
+  removePublisherFixture(semanticOrderRoot);
+}
+
+const semanticIdentityRoot = realpathSync.native(
+  mkdtempSync(join(tmpdir(), "cheng-current-release-semantic-identity-")),
+);
+try {
+  const receiptPath = writePublisherEnvelopeFixture(
+    semanticIdentityRoot,
+    "current",
+    SEMANTIC_PUBLISHER_ARTIFACTS,
+  );
+  const path = join(semanticIdentityRoot, "published-binding.bin");
+  chmodSync(path, 0o600);
+  writeFileSync(path, "tampered binding\n");
+  assert.throws(
+    () => inspectCurrentReleaseSemanticPublisherArtifacts(receiptPath),
+    /publisher_artifact_.*_identity_drift/,
+  );
+} finally {
+  removePublisherFixture(semanticIdentityRoot);
+}
+
+const semanticNlinkRoot = realpathSync.native(
+  mkdtempSync(join(tmpdir(), "cheng-current-release-semantic-nlink-")),
+);
+try {
+  const receiptPath = writePublisherEnvelopeFixture(
+    semanticNlinkRoot,
+    "current",
+    SEMANTIC_PUBLISHER_ARTIFACTS,
+  );
+  linkSync(
+    join(semanticNlinkRoot, "published-query-projection.bin"),
+    join(semanticNlinkRoot, "unmanifested-hardlink.bin"),
+  );
+  assert.throws(
+    () => inspectCurrentReleaseSemanticPublisherArtifacts(receiptPath),
+    /publisher_artifact_.*_identity_invalid/,
+  );
+} finally {
+  removePublisherFixture(semanticNlinkRoot);
+}
+
+for (const kind of ["symlink", "nonregular"] as const) {
+  const root = realpathSync.native(
+    mkdtempSync(join(tmpdir(), `cheng-current-release-semantic-${kind}-`)),
+  );
+  try {
+    const receiptPath = writePublisherEnvelopeFixture(
+      root,
+      "current",
+      SEMANTIC_PUBLISHER_ARTIFACTS,
+    );
+    const path = join(root, "published-open-document-universe.bin");
+    rmSync(path);
+    if (kind === "symlink") {
+      symlinkSync(join(root, "published-binding.bin"), path);
+    } else {
+      mkdirSync(path);
+    }
+    assert.throws(
+      () => inspectCurrentReleaseSemanticPublisherArtifacts(receiptPath),
+      /publisher_artifact_.*_identity_invalid/,
+      kind,
+    );
+  } finally {
+    removePublisherFixture(root);
+  }
+}
+
+for (const sourceClosureSchema of ["legacy", "dual", "missing"] as const) {
+  const root = realpathSync.native(
+    mkdtempSync(
+      join(
+        tmpdir(),
+        `cheng-current-release-publisher-${sourceClosureSchema}-schema-`,
+      ),
+    ),
+  );
+  try {
+    const receiptPath = writePublisherEnvelopeFixture(
+      root,
+      sourceClosureSchema,
+    );
+    assert.throws(
+      () => inspectCurrentReleasePublisherEnvelope(receiptPath),
+      /current_release_publisher_receipt_keys_invalid/,
+      sourceClosureSchema,
+    );
+  } finally {
+    removePublisherFixture(root);
+  }
 }
 
 const publisherMutationRoot = realpathSync.native(
@@ -253,7 +969,94 @@ try {
     /publisher_artifact_0_identity_drift/,
   );
 } finally {
-  rmSync(publisherMutationRoot, { recursive: true, force: true });
+  removePublisherFixture(publisherMutationRoot);
+}
+
+for (const [receiptKey, runtimeKey] of [
+  [
+    "darwin_runtime_formal_physical_sha256",
+    "physical",
+  ],
+  [
+    "darwin_runtime_formal_logical_sha256",
+    "logical",
+  ],
+  [
+    "darwin_runtime_formal_path_role_sha256",
+    "path-role",
+  ],
+  [
+    "darwin_runtime_formal_support_path_role_sha256",
+    "support-path-role",
+  ],
+] as const) {
+  const root = realpathSync.native(
+    mkdtempSync(
+      join(
+        tmpdir(),
+        `cheng-current-release-runtime-${runtimeKey}-mutation-`,
+      ),
+    ),
+  );
+  try {
+    const receiptPath = writePublisherEnvelopeFixture(root);
+    mutateSealedKvField(
+      receiptPath,
+      receiptKey,
+      hash(`runtime-formal:${runtimeKey}:mutated`),
+      "receipt_payload_sha256",
+    );
+    assert.throws(
+      () => inspectCurrentReleasePublisherEnvelope(receiptPath),
+      /current_release_runtime_formal_authority_drift/,
+      runtimeKey,
+    );
+  } finally {
+    removePublisherFixture(root);
+  }
+}
+
+for (const [field, expected] of [
+  [
+    "directory.0.uid",
+    /current_release_publisher_directory_0_identity_drift/,
+  ],
+  [
+    "directory.0.gid",
+    /current_release_publisher_directory_0_identity_drift/,
+  ],
+  [
+    "artifact.0.nlink",
+    /current_release_publisher_artifact_0_identity_drift/,
+  ],
+  [
+    "artifact.0.uid",
+    /current_release_publisher_artifact_0_identity_drift/,
+  ],
+  [
+    "artifact.0.gid",
+    /current_release_publisher_artifact_0_identity_drift/,
+  ],
+] as const) {
+  const root = realpathSync.native(
+    mkdtempSync(
+      join(
+        tmpdir(),
+        `cheng-current-release-identity-${field.replaceAll(".", "-")}-`,
+      ),
+    ),
+  );
+  try {
+    const receiptPath = writePublisherEnvelopeFixture(root);
+    mutateManifestFieldAndRebind(root, receiptPath, field);
+    assert.throws(
+      () => inspectCurrentReleasePublisherEnvelope(receiptPath),
+      expected,
+      field,
+    );
+  } finally {
+    removePublisherFixture(root);
+  }
 }
 
 const identity = {
@@ -390,6 +1193,9 @@ const manifest = seal(
       "/release/semantic-snapshot-bitmap-receipt.json",
     ),
     semanticPublishedStdout: pin("/release/published-candidate.stdout.txt"),
+    semanticSourceMembershipFocusedStdout: pin(
+      "/release/source-membership-focused.stdout.txt",
+    ),
     semanticSourceClosure: pin("/release/published-source-closure.bin"),
     semanticPublishedObject: pin("/release/published-candidate.o"),
     semanticBinding: pin("/release/published-binding.bin"),
@@ -421,6 +1227,15 @@ const manifest = seal(
       "/release/fresh-mcp-type-arena-execution.json",
     ),
     tools: toolRows,
+    publisherReceiptRaw32: hash("publisher-receipt"),
+    publisherManifestRaw32: hash("publisher-manifest"),
+    runtimeFormalValidationRaw32: hash("runtime-formal-validation"),
+    runtimeFormalPhysicalRaw32: hash("runtime-formal-physical"),
+    runtimeFormalLogicalRaw32: hash("runtime-formal-logical"),
+    runtimeFormalPathRoleRaw32: hash("runtime-formal-path-role"),
+    runtimeFormalSupportPathRoleRaw32: hash(
+      "runtime-formal-support-path-role",
+    ),
     releaseIdentityRaw32: hash("release-identity"),
     manifestRaw32: "",
   },
@@ -857,17 +1672,49 @@ try {
   );
   const runtimePath = realpathSync.native(process.execPath);
   const runtimePin = existingHarnessPin(runtimePath);
-  const artifact = (name: string) => {
+  const artifact = (name: string, contents = `${name}\n`) => {
     const path = join(harnessRoot, name);
-    writeFileSync(path, `${name}\n`);
+    writeFileSync(path, contents);
     const pin = existingHarnessPin(path);
     return { ...pin, inode: lstatSync(path).ino.toString() };
   };
-  const driverA = artifact("driver-a");
-  const driverB = artifact("driver-b");
+  const driverA = artifact("driver-a", "fixed-point-driver\n");
+  const driverB = artifact("driver-b", "fixed-point-driver\n");
   const source = artifact("source.cheng");
   const receiptA = artifact("receipt-a.json");
   const receiptB = artifact("receipt-b.json");
+  const formalSpec = existingHarnessPin(
+    join(CHENG_CURRENT_ROOT, "docs/cheng-formal-spec.md"),
+  );
+  const parserSource = existingHarnessPin(
+    join(CHENG_CURRENT_ROOT, "src/core/lang/parser.cheng"),
+  );
+  const receiptProducer = existingHarnessPin(
+    join(
+      CHENG_CURRENT_ROOT,
+      "src/core/tooling/compiler_parser_receipt.cheng",
+    ),
+  );
+  const driverEntry = existingHarnessPin(
+    join(
+      CHENG_CURRENT_ROOT,
+      "src/core/tooling/backend_driver_dispatch_min.cheng",
+    ),
+  );
+  const bootstrap = existingHarnessPin(
+    join(CHENG_CURRENT_ROOT, "bootstrap/cheng_cold.c"),
+  );
+  const parserNodeMap = existingHarnessPin(
+    join(
+      "/Users/lbcheng/cheng-fusion",
+      "fixtures/semantic/ebnf_parser_node_map.json",
+    ),
+  );
+  const parserNodeMapValue = JSON.parse(
+    readFileSync(parserNodeMap.path, "utf8"),
+  ) as any;
+  const buildCompilerPath = realpathSync.native("/usr/bin/cc");
+  const buildCompilerPin = existingHarnessPin(buildCompilerPath);
   const chengClosureRows = [
     {
       path: "cheng-package.toml",
@@ -885,16 +1732,50 @@ try {
   const harnessManifest = {
     schema: "cheng_parser_production_receipt_harness",
     status: "accepted",
-    formalEbnfSha256: hash("formal-ebnf"),
-    formalSpec: { path: chengPackage.path, sha256: chengPackage.sha256 },
-    parser: { path: chengPackage.path, sha256: chengPackage.sha256 },
-    receiptProducer: {
-      path: chengPackage.path,
-      sha256: chengPackage.sha256,
+    officialCurrentBuild: {
+      bindingPath: join(harnessRoot, "current-official-binding.kv"),
+      bindingSha256: hash("official-binding"),
+      officialBuildReceiptPath: join(
+        harnessRoot,
+        "cheng.current-build-receipt.kv",
+      ),
+      officialBuildReceiptSha256: hash("official-build-receipt"),
+      sourceSnapshotManifestPath: join(
+        harnessRoot,
+        "cheng-source-snapshot.manifest.txt",
+      ),
+      sourceSnapshotManifestSha256: hash("source-snapshot-manifest"),
+      sourceSnapshotRoot: CHENG_CURRENT_ROOT,
+      sourceSnapshotClosureSha256: hash("source-snapshot-closure"),
+      officialDriverPath: driverA.path,
+      officialDriverSha256: driverA.sha256,
     },
-    driverEntry: { path: chengPackage.path, sha256: chengPackage.sha256 },
-    bootstrap: { path: chengPackage.path, sha256: chengPackage.sha256 },
+    formalEbnfSha256: parserNodeMapValue.spec.ebnfSha256,
+    formalSpec: {
+      path: formalSpec.path,
+      sha256: formalSpec.sha256,
+    },
+    parser: {
+      path: parserSource.path,
+      sha256: parserSource.sha256,
+    },
+    receiptProducer: {
+      path: receiptProducer.path,
+      sha256: receiptProducer.sha256,
+    },
+    driverEntry: {
+      path: driverEntry.path,
+      sha256: driverEntry.sha256,
+    },
+    bootstrap: {
+      path: bootstrap.path,
+      sha256: bootstrap.sha256,
+    },
     harness: { path: fusionPackage.path, sha256: fusionPackage.sha256 },
+    parserNodeMap: {
+      path: parserNodeMap.path,
+      sha256: parserNodeMap.sha256,
+    },
     dependencyClosure: {
       fileCount: chengClosureRows.length,
       sha256: createHash("sha256")
@@ -911,8 +1792,8 @@ try {
     },
     buildCompiler: {
       command: "cc",
-      executablePath: runtimePath,
-      executableSha256: runtimePin.sha256,
+      executablePath: buildCompilerPath,
+      executableSha256: buildCompilerPin.sha256,
       versionSha256: hash("compiler-version"),
     },
     compilerProfile: {},
@@ -939,6 +1820,9 @@ try {
         driverRole: "receipt_driver_a",
         driverSha256: driverA.sha256,
         parserTraceRootSha256: hash("trace"),
+        parserBindingSha256: hash("parser-binding"),
+        parserBindingRequiredResultCount: 971,
+        parserBindingHitCount: 1,
       },
       {
         ...receiptB,
@@ -946,10 +1830,17 @@ try {
         driverRole: "receipt_driver_b",
         driverSha256: driverB.sha256,
         parserTraceRootSha256: hash("trace"),
+        parserBindingSha256: hash("parser-binding"),
+        parserBindingRequiredResultCount: 971,
+        parserBindingHitCount: 1,
       },
     ],
   };
-  assert.ok(pinCurrentParserHarnessClosure(harnessManifest).files.length >= 7);
+  assert.throws(
+    () => pinCurrentParserHarnessClosure(harnessManifest),
+    /driver_parse_receipt|json/i,
+    "current release 必须拒绝未经过 current binder 的旧合成 receipt",
+  );
   const mutatedHarness = clone(harnessManifest);
   mutatedHarness.toolClosure.rows[0]!.sha256 = hash("tool-mutation");
   mutatedHarness.toolClosure.sha256 = createHash("sha256")
@@ -963,24 +1854,146 @@ try {
   rmSync(harnessRoot, { recursive: true, force: true });
 }
 
-const publishedCandidateReceipt = {
-  schema: "cheng.semantic_snapshot.published_candidate_receipt",
-  status: "pass",
-  executionBound: true,
+const publishedCandidateAuthority = {
+  sourceSetCid: hash("source-set"),
   sourceVersion: 7,
   documentCount: 3,
   openDocumentCount: 3,
   compilerSha256: hash("compiler"),
+  formalSpecSha256: hash("formal-spec"),
   sourceClosureCid: hash("source-closure"),
   objectSha256: hash("object"),
   bindingReceiptCid: hash("binding"),
   queryProjectionCid: hash("query"),
   openDocumentUniverseCid: hash("open-document-universe"),
+  snapshotPayloadCid: hash("snapshot"),
   stdoutSha256: hash("stdout"),
-  runtimeReceiptCid: hash("runtime"),
   routingReceiptCid: hash("routing"),
-  receiptCid: hash("published"),
 };
+const publishedRuntimeReceiptCid = currentReleaseDomainCid(
+  "cheng.semantic_snapshot.published_candidate_receipt",
+  [
+    publishedCandidateAuthority.sourceSetCid,
+    publishedCandidateAuthority.stdoutSha256,
+    publishedCandidateAuthority.compilerSha256,
+    publishedCandidateAuthority.formalSpecSha256,
+    publishedCandidateAuthority.sourceClosureCid,
+    publishedCandidateAuthority.objectSha256,
+    String(publishedCandidateAuthority.sourceVersion),
+    String(publishedCandidateAuthority.documentCount),
+    String(publishedCandidateAuthority.openDocumentCount),
+    publishedCandidateAuthority.bindingReceiptCid,
+    publishedCandidateAuthority.queryProjectionCid,
+    publishedCandidateAuthority.openDocumentUniverseCid,
+    publishedCandidateAuthority.snapshotPayloadCid,
+  ],
+);
+const publishedCandidateReceipt = {
+  schema: "cheng.semantic_snapshot.published_candidate_receipt",
+  status: "pass",
+  executionBound: true,
+  ...publishedCandidateAuthority,
+  runtimeReceiptCid: publishedRuntimeReceiptCid,
+  receiptCid: currentReleaseDomainCid(
+    "cheng.semantic_snapshot.published_candidate_execution_receipt",
+    [
+      publishedCandidateAuthority.sourceSetCid,
+      publishedRuntimeReceiptCid,
+      publishedCandidateAuthority.routingReceiptCid,
+      String(publishedCandidateAuthority.sourceVersion),
+      String(publishedCandidateAuthority.documentCount),
+      String(publishedCandidateAuthority.openDocumentCount),
+      publishedCandidateAuthority.compilerSha256,
+      publishedCandidateAuthority.formalSpecSha256,
+      publishedCandidateAuthority.sourceClosureCid,
+      publishedCandidateAuthority.objectSha256,
+      publishedCandidateAuthority.bindingReceiptCid,
+      publishedCandidateAuthority.queryProjectionCid,
+      publishedCandidateAuthority.openDocumentUniverseCid,
+      publishedCandidateAuthority.snapshotPayloadCid,
+      publishedCandidateAuthority.stdoutSha256,
+    ],
+  ),
+};
+assert.equal(
+  validateCurrentPublishedCandidateExecutionReceipt(
+    publishedCandidateReceipt,
+    publishedCandidateAuthority,
+  ),
+  publishedCandidateReceipt.receiptCid,
+);
+assert.equal(
+  currentPublishedCandidateReceiptBindingCid(
+    publishedCandidateReceipt.receiptCid),
+  semanticSnapshotPublishedCandidateReceiptBindingCid(
+    publishedCandidateReceipt),
+);
+assert.notEqual(
+  currentPublishedCandidateReceiptBindingCid(
+    publishedCandidateReceipt.receiptCid),
+  publishedCandidateReceipt.receiptCid,
+);
+const publishedCandidateWithoutSourceSet = {...publishedCandidateReceipt};
+delete publishedCandidateWithoutSourceSet.sourceSetCid;
+assert.throws(
+  () => validateCurrentPublishedCandidateExecutionReceipt(
+    publishedCandidateWithoutSourceSet,
+    publishedCandidateAuthority,
+  ),
+  /current_release_published_candidate_keys_invalid/,
+);
+assert.throws(
+  () => validateCurrentPublishedCandidateExecutionReceipt(
+    {
+      ...publishedCandidateReceipt,
+      receiptCid: currentReleaseDomainCid(
+        "cheng.semantic_snapshot.published_candidate_execution_receipt",
+        [
+          publishedCandidateAuthority.sourceSetCid,
+          publishedRuntimeReceiptCid,
+          publishedCandidateAuthority.routingReceiptCid,
+          publishedCandidateAuthority.formalSpecSha256,
+        ],
+      ),
+    },
+    publishedCandidateAuthority,
+  ),
+  /current_release_published_candidate_cid_drift/,
+);
+const changedPublishedPayloadAuthority = {
+  ...publishedCandidateAuthority,
+  snapshotPayloadCid: hash("snapshot-tampered"),
+};
+assert.throws(
+  () => validateCurrentPublishedCandidateExecutionReceipt(
+    {
+      ...publishedCandidateReceipt,
+      snapshotPayloadCid: changedPublishedPayloadAuthority.snapshotPayloadCid,
+      receiptCid: currentReleaseDomainCid(
+        "cheng.semantic_snapshot.published_candidate_execution_receipt",
+        [
+          changedPublishedPayloadAuthority.sourceSetCid,
+          publishedRuntimeReceiptCid,
+          changedPublishedPayloadAuthority.routingReceiptCid,
+          String(changedPublishedPayloadAuthority.sourceVersion),
+          String(changedPublishedPayloadAuthority.documentCount),
+          String(changedPublishedPayloadAuthority.openDocumentCount),
+          changedPublishedPayloadAuthority.compilerSha256,
+          changedPublishedPayloadAuthority.formalSpecSha256,
+          changedPublishedPayloadAuthority.sourceClosureCid,
+          changedPublishedPayloadAuthority.objectSha256,
+          changedPublishedPayloadAuthority.bindingReceiptCid,
+          changedPublishedPayloadAuthority.queryProjectionCid,
+          changedPublishedPayloadAuthority.openDocumentUniverseCid,
+          changedPublishedPayloadAuthority.snapshotPayloadCid,
+          changedPublishedPayloadAuthority.stdoutSha256,
+        ],
+      ),
+    },
+    changedPublishedPayloadAuthority,
+  ),
+  /current_release_published_candidate_cid_drift/,
+);
 const semanticAudit = {
   schema: "cheng.semantic_snapshot.audit",
   status: "pass",
@@ -1032,6 +2045,7 @@ assert.throws(
         inputArtifacts: [],
         sourceSnapshotRows: [],
         publishedStdoutRaw: Buffer.from("fabricated\n"),
+        sourceMembershipFocusedStdoutRaw: Buffer.from("fabricated\n"),
         sourceClosureRaw: Buffer.from("fabricated"),
         publishedObjectRaw: Buffer.from("fabricated"),
         bindingRaw: Buffer.from("fabricated"),
@@ -1108,7 +2122,9 @@ assert.throws(
 assert.equal(current.schema, CHENG_CURRENT_RELEASE_AUDIT_SCHEMA);
 
 console.log(
-  "item34 current RELEASE_GREEN audit: PASS " +
+    "item34 current RELEASE_GREEN audit: PASS " +
     "publisher-envelope/generation/source/driver/tool/harness/policy/raw-target/snapshot/" +
-    "replay/alias/perf mutations hard-red",
+    "replay/alias/perf mutations hard-red semantic_publisher_mutations=9 " +
+    "runtime_authority_mutations=4 publisher_identity_mutations=5 " +
+    "source_membership_focused_mutations=6",
 );

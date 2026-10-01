@@ -1,0 +1,663 @@
+# TURN over TCP server (RFC 5766 section 7).
+#
+# One RFC 5766 allocation per TCP connection (section 2.1: one allocation per
+# 5-tuple; for TURN-over-TCP the 5-tuple is the TCP connection). Each accepted
+# connection is served by its own dedicated thread that owns the allocation's
+# state (relay socket, permissions, channels). Cross-connection relay happens
+# over UDP loopback (peer sockets are UDP, RFC 5766 section 7.2), so there is
+# NO shared mutable allocation table and therefore no Mutex: each connection
+# thread is independent and communicates with peers purely via UDP.
+#
+# The connection thread multiplexes two fds with short-timeout polls:
+#   - clientFd (TCP): incoming TURN requests / ChannelData -> handle + respond
+#   - relayFd  (UDP): incoming peer datagrams -> wrap as Data Indication or
+#     ChannelData and send a framed response back over the TCP connection.
+#
+# Framing (RFC 5766 section 7) is delegated to turn_tcp_transport. The STUN
+# codec, REST/long-term auth and relay-socket open are reused from stage 1
+# (turn_protocol / turn_auth / turn_relay). Every routine is a small
+# single-purpose function to keep BodyIR/CFG small.
+
+import std/rawbytes
+import std/system
+import std/result
+import std/atomic
+import std/thread
+import std/os
+import std/net/transports/tcp_syscall as tcp
+import std/net/transports/udp_syscall as udp
+import std/stun/protocol as stun
+import std/stun/turn_protocol as turn
+import std/stun/turn_auth as auth
+import std/stun/turn_relay as relay
+import std/stun/turn_tcp_transport as tr
+import std/stun/turn_metrics as metrics
+import std/stun/turn_log as tlog
+import std/log as slog
+import std/times
+
+var
+    gTcpLogger: slog.Logger
+    gTcpLogOn: bool
+
+fn TurnTcpServerSetLogger(l: slog.Logger) =
+    gTcpLogger = l
+    gTcpLogOn = true
+
+fn TurnTcpNowSec(): int64 =
+    return times.EpochTimeSeconds()
+
+fn TurnTcpAuthSuccess(clientHost: str, clientPort: int32, user: str) =
+    if relay.TurnMetricsEnabled():
+        metrics.TurnMetricsIncAuthSuccess()
+    if gTcpLogOn:
+        tlog.TurnLogAuthSuccess(gTcpLogger, clientHost, clientPort, user)
+
+fn TurnTcpAuthFail(clientHost: str, clientPort: int32, reason: str) =
+    if relay.TurnMetricsEnabled():
+        metrics.TurnMetricsIncAuthFail()
+    if gTcpLogOn:
+        tlog.TurnLogAuthFail(gTcpLogger, clientHost, clientPort, reason)
+
+const
+    turnTcpRelayBindHost = "127.0.0.1"
+    turnTcpRelayRecvBuf = 1500
+    turnTcpMaxConns = 16
+    turnTcpMaxPerms = 64
+    turnTcpMaxChans = 64
+    turnTcpConnPollMs = 25
+    turnTcpDefaultLifetime = 600
+    turnTcpMaxLifetime = 3600
+
+var
+    turnTcpTxidCounter: int32
+
+type
+    TurnTcpConnCtx = ref object
+        fd: int32
+        stopFlag: atomic.I32
+        realm: Bytes
+        nonce: Bytes
+        secret: Bytes
+        software: Bytes
+
+    TurnTcpServer =
+        listenFd: int32
+        listenHost: str
+        listenPort: int32
+        boundPort: int32
+        family: int32
+        useLenField: bool
+        software: Bytes
+        realm: Bytes
+        nonce: Bytes
+        secret: Bytes
+        stopFlag: atomic.I32
+        connCount: int32
+        connCtxs: TurnTcpConnCtx[turnTcpMaxConns]
+
+    TurnTcpConn =
+        clientFd: int32
+        family: int32
+        useLenField: bool
+        relayFd: int32
+        relayPort: int32
+        relayedIp: Bytes
+        allocated: bool
+        realm: Bytes
+        nonce: Bytes
+        secret: Bytes
+        software: Bytes
+        stopFlag: atomic.I32
+        permCount: int32
+        permPeerHost: str[turnTcpMaxPerms]
+        permPeerPort: int32[turnTcpMaxPerms]
+        chanCount: int32
+        chanNumber: int32[turnTcpMaxChans]
+        chanPeerHost: str[turnTcpMaxChans]
+        chanPeerPort: int32[turnTcpMaxChans]
+
+# --- small shared helpers ---
+
+fn TurnTcpNextTxid(): Bytes =
+    turnTcpTxidCounter = turnTcpTxidCounter + 1
+    let out: Bytes = rawbytes.BytesAlloc(12)
+    var c: int32 = turnTcpTxidCounter
+    var i: int32
+    for i in i..<12:
+        rawbytes.BytesSet(out, i, c & 255)
+        c = c >> 8
+    return out
+
+fn TurnTcpBytesDup(src: Bytes): Bytes =
+    let n: int32 = rawbytes.BytesLen(src)
+    if n <= 0:
+        return rawbytes.EmptyBytes()
+    let out: Bytes = rawbytes.BytesAlloc(n)
+    rawbytes.BytesCopyInto(out, 0, src)
+    return out
+
+fn TurnTcpClampLifetime(req: int32): int32 =
+    if req > 0 && req <= turnTcpMaxLifetime:
+        return req
+    return turnTcpDefaultLifetime
+
+fn TurnTcpHasMessageIntegrity(msg: Bytes): bool =
+    return stun.StunFindAttrOffset(msg, stun.StunAttrMessageIntegrity()) >= 0
+
+fn TurnTcpRespond(conn: var TurnTcpConn, resp: Bytes): int32 =
+    if rawbytes.BytesLen(resp) <= 0:
+        return 0
+    return tr.TurnTcpSendFrame(conn.clientFd, resp)
+
+# --- per-connection state ---
+
+fn TurnTcpConnCtxNew(fd: int32, stopFlag: atomic.I32, realm: Bytes, nonce: Bytes, secret: Bytes, software: Bytes): TurnTcpConnCtx =
+    let ctx = new(TurnTcpConnCtx)
+    ctx.fd = fd
+    ctx.stopFlag = stopFlag
+    # Deep-copy config so each connection thread exclusively owns its Bytes
+    # (no refcount ops on shared immutable Bytes across thread boundaries).
+    ctx.realm = TurnTcpBytesDup(realm)
+    ctx.nonce = TurnTcpBytesDup(nonce)
+    ctx.secret = TurnTcpBytesDup(secret)
+    ctx.software = TurnTcpBytesDup(software)
+    return ctx
+
+fn TurnTcpConnNew(ctx: TurnTcpConnCtx): TurnTcpConn =
+    var c: TurnTcpConn
+    c.clientFd = ctx.fd
+    c.family = 2
+    c.useLenField = os.udpPlatformUseLenFieldBridge() != 0
+    c.relayFd = -1
+    c.relayPort = 0
+    c.relayedIp = rawbytes.EmptyBytes()
+    c.allocated = false
+    c.realm = ctx.realm
+    c.nonce = ctx.nonce
+    c.secret = ctx.secret
+    c.software = ctx.software
+    c.stopFlag = ctx.stopFlag
+    c.permCount = 0
+    c.chanCount = 0
+    return c
+
+fn TurnTcpConnClose(conn: var TurnTcpConn) =
+    if conn.clientFd >= 0:
+        let _ = os.TcpShutdownFd(conn.clientFd, 2)
+        let _ = os.UdpCloseFd(conn.clientFd)
+        conn.clientFd = -1
+    if conn.relayFd >= 0:
+        let _ = os.UdpCloseFd(conn.relayFd)
+        conn.relayFd = -1
+    if conn.allocated:
+        conn.allocated = false
+    if relay.TurnMetricsEnabled():
+        metrics.TurnMetricsDecActiveConn()
+
+# --- permission / channel tables (SoA fixed arrays, per connection) ---
+
+@borrows
+fn TurnTcpPermHas(conn: TurnTcpConn, peerHost: str, peerPort: int32): bool =
+    let n: int32 = conn.permCount
+    var i: int32
+    for i in i..<n:
+        if conn.permPeerHost[i] == peerHost && conn.permPeerPort[i] == peerPort:
+            return true
+    return false
+
+fn TurnTcpPermAdd(conn: var TurnTcpConn, peerHost: str, peerPort: int32) =
+    if TurnTcpPermHas(conn, peerHost, peerPort):
+        return
+    if conn.permCount >= turnTcpMaxPerms:
+        return
+    let idx: int32 = conn.permCount
+    conn.permPeerHost[idx] = peerHost
+    conn.permPeerPort[idx] = peerPort
+    conn.permCount = conn.permCount + 1
+
+fn TurnTcpChannelFindPeer(conn: TurnTcpConn, peerHost: str, peerPort: int32, outChannel: var int32): bool =
+    let n: int32 = conn.chanCount
+    var i: int32
+    for i in i..<n:
+        if conn.chanPeerHost[i] == peerHost && conn.chanPeerPort[i] == peerPort:
+            outChannel = conn.chanNumber[i]
+            return true
+    return false
+
+fn TurnTcpChannelLookupPeer(conn: TurnTcpConn, channel: int32, outHost: var str, outPort: var int32): bool =
+    let n: int32 = conn.chanCount
+    var i: int32
+    for i in i..<n:
+        if conn.chanNumber[i] == channel:
+            outHost = conn.chanPeerHost[i]
+            outPort = conn.chanPeerPort[i]
+            return true
+    return false
+
+fn TurnTcpChannelAdd(conn: var TurnTcpConn, channel: int32, peerHost: str, peerPort: int32): int32 =
+    var dummy: int32
+    if TurnTcpChannelFindPeer(conn, peerHost, peerPort, dummy):
+        return 1
+    if conn.chanCount >= turnTcpMaxChans:
+        return 2
+    let idx: int32 = conn.chanCount
+    conn.chanNumber[idx] = channel
+    conn.chanPeerHost[idx] = peerHost
+    conn.chanPeerPort[idx] = peerPort
+    conn.chanCount = conn.chanCount + 1
+    return 0
+
+# --- relay forwarding (client -> peer over UDP) ---
+
+# Build the peer sockaddr locally and sendto in the same scope (cheng ORC:
+# passing a UdpSockAddr that holds a Bytes field across a function boundary
+# can free the addr early; local build + local use is the proven pattern).
+fn TurnTcpSendToPeer(conn: TurnTcpConn, peerHost: str, peerPort: int32, data: Bytes): int32 =
+    if conn.relayFd < 0:
+        return 1
+    var addr: udp.UdpSockAddr
+    let addrRes = udp.UdpSockAddrFromHostPort(peerHost, peerPort, false, conn.family, conn.useLenField, addr)
+    if IsErr(addrRes):
+        return 2
+    let sendRes = udp.UdpSendTo(conn.relayFd, data, addr)
+    if IsErr(sendRes):
+        return 3
+    return 0
+
+# --- auth ---
+
+fn TurnTcpAuthKey(conn: TurnTcpConn, msg: Bytes): Bytes =
+    let username: str = rawbytes.BytesToString(turn.TurnDecodeUsername(msg))
+    let realmStr: str = rawbytes.BytesToString(conn.realm)
+    # stage 4: prefer a per-user long-term key from the userdb when loaded
+    if relay.TurnUserDbIsLoaded():
+        let ltKey: Bytes = relay.TurnLookupLongTermKey(username, realmStr)
+        if rawbytes.BytesLen(ltKey) > 0:
+            return ltKey
+    return auth.TurnRestLongTermKey(username, realmStr, conn.secret)
+
+# Fresh nonce for a 401 challenge (time-stamped HMAC when hardening is on).
+fn TurnTcpFreshNonce(conn: TurnTcpConn): Bytes =
+    let nowSec: int64 = TurnTcpNowSec()
+    return relay.TurnServerFreshNonce(conn.nonce, nowSec)
+
+# Validate the request nonce when hardening is on. Returns 0 ok; otherwise fills
+# `out` with a 438 Stale Nonce error and returns 1. No-op when hardening is off.
+fn TurnTcpNonceOk(conn: TurnTcpConn, msgType: int32, msg: Bytes, txid: Bytes, out: var Bytes): int32 =
+    let nowSec: int64 = TurnTcpNowSec()
+    let n: Bytes = turn.TurnDecodeNonce(msg)
+    let v: int32 = relay.TurnServerValidateNonce(n, nowSec)
+    if v != 0:
+        out = turn.TurnEncodeErrorResponse(msgType, txid, 438, "Stale Nonce", rawbytes.EmptyBytes(), conn.software)
+        return 1
+    return 0
+
+# --- request handlers ---
+
+fn TurnTcpHandleAllocate(conn: var TurnTcpConn, msg: Bytes, out: var Bytes): int32 =
+    let txid: Bytes = turn.TurnMessageTxid(msg)
+    if !TurnTcpHasMessageIntegrity(msg):
+        let n: Bytes = TurnTcpFreshNonce(conn)
+        out = turn.TurnEncodeAllocate401(txid, conn.realm, n, conn.software, rawbytes.EmptyBytes())
+        return 0
+    if TurnTcpNonceOk(conn, turn.TurnAllocateErrorType(), msg, txid, out) != 0:
+        return 0
+    let key: Bytes = TurnTcpAuthKey(conn, msg)
+    if !auth.TurnVerifyMessageIntegrity(msg, key):
+        TurnTcpAuthFail("tcp-client", conn.clientFd, "bad message-integrity")
+        let n: Bytes = TurnTcpFreshNonce(conn)
+        out = turn.TurnEncodeAllocate401(txid, conn.realm, n, conn.software, rawbytes.EmptyBytes())
+        return 0
+    let user: str = rawbytes.BytesToString(turn.TurnDecodeUsername(msg))
+    TurnTcpAuthSuccess("tcp-client", conn.clientFd, user)
+    let proto: int32 = turn.TurnDecodeRequestedTransport(msg)
+    if proto != turn.TurnProtoUdp():
+        out = turn.TurnEncodeErrorResponse(turn.TurnAllocateErrorType(), txid, 442, "Unsupported Transport Protocol", key, conn.software)
+        return 0
+    if conn.allocated:
+        out = turn.TurnEncodeErrorResponse(turn.TurnAllocateErrorType(), txid, 437, "Allocation Mismatch", key, conn.software)
+        return 0
+    var relayFd: int32
+    var relayPort: int32
+    let rc: int32 = relay.TurnRelaySocketOpen(relayFd, relayPort)
+    if rc != 0:
+        out = turn.TurnEncodeErrorResponse(turn.TurnAllocateErrorType(), txid, 508, "Insufficient Capacity", key, conn.software)
+        return 0
+    conn.relayFd = relayFd
+    conn.relayPort = relayPort
+    conn.relayedIp = relay.TurnIpv4FromHost(turnTcpRelayBindHost)
+    conn.allocated = true
+    let lt: int32 = TurnTcpClampLifetime(turn.TurnDecodeLifetime(msg))
+    if gTcpLogOn:
+        tlog.TurnLogAllocCreate(gTcpLogger, "tcp-client", conn.clientFd, relayPort)
+    out = turn.TurnEncodeAllocateResponse(txid, conn.relayedIp, conn.relayPort, lt, rawbytes.EmptyBytes(), false, key, conn.software)
+    return 0
+
+fn TurnTcpHandleCreatePermission(conn: var TurnTcpConn, msg: Bytes, out: var Bytes): int32 =
+    let txid: Bytes = turn.TurnMessageTxid(msg)
+    if !conn.allocated:
+        out = turn.TurnEncodeErrorResponse(turn.TurnCreatePermissionErrorType(), txid, 437, "Allocation Mismatch", rawbytes.EmptyBytes(), conn.software)
+        return 0
+    if TurnTcpNonceOk(conn, turn.TurnCreatePermissionErrorType(), msg, txid, out) != 0:
+        return 0
+    let key: Bytes = TurnTcpAuthKey(conn, msg)
+    if !auth.TurnVerifyMessageIntegrity(msg, key):
+        TurnTcpAuthFail("tcp-client", conn.clientFd, "bad message-integrity")
+        out = turn.TurnEncodeErrorResponse(turn.TurnCreatePermissionErrorType(), txid, 441, "Wrong Credentials", rawbytes.EmptyBytes(), conn.software)
+        return 0
+    let peer: stun.StunXorMappedAddress = turn.TurnDecodeXorPeerAddress(msg, txid)
+    if peer.family == 0:
+        out = turn.TurnEncodeErrorResponse(turn.TurnCreatePermissionErrorType(), txid, 400, "Bad Request", rawbytes.EmptyBytes(), conn.software)
+        return 0
+    let peerHost: str = relay.TurnHostFromIp(peer.ip)
+    TurnTcpPermAdd(conn, peerHost, peer.port)
+    out = turn.TurnEncodeCreatePermissionResponse(txid, key, conn.software)
+    return 0
+
+fn TurnTcpHandleSendIndication(conn: var TurnTcpConn, msg: Bytes): int32 =
+    if !conn.allocated:
+        return 1
+    let txid: Bytes = turn.TurnMessageTxid(msg)
+    let peer: stun.StunXorMappedAddress = turn.TurnDecodeXorPeerAddress(msg, txid)
+    if peer.family == 0:
+        return 2
+    let peerHost: str = relay.TurnHostFromIp(peer.ip)
+    if !TurnTcpPermHas(conn, peerHost, peer.port):
+        return 3
+    let data: Bytes = turn.TurnDecodeData(msg)
+    if rawbytes.BytesLen(data) <= 0:
+        return 4
+    return TurnTcpSendToPeer(conn, peerHost, peer.port, data)
+
+fn TurnTcpHandleChannelBind(conn: var TurnTcpConn, msg: Bytes, out: var Bytes): int32 =
+    let txid: Bytes = turn.TurnMessageTxid(msg)
+    if !conn.allocated:
+        out = turn.TurnEncodeErrorResponse(turn.TurnChannelBindErrorType(), txid, 437, "Allocation Mismatch", rawbytes.EmptyBytes(), conn.software)
+        return 0
+    if TurnTcpNonceOk(conn, turn.TurnChannelBindErrorType(), msg, txid, out) != 0:
+        return 0
+    let key: Bytes = TurnTcpAuthKey(conn, msg)
+    if !auth.TurnVerifyMessageIntegrity(msg, key):
+        TurnTcpAuthFail("tcp-client", conn.clientFd, "bad message-integrity")
+        out = turn.TurnEncodeErrorResponse(turn.TurnChannelBindErrorType(), txid, 441, "Wrong Credentials", rawbytes.EmptyBytes(), conn.software)
+        return 0
+    let channel: int32 = turn.TurnDecodeChannelNumber(msg)
+    if !turn.TurnIsValidChannel(channel):
+        out = turn.TurnEncodeErrorResponse(turn.TurnChannelBindErrorType(), txid, 400, "Bad Request", rawbytes.EmptyBytes(), conn.software)
+        return 0
+    let peer: stun.StunXorMappedAddress = turn.TurnDecodeXorPeerAddress(msg, txid)
+    if peer.family == 0:
+        out = turn.TurnEncodeErrorResponse(turn.TurnChannelBindErrorType(), txid, 400, "Bad Request", rawbytes.EmptyBytes(), conn.software)
+        return 0
+    let peerHost: str = relay.TurnHostFromIp(peer.ip)
+    let rc: int32 = TurnTcpChannelAdd(conn, channel, peerHost, peer.port)
+    if rc != 0:
+        out = turn.TurnEncodeErrorResponse(turn.TurnChannelBindErrorType(), txid, 400, "Bad Request", key, conn.software)
+        return 0
+    TurnTcpPermAdd(conn, peerHost, peer.port)
+    out = turn.TurnEncodeChannelBindResponse(txid, key, conn.software)
+    return 0
+
+fn TurnTcpHandleChannelData(conn: var TurnTcpConn, msg: Bytes): int32 =
+    if !conn.allocated:
+        return 1
+    var channel: int32
+    var data: Bytes
+    let rc: int32 = tr.TurnDecodeChannelData(msg, channel, data)
+    if rc != 0:
+        return 2
+    var peerHost: str
+    var peerPort: int32
+    if !TurnTcpChannelLookupPeer(conn, channel, peerHost, peerPort):
+        return 3
+    return TurnTcpSendToPeer(conn, peerHost, peerPort, data)
+
+fn TurnTcpHandleRefresh(conn: var TurnTcpConn, msg: Bytes, out: var Bytes): int32 =
+    let txid: Bytes = turn.TurnMessageTxid(msg)
+    if !conn.allocated:
+        out = turn.TurnEncodeErrorResponse(turn.TurnRefreshErrorType(), txid, 437, "Allocation Mismatch", rawbytes.EmptyBytes(), conn.software)
+        return 0
+    if TurnTcpNonceOk(conn, turn.TurnRefreshErrorType(), msg, txid, out) != 0:
+        return 0
+    let key: Bytes = TurnTcpAuthKey(conn, msg)
+    if !auth.TurnVerifyMessageIntegrity(msg, key):
+        TurnTcpAuthFail("tcp-client", conn.clientFd, "bad message-integrity")
+        out = turn.TurnEncodeErrorResponse(turn.TurnRefreshErrorType(), txid, 441, "Wrong Credentials", rawbytes.EmptyBytes(), conn.software)
+        return 0
+    let lt: int32 = TurnTcpClampLifetime(turn.TurnDecodeLifetime(msg))
+    if lt <= 0:
+        conn.allocated = false
+        if conn.relayFd >= 0:
+            let _ = os.UdpCloseFd(conn.relayFd)
+            conn.relayFd = -1
+        if gTcpLogOn:
+            tlog.TurnLogAllocDelete(gTcpLogger, "tcp-client", conn.clientFd)
+    else:
+        if gTcpLogOn:
+            tlog.TurnLogAllocRefresh(gTcpLogger, "tcp-client", conn.clientFd, lt)
+    out = turn.TurnEncodeRefreshResponse(txid, lt, key, conn.software)
+    return 0
+
+# --- frame dispatch ---
+
+fn TurnTcpHandleFrame(conn: var TurnTcpConn, frame: Bytes): int32 =
+    if tr.TurnIsChannelData(frame):
+        return TurnTcpHandleChannelData(conn, frame)
+    if turn.TurnIsAllocateRequest(frame):
+        var resp: Bytes
+        let _ = TurnTcpHandleAllocate(conn, frame, resp)
+        return TurnTcpRespond(conn, resp)
+    if turn.TurnIsCreatePermissionRequest(frame):
+        var resp: Bytes
+        let _ = TurnTcpHandleCreatePermission(conn, frame, resp)
+        return TurnTcpRespond(conn, resp)
+    if turn.TurnIsSendIndication(frame):
+        return TurnTcpHandleSendIndication(conn, frame)
+    if turn.TurnIsChannelBindRequest(frame):
+        var resp: Bytes
+        let _ = TurnTcpHandleChannelBind(conn, frame, resp)
+        return TurnTcpRespond(conn, resp)
+    if turn.TurnIsRefreshRequest(frame):
+        var resp: Bytes
+        let _ = TurnTcpHandleRefresh(conn, frame, resp)
+        return TurnTcpRespond(conn, resp)
+    return 3
+
+# --- connection I/O ---
+
+# Drain one TCP recv into the accumulating buffer and handle every complete
+# frame it yields. Returns 0 ok, 1 would-block/no-data, 2 EOF, 3 error.
+fn TurnTcpConnDrainClient(conn: var TurnTcpConn, buf: var Bytes, bufLen: var int32): int32 =
+    var h: tcp.TcpConnectionHandle
+    h.fd = conn.clientFd
+    h.open = true
+    let recvRes = tcp.TcpRecvNonblocking(h, tr.TurnTcpRecvChunk())
+    if IsErr(recvRes):
+        return 1
+    let data: Bytes = Value(recvRes)
+    if rawbytes.BytesLen(data) <= 0:
+        return 2
+    let arc: int32 = tr.TurnTcpFrameAppend(buf, bufLen, data)
+    if arc != 0:
+        return 3
+    while true:
+        var frame: Bytes
+        let ex: int32 = tr.TurnTcpFrameTryExtract(buf, bufLen, frame)
+        if ex != 0:
+            break
+        let _ = TurnTcpHandleFrame(conn, frame)
+    return 0
+
+# Drain one peer UDP datagram from the relay socket and forward it to the
+# client as a Data Indication (or ChannelData if a channel is bound for the
+# peer). Returns 0 ok, 1 no-data/error.
+fn TurnTcpConnDrainRelay(conn: var TurnTcpConn): int32 =
+    if conn.relayFd < 0:
+        return 1
+    var recv: udp.UdpRecvResult
+    let recvRes = udp.UdpRecvFromNonblock(conn.relayFd, turnTcpRelayRecvBuf, recv)
+    if IsErr(recvRes):
+        return 1
+    let data: Bytes = recv.data
+    if rawbytes.BytesLen(data) <= 0:
+        return 1
+    let peerHost: str = recv.fromAddr.host
+    let peerPort: int32 = recv.fromAddr.port
+    let peerIp: Bytes = relay.TurnIpv4FromHost(peerHost)
+    var channel: int32
+    if TurnTcpChannelFindPeer(conn, peerHost, peerPort, channel):
+        let cd: Bytes = tr.TurnEncodeChannelData(channel, data)
+        return tr.TurnTcpSendFrame(conn.clientFd, cd)
+    let txid: Bytes = TurnTcpNextTxid()
+    let ind: Bytes = turn.TurnEncodeDataIndication(txid, peerIp, peerPort, data)
+    return tr.TurnTcpSendFrame(conn.clientFd, ind)
+
+# Connection thread main loop: multiplex clientFd + relayFd via short-timeout
+# polls until the stop flag is raised or the client closes the connection.
+fn TurnTcpConnLoop(conn: var TurnTcpConn): int32 =
+    var recvBuf: Bytes = rawbytes.BytesAlloc(tr.TurnTcpRecvBufCap())
+    var recvLen: int32
+    while atomic.LoadI32(conn.stopFlag) == 0:
+        let rc1: int32 = os.fdWaitReadable(conn.clientFd, turnTcpConnPollMs)
+        if rc1 < 0:
+            break
+        if rc1 > 0:
+            let dr: int32 = TurnTcpConnDrainClient(conn, recvBuf, recvLen)
+            if dr == 2 || dr == 3:
+                break
+        if conn.relayFd >= 0:
+            let rc2: int32 = os.UdpFdWaitReadable(conn.relayFd, turnTcpConnPollMs)
+            if rc2 > 0:
+                let _ = TurnTcpConnDrainRelay(conn)
+    return 0
+
+# Connection thread entry (called via thread.StartPtr). `raw` is the address
+# of the ctx's first field (fd), which is the heap object's data start; cast
+# back to the ref to recover the ctx (same pattern as thread_join_pool_runtime
+# _smoke's CounterCtx handoff).
+fn TurnTcpConnHandler(raw: ptr) =
+    if raw == nil:
+        return
+    let ctx: TurnTcpConnCtx = TurnTcpConnCtx(raw)
+    if ctx == nil:
+        return
+    var conn: TurnTcpConn = TurnTcpConnNew(ctx)
+    let _ = TurnTcpConnLoop(conn)
+    TurnTcpConnClose(conn)
+
+# --- synchronous one-shot (for in-process protocol tests, no thread) ---
+
+# Receive exactly one complete frame into `out` (looping recv+append until a
+# full frame is available or timeout). Returns 0 ok, 1 timeout, 2 EOF, 3 err.
+fn TurnTcpConnRecvOneFrame(conn: var TurnTcpConn, buf: var Bytes, bufLen: var int32, timeoutMs: int32, out: var Bytes): int32 =
+    var tries: int32
+    while tries < 16:
+        tries = tries + 1
+        let ex: int32 = tr.TurnTcpFrameTryExtract(buf, bufLen, out)
+        if ex == 0:
+            return 0
+        if ex == 2:
+            return 3
+        let rc: int32 = os.fdWaitReadable(conn.clientFd, timeoutMs)
+        if rc <= 0:
+            return 1
+        var h: tcp.TcpConnectionHandle
+        h.fd = conn.clientFd
+        h.open = true
+        let recvRes = tcp.TcpRecvNonblocking(h, tr.TurnTcpRecvChunk())
+        if IsErr(recvRes):
+            continue
+        let data: Bytes = Value(recvRes)
+        if rawbytes.BytesLen(data) <= 0:
+            return 2
+        let arc: int32 = tr.TurnTcpFrameAppend(buf, bufLen, data)
+        if arc != 0:
+            return 3
+    return 1
+
+# Receive one framed request, dispatch it, and send the framed response.
+# Used by the synchronous protocol-machine test (no connection thread).
+fn TurnTcpConnProcessOneRequest(conn: var TurnTcpConn, buf: var Bytes, bufLen: var int32, timeoutMs: int32): int32 =
+    var frame: Bytes
+    let rrc: int32 = TurnTcpConnRecvOneFrame(conn, buf, bufLen, timeoutMs, frame)
+    if rrc != 0:
+        return rrc
+    return TurnTcpHandleFrame(conn, frame)
+
+# --- server lifecycle ---
+
+fn TurnTcpServerNew(host: str, port: int32, software: Bytes, realm: Bytes, nonce: Bytes, secret: Bytes): TurnTcpServer =
+    var s: TurnTcpServer
+    s.listenFd = -1
+    s.listenHost = host
+    s.listenPort = port
+    s.boundPort = 0
+    s.family = 2
+    s.useLenField = os.udpPlatformUseLenFieldBridge() != 0
+    s.software = software
+    s.realm = realm
+    s.nonce = nonce
+    s.secret = secret
+    s.stopFlag = atomic.NewI32(0)
+    s.connCount = 0
+    return s
+
+fn TurnTcpServerBind(s: var TurnTcpServer): int32 =
+    var listener: tcp.TcpListenerHandle
+    let res = tcp.TcpListen4Fill(s.listenHost, s.listenPort, listener)
+    if IsErr(res):
+        return 1
+    s.listenFd = listener.fd
+    s.boundPort = listener.addr.port
+    return 0
+
+fn TurnTcpServerBoundPort(s: TurnTcpServer): int32 =
+    return s.boundPort
+
+fn TurnTcpServerAcceptOne(s: var TurnTcpServer): int32 =
+    if s.connCount >= turnTcpMaxConns:
+        return 2
+    var conn: tcp.TcpConnectionHandle
+    let ok: bool = tcp.TcpAcceptFdInto(s.listenFd, conn)
+    if !ok:
+        return 1
+    let fd: int32 = conn.fd
+    let ctx = TurnTcpConnCtxNew(fd, s.stopFlag, s.realm, s.nonce, s.secret, s.software)
+    # Retain ctx in the server's table for the connection thread's startup
+    # window: the thread recovers ctx from `raw` and copies the config into its
+    # own self-contained `conn` (TurnTcpConnNew dups + retains Bytes/stopFlag),
+    # after which ctx is no longer touched. The connCtxs slot is retain-only and
+    # never read back (reading a Thread ref back from a fixed ref array corrupts
+    # its bool fields — a cheng codegen limitation); connection threads are
+    # detached instead of joined to avoid that path entirely.
+    s.connCtxs[s.connCount] = ctx
+    let raw: ptr = &ctx.fd
+    let handle = thread.StartPtr(&TurnTcpConnHandler, raw)
+    if handle == nil:
+        return 3
+    let _ = thread.Detach(handle)
+    s.connCount = s.connCount + 1
+    if relay.TurnMetricsEnabled():
+        metrics.TurnMetricsIncActiveConn()
+    return 0
+
+fn TurnTcpServerStop(s: var TurnTcpServer) =
+    atomic.StoreI32(s.stopFlag, 1)
+
+# Accept loop: poll the listener, spawn a detached connection thread per
+# accepted fd, until the stop flag is raised. Connection threads are detached
+# (they own their allocation + exit on stop flag / client EOF), so there is no
+# per-connection join; the accept thread itself is joined by the caller.
+fn TurnTcpServerRun(s: var TurnTcpServer): int32 =
+    if s.listenFd < 0:
+        let bc: int32 = TurnTcpServerBind(s)
+        if bc != 0:
+            return bc
+    while atomic.LoadI32(s.stopFlag) == 0:
+        let rc: int32 = os.fdWaitReadable(s.listenFd, 100)
+        if rc < 0:
+            return 1
+        if rc > 0:
+            let _ = TurnTcpServerAcceptOne(s)
+    return 0

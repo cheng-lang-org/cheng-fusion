@@ -1,0 +1,864 @@
+#!/usr/bin/env python3
+"""Build immutable native-Linux inputs for the stage2/stage3 gate.
+
+This producer materializes a symlink-free rootfs, enumerates that exact tree,
+then enables fs-verity on the ext4 image before mounting it read-only.  Runtime
+validation can therefore rejoin the immutable kernel authority in constant
+time; the production gate still performs full tree checks at publication
+boundaries.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import platform
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+import beat_c_validate_linux_cgroup_v2_hard_memory_receipt as validator
+
+
+class BuildError(RuntimeError):
+    pass
+
+
+SEALED_DIRECTORY_MODE = 0o555
+SEALED_REGULAR_MODE = 0o444
+SEALED_EXECUTABLE_MODE = 0o555
+ROOTFS_MOUNT_DIRECTORIES = (
+    Path("cheng-hardcap"),
+    Path("cheng-hardcap-control"),
+    Path("cheng-hardcap-work"),
+    Path("cheng-current-source"),
+    Path("cheng-current-source/repo"),
+    Path("cheng-stage23-control"),
+    Path("cheng-stage23-evidence"),
+    Path("cheng-stage23-source"),
+    Path("cheng-stage23-source/repo"),
+    Path("dev"),
+    Path("proc"),
+    Path("tmp"),
+)
+ROOTFS_MOUNT_FILES = (Path("cheng-hardcap/current-driver"),)
+
+
+def fail(message: str) -> NoReturn:
+    raise BuildError(message)
+
+
+def exact_directory(path: Path, label: str) -> Path:
+    if not path.is_absolute() or path.resolve(strict=True) != path:
+        fail(f"{label} is not a canonical absolute directory")
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        fail(f"{label} is not a real directory")
+    return path
+
+
+def exact_file(path: Path, label: str) -> Path:
+    if not path.is_absolute() or path.resolve(strict=True) != path:
+        fail(f"{label} is not a canonical absolute file")
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        fail(f"{label} is not a real regular file")
+    return path
+
+
+def exact_block_device(path: Path, label: str) -> Path:
+    if not path.is_absolute() or path.resolve(strict=True) != path:
+        fail(f"{label} is not a canonical absolute block device")
+    info = path.lstat()
+    if not stat.S_ISBLK(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        fail(f"{label} is not a real block device")
+    return path
+
+
+def write_exclusive(path: Path, raw: bytes, mode: int) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, mode)
+    try:
+        offset = 0
+        while offset < len(raw):
+            written = os.write(fd, raw[offset:])
+            if written <= 0:
+                fail("authority output write did not progress")
+            offset += written
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chmod(path, mode)
+
+
+def lexical_link_target(root: Path, link: Path) -> Path:
+    raw = os.readlink(link)
+    if "\x00" in raw:
+        fail("rootfs symlink target contains NUL")
+    target = root / raw.lstrip("/") if raw.startswith("/") else link.parent / raw
+    normalized = Path(os.path.normpath(os.fspath(target)))
+    if normalized != root and root not in normalized.parents:
+        fail(f"rootfs symlink escapes tree: {link}")
+    return normalized
+
+
+def resolved_source(root: Path, source: Path) -> Path | None:
+    if source != root and root not in source.parents:
+        fail("rootfs source path escapes tree")
+    seen: set[Path] = set()
+    current = source
+    while True:
+        if current in seen:
+            fail(f"rootfs symlink cycle: {source}")
+        seen.add(current)
+        relative = current.relative_to(root)
+        prefix = root
+        rewritten: Path | None = None
+        for index, part in enumerate(relative.parts):
+            candidate = prefix / part
+            if candidate.is_symlink():
+                target = lexical_link_target(root, candidate)
+                remaining = relative.parts[index + 1:]
+                rewritten = Path(os.path.normpath(os.fspath(
+                    target.joinpath(*remaining)
+                )))
+                if rewritten != root and root not in rewritten.parents:
+                    fail(f"rootfs symlink expansion escapes tree: {source}")
+                break
+            prefix = candidate
+        if rewritten is None:
+            return current if os.path.lexists(current) else None
+        current = rewritten
+
+
+def copy_regular(source: Path, destination: Path, mode: int) -> None:
+    source_file = validator.stable_read(
+        source, "rootfs source file", 2 * 1024 * 1024 * 1024
+    )
+    write_exclusive(destination, source_file.raw, mode & 0o777)
+    copied = validator.stable_read(
+        destination, "materialized rootfs file", 2 * 1024 * 1024 * 1024
+    )
+    if copied.sha256 != source_file.sha256 or copied.size != source_file.size:
+        fail("materialized rootfs file identity drifted")
+
+
+def materialize_node(
+    root: Path,
+    source: Path,
+    destination: Path,
+    directory_stack: tuple[Path, ...],
+    omitted: list[tuple[str, str]],
+) -> None:
+    resolved = resolved_source(root, source)
+    if resolved is None:
+        target = os.readlink(source) if source.is_symlink() else "<ancestor>"
+        omitted.append((str(source.relative_to(root)), target))
+        return
+    info = resolved.lstat()
+    if stat.S_ISREG(info.st_mode):
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        copy_regular(resolved, destination, stat.S_IMODE(info.st_mode))
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        fail(f"rootfs special file is forbidden: {source}")
+    if resolved in directory_stack:
+        fail(f"rootfs directory-link cycle: {source}")
+    destination.mkdir(mode=stat.S_IMODE(info.st_mode) & 0o777)
+    next_stack = (*directory_stack, resolved)
+    with os.scandir(resolved) as iterator:
+        children = sorted(iterator, key=lambda item: os.fsencode(item.name))
+    for child in children:
+        materialize_node(
+            root,
+            Path(child.path),
+            destination / child.name,
+            next_stack,
+            omitted,
+        )
+    os.chmod(destination, stat.S_IMODE(info.st_mode) & 0o777)
+
+
+def materialize_rootfs(source: Path, output: Path, report: Path) -> None:
+    source = exact_directory(source, "source rootfs")
+    if output.exists() or output.is_symlink():
+        fail("output rootfs already exists")
+    if report.exists() or report.is_symlink():
+        fail("materialization report already exists")
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    output.mkdir(mode=0o755)
+    omitted: list[tuple[str, str]] = []
+    with os.scandir(source) as iterator:
+        children = sorted(iterator, key=lambda item: os.fsencode(item.name))
+    for child in children:
+        materialize_node(
+            source,
+            Path(child.path),
+            output / child.name,
+            (source,),
+            omitted,
+        )
+    observed_symlinks = [path for path in output.rglob("*") if path.is_symlink()]
+    if observed_symlinks:
+        fail("materialized rootfs still contains symlinks")
+    payload = {
+        "schema": "cheng.native_linux_rootfs_materialization",
+        "status": "ready",
+        "sourcePathFshex": os.fsencode(str(source)).hex(),
+        "outputPathFshex": os.fsencode(str(output)).hex(),
+        "omittedBrokenSymlinkCount": len(omitted),
+        "omittedBrokenSymlinks": [
+            {
+                "pathFshex": os.fsencode(path).hex(),
+                "targetFshex": os.fsencode(target).hex(),
+            }
+            for path, target in sorted(omitted)
+        ],
+    }
+    payload_raw = validator.canonical_json(payload)
+    value = dict(payload)
+    value["payloadSha256"] = hashlib.sha256(payload_raw).hexdigest()
+    write_exclusive(report, validator.canonical_json(value) + b"\n", 0o400)
+
+
+def rootfs_entries(rootfs: Path) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    pending = [rootfs]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as iterator:
+            children = sorted(iterator, key=lambda item: os.fsencode(item.name))
+        for child in children:
+            candidate = Path(child.path)
+            relative = candidate.relative_to(rootfs)
+            info = candidate.lstat()
+            common = {
+                "pathFshex": os.fsencode(str(relative)).hex(),
+                "mode": stat.S_IMODE(info.st_mode),
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "linkTargetFshex": "",
+            }
+            if stat.S_ISDIR(info.st_mode):
+                pending.append(candidate)
+                entries.append({
+                    **common,
+                    "kind": "directory",
+                    "size": 0,
+                    "sha256": validator.ZERO_SHA256,
+                })
+            elif stat.S_ISREG(info.st_mode):
+                current = validator.stable_read(
+                    candidate, "rootfs manifest file", 2 * 1024 * 1024 * 1024
+                )
+                entries.append({
+                    **common,
+                    "kind": "file",
+                    "size": current.size,
+                    "sha256": current.sha256,
+                })
+            else:
+                fail(f"rootfs special file is forbidden: {candidate}")
+    entries.sort(key=lambda item: str(item["pathFshex"]))
+    return entries
+
+
+def write_rootfs_manifest(
+    rootfs: Path,
+    crun: Path,
+    output: Path,
+    delegate_uid: int,
+    delegate_gid: int,
+) -> None:
+    rootfs = exact_directory(rootfs, "rootfs")
+    crun = exact_file(crun, "crun")
+    validate_sealed_rootfs(rootfs, delegate_uid, delegate_gid)
+    if output.exists() or output.is_symlink():
+        fail("rootfs manifest already exists")
+    crun_file = validator.stable_read(crun, "crun", 256 * 1024 * 1024)
+    entries = rootfs_entries(rootfs)
+    payload = {
+        "schema": validator.ROOTFS_SCHEMA,
+        "status": "ready",
+        "rootfsPathFshex": os.fsencode(str(rootfs)).hex(),
+        "crunSha256": crun_file.sha256,
+        "treeCid": validator.sha256_bytes(validator.canonical_json(entries)),
+        "entryCount": len(entries),
+        "entries": entries,
+        "delegateUid": delegate_uid,
+        "delegateGid": delegate_gid,
+        "mountAuthority": validator.rootfs_mount_authority(rootfs),
+    }
+    value = dict(payload)
+    value["manifestSha256"] = validator.sha256_bytes(
+        validator.canonical_json(payload)
+    )
+    write_exclusive(output, validator.canonical_json(value) + b"\n", 0o444)
+    os.chown(output, 0, 0)
+    validator.validate_rootfs_manifest(
+        output, rootfs, crun_file.sha256, verify_tree=True
+    )
+
+
+def ensure_rootfs_mount_surface(rootfs: Path) -> None:
+    for relative in ROOTFS_MOUNT_DIRECTORIES:
+        candidate = rootfs / relative
+        if candidate.exists() or candidate.is_symlink():
+            info = candidate.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                fail("rootfs mount directory has the wrong type")
+            continue
+        os.mkdir(candidate, 0o755)
+    for relative in ROOTFS_MOUNT_FILES:
+        candidate = rootfs / relative
+        if candidate.exists() or candidate.is_symlink():
+            current = exact_file(candidate, "rootfs mount file")
+            if current.stat(follow_symlinks=False).st_size != 0:
+                fail("rootfs mount file is not empty")
+            continue
+        write_exclusive(candidate, b"", 0o444)
+
+
+def validate_sealed_rootfs(
+    rootfs: Path,
+    delegate_uid: int,
+    delegate_gid: int,
+) -> None:
+    rootfs = exact_directory(rootfs, "sealed rootfs")
+    pending = [rootfs]
+    while pending:
+        candidate = pending.pop()
+        info = candidate.lstat()
+        if info.st_uid != delegate_uid or info.st_gid != delegate_gid:
+            fail(
+                "sealed rootfs ownership is outside the delegated mapping: "
+                + str(candidate.relative_to(rootfs))
+                + f":{info.st_uid}:{info.st_gid}"
+            )
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISDIR(info.st_mode):
+            if mode != SEALED_DIRECTORY_MODE:
+                fail(
+                    "sealed rootfs directory mode drifted: "
+                    + str(candidate.relative_to(rootfs))
+                    + f":{mode:o}"
+                )
+            with os.scandir(candidate) as iterator:
+                children = sorted(iterator, key=lambda item: os.fsencode(item.name))
+            pending.extend(Path(child.path) for child in children)
+        elif stat.S_ISREG(info.st_mode):
+            if mode not in {SEALED_REGULAR_MODE, SEALED_EXECUTABLE_MODE}:
+                fail("sealed rootfs regular-file mode drifted")
+        else:
+            fail("sealed rootfs contains a symlink or special file")
+
+
+def restrict_rootfs_executables(
+    rootfs: Path,
+    allowed_values: list[str],
+    report: Path,
+    delegate_uid: int,
+    delegate_gid: int,
+) -> None:
+    rootfs = exact_directory(rootfs, "rootfs")
+    if os.geteuid() != 0 or os.getegid() != 0:
+        fail("rootfs sealing requires root")
+    if delegate_uid <= 0 or delegate_gid <= 0:
+        fail("rootfs delegate identity is invalid")
+    if report.exists() or report.is_symlink():
+        fail("executable restriction report already exists")
+    if not allowed_values or len(set(allowed_values)) != len(allowed_values):
+        fail("rootfs executable allowlist is absent or duplicated")
+    ensure_rootfs_mount_surface(rootfs)
+    allowed: dict[Path, str] = {}
+    for value in allowed_values:
+        relative = Path(value)
+        if relative.is_absolute() or "." in relative.parts or ".." in relative.parts:
+            fail("rootfs executable allowlist path is not canonical")
+        candidate = rootfs / relative
+        exact_file(candidate, "allowed rootfs executable")
+        allowed[candidate] = str(relative)
+    changed: list[str] = []
+    changed_owner_count = 0
+    for candidate in sorted(rootfs.rglob("*"), key=lambda item: os.fsencode(str(item))):
+        if candidate.is_symlink():
+            fail("rootfs executable restriction found a symlink")
+        info = candidate.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            fail("rootfs executable restriction found a special file")
+        mode = stat.S_IMODE(info.st_mode)
+        if candidate in allowed:
+            desired = SEALED_EXECUTABLE_MODE
+        else:
+            desired = SEALED_REGULAR_MODE
+        if desired != mode:
+            os.chmod(candidate, desired, follow_symlinks=False)
+            changed.append(str(candidate.relative_to(rootfs)))
+        if info.st_uid != delegate_uid or info.st_gid != delegate_gid:
+            os.chown(
+                candidate,
+                delegate_uid,
+                delegate_gid,
+                follow_symlinks=False,
+            )
+            changed_owner_count += 1
+    directories = [
+        rootfs,
+        *sorted(
+            (path for path in rootfs.rglob("*") if path.is_dir()),
+            key=lambda item: len(item.parts),
+            reverse=True,
+        ),
+    ]
+    for candidate in directories:
+        info = candidate.lstat()
+        if stat.S_IMODE(info.st_mode) != SEALED_DIRECTORY_MODE:
+            os.chmod(candidate, SEALED_DIRECTORY_MODE, follow_symlinks=False)
+            changed.append(str(candidate.relative_to(rootfs)) or ".")
+        if info.st_uid != delegate_uid or info.st_gid != delegate_gid:
+            os.chown(
+                candidate,
+                delegate_uid,
+                delegate_gid,
+                follow_symlinks=False,
+            )
+            changed_owner_count += 1
+    validate_sealed_rootfs(rootfs, delegate_uid, delegate_gid)
+    observed = [
+        str(path.relative_to(rootfs))
+        for path in sorted(rootfs.rglob("*"), key=lambda item: os.fsencode(str(item)))
+        if path.is_file() and stat.S_IMODE(path.lstat().st_mode) & 0o111
+    ]
+    if observed != sorted(allowed.values(), key=os.fsencode):
+        fail("rootfs executable surface does not equal the allowlist")
+    identities = []
+    for relative in observed:
+        current = validator.stable_read(
+            rootfs / relative,
+            "restricted rootfs executable",
+            512 * 1024 * 1024,
+        )
+        identities.append({
+            "pathFshex": os.fsencode(relative).hex(),
+            "sha256": current.sha256,
+            "size": current.size,
+            "mode": current.mode,
+        })
+    payload = {
+        "schema": "cheng.native_linux_rootfs_executable_surface",
+        "status": "ready",
+        "rootfsPathFshex": os.fsencode(str(rootfs)).hex(),
+        "executableCount": len(identities),
+        "executables": identities,
+        "changedModeCount": len(changed),
+        "changedOwnerCount": changed_owner_count,
+        "delegateUid": delegate_uid,
+        "delegateGid": delegate_gid,
+        "sealedDirectoryMode": SEALED_DIRECTORY_MODE,
+        "sealedRegularMode": SEALED_REGULAR_MODE,
+        "sealedExecutableMode": SEALED_EXECUTABLE_MODE,
+        "mountDirectories": [str(value) for value in ROOTFS_MOUNT_DIRECTORIES],
+        "mountFiles": [str(value) for value in ROOTFS_MOUNT_FILES],
+        "changedPathSetSha256": validator.sha256_bytes(
+            validator.canonical_json([
+                os.fsencode(value).hex() for value in changed
+            ])
+        ),
+    }
+    value = dict(payload)
+    value["payloadSha256"] = validator.sha256_bytes(
+        validator.canonical_json(payload)
+    )
+    write_exclusive(report, validator.canonical_json(value) + b"\n", 0o444)
+    os.chown(report, 0, 0)
+
+
+def run_exact_tool(argv: list[str]) -> bytes:
+    completed = subprocess.run(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            "HOME": "/nonexistent",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
+            "TZ": "UTC",
+        },
+        check=False,
+        timeout=900,
+    )
+    if completed.returncode != 0 or completed.stderr:
+        fail(
+            "rootfs authority tool failed: "
+            + completed.stderr.decode("utf-8", "replace")[:2000]
+        )
+    return completed.stdout
+
+
+def build_readonly_ext4_rootfs(
+    source: Path,
+    image: Path,
+    mountpoint: Path,
+    report: Path,
+    image_size_bytes: int,
+    delegate_uid: int,
+    delegate_gid: int,
+) -> None:
+    if platform.system() != "Linux" or os.geteuid() != 0 or os.getegid() != 0:
+        fail("read-only ext4 rootfs construction requires Linux root")
+    source = exact_directory(source, "sealed source rootfs")
+    validate_sealed_rootfs(source, delegate_uid, delegate_gid)
+    if image_size_bytes < 1024 * 1024 * 1024 or \
+            image_size_bytes > 8 * 1024 * 1024 * 1024:
+        fail("rootfs image size is outside the bounded contract")
+    for candidate, label in (
+        (image, "rootfs image"),
+        (mountpoint, "rootfs mountpoint"),
+        (report, "rootfs mount report"),
+    ):
+        if candidate.exists() or candidate.is_symlink():
+            fail(f"{label} already exists")
+    tools = {
+        "fsverity": exact_file(Path("/usr/bin/fsverity"), "fsverity"),
+        "mke2fs": exact_file(Path("/usr/sbin/mke2fs"), "mke2fs"),
+        "losetup": exact_file(Path("/usr/sbin/losetup"), "losetup"),
+        "mount": exact_file(Path("/usr/bin/mount"), "mount"),
+        "umount": exact_file(Path("/usr/bin/umount"), "umount"),
+    }
+    image.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    image_fd = os.open(image, flags, 0o600)
+    try:
+        os.ftruncate(image_fd, image_size_bytes)
+        os.fsync(image_fd)
+    finally:
+        os.close(image_fd)
+    loop_device: Path | None = None
+    mounted = False
+    try:
+        run_exact_tool([
+            str(tools["mke2fs"]),
+            "-q",
+            "-F",
+            "-t",
+            "ext4",
+            "-m",
+            "0",
+            "-E",
+            f"root_owner={delegate_uid}:{delegate_gid}",
+            "-O",
+            "^has_journal",
+            "-d",
+            str(source),
+            str(image),
+        ])
+        mountpoint.mkdir(mode=0o555)
+        os.chown(mountpoint, 0, 0)
+        loop_raw = run_exact_tool([
+            str(tools["losetup"]),
+            "--find",
+            "--show",
+            str(image),
+        ])
+        try:
+            loop_value = loop_raw.decode("utf-8", "strict").strip()
+        except UnicodeDecodeError as exc:
+            raise BuildError("loop device output is not UTF-8") from exc
+        loop_device = exact_block_device(
+            Path(loop_value), "writable construction loop device"
+        )
+        run_exact_tool([
+            str(tools["mount"]),
+            "-t",
+            "ext4",
+            "-o",
+            "rw,nosuid,nodev",
+            str(loop_device),
+            str(mountpoint),
+        ])
+        mounted = True
+        lost_found = mountpoint / "lost+found"
+        if (
+            not lost_found.is_dir()
+            or lost_found.is_symlink()
+            or any(lost_found.iterdir())
+        ):
+            fail("ext4 lost+found is not the unique empty construction artifact")
+        lost_found.rmdir()
+        os.chmod(mountpoint, SEALED_DIRECTORY_MODE)
+        os.chown(mountpoint, delegate_uid, delegate_gid)
+        os.sync()
+        run_exact_tool([str(tools["umount"]), str(mountpoint)])
+        mounted = False
+        run_exact_tool([
+            str(tools["losetup"]), "--detach", str(loop_device)
+        ])
+        loop_device = None
+        os.chmod(image, 0o444)
+        os.chown(image, 0, 0)
+        run_exact_tool([
+            str(tools["fsverity"]),
+            "enable",
+            str(image),
+            "--hash-alg=sha256",
+            "--block-size=4096",
+        ])
+        image_fsverity_sha256 = validator.fsverity_sha256(image)
+        loop_raw = run_exact_tool([
+            str(tools["losetup"]),
+            "--find",
+            "--show",
+            "--read-only",
+            str(image),
+        ])
+        try:
+            loop_value = loop_raw.decode("utf-8", "strict").strip()
+        except UnicodeDecodeError as exc:
+            raise BuildError("read-only loop device output is not UTF-8") from exc
+        loop_device = exact_block_device(
+            Path(loop_value), "read-only loop device"
+        )
+        run_exact_tool([
+            str(tools["mount"]),
+            "-t",
+            "ext4",
+            "-o",
+            "ro,nosuid,nodev",
+            str(loop_device),
+            str(mountpoint),
+        ])
+        mounted = True
+        validate_sealed_rootfs(mountpoint, delegate_uid, delegate_gid)
+        mount_authority = validator.rootfs_mount_authority(mountpoint)
+        image_file = validator.stable_read(
+            image, "rootfs ext4 image", 8 * 1024 * 1024 * 1024
+        )
+        tool_identities = {}
+        for label, path in tools.items():
+            current = validator.stable_read(
+                path, f"rootfs authority tool {label}", 256 * 1024 * 1024
+            )
+            tool_identities[label] = {
+                "pathFshex": os.fsencode(str(path)).hex(),
+                "sha256": current.sha256,
+                "size": current.size,
+                "mode": current.mode,
+            }
+        payload = {
+            "schema": "cheng.native_linux_readonly_ext4_rootfs",
+            "status": "ready",
+            "sourcePathFshex": os.fsencode(str(source)).hex(),
+            "imagePathFshex": os.fsencode(str(image)).hex(),
+            "imageSha256": image_file.sha256,
+            "imageFsveritySha256": image_fsverity_sha256,
+            "imageSize": image_file.size,
+            "mountpointPathFshex": os.fsencode(str(mountpoint)).hex(),
+            "delegateUid": delegate_uid,
+            "delegateGid": delegate_gid,
+            "mountAuthority": mount_authority,
+            "tools": tool_identities,
+        }
+        value = dict(payload)
+        value["payloadSha256"] = validator.sha256_bytes(
+            validator.canonical_json(payload)
+        )
+        write_exclusive(report, validator.canonical_json(value) + b"\n", 0o444)
+        os.chown(report, 0, 0)
+    except BaseException:
+        if mounted:
+            subprocess.run(
+                [str(tools["umount"]), str(mountpoint)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        if loop_device is not None:
+            subprocess.run(
+                [str(tools["losetup"]), "--detach", str(loop_device)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        if report.exists() and report.is_file() and not report.is_symlink():
+            report.unlink()
+        if mountpoint.exists() and mountpoint.is_dir() and \
+                not mountpoint.is_symlink() and not any(mountpoint.iterdir()):
+            mountpoint.rmdir()
+        if image.exists() and image.is_file() and not image.is_symlink():
+            image.unlink()
+        raise
+
+
+def cgroup2_mount_path() -> Path:
+    raw = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+    matches: list[Path] = []
+    for row in raw.splitlines():
+        before, separator, after = row.partition(" - ")
+        left = before.split()
+        right = after.split()
+        if separator and len(left) >= 6 and len(right) >= 3 and right[0] == "cgroup2":
+            matches.append(validator.decode_mountinfo_path(left[4]))
+    if len(matches) != 1:
+        fail("unique cgroup2 mount is absent")
+    return exact_directory(matches[0], "cgroup2 mount")
+
+
+def write_delegation_manifest(
+    parent: Path,
+    controller: Path,
+    delegate_uid: int,
+    delegate_gid: int,
+    output: Path,
+) -> None:
+    if platform.system() != "Linux":
+        fail("delegation capture requires Linux")
+    if os.geteuid() != 0 or os.getegid() != 0:
+        fail("delegation manifest must be captured as root")
+    parent = exact_directory(parent, "delegation parent")
+    controller = exact_directory(controller, "delegation controller")
+    mount = cgroup2_mount_path()
+    if parent == mount or mount not in parent.parents or parent not in controller.parents:
+        fail("delegation paths do not form mount/parent/controller ancestry")
+    if output.exists() or output.is_symlink():
+        fail("delegation manifest already exists")
+    mount_info = mount.stat(follow_symlinks=False)
+    parent_info = parent.stat(follow_symlinks=False)
+    controller_info = controller.stat(follow_symlinks=False)
+    keys = validator.DELEGATION_KEYS
+    rows = {
+        "schema": validator.DELEGATION_SCHEMA,
+        "status": "ready",
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "cgroup_mount_path_fshex": os.fsencode(str(mount)).hex(),
+        "cgroup_mount_device": str(mount_info.st_dev),
+        "cgroup_mount_inode": str(mount_info.st_ino),
+        "cgroup_namespace_inode": str(Path("/proc/self/ns/cgroup").stat().st_ino),
+        "parent_path_fshex": os.fsencode(str(parent)).hex(),
+        "parent_device": str(parent_info.st_dev),
+        "parent_inode": str(parent_info.st_ino),
+        "controller_path_fshex": os.fsencode(str(controller)).hex(),
+        "controller_device": str(controller_info.st_dev),
+        "controller_inode": str(controller_info.st_ino),
+        "delegate_uid": str(delegate_uid),
+        "delegate_gid": str(delegate_gid),
+        "controllers": "memory,pids",
+        "subtree_controllers": "memory,pids",
+        "host_machine": validator.normalized_machine(os.uname().machine),
+        "kernel_release": os.uname().release,
+    }
+    prefix = b"".join(
+        f"{key}={rows[key]}\n".encode("utf-8") for key in keys[:-1]
+    )
+    rows["receipt_payload_sha256"] = hashlib.sha256(prefix).hexdigest()
+    raw = prefix + (
+        f"receipt_payload_sha256={rows['receipt_payload_sha256']}\n".encode("utf-8")
+    )
+    write_exclusive(output, raw, 0o444)
+    os.chown(output, 0, 0)
+    manifest = validator.parse_delegation_manifest(
+        output, require_root_owner=True
+    )
+    if manifest.rows != rows:
+        fail("delegation manifest round trip drifted")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    materialize = subparsers.add_parser("materialize-rootfs")
+    materialize.add_argument("--source", required=True)
+    materialize.add_argument("--output", required=True)
+    materialize.add_argument("--report", required=True)
+    rootfs = subparsers.add_parser("rootfs-manifest")
+    rootfs.add_argument("--rootfs", required=True)
+    rootfs.add_argument("--crun", required=True)
+    rootfs.add_argument("--output", required=True)
+    rootfs.add_argument("--delegate-uid", required=True, type=int)
+    rootfs.add_argument("--delegate-gid", required=True, type=int)
+    restrict = subparsers.add_parser("restrict-rootfs-executables")
+    restrict.add_argument("--rootfs", required=True)
+    restrict.add_argument("--allow", action="append", required=True)
+    restrict.add_argument("--report", required=True)
+    restrict.add_argument("--delegate-uid", required=True, type=int)
+    restrict.add_argument("--delegate-gid", required=True, type=int)
+    delegation = subparsers.add_parser("delegation-manifest")
+    delegation.add_argument("--parent", required=True)
+    delegation.add_argument("--controller", required=True)
+    delegation.add_argument("--delegate-uid", required=True, type=int)
+    delegation.add_argument("--delegate-gid", required=True, type=int)
+    delegation.add_argument("--output", required=True)
+    ext4 = subparsers.add_parser("build-readonly-ext4-rootfs")
+    ext4.add_argument("--source", required=True)
+    ext4.add_argument("--image", required=True)
+    ext4.add_argument("--mountpoint", required=True)
+    ext4.add_argument("--report", required=True)
+    ext4.add_argument("--image-size-bytes", required=True, type=int)
+    ext4.add_argument("--delegate-uid", required=True, type=int)
+    ext4.add_argument("--delegate-gid", required=True, type=int)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.command == "materialize-rootfs":
+            materialize_rootfs(
+                Path(args.source), Path(args.output), Path(args.report)
+            )
+        elif args.command == "rootfs-manifest":
+            write_rootfs_manifest(
+                Path(args.rootfs),
+                Path(args.crun),
+                Path(args.output),
+                args.delegate_uid,
+                args.delegate_gid,
+            )
+        elif args.command == "restrict-rootfs-executables":
+            restrict_rootfs_executables(
+                Path(args.rootfs),
+                args.allow,
+                Path(args.report),
+                args.delegate_uid,
+                args.delegate_gid,
+            )
+        elif args.command == "delegation-manifest":
+            write_delegation_manifest(
+                Path(args.parent),
+                Path(args.controller),
+                args.delegate_uid,
+                args.delegate_gid,
+                Path(args.output),
+            )
+        elif args.command == "build-readonly-ext4-rootfs":
+            build_readonly_ext4_rootfs(
+                Path(args.source),
+                Path(args.image),
+                Path(args.mountpoint),
+                Path(args.report),
+                args.image_size_bytes,
+                args.delegate_uid,
+                args.delegate_gid,
+            )
+        else:
+            fail("unknown authority input builder command")
+    except (BuildError, validator.ValidationError, OSError, ValueError) as exc:
+        print(f"HARD_RED:{exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

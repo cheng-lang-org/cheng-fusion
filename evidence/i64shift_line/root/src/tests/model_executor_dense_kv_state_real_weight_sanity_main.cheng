@@ -1,0 +1,172 @@
+import std/result
+import std/os
+import std/strings
+import std/strutils as strutil
+import std/times as times
+import cheng/std/unicode as uni
+import cheng/inference/tokenizer as tok
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/hf_model_graph as hfgraph
+import cheng/inference/weight_store as ws
+import cheng/inference/weight_binding as wb
+import cheng/inference/model_executor as mexec
+import cheng/inference/distributed_engine as engine
+
+# #141 5.2: real-weight, one-shot end-to-end sanity for the KV-cache
+# generation path. NOT a regression gate (the equivalence gate is the small
+# synthetic fixture in model_executor_dense_kv_state_equivalence_smoke.cheng,
+# which runs in milliseconds and is the actual pass/fail authority) -- this
+# program is the single real-Qwen2.5-0.5B confirmation that (a) the KV path
+# actually runs end to end against real weights and (b) produces the exact
+# same token sequence as the frozen full-recompute path, per the environment
+# rule that a real-weight forward is ~13min and cannot be swept/batched.
+#
+# Usage: CHENG_PLANNER_CONFIG=~/models/Qwen2.5-0.5B/config.json
+#        CHENG_PLANNER_WEIGHTS=~/models/Qwen2.5-0.5B/model.safetensors
+#        ./model_executor_dense_kv_state_real_weight_sanity_main
+#
+# Runs the frozen full-recompute loop once, then the new KV loop once (both
+# maxNewTokens=4, same prompt), asserts the two token sequences are
+# identical, and prints both wall-clock times -- no sweep, no multiple
+# prompts, exactly the one combined run the environment budget allows.
+
+type
+    SanityFixture =
+        graph: mg.ModelGraph
+        bindings: wb.WeightBindingSet
+        store: ws.WeightTensorStore
+
+fn sanityLoadFixtureFromEnv(): Result[SanityFixture] =
+    let configPath = os.GetEnv("CHENG_PLANNER_CONFIG")
+    let weightsPath = os.GetEnv("CHENG_PLANNER_WEIGHTS")
+    if configPath == "" || weightsPath == "":
+        return Err[SanityFixture]("real weight sanity: CHENG_PLANNER_CONFIG / CHENG_PLANNER_WEIGHTS not set")
+    if !os.FileExists(configPath) || !os.FileExists(weightsPath):
+        return Err[SanityFixture]("real weight sanity: config/weights path not found")
+    var linearDtype = kir.KernelDtypeBf16
+    let dtypeEnv = os.GetEnv("CHENG_PLANNER_DTYPE")
+    if dtypeEnv == "fp16":
+        linearDtype = kir.KernelDtypeFp16
+    elif dtypeEnv != "" && dtypeEnv != "bf16":
+        return Err[SanityFixture]("real weight sanity: dtype env")
+    var tensorScale: int32 = 100000
+    let scaleEnv = os.GetEnv("CHENG_PLANNER_TENSOR_SCALE")
+    if scaleEnv != "":
+        tensorScale = int32(strutil.ParseInt(scaleEnv))
+        if tensorScale <= 0:
+            return Err[SanityFixture]("real weight sanity: tensor scale env")
+    let configRes = os.ReadFileResult(configPath)
+    if IsErr(configRes):
+        return Err[SanityFixture](Error(configRes))
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        Value(configRes),
+        "cid:model:xiaoyou-kv-real-weight-sanity",
+        linearDtype,
+        mg.ModelQuantSchemeNone
+    )
+    if IsErr(graphRes):
+        return Err[SanityFixture](Error(graphRes))
+    let graph = Value(graphRes)
+    if graph.architecture != mg.InferenceModelArchitectureDenseTransformer:
+        return Err[SanityFixture]("real weight sanity: architecture")
+    if graph.weights.len <= 0:
+        return Err[SanityFixture]("real weight sanity: empty weight inventory")
+    var peerIds: str[]
+    for i in 0..<graph.weights.len:
+        add(peerIds, "peer:xiaoyou-kv-real-weight-sanity")
+    let loaded = ws.WeightSafetensorsLoadGraphFilePathStreaming(weightsPath, share(graph), peerIds, tensorScale)
+    if IsErr(loaded):
+        return Err[SanityFixture](Error(loaded))
+    let loadResult = Value(loaded)
+    let gateRes = mexec.ModelExecutorValidateDenseTransformerGraph(graph, loadResult.bindings, loadResult.store)
+    if IsErr(gateRes):
+        return Err[SanityFixture](Error(gateRes))
+    if !Value(gateRes):
+        return Err[SanityFixture]("real weight sanity: dense graph gate false")
+    return Ok[SanityFixture](SanityFixture(graph: graph, bindings: loadResult.bindings, store: loadResult.store))
+
+fn sanityTokenIdsToString(ids: int32[]): str =
+    var parts: str[]
+    for i in 0..<ids.len:
+        add(parts, strings.IntToStr(ids[i]))
+    return strutil.Join(parts, ",")
+
+fn main(): int32 =
+    let fixtureRes = sanityLoadFixtureFromEnv()
+    assert(IsOk(fixtureRes), " model executor dense kv state real weight sanity: load fixture (set CHENG_PLANNER_CONFIG/CHENG_PLANNER_WEIGHTS)")
+    let fixture = Value(fixtureRes)
+
+    var tokenizerPath = os.GetEnv("CHENG_PLANNER_TOKENIZER")
+    if tokenizerPath == "":
+        tokenizerPath = "artifacts/tokenizer/qwen25/tokenizer_qwen25.bin"
+    var unicodePath = os.GetEnv("CHENG_PLANNER_UNICODE_TABLES")
+    if unicodePath == "":
+        unicodePath = "artifacts/tokenizer/unicode_tables.bin"
+    let uniRes = uni.UnicodeTablesLoad(unicodePath)
+    assert(IsOk(uniRes), " model executor dense kv state real weight sanity: load unicode tables")
+    let tables = Value(uniRes)
+    let tokRes = tok.TokenizerLoad(tokenizerPath)
+    assert(IsOk(tokRes), " model executor dense kv state real weight sanity: load tokenizer")
+    let tokenizer = Value(tokRes)
+
+    # Same classify-style candidate-menu prompt shape as
+    # planner_task.cheng's plannerTaskBuildClassifyPrompt (~60-90 token
+    # range per its own S8 provenance note) -- a realistic production
+    # prompt, not a synthetic minimal string.
+    let prompt = strutil.Join([
+        "任务分类。请从以下选项中选出最符合用户请求的任务类型编号:\n",
+        "1. 发布广告视频草稿\n",
+        "2. 发布短视频草稿\n",
+        "3. 授权商品发布草稿\n",
+        "4. 购买辅助\n",
+        "5. 内容搜索\n",
+        "6. 二手同城筛选\n",
+        "7. 其他\n",
+        "用户请求: 帮我发布一个宠物视频\n",
+        "最符合的选项编号是"
+    ], "")
+    let promptIds = tok.TokenizerEncode(tokenizer, tables, prompt)
+    assert(promptIds.len > 0, " model executor dense kv state real weight sanity: empty prompt encoding")
+    echo(strutil.Join(["prompt_token_count: ", strings.IntToStr(promptIds.len)], ""))
+    var promptTensor: infer.TensorQ
+    let promptFillOk = infer.TensorFromDataFill(promptTensor, [promptIds.len], 1, promptIds)
+    assert(IsOk(promptFillOk), " model executor dense kv state real weight sanity: prompt tensor build")
+
+    let maxNewTokens: int32 = 4
+
+    echo(" model executor dense kv state real weight sanity: running frozen full-recompute loop (T_full, ~13min/forward x maxNewTokens)")
+    let tFullStart = times.MonotimeMs()
+    let frozenRes = engine.DistributedGenerateGreedyDenseTransformerTokens(
+        fixture.graph, fixture.bindings, fixture.store, promptTensor, maxNewTokens, -1)
+    let tFullEnd = times.MonotimeMs()
+    assert(IsOk(frozenRes), " model executor dense kv state real weight sanity: frozen generate")
+    let frozenTokens = Value(frozenRes)
+    let tFullMs = tFullEnd - tFullStart
+    echo(strutil.Join(["T_full_ms: ", strings.IntToStr(int32(tFullMs))], ""))
+    echo(strutil.Join(["frozen_tokens: ", sanityTokenIdsToString(frozenTokens.data)], ""))
+
+    echo(" model executor dense kv state real weight sanity: running kv-cache loop (T_kv, prefill once + maxNewTokens-1 single-token decodes)")
+    let unbounded = engine.DistributedGenerationBudgetUnbounded()
+    let tKvStart = times.MonotimeMs()
+    let kvRes = engine.DistributedGenerateGreedyDenseTransformerTokensWithKvState(
+        fixture.graph, fixture.bindings, fixture.store, promptTensor, maxNewTokens, -1, unbounded)
+    let tKvEnd = times.MonotimeMs()
+    assert(IsOk(kvRes), " model executor dense kv state real weight sanity: kv generate")
+    let kvOutcome = Value(kvRes)
+    let tKvMs = tKvEnd - tKvStart
+    echo(strutil.Join(["T_kv_ms: ", strings.IntToStr(int32(tKvMs))], ""))
+    echo(strutil.Join(["kv_tokens: ", sanityTokenIdsToString(kvOutcome.tokenIds.data)], ""))
+    assert(!kvOutcome.budgetExceeded && !kvOutcome.cancelled && kvOutcome.stepsRun == maxNewTokens,
+           " model executor dense kv state real weight sanity: kv outcome flags")
+
+    assert(frozenTokens.shape[0] == kvOutcome.tokenIds.shape[0],
+           " model executor dense kv state real weight sanity: token count mismatch")
+    for i in 0..<frozenTokens.data.len:
+        assert(frozenTokens.data[i] == kvOutcome.tokenIds.data[i],
+               " model executor dense kv state real weight sanity: SEQUENCE MISMATCH between frozen full-recompute and kv-cache generation")
+
+    echo(strutil.Join(["speedup_x100: ", strings.IntToStr(int32(tFullMs * int64(100) / tKvMs))], ""))
+    echo(" model_executor_dense_kv_state_real_weight_sanity_main ok")
+    return 0

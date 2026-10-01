@@ -1,0 +1,906 @@
+# OAuth device-code flow implementation
+# Purely HTTP-based — no local TCP server required.
+
+import std/strings
+import cheng/codex/std/http
+import cheng/codex/auth/login
+import cheng/codex/crates/utils_base64/utils_base64 as base64
+
+# ── C provider bindings ─────────────────────────────────────────────────
+
+@importc("cheng_auth_sleep")
+fn authSleep(seconds: int32)
+
+@importc("RustCsgCrashTraceMark")
+fn RustCsgCrashTraceMark(tag: str, a: int32, b: int32, c: int32, d: int32): int32
+
+# ── Constants ───────────────────────────────────────────────────────────
+
+const CLIENT_ID: str = "app_EMoamEEZ73f0CkXaXp7hrann"
+const DEFAULT_INTERVAL: int32 = 5
+const MAX_POLL_SECONDS: int32 = 900
+const REFRESH_TOKEN_URL: str = "https://auth.openai.com/oauth/token"
+const REFRESH_TOKEN_EXPIRED_MESSAGE: str = "Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again."
+const REFRESH_TOKEN_REUSED_MESSAGE: str = "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."
+const REFRESH_TOKEN_INVALIDATED_MESSAGE: str = "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again."
+const REFRESH_TOKEN_UNKNOWN_MESSAGE: str = "Your access token could not be refreshed. Please log out and sign in again."
+const TOKEN_REFRESH_INTERVAL_SECONDS: int64 = int64(691200)
+
+# ── String helpers ──────────────────────────────────────────────────────
+
+fn strcat3(a: str, b: str, c: str): str =
+    return strings.ConcatStr(strings.ConcatStr(a, b), c)
+
+fn oauthCrashMark(tag: str) =
+    let _mark = RustCsgCrashTraceMark(tag, 0, 0, 0, 0)
+
+fn oauthHexNibble(value: int32): str =
+    let table: str = "0123456789ABCDEF"
+    return strings.SliceBytes(table, value & 15, 1)
+
+fn oauthIsUrlUnreserved(ch: char): bool =
+    if ch >= 'A' && ch <= 'Z':
+        return true
+    if ch >= 'a' && ch <= 'z':
+        return true
+    if ch >= '0' && ch <= '9':
+        return true
+    return ch == '-' || ch == '_' || ch == '.' || ch == '~'
+
+fn oauthUrlEncode(data: str): str =
+    var out: str
+    var i: int32
+    while i < data.len:
+        let ch = data[i]
+        if oauthIsUrlUnreserved(ch):
+            out = strings.ConcatStr(out, strings.SliceBytes(data, i, 1))
+        else:
+            let b = int32(ch) & 255
+            out = strings.ConcatStr(out, "%")
+            out = strings.ConcatStr(out, oauthHexNibble(b >> 4))
+            out = strings.ConcatStr(out, oauthHexNibble(b))
+        i = i + 1
+    return out
+
+# ── JSON integer extraction ─────────────────────────────────────────────
+
+fn jsonGetInt(json: str, key: str): int32 =
+    let n: int32 = strings.Len(json)
+    if n == 0:
+        return 0
+    if key == "":
+        return 0
+
+    var keyPat: str = strcat3("\"", key, "\":")
+    var pos: int32 = login.findSub(json, keyPat, 0)
+    if pos < 0:
+        keyPat = strings.ConcatStr(strcat3("\"", key, "\":"), " ")
+        pos = login.findSub(json, keyPat, 0)
+        if pos < 0:
+            return 0
+
+    var i: int32 = pos + strings.Len(keyPat)
+    i = login.skipWs(json, i)
+    if i >= n:
+        return 0
+    if json[i] < '0':
+        return 0
+    if json[i] > '9':
+        return 0
+
+    var val: int32 = 0
+    while i < n:
+        if json[i] >= '0':
+            if json[i] <= '9':
+                val = val * 10 + (int32(json[i]) - int32('0'))
+                i = i + 1
+            else:
+                break
+        else:
+            break
+    return val
+
+fn jsonGetInterval(json: str, key: str, outValue: var int32): bool =
+    outValue = 0
+    let n: int32 = strings.Len(json)
+    if n == 0:
+        return true
+    if key == "":
+        return false
+
+    var keyPat: str = strcat3("\"", key, "\":")
+    var pos: int32 = login.findSub(json, keyPat, 0)
+    if pos < 0:
+        keyPat = strings.ConcatStr(strcat3("\"", key, "\":"), " ")
+        pos = login.findSub(json, keyPat, 0)
+        if pos < 0:
+            return true
+
+    var i: int32 = pos + strings.Len(keyPat)
+    i = login.skipWs(json, i)
+    if i >= n:
+        return false
+    if json[i] != '"':
+        return false
+    i = i + 1
+    i = login.skipWs(json, i)
+
+    var val: int32
+    var sawDigit: bool
+    while i < n:
+        if json[i] >= '0' && json[i] <= '9':
+            sawDigit = true
+            val = val * 10 + (int32(json[i]) - int32('0'))
+            i = i + 1
+            continue
+        break
+    if !sawDigit:
+        return false
+    i = login.skipWs(json, i)
+    if i >= n:
+        return false
+    if json[i] != '"':
+        return false
+    outValue = val
+    return true
+
+fn digitValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    return -1
+
+fn parseFixedPositiveInt64(text: str, start: int32, count: int32, outValue: var int64): bool =
+    outValue = int64(0)
+    if start < 0:
+        return false
+    if count <= 0:
+        return false
+    if start + count > text.len:
+        return false
+    var i: int32
+    while i < count:
+        let d = digitValue(text[start + i])
+        if d < 0:
+            return false
+        outValue = outValue * int64(10) + int64(d)
+        i = i + 1
+    return true
+
+fn jsonGetOptionalInt64(json: str, key: str, outValue: var int64): bool =
+    outValue = int64(0)
+    let n: int32 = strings.Len(json)
+    if n == 0:
+        return false
+    if key == "":
+        return false
+
+    var keyPat: str = strcat3("\"", key, "\":")
+    var pos: int32 = login.findSub(json, keyPat, 0)
+    if pos < 0:
+        keyPat = strings.ConcatStr(strcat3("\"", key, "\":"), " ")
+        pos = login.findSub(json, keyPat, 0)
+        if pos < 0:
+            return false
+
+    var i: int32 = pos + strings.Len(keyPat)
+    i = login.skipWs(json, i)
+    if i >= n:
+        return false
+
+    var negative: bool
+    if json[i] == '-':
+        negative = true
+        i = i + 1
+    var value: int64
+    var sawDigit: bool
+    while i < n:
+        let d = digitValue(json[i])
+        if d < 0:
+            break
+        sawDigit = true
+        value = value * int64(10) + int64(d)
+        i = i + 1
+    if !sawDigit:
+        return false
+    if negative:
+        outValue = int64(0) - value
+    else:
+        outValue = value
+    return true
+
+fn base64UrlToBase64(segment: str): str =
+    var out: str
+    var i: int32
+    while i < segment.len:
+        let ch = strings.SliceBytes(segment, i, 1)
+        if ch == "-":
+            out = strings.ConcatStr(out, "+")
+        elif ch == "_":
+            out = strings.ConcatStr(out, "/")
+        else:
+            out = strings.ConcatStr(out, ch)
+        i = i + 1
+    let rem = out.len % 4
+    if rem == 1:
+        return ""
+    if rem == 2:
+        out = strings.ConcatStr(out, "==")
+    elif rem == 3:
+        out = strings.ConcatStr(out, "=")
+    return out
+
+fn asciiLower(text: str): str =
+    var out: str
+    var i: int32
+    while i < text.len:
+        let ch = text[i]
+        if ch >= 'A' && ch <= 'Z':
+            out = strings.ConcatStr(out, strings.CharToStr(char(int32(ch) + 32)))
+        else:
+            out = strings.ConcatStr(out, strings.SliceBytes(text, i, 1))
+        i = i + 1
+    return out
+
+fn jwtPayloadSegment(token: str): str =
+    var firstDot: int32 = -1
+    var secondDot: int32 = -1
+    var i: int32
+    while i < token.len:
+        if token[i] == '.':
+            if firstDot < 0:
+                firstDot = i
+            else:
+                secondDot = i
+                break
+        i = i + 1
+    if firstDot < 0:
+        return ""
+    if secondDot <= firstDot + 1:
+        return ""
+    return strings.SliceBytes(token, firstDot + 1, secondDot - firstDot - 1)
+
+fn JwtPayloadJson(token: str): str =
+    let segment = jwtPayloadSegment(token)
+    if segment == "":
+        return ""
+    let b64 = base64UrlToBase64(segment)
+    if b64 == "":
+        return ""
+    let payload = base64.RustCsgBase64Decode(b64)
+    if payload.len < 2:
+        return ""
+    if strings.SliceBytes(payload, 0, 1) != "{":
+        return ""
+    if strings.SliceBytes(payload, payload.len - 1, 1) != "}":
+        return ""
+    return payload
+
+fn IdTokenEmail(idToken: str): str =
+    let payload = JwtPayloadJson(idToken)
+    if payload == "":
+        return ""
+    return login.jsonGetStr(payload, "email")
+
+fn IdTokenAccountId(idToken: str): str =
+    let payload = JwtPayloadJson(idToken)
+    if payload == "":
+        return ""
+    return login.jsonGetNestedStr(payload, "https://api.openai.com/auth", "chatgpt_account_id")
+
+fn ResolvedAccountId(idToken: str, tokenResponseAccountId: str, outError: var str): str =
+    outError = ""
+    let idTokenAccountId = IdTokenAccountId(idToken)
+    if idTokenAccountId != "" && tokenResponseAccountId != "":
+        if idTokenAccountId != tokenResponseAccountId:
+            outError = "token account_id does not match id_token chatgpt_account_id"
+            return ""
+        return idTokenAccountId
+    if tokenResponseAccountId != "":
+        return tokenResponseAccountId
+    return idTokenAccountId
+
+fn accessTokenExpirationUnixSeconds(token: str, outExpiresAt: var int64): bool =
+    outExpiresAt = int64(0)
+    let payload = JwtPayloadJson(token)
+    if payload == "":
+        return false
+    return jsonGetOptionalInt64(payload, "exp", outExpiresAt)
+
+fn civilToUnixDays(yearIn: int64, monthIn: int64, day: int64): int64 =
+    var year: int64 = yearIn
+    let month: int64 = monthIn
+    if month <= int64(2):
+        year = year - int64(1)
+    var era: int64
+    if year >= int64(0):
+        era = year / int64(400)
+    else:
+        era = (year - int64(399)) / int64(400)
+    let yoe: int64 = year - era * int64(400)
+    var mp: int64
+    if month > int64(2):
+        mp = month - int64(3)
+    else:
+        mp = month + int64(9)
+    let doy: int64 = (int64(153) * mp + int64(2)) / int64(5) + day - int64(1)
+    let doe: int64 = yoe * int64(365) + yoe / int64(4) - yoe / int64(100) + doy
+    return era * int64(146097) + doe - int64(719468)
+
+fn rfc3339ToUnixSeconds(value: str, outSeconds: var int64): bool =
+    outSeconds = int64(0)
+    if value.len < 20:
+        return false
+    if value[4] != '-':
+        return false
+    if value[7] != '-':
+        return false
+    if value[10] != 'T':
+        return false
+    if value[13] != ':':
+        return false
+    if value[16] != ':':
+        return false
+    var year: int64
+    var month: int64
+    var day: int64
+    var hour: int64
+    var minute: int64
+    var second: int64
+    if !parseFixedPositiveInt64(value, 0, 4, year):
+        return false
+    if !parseFixedPositiveInt64(value, 5, 2, month):
+        return false
+    if !parseFixedPositiveInt64(value, 8, 2, day):
+        return false
+    if !parseFixedPositiveInt64(value, 11, 2, hour):
+        return false
+    if !parseFixedPositiveInt64(value, 14, 2, minute):
+        return false
+    if !parseFixedPositiveInt64(value, 17, 2, second):
+        return false
+    if month < int64(1) || month > int64(12):
+        return false
+    if day < int64(1) || day > int64(31):
+        return false
+    if hour > int64(23):
+        return false
+    if minute > int64(59):
+        return false
+    if second > int64(60):
+        return false
+    let days = civilToUnixDays(year, month, day)
+    outSeconds = days * int64(86400) + hour * int64(3600) + minute * int64(60) + second
+    return true
+
+fn pad2(value: int64): str =
+    let raw: str = strings.Int64ToStr(value)
+    if value < int64(10):
+        return strings.ConcatStr("0", raw)
+    return raw
+
+fn pad4(value: int64): str =
+    let raw: str = strings.Int64ToStr(value)
+    if value < int64(10):
+        return strings.ConcatStr("000", raw)
+    if value < int64(100):
+        return strings.ConcatStr("00", raw)
+    if value < int64(1000):
+        return strings.ConcatStr("0", raw)
+    return raw
+
+fn unixSecondsToRfc3339(seconds: int64): str =
+    var days: int64 = seconds / int64(86400)
+    var secondsOfDay: int64 = seconds % int64(86400)
+    if secondsOfDay < int64(0):
+        secondsOfDay = secondsOfDay + int64(86400)
+        days = days - int64(1)
+    var z: int64 = days + int64(719468)
+    var era: int64
+    if z >= int64(0):
+        era = z / int64(146097)
+    else:
+        era = (z - int64(146096)) / int64(146097)
+    let doe: int64 = z - era * int64(146097)
+    let yoe: int64 = (doe - doe / int64(1460) + doe / int64(36524) - doe / int64(146096)) / int64(365)
+    var year: int64 = yoe + era * int64(400)
+    let doy: int64 = doe - (int64(365) * yoe + yoe / int64(4) - yoe / int64(100))
+    let mp: int64 = (int64(5) * doy + int64(2)) / int64(153)
+    let day: int64 = doy - (int64(153) * mp + int64(2)) / int64(5) + int64(1)
+    var month: int64
+    if mp < int64(10):
+        month = mp + int64(3)
+    else:
+        month = mp - int64(9)
+    if month <= int64(2):
+        year = year + int64(1)
+    let hour: int64 = secondsOfDay / int64(3600)
+    let minute: int64 = (secondsOfDay % int64(3600)) / int64(60)
+    let second: int64 = secondsOfDay % int64(60)
+    var out: str = pad4(year)
+    out = strings.ConcatStr(out, "-")
+    out = strings.ConcatStr(out, pad2(month))
+    out = strings.ConcatStr(out, "-")
+    out = strings.ConcatStr(out, pad2(day))
+    out = strings.ConcatStr(out, "T")
+    out = strings.ConcatStr(out, pad2(hour))
+    out = strings.ConcatStr(out, ":")
+    out = strings.ConcatStr(out, pad2(minute))
+    out = strings.ConcatStr(out, ":")
+    out = strings.ConcatStr(out, pad2(second))
+    out = strings.ConcatStr(out, "Z")
+    return out
+
+fn ChatGptAuthNeedsProactiveRefresh(auth: login.AuthDotJson, nowSeconds: int64): bool =
+    if auth.authMode != "Chatgpt":
+        return false
+    if auth.accessToken != "":
+        var expiresAt: int64
+        if accessTokenExpirationUnixSeconds(auth.accessToken, expiresAt):
+            return expiresAt <= nowSeconds
+    if auth.lastRefresh == "":
+        return false
+    var lastRefreshSeconds: int64
+    if !rfc3339ToUnixSeconds(auth.lastRefresh, lastRefreshSeconds):
+        return false
+    return lastRefreshSeconds < nowSeconds - int64(691200)
+
+# ── URI helpers ─────────────────────────────────────────────────────────
+
+fn deviceCallbackUri(issuer: str): str =
+    var base: str = issuer
+    let baseN: int32 = strings.Len(base)
+    if baseN > 0:
+        if base[baseN - 1] == '/':
+            base = strings.SliceBytes(base, 0, baseN - 1)
+    return strings.ConcatStr(base, "/deviceauth/callback")
+
+fn normalizeBase(issuer: str): str =
+    let n: int32 = strings.Len(issuer)
+    if n > 0:
+        if issuer[n - 1] == '/':
+            return strings.SliceBytes(issuer, 0, n - 1)
+    return issuer
+
+# ── Step 1: Request device code ─────────────────────────────────────────
+
+fn requestUserCode(authBaseUrl: str, clientId: str,
+                    outDeviceAuthId: var str,
+                    outUserCode: var str,
+                    outInterval: var int32,
+                    outError: var str): bool =
+    outError = ""
+    let url: str = strings.ConcatStr(authBaseUrl, "/deviceauth/usercode")
+
+    # Build JSON manually (std/json has bootstrap compile error with struct types)
+    let reqBody: str = login.strcat3("{\"client_id\":\"", clientId, "\"}")
+
+    let headers: str = "[\"Content-Type: application/json\"]"
+    var resp: http.HttpResult = http.HttpPost(url, reqBody, headers)
+
+    if !resp.ok:
+        outError = strings.ConcatStr("manual device-code usercode transport error: ", resp.error)
+        echo(outError)
+        return false
+
+    if resp.statusCode == 404:
+        outError = "device code login is not enabled for this Codex server"
+        echo(outError)
+        return false
+
+    if resp.statusCode != 200:
+        outError = strings.ConcatStr(
+            "manual device-code usercode failed with status ",
+            strings.IntToStr(resp.statusCode))
+        if resp.body != "":
+            outError = login.strcat3(outError, ": ", resp.body)
+        echo(outError)
+        return false
+
+    outDeviceAuthId = login.jsonGetStr(resp.body, "device_auth_id")
+    outUserCode = login.jsonGetStr(resp.body, "user_code")
+    if outUserCode == "":
+        outUserCode = login.jsonGetStr(resp.body, "usercode")
+    if !jsonGetInterval(resp.body, "interval", outInterval):
+        outError = strings.ConcatStr("manual device-code usercode response has invalid interval: ", resp.body)
+        echo(outError)
+        return false
+
+    if outDeviceAuthId == "":
+        outError = strings.ConcatStr("manual device-code usercode response is missing device_auth_id or user_code: ", resp.body)
+        echo(outError)
+        return false
+    if outUserCode == "":
+        outError = strings.ConcatStr("manual device-code usercode response is missing device_auth_id or user_code: ", resp.body)
+        echo(outError)
+        return false
+
+    return true
+
+fn RequestDeviceCodeStartAtIssuer(issuer: str,
+                                   outDeviceAuthId: var str,
+                                   outUserCode: var str,
+                                   outVerificationUrl: var str,
+                                   outInterval: var int32,
+                                   outError: var str): bool =
+    outDeviceAuthId = ""
+    outUserCode = ""
+    outVerificationUrl = ""
+    outInterval = 5
+    outError = ""
+    if issuer == "":
+        outError = "manual device-code login issuer is empty"
+        return false
+    let base = normalizeBase(issuer)
+    let apiBaseUrl = strings.ConcatStr(base, "/api/accounts")
+    let clientId = "app_EMoamEEZ73f0CkXaXp7hrann"
+    var requestError: str
+    if !requestUserCode(apiBaseUrl, clientId, outDeviceAuthId, outUserCode, outInterval, requestError):
+        outError = strings.ConcatStr("failed to request manual device code from ", strings.ConcatStr(apiBaseUrl, "/deviceauth/usercode"))
+        if requestError != "":
+            outError = login.strcat3(outError, ": ", requestError)
+        return false
+    outVerificationUrl = strings.ConcatStr(base, "/codex/device")
+    return true
+
+fn pollForTokenOnce(authBaseUrl: str,
+                    deviceAuthId: str,
+                    userCode: str,
+                    outAuthCode: var str,
+                    outCodeVerifier: var str,
+                    outError: var str): bool =
+    outAuthCode = ""
+    outCodeVerifier = ""
+    outError = ""
+    let url = strings.ConcatStr(authBaseUrl, "/deviceauth/token")
+    var reqBody: str = "{\"device_auth_id\":\""
+    reqBody = strings.ConcatStr(reqBody, deviceAuthId)
+    reqBody = strings.ConcatStr(reqBody, "\",\"user_code\":\"")
+    reqBody = strings.ConcatStr(reqBody, userCode)
+    reqBody = strings.ConcatStr(reqBody, "\"}")
+    let headers: str = "[\"Content-Type: application/json\"]"
+    var resp: http.HttpResult = http.HttpPost(url, reqBody, headers)
+    if !resp.ok:
+        outError = strings.ConcatStr("manual device-code token poll transport error: ", resp.error)
+        return false
+    if resp.statusCode == 200:
+        outAuthCode = login.jsonGetStr(resp.body, "authorization_code")
+        outCodeVerifier = login.jsonGetStr(resp.body, "code_verifier")
+        if outAuthCode == "":
+            outError = "manual device-code token poll succeeded but authorization_code is missing"
+            return false
+        if outCodeVerifier == "":
+            outError = "manual device-code token poll succeeded but code_verifier is missing"
+            return false
+        return true
+    if resp.statusCode == 403 || resp.statusCode == 404:
+        outError = "manual device-code login is still pending"
+        return false
+    outError = strings.ConcatStr("manual device-code token poll failed with status ", strings.IntToStr(resp.statusCode))
+    return false
+
+fn CompleteDeviceCodeLoginOnceAtIssuer(codexHome: str,
+                                        issuer: str,
+                                        deviceAuthId: str,
+                                        userCode: str,
+                                        expectedEmail: str,
+                                        expectedWorkspaceId: str,
+                                        completedAtSeconds: int64,
+                                        outError: var str): bool =
+    outError = ""
+    if codexHome == "":
+        outError = "manual device-code auth home is empty"
+        return false
+    if issuer == "":
+        outError = "manual device-code login issuer is empty"
+        return false
+    if deviceAuthId == "" || userCode == "":
+        outError = "manual device-code login session is missing device code data"
+        return false
+    let base = normalizeBase(issuer)
+    let apiBaseUrl = strings.ConcatStr(base, "/api/accounts")
+    let clientId = "app_EMoamEEZ73f0CkXaXp7hrann"
+    var authCode: str
+    var codeVerifier: str
+    oauthCrashMark("device-complete-poll-start")
+    if !pollForTokenOnce(apiBaseUrl, deviceAuthId, userCode, authCode, codeVerifier, outError):
+        return false
+    oauthCrashMark("device-complete-poll-ok")
+    var exchanged: login.AuthDotJson
+    oauthCrashMark("device-complete-exchange-start")
+    if !exchangeCodeForTokens(base, clientId, deviceCallbackUri(base), codeVerifier, authCode, exchanged):
+        outError = "manual device-code exchange failed"
+        return false
+    oauthCrashMark("device-complete-exchange-ok")
+    oauthCrashMark("device-complete-id-token-email")
+    let authEmail = IdTokenEmail(exchanged.rawIdToken)
+    if authEmail != "" && expectedEmail != "" && asciiLower(authEmail) != asciiLower(expectedEmail):
+        outError = login.strcat3("cached auth email mismatch for ", expectedEmail, login.strcat3(": got ", authEmail, ""))
+        return false
+    var accountIdError: str
+    oauthCrashMark("device-complete-account-id")
+    let actualWorkspaceId = ResolvedAccountId(exchanged.rawIdToken, exchanged.accountId, accountIdError)
+    if accountIdError != "":
+        outError = accountIdError
+        return false
+    if expectedWorkspaceId != "":
+        if actualWorkspaceId == "":
+            outError = "Login is restricted to a specific workspace, but the token did not include an chatgpt_account_id claim."
+            return false
+        if actualWorkspaceId != expectedWorkspaceId:
+            outError = login.strcat3("Login is restricted to workspace id ", expectedWorkspaceId, ".")
+            return false
+    var result = login.NewAuthDotJson()
+    result.authMode = "Chatgpt"
+    result.rawIdToken = exchanged.rawIdToken
+    result.accessToken = exchanged.accessToken
+    result.refreshToken = exchanged.refreshToken
+    result.accountId = actualWorkspaceId
+    result.lastRefresh = unixSecondsToRfc3339(completedAtSeconds)
+    oauthCrashMark("device-complete-save-start")
+    if !login.SaveAuth(codexHome, result):
+        outError = "failed to persist manual device-code auth tokens"
+        return false
+    oauthCrashMark("device-complete-save-ok")
+    return true
+
+# ── Step 2: Poll for token ──────────────────────────────────────────────
+
+fn pollForToken(authBaseUrl: str, deviceAuthId: str, userCode: str,
+                 interval: int32,
+                 outAuthCode: var str,
+                 outCodeVerifier: var str): bool =
+    let url: str = strings.ConcatStr(authBaseUrl, "/deviceauth/token")
+
+    # Build JSON manually (std/json has bootstrap compile error with struct types)
+    var reqBody: str = "{\"device_auth_id\":\""
+    reqBody = strings.ConcatStr(reqBody, deviceAuthId)
+    reqBody = strings.ConcatStr(reqBody, "\",\"user_code\":\"")
+    reqBody = strings.ConcatStr(reqBody, userCode)
+    reqBody = strings.ConcatStr(reqBody, "\"}")
+
+    let headers: str = "[\"Content-Type: application/json\"]"
+
+    var elapsed: int32 = 0
+    let pollSleep: int32 = interval
+    if pollSleep <= 0:
+        return false
+
+    while elapsed < 900:
+        var resp: http.HttpResult = http.HttpPost(url, reqBody, headers)
+
+        if !resp.ok:
+            echo(strings.ConcatStr("pollForToken: transport error: ", resp.error))
+            return false
+
+        if resp.statusCode == 200:
+            outAuthCode = login.jsonGetStr(resp.body, "authorization_code")
+            outCodeVerifier = login.jsonGetStr(resp.body, "code_verifier")
+            if outAuthCode != "":
+                return true
+            echo("pollForToken: success but missing authorization_code")
+            return false
+
+        if resp.statusCode == 403:
+            elapsed = elapsed + pollSleep
+            if elapsed < 900:
+                authSleep(pollSleep)
+            continue
+        if resp.statusCode == 404:
+            elapsed = elapsed + pollSleep
+            if elapsed < 900:
+                authSleep(pollSleep)
+            continue
+
+        echo(strings.ConcatStr("pollForToken: unexpected status ",
+                               strings.IntToStr(resp.statusCode)))
+        return false
+
+    echo("device auth timed out after 15 minutes")
+    return false
+
+# ── Step 3: Exchange code for tokens ────────────────────────────────────
+
+fn exchangeCodeForTokens(issuer: str, clientId: str, redirectUri: str,
+                          codeVerifier: str, authCode: str,
+                          outAuth: var login.AuthDotJson): bool =
+    oauthCrashMark("exchange-entry")
+    let tokenEndpoint: str = strings.ConcatStr(issuer, "/oauth/token")
+    let headers: str = "[\"Content-Type: application/x-www-form-urlencoded\"]"
+
+    oauthCrashMark("exchange-build-code")
+    var body: str = "grant_type=authorization_code"
+    body = strings.ConcatStr(body, "&code=")
+    body = strings.ConcatStr(body, oauthUrlEncode(authCode))
+    oauthCrashMark("exchange-build-redirect")
+    body = strings.ConcatStr(body, "&redirect_uri=")
+    body = strings.ConcatStr(body, oauthUrlEncode(redirectUri))
+    oauthCrashMark("exchange-build-client")
+    body = strings.ConcatStr(body, "&client_id=")
+    body = strings.ConcatStr(body, oauthUrlEncode(clientId))
+    oauthCrashMark("exchange-build-verifier")
+    body = strings.ConcatStr(body, "&code_verifier=")
+    body = strings.ConcatStr(body, oauthUrlEncode(codeVerifier))
+
+    oauthCrashMark("exchange-http-start")
+    var resp: http.HttpResult = http.HttpPost(tokenEndpoint, body, headers)
+    oauthCrashMark("exchange-http-done")
+
+    if !resp.ok:
+        echo(strings.ConcatStr("exchangeCodeForTokens: transport error: ", resp.error))
+        return false
+
+    oauthCrashMark("exchange-status")
+    if resp.statusCode != 200:
+        echo(strings.ConcatStr("exchangeCodeForTokens: status ",
+                               strings.IntToStr(resp.statusCode)))
+        echo(strings.ConcatStr("  body: ", resp.body))
+        return false
+
+    oauthCrashMark("exchange-parse-start")
+    outAuth.rawIdToken = login.jsonGetStr(resp.body, "id_token")
+    outAuth.accessToken = login.jsonGetStr(resp.body, "access_token")
+    outAuth.refreshToken = login.jsonGetStr(resp.body, "refresh_token")
+    outAuth.accountId = login.jsonGetStr(resp.body, "account_id")
+    if outAuth.accountId == "":
+        outAuth.accountId = login.jsonGetStr(resp.body, "chatgpt_account_id")
+    oauthCrashMark("exchange-parse-done")
+
+    if outAuth.accessToken == "":
+        echo("exchangeCodeForTokens: missing access_token")
+        return false
+
+    return true
+
+fn RefreshTokenFailureMessage(body: str): str =
+    var code = login.jsonGetNestedStr(body, "error", "code")
+    if code == "":
+        code = login.jsonGetStr(body, "error")
+    if code == "":
+        code = login.jsonGetStr(body, "code")
+    if code == "refresh_token_expired":
+        return REFRESH_TOKEN_EXPIRED_MESSAGE
+    if code == "refresh_token_reused":
+        return REFRESH_TOKEN_REUSED_MESSAGE
+    if code == "refresh_token_invalidated":
+        return REFRESH_TOKEN_INVALIDATED_MESSAGE
+    return REFRESH_TOKEN_UNKNOWN_MESSAGE
+
+fn RefreshTokenEndpoint(endpoint: str): str =
+    if endpoint == "":
+        return REFRESH_TOKEN_URL
+    return endpoint
+
+fn RefreshChatGptTokenAtEndpointAtUnixSeconds(codexHome: str,
+                                              endpoint: str,
+                                              refreshedAtSeconds: int64,
+                                              outAuth: var login.AuthDotJson,
+                                              outError: var str): bool =
+    outAuth = login.NewAuthDotJson()
+    outError = ""
+    let current: login.AuthDotJson = login.LoadAuth(codexHome)
+    if !login.AuthAvailable(current):
+        outError = "Token data is not available."
+        return false
+    let currentRefreshToken: str = current.refreshToken
+    if currentRefreshToken == "":
+        outError = "Token data is not available."
+        return false
+    let url = RefreshTokenEndpoint(endpoint)
+    let headers: str = "[\"Content-Type: application/json\"]"
+    let clientId: str = "app_EMoamEEZ73f0CkXaXp7hrann"
+    let escapedRefreshToken: str = login.jsonEscapeStr(currentRefreshToken)
+    let bodyPrefix = login.strcat3("{\"client_id\":\"", clientId, "\",\"grant_type\":\"refresh_token\",\"refresh_token\":\"")
+    let body: str = login.strcat3(bodyPrefix, escapedRefreshToken, "\"}")
+
+    var resp: http.HttpResult = http.HttpPost(url, body, headers)
+    if !resp.ok:
+        outError = "Failed to refresh token"
+        return false
+    let statusCode: int32 = resp.statusCode
+    let responseBody: str = resp.body
+    if statusCode == 200:
+        var refreshed: login.AuthDotJson = current
+        let idToken = login.jsonGetStr(responseBody, "id_token")
+        let accessToken = login.jsonGetStr(responseBody, "access_token")
+        let refreshToken = login.jsonGetStr(responseBody, "refresh_token")
+        var accountId = login.jsonGetStr(responseBody, "account_id")
+        if accountId == "":
+            accountId = login.jsonGetStr(responseBody, "chatgpt_account_id")
+        if idToken != "":
+            refreshed.rawIdToken = idToken
+        if accessToken != "":
+            refreshed.accessToken = accessToken
+        if refreshToken != "":
+            refreshed.refreshToken = refreshToken
+        if idToken != "" || accountId != "":
+            var accountIdError: str
+            let resolvedAccountId = ResolvedAccountId(refreshed.rawIdToken, accountId, accountIdError)
+            if accountIdError != "":
+                outError = accountIdError
+                return false
+            if resolvedAccountId != "":
+                refreshed.accountId = resolvedAccountId
+        refreshed.lastRefresh = unixSecondsToRfc3339(refreshedAtSeconds)
+        if !login.SaveAuth(codexHome, refreshed):
+            outError = "failed to persist refreshed auth tokens"
+            return false
+        outAuth = refreshed
+        return true
+    if statusCode == 401:
+        outError = RefreshTokenFailureMessage(responseBody)
+        return false
+    outError = "Failed to refresh token"
+    return false
+
+fn RefreshChatGptTokenAtEndpoint(codexHome: str,
+                                 endpoint: str,
+                                 outAuth: var login.AuthDotJson,
+                                 outError: var str): bool =
+    return RefreshChatGptTokenAtEndpointAtUnixSeconds(codexHome, endpoint, int64(0), outAuth, outError)
+
+# ── High-level device code login ────────────────────────────────────────
+
+fn RunDeviceCodeLogin(codexHome: str, issuer: str): login.AuthDotJson =
+    var result: login.AuthDotJson = login.NewAuthDotJson()
+
+    if issuer == "":
+        echo("RunDeviceCodeLogin: issuer is empty")
+        return result
+
+    let base: str = normalizeBase(issuer)
+    let apiBaseUrl: str = strings.ConcatStr(base, "/api/accounts")
+    let redirectUri: str = deviceCallbackUri(base)
+    let clientId: str = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+    # Step 1: Request user code
+    var deviceAuthId: str
+    var userCode: str
+    var interval: int32
+
+    echo(strings.ConcatStr("Requesting device code from ",
+         strings.ConcatStr(apiBaseUrl, "/deviceauth/usercode")))
+    var requestError: str
+    if !requestUserCode(apiBaseUrl, clientId, deviceAuthId, userCode, interval, requestError):
+        if requestError != "":
+            echo(strings.ConcatStr("RunDeviceCodeLogin: ", requestError))
+        else:
+            echo("RunDeviceCodeLogin: failed to request device code")
+        return result
+
+    # Step 2: Display prompt
+    let verificationUrl: str = strings.ConcatStr(base, "/codex/device")
+    echo("")
+    echo("Follow these steps to sign in with ChatGPT using device code authorization:")
+    echo("")
+    echo("1. Open this link in your browser and sign in to your account")
+    echo(strings.ConcatStr("   ", verificationUrl))
+    echo("")
+    echo("2. Enter this one-time code (expires in 15 minutes)")
+    echo(strings.ConcatStr("   ", userCode))
+    echo("")
+    echo("Device codes are a common phishing target. Never share this code.")
+    echo("")
+
+    # Step 3: Poll for token
+    var authCode: str
+    var codeVerifier: str
+    if !pollForToken(apiBaseUrl, deviceAuthId, userCode, interval, authCode, codeVerifier):
+        echo("RunDeviceCodeLogin: failed to poll for token")
+        return result
+
+    # Step 4: Exchange code for tokens
+    var exchanged: login.AuthDotJson
+    if !exchangeCodeForTokens(base, clientId, redirectUri, codeVerifier, authCode, exchanged):
+        echo("RunDeviceCodeLogin: failed to exchange code for tokens")
+        return result
+
+    # Step 5: Save auth
+    result.authMode = "Chatgpt"
+    result.rawIdToken = exchanged.rawIdToken
+    result.accessToken = exchanged.accessToken
+    result.refreshToken = exchanged.refreshToken
+    result.accountId = exchanged.accountId
+    login.SaveAuth(codexHome, result)
+    echo("RunDeviceCodeLogin: login successful")
+
+    return result

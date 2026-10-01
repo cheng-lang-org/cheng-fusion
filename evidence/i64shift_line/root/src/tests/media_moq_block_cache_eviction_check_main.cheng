@@ -1,0 +1,289 @@
+# Runtime verification for web_scene_media_block_cache.cheng 的容量淘汰切片: LRU(按最后
+# 访问) + 上限/目标水位 + pinned 豁免, 镜像 PWA 蓝本 p2pMedia.ts planManifestEviction
+# (:716-747, updatedAt LRU / 512MB 上限 / 384MB 目标 / pinned 豁免)。纯文件系统行为断言,
+# 无网络无设备; 容量参数经 WebSceneMediaBlockCacheSetCapacity 覆盖为小值(默认 512MB/384MB
+# 不适合冒烟), 淘汰算法本身与容量值无关。
+#
+# 断言分两层(关键设计): 模块 Get 命中会刷新该键 lastAccess——若拿 Get 当断言工具, 断言
+# 本身就在搅乱被测的 LRU 序。因此"块是否保留/字节是否精确"一律直读磁盘文件断言(淘汰
+# 的可见效果就是删文件), 模块 Get 只在①验证淘汰键返回 Err(非静默空/垃圾)②故意刷新
+# lastAccess 时使用, 次序完全可控。
+#
+# --mode evict           单进程全矩阵:
+#                          1. 容量参数非法值(非正/目标>上限)诚实返回 false 不生效;
+#                          2. 未越限绝不淘汰;
+#                          3. Get 命中刷新 lastAccess 可观察: 刚被读的 0 比先写的 120/240
+#                             活得久(若无 touch, 被淘汰的会是 0)——越限后按 LRU 淘汰到目标
+#                             水位, 被淘汰键模块 Get 返回 Err;
+#                          4. pinned 豁免: 最老的 0 被 pin 后两次越过淘汰, 次老者被淘汰;
+#                             不存在的键 pin 返回 false(诚实失败);
+#                          5. 音视频双键空间(a-<idx>.blk)语义保持: 同 idx 音视频互不命中,
+#                             unpin 后 0 恢复可淘汰, 音频块参与同一容量同一 LRU。
+# --mode persist-fill    进程 #1: 大容量(不触发淘汰)按已知先后序写 3 块, 清单持久化。
+# --mode persist-evict   进程 #2(全新进程): Init 载清单+磁盘对账后, 3 块全部仍在(清单
+#                          跨进程往返); 越限 Put 按"进程 #1 持久化的 lastAccess 序"淘汰
+#                          最老者; 再收缩容量上限, 验证 SetCapacity 立即按新水位淘汰。
+#
+# 各 op 之间 os.SleepMs(15) 保证 epoch-ms 级 lastAccess 两两不同, 淘汰序与被访问序严格
+# 对应, 断言不依赖同毫秒内的次序巧合。
+
+import std/os
+import std/result
+import std/rawbytes
+import std/strings as strs
+import std/strutils as strutil
+import std/cmdline as cmdline
+import cheng/core/runtime/web_scene_media_block_cache as blockcache
+
+fn fail(msg: str): int32 =
+    os.WriteLine(os.Get_stdout(), strutil.Join(["FAIL: ", msg], ""))
+    return 1
+
+# 每块 300 字节, 内容随 frameIdx 变化(非全零非纯 ASCII), 字节精确比较才真实校验二进制安全。
+fn buildPayload(frameIdx: int32): Bytes =
+    let n: int32 = 300
+    var out: Bytes = BytesAlloc(n)
+    var i: int32
+    while i < n:
+        BytesSet(out, i, (i * 37 + 11 + frameIdx) % 256)
+        i = i + 1
+    return out
+
+fn bytesEqualExact(a: Bytes, b: Bytes): bool =
+    if BytesLen(a) != BytesLen(b):
+        return false
+    var i: int32
+    while i < BytesLen(a):
+        if BytesGet(a, i) != BytesGet(b, i):
+            return false
+        i = i + 1
+    return true
+
+fn blockFilePath(root: str, assetCid: str, frameIdx: int32, audio: bool): str =
+    if audio:
+        return root + "/" + assetCid + "/a-" + strs.IntToStr(frameIdx) + ".blk"
+    return root + "/" + assetCid + "/" + strs.IntToStr(frameIdx) + ".blk"
+
+# 保留断言: 直读磁盘文件(不经过模块 Get, 不刷新 lastAccess), 存在且字节精确。
+fn expectFileHit(root: str, assetCid: str, frameIdx: int32, audio: bool): int32 =
+    let path = blockFilePath(root, assetCid, frameIdx, audio)
+    if !os.FileExists(path):
+        return fail("expected retained block file missing idx=" + strs.IntToStr(frameIdx))
+    let res: Result[Bytes] = os.ReadFileBytesResult(path)
+    if IsErr(res):
+        return fail("retained block unreadable idx=" + strs.IntToStr(frameIdx))
+    if !bytesEqualExact(Value(res), buildPayload(frameIdx)):
+        return fail("retained block bytes mismatch idx=" + strs.IntToStr(frameIdx))
+    return 0
+
+# 淘汰断言: 文件必须真的被删。
+fn expectFileGone(root: str, assetCid: str, frameIdx: int32, audio: bool): int32 =
+    if os.FileExists(blockFilePath(root, assetCid, frameIdx, audio)):
+        return fail("expected evicted block file still exists idx=" + strs.IntToStr(frameIdx))
+    return 0
+
+fn runEvict(root: str, assetCid: str): int32 =
+    if !blockcache.WebSceneMediaBlockCacheInit(root):
+        return fail("Init failed")
+    # 1. 容量参数: 非法值诚实 false 不生效, 合法值生效。
+    if blockcache.WebSceneMediaBlockCacheSetCapacity(0, 600):
+        return fail("SetCapacity(0, 600) must be false (non-positive max)")
+    if blockcache.WebSceneMediaBlockCacheSetCapacity(1000, 0):
+        return fail("SetCapacity(1000, 0) must be false (non-positive target)")
+    if blockcache.WebSceneMediaBlockCacheSetCapacity(600, 1000):
+        return fail("SetCapacity(600, 1000) must be false (target > max)")
+    if !blockcache.WebSceneMediaBlockCacheSetCapacity(1000, 600):
+        return fail("SetCapacity(1000, 600) failed")
+    os.WriteLine(os.Get_stdout(), "step1_capacity_args_ok")
+
+    # 2. 未越限不淘汰: 3x300=900 <= 1000。
+    if !blockcache.WebSceneMediaBlockCachePut(assetCid, 0, buildPayload(0)):
+        return fail("Put(0) failed")
+    os.SleepMs(15)
+    if !blockcache.WebSceneMediaBlockCachePut(assetCid, 120, buildPayload(120)):
+        return fail("Put(120) failed")
+    os.SleepMs(15)
+    if !blockcache.WebSceneMediaBlockCachePut(assetCid, 240, buildPayload(240)):
+        return fail("Put(240) failed")
+    var rc = expectFileHit(root, assetCid, 0, false)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 120, false)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 240, false)
+    if rc != 0:
+        return rc
+    os.WriteLine(os.Get_stdout(), "step2_under_cap_no_eviction_ok")
+
+    # 3. Get 命中刷新 lastAccess 可观察: 此刻 0 被模块 Get 读一次(MRU)。随后 Put(360) 越限
+    # 1200 > 1000 → 按 lastAccess 升序淘汰到 <=600: 120 最老、240 次之被淘汰; 0(刚读)与
+    # 360(新写)保留。若 touch 不生效, 0(t0) 比 120(t1) 更老, 被淘汰的会是 0——断言可区分。
+    os.SleepMs(15)
+    let touchRes: Result[Bytes] = blockcache.WebSceneMediaBlockCacheGet(assetCid, 0)
+    if IsErr(touchRes):
+        return fail("Get(0) for LRU touch returned Err")
+    if !bytesEqualExact(Value(touchRes), buildPayload(0)):
+        return fail("Get(0) bytes mismatch")
+    os.SleepMs(15)
+    if !blockcache.WebSceneMediaBlockCachePut(assetCid, 360, buildPayload(360)):
+        return fail("Put(360) failed")
+    rc = expectFileGone(root, assetCid, 120, false)
+    if rc != 0:
+        return rc
+    rc = expectFileGone(root, assetCid, 240, false)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 0, false)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 360, false)
+    if rc != 0:
+        return rc
+    # 被淘汰键的模块 Get 必须返回 Err, 不静默返回空/垃圾数据。
+    if IsOk(blockcache.WebSceneMediaBlockCacheGet(assetCid, 120)):
+        return fail("Get(120) after eviction must be Err, not silent Ok")
+    os.WriteLine(os.Get_stdout(), "step3_lru_touch_observable_ok")
+
+    # 4. pinned 豁免: pin 住全场最老的 0; 越限后候选只剩 360/480/600, 淘汰 360、480 到
+    # <=600, 0 以最老身份两次越过淘汰。不存在的键 pin 诚实 false。
+    if !blockcache.WebSceneMediaBlockCachePut(assetCid, 480, buildPayload(480)):
+        return fail("Put(480) failed")
+    os.SleepMs(15)
+    if !blockcache.WebSceneMediaBlockCacheSetPinned(assetCid, 0, false, true):
+        return fail("SetPinned(0, true) failed on existing key")
+    if blockcache.WebSceneMediaBlockCacheSetPinned(assetCid, 999, false, true):
+        return fail("SetPinned(999) must be false on absent key")
+    os.SleepMs(15)
+    if !blockcache.WebSceneMediaBlockCachePut(assetCid, 600, buildPayload(600)):
+        return fail("Put(600) failed")
+    rc = expectFileHit(root, assetCid, 0, false)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 600, false)
+    if rc != 0:
+        return rc
+    rc = expectFileGone(root, assetCid, 360, false)
+    if rc != 0:
+        return rc
+    rc = expectFileGone(root, assetCid, 480, false)
+    if rc != 0:
+        return rc
+    os.WriteLine(os.Get_stdout(), "step4_pinned_exempt_ok")
+
+    # 5. 音频双键空间: a-96 存在而 96(视频键)从不存在, 互不命中; unpin 后 0 恢复可淘汰;
+    # 越限按同一 LRU 淘汰 0、600, 音频块 a-96 与 720 保留——音频参与同一容量同一 LRU。
+    if !blockcache.WebSceneMediaBlockCacheSetPinned(assetCid, 0, false, false):
+        return fail("SetPinned(0, false) failed")
+    if !blockcache.WebSceneMediaBlockCachePutAudio(assetCid, 96, buildPayload(96)):
+        return fail("PutAudio(96) failed")
+    rc = expectFileHit(root, assetCid, 96, true)
+    if rc != 0:
+        return rc
+    rc = expectFileGone(root, assetCid, 96, false)
+    if rc != 0:
+        return rc
+    os.SleepMs(15)
+    if !blockcache.WebSceneMediaBlockCachePut(assetCid, 720, buildPayload(720)):
+        return fail("Put(720) failed")
+    rc = expectFileGone(root, assetCid, 0, false)
+    if rc != 0:
+        return rc
+    rc = expectFileGone(root, assetCid, 600, false)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 96, true)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 720, false)
+    if rc != 0:
+        return rc
+    os.WriteLine(os.Get_stdout(), "step5_audio_keyspace_shared_lru_ok")
+
+    os.WriteLine(os.Get_stdout(), "EVICT_OK")
+    return 0
+
+fn runPersistFill(root: str, assetCid: str): int32 =
+    if !blockcache.WebSceneMediaBlockCacheInit(root):
+        return fail("Init failed")
+    if !blockcache.WebSceneMediaBlockCacheSetCapacity(100000, 90000):
+        return fail("SetCapacity failed")
+    if !blockcache.WebSceneMediaBlockCachePut(assetCid, 0, buildPayload(0)):
+        return fail("Put(0) failed")
+    os.SleepMs(15)
+    if !blockcache.WebSceneMediaBlockCachePut(assetCid, 120, buildPayload(120)):
+        return fail("Put(120) failed")
+    os.SleepMs(15)
+    if !blockcache.WebSceneMediaBlockCachePut(assetCid, 240, buildPayload(240)):
+        return fail("Put(240) failed")
+    os.WriteLine(os.Get_stdout(), "PERSIST_FILL_OK")
+    return 0
+
+fn runPersistEvict(root: str, assetCid: str): int32 =
+    # 全新进程: Init 载清单 + 磁盘对账, 进程 #1 写的 3 块必须全部仍在(清单跨进程往返)。
+    # 用文件断言而非模块 Get——Get 会刷新 lastAccess, 搅乱待验证的持久化 LRU 序。
+    if !blockcache.WebSceneMediaBlockCacheInit(root):
+        return fail("Init failed in fresh process")
+    var rc = expectFileHit(root, assetCid, 0, false)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 120, false)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 240, false)
+    if rc != 0:
+        return rc
+    os.WriteLine(os.Get_stdout(), "step1_manifest_cross_process_ok")
+
+    # 越限 Put: 900+300=1200 > 1000 → 按进程 #1 持久化的 lastAccess 序淘汰 0、120 到 <=600。
+    if !blockcache.WebSceneMediaBlockCacheSetCapacity(1000, 600):
+        return fail("SetCapacity(1000, 600) failed")
+    os.SleepMs(15)
+    if !blockcache.WebSceneMediaBlockCachePut(assetCid, 360, buildPayload(360)):
+        return fail("Put(360) failed")
+    rc = expectFileGone(root, assetCid, 0, false)
+    if rc != 0:
+        return rc
+    rc = expectFileGone(root, assetCid, 120, false)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 240, false)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 360, false)
+    if rc != 0:
+        return rc
+    os.WriteLine(os.Get_stdout(), "step2_persisted_lru_order_ok")
+
+    # 收缩容量上限立即生效: 600 > 350 → 淘汰最老的 240 到 <=300。
+    if !blockcache.WebSceneMediaBlockCacheSetCapacity(350, 300):
+        return fail("SetCapacity(350, 300) failed")
+    rc = expectFileGone(root, assetCid, 240, false)
+    if rc != 0:
+        return rc
+    rc = expectFileHit(root, assetCid, 360, false)
+    if rc != 0:
+        return rc
+    os.WriteLine(os.Get_stdout(), "step3_capacity_shrink_evicts_ok")
+
+    os.WriteLine(os.Get_stdout(), "PERSIST_EVICT_OK")
+    return 0
+
+fn main(): int32 =
+    var rootRaw: str
+    let hasRoot: bool = cmdline.ReadFirstFlagValue("--root", rootRaw)
+    if !hasRoot:
+        return fail("missing --root")
+    var assetCidRaw: str
+    let hasAssetCid: bool = cmdline.ReadFirstFlagValue("--asset-cid", assetCidRaw)
+    if !hasAssetCid:
+        return fail("missing --asset-cid")
+    var modeRaw: str
+    let hasMode: bool = cmdline.ReadFirstFlagValue("--mode", modeRaw)
+    let mode: str = if hasMode: modeRaw else: "evict"
+
+    if mode == "persist-fill":
+        return runPersistFill(rootRaw, assetCidRaw)
+    if mode == "persist-evict":
+        return runPersistEvict(rootRaw, assetCidRaw)
+    return runEvict(rootRaw, assetCidRaw)

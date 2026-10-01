@@ -1,0 +1,177 @@
+# libp2p P5 收口: channel-head 持久 pin — head-store 跨会话 TOFU 信任状态 (正典 §11.6 P5 收口)。
+# 缺口: fetch-head 生产路径 (net_cas_cli → cas_fetch_subprocess) 此前只落 <store>/heads/<chan>.headcid
+# 内容缓存 (且子进程每次 fetch 前去陈), signer pin 与 last-admitted epoch 不过夜 —— 新进程对同
+# channel 收【合法签名的旧 epoch head】(跨会话回滚重放) 或同 epoch 分叉 head 无从拒。
+#
+# 落盘: <store>/heads/<channelIdHex>.pin (行式 key=value, tmp+rename 原子写, 照 tofu.cheng 范式):
+#   signer=<64hex raw ed25519 pubkey>
+#   epoch=<dec last admitted>
+#   headcid=<64hex last admitted headCid>
+#
+# 四臂语义 (与 tofu.TofuAdmit 的关键差异 = 幂等重取放行 + 同 epoch 分叉拒):
+#   无 pin        → 首用即钉 (admit 落盘)
+#   signer ≠ pin  → 换钥硬拒 (defense-in-depth: channelId==sha256(signer) 自证在 decode 层已绊一脚,
+#                   pin 臂拦"信任状态被外因指向异钥"的存储层混淆)
+#   epoch < pin   → 回滚硬拒 (跨会话重放防护 —— 本模块的载重臂, 网络层各门皆不覆盖)
+#   epoch == pin  → headCid 同 = 幂等重取放行 (不重写; 缺锁重建/重启重取是合法流);
+#                   headCid 异 = 同 epoch 分叉 (equivocation) 硬拒
+#   epoch > pin   → admit + pin 单调前进 (原子重写)
+#
+# 职责分离: .pin 是信任状态 (本模块专辖), .headcid 是内容缓存 (net_cas_cli 写/子进程消费), 互不混写。
+# 与 tofu.cheng (channel_trust.txt) 关系: tofu 是库级 TOFU (smoke/委托调用方显式用), 零改动; 本模块
+# 是 fetch-head 生产路径的 per-channel 持久 pin, 平行库不互写 (照 authz_store 三副平行库先例)。
+# rotation 边界: 0x31 redirect 走 authz_resolver/authz_store 本地库路径, fetch 面尚无 rotation 传输
+# verb; rotation 合法过户后新 channelId 自然有自己的 .pin (按 channelIdHex 键), 旧 channel pin 不被
+# 改写 (admit 只写 record.channelId 自己的 pin 文件)。
+#
+# 生产纪律 (no fallback / let it crash): pin 存在但畸形 = 硬 Err (信任状态损坏必须浮现, 绝不静默当
+# 无 pin 重钉); 负路径零写 (Check 只读, Admit 拒时不动盘)。
+
+import std/result
+import std/os
+import std/rawbytes
+import std/strutils as strutil
+import std/strings
+import std/parseutils
+import cheng/std/bytes_layout as layout
+import cheng/libp2p/protocols/cas_source/channel_head/head_codec as head
+
+type
+    ChannelHeadPinRecord =
+        found: bool
+        signerPubKeyHex: str
+        epoch: int64
+        headCidHex: str
+
+fn ChannelHeadPinPath(storeRoot: str, channelIdHex: str): str =
+    return storeRoot + "/heads/" + channelIdHex + ".pin"
+
+# 严格纯十进制 int64 (信任状态解析不用宽松 parseInt64 —— 它吞尾垃圾): 任何非数字字符 = false。
+fn channelHeadPinParseEpoch(text: str, outEpoch: var int64): bool =
+    outEpoch = 0
+    if text == "":
+        return false
+    var i: int32 = 0
+    while i < text.len:
+        let c = text[i]
+        if c < '0' || c > '9':
+            return false
+        i = i + 1
+    var ep: int64 = 0
+    if parseutils.parseInt64(text, ep) <= 0:
+        return false
+    if ep < 0:
+        return false
+    outEpoch = ep
+    return true
+
+# 读持久 pin: 缺文件 = outPin.found=false (首用未钉, 非错); 存在但畸形 = 硬 Err。
+# out-var 出参 + Result[bool] (照 FetchCasHead 惯用形, 规避跨函数返回大 object 的已知 ABI 风险;
+# 注意 2026-07-08 撞的 miscompile 真触发点是【netCasFetchHeadOverPeers 环内跨 dial 加调用】,
+# 与本函数返回形态无关 — 空身体调用也触发, 见 net_cas_cli_main.netCasFetchHeadOverPeers 头注)。
+fn ChannelHeadPinLoad(storeRoot: str, channelIdHex: str, outPin: var ChannelHeadPinRecord): Result[bool] =
+    outPin.found = false
+    outPin.signerPubKeyHex = ""
+    outPin.epoch = 0
+    outPin.headCidHex = ""
+    if storeRoot == "":
+        return Err[bool]("head pin: empty storeRoot")
+    if channelIdHex == "":
+        return Err[bool]("head pin: empty channelIdHex")
+    let path = ChannelHeadPinPath(storeRoot, channelIdHex)
+    if !os.FileExists(path):
+        return Ok[bool](true)
+    var readRes: Result[str] = os.ReadFileResult(path)
+    if IsErr(readRes):
+        return Err[bool]("head pin: pin read failed: " + path)
+    let rawLines = strutil.Split(Value(readRes), '\n')
+    var haveSigner = false
+    var haveEpoch = false
+    var haveHead = false
+    var lineCount: int32 = 0
+    for i in 0..<rawLines.len:
+        let line = strutil.Strip(rawLines[i])
+        if line == "":
+            continue
+        lineCount = lineCount + 1
+        let parts = strutil.Split(line, '=')
+        if parts.len != 2:
+            return Err[bool]("head pin: pin 行畸形 (需 key=value): " + path)
+        let key = strutil.Strip(parts[0])
+        let valuePart = strutil.Strip(parts[1])
+        if key == "signer":
+            if valuePart.len != 64:
+                return Err[bool]("head pin: signer 非 64 hex: " + path)
+            outPin.signerPubKeyHex = valuePart
+            haveSigner = true
+        elif key == "epoch":
+            var ep: int64 = 0
+            if !channelHeadPinParseEpoch(valuePart, ep):
+                return Err[bool]("head pin: epoch 非法: " + path)
+            outPin.epoch = ep
+            haveEpoch = true
+        elif key == "headcid":
+            if valuePart.len != 64:
+                return Err[bool]("head pin: headcid 非 64 hex: " + path)
+            outPin.headCidHex = valuePart
+            haveHead = true
+        else:
+            return Err[bool]("head pin: 未知键 " + key + ": " + path)
+    if lineCount != 3 || !haveSigner || !haveEpoch || !haveHead:
+        return Err[bool]("head pin: pin 文件畸形 (需恰 signer/epoch/headcid 三行): " + path)
+    outPin.found = true
+    return Ok[bool](true)
+
+# 只读四臂裁决 (不写盘): Ok = 可 admit (首钉/幂等/前进); Err = 拒 (换钥/回滚/同 epoch 分叉/pin 损坏),
+# rejectReason 各自独立 (分层拒证明用)。record 须已过网络层三重验 (decode 自证 + 验签 + 请求绑定)。
+# record 用 var 显式借用 (只读): 大 object 跨模块值参 ABI 有风险 (lessons: 值传丢字段/污染邻栈)。
+fn ChannelHeadPinCheck(storeRoot: str, record: var head.ChannelHeadRecord): Result[bool] =
+    if BytesLen(record.signerPubKey) != 32:
+        return Err[bool]("head pin: signerPubKey 必须 32B")
+    let channelIdHex = layout.FixedBytes32Hex(record.channelId)
+    var pin: ChannelHeadPinRecord
+    var loadRes: Result[bool] = ChannelHeadPinLoad(storeRoot, channelIdHex, pin)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    if !pin.found:
+        return Ok[bool](true)
+    let signerHex = rawbytes.BytesToHex(record.signerPubKey)
+    if pin.signerPubKeyHex != signerHex:
+        return Err[bool]("head pin: signer key change rejected channel=" + channelIdHex)
+    if record.epoch < pin.epoch:
+        return Err[bool]("head pin: epoch rollback rejected channel=" + channelIdHex + " pinned=" + strings.Int64ToStr(pin.epoch) + " got=" + strings.Int64ToStr(record.epoch))
+    if record.epoch == pin.epoch:
+        let headHex = layout.FixedBytes32Hex(record.headCid)
+        if headHex != pin.headCidHex:
+            return Err[bool]("head pin: same-epoch equivocation rejected channel=" + channelIdHex + " epoch=" + strings.Int64ToStr(record.epoch))
+    return Ok[bool](true)
+
+# Check 通过后落盘: 首钉/epoch 前进 → tmp+rename 原子写; 幂等重取 (同 epoch 同 headCid) → 不动盘。
+# 拒 = 硬 Err 且零写 (pin 零污染)。record 同上 var 显式借用 (只读)。
+fn ChannelHeadPinAdmit(storeRoot: str, record: var head.ChannelHeadRecord): Result[bool] =
+    var checkRes: Result[bool] = ChannelHeadPinCheck(storeRoot, record)
+    if IsErr(checkRes):
+        return Err[bool](Error(checkRes))
+    let channelIdHex = layout.FixedBytes32Hex(record.channelId)
+    var pin: ChannelHeadPinRecord
+    var loadRes: Result[bool] = ChannelHeadPinLoad(storeRoot, channelIdHex, pin)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    if pin.found && record.epoch == pin.epoch:
+        return Ok[bool](true)
+    var body = "signer=" + rawbytes.BytesToHex(record.signerPubKey) + "\n"
+    body = body + "epoch=" + strings.Int64ToStr(record.epoch) + "\n"
+    body = body + "headcid=" + layout.FixedBytes32Hex(record.headCid) + "\n"
+    os.MkdirAll(storeRoot + "/heads", 493)
+    let path = ChannelHeadPinPath(storeRoot, channelIdHex)
+    let tmpPath = path + ".tmp"
+    if os.FileExists(tmpPath):
+        os.RemoveFile(tmpPath)
+    var wr: Result[bool] = os.WriteFileResult(tmpPath, body)
+    if !wr.ok:
+        os.RemoveFile(tmpPath)
+        return Err[bool]("head pin: tmp write failed: " + tmpPath)
+    if os.RenameFile(tmpPath, path):
+        return Ok[bool](true)
+    os.RemoveFile(tmpPath)
+    return Err[bool]("head pin: rename failed: " + path)

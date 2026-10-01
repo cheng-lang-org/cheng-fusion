@@ -1,0 +1,878 @@
+# TLS 1.3 handshake message codec (RFC 8446 section 4) — W2 first slice (i1).
+#
+# Minimal field set: suite TLS_AES_128_GCM_SHA256, group x25519,
+# signature ed25519. Unknown extensions are skipped (ignored, never fatal);
+# malformed lengths and overruns are rejected with a precise error text.
+#
+# Compiler-generation contract (frozen stage3 driver, learned by probe):
+#   - managed-struct values do not cross module boundaries: decode fills
+#     module-local state slots; accessors return scalars / owned Bytes / str;
+#   - no managed (Bytes/str) stores through var-parameters: the decode
+#     functions write their scratch cursors and state slots inline;
+#   - list state is fixed-capacity int32 arrays (no dynamic seq globals);
+#   - byte buffers use bytebuffer.GrowByteBuffer with an owned copy out of
+#     ToBytes (BytesBuilder local vars are not admitted by this driver).
+#
+# Builders take scalar + Bytes inputs and return framed handshake messages;
+# tls13XxxRoundtrip decodes and re-encodes in-module for byte-identity tests.
+
+import std/result
+import std/rawbytes
+import std/strings
+import std/buffer as bytebuffer
+
+const
+    tls13HsClientHello: int32 = 1
+    tls13HsServerHello: int32 = 2
+    tls13HsNewSessionTicket: int32 = 4
+    tls13HsEncryptedExtensions: int32 = 8
+    tls13HsCertificate: int32 = 11
+    tls13HsCertificateRequest: int32 = 13
+    tls13HsCertificateVerify: int32 = 15
+    tls13HsFinished: int32 = 20
+    tls13HsKeyUpdate: int32 = 24
+
+    tls13LegacyVersion: int32 = 771        # 0x0303
+    tls13Version: int32 = 772              # 0x0304
+
+    tls13CipherAes128GcmSha256: int32 = 4865   # 0x1301
+
+    tls13GroupX25519: int32 = 29           # 0x001d
+
+    tls13SigEd25519: int32 = 2055          # 0x0807
+
+    tls13ExtServerName: int32 = 0
+    tls13ExtSupportedGroups: int32 = 10
+    tls13ExtSignatureAlgorithms: int32 = 13
+    tls13ExtSupportedVersions: int32 = 43
+    tls13ExtKeyShare: int32 = 51
+
+    tls13MaxCertEntries: int32 = 4
+    tls13MaxListItems: int32 = 16
+
+type
+    Tls13IdList =
+        count: int32
+        items: int32[tls13MaxListItems]
+
+    Tls13Cursor =
+        data: Bytes
+        pos: int32
+        failCode: int32
+
+var
+    tls13LastError: str
+    tls13Cursor: Tls13Cursor
+    tls13SubCursor: Tls13Cursor
+
+    tls13ChLegacyVersion: int32
+    tls13ChRandom: Bytes
+    tls13ChSessionId: Bytes
+    tls13ChSuites: Tls13IdList
+    tls13ChServerName: str
+    tls13ChGroups: Tls13IdList
+    tls13ChSigAlgs: Tls13IdList
+    tls13ChKeyShareGroup: int32
+    tls13ChKeyShare: Bytes
+    tls13ChSelectedVersion: int32
+
+    tls13ShLegacyVersion: int32
+    tls13ShRandom: Bytes
+    tls13ShSessionId: Bytes
+    tls13ShCipherSuite: int32
+    tls13ShCompression: int32
+    tls13ShKeyShareGroup: int32
+    tls13ShKeyShare: Bytes
+    tls13ShSelectedVersion: int32
+
+    tls13EeGroups: Tls13IdList
+
+    tls13CertContext: Bytes
+    tls13CertDer0: Bytes
+    tls13CertDer1: Bytes
+    tls13CertDer2: Bytes
+    tls13CertDer3: Bytes
+    tls13CertCount: int32
+
+    tls13CvScheme: int32
+    tls13CvSignature: Bytes
+
+    tls13FinVerifyData: Bytes
+
+# ---------- error surface ----------
+
+fn tls13LastErrorText(): str =
+    return strings.CloneStr(tls13LastError)
+
+# ---------- owned copies ----------
+
+@borrows
+fn tls13OwnedBytes(src: Bytes): Bytes =
+    let n: int32 = BytesLen(src)
+    let out: Bytes = BytesAlloc(n)
+    if n <= 0:
+        return out
+    BytesCopyInto(out, 0, src)
+    return out
+
+# ---------- cursor (single module-local instance per nesting level) ----------
+# failCode: 0 ok, 1 vector overrun, 2 odd cipher length, 3 extension block
+# overrun, 4 certificate_list overrun.
+
+fn tls13CursorReset(data: Bytes) =
+    tls13Cursor.data = data
+    tls13Cursor.pos = 0
+    tls13Cursor.failCode = 0
+
+fn tls13SubCursorReset(data: Bytes) =
+    tls13SubCursor.data = data
+    tls13SubCursor.pos = 0
+    tls13SubCursor.failCode = 0
+
+fn tls13CursorFail(code: int32) =
+    if tls13Cursor.failCode == 0:
+        tls13Cursor.failCode = code
+
+fn tls13SubCursorFail(code: int32) =
+    if tls13SubCursor.failCode == 0:
+        tls13SubCursor.failCode = code
+
+fn tls13CursorOk(): bool =
+    return tls13Cursor.failCode == 0
+
+fn tls13SubCursorOk(): bool =
+    return tls13SubCursor.failCode == 0
+
+fn tls13CursorRemaining(): int32 =
+    if tls13Cursor.failCode != 0:
+        return 0
+    return BytesLen(tls13Cursor.data) - tls13Cursor.pos
+
+fn tls13CursorTake(count: int32): Bytes =
+    if tls13Cursor.failCode != 0:
+        return EmptyBytes()
+    let remaining: int32 = BytesLen(tls13Cursor.data) - tls13Cursor.pos
+    if count < 0 || count > remaining:
+        tls13CursorFail(1)
+        return EmptyBytes()
+    let out: Bytes = BytesSlice(tls13Cursor.data, tls13Cursor.pos, count)
+    tls13Cursor.pos = tls13Cursor.pos + count
+    return out
+
+fn tls13CursorSkip(count: int32) =
+    if tls13Cursor.failCode != 0:
+        return
+    let remaining: int32 = BytesLen(tls13Cursor.data) - tls13Cursor.pos
+    if count < 0 || count > remaining:
+        tls13CursorFail(1)
+        return
+    tls13Cursor.pos = tls13Cursor.pos + count
+
+fn tls13CursorU8(): int32 =
+    if tls13Cursor.failCode != 0:
+        return 0
+    if tls13CursorRemaining() < 1:
+        tls13CursorFail(1)
+        return 0
+    let v: int32 = BytesGet(tls13Cursor.data, tls13Cursor.pos)
+    tls13Cursor.pos = tls13Cursor.pos + 1
+    return v
+
+fn tls13CursorU16(): int32 =
+    if tls13Cursor.failCode != 0:
+        return 0
+    if tls13CursorRemaining() < 2:
+        tls13CursorFail(1)
+        return 0
+    let hi: int32 = BytesGet(tls13Cursor.data, tls13Cursor.pos)
+    let lo: int32 = BytesGet(tls13Cursor.data, tls13Cursor.pos + 1)
+    tls13Cursor.pos = tls13Cursor.pos + 2
+    return hi * 256 + lo
+
+fn tls13CursorU24(): int32 =
+    if tls13Cursor.failCode != 0:
+        return 0
+    if tls13CursorRemaining() < 3:
+        tls13CursorFail(1)
+        return 0
+    let b0: int32 = BytesGet(tls13Cursor.data, tls13Cursor.pos)
+    let b1: int32 = BytesGet(tls13Cursor.data, tls13Cursor.pos + 1)
+    let b2: int32 = BytesGet(tls13Cursor.data, tls13Cursor.pos + 2)
+    tls13Cursor.pos = tls13Cursor.pos + 3
+    return b0 * 65536 + b1 * 256 + b2
+
+fn tls13SubCursorRemaining(): int32 =
+    if tls13SubCursor.failCode != 0:
+        return 0
+    return BytesLen(tls13SubCursor.data) - tls13SubCursor.pos
+
+fn tls13SubCursorTake(count: int32): Bytes =
+    if tls13SubCursor.failCode != 0:
+        return EmptyBytes()
+    let remaining: int32 = BytesLen(tls13SubCursor.data) - tls13SubCursor.pos
+    if count < 0 || count > remaining:
+        tls13SubCursorFail(1)
+        return EmptyBytes()
+    let out: Bytes = BytesSlice(tls13SubCursor.data, tls13SubCursor.pos, count)
+    tls13SubCursor.pos = tls13SubCursor.pos + count
+    return out
+
+fn tls13SubCursorSkip(count: int32) =
+    if tls13SubCursor.failCode != 0:
+        return
+    let remaining: int32 = BytesLen(tls13SubCursor.data) - tls13SubCursor.pos
+    if count < 0 || count > remaining:
+        tls13SubCursorFail(1)
+        return
+    tls13SubCursor.pos = tls13SubCursor.pos + count
+
+fn tls13SubCursorU8(): int32 =
+    if tls13SubCursor.failCode != 0:
+        return 0
+    if tls13SubCursorRemaining() < 1:
+        tls13SubCursorFail(1)
+        return 0
+    let v: int32 = BytesGet(tls13SubCursor.data, tls13SubCursor.pos)
+    tls13SubCursor.pos = tls13SubCursor.pos + 1
+    return v
+
+fn tls13SubCursorU16(): int32 =
+    if tls13SubCursor.failCode != 0:
+        return 0
+    if tls13SubCursorRemaining() < 2:
+        tls13SubCursorFail(1)
+        return 0
+    let hi: int32 = BytesGet(tls13SubCursor.data, tls13SubCursor.pos)
+    let lo: int32 = BytesGet(tls13SubCursor.data, tls13SubCursor.pos + 1)
+    tls13SubCursor.pos = tls13SubCursor.pos + 2
+    return hi * 256 + lo
+
+fn tls13CursorFailText(): str =
+    if tls13Cursor.failCode == 2:
+        return "tls13: cipher_suites length odd"
+    if tls13Cursor.failCode == 3:
+        return "tls13: extension block overruns message body"
+    if tls13Cursor.failCode == 4:
+        return "tls13: certificate_list overruns body"
+    return "tls13: vector overruns message body"
+
+# ---------- byte writers ----------
+
+fn tls13PutU8(b: var bytebuffer.GrowByteBuffer, v: int32) =
+    bytebuffer.AppendByte(b, v)
+
+fn tls13PutU16(b: var bytebuffer.GrowByteBuffer, v: int32) =
+    bytebuffer.AppendByte(b, v / 256)
+    bytebuffer.AppendByte(b, v - (v / 256) * 256)
+
+fn tls13PutU24(b: var bytebuffer.GrowByteBuffer, v: int32) =
+    bytebuffer.AppendByte(b, v / 65536)
+    bytebuffer.AppendByte(b, (v / 256) - (v / 65536) * 256)
+    bytebuffer.AppendByte(b, v - (v / 256) * 256)
+
+fn tls13PutBytes(b: var bytebuffer.GrowByteBuffer, data: Bytes) =
+    bytebuffer.AppendBytes(b, data)
+
+fn tls13PutBytesWithU16Len(b: var bytebuffer.GrowByteBuffer, data: Bytes) =
+    tls13PutU16(b, BytesLen(data))
+    bytebuffer.AppendBytes(b, data)
+
+# Extension block layout: opaque extensions<2..2^16-1>.
+fn tls13BufOwned(b: var bytebuffer.GrowByteBuffer): Bytes =
+    let view: Bytes = bytebuffer.ToBytes(b)
+    return tls13OwnedBytes(view)
+
+fn tls13BuildExtensions(inner: Bytes): Bytes =
+    var b: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutU16(b, BytesLen(inner))
+    bytebuffer.AppendBytes(b, inner)
+    return tls13BufOwned(b)
+
+# ---------- handshake frame header ----------
+
+fn tls13HandshakeFrame(kind: int32, body: Bytes): Bytes =
+    let n: int32 = BytesLen(body)
+    let out: Bytes = BytesAlloc(4 + n)
+    BytesSet(out, 0, kind)
+    BytesSet(out, 1, n / 65536)
+    BytesSet(out, 2, (n / 256) - (n / 65536) * 256)
+    BytesSet(out, 3, n - (n / 256) * 256)
+    if n > 0:
+        BytesCopyInto(out, 4, body)
+    return out
+
+# shared prologue: validates header + kind + length, primes tls13Cursor
+fn tls13UnframeCheck(raw: Bytes, wantKind: int32): bool =
+    if BytesLen(raw) < 4:
+        tls13LastError = "tls13: handshake message shorter than header"
+        return false
+    if BytesGet(raw, 0) != wantKind:
+        tls13LastError = "tls13: unexpected handshake message kind"
+        return false
+    let claim: int32 = BytesGet(raw, 1) * 65536 + BytesGet(raw, 2) * 256 + BytesGet(raw, 3)
+    let have: int32 = BytesLen(raw) - 4
+    if claim != have:
+        tls13LastError = "tls13: handshake length header mismatch"
+        return false
+    tls13CursorReset(BytesSlice(raw, 4, have))
+    return true
+
+# ---------- ClientHello decode ----------
+
+fn tls13DecodeClientHello(raw: Bytes): Result[bool] =
+    if !tls13UnframeCheck(raw, tls13HsClientHello):
+        return Err[bool](tls13LastError)
+    tls13ChLegacyVersion = tls13CursorU16()
+    tls13ChRandom = tls13CursorTake(32)
+    tls13ChSessionId = tls13CursorTake(tls13CursorU8())
+    let cipherLen: int32 = tls13CursorU16()
+    if cipherLen % 2 != 0:
+        tls13CursorFail(2)
+    tls13ChSuites.count = 0
+    while tls13CursorOk() && tls13CursorRemaining() > 0 && tls13ChSuites.count * 2 + 2 <= cipherLen && tls13ChSuites.count < tls13MaxListItems:
+        tls13ChSuites.items[tls13ChSuites.count] = tls13CursorU16()
+        tls13ChSuites.count = tls13ChSuites.count + 1
+    tls13CursorSkip(tls13CursorU8())           # legacy_compression_methods
+    let extTotal: int32 = tls13CursorU16()
+    let extEnd: int32 = tls13Cursor.pos + extTotal
+    if extEnd > BytesLen(tls13Cursor.data):
+        tls13CursorFail(3)
+    tls13ChGroups.count = 0
+    tls13ChSigAlgs.count = 0
+    var sni: str = ""
+    var ksGroup: int32 = 0
+    var ksKey: Bytes = EmptyBytes()
+    var selVersion: int32 = 0
+    while tls13CursorOk() && tls13Cursor.pos < extEnd:
+        let etype: int32 = tls13CursorU16()
+        let edata: Bytes = tls13CursorTake(tls13CursorU16())
+        tls13SubCursorReset(edata)
+        if etype == tls13ExtServerName:
+            let listLen: int32 = tls13SubCursorU16()   # server_name_list length
+            let nameType: int32 = tls13SubCursorU8()
+            let name: Bytes = tls13SubCursorTake(tls13SubCursorU16())
+            if tls13SubCursorOk() && nameType == 0 && BytesLen(name) > 0:
+                sni = BytesToString(name)
+        if etype == tls13ExtSupportedGroups:
+            let listLen: int32 = tls13SubCursorU16()
+            while tls13SubCursorOk() && tls13SubCursorRemaining() >= 2 && tls13ChGroups.count * 2 + 2 <= listLen && tls13ChGroups.count < tls13MaxListItems:
+                tls13ChGroups.items[tls13ChGroups.count] = tls13SubCursorU16()
+                tls13ChGroups.count = tls13ChGroups.count + 1
+        if etype == tls13ExtSignatureAlgorithms:
+            let listLen: int32 = tls13SubCursorU16()
+            while tls13SubCursorOk() && tls13SubCursorRemaining() >= 2 && tls13ChSigAlgs.count * 2 + 2 <= listLen && tls13ChSigAlgs.count < tls13MaxListItems:
+                tls13ChSigAlgs.items[tls13ChSigAlgs.count] = tls13SubCursorU16()
+                tls13ChSigAlgs.count = tls13ChSigAlgs.count + 1
+        if etype == tls13ExtSupportedVersions:
+            let versionsLen: int32 = tls13SubCursorU8()   # list length in bytes
+            while tls13SubCursorOk() && tls13SubCursorRemaining() >= 2 && versionsLen > 0:
+                let v: int32 = tls13SubCursorU16()
+                if v == tls13Version:
+                    selVersion = v
+        if etype == tls13ExtKeyShare:
+            let sharesLen: int32 = tls13SubCursorU16()   # client_shares vector length
+            while tls13SubCursorOk() && tls13SubCursorRemaining() >= 4 && ksGroup == 0 && (tls13SubCursorRemaining() - 2) <= sharesLen:
+                let group: int32 = tls13SubCursorU16()
+                let key: Bytes = tls13SubCursorTake(tls13SubCursorU16())
+                if tls13SubCursorOk() && BytesLen(key) > 0 && group == tls13GroupX25519:
+                    ksGroup = group
+                    ksKey = key
+    if !tls13CursorOk():
+        tls13LastError = tls13CursorFailText()
+        return Err[bool](tls13LastError)
+    if tls13Cursor.pos != BytesLen(tls13Cursor.data):
+        tls13LastError = "tls13: trailing bytes after ClientHello"
+        return Err[bool](tls13LastError)
+    tls13ChServerName = sni
+    tls13ChKeyShareGroup = ksGroup
+    tls13ChKeyShare = ksKey
+    tls13ChSelectedVersion = selVersion
+    return Ok[bool](true)
+
+# ---------- ServerHello decode ----------
+
+fn tls13DecodeServerHello(raw: Bytes): Result[bool] =
+    if !tls13UnframeCheck(raw, tls13HsServerHello):
+        return Err[bool](tls13LastError)
+    tls13ShLegacyVersion = tls13CursorU16()
+    tls13ShRandom = tls13CursorTake(32)
+    tls13ShSessionId = tls13CursorTake(tls13CursorU8())
+    tls13ShCipherSuite = tls13CursorU16()
+    tls13ShCompression = tls13CursorU8()
+    let extTotal: int32 = tls13CursorU16()
+    let extEnd: int32 = tls13Cursor.pos + extTotal
+    if extEnd > BytesLen(tls13Cursor.data):
+        tls13CursorFail(3)
+    var ksGroup: int32 = 0
+    var ksKey: Bytes = EmptyBytes()
+    var selVersion: int32 = 0
+    while tls13CursorOk() && tls13Cursor.pos < extEnd:
+        let etype: int32 = tls13CursorU16()
+        let edata: Bytes = tls13CursorTake(tls13CursorU16())
+        tls13SubCursorReset(edata)
+        if etype == tls13ExtSupportedVersions:
+            if BytesLen(edata) == 2:
+                selVersion = tls13SubCursorU16()
+        if etype == tls13ExtKeyShare:
+            if tls13SubCursorRemaining() >= 4:
+                ksGroup = tls13SubCursorU16()
+                ksKey = tls13SubCursorTake(tls13SubCursorU16())
+    if !tls13CursorOk():
+        tls13LastError = tls13CursorFailText()
+        return Err[bool](tls13LastError)
+    if tls13Cursor.pos != BytesLen(tls13Cursor.data):
+        tls13LastError = "tls13: trailing bytes after ServerHello"
+        return Err[bool](tls13LastError)
+    tls13ShKeyShareGroup = ksGroup
+    tls13ShKeyShare = ksKey
+    tls13ShSelectedVersion = selVersion
+    return Ok[bool](true)
+
+# ---------- EncryptedExtensions decode ----------
+
+fn tls13DecodeEncryptedExtensions(raw: Bytes): Result[bool] =
+    if !tls13UnframeCheck(raw, tls13HsEncryptedExtensions):
+        return Err[bool](tls13LastError)
+    tls13EeGroups.count = 0
+    let extTotal: int32 = tls13CursorU16()
+    let extEnd: int32 = tls13Cursor.pos + extTotal
+    if extEnd > BytesLen(tls13Cursor.data):
+        tls13CursorFail(3)
+    while tls13CursorOk() && tls13Cursor.pos < extEnd:
+        let etype: int32 = tls13CursorU16()
+        let edata: Bytes = tls13CursorTake(tls13CursorU16())
+        if etype == tls13ExtSupportedGroups:
+            tls13SubCursorReset(edata)
+            let listLen: int32 = tls13SubCursorU16()
+            while tls13SubCursorOk() && tls13SubCursorRemaining() >= 2 && tls13EeGroups.count * 2 + 2 <= listLen && tls13EeGroups.count < tls13MaxListItems:
+                tls13EeGroups.items[tls13EeGroups.count] = tls13SubCursorU16()
+                tls13EeGroups.count = tls13EeGroups.count + 1
+    if !tls13CursorOk():
+        tls13LastError = tls13CursorFailText()
+        return Err[bool](tls13LastError)
+    if tls13Cursor.pos != BytesLen(tls13Cursor.data):
+        tls13LastError = "tls13: trailing bytes after EncryptedExtensions"
+        return Err[bool](tls13LastError)
+    return Ok[bool](true)
+
+# ---------- Certificate decode ----------
+
+fn tls13DecodeCertificate(raw: Bytes): Result[bool] =
+    if !tls13UnframeCheck(raw, tls13HsCertificate):
+        return Err[bool](tls13LastError)
+    var count: int32 = 0
+    tls13CertContext = tls13CursorTake(tls13CursorU8())
+    let listLen: int32 = tls13CursorU24()
+    let listEnd: int32 = tls13Cursor.pos + listLen
+    if listEnd > BytesLen(tls13Cursor.data):
+        tls13CursorFail(4)
+    while tls13CursorOk() && tls13Cursor.pos < listEnd && count < tls13MaxCertEntries:
+        let derLen: int32 = tls13CursorU24()
+        let der: Bytes = tls13CursorTake(derLen)
+        let extLen: int32 = tls13CursorU16()
+        tls13CursorSkip(extLen)
+        if tls13CursorOk():
+            if count == 0:
+                tls13CertDer0 = der
+            if count == 1:
+                tls13CertDer1 = der
+            if count == 2:
+                tls13CertDer2 = der
+            if count == 3:
+                tls13CertDer3 = der
+            count = count + 1
+    if !tls13CursorOk():
+        tls13LastError = tls13CursorFailText()
+        return Err[bool](tls13LastError)
+    if tls13Cursor.pos != BytesLen(tls13Cursor.data):
+        tls13LastError = "tls13: trailing bytes after Certificate"
+        return Err[bool](tls13LastError)
+    tls13CertCount = count
+    return Ok[bool](true)
+
+# ---------- CertificateVerify decode ----------
+
+fn tls13DecodeCertificateVerify(raw: Bytes): Result[bool] =
+    if !tls13UnframeCheck(raw, tls13HsCertificateVerify):
+        return Err[bool](tls13LastError)
+    let scheme: int32 = tls13CursorU16()
+    let sig: Bytes = tls13CursorTake(tls13CursorU16())
+    if !tls13CursorOk():
+        tls13LastError = tls13CursorFailText()
+        return Err[bool](tls13LastError)
+    if BytesLen(sig) <= 0 || BytesLen(sig) > 4096:
+        tls13LastError = "tls13: CertificateVerify signature length out of range"
+        return Err[bool](tls13LastError)
+    if tls13Cursor.pos != BytesLen(tls13Cursor.data):
+        tls13LastError = "tls13: trailing bytes after CertificateVerify"
+        return Err[bool](tls13LastError)
+    tls13CvScheme = scheme
+    tls13CvSignature = sig
+    return Ok[bool](true)
+
+# ---------- Finished decode ----------
+
+fn tls13DecodeFinished(raw: Bytes): Result[bool] =
+    if !tls13UnframeCheck(raw, tls13HsFinished):
+        return Err[bool](tls13LastError)
+    if BytesLen(tls13Cursor.data) <= 0 || BytesLen(tls13Cursor.data) > 64:
+        tls13LastError = "tls13: Finished verify_data length out of range"
+        return Err[bool](tls13LastError)
+    tls13FinVerifyData = tls13Cursor.data
+    return Ok[bool](true)
+
+# ---------- decoded-state accessors ----------
+
+fn tls13ChLegacyVersionOf(): int32 = tls13ChLegacyVersion
+fn tls13ChRandomOf(): Bytes =
+    return BytesSlice(tls13ChRandom, 0, BytesLen(tls13ChRandom))
+fn tls13ChSessionIdLenOf(): int32 = BytesLen(tls13ChSessionId)
+fn tls13ChCipherCountOf(): int32 = tls13ChSuites.count
+fn tls13ChCipherAtOf(idx: int32): int32 = tls13ChSuites.items[idx]
+fn tls13ChServerNameOf(): str =
+    return strings.CloneStr(tls13ChServerName)
+fn tls13ChGroupCountOf(): int32 = tls13ChGroups.count
+fn tls13ChGroupAtOf(idx: int32): int32 = tls13ChGroups.items[idx]
+fn tls13ChSigalgCountOf(): int32 = tls13ChSigAlgs.count
+fn tls13ChSigalgAtOf(idx: int32): int32 = tls13ChSigAlgs.items[idx]
+fn tls13ChKeyShareGroupOf(): int32 = tls13ChKeyShareGroup
+fn tls13ChKeyShareOf(): Bytes =
+    return BytesSlice(tls13ChKeyShare, 0, BytesLen(tls13ChKeyShare))
+fn tls13ChSelectedVersionOf(): int32 = tls13ChSelectedVersion
+
+fn tls13ShRandomOf(): Bytes =
+    return BytesSlice(tls13ShRandom, 0, BytesLen(tls13ShRandom))
+fn tls13ShCipherOf(): int32 = tls13ShCipherSuite
+fn tls13ShKeyShareGroupOf(): int32 = tls13ShKeyShareGroup
+fn tls13ShKeyShareOf(): Bytes =
+    return BytesSlice(tls13ShKeyShare, 0, BytesLen(tls13ShKeyShare))
+fn tls13ShSelectedVersionOf(): int32 = tls13ShSelectedVersion
+
+fn tls13EeGroupCountOf(): int32 = tls13EeGroups.count
+fn tls13EeGroupAtOf(idx: int32): int32 = tls13EeGroups.items[idx]
+
+fn tls13CertCountOf(): int32 = tls13CertCount
+fn tls13CertDerOf(idx: int32): Bytes =
+    let src: Bytes = tls13CertDerSlot(idx)
+    return BytesSlice(src, 0, BytesLen(src))
+
+fn tls13CertDerSlot(idx: int32): Bytes =
+    if idx == 0:
+        return BytesSlice(tls13CertDer0, 0, BytesLen(tls13CertDer0))
+    if idx == 1:
+        return BytesSlice(tls13CertDer1, 0, BytesLen(tls13CertDer1))
+    if idx == 2:
+        return BytesSlice(tls13CertDer2, 0, BytesLen(tls13CertDer2))
+    return BytesSlice(tls13CertDer3, 0, BytesLen(tls13CertDer3))
+
+fn tls13CvSchemeOf(): int32 = tls13CvScheme
+fn tls13CvSignatureOf(): Bytes =
+    return BytesSlice(tls13CvSignature, 0, BytesLen(tls13CvSignature))
+
+fn tls13FinVerifyDataOf(): Bytes =
+    return BytesSlice(tls13FinVerifyData, 0, BytesLen(tls13FinVerifyData))
+
+# ---------- builders (scalar inputs, framed output) ----------
+# Deterministic minimal-form encoders: cipher suites are the 4865..4865+n
+# prefix truncated to suiteCount, group ids are 29+i, sig algs are ed25519.
+
+fn tls13BuildClientHelloFrame(random: Bytes, sessionId: Bytes, suiteCount: int32, serverName: str, groupCount: int32, sigalgCount: int32, keyShare: Bytes, selectedVersion: int32): Bytes =
+    var ext: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    if len(serverName) > 0:
+        var sn: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(sn, len(serverName) + 3)
+        tls13PutU8(sn, 0)
+        tls13PutU16(sn, len(serverName))
+        var i: int32
+        while i < len(serverName):
+            bytebuffer.AppendByte(sn, int32(serverName[i]))
+            i = i + 1
+        tls13PutU16(ext, tls13ExtServerName)
+        let snOut: Bytes = tls13BufOwned(sn)
+        tls13PutBytesWithU16Len(ext, snOut)
+    if groupCount > 0:
+        var gl: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(gl, groupCount * 2)
+        var i: int32
+        while i < groupCount:
+            tls13PutU16(gl, 29 + i)
+            i = i + 1
+        tls13PutU16(ext, tls13ExtSupportedGroups)
+        let glOut: Bytes = tls13BufOwned(gl)
+        tls13PutBytesWithU16Len(ext, glOut)
+    if sigalgCount > 0:
+        var sl: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(sl, sigalgCount * 2)
+        var i: int32
+        while i < sigalgCount:
+            tls13PutU16(sl, tls13SigEd25519)
+            i = i + 1
+        tls13PutU16(ext, tls13ExtSignatureAlgorithms)
+        let slOut: Bytes = tls13BufOwned(sl)
+        tls13PutBytesWithU16Len(ext, slOut)
+    if selectedVersion != 0:
+        var vl: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU8(vl, 2)
+        tls13PutU16(vl, selectedVersion)
+        tls13PutU16(ext, tls13ExtSupportedVersions)
+        let vlOut: Bytes = tls13BufOwned(vl)
+        tls13PutBytesWithU16Len(ext, vlOut)
+    if BytesLen(keyShare) > 0:
+        var ks: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(ks, BytesLen(keyShare) + 4)
+        tls13PutU16(ks, tls13GroupX25519)
+        tls13PutBytesWithU16Len(ks, keyShare)
+        tls13PutU16(ext, tls13ExtKeyShare)
+        let ksOut: Bytes = tls13BufOwned(ks)
+        tls13PutBytesWithU16Len(ext, ksOut)
+    let extOut: Bytes = tls13BufOwned(ext)
+    let extBlock: Bytes = tls13BuildExtensions(extOut)
+    var b: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutU16(b, tls13LegacyVersion)
+    tls13PutBytes(b, random)
+    tls13PutBytesWithU16Len(b, sessionId)
+    tls13PutU16(b, suiteCount * 2)
+    var i: int32
+    while i < suiteCount:
+        tls13PutU16(b, 4865 + i)
+        i = i + 1
+    tls13PutU8(b, 1)
+    tls13PutU8(b, 0)
+    tls13PutBytes(b, extBlock)
+    let bodyOut: Bytes = tls13BufOwned(b)
+    return tls13HandshakeFrame(tls13HsClientHello, bodyOut)
+
+fn tls13BuildServerHelloFrame(random: Bytes, sessionId: Bytes, cipherSuite: int32, compression: int32, keyShare: Bytes, selectedVersion: int32): Bytes =
+    var ext: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    if selectedVersion != 0:
+        var vl: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(vl, selectedVersion)
+        tls13PutU16(ext, tls13ExtSupportedVersions)
+        let vlOut: Bytes = tls13BufOwned(vl)
+        tls13PutBytesWithU16Len(ext, vlOut)
+    if BytesLen(keyShare) > 0:
+        var ks: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(ks, tls13GroupX25519)
+        tls13PutBytesWithU16Len(ks, keyShare)
+        tls13PutU16(ext, tls13ExtKeyShare)
+        let ksOut: Bytes = tls13BufOwned(ks)
+        tls13PutBytesWithU16Len(ext, ksOut)
+    let extOut: Bytes = tls13BufOwned(ext)
+    let extBlock: Bytes = tls13BuildExtensions(extOut)
+    var b: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutU16(b, tls13LegacyVersion)
+    tls13PutBytes(b, random)
+    tls13PutBytesWithU16Len(b, sessionId)
+    tls13PutU16(b, cipherSuite)
+    tls13PutU8(b, compression)
+    tls13PutBytes(b, extBlock)
+    let bodyOut: Bytes = tls13BufOwned(b)
+    return tls13HandshakeFrame(tls13HsServerHello, bodyOut)
+
+fn tls13BuildEncryptedExtensionsFrame(groupCount: int32): Bytes =
+    var gl: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutU16(gl, groupCount * 2)
+    var i: int32
+    while i < groupCount:
+        tls13PutU16(gl, 29 + i)
+        i = i + 1
+    var ext: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutU16(ext, tls13ExtSupportedGroups)
+    let glOut: Bytes = tls13BufOwned(gl)
+    tls13PutBytesWithU16Len(ext, glOut)
+    let extOut: Bytes = tls13BufOwned(ext)
+    let extBlock: Bytes = tls13BuildExtensions(extOut)
+    return tls13HandshakeFrame(tls13HsEncryptedExtensions, extBlock)
+
+fn tls13BuildCertificateFrame(context: Bytes, entryCount: int32, derLen: int32): Bytes =
+    var list: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    var i: int32
+    while i < entryCount:
+        var der: Bytes = BytesAlloc(derLen)
+        var j: int32
+        while j < derLen:
+            let v: int32 = i * 31 + j
+            BytesSet(der, j, v - (v / 256) * 256)
+            j = j + 1
+        tls13PutU24(list, derLen)
+        bytebuffer.AppendBytes(list, der)
+        tls13PutU16(list, 0)
+        i = i + 1
+    var b: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutBytesWithU16Len(b, context)
+    tls13PutU24(b, bytebuffer.ByteBufferLen(list))
+    let listOut: Bytes = tls13BufOwned(list)
+    bytebuffer.AppendBytes(b, listOut)
+    let bodyOut: Bytes = tls13BufOwned(b)
+    return tls13HandshakeFrame(tls13HsCertificate, bodyOut)
+
+fn tls13BuildCertificateVerifyFrame(scheme: int32, sigLen: int32): Bytes =
+    var sig: Bytes = BytesAlloc(sigLen)
+    var j: int32
+    while j < sigLen:
+        let v: int32 = j * 7
+        BytesSet(sig, j, v - (v / 256) * 256)
+        j = j + 1
+    var b: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutU16(b, scheme)
+    tls13PutBytesWithU16Len(b, sig)
+    let bodyOut: Bytes = tls13BufOwned(b)
+    return tls13HandshakeFrame(tls13HsCertificateVerify, bodyOut)
+
+fn tls13BuildFinishedFrame(verifyData: Bytes): Bytes =
+    return tls13HandshakeFrame(tls13HsFinished, verifyData)
+
+# ---------- roundtrips (decode -> re-encode, in-module) ----------
+
+fn tls13ClientHelloRoundtrip(encoded: Bytes): Bytes =
+    let dec: Result[bool] = tls13DecodeClientHello(encoded)
+    if IsErr(dec):
+        return EmptyBytes()
+    var ext: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    if len(tls13ChServerName) > 0:
+        var sn: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(sn, len(tls13ChServerName) + 3)
+        tls13PutU8(sn, 0)
+        tls13PutU16(sn, len(tls13ChServerName))
+        var j: int32
+        while j < len(tls13ChServerName):
+            bytebuffer.AppendByte(sn, int32(tls13ChServerName[j]))
+            j = j + 1
+        tls13PutU16(ext, tls13ExtServerName)
+        let snOut: Bytes = tls13BufOwned(sn)
+        tls13PutBytesWithU16Len(ext, snOut)
+    if tls13ChGroups.count > 0:
+        var gl: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(gl, tls13ChGroups.count * 2)
+        var j: int32
+        while j < tls13ChGroups.count:
+            tls13PutU16(gl, tls13ChGroups.items[j])
+            j = j + 1
+        tls13PutU16(ext, tls13ExtSupportedGroups)
+        let glOut: Bytes = tls13BufOwned(gl)
+        tls13PutBytesWithU16Len(ext, glOut)
+    if tls13ChSigAlgs.count > 0:
+        var sl: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(sl, tls13ChSigAlgs.count * 2)
+        var j: int32
+        while j < tls13ChSigAlgs.count:
+            tls13PutU16(sl, tls13ChSigAlgs.items[j])
+            j = j + 1
+        tls13PutU16(ext, tls13ExtSignatureAlgorithms)
+        let slOut: Bytes = tls13BufOwned(sl)
+        tls13PutBytesWithU16Len(ext, slOut)
+    if tls13ChSelectedVersion != 0:
+        var vl: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU8(vl, 2)
+        tls13PutU16(vl, tls13ChSelectedVersion)
+        tls13PutU16(ext, tls13ExtSupportedVersions)
+        let vlOut: Bytes = tls13BufOwned(vl)
+        tls13PutBytesWithU16Len(ext, vlOut)
+    if tls13ChKeyShareGroup != 0:
+        var ks: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(ks, BytesLen(tls13ChKeyShare) + 4)
+        tls13PutU16(ks, tls13ChKeyShareGroup)
+        tls13PutBytesWithU16Len(ks, tls13ChKeyShare)
+        tls13PutU16(ext, tls13ExtKeyShare)
+        let ksOut: Bytes = tls13BufOwned(ks)
+        tls13PutBytesWithU16Len(ext, ksOut)
+    let extOut: Bytes = tls13BufOwned(ext)
+    let extBlock: Bytes = tls13BuildExtensions(extOut)
+    var enc: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutU16(enc, tls13ChLegacyVersion)
+    tls13PutBytes(enc, tls13ChRandom)
+    tls13PutBytesWithU16Len(enc, tls13ChSessionId)
+    tls13PutU16(enc, tls13ChSuites.count * 2)
+    var i: int32
+    while i < tls13ChSuites.count:
+        tls13PutU16(enc, tls13ChSuites.items[i])
+        i = i + 1
+    tls13PutU8(enc, 1)
+    tls13PutU8(enc, 0)
+    tls13PutBytes(enc, extBlock)
+    let encOut: Bytes = tls13BufOwned(enc)
+    return tls13HandshakeFrame(tls13HsClientHello, encOut)
+
+fn tls13ServerHelloRoundtrip(encoded: Bytes): Bytes =
+    let dec: Result[bool] = tls13DecodeServerHello(encoded)
+    if IsErr(dec):
+        return EmptyBytes()
+    var ext: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    if tls13ShSelectedVersion != 0:
+        var vl: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(vl, tls13ShSelectedVersion)
+        tls13PutU16(ext, tls13ExtSupportedVersions)
+        let vlOut: Bytes = tls13BufOwned(vl)
+        tls13PutBytesWithU16Len(ext, vlOut)
+    if tls13ShKeyShareGroup != 0:
+        var ks: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+        tls13PutU16(ks, tls13ShKeyShareGroup)
+        tls13PutBytesWithU16Len(ks, tls13ShKeyShare)
+        tls13PutU16(ext, tls13ExtKeyShare)
+        let ksOut: Bytes = tls13BufOwned(ks)
+        tls13PutBytesWithU16Len(ext, ksOut)
+    let extOut: Bytes = tls13BufOwned(ext)
+    let extBlock: Bytes = tls13BuildExtensions(extOut)
+    var enc: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutU16(enc, tls13ShLegacyVersion)
+    tls13PutBytes(enc, tls13ShRandom)
+    tls13PutBytesWithU16Len(enc, tls13ShSessionId)
+    tls13PutU16(enc, tls13ShCipherSuite)
+    tls13PutU8(enc, tls13ShCompression)
+    tls13PutBytes(enc, extBlock)
+    let encOut: Bytes = tls13BufOwned(enc)
+    return tls13HandshakeFrame(tls13HsServerHello, encOut)
+
+fn tls13EncryptedExtensionsRoundtrip(encoded: Bytes): Bytes =
+    let dec: Result[bool] = tls13DecodeEncryptedExtensions(encoded)
+    if IsErr(dec):
+        return EmptyBytes()
+    var gl: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutU16(gl, tls13EeGroups.count * 2)
+    var i: int32
+    while i < tls13EeGroups.count:
+        tls13PutU16(gl, tls13EeGroups.items[i])
+        i = i + 1
+    var ext: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutU16(ext, tls13ExtSupportedGroups)
+    let glOut: Bytes = tls13BufOwned(gl)
+    tls13PutBytesWithU16Len(ext, glOut)
+    let extOut: Bytes = tls13BufOwned(ext)
+    let extBlock: Bytes = tls13BuildExtensions(extOut)
+    return tls13HandshakeFrame(tls13HsEncryptedExtensions, extBlock)
+
+fn tls13CertificateRoundtrip(encoded: Bytes): Bytes =
+    let dec: Result[bool] = tls13DecodeCertificate(encoded)
+    if IsErr(dec):
+        return EmptyBytes()
+    var list: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    var i: int32
+    while i < tls13CertCount:
+        let entryDer: Bytes = tls13CertDerSlot(i)
+        tls13PutU24(list, BytesLen(entryDer))
+        bytebuffer.AppendBytes(list, entryDer)
+        tls13PutU16(list, 0)
+        i = i + 1
+    var b: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutBytesWithU16Len(b, tls13CertContext)
+    tls13PutU24(b, bytebuffer.ByteBufferLen(list))
+    let listOut: Bytes = tls13BufOwned(list)
+    bytebuffer.AppendBytes(b, listOut)
+    let bodyOut: Bytes = tls13BufOwned(b)
+    return tls13HandshakeFrame(tls13HsCertificate, bodyOut)
+
+fn tls13CertificateVerifyRoundtrip(encoded: Bytes): Bytes =
+    let dec: Result[bool] = tls13DecodeCertificateVerify(encoded)
+    if IsErr(dec):
+        return EmptyBytes()
+    var b: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    tls13PutU16(b, tls13CvScheme)
+    tls13PutBytesWithU16Len(b, tls13CvSignature)
+    let bodyOut: Bytes = tls13BufOwned(b)
+    return tls13HandshakeFrame(tls13HsCertificateVerify, bodyOut)
+
+fn tls13FinishedRoundtrip(encoded: Bytes): Bytes =
+    let dec: Result[bool] = tls13DecodeFinished(encoded)
+    if IsErr(dec):
+        return EmptyBytes()
+    return tls13HandshakeFrame(tls13HsFinished, tls13FinVerifyData)

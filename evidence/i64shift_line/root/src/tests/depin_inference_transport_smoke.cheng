@@ -1,0 +1,3274 @@
+import std/result
+import std/rawbytes
+import std/os
+import std/strings
+import std/strutils as strutil
+import cheng/quic/connection as qconn
+import cheng/quic/msquictransport_native as qtransport
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/parallel_plan as pp
+import cheng/inference/paged_kv_cache as pkv
+import cheng/inference/moe_router as moe
+import cheng/inference/model_executor as exec
+import cheng/libp2p/core/types
+import cheng/libp2p/core/multiaddr
+import cheng/libp2p/transports/quic_transport
+import cheng/inference/distributed_engine as engine
+import cheng/inference/weight_binding as wb
+import cheng/inference/weight_store as ws
+import cheng/inference/activation_transport as at
+import cheng/libp2p/protocols/depin/inference_manifest
+import cheng/libp2p/protocols/depin/inference_pipeline_protocol as pipe
+import cheng/libp2p/protocols/depin/inference_settlement
+import cheng/libp2p/protocols/depin/inference_specdecode as depinspec
+import cheng/libp2p/protocols/depin/inference_transport as transport
+import cheng/libp2p/protocols/depin/rwad_dispatcher_adapter
+import cheng/core/tooling/host_ops as hostops
+import cheng/core/tooling/path as chengpath
+
+type
+    DepinTransportSmokeWeightFixture =
+        graph: mg.ModelGraph
+        bindings: wb.WeightBindingSet
+        store: ws.WeightTensorStore
+
+    DepinTransportSmokeActivationFixture =
+        shards: engine.DistributedActivationShard[]
+        payloads: at.ActivationTensorPayload[]
+
+    DepinTransportSmokeKvFixture =
+        cache: pkv.PagedKVCache
+        seq: pkv.PagedKVSequence
+        receipt: pkv.PagedKVReceipt
+        stateHash: int64
+
+fn depinInferenceTransportSmokeFrame(kind: int64): pipe.DepinInferenceWireFrame =
+    var frame: pipe.DepinInferenceWireFrame
+    frame.magic = int64(pipe.DepinInferenceWireFrameMagic)
+    frame.frameKind = kind
+    frame.enginePlanHash = int64(101)
+    frame.seqNo = int64(0)
+    frame.coordinatorPeerHash = int64(201)
+    frame.sourcePeerHash = int64(202)
+    frame.targetPeerHash = int64(203)
+    frame.shardNameHash = int64(204)
+    frame.requestHash = int64(301)
+    frame.responseHash = int64(0)
+    frame.envelopeHash = int64(0)
+    frame.payloadHash = int64(401)
+    frame.receiptHash = int64(0)
+    frame.sentAtNs = int64(501)
+    frame.frameHash = int64(601)
+    if kind == int64(pipe.DepinInferenceWireFrameKindResponse):
+        frame.responseHash = int64(302)
+        frame.envelopeHash = int64(303)
+        frame.receiptHash = int64(304)
+    return frame
+
+fn depinInferenceTransportSmokeDistributedFrame(kind: str, seqNo: uint64): engine.DistributedShardTransportFrame =
+    var sourcePeerId: str = "peer:coordinator"
+    var targetPeerId: str = "peer:a"
+    var responseHash: int64 = int64(0)
+    var envelopeHash: int64 = int64(0)
+    var receiptHash: int64 = int64(0)
+    if kind == engine.DistributedTransportFrameKindResponse:
+        sourcePeerId = "peer:a"
+        targetPeerId = "peer:coordinator"
+        responseHash = int64(302)
+        envelopeHash = int64(303)
+        receiptHash = int64(304)
+    return engine.DistributedShardTransportFrameBuild(engine.DistributedShardTransportFrame(
+        schema: "",
+        frameKind: kind,
+        enginePlanHash: int64(101),
+        seqNo: seqNo,
+        coordinatorPeerId: "peer:coordinator",
+        sourcePeerId: sourcePeerId,
+        targetPeerId: targetPeerId,
+        shardName: "hidden:tokens:0",
+        requestHash: int64(301),
+        responseHash: responseHash,
+        envelopeHash: envelopeHash,
+        payloadHash: int64(401),
+        receiptHash: receiptHash,
+        sentAtNs: int64(501),
+        frameHash: int64(0)
+    ))
+
+fn depinInferenceTransportSmokeOpen(pair: var quic_transport.Libp2pQuicLoopbackPair): Result[bool] =
+    var listenAddr: types.Libp2pMultiaddr
+    multiaddr.Libp2pMultiaddrFillQuic(listenAddr, "127.0.0.1", 0)
+    let openRes = quic_transport.Libp2pQuicLoopbackOpenInto(pair, listenAddr)
+    if IsErr(openRes):
+        return Err[bool](ErrorText(openRes))
+    return quic_transport.Libp2pQuicLoopbackSelectProtocol(pair, types.Libp2pProtocolDepinInference)
+
+fn depinInferenceTransportSmokeDerivePair(out: var quic_transport.Libp2pQuicLoopbackPair,
+                                          base: quic_transport.Libp2pQuicLoopbackPair,
+                                          streamId: int64) =
+    out.listener = base.listener
+    out.client = base.client
+    out.listenAddr = base.listenAddr
+    out.outbound = qconn.ConnDeriveStream(base.outbound, streamId, streamId)
+    out.inbound = qconn.ConnDeriveStream(base.inbound, streamId, streamId)
+
+fn depinTransportSmokeMakeTensor(shape: int32[], scale: int32, data: int32[]): infer.TensorQ =
+    var out: infer.TensorQ
+    let res = infer.TensorFromDataFill(out, shape, scale, data)
+    assert(IsOk(res), " depin transport smoke: tensor")
+    return out
+
+fn depinTransportSmokeBuildKvFixture(): DepinTransportSmokeKvFixture =
+    let cacheRes = pkv.PagedKVInit(2, 4, 4, 1000, 1000)
+    assert(IsOk(cacheRes), " depin transport smoke: kv init")
+    var cache = Value(cacheRes)
+    var seq = pkv.PagedKVSequenceInit(9)
+    let appendRes = pkv.PagedKVAppendToken(
+        cache,
+        seq,
+        depinTransportSmokeMakeTensor([4], 1000, [1000, 0, 0, 0]),
+        depinTransportSmokeMakeTensor([4], 1000, [0, 1000, 0, 0])
+    )
+    assert(IsOk(appendRes), " depin transport smoke: kv append")
+    let layerState = exec.ModelExecutorKvLayerStateBuild(0, cache, seq)
+    assert(IsOk(layerState), " depin transport smoke: kv layer state")
+    let stateSet = exec.ModelExecutorKvStateSetBuild([Value(layerState)])
+    assert(IsOk(exec.ModelExecutorValidateKvStateSet(stateSet)), " depin transport smoke: kv state set")
+    return DepinTransportSmokeKvFixture(cache: cache, seq: seq, receipt: pkv.PagedKVReceiptFor(seq), stateHash: stateSet.stateSetHash)
+
+fn depinTransportSmokeBuildPartition(peers: str[]): pp.InferencePartitionPlan =
+    let planRes = pp.ParallelBuildTensorHeadPlan("cid:partition:transport-session", 1, peers)
+    assert(IsOk(planRes), " depin transport smoke: tensor plan")
+    var plan = Value(planRes)
+    let expertRes = pp.ParallelAttachExpertPlan(plan, 2, peers, "cid:expert:transport:")
+    assert(IsOk(expertRes), " depin transport smoke: expert plan")
+    assert(IsOk(pp.ParallelValidatePlan(plan)), " depin transport smoke: partition validate")
+    return plan
+
+fn depinTransportSmokeMakeWeightTensor(weight: mg.ModelWeightShard, ordinal: int32): infer.TensorQ =
+    let countRes = mg.ModelGraphTensorElementCount(weight.shape)
+    assert(IsOk(countRes), " depin transport smoke: weight shape")
+    let elemCount = int32(Value(countRes))
+    var data: int32[]
+    for i in 0..<elemCount:
+        add(data, 100 + ordinal * 10 + i)
+    return depinTransportSmokeMakeTensor(weight.shape, 1000, data)
+
+fn depinTransportSmokeWeightShardPath(graph: mg.ModelGraph, ordinal: int32): str =
+    return strutil.Join([
+        "/tmp/cheng_depin_inference_weight_",
+        strings.Int64ToStr(graph.graphHash),
+        "_",
+        strings.IntToStr(ordinal),
+        ".cwi1"
+    ], "")
+
+fn depinTransportSmokeBuildWeightFixture(graph: mg.ModelGraph): DepinTransportSmokeWeightFixture =
+    var payloads: ws.WeightTensorPayload[]
+    var bindings: wb.WeightShardBinding[]
+    var shardPaths: str[]
+    for i in 0..<graph.weights.len:
+        var peerId = "peer:a"
+        if i % 2 == 1:
+            peerId = "peer:b"
+        let tensor = depinTransportSmokeMakeWeightTensor(graph.weights[i], i)
+        let payloadRes = ws.WeightTensorPayloadBuild(
+            graph.weights[i].modelCid,
+            graph.weights[i].tensorName,
+            graph.weights[i].shardCid,
+            graph.weights[i].dtype,
+            graph.weights[i].quantScheme,
+            peerId,
+            tensor
+        )
+        assert(IsOk(payloadRes), " depin transport smoke: weight payload")
+        let payload = Value(payloadRes)
+        add(payloads, payload)
+        add(bindings, wb.WeightShardBinding(
+            modelCid: graph.weights[i].modelCid,
+            tensorName: graph.weights[i].tensorName,
+            shardCid: graph.weights[i].shardCid,
+            dtype: graph.weights[i].dtype,
+            quantScheme: graph.weights[i].quantScheme,
+            sizeBytes: graph.weights[i].sizeBytes,
+            peerId: peerId,
+            payloadHash: payload.payloadHash
+        ))
+        let shardPath = depinTransportSmokeWeightShardPath(graph, i)
+        if os.FileExists(shardPath):
+            assert(os.RemoveFile(shardPath), " depin transport smoke: remove old shard")
+        let writeShard = ws.WeightTensorPayloadWriteMaterializedShardFile(shardPath, payload)
+        assert(IsOk(writeShard), " depin transport smoke: write weight shard")
+        add(shardPaths, shardPath)
+    let set = wb.WeightBindingBuildSet(graph.modelCid, bindings)
+    assert(IsOk(wb.WeightBindingValidate(set, graph)), " depin transport smoke: weight binding")
+    let loadStore = ws.WeightTensorStoreLoadMaterializedShardFiles(graph.modelCid, set, shardPaths)
+    assert(IsOk(loadStore), " depin transport smoke: load materialized weight shards")
+    let store = Value(loadStore)
+    assert(IsOk(ws.WeightTensorValidateStore(store, set, graph)), " depin transport smoke: weight store")
+    var payloadHashes: int64[]
+    for i in 0..<store.payloads.len:
+        add(payloadHashes, store.payloads[i].payloadHash)
+    let boundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(graph, payloadHashes)
+    assert(IsOk(boundGraphRes), " depin transport smoke: bind weight anchors")
+    let boundGraph = Value(boundGraphRes)
+    assert(IsOk(wb.WeightBindingValidate(set, boundGraph)), " depin transport smoke: anchored weight binding")
+    assert(IsOk(ws.WeightTensorValidateStore(store, set, boundGraph)), " depin transport smoke: anchored weight store")
+    return DepinTransportSmokeWeightFixture(graph: boundGraph, bindings: set, store: store)
+
+fn depinTransportSmokeBuildActivationFixture(): DepinTransportSmokeActivationFixture =
+    let payload0Res = at.ActivationTensorPayloadBuild(
+        "peer:a",
+        "peer:b",
+        "hidden:tokens:0",
+        0,
+        1,
+        0,
+        4,
+        depinTransportSmokeMakeTensor([1, 4], 1000, [101, 102, 103, 104])
+    )
+    assert(IsOk(payload0Res), " depin transport smoke: activation payload0")
+    let payload0 = Value(payload0Res)
+    let payload1Res = at.ActivationTensorPayloadBuild(
+        "peer:a",
+        "peer:b",
+        "hidden:tokens:1",
+        1,
+        1,
+        0,
+        4,
+        depinTransportSmokeMakeTensor([1, 4], 1000, [201, 202, 203, 204])
+    )
+    assert(IsOk(payload1Res), " depin transport smoke: activation payload1")
+    let payload1 = Value(payload1Res)
+    var shards: engine.DistributedActivationShard[]
+    add(shards, engine.DistributedActivationShard(shardName: payload0.shardName, peerId: payload0.sourcePeerId, schema: engine.DistributedInferenceActivationSchema, tokenStart: payload0.tokenStart, tokenCount: payload0.tokenCount, featureStart: payload0.featureStart, featureCount: payload0.featureCount, shardHash: payload0.payloadHash))
+    add(shards, engine.DistributedActivationShard(shardName: payload1.shardName, peerId: payload1.sourcePeerId, schema: engine.DistributedInferenceActivationSchema, tokenStart: payload1.tokenStart, tokenCount: payload1.tokenCount, featureStart: payload1.featureStart, featureCount: payload1.featureCount, shardHash: payload1.payloadHash))
+    var payloads: at.ActivationTensorPayload[]
+    add(payloads, payload0)
+    add(payloads, payload1)
+    return DepinTransportSmokeActivationFixture(shards: shards, payloads: payloads)
+
+fn depinTransportSmokePeerCapability(peers: engine.DistributedInferencePeer[], peerId: str): str =
+    for i in 0..<peers.len:
+        if peers[i].peerId == peerId:
+            return peers[i].deviceCapabilityHash
+    assert(false, " depin transport smoke: peer capability")
+    return ""
+
+fn depinTransportSmokeBuildRequestSet(plan: engine.DistributedInferencePlan,
+                                      peers: engine.DistributedInferencePeer[],
+                                      payloads: at.ActivationTensorPayload[]): engine.DistributedShardDispatchRequestSet =
+    var requests: engine.DistributedShardDispatchRequest[]
+    let kernelHash: int64 = plan.kernelPrograms[0].kernelHash
+    for i in 0..<payloads.len:
+        let inputHash = engine.DistributedShardDispatchExpectedInputHash(
+            plan,
+            plan.activationShards[i],
+            kernelHash
+        )
+        assert(IsOk(inputHash), " depin transport smoke: shard input hash")
+        let draft = engine.DistributedShardDispatchRequest(
+            schema: "",
+            enginePlanHash: plan.engineHash,
+            coordinatorPeerId: "peer:coordinator",
+            peerId: payloads[i].sourcePeerId,
+            targetPeerId: payloads[i].targetPeerId,
+            deviceCapabilityHash: depinTransportSmokePeerCapability(peers, payloads[i].sourcePeerId),
+            shardName: payloads[i].shardName,
+            kernelHash: kernelHash,
+            inputHash: Value(inputHash),
+            expectedOutputPayloadHash: payloads[i].payloadHash,
+            tokenStart: payloads[i].tokenStart,
+            tokenCount: payloads[i].tokenCount,
+            featureStart: payloads[i].featureStart,
+            featureCount: payloads[i].featureCount,
+            requestHash: int64(0)
+        )
+        add(requests, engine.DistributedShardDispatchRequestBuild(draft))
+    return engine.DistributedShardDispatchRequestSetBuild(plan.engineHash, requests)
+
+fn depinTransportSmokeBuildCertifiedFixtureWithSpecDecodePlan(specDecodePlan: engine.DistributedSpecDecodePlan,
+                                                             planOut: var engine.DistributedInferencePlan,
+                                                             peersOut: var engine.DistributedInferencePeer[],
+                                                             kvCacheOut: var pkv.PagedKVCache,
+                                                             kvSeqOut: var pkv.PagedKVSequence,
+                                                             envelopesOut: var at.ActivationEnvelope[],
+                                                             activationStoreOut: var at.ActivationTensorStore,
+                                                             evidenceOut: var engine.DistributedActivationEvidence,
+                                                             kvTransferEvidenceOut: var engine.DistributedKvPageTransferEvidence,
+                                                             distributedManifestOut: var inference_manifest.DepinDistributedInferenceManifest): Result[bool] =
+    let graph = mg.ModelGraphBuildTinyGlmMoeFixture("cid:model:transport-session")
+    assert(IsOk(mg.ModelGraphValidate(graph)), " depin transport smoke: graph")
+    let peersText: str[] = ["peer:a", "peer:b"]
+    var peers: engine.DistributedInferencePeer[]
+    add(peers, engine.DistributedInferencePeer(peerId: "peer:a", deviceCapabilityHash: "cap:metal:a", online: true, tensorShardBudget: 4, expertShardBudget: 1))
+    add(peers, engine.DistributedInferencePeer(peerId: "peer:b", deviceCapabilityHash: "cap:metal:b", online: true, tensorShardBudget: 4, expertShardBudget: 1))
+    let partition = depinTransportSmokeBuildPartition(peersText)
+    let weightFixture = depinTransportSmokeBuildWeightFixture(graph)
+    let anchoredGraph = weightFixture.graph
+    let kernels = [
+        kir.KernelIrGemmProgram(2, 4, 4, kir.KernelDtypeFp16, 1000),
+        kir.KernelIrRmsNormProgram(4, kir.KernelDtypeFp16, 1000, 1)
+    ]
+    let routeRes = moe.MoeRouteTop2([10, 8, 7, 9], 2, 2, 4)
+    assert(IsOk(routeRes), " depin transport smoke: route")
+    let routePlanSet = moe.MoeRoutePlanSetFromSingle(0, Value(routeRes))
+    let activationFixture = depinTransportSmokeBuildActivationFixture()
+    let kvFixture = depinTransportSmokeBuildKvFixture()
+    let plan = engine.DistributedBuildPlanWithRouteSetAndSpecDecode(
+        "cid:engine:transport-session",
+        anchoredGraph,
+        weightFixture.bindings,
+        partition,
+        kernels,
+        kvFixture.receipt,
+        kvFixture.stateHash,
+        specDecodePlan,
+        Value(routeRes),
+        routePlanSet,
+        activationFixture.shards
+    )
+    assert(IsOk(engine.DistributedValidatePlan(plan, peers)), " depin transport smoke: plan")
+    let unanchoredPlan = engine.DistributedBuildPlanWithRouteSetAndSpecDecode(
+        "cid:engine:transport-session-unanchored",
+        graph,
+        weightFixture.bindings,
+        partition,
+        kernels,
+        kvFixture.receipt,
+        kvFixture.stateHash,
+        specDecodePlan,
+        Value(routeRes),
+        routePlanSet,
+        activationFixture.shards
+    )
+    assert(IsErr(engine.DistributedValidatePlan(unanchoredPlan, peers)),
+           " depin transport smoke: unanchored weight graph hard fail")
+    let envelope0 = at.ActivationTransportBuildEnvelope(
+        plan.engineHash,
+        activationFixture.payloads[0].sourcePeerId,
+        activationFixture.payloads[0].targetPeerId,
+        activationFixture.payloads[0].shardName,
+        uint64(0),
+        activationFixture.payloads[0].tokenStart,
+        activationFixture.payloads[0].tokenCount,
+        activationFixture.payloads[0].featureStart,
+        activationFixture.payloads[0].featureCount,
+        activationFixture.payloads[0].payloadHash,
+        int64(0)
+    )
+    let envelope1 = at.ActivationTransportBuildEnvelope(
+        plan.engineHash,
+        activationFixture.payloads[1].sourcePeerId,
+        activationFixture.payloads[1].targetPeerId,
+        activationFixture.payloads[1].shardName,
+        uint64(1),
+        activationFixture.payloads[1].tokenStart,
+        activationFixture.payloads[1].tokenCount,
+        activationFixture.payloads[1].featureStart,
+        activationFixture.payloads[1].featureCount,
+        activationFixture.payloads[1].payloadHash,
+        envelope0.envelopeHash
+    )
+    var envelopes: at.ActivationEnvelope[]
+    add(envelopes, envelope0)
+    add(envelopes, envelope1)
+    let activationStore = at.ActivationTensorStoreBuild(plan.engineHash, activationFixture.payloads)
+    let activationPayloadWire0 = at.ActivationTensorPayloadWireBytes(activationFixture.payloads[0])
+    assert(IsOk(activationPayloadWire0), " depin transport smoke: activation payload wire")
+    var activationPayloadWire0Bytes = Value(activationPayloadWire0)
+    assert(IsOk(at.ActivationTensorPayloadValidateWire(activationFixture.payloads[0], activationPayloadWire0Bytes)),
+        " depin transport smoke: activation payload wire validate")
+    let decodedActivationPayload0 = at.ActivationTensorPayloadDecodeWire(envelope0, activationPayloadWire0Bytes)
+    assert(IsOk(decodedActivationPayload0), " depin transport smoke: activation payload wire decode")
+    assert(Value(decodedActivationPayload0).payloadHash == activationFixture.payloads[0].payloadHash,
+        " depin transport smoke: activation payload wire decode hash")
+    rawbytes.BytesSet(activationPayloadWire0Bytes, at.ActivationTensorPayloadWireHeaderBytes, rawbytes.BytesGet(activationPayloadWire0Bytes, at.ActivationTensorPayloadWireHeaderBytes) ^ 1)
+    assert(IsErr(at.ActivationTensorPayloadValidateWire(activationFixture.payloads[0], activationPayloadWire0Bytes)),
+        " depin transport smoke: activation payload wire drift hard fail")
+    assert(IsErr(at.ActivationTensorPayloadDecodeWire(envelope0, activationPayloadWire0Bytes)),
+        " depin transport smoke: activation payload wire decode drift hard fail")
+    rawbytes.BytesFree(activationPayloadWire0Bytes)
+    let requests = depinTransportSmokeBuildRequestSet(plan, peers, activationFixture.payloads)
+    var receiptsRaw: engine.DistributedShardExecutionReceipt[]
+    var responsesRaw: engine.DistributedShardDispatchResponse[]
+    var framesRaw: engine.DistributedShardTransportFrame[]
+    for i in 0..<requests.requests.len:
+        let request = requests.requests[i]
+        let executed = engine.DistributedPeerExecuteActivationDispatch(
+            plan,
+            peers,
+            request,
+            activationFixture.payloads[i].tensor,
+            int64(3000 + i)
+        )
+        assert(IsOk(executed), " depin transport smoke: peer execute")
+        let peerResult = Value(executed)
+        add(receiptsRaw, peerResult.receipt)
+        add(responsesRaw, peerResult.response)
+        let requestFrame = engine.DistributedShardTransportRequestFrameBuild(
+            request,
+            uint64(i * 2),
+            int64(9000 + i * 2)
+        )
+        assert(IsOk(requestFrame), " depin transport smoke: request frame")
+        add(framesRaw, Value(requestFrame))
+        let responseFrame = engine.DistributedShardTransportResponseFrameBuild(
+            request,
+            peerResult.response,
+            envelopes[i],
+            uint64(i * 2 + 1),
+            int64(9000 + i * 2 + 1)
+        )
+        assert(IsOk(responseFrame), " depin transport smoke: response frame")
+        add(framesRaw, Value(responseFrame))
+    let receipts = engine.DistributedShardExecutionReceiptSetBuild(plan.engineHash, receiptsRaw)
+    let responses = engine.DistributedShardDispatchResponseSetBuild(plan.engineHash, responsesRaw)
+    let frames = engine.DistributedShardTransportFrameSetBuild(plan.engineHash, framesRaw)
+    let draft = engine.DistributedActivationEvidenceBuild(plan.engineHash, requests, responses, receipts, frames)
+    let evidenceRes = engine.DistributedActivationEvidenceSeal(envelopes, activationStore, draft)
+    assert(IsOk(evidenceRes), " depin transport smoke: evidence seal")
+    let evidence = Value(evidenceRes)
+    assert(IsOk(engine.DistributedValidateActivationEvidence(plan, peers, envelopes, activationStore, evidence)),
+        " depin transport smoke: evidence validate")
+    let kvTransferEvidenceRes = engine.DistributedBuildKvPageTransferEvidence(
+        plan,
+        peers,
+        kvFixture.cache,
+        kvFixture.seq,
+        "peer:b",
+        "peer:a",
+        int64(880000)
+    )
+    assert(IsOk(kvTransferEvidenceRes), " depin transport smoke: kv transfer evidence build")
+    let kvTransferEvidence = Value(kvTransferEvidenceRes)
+    assert(IsOk(engine.DistributedValidateKvPageTransferEvidence(plan, peers, kvFixture.cache, kvFixture.seq, kvTransferEvidence)),
+        " depin transport smoke: kv transfer evidence validate")
+    let kvResidencyReceiptRes = engine.DistributedBuildKvPageResidencyReceipt(
+        plan,
+        peers,
+        kvTransferEvidence,
+        int64(990000),
+        int64(1990000)
+    )
+    assert(IsOk(kvResidencyReceiptRes), " depin transport smoke: kv residency receipt build")
+    let kvResidencyReceipt = Value(kvResidencyReceiptRes)
+    assert(IsOk(engine.DistributedValidateKvPageResidencyReceipt(plan, peers, kvTransferEvidence, kvResidencyReceipt)),
+        " depin transport smoke: kv residency receipt validate")
+    assert(kvResidencyReceipt.targetPeerId == "peer:b" &&
+           kvResidencyReceipt.pageCount == kvTransferEvidence.payloadStore.payloads.len,
+        " depin transport smoke: kv residency receipt binding")
+    var kvResidencyDrift = kvResidencyReceipt
+    var kvResidencyDriftEntries: engine.DistributedKvPageResidencyEntry[]
+    for i in 0..<kvResidencyReceipt.entries.len:
+        var entry = kvResidencyReceipt.entries[i]
+        if i == 0:
+            entry.payloadHash = entry.payloadHash + int64(1)
+        add(kvResidencyDriftEntries, entry)
+    kvResidencyDrift.entries = kvResidencyDriftEntries
+    assert(IsErr(engine.DistributedValidateKvPageResidencyReceipt(plan, peers, kvTransferEvidence, kvResidencyDrift)),
+        " depin transport smoke: kv residency drift hard fail")
+    let distributedManifest = DepinBuildDistributedManifestFromPlanFacts(
+        graph.modelCid,
+        plan.partitionPlan,
+        plan.kernelPrograms,
+        plan.deviceWeightBindingHash,
+        plan.kvReceipt,
+        plan.kvStateHash,
+        plan.kvShardReceipts.receiptSetHash,
+        kvTransferEvidence.evidenceHash,
+        plan.specDecodePlan.planHash,
+        plan.routePlanSet,
+        evidence.requests.requestSetHash,
+        evidence.transportFrames.frameSetHash,
+        evidence.evidenceHash,
+        DepinInferenceNowMs()
+    )
+    assert(IsOk(DepinValidateDistributedManifest(distributedManifest)), " depin transport smoke: manifest")
+    assert(distributedManifest.weightDeviceBindingCid == strutil.Join([
+        "cid:weight_device_binding:",
+        strings.Int64ToStr(plan.deviceWeightBindingHash)
+    ], ""), " depin transport smoke: manifest weight device binding")
+    assert(distributedManifest.kvShardReceiptCid == strutil.Join([
+        "cid:kv:shard_receipt:",
+        strings.Int64ToStr(plan.kvShardReceipts.receiptSetHash)
+    ], ""), " depin transport smoke: manifest kv shard receipt binding")
+    assert(distributedManifest.kvPageTransferEvidenceCid == strutil.Join([
+        "cid:kv:page_transfer_evidence:",
+        strings.Int64ToStr(kvTransferEvidence.evidenceHash)
+    ], ""), " depin transport smoke: manifest kv transfer evidence binding")
+    planOut = plan
+    peersOut = peers
+    kvCacheOut = kvFixture.cache
+    kvSeqOut = kvFixture.seq
+    envelopesOut = envelopes
+    activationStoreOut = activationStore
+    evidenceOut = evidence
+    kvTransferEvidenceOut = kvTransferEvidence
+    distributedManifestOut = distributedManifest
+    return Ok[bool](true)
+
+fn depinTransportSmokeBuildCertifiedFixture(planOut: var engine.DistributedInferencePlan,
+                                           peersOut: var engine.DistributedInferencePeer[],
+                                           kvCacheOut: var pkv.PagedKVCache,
+                                           kvSeqOut: var pkv.PagedKVSequence,
+                                           envelopesOut: var at.ActivationEnvelope[],
+                                           activationStoreOut: var at.ActivationTensorStore,
+                                           evidenceOut: var engine.DistributedActivationEvidence,
+                                           kvTransferEvidenceOut: var engine.DistributedKvPageTransferEvidence,
+                                           distributedManifestOut: var inference_manifest.DepinDistributedInferenceManifest): Result[bool] =
+    return depinTransportSmokeBuildCertifiedFixtureWithSpecDecodePlan(
+        engine.DistributedBuildDisabledSpecDecodePlan(),
+        planOut,
+        peersOut,
+        kvCacheOut,
+        kvSeqOut,
+        envelopesOut,
+        activationStoreOut,
+        evidenceOut,
+        kvTransferEvidenceOut,
+        distributedManifestOut
+    )
+
+fn depinTransportSmokeBuildSession(modelCid: str): inference_manifest.DepinInferenceSession =
+    return DepinBuildStartedInferenceSession(
+        "req:depin:transport-session",
+        modelCid,
+        "prompt:transport-session",
+        "base"
+    )
+
+fn depinTransportSmokeBuildSettlementPlan(): inference_settlement.DepinSettlementPlan =
+    return inference_settlement.DepinSettlementPlanBuildWithReplicas(
+        "batch:transport-session",
+        "job:transport-session",
+        "peer:coordinator",
+        "escrow:transport-session",
+        int64(100),
+        ["peer:coordinator", "peer:b"],
+        2,
+        2
+    )
+
+fn depinTransportSmokeFreshResidencyPrefix(label: str, planHash: int64): str =
+    let prefix = strutil.Join([
+        "/tmp/cheng_depin_inference_residency_",
+        label,
+        "_",
+        strings.Int64ToStr(planHash)
+    ], "")
+    let storePath = strutil.Join([prefix, ".ckvs1"], "")
+    let walPath = strutil.Join([prefix, ".cwal1"], "")
+    let headPath = strutil.Join([prefix, ".ckvh1"], "")
+    let tempPath = strutil.Join([prefix, ".ckvh1.tmp"], "")
+    let lockDir = strutil.Join([prefix, ".ckvl1.lock"], "")
+    let settlementLedgerPath = inference_settlement.DepinSettlementLedgerPathFromPrefix(prefix)
+    let settlementReplicaPath = inference_settlement.DepinSettlementLedgerReplicaPathFromPrefix(prefix, "peer:b")
+    let settlementCoordinatorReplicaPath = inference_settlement.DepinSettlementLedgerReplicaPathFromPrefix(prefix, "peer:coordinator")
+    let settlementPeerAReplicaPath = inference_settlement.DepinSettlementLedgerReplicaPathFromPrefix(prefix, "peer:a")
+    let settlementNotPresentReplicaPath = inference_settlement.DepinSettlementLedgerReplicaPathFromPrefix(prefix, "peer:not-present")
+    let settlementQuorumPath = transport.DepinInferenceTransportSettlementLedgerQuorumPathFromPrefix(prefix)
+    let settlementRepairPath = transport.DepinInferenceTransportSettlementLedgerRepairPathFromPrefix(prefix)
+    let settlementRepairDaemonPath = transport.DepinInferenceTransportSettlementRepairDaemonStatePathFromPrefix(prefix)
+    let supervisorPath = transport.DepinInferenceTransportResidencySettlementSupervisorStatePathFromPrefix(prefix)
+    let daemonRunPath = transport.DepinInferenceTransportResidencySettlementDaemonRunReceiptPathFromPrefix(prefix)
+    let daemonWatchPath = transport.DepinInferenceTransportResidencySettlementDaemonFileEventBatchPathFromPrefix(prefix)
+    let daemonOsServiceReceiptPath = transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSpecReceiptPathFromPrefix(prefix)
+    let daemonStartupBundlePath = transport.DepinInferenceTransportResidencySettlementDaemonStartupBundlePathFromPrefix(prefix)
+    let daemonHealthPath = transport.DepinInferenceTransportResidencySettlementDaemonHealthReceiptPathFromPrefix(prefix)
+    let daemonLaunchdPathRes = transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSpecTextPathFromPrefix(
+        prefix,
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd
+    )
+    assert(IsOk(daemonLaunchdPathRes), " depin transport smoke: launchd service path")
+    let daemonSystemdPathRes = transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSpecTextPathFromPrefix(
+        prefix,
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSystemd
+    )
+    assert(IsOk(daemonSystemdPathRes), " depin transport smoke: systemd service path")
+    let daemonSystemdTriggerPathRes = transport.DepinInferenceTransportResidencySettlementDaemonOsServiceTriggerSpecTextPathFromPrefix(
+        prefix,
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSystemd
+    )
+    assert(IsOk(daemonSystemdTriggerPathRes), " depin transport smoke: systemd trigger service path")
+    let lockFile = engine.DistributedKvResidencyHeadLockFilePath(lockDir)
+    if os.FileExists(storePath):
+        assert(os.RemoveFile(storePath), " depin transport smoke: remove old residency store")
+    if os.FileExists(walPath):
+        assert(os.RemoveFile(walPath), " depin transport smoke: remove old residency wal")
+    if os.FileExists(headPath):
+        assert(os.RemoveFile(headPath), " depin transport smoke: remove old residency head")
+    if os.FileExists(tempPath):
+        assert(os.RemoveFile(tempPath), " depin transport smoke: remove old residency temp")
+    if os.FileExists(settlementLedgerPath):
+        assert(os.RemoveFile(settlementLedgerPath), " depin transport smoke: remove old settlement ledger")
+    if os.FileExists(settlementReplicaPath):
+        assert(os.RemoveFile(settlementReplicaPath), " depin transport smoke: remove old settlement replica")
+    if os.FileExists(settlementCoordinatorReplicaPath):
+        assert(os.RemoveFile(settlementCoordinatorReplicaPath), " depin transport smoke: remove old coordinator settlement replica")
+    if os.FileExists(settlementPeerAReplicaPath):
+        assert(os.RemoveFile(settlementPeerAReplicaPath), " depin transport smoke: remove old peer a settlement replica")
+    if os.FileExists(settlementNotPresentReplicaPath):
+        assert(os.RemoveFile(settlementNotPresentReplicaPath), " depin transport smoke: remove old not-present settlement replica")
+    if os.FileExists(settlementQuorumPath):
+        assert(os.RemoveFile(settlementQuorumPath), " depin transport smoke: remove old settlement quorum")
+    if os.FileExists(settlementRepairPath):
+        assert(os.RemoveFile(settlementRepairPath), " depin transport smoke: remove old settlement repair")
+    if os.FileExists(settlementRepairDaemonPath):
+        assert(os.RemoveFile(settlementRepairDaemonPath), " depin transport smoke: remove old settlement repair daemon")
+    if os.FileExists(supervisorPath):
+        assert(os.RemoveFile(supervisorPath), " depin transport smoke: remove old supervisor")
+    if os.FileExists(daemonRunPath):
+        assert(os.RemoveFile(daemonRunPath), " depin transport smoke: remove old residency settlement daemon run")
+    if os.FileExists(daemonWatchPath):
+        assert(os.RemoveFile(daemonWatchPath), " depin transport smoke: remove old residency settlement daemon file events")
+    if os.FileExists(daemonOsServiceReceiptPath):
+        assert(os.RemoveFile(daemonOsServiceReceiptPath), " depin transport smoke: remove old residency settlement os service receipt")
+    if os.FileExists(daemonStartupBundlePath):
+        assert(os.RemoveFile(daemonStartupBundlePath), " depin transport smoke: remove old residency settlement startup bundle")
+    if os.FileExists(daemonHealthPath):
+        assert(os.RemoveFile(daemonHealthPath), " depin transport smoke: remove old residency settlement health receipt")
+    if os.FileExists(Value(daemonLaunchdPathRes)):
+        assert(os.RemoveFile(Value(daemonLaunchdPathRes)), " depin transport smoke: remove old launchd service spec")
+    if os.FileExists(Value(daemonSystemdPathRes)):
+        assert(os.RemoveFile(Value(daemonSystemdPathRes)), " depin transport smoke: remove old systemd service spec")
+    if os.FileExists(Value(daemonSystemdTriggerPathRes)):
+        assert(os.RemoveFile(Value(daemonSystemdTriggerPathRes)), " depin transport smoke: remove old systemd trigger service spec")
+    if os.FileExists(lockFile):
+        assert(os.RemoveFile(lockFile), " depin transport smoke: remove old residency lock file")
+    if os.DirExists(lockDir):
+        os.RemoveDir(lockDir)
+        assert(!os.DirExists(lockDir), " depin transport smoke: remove old residency lock dir")
+    return prefix
+
+fn depinTransportSmokeResolveCompiler(root: str): Result[str] =
+    let explicit = strutil.Strip(os.GetEnv("CHENG_SMOKE_COMPILER"))
+    if explicit != "":
+        let explicitPath = chengpath.PathAbsolute(root, explicit)
+        if chengpath.FileExistsNonEmpty(root, explicitPath):
+            return Ok[str](explicitPath)
+        return Err[str](strutil.Join([" depin transport smoke: CHENG_SMOKE_COMPILER missing: ", explicitPath], ""))
+    let stage3 = chengpath.PathAbsolute(root, "artifacts/bootstrap/cheng.stage3")
+    if chengpath.FileExistsNonEmpty(root, stage3):
+        return Ok[str](stage3)
+    let backendDriver = chengpath.PathAbsolute(root, "artifacts/backend_driver/cheng")
+    if chengpath.FileExistsNonEmpty(root, backendDriver):
+        return Ok[str](backendDriver)
+    return Err[str](" depin transport smoke: missing compiler for daemon build")
+
+fn depinTransportSmokeBuildResidencySettlementDaemon(root: str): Result[str] =
+    let compilerRes = depinTransportSmokeResolveCompiler(root)
+    if IsErr(compilerRes):
+        return Err[str](Error(compilerRes))
+    let outDir = chengpath.PathAbsolute(root, "artifacts/depin_residency_settlement_daemon_smoke")
+    if !chengpath.MkdirP(root, outDir):
+        return Err[str](" depin transport smoke: mkdir daemon artifact dir")
+    let outBin = os.JoinPath(outDir, "depin_residency_settlement_daemon")
+    let source = chengpath.PathAbsolute(root, "src/libp2p/cli/depin_residency_settlement_daemon_main.cheng")
+    let reportPath = os.JoinPath(outDir, "depin_residency_settlement_daemon.report.txt")
+    let logPath = os.JoinPath(outDir, "depin_residency_settlement_daemon.compile.log")
+    if chengpath.PathFileExists(outBin):
+        os.RemoveFile(outBin)
+    let compileRun = hostops.RunFileLogged(
+        root,
+        "build_depin_residency_settlement_daemon",
+        Value(compilerRes),
+        [
+            "system-link-exec",
+            strutil.Join(["--root:", root], ""),
+            strutil.Join(["--in:", source], ""),
+            "--emit:exe",
+            "--target:arm64-apple-darwin",
+            strutil.Join(["--out:", outBin], ""),
+            strutil.Join(["--report-out:", reportPath], "")
+        ],
+        [],
+        root,
+        300,
+        logPath
+    )
+    if compileRun.exitCode != 0:
+        return Err[str](strutil.Join([" depin transport smoke: daemon compile failed: ", compileRun.output], ""))
+    if !chengpath.FileExistsNonEmpty(root, outBin):
+        return Err[str](" depin transport smoke: daemon binary missing after compile")
+    return Ok[str](outBin)
+
+fn depinTransportSmokeOpenCertifiedLinks(links: var transport.DepinInferenceTransportPeerLink[],
+                                         peerAPair: var quic_transport.Libp2pQuicLoopbackPair,
+                                         peerBPair: var quic_transport.Libp2pQuicLoopbackPair,
+                                         coordinatorPair: var quic_transport.Libp2pQuicLoopbackPair): Result[bool] =
+    let peerAOpen = depinInferenceTransportSmokeOpen(peerAPair)
+    if IsErr(peerAOpen):
+        return Err[bool](Error(peerAOpen))
+    depinInferenceTransportSmokeDerivePair(peerBPair, peerAPair, int64(4))
+    depinInferenceTransportSmokeDerivePair(coordinatorPair, peerAPair, int64(8))
+    links = [
+        transport.DepinInferenceTransportPeerLink(peerId: "peer:a", outbound: peerAPair.outbound, inbound: peerAPair.inbound),
+        transport.DepinInferenceTransportPeerLink(peerId: "peer:b", outbound: peerBPair.outbound, inbound: peerBPair.inbound),
+        transport.DepinInferenceTransportPeerLink(peerId: "peer:coordinator", outbound: coordinatorPair.outbound, inbound: coordinatorPair.inbound)
+    ]
+    return Ok[bool](true)
+
+fn RunDepinInferenceTransportSmoke(): int32 =
+    qtransport.ResetNativeRuntime()
+    var pair: quic_transport.Libp2pQuicLoopbackPair
+    let pairOk = depinInferenceTransportSmokeOpen(pair)
+    if IsErr(pairOk):
+        echo(ErrorText(pairOk))
+        return 1
+    echo("depin transport smoke: pair open")
+
+    let requestFrame = depinInferenceTransportSmokeFrame(int64(pipe.DepinInferenceWireFrameKindRequest))
+    let writeRequest = transport.DepinInferenceTransportWriteWireFrame(pair.outbound, requestFrame)
+    if IsErr(writeRequest):
+        echo(ErrorText(writeRequest))
+        return 2
+    echo("depin transport smoke: request written")
+    let readRequest = transport.DepinInferenceTransportReadWireFrame(pair.inbound)
+    if IsErr(readRequest):
+        echo(ErrorText(readRequest))
+        return 3
+    if Value(readRequest).requestHash != requestFrame.requestHash ||
+       Value(readRequest).responseHash != int64(0):
+        return 4
+
+    let responseFrame = depinInferenceTransportSmokeFrame(int64(pipe.DepinInferenceWireFrameKindResponse))
+    let writeResponse = transport.DepinInferenceTransportWriteWireFrame(pair.outbound, responseFrame)
+    if IsErr(writeResponse):
+        echo(ErrorText(writeResponse))
+        return 5
+    echo("depin transport smoke: response written")
+    let readResponse = transport.DepinInferenceTransportReadWireFrame(pair.inbound)
+    if IsErr(readResponse):
+        echo(ErrorText(readResponse))
+        return 6
+    if Value(readResponse).receiptHash != responseFrame.receiptHash ||
+       Value(readResponse).envelopeHash != responseFrame.envelopeHash:
+        return 7
+    quic_transport.Libp2pQuicLoopbackClose(pair)
+
+    var badPair: quic_transport.Libp2pQuicLoopbackPair
+    let badPairOk = depinInferenceTransportSmokeOpen(badPair)
+    if IsErr(badPairOk):
+        echo(ErrorText(badPairOk))
+        return 8
+    var badFrame: Bytes = BytesAlloc(pipe.DepinInferenceWireFrameBytes)
+    BytesSet(badFrame, 0, 7)
+    let rawWrite = qconn.connWrite(badPair.outbound, badFrame)
+    if IsErr(rawWrite):
+        return 9
+    let badRead = transport.DepinInferenceTransportReadWireFrame(badPair.inbound)
+    if IsOk(badRead):
+        return 10
+    rawbytes.BytesFree(badFrame)
+    quic_transport.Libp2pQuicLoopbackClose(badPair)
+
+    let distributedFrame = depinInferenceTransportSmokeDistributedFrame(engine.DistributedTransportFrameKindRequest, uint64(0))
+    let distributedWire = transport.DepinInferenceTransportWireFrameFromDistributedFrame(distributedFrame)
+    if IsErr(distributedWire):
+        echo(ErrorText(distributedWire))
+        return 11
+    if Value(distributedWire).frameHash != distributedFrame.frameHash:
+        return 12
+
+    var distributedPair: quic_transport.Libp2pQuicLoopbackPair
+    let distributedOpen = depinInferenceTransportSmokeOpen(distributedPair)
+    if IsErr(distributedOpen):
+        echo(ErrorText(distributedOpen))
+        return 13
+    let distributedWrite = transport.DepinInferenceTransportWriteDistributedFrame(distributedPair.outbound, distributedFrame)
+    if IsErr(distributedWrite):
+        echo(ErrorText(distributedWrite))
+        return 14
+    let distributedRead = transport.DepinInferenceTransportReadExpectedDistributedFrame(distributedPair.inbound, distributedFrame)
+    if IsErr(distributedRead):
+        echo(ErrorText(distributedRead))
+        return 15
+    if Value(distributedRead).frameHash != distributedFrame.frameHash:
+        return 16
+    quic_transport.Libp2pQuicLoopbackClose(distributedPair)
+
+    var driftPair: quic_transport.Libp2pQuicLoopbackPair
+    let driftOpen = depinInferenceTransportSmokeOpen(driftPair)
+    if IsErr(driftOpen):
+        echo(ErrorText(driftOpen))
+        return 17
+    let driftWrite = transport.DepinInferenceTransportWriteDistributedFrame(driftPair.outbound, distributedFrame)
+    if IsErr(driftWrite):
+        echo(ErrorText(driftWrite))
+        return 18
+    var driftExpected = distributedFrame
+    driftExpected.payloadHash = driftExpected.payloadHash + int64(1)
+    driftExpected = engine.DistributedShardTransportFrameBuild(driftExpected)
+    if driftExpected.payloadHash == distributedFrame.payloadHash ||
+       driftExpected.frameHash == distributedFrame.frameHash:
+        return 281
+    let driftWireBytes = engine.DistributedShardTransportFrameWireBytes(distributedFrame)
+    if IsErr(driftWireBytes):
+        echo(ErrorText(driftWireBytes))
+        return 282
+    var driftWireBytesValue = Value(driftWireBytes)
+    let driftWireValidate = engine.DistributedValidateShardTransportFrameWire(driftExpected, driftWireBytesValue)
+    rawbytes.BytesFree(driftWireBytesValue)
+    if IsOk(driftWireValidate):
+        return 283
+    let driftRead = transport.DepinInferenceTransportReadExpectedDistributedFrame(driftPair.inbound, driftExpected)
+    if IsOk(driftRead):
+        return 19
+    quic_transport.Libp2pQuicLoopbackClose(driftPair)
+
+    let requestDistributedFrame = depinInferenceTransportSmokeDistributedFrame(engine.DistributedTransportFrameKindRequest, uint64(0))
+    let responseDistributedFrame = depinInferenceTransportSmokeDistributedFrame(engine.DistributedTransportFrameKindResponse, uint64(1))
+    let frameSet = engine.DistributedShardTransportFrameSetBuild(
+        int64(101),
+        [requestDistributedFrame, responseDistributedFrame]
+    )
+    let frameSetOk = transport.DepinInferenceTransportValidateDistributedFrameSet(frameSet)
+    if IsErr(frameSetOk):
+        echo(ErrorText(frameSetOk))
+        return 20
+    var setPair: quic_transport.Libp2pQuicLoopbackPair
+    let setOpen = depinInferenceTransportSmokeOpen(setPair)
+    if IsErr(setOpen):
+        echo(ErrorText(setOpen))
+        return 21
+    let setWrite = transport.DepinInferenceTransportWriteDistributedFrameSet(setPair.outbound, frameSet)
+    if IsErr(setWrite):
+        echo(ErrorText(setWrite))
+        return 22
+    if Value(setWrite) != pipe.DepinInferenceWireFrameBytes * 2:
+        return 23
+    let setRead = transport.DepinInferenceTransportReadExpectedDistributedFrameSet(setPair.inbound, frameSet)
+    if IsErr(setRead):
+        echo(ErrorText(setRead))
+        return 24
+    if Value(setRead) != pipe.DepinInferenceWireFrameBytes * 2:
+        return 25
+    quic_transport.Libp2pQuicLoopbackClose(setPair)
+
+    let wrongOrderFrameSet = engine.DistributedShardTransportFrameSetBuild(
+        int64(101),
+        [responseDistributedFrame, requestDistributedFrame]
+    )
+    let wrongOrderValidate = transport.DepinInferenceTransportValidateDistributedFrameSet(wrongOrderFrameSet)
+    if IsOk(wrongOrderValidate):
+        return 26
+    var orderPair: quic_transport.Libp2pQuicLoopbackPair
+    let orderOpen = depinInferenceTransportSmokeOpen(orderPair)
+    if IsErr(orderOpen):
+        echo(ErrorText(orderOpen))
+        return 27
+    let orderWrite0 = transport.DepinInferenceTransportWriteDistributedFrame(orderPair.outbound, responseDistributedFrame)
+    if IsErr(orderWrite0):
+        echo(ErrorText(orderWrite0))
+        return 28
+    let orderWrite1 = transport.DepinInferenceTransportWriteDistributedFrame(orderPair.outbound, requestDistributedFrame)
+    if IsErr(orderWrite1):
+        echo(ErrorText(orderWrite1))
+        return 29
+    let orderRead = transport.DepinInferenceTransportReadExpectedDistributedFrameSet(orderPair.inbound, frameSet)
+    if IsOk(orderRead):
+        return 30
+    quic_transport.Libp2pQuicLoopbackClose(orderPair)
+
+    var driftSetFrame0 = requestDistributedFrame
+    driftSetFrame0.payloadHash = driftSetFrame0.payloadHash + int64(1)
+    driftSetFrame0 = engine.DistributedShardTransportFrameBuild(driftSetFrame0)
+    let driftFrameSet = engine.DistributedShardTransportFrameSetBuild(
+        int64(101),
+        [driftSetFrame0, responseDistributedFrame]
+    )
+    var driftSetPair: quic_transport.Libp2pQuicLoopbackPair
+    let driftSetOpen = depinInferenceTransportSmokeOpen(driftSetPair)
+    if IsErr(driftSetOpen):
+        echo(ErrorText(driftSetOpen))
+        return 31
+    let driftSetWrite = transport.DepinInferenceTransportWriteDistributedFrameSet(driftSetPair.outbound, frameSet)
+    if IsErr(driftSetWrite):
+        echo(ErrorText(driftSetWrite))
+        return 32
+    let driftSetRead = transport.DepinInferenceTransportReadExpectedDistributedFrameSet(driftSetPair.inbound, driftFrameSet)
+    if IsOk(driftSetRead):
+        return 33
+    quic_transport.Libp2pQuicLoopbackClose(driftSetPair)
+
+    var peerPair: quic_transport.Libp2pQuicLoopbackPair
+    let peerOpen = depinInferenceTransportSmokeOpen(peerPair)
+    if IsErr(peerOpen):
+        echo(ErrorText(peerOpen))
+        return 34
+    var coordinatorPair: quic_transport.Libp2pQuicLoopbackPair
+    depinInferenceTransportSmokeDerivePair(coordinatorPair, peerPair, int64(4))
+    var links: transport.DepinInferenceTransportPeerLink[] = [
+        transport.DepinInferenceTransportPeerLink(peerId: "peer:a", outbound: peerPair.outbound, inbound: peerPair.inbound),
+        transport.DepinInferenceTransportPeerLink(peerId: "peer:coordinator", outbound: coordinatorPair.outbound, inbound: coordinatorPair.inbound)
+    ]
+    let dispatchWrite = transport.DepinInferenceTransportDispatchFrameSetByTarget(links, frameSet)
+    if IsErr(dispatchWrite):
+        echo(ErrorText(dispatchWrite))
+        return 36
+    if Value(dispatchWrite) != pipe.DepinInferenceWireFrameBytes * 2:
+        return 37
+    let peerRead = transport.DepinInferenceTransportReadPeerExpectedFrames(links, "peer:a", [requestDistributedFrame])
+    if IsErr(peerRead):
+        echo(ErrorText(peerRead))
+        return 38
+    let coordinatorRead = transport.DepinInferenceTransportReadPeerExpectedFrames(links, "peer:coordinator", [responseDistributedFrame])
+    if IsErr(coordinatorRead):
+        echo(ErrorText(coordinatorRead))
+        return 39
+    if Value(peerRead) != pipe.DepinInferenceWireFrameBytes ||
+       Value(coordinatorRead) != pipe.DepinInferenceWireFrameBytes:
+        return 40
+
+    var missingLinks: transport.DepinInferenceTransportPeerLink[] = [
+        transport.DepinInferenceTransportPeerLink(peerId: "peer:a", outbound: peerPair.outbound, inbound: peerPair.inbound)
+    ]
+    let missingDispatch = transport.DepinInferenceTransportDispatchFrameSetByTarget(missingLinks, frameSet)
+    if IsOk(missingDispatch):
+        return 41
+
+    let wrongPeerRead = transport.DepinInferenceTransportReadPeerExpectedFrames(links, "peer:a", [responseDistributedFrame])
+    if IsOk(wrongPeerRead):
+        return 42
+
+    var duplicateLinks: transport.DepinInferenceTransportPeerLink[] = [
+        transport.DepinInferenceTransportPeerLink(peerId: "peer:a", outbound: peerPair.outbound, inbound: peerPair.inbound),
+        transport.DepinInferenceTransportPeerLink(peerId: "peer:a", outbound: coordinatorPair.outbound, inbound: coordinatorPair.inbound)
+    ]
+    let duplicateValidate = transport.DepinInferenceTransportValidatePeerLinks(duplicateLinks)
+    if IsOk(duplicateValidate):
+        return 43
+    quic_transport.Libp2pQuicLoopbackClose(peerPair)
+
+    var certifiedPlan: engine.DistributedInferencePlan
+    var certifiedPeers: engine.DistributedInferencePeer[]
+    var certifiedKvCache: pkv.PagedKVCache
+    var certifiedKvSeq: pkv.PagedKVSequence
+    var certifiedEnvelopes: at.ActivationEnvelope[]
+    var certifiedActivationStore: at.ActivationTensorStore
+    var certifiedEvidence: engine.DistributedActivationEvidence
+    var certifiedKvTransferEvidence: engine.DistributedKvPageTransferEvidence
+    var certifiedManifest: inference_manifest.DepinDistributedInferenceManifest
+    let certifiedFixtureOk = depinTransportSmokeBuildCertifiedFixture(
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        certifiedKvTransferEvidence,
+        certifiedManifest
+    )
+    if IsErr(certifiedFixtureOk):
+        echo(ErrorText(certifiedFixtureOk))
+        return 44
+
+    let kvWireFrame0 = transport.DepinInferenceTransportWireFrameFromKvPageTransferFrame(certifiedKvTransferEvidence.frames.frames[0])
+    if IsErr(kvWireFrame0):
+        echo(ErrorText(kvWireFrame0))
+        return 141
+    if Value(kvWireFrame0).shardNameHash != engine.DistributedKvPageTransferFramePageHash(certifiedKvTransferEvidence.frames.frames[0]):
+        return 142
+    var kvFramePair: quic_transport.Libp2pQuicLoopbackPair
+    let kvFrameOpen = depinInferenceTransportSmokeOpen(kvFramePair)
+    if IsErr(kvFrameOpen):
+        echo(ErrorText(kvFrameOpen))
+        return 143
+    let kvFrameWrite = transport.DepinInferenceTransportWriteKvPageTransferFrame(kvFramePair.outbound, certifiedKvTransferEvidence.frames.frames[0])
+    if IsErr(kvFrameWrite):
+        echo(ErrorText(kvFrameWrite))
+        return 144
+    let kvFrameRead = transport.DepinInferenceTransportReadExpectedKvPageTransferFrame(kvFramePair.inbound, certifiedKvTransferEvidence.frames.frames[0])
+    if IsErr(kvFrameRead):
+        echo(ErrorText(kvFrameRead))
+        return 145
+    if Value(kvFrameRead).frameHash != certifiedKvTransferEvidence.frames.frames[0].frameHash:
+        return 146
+    quic_transport.Libp2pQuicLoopbackClose(kvFramePair)
+    var kvFrameDriftPair: quic_transport.Libp2pQuicLoopbackPair
+    let kvFrameDriftOpen = depinInferenceTransportSmokeOpen(kvFrameDriftPair)
+    if IsErr(kvFrameDriftOpen):
+        echo(ErrorText(kvFrameDriftOpen))
+        return 147
+    let kvFrameDriftWrite = transport.DepinInferenceTransportWriteKvPageTransferFrame(kvFrameDriftPair.outbound, certifiedKvTransferEvidence.frames.frames[0])
+    if IsErr(kvFrameDriftWrite):
+        echo(ErrorText(kvFrameDriftWrite))
+        return 148
+    var kvFrameDriftExpected = certifiedKvTransferEvidence.frames.frames[0]
+    kvFrameDriftExpected.pageId = kvFrameDriftExpected.pageId + 1
+    kvFrameDriftExpected = engine.DistributedKvPageTransferFrameBuild(kvFrameDriftExpected)
+    let kvFrameDriftRead = transport.DepinInferenceTransportReadExpectedKvPageTransferFrame(kvFrameDriftPair.inbound, kvFrameDriftExpected)
+    if IsOk(kvFrameDriftRead):
+        return 140
+    quic_transport.Libp2pQuicLoopbackClose(kvFrameDriftPair)
+
+    var session: inference_manifest.DepinInferenceSession
+    session = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var certifiedLinks: transport.DepinInferenceTransportPeerLink[]
+    var certifiedPeerAPair: quic_transport.Libp2pQuicLoopbackPair
+    var certifiedPeerBPair: quic_transport.Libp2pQuicLoopbackPair
+    var certifiedCoordinatorPair: quic_transport.Libp2pQuicLoopbackPair
+    let certifiedLinksOpen = depinTransportSmokeOpenCertifiedLinks(
+        certifiedLinks,
+        certifiedPeerAPair,
+        certifiedPeerBPair,
+        certifiedCoordinatorPair
+    )
+    if IsErr(certifiedLinksOpen):
+        echo(ErrorText(certifiedLinksOpen))
+        return 45
+    var adapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "keyref:coordinator:transport",
+        uint64(1)
+    )
+    let certifiedKvResidencyStoreRes = engine.DistributedBuildEmptyKvResidencyStore(
+        certifiedPlan,
+        certifiedPeers,
+        "peer:b",
+        certifiedPlan.kvReceipt.pageCount,
+        int64(900000)
+    )
+    if IsErr(certifiedKvResidencyStoreRes):
+        echo(ErrorText(certifiedKvResidencyStoreRes))
+        return 140
+    let certifiedKvResidencyStore = Value(certifiedKvResidencyStoreRes)
+    let certifiedResidencyPrefix = depinTransportSmokeFreshResidencyPrefix("certified", certifiedPlan.engineHash)
+    let certifiedReceipt = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        session,
+        certifiedLinks,
+        certifiedManifest,
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        certifiedKvTransferEvidence,
+        certifiedKvResidencyStore,
+        certifiedResidencyPrefix,
+        adapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsErr(certifiedReceipt):
+        echo(ErrorText(certifiedReceipt))
+        return 46
+    if !session.finished || session.failed:
+        return 47
+    let certifiedExpectedBytes = (certifiedEvidence.transportFrames.frames.len + certifiedKvTransferEvidence.frames.frames.len + 2) * pipe.DepinInferenceWireFrameBytes
+    if Value(certifiedReceipt).bytesWritten != certifiedExpectedBytes ||
+       Value(certifiedReceipt).bytesRead != certifiedExpectedBytes:
+        return 48
+    if session.expectedSeqNo != uint64(certifiedEvidence.transportFrames.frames.len + certifiedKvTransferEvidence.frames.frames.len + 2):
+        return 139
+    if Value(certifiedReceipt).manifestHash != certifiedManifest.manifestHash ||
+       Value(certifiedReceipt).evidenceHash != certifiedEvidence.evidenceHash:
+        return 49
+    if Value(certifiedReceipt).specDecodeAlgorithm != engine.DistributedSpecDecodeAlgorithmNone ||
+       Value(certifiedReceipt).specDecodePlanHash != certifiedPlan.specDecodePlan.planHash ||
+       Value(certifiedReceipt).specDecodeCertifiedReceiptHash != int64(0) ||
+       session.specDecodeCertifiedReceiptHash != int64(0):
+        return 262
+    if Value(certifiedReceipt).kvPageTransferEvidenceHash != certifiedKvTransferEvidence.evidenceHash:
+        return 149
+    if Value(certifiedReceipt).kvPageResidencyReceiptHash <= int64(0) ||
+       Value(certifiedReceipt).kvResidencyScheduleHash <= int64(0) ||
+       Value(certifiedReceipt).kvResidencyStoreOperationHash <= int64(0) ||
+       Value(certifiedReceipt).kvResidencyStoreHash <= int64(0) ||
+       Value(certifiedReceipt).kvResidencyWalRecordHash <= int64(0) ||
+       Value(certifiedReceipt).kvResidencyWalLogHash <= int64(0) ||
+       Value(certifiedReceipt).kvResidencyWalAppendHash <= int64(0) ||
+       Value(certifiedReceipt).kvResidencyServiceCommitHash <= int64(0) ||
+       Value(certifiedReceipt).kvResidencyServiceApplyHash <= int64(0) ||
+       Value(certifiedReceipt).settlementLedgerHash <= int64(0) ||
+       Value(certifiedReceipt).settlementLedgerReceiptHash <= int64(0) ||
+       Value(certifiedReceipt).settlementLedgerReplicationHash <= int64(0) ||
+       Value(certifiedReceipt).settlementLedgerAckHash <= int64(0) ||
+       Value(certifiedReceipt).settlementLedgerReplicaCount != 2 ||
+       Value(certifiedReceipt).settlementLedgerReplicaQuorum != 2 ||
+       Value(certifiedReceipt).settlementLedgerQuorumFileReceiptHash <= int64(0) ||
+       Value(certifiedReceipt).settlementLedgerReplicaAttemptCount != 2 ||
+       Value(certifiedReceipt).settlementLedgerReplicaAttemptSetHash <= int64(0):
+        return 138
+    let certifiedSettlementLedgerRead = inference_settlement.DepinSettlementReadLedgerFile(
+        inference_settlement.DepinSettlementLedgerPathFromPrefix(certifiedResidencyPrefix)
+    )
+    if IsErr(certifiedSettlementLedgerRead):
+        echo(ErrorText(certifiedSettlementLedgerRead))
+        return 165
+    let certifiedSettlementLedger = Value(certifiedSettlementLedgerRead).ledger
+    let certifiedSettlementReceipt = Value(certifiedSettlementLedgerRead).receipt
+    if certifiedSettlementLedger.recordCount != 2 ||
+       certifiedSettlementReceipt.ledgerHash != Value(certifiedReceipt).settlementLedgerHash ||
+       certifiedSettlementReceipt.receiptHash != Value(certifiedReceipt).settlementLedgerReceiptHash:
+        return 166
+    let certifiedReplicaRead = inference_settlement.DepinSettlementReadLedgerReplicaReceiptFile(
+        inference_settlement.DepinSettlementLedgerReplicaPathFromPrefix(certifiedResidencyPrefix, "peer:coordinator")
+    )
+    if IsErr(certifiedReplicaRead):
+        echo(ErrorText(certifiedReplicaRead))
+        return 177
+    let certifiedReplicaReceipt = Value(certifiedReplicaRead)
+    if certifiedReplicaReceipt.ledgerHash != certifiedSettlementReceipt.ledgerHash ||
+       certifiedReplicaReceipt.ledgerReceiptHash != certifiedSettlementReceipt.receiptHash ||
+       certifiedReplicaReceipt.ledgerByteHash != certifiedSettlementReceipt.byteHash ||
+       certifiedReplicaReceipt.ledgerRecordCount != certifiedSettlementReceipt.recordCount ||
+       certifiedReplicaReceipt.sourcePeerHash != inference_settlement.DepinSettlementTextHash("did:coordinator:transport") ||
+       certifiedReplicaReceipt.targetPeerHash != inference_settlement.DepinSettlementTextHash("peer:coordinator"):
+        return 178
+    let certifiedReplicaBRead = inference_settlement.DepinSettlementReadLedgerReplicaReceiptFile(
+        inference_settlement.DepinSettlementLedgerReplicaPathFromPrefix(certifiedResidencyPrefix, "peer:b")
+    )
+    if IsErr(certifiedReplicaBRead):
+        echo(ErrorText(certifiedReplicaBRead))
+        return 181
+    if Value(certifiedReplicaBRead).ledgerReceiptHash != certifiedSettlementReceipt.receiptHash ||
+       Value(certifiedReplicaBRead).targetPeerHash != inference_settlement.DepinSettlementTextHash("peer:b"):
+        return 182
+    let certifiedQuorumFileRead = transport.DepinInferenceTransportReadSettlementLedgerQuorumReceiptFile(
+        transport.DepinInferenceTransportSettlementLedgerQuorumPathFromPrefix(certifiedResidencyPrefix)
+    )
+    if IsErr(certifiedQuorumFileRead):
+        echo(ErrorText(certifiedQuorumFileRead))
+        return 193
+    if Value(certifiedQuorumFileRead).receiptHash != Value(certifiedReceipt).settlementLedgerQuorumFileReceiptHash ||
+       Value(certifiedQuorumFileRead).quorumReceiptHash != Value(certifiedReceipt).settlementLedgerReplicationHash ||
+       Value(certifiedQuorumFileRead).ackFrameSetHash != Value(certifiedReceipt).settlementLedgerAckHash ||
+       Value(certifiedQuorumFileRead).successfulReplicaCount != 2 ||
+       Value(certifiedQuorumFileRead).requiredReplicaCount != 2 ||
+       Value(certifiedQuorumFileRead).maxReplicaAttempts != 2 ||
+       Value(certifiedQuorumFileRead).replicaAttemptCount != Value(certifiedReceipt).settlementLedgerReplicaAttemptCount ||
+       Value(certifiedQuorumFileRead).replicaAttemptSetHash != Value(certifiedReceipt).settlementLedgerReplicaAttemptSetHash:
+        return 194
+    let settlementReplicationRequest = transport.DepinInferenceTransportBuildSettlementLedgerRequestFrame(
+        certifiedPlan,
+        "did:coordinator:transport",
+        "peer:b",
+        certifiedSettlementReceipt,
+        int64(700),
+        int64(800000)
+    )
+    if IsErr(settlementReplicationRequest):
+        echo(ErrorText(settlementReplicationRequest))
+        return 172
+    let manualReplicaPrefix = depinTransportSmokeFreshResidencyPrefix("settlement_replica_manual", certifiedPlan.engineHash)
+    let settlementReplicationReplica = inference_settlement.DepinSettlementWriteLedgerReplicaReceiptFile(
+        inference_settlement.DepinSettlementLedgerReplicaPathFromPrefix(manualReplicaPrefix, "peer:b"),
+        "did:coordinator:transport",
+        "peer:b",
+        certifiedSettlementReceipt,
+        Value(settlementReplicationRequest).frameHash,
+        int64(800001)
+    )
+    if IsErr(settlementReplicationReplica):
+        echo(ErrorText(settlementReplicationReplica))
+        return 179
+    let settlementReplicationAck = transport.DepinInferenceTransportBuildSettlementLedgerAckFrame(
+        certifiedPlan,
+        Value(settlementReplicationRequest),
+        certifiedSettlementReceipt,
+        Value(settlementReplicationReplica),
+        int64(800001)
+    )
+    if IsErr(settlementReplicationAck):
+        echo(ErrorText(settlementReplicationAck))
+        return 173
+    var settlementReplicationReplicaDrift = Value(settlementReplicationReplica)
+    settlementReplicationReplicaDrift.ledgerHash = settlementReplicationReplicaDrift.ledgerHash + int64(1)
+    let settlementReplicationAckBadReplica = transport.DepinInferenceTransportBuildSettlementLedgerAckFrame(
+        certifiedPlan,
+        Value(settlementReplicationRequest),
+        certifiedSettlementReceipt,
+        settlementReplicationReplicaDrift,
+        int64(800001)
+    )
+    if IsOk(settlementReplicationAckBadReplica):
+        return 180
+    let settlementReplicationReceiptOk = transport.DepinInferenceTransportBuildSettlementLedgerReplicationReceipt(
+        certifiedPlan,
+        "did:coordinator:transport",
+        "did:coordinator:transport",
+        "peer:b",
+        certifiedSettlementReceipt,
+        Value(settlementReplicationReplica),
+        Value(settlementReplicationRequest),
+        Value(settlementReplicationAck),
+        int64(800001)
+    )
+    if IsErr(settlementReplicationReceiptOk):
+        echo(ErrorText(settlementReplicationReceiptOk))
+        return 174
+    let settlementReplicationWrongCoordinator = transport.DepinInferenceTransportBuildSettlementLedgerReplicationReceipt(
+        certifiedPlan,
+        "peer:b",
+        "did:coordinator:transport",
+        "peer:b",
+        certifiedSettlementReceipt,
+        Value(settlementReplicationReplica),
+        Value(settlementReplicationRequest),
+        Value(settlementReplicationAck),
+        int64(800001)
+    )
+    if IsOk(settlementReplicationWrongCoordinator):
+        return 175
+    let settlementReplicationCoordinatorRequest = transport.DepinInferenceTransportBuildSettlementLedgerRequestFrame(
+        certifiedPlan,
+        "did:coordinator:transport",
+        "peer:coordinator",
+        certifiedSettlementReceipt,
+        int64(701),
+        int64(800010)
+    )
+    if IsErr(settlementReplicationCoordinatorRequest):
+        echo(ErrorText(settlementReplicationCoordinatorRequest))
+        return 183
+    let settlementReplicationCoordinatorReplica = inference_settlement.DepinSettlementWriteLedgerReplicaReceiptFile(
+        inference_settlement.DepinSettlementLedgerReplicaPathFromPrefix(manualReplicaPrefix, "peer:coordinator"),
+        "did:coordinator:transport",
+        "peer:coordinator",
+        certifiedSettlementReceipt,
+        Value(settlementReplicationCoordinatorRequest).frameHash,
+        int64(800011)
+    )
+    if IsErr(settlementReplicationCoordinatorReplica):
+        echo(ErrorText(settlementReplicationCoordinatorReplica))
+        return 184
+    let settlementReplicationCoordinatorAck = transport.DepinInferenceTransportBuildSettlementLedgerAckFrame(
+        certifiedPlan,
+        Value(settlementReplicationCoordinatorRequest),
+        certifiedSettlementReceipt,
+        Value(settlementReplicationCoordinatorReplica),
+        int64(800011)
+    )
+    if IsErr(settlementReplicationCoordinatorAck):
+        echo(ErrorText(settlementReplicationCoordinatorAck))
+        return 185
+    let settlementReplicationCoordinatorReceiptOk = transport.DepinInferenceTransportBuildSettlementLedgerReplicationReceipt(
+        certifiedPlan,
+        "did:coordinator:transport",
+        "did:coordinator:transport",
+        "peer:coordinator",
+        certifiedSettlementReceipt,
+        Value(settlementReplicationCoordinatorReplica),
+        Value(settlementReplicationCoordinatorRequest),
+        Value(settlementReplicationCoordinatorAck),
+        int64(800011)
+    )
+    if IsErr(settlementReplicationCoordinatorReceiptOk):
+        echo(ErrorText(settlementReplicationCoordinatorReceiptOk))
+        return 186
+    let settlementReplicationCoordinatorAttempt = transport.DepinInferenceTransportBuildSettlementLedgerReplicationAttempt(
+        certifiedPlan,
+        "did:coordinator:transport",
+        "peer:coordinator",
+        certifiedSettlementReceipt,
+        0,
+        int64(701),
+        int64(800010),
+        true,
+        Value(settlementReplicationCoordinatorReceiptOk).requestFrameHash,
+        Value(settlementReplicationCoordinatorReceiptOk).ackFrameHash,
+        Value(settlementReplicationCoordinatorReceiptOk).replicaReceiptHash,
+        ""
+    )
+    let settlementReplicationBAttempt = transport.DepinInferenceTransportBuildSettlementLedgerReplicationAttempt(
+        certifiedPlan,
+        "did:coordinator:transport",
+        "peer:b",
+        certifiedSettlementReceipt,
+        0,
+        int64(700),
+        int64(800000),
+        true,
+        Value(settlementReplicationReceiptOk).requestFrameHash,
+        Value(settlementReplicationReceiptOk).ackFrameHash,
+        Value(settlementReplicationReceiptOk).replicaReceiptHash,
+        ""
+    )
+    let settlementQuorumOk = transport.DepinInferenceTransportBuildSettlementLedgerQuorumReceipt(
+        certifiedPlan,
+        depinTransportSmokeBuildSettlementPlan(),
+        "did:coordinator:transport",
+        "did:coordinator:transport",
+        certifiedSettlementReceipt,
+        [Value(settlementReplicationCoordinatorReceiptOk), Value(settlementReplicationReceiptOk)],
+        [],
+        [settlementReplicationCoordinatorAttempt, settlementReplicationBAttempt],
+        int64(800020)
+    )
+    if IsErr(settlementQuorumOk):
+        echo(ErrorText(settlementQuorumOk))
+        return 187
+    if Value(settlementQuorumOk).successfulReplicaCount != 2 ||
+       Value(settlementQuorumOk).requiredReplicaCount != 2 ||
+       Value(settlementQuorumOk).maxReplicaAttempts != 2 ||
+       Value(settlementQuorumOk).replicaAttemptCount != 2 ||
+       Value(settlementQuorumOk).replicaAttemptSetHash <= int64(0) ||
+       Value(settlementQuorumOk).bytesWritten != pipe.DepinInferenceWireFrameBytes * 2:
+        return 188
+    let settlementQuorumFileOk = transport.DepinInferenceTransportWriteSettlementLedgerQuorumReceiptFile(
+        transport.DepinInferenceTransportSettlementLedgerQuorumPathFromPrefix(manualReplicaPrefix),
+        Value(settlementQuorumOk)
+    )
+    if IsErr(settlementQuorumFileOk):
+        echo(ErrorText(settlementQuorumFileOk))
+        return 195
+    if Value(settlementQuorumFileOk).quorumReceiptHash != Value(settlementQuorumOk).receiptHash ||
+       Value(settlementQuorumFileOk).ackFrameSetHash != Value(settlementQuorumOk).ackFrameSetHash ||
+       Value(settlementQuorumFileOk).replicaAttemptSetHash != Value(settlementQuorumOk).replicaAttemptSetHash ||
+       Value(settlementQuorumFileOk).replicaAttemptCount != Value(settlementQuorumOk).replicaAttemptCount ||
+       Value(settlementQuorumFileOk).maxReplicaAttempts != Value(settlementQuorumOk).maxReplicaAttempts:
+        return 196
+    let settlementQuorumFileRead = transport.DepinInferenceTransportReadSettlementLedgerQuorumReceiptFile(
+        transport.DepinInferenceTransportSettlementLedgerQuorumPathFromPrefix(manualReplicaPrefix)
+    )
+    if IsErr(settlementQuorumFileRead):
+        echo(ErrorText(settlementQuorumFileRead))
+        return 197
+    if Value(settlementQuorumFileRead).receiptHash != Value(settlementQuorumFileOk).receiptHash:
+        return 198
+    let settlementQuorumFileBytes = os.ReadFileBytesResult(
+        transport.DepinInferenceTransportSettlementLedgerQuorumPathFromPrefix(manualReplicaPrefix)
+    )
+    if IsErr(settlementQuorumFileBytes):
+        echo(ErrorText(settlementQuorumFileBytes))
+        return 199
+    var settlementQuorumFileBytesRaw = Value(settlementQuorumFileBytes)
+    rawbytes.BytesSet(settlementQuorumFileBytesRaw, 40, rawbytes.BytesGet(settlementQuorumFileBytesRaw, 40) ^ 1)
+    let settlementQuorumFileWriteBad = os.WriteFileBytesResult(
+        transport.DepinInferenceTransportSettlementLedgerQuorumPathFromPrefix(manualReplicaPrefix),
+        settlementQuorumFileBytesRaw
+    )
+    rawbytes.BytesFree(settlementQuorumFileBytesRaw)
+    if IsErr(settlementQuorumFileWriteBad):
+        echo(ErrorText(settlementQuorumFileWriteBad))
+        return 200
+    if IsOk(transport.DepinInferenceTransportValidateSettlementLedgerQuorumFileReceipt(Value(settlementQuorumFileOk))):
+        return 201
+    var settlementQuorumDrift = Value(settlementQuorumOk)
+    settlementQuorumDrift.successfulReplicaCount = settlementQuorumDrift.successfulReplicaCount - 1
+    if IsOk(transport.DepinInferenceTransportValidateSettlementLedgerQuorumReceipt(settlementQuorumDrift)):
+        return 189
+    var settlementQuorumAttemptDrift = Value(settlementQuorumOk)
+    settlementQuorumAttemptDrift.replicaAttemptSetHash = settlementQuorumAttemptDrift.replicaAttemptSetHash + int64(1)
+    if IsOk(transport.DepinInferenceTransportValidateSettlementLedgerQuorumReceipt(settlementQuorumAttemptDrift)):
+        return 203
+    let settlementQuorumBelow = transport.DepinInferenceTransportBuildSettlementLedgerQuorumReceipt(
+        certifiedPlan,
+        depinTransportSmokeBuildSettlementPlan(),
+        "did:coordinator:transport",
+        "did:coordinator:transport",
+        certifiedSettlementReceipt,
+        [Value(settlementReplicationReceiptOk)],
+        [],
+        [settlementReplicationBAttempt],
+        int64(800021)
+    )
+    if IsOk(settlementQuorumBelow):
+        return 190
+    let settlementRetryPlan = inference_settlement.DepinSettlementPlanBuildWithReplicas(
+        "batch:transport-session",
+        "job:transport-session",
+        "peer:coordinator",
+        "escrow:transport-session",
+        int64(100),
+        ["peer:coordinator", "peer:b", "peer:a"],
+        2,
+        3
+    )
+    let settlementMissingAttempt0 = transport.DepinInferenceTransportBuildSettlementLedgerReplicationAttempt(
+        certifiedPlan,
+        "did:coordinator:transport",
+        "peer:a",
+        certifiedSettlementReceipt,
+        0,
+        int64(702),
+        int64(800030),
+        false,
+        int64(0),
+        int64(0),
+        int64(0),
+        "missing peer link"
+    )
+    let settlementMissingAttempt1 = transport.DepinInferenceTransportBuildSettlementLedgerReplicationAttempt(
+        certifiedPlan,
+        "did:coordinator:transport",
+        "peer:a",
+        certifiedSettlementReceipt,
+        1,
+        int64(703),
+        int64(800031),
+        false,
+        int64(0),
+        int64(0),
+        int64(0),
+        "missing peer link"
+    )
+    let settlementMissingAttempt2 = transport.DepinInferenceTransportBuildSettlementLedgerReplicationAttempt(
+        certifiedPlan,
+        "did:coordinator:transport",
+        "peer:a",
+        certifiedSettlementReceipt,
+        2,
+        int64(704),
+        int64(800032),
+        false,
+        int64(0),
+        int64(0),
+        int64(0),
+        "missing peer link"
+    )
+    let settlementMissingFailure = transport.DepinInferenceTransportBuildSettlementLedgerReplicationFailure(
+        certifiedPlan,
+        "did:coordinator:transport",
+        "peer:a",
+        certifiedSettlementReceipt,
+        "missing peer link",
+        int64(800032)
+    )
+    let settlementRetryQuorumOk = transport.DepinInferenceTransportBuildSettlementLedgerQuorumReceipt(
+        certifiedPlan,
+        settlementRetryPlan,
+        "did:coordinator:transport",
+        "did:coordinator:transport",
+        certifiedSettlementReceipt,
+        [Value(settlementReplicationCoordinatorReceiptOk), Value(settlementReplicationReceiptOk)],
+        [settlementMissingFailure],
+        [
+            settlementReplicationCoordinatorAttempt,
+            settlementReplicationBAttempt,
+            settlementMissingAttempt0,
+            settlementMissingAttempt1,
+            settlementMissingAttempt2
+        ],
+        int64(800040)
+    )
+    if IsErr(settlementRetryQuorumOk):
+        echo(ErrorText(settlementRetryQuorumOk))
+        return 204
+    if Value(settlementRetryQuorumOk).successfulReplicaCount != 2 ||
+       Value(settlementRetryQuorumOk).failedReplicaCount != 1 ||
+       Value(settlementRetryQuorumOk).requiredReplicaCount != 2 ||
+       Value(settlementRetryQuorumOk).maxReplicaAttempts != 3 ||
+       Value(settlementRetryQuorumOk).replicaAttemptCount != 5 ||
+       Value(settlementRetryQuorumOk).replicaAttemptSetHash <= int64(0):
+        return 205
+    let settlementRepairQuorumPath = strutil.Join([certifiedResidencyPrefix, "_repair.csq1"], "")
+    if os.FileExists(settlementRepairQuorumPath):
+        assert(os.RemoveFile(settlementRepairQuorumPath), " depin transport smoke: remove old settlement repair quorum")
+    let settlementRepairPreviousQuorum = transport.DepinInferenceTransportWriteSettlementLedgerQuorumReceiptFile(
+        settlementRepairQuorumPath,
+        Value(settlementRetryQuorumOk)
+    )
+    if IsErr(settlementRepairPreviousQuorum):
+        echo(ErrorText(settlementRepairPreviousQuorum))
+        return 208
+    let settlementRepairPath = transport.DepinInferenceTransportSettlementLedgerRepairPathFromPrefix(certifiedResidencyPrefix)
+    let settlementRepairDaemonPath = transport.DepinInferenceTransportSettlementRepairDaemonStatePathFromPrefix(certifiedResidencyPrefix)
+    let settlementRepairDaemonTick = transport.DepinInferenceTransportRunSettlementRepairDaemonSchedulerTick(
+        certifiedLinks,
+        certifiedPlan,
+        settlementRetryPlan,
+        "did:coordinator:transport",
+        certifiedResidencyPrefix,
+        settlementRepairQuorumPath,
+        settlementRepairPath,
+        settlementRepairDaemonPath,
+        int64(800),
+        int64(810000),
+        int64(1000),
+        int64(100)
+    )
+    if IsErr(settlementRepairDaemonTick):
+        echo(ErrorText(settlementRepairDaemonTick))
+        return 209
+    if Value(settlementRepairDaemonTick).tickSeq != int64(0) ||
+       Value(settlementRepairDaemonTick).previousDaemonStateHash != int64(0) ||
+       Value(settlementRepairDaemonTick).finalReplicaCount != 3 ||
+       Value(settlementRepairDaemonTick).failedReplicaCount != 0 ||
+       !Value(settlementRepairDaemonTick).repairComplete ||
+       Value(settlementRepairDaemonTick).nextEligibleAtNs != int64(811000) ||
+       Value(settlementRepairDaemonTick).leaseUntilNs != int64(810100):
+        return 210
+    let settlementRepairRead = transport.DepinInferenceTransportReadSettlementLedgerRepairReceiptFile(settlementRepairPath)
+    if IsErr(settlementRepairRead):
+        echo(ErrorText(settlementRepairRead))
+        return 213
+    if Value(settlementRepairRead).existingReplicaCount != 2 ||
+       Value(settlementRepairRead).repairedReplicaCount != 1 ||
+       Value(settlementRepairRead).failedReplicaCount != 0 ||
+       Value(settlementRepairRead).finalReplicaCount != 3 ||
+       !Value(settlementRepairRead).complete ||
+       Value(settlementRepairRead).replicaAttemptCount != 1 ||
+       Value(settlementRepairRead).bytesWritten != pipe.DepinInferenceWireFrameBytes ||
+       Value(settlementRepairRead).bytesRead != pipe.DepinInferenceWireFrameBytes ||
+       Value(settlementRepairDaemonTick).repairReceiptHash != Value(settlementRepairRead).receiptHash ||
+       Value(settlementRepairDaemonTick).repairHash != Value(settlementRepairRead).repairHash:
+        return 214
+    let settlementRepairPeerARead = inference_settlement.DepinSettlementReadLedgerReplicaReceiptFile(
+        inference_settlement.DepinSettlementLedgerReplicaPathFromPrefix(certifiedResidencyPrefix, "peer:a")
+    )
+    if IsErr(settlementRepairPeerARead):
+        echo(ErrorText(settlementRepairPeerARead))
+        return 211
+    if Value(settlementRepairPeerARead).ledgerReceiptHash != certifiedSettlementReceipt.receiptHash ||
+       Value(settlementRepairPeerARead).targetPeerHash != inference_settlement.DepinSettlementTextHash("peer:a"):
+        return 212
+    let settlementRepairDaemonRead = transport.DepinInferenceTransportReadSettlementRepairDaemonStateReceiptFile(settlementRepairDaemonPath)
+    if IsErr(settlementRepairDaemonRead):
+        echo(ErrorText(settlementRepairDaemonRead))
+        return 216
+    if Value(settlementRepairDaemonRead).receiptHash != Value(settlementRepairDaemonTick).receiptHash ||
+       Value(settlementRepairDaemonRead).stateHash != Value(settlementRepairDaemonTick).stateHash:
+        return 217
+    var settlementRepairDaemonDrift = Value(settlementRepairDaemonTick)
+    settlementRepairDaemonDrift.finalReplicaCount = settlementRepairDaemonDrift.finalReplicaCount - 1
+    if IsOk(transport.DepinInferenceTransportValidateSettlementRepairDaemonStateReceipt(settlementRepairDaemonDrift)):
+        return 218
+    var settlementRepairDrift = Value(settlementRepairRead)
+    settlementRepairDrift.finalReplicaCount = settlementRepairDrift.finalReplicaCount - 1
+    if IsOk(transport.DepinInferenceTransportValidateSettlementLedgerRepairReceipt(settlementRepairDrift)):
+        return 215
+    let settlementRepairNotDue = transport.DepinInferenceTransportRunSettlementRepairDaemonSchedulerTick(
+        certifiedLinks,
+        certifiedPlan,
+        settlementRetryPlan,
+        "did:coordinator:transport",
+        certifiedResidencyPrefix,
+        settlementRepairQuorumPath,
+        settlementRepairPath,
+        settlementRepairDaemonPath,
+        int64(900),
+        int64(810500),
+        int64(1000),
+        int64(100)
+    )
+    if IsOk(settlementRepairNotDue):
+        return 219
+    let settlementRepairBytes = os.ReadFileBytesResult(settlementRepairPath)
+    if IsErr(settlementRepairBytes):
+        echo(ErrorText(settlementRepairBytes))
+        return 224
+    var settlementRepairBytesRaw = Value(settlementRepairBytes)
+    rawbytes.BytesSet(settlementRepairBytesRaw, 40, rawbytes.BytesGet(settlementRepairBytesRaw, 40) ^ 1)
+    let settlementRepairWriteBad = os.WriteFileBytesResult(settlementRepairPath, settlementRepairBytesRaw)
+    if IsErr(settlementRepairWriteBad):
+        rawbytes.BytesFree(settlementRepairBytesRaw)
+        echo(ErrorText(settlementRepairWriteBad))
+        return 225
+    let settlementRepairPreviousDrift = transport.DepinInferenceTransportRunSettlementRepairDaemonSchedulerTick(
+        certifiedLinks,
+        certifiedPlan,
+        settlementRetryPlan,
+        "did:coordinator:transport",
+        certifiedResidencyPrefix,
+        settlementRepairQuorumPath,
+        settlementRepairPath,
+        settlementRepairDaemonPath,
+        int64(900),
+        int64(811000),
+        int64(1000),
+        int64(100)
+    )
+    rawbytes.BytesSet(settlementRepairBytesRaw, 40, rawbytes.BytesGet(settlementRepairBytesRaw, 40) ^ 1)
+    let settlementRepairRestore = os.WriteFileBytesResult(settlementRepairPath, settlementRepairBytesRaw)
+    rawbytes.BytesFree(settlementRepairBytesRaw)
+    if IsErr(settlementRepairRestore):
+        echo(ErrorText(settlementRepairRestore))
+        return 226
+    if IsOk(settlementRepairPreviousDrift):
+        return 227
+    let settlementRepairDaemonTick2 = transport.DepinInferenceTransportRunSettlementRepairDaemonSchedulerTick(
+        certifiedLinks,
+        certifiedPlan,
+        settlementRetryPlan,
+        "did:coordinator:transport",
+        certifiedResidencyPrefix,
+        settlementRepairQuorumPath,
+        settlementRepairPath,
+        settlementRepairDaemonPath,
+        int64(900),
+        int64(811000),
+        int64(1000),
+        int64(100)
+    )
+    if IsErr(settlementRepairDaemonTick2):
+        echo(ErrorText(settlementRepairDaemonTick2))
+        return 220
+    if Value(settlementRepairDaemonTick2).tickSeq != int64(1) ||
+       Value(settlementRepairDaemonTick2).previousDaemonStateHash != Value(settlementRepairDaemonTick).receiptHash ||
+       Value(settlementRepairDaemonTick2).finalReplicaCount != 3 ||
+       Value(settlementRepairDaemonTick2).failedReplicaCount != 0 ||
+       !Value(settlementRepairDaemonTick2).repairComplete ||
+       Value(settlementRepairDaemonTick2).nextEligibleAtNs != int64(812000):
+        return 221
+    let settlementRepairRead2 = transport.DepinInferenceTransportReadSettlementLedgerRepairReceiptFile(settlementRepairPath)
+    if IsErr(settlementRepairRead2):
+        echo(ErrorText(settlementRepairRead2))
+        return 222
+    if Value(settlementRepairRead2).existingReplicaCount != 3 ||
+       Value(settlementRepairRead2).repairedReplicaCount != 0 ||
+       Value(settlementRepairRead2).failedReplicaCount != 0 ||
+       Value(settlementRepairRead2).finalReplicaCount != 3 ||
+       Value(settlementRepairRead2).replicaAttemptCount != 0 ||
+       Value(settlementRepairRead2).bytesWritten != 0 ||
+       Value(settlementRepairRead2).bytesRead != 0:
+        return 223
+    let supervisorPath = transport.DepinInferenceTransportResidencySettlementSupervisorStatePathFromPrefix(certifiedResidencyPrefix)
+    let supervisorNowNs = DepinInferenceNowMs() * int64(1000000) + int64(1000000)
+    let supervisorTick = transport.DepinInferenceTransportRunResidencySettlementSupervisorTick(
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvResidencyStore,
+        certifiedResidencyPrefix,
+        supervisorPath,
+        supervisorNowNs,
+        int64(1000000),
+        int64(1000)
+    )
+    if IsErr(supervisorTick):
+        echo(ErrorText(supervisorTick))
+        return 228
+    if Value(supervisorTick).tickSeq != int64(0) ||
+       Value(supervisorTick).previousSupervisorStateHash != int64(0) ||
+       !Value(supervisorTick).kvReady ||
+       !Value(supervisorTick).settlementReady ||
+       !Value(supervisorTick).complete ||
+       Value(supervisorTick).settlementRepairDaemonReceiptHash != Value(settlementRepairDaemonTick2).receiptHash ||
+       Value(supervisorTick).settlementRepairReceiptHash != Value(settlementRepairRead2).receiptHash ||
+       Value(supervisorTick).kvHeadHash <= int64(0) ||
+       Value(supervisorTick).kvCurrentStoreHash <= int64(0):
+        return 229
+    let supervisorRead = transport.DepinInferenceTransportReadResidencySettlementSupervisorStateReceiptFile(supervisorPath)
+    if IsErr(supervisorRead):
+        echo(ErrorText(supervisorRead))
+        return 230
+    if Value(supervisorRead).receiptHash != Value(supervisorTick).receiptHash ||
+       Value(supervisorRead).stateHash != Value(supervisorTick).stateHash:
+        return 231
+    var supervisorDrift = Value(supervisorTick)
+    supervisorDrift.kvCurrentStoreHash = supervisorDrift.kvCurrentStoreHash + int64(1)
+    if IsOk(transport.DepinInferenceTransportValidateResidencySettlementSupervisorStateReceipt(supervisorDrift)):
+        return 232
+    let supervisorNotDue = transport.DepinInferenceTransportRunResidencySettlementSupervisorTick(
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvResidencyStore,
+        certifiedResidencyPrefix,
+        supervisorPath,
+        supervisorNowNs + int64(500000),
+        int64(1000000),
+        int64(1000)
+    )
+    if IsOk(supervisorNotDue):
+        return 233
+    let settlementRepairDaemonBytes = os.ReadFileBytesResult(settlementRepairDaemonPath)
+    if IsErr(settlementRepairDaemonBytes):
+        echo(ErrorText(settlementRepairDaemonBytes))
+        return 234
+    var settlementRepairDaemonBytesRaw = Value(settlementRepairDaemonBytes)
+    rawbytes.BytesSet(settlementRepairDaemonBytesRaw, 40, rawbytes.BytesGet(settlementRepairDaemonBytesRaw, 40) ^ 1)
+    let settlementRepairDaemonWriteBad = os.WriteFileBytesResult(settlementRepairDaemonPath, settlementRepairDaemonBytesRaw)
+    if IsErr(settlementRepairDaemonWriteBad):
+        rawbytes.BytesFree(settlementRepairDaemonBytesRaw)
+        echo(ErrorText(settlementRepairDaemonWriteBad))
+        return 235
+    let supervisorRepairDaemonDrift = transport.DepinInferenceTransportRunResidencySettlementSupervisorTick(
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvResidencyStore,
+        certifiedResidencyPrefix,
+        supervisorPath,
+        supervisorNowNs + int64(1000000),
+        int64(1000000),
+        int64(1000)
+    )
+    rawbytes.BytesSet(settlementRepairDaemonBytesRaw, 40, rawbytes.BytesGet(settlementRepairDaemonBytesRaw, 40) ^ 1)
+    let settlementRepairDaemonRestore = os.WriteFileBytesResult(settlementRepairDaemonPath, settlementRepairDaemonBytesRaw)
+    rawbytes.BytesFree(settlementRepairDaemonBytesRaw)
+    if IsErr(settlementRepairDaemonRestore):
+        echo(ErrorText(settlementRepairDaemonRestore))
+        return 236
+    if IsOk(supervisorRepairDaemonDrift):
+        return 237
+    let supervisorTick2 = transport.DepinInferenceTransportRunResidencySettlementSupervisorTick(
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvResidencyStore,
+        certifiedResidencyPrefix,
+        supervisorPath,
+        supervisorNowNs + int64(1000000),
+        int64(1000000),
+        int64(1000)
+    )
+    if IsErr(supervisorTick2):
+        echo(ErrorText(supervisorTick2))
+        return 238
+    if Value(supervisorTick2).tickSeq != int64(1) ||
+       Value(supervisorTick2).previousSupervisorStateHash != Value(supervisorTick).receiptHash ||
+       Value(supervisorTick2).kvHeadHash != Value(supervisorTick).kvHeadHash ||
+       Value(supervisorTick2).settlementRepairDaemonReceiptHash != Value(settlementRepairDaemonTick2).receiptHash ||
+       !Value(supervisorTick2).complete:
+        return 239
+    let daemonRunPath = transport.DepinInferenceTransportResidencySettlementDaemonRunReceiptPathFromPrefix(certifiedResidencyPrefix)
+    let daemonConfig = transport.DepinInferenceTransportBuildResidencySettlementDaemonConfig(
+        "daemon:transport",
+        "event-stream:transport",
+        certifiedResidencyPrefix,
+        supervisorPath,
+        daemonRunPath,
+        int64(1000000),
+        int64(1000),
+        8
+    )
+    let daemonConfigOk = transport.DepinInferenceTransportValidateResidencySettlementDaemonConfig(daemonConfig)
+    if IsErr(daemonConfigOk):
+        echo(ErrorText(daemonConfigOk))
+        return 240
+    let daemonOsServiceReceiptPath = transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSpecReceiptPathFromPrefix(certifiedResidencyPrefix)
+    let daemonStartupBundlePath = transport.DepinInferenceTransportResidencySettlementDaemonStartupBundlePathFromPrefix(certifiedResidencyPrefix)
+    let daemonHealthPath = transport.DepinInferenceTransportResidencySettlementDaemonHealthReceiptPathFromPrefix(certifiedResidencyPrefix)
+    let daemonStartupBundle = transport.DepinInferenceTransportWriteResidencySettlementDaemonStartupBundle(
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        supervisorNowNs + int64(1490000)
+    )
+    if IsErr(daemonStartupBundle):
+        echo(ErrorText(daemonStartupBundle))
+        return 277
+    if Value(daemonStartupBundle).path != daemonStartupBundlePath ||
+       Value(daemonStartupBundle).configHash != daemonConfig.configHash ||
+       Value(daemonStartupBundle).enginePlanHash != certifiedPlan.engineHash ||
+       Value(daemonStartupBundle).peerSetHash != transport.DepinInferenceTransportDistributedPeerSetHash(certifiedPeers) ||
+       Value(daemonStartupBundle).baseStoreHash != certifiedKvResidencyStore.storeHash ||
+       Value(daemonStartupBundle).kvHeadHash != Value(supervisorTick2).kvHeadHash ||
+       Value(daemonStartupBundle).repairDaemonStateHash != Value(settlementRepairDaemonTick2).stateHash ||
+       Value(daemonStartupBundle).supervisorStateHash != Value(supervisorTick2).stateHash ||
+       !Value(daemonStartupBundle).complete:
+        return 278
+    let daemonStartupBundleRead = transport.DepinInferenceTransportReadResidencySettlementDaemonStartupBundleReceiptFile(daemonStartupBundlePath)
+    if IsErr(daemonStartupBundleRead):
+        echo(ErrorText(daemonStartupBundleRead))
+        return 279
+    if Value(daemonStartupBundleRead).receiptHash != Value(daemonStartupBundle).receiptHash ||
+       Value(daemonStartupBundleRead).bundleHash != Value(daemonStartupBundle).bundleHash:
+        return 280
+    var daemonStartupBundleDrift = Value(daemonStartupBundle)
+    daemonStartupBundleDrift.peerSetHash = daemonStartupBundleDrift.peerSetHash + int64(1)
+    let daemonStartupBundleDriftCheck = transport.DepinInferenceTransportValidateResidencySettlementDaemonStartupBundleReceipt(
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        daemonStartupBundleDrift
+    )
+    if IsOk(daemonStartupBundleDriftCheck):
+        return 281
+    let daemonBundleHeadPath = strutil.Join([certifiedResidencyPrefix, ".ckvh1"], "")
+    let daemonBundleHeadBytes = os.ReadFileBytesResult(daemonBundleHeadPath)
+    if IsErr(daemonBundleHeadBytes):
+        echo(ErrorText(daemonBundleHeadBytes))
+        return 286
+    var daemonBundleHeadBytesRaw = Value(daemonBundleHeadBytes)
+    rawbytes.BytesSet(daemonBundleHeadBytesRaw, 40, rawbytes.BytesGet(daemonBundleHeadBytesRaw, 40) ^ 1)
+    let daemonBundleHeadWriteBad = os.WriteFileBytesResult(daemonBundleHeadPath, daemonBundleHeadBytesRaw)
+    if IsErr(daemonBundleHeadWriteBad):
+        rawbytes.BytesFree(daemonBundleHeadBytesRaw)
+        echo(ErrorText(daemonBundleHeadWriteBad))
+        return 287
+    let daemonBundleHeadDriftCheck = transport.DepinInferenceTransportValidateResidencySettlementDaemonStartupBundleReceipt(
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        Value(daemonStartupBundle)
+    )
+    if IsOk(daemonBundleHeadDriftCheck):
+        rawbytes.BytesFree(daemonBundleHeadBytesRaw)
+        return 288
+    rawbytes.BytesSet(daemonBundleHeadBytesRaw, 40, rawbytes.BytesGet(daemonBundleHeadBytesRaw, 40) ^ 1)
+    let daemonBundleHeadRestore = os.WriteFileBytesResult(daemonBundleHeadPath, daemonBundleHeadBytesRaw)
+    rawbytes.BytesFree(daemonBundleHeadBytesRaw)
+    if IsErr(daemonBundleHeadRestore):
+        echo(ErrorText(daemonBundleHeadRestore))
+        return 289
+    let daemonHealth = transport.DepinInferenceTransportWriteResidencySettlementDaemonHealthReceiptFromStartupBundle(
+        daemonStartupBundlePath,
+        int64(0),
+        supervisorNowNs + int64(1495000)
+    )
+    if IsErr(daemonHealth):
+        echo(ErrorText(daemonHealth))
+        return 290
+    if Value(daemonHealth).path != daemonHealthPath ||
+       Value(daemonHealth).startupBundlePath != daemonStartupBundlePath ||
+       Value(daemonHealth).configHash != daemonConfig.configHash ||
+       Value(daemonHealth).enginePlanHash != certifiedPlan.engineHash ||
+       Value(daemonHealth).baseStoreHash != certifiedKvResidencyStore.storeHash ||
+       Value(daemonHealth).startupBundleReceiptHash != Value(daemonStartupBundle).receiptHash ||
+       Value(daemonHealth).startupBundleByteHash != Value(daemonStartupBundle).byteHash ||
+       Value(daemonHealth).kvHeadByteHash != Value(daemonStartupBundle).kvHeadByteHash ||
+       Value(daemonHealth).repairDaemonByteHash != Value(daemonStartupBundle).repairDaemonByteHash ||
+       Value(daemonHealth).supervisorByteHash != Value(daemonStartupBundle).supervisorByteHash ||
+       !Value(daemonHealth).healthy:
+        return 291
+    let daemonHealthRead = transport.DepinInferenceTransportReadResidencySettlementDaemonHealthReceiptFile(daemonHealthPath)
+    if IsErr(daemonHealthRead):
+        echo(ErrorText(daemonHealthRead))
+        return 292
+    if Value(daemonHealthRead).receiptHash != Value(daemonHealth).receiptHash ||
+       Value(daemonHealthRead).healthHash != Value(daemonHealth).healthHash:
+        return 293
+    let daemonHealthOk = transport.DepinInferenceTransportValidateResidencySettlementDaemonHealthReceiptSelf(Value(daemonHealth))
+    if IsErr(daemonHealthOk):
+        echo(ErrorText(daemonHealthOk))
+        return 294
+    var daemonHealthDrift = Value(daemonHealth)
+    daemonHealthDrift.kvHeadByteHash = daemonHealthDrift.kvHeadByteHash + int64(1)
+    let daemonHealthDriftCheck = transport.DepinInferenceTransportValidateResidencySettlementDaemonHealthReceiptSelf(daemonHealthDrift)
+    if IsOk(daemonHealthDriftCheck):
+        return 295
+    let daemonHealthHeadBytes = os.ReadFileBytesResult(daemonBundleHeadPath)
+    if IsErr(daemonHealthHeadBytes):
+        echo(ErrorText(daemonHealthHeadBytes))
+        return 296
+    var daemonHealthHeadBytesRaw = Value(daemonHealthHeadBytes)
+    rawbytes.BytesSet(daemonHealthHeadBytesRaw, 40, rawbytes.BytesGet(daemonHealthHeadBytesRaw, 40) ^ 1)
+    let daemonHealthHeadWriteBad = os.WriteFileBytesResult(daemonBundleHeadPath, daemonHealthHeadBytesRaw)
+    if IsErr(daemonHealthHeadWriteBad):
+        rawbytes.BytesFree(daemonHealthHeadBytesRaw)
+        echo(ErrorText(daemonHealthHeadWriteBad))
+        return 297
+    if IsOk(transport.DepinInferenceTransportValidateResidencySettlementDaemonHealthReceiptSelf(Value(daemonHealth))):
+        rawbytes.BytesFree(daemonHealthHeadBytesRaw)
+        return 298
+    rawbytes.BytesSet(daemonHealthHeadBytesRaw, 40, rawbytes.BytesGet(daemonHealthHeadBytesRaw, 40) ^ 1)
+    let daemonHealthHeadRestore = os.WriteFileBytesResult(daemonBundleHeadPath, daemonHealthHeadBytesRaw)
+    rawbytes.BytesFree(daemonHealthHeadBytesRaw)
+    if IsErr(daemonHealthHeadRestore):
+        echo(ErrorText(daemonHealthHeadRestore))
+        return 299
+    let daemonExecutableRes = depinTransportSmokeBuildResidencySettlementDaemon("/Users/lbcheng/cheng-lang")
+    if IsErr(daemonExecutableRes):
+        echo(Error(daemonExecutableRes))
+        return 286
+    let daemonExecutablePath = Value(daemonExecutableRes)
+    let daemonWorkingDirectory = "/Users/lbcheng/cheng-lang"
+    if !os.FileExists(daemonExecutablePath) ||
+       !os.DirExists(daemonWorkingDirectory):
+        return 276
+    let daemonLaunchdService = transport.DepinInferenceTransportWriteResidencySettlementDaemonOsServiceSpec(
+        certifiedPlan,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        Value(daemonStartupBundle),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd,
+        "com.cheng.depin.transport.daemon",
+        daemonExecutablePath,
+        daemonWorkingDirectory,
+        supervisorNowNs + int64(1500000)
+    )
+    if IsErr(daemonLaunchdService):
+        echo(ErrorText(daemonLaunchdService))
+        return 262
+    if Value(daemonLaunchdService).receiptPath != daemonOsServiceReceiptPath ||
+       Value(daemonLaunchdService).serviceKind != transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd ||
+       Value(daemonLaunchdService).configHash != daemonConfig.configHash ||
+       Value(daemonLaunchdService).enginePlanHash != certifiedPlan.engineHash ||
+       Value(daemonLaunchdService).baseStoreHash != certifiedKvResidencyStore.storeHash ||
+       Value(daemonLaunchdService).startupBundlePath != daemonStartupBundlePath ||
+       Value(daemonLaunchdService).startupBundleReceiptHash != Value(daemonStartupBundle).receiptHash ||
+       Value(daemonLaunchdService).specByteCount <= 0 ||
+       Value(daemonLaunchdService).specByteHash <= int64(0) ||
+       Value(daemonLaunchdService).triggerSpecPath != "" ||
+       Value(daemonLaunchdService).triggerSpecTextHash != int64(0) ||
+       Value(daemonLaunchdService).triggerSpecByteCount != 0 ||
+       Value(daemonLaunchdService).triggerSpecByteHash != int64(0) ||
+       !Value(daemonLaunchdService).complete:
+        return 263
+    let daemonLaunchdRead = transport.DepinInferenceTransportReadResidencySettlementDaemonOsServiceSpecReceiptFile(daemonOsServiceReceiptPath)
+    if IsErr(daemonLaunchdRead):
+        echo(ErrorText(daemonLaunchdRead))
+        return 264
+    if Value(daemonLaunchdRead).receiptHash != Value(daemonLaunchdService).receiptHash ||
+       Value(daemonLaunchdRead).specHash != Value(daemonLaunchdService).specHash ||
+       Value(daemonLaunchdRead).serviceKind != transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd:
+        return 265
+    let daemonLaunchdTextRead = os.ReadFileResult(Value(daemonLaunchdService).specPath)
+    if IsErr(daemonLaunchdTextRead):
+        echo(ErrorText(daemonLaunchdTextRead))
+        return 300
+    let daemonLaunchdText = Value(daemonLaunchdTextRead)
+    if !strutil.Contains(daemonLaunchdText, "--run-until-idle") ||
+       !strutil.Contains(daemonLaunchdText, "--max-cycles") ||
+       !strutil.Contains(daemonLaunchdText, "<key>WatchPaths</key>") ||
+       strutil.Contains(daemonLaunchdText, "<key>KeepAlive</key>"):
+        return 301
+    var daemonLaunchdDrift = Value(daemonLaunchdService)
+    daemonLaunchdDrift.serviceNameHash = daemonLaunchdDrift.serviceNameHash + int64(1)
+    if IsOk(transport.DepinInferenceTransportValidateResidencySettlementDaemonOsServiceSpecReceipt(daemonLaunchdDrift)):
+        return 266
+    let daemonLaunchdBytes = os.ReadFileBytesResult(Value(daemonLaunchdService).specPath)
+    if IsErr(daemonLaunchdBytes):
+        echo(ErrorText(daemonLaunchdBytes))
+        return 267
+    var daemonLaunchdBytesRaw = Value(daemonLaunchdBytes)
+    rawbytes.BytesSet(daemonLaunchdBytesRaw, 16, rawbytes.BytesGet(daemonLaunchdBytesRaw, 16) ^ 1)
+    let daemonLaunchdWriteBad = os.WriteFileBytesResult(Value(daemonLaunchdService).specPath, daemonLaunchdBytesRaw)
+    if IsErr(daemonLaunchdWriteBad):
+        rawbytes.BytesFree(daemonLaunchdBytesRaw)
+        echo(ErrorText(daemonLaunchdWriteBad))
+        return 268
+    if IsOk(transport.DepinInferenceTransportValidateResidencySettlementDaemonOsServiceSpecReceipt(Value(daemonLaunchdService))):
+        rawbytes.BytesFree(daemonLaunchdBytesRaw)
+        return 269
+    rawbytes.BytesSet(daemonLaunchdBytesRaw, 16, rawbytes.BytesGet(daemonLaunchdBytesRaw, 16) ^ 1)
+    let daemonLaunchdRestore = os.WriteFileBytesResult(Value(daemonLaunchdService).specPath, daemonLaunchdBytesRaw)
+    rawbytes.BytesFree(daemonLaunchdBytesRaw)
+    if IsErr(daemonLaunchdRestore):
+        echo(ErrorText(daemonLaunchdRestore))
+        return 270
+    let daemonStartupBundleBytes = os.ReadFileBytesResult(daemonStartupBundlePath)
+    if IsErr(daemonStartupBundleBytes):
+        echo(ErrorText(daemonStartupBundleBytes))
+        return 282
+    var daemonStartupBundleBytesRaw = Value(daemonStartupBundleBytes)
+    rawbytes.BytesSet(daemonStartupBundleBytesRaw, 40, rawbytes.BytesGet(daemonStartupBundleBytesRaw, 40) ^ 1)
+    let daemonStartupBundleWriteBad = os.WriteFileBytesResult(daemonStartupBundlePath, daemonStartupBundleBytesRaw)
+    if IsErr(daemonStartupBundleWriteBad):
+        rawbytes.BytesFree(daemonStartupBundleBytesRaw)
+        echo(ErrorText(daemonStartupBundleWriteBad))
+        return 283
+    if IsOk(transport.DepinInferenceTransportValidateResidencySettlementDaemonOsServiceSpecReceipt(Value(daemonLaunchdService))):
+        rawbytes.BytesFree(daemonStartupBundleBytesRaw)
+        return 284
+    rawbytes.BytesSet(daemonStartupBundleBytesRaw, 40, rawbytes.BytesGet(daemonStartupBundleBytesRaw, 40) ^ 1)
+    let daemonStartupBundleRestore = os.WriteFileBytesResult(daemonStartupBundlePath, daemonStartupBundleBytesRaw)
+    rawbytes.BytesFree(daemonStartupBundleBytesRaw)
+    if IsErr(daemonStartupBundleRestore):
+        echo(ErrorText(daemonStartupBundleRestore))
+        return 285
+    let daemonUnsafeService = transport.DepinInferenceTransportWriteResidencySettlementDaemonOsServiceSpec(
+        certifiedPlan,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        Value(daemonStartupBundle),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd,
+        "bad\nservice",
+        daemonExecutablePath,
+        daemonWorkingDirectory,
+        supervisorNowNs + int64(1500001)
+    )
+    if IsOk(daemonUnsafeService):
+        return 271
+    let daemonSystemdService = transport.DepinInferenceTransportWriteResidencySettlementDaemonOsServiceSpec(
+        certifiedPlan,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        Value(daemonStartupBundle),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSystemd,
+        "cheng-depin-transport-daemon",
+        daemonExecutablePath,
+        daemonWorkingDirectory,
+        supervisorNowNs + int64(1500002)
+    )
+    if IsErr(daemonSystemdService):
+        echo(ErrorText(daemonSystemdService))
+        return 272
+    if Value(daemonSystemdService).serviceKind != transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSystemd ||
+       Value(daemonSystemdService).receiptPath != daemonOsServiceReceiptPath ||
+       Value(daemonSystemdService).specByteCount <= 0 ||
+       Value(daemonSystemdService).triggerSpecPath == "" ||
+       Value(daemonSystemdService).triggerSpecByteCount <= 0 ||
+       Value(daemonSystemdService).triggerSpecByteHash <= int64(0) ||
+       Value(daemonSystemdService).specHash == Value(daemonLaunchdService).specHash:
+        return 273
+    let daemonSystemdTextRead = os.ReadFileResult(Value(daemonSystemdService).specPath)
+    if IsErr(daemonSystemdTextRead):
+        echo(ErrorText(daemonSystemdTextRead))
+        return 302
+    let daemonSystemdText = Value(daemonSystemdTextRead)
+    if !strutil.Contains(daemonSystemdText, "--run-until-idle") ||
+       !strutil.Contains(daemonSystemdText, "--max-cycles") ||
+       !strutil.Contains(daemonSystemdText, "Type=oneshot") ||
+       strutil.Contains(daemonSystemdText, "Restart=always"):
+        return 303
+    let daemonSystemdTriggerTextRead = os.ReadFileResult(Value(daemonSystemdService).triggerSpecPath)
+    if IsErr(daemonSystemdTriggerTextRead):
+        echo(ErrorText(daemonSystemdTriggerTextRead))
+        return 304
+    let daemonSystemdTriggerText = Value(daemonSystemdTriggerTextRead)
+    if !strutil.Contains(daemonSystemdTriggerText, "[Path]") ||
+       !strutil.Contains(daemonSystemdTriggerText, "PathChanged=") ||
+       !strutil.Contains(daemonSystemdTriggerText, ".ckvh1") ||
+       !strutil.Contains(daemonSystemdTriggerText, ".csrd1") ||
+       !strutil.Contains(daemonSystemdTriggerText, ".cssv1") ||
+       !strutil.Contains(daemonSystemdTriggerText, "Unit=cheng-depin-transport-daemon.service"):
+        return 305
+    let daemonSystemdTriggerBytes = os.ReadFileBytesResult(Value(daemonSystemdService).triggerSpecPath)
+    if IsErr(daemonSystemdTriggerBytes):
+        echo(ErrorText(daemonSystemdTriggerBytes))
+        return 306
+    var daemonSystemdTriggerBytesRaw = Value(daemonSystemdTriggerBytes)
+    rawbytes.BytesSet(daemonSystemdTriggerBytesRaw, 16, rawbytes.BytesGet(daemonSystemdTriggerBytesRaw, 16) ^ 1)
+    let daemonSystemdTriggerWriteBad = os.WriteFileBytesResult(Value(daemonSystemdService).triggerSpecPath, daemonSystemdTriggerBytesRaw)
+    if IsErr(daemonSystemdTriggerWriteBad):
+        rawbytes.BytesFree(daemonSystemdTriggerBytesRaw)
+        echo(ErrorText(daemonSystemdTriggerWriteBad))
+        return 307
+    if IsOk(transport.DepinInferenceTransportValidateResidencySettlementDaemonOsServiceSpecReceipt(Value(daemonSystemdService))):
+        rawbytes.BytesFree(daemonSystemdTriggerBytesRaw)
+        return 308
+    rawbytes.BytesSet(daemonSystemdTriggerBytesRaw, 16, rawbytes.BytesGet(daemonSystemdTriggerBytesRaw, 16) ^ 1)
+    let daemonSystemdTriggerRestore = os.WriteFileBytesResult(Value(daemonSystemdService).triggerSpecPath, daemonSystemdTriggerBytesRaw)
+    rawbytes.BytesFree(daemonSystemdTriggerBytesRaw)
+    if IsErr(daemonSystemdTriggerRestore):
+        echo(ErrorText(daemonSystemdTriggerRestore))
+        return 309
+    let daemonSystemdRead = transport.DepinInferenceTransportReadResidencySettlementDaemonOsServiceSpecReceiptFile(daemonOsServiceReceiptPath)
+    if IsErr(daemonSystemdRead):
+        echo(ErrorText(daemonSystemdRead))
+        return 274
+    if Value(daemonSystemdRead).receiptHash != Value(daemonSystemdService).receiptHash ||
+       Value(daemonSystemdRead).serviceKind != transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSystemd:
+        return 275
+    let daemonWatchPath = transport.DepinInferenceTransportResidencySettlementDaemonFileEventBatchPathFromPrefix(certifiedResidencyPrefix)
+    let daemonCliRun = hostops.RunFileLogged(
+        daemonWorkingDirectory,
+        "run_depin_residency_settlement_daemon_health",
+        daemonExecutablePath,
+        [
+            "depin-residency-settlement-daemon",
+            "--daemon-id", daemonConfig.daemonId,
+            "--event-stream-id", daemonConfig.eventStreamId,
+            "--residency-prefix", certifiedResidencyPrefix,
+            "--supervisor-state", daemonConfig.supervisorStatePath,
+            "--daemon-run-receipt", daemonConfig.daemonRunReceiptPath,
+            "--daemon-file-events", daemonWatchPath,
+            "--daemon-startup-bundle", daemonStartupBundlePath,
+            "--config-hash", strings.Int64ToStr(daemonConfig.configHash),
+            "--interval-ns", strings.Int64ToStr(daemonConfig.intervalNs),
+            "--lease-ns", strings.Int64ToStr(daemonConfig.leaseNs),
+            "--max-events", strings.IntToStr(daemonConfig.maxEvents),
+            "--checked-at-ns", strings.Int64ToStr(supervisorNowNs + int64(1500003))
+        ],
+        [],
+        daemonWorkingDirectory,
+        60,
+        "artifacts/depin_residency_settlement_daemon_smoke/depin_residency_settlement_daemon.run.log"
+    )
+    if daemonCliRun.exitCode != 0 ||
+       !strutil.Contains(daemonCliRun.output, "depin_residency_settlement_daemon_health_ready=1"):
+        echo(daemonCliRun.output)
+        return 277
+    let daemonCliHealth = transport.DepinInferenceTransportReadResidencySettlementDaemonHealthReceiptFile(daemonHealthPath)
+    if IsErr(daemonCliHealth):
+        echo(ErrorText(daemonCliHealth))
+        return 278
+    let daemonCliHealthOk = transport.DepinInferenceTransportValidateResidencySettlementDaemonHealthReceiptSelf(Value(daemonCliHealth))
+    if IsErr(daemonCliHealthOk):
+        echo(ErrorText(daemonCliHealthOk))
+        return 279
+    let daemonCliBuildEvents = hostops.RunFileLogged(
+        daemonWorkingDirectory,
+        "run_depin_residency_settlement_daemon_build_events",
+        daemonExecutablePath,
+        [
+            "depin-residency-settlement-daemon",
+            "--daemon-id", daemonConfig.daemonId,
+            "--event-stream-id", daemonConfig.eventStreamId,
+            "--residency-prefix", certifiedResidencyPrefix,
+            "--supervisor-state", daemonConfig.supervisorStatePath,
+            "--daemon-run-receipt", daemonConfig.daemonRunReceiptPath,
+            "--daemon-file-events", daemonWatchPath,
+            "--daemon-startup-bundle", daemonStartupBundlePath,
+            "--config-hash", strings.Int64ToStr(daemonConfig.configHash),
+            "--interval-ns", strings.Int64ToStr(daemonConfig.intervalNs),
+            "--lease-ns", strings.Int64ToStr(daemonConfig.leaseNs),
+            "--max-events", strings.IntToStr(daemonConfig.maxEvents),
+            "--checked-at-ns", strings.Int64ToStr(supervisorNowNs + int64(2000000)),
+            "--build-events"
+        ],
+        [],
+        daemonWorkingDirectory,
+        60,
+        "artifacts/depin_residency_settlement_daemon_smoke/depin_residency_settlement_daemon.build_events.log"
+    )
+    if daemonCliBuildEvents.exitCode != 0 ||
+       !strutil.Contains(daemonCliBuildEvents.output, "depin_residency_settlement_daemon_events_ready=1"):
+        echo(daemonCliBuildEvents.output)
+        return 250
+    let daemonFileBatchRead = transport.DepinInferenceTransportReadResidencySettlementDaemonFileEventBatchReceiptFile(daemonWatchPath)
+    if IsErr(daemonFileBatchRead):
+        echo(ErrorText(daemonFileBatchRead))
+        return 252
+    let daemonFileBatchEvents = transport.DepinInferenceTransportRebuildResidencySettlementDaemonEventsFromBatchReceipt(
+        daemonConfig,
+        Value(daemonFileBatchRead)
+    )
+    if IsErr(daemonFileBatchEvents):
+        echo(ErrorText(daemonFileBatchEvents))
+        return 253
+    let daemonFileBatchValue = transport.DepinInferenceTransportResidencySettlementDaemonFileEventBatch(
+        receipt: Value(daemonFileBatchRead),
+        events: Value(daemonFileBatchEvents)
+    )
+    if daemonFileBatchValue.receipt.batchSeq != int64(0) ||
+       daemonFileBatchValue.receipt.previousBatchReceiptHash != int64(0) ||
+       daemonFileBatchValue.receipt.previousRunReceiptHash != int64(0) ||
+       daemonFileBatchValue.receipt.emittedEventCount != 3 ||
+       daemonFileBatchValue.events.len != 3 ||
+       daemonFileBatchValue.events[1].eventKind != transport.DepinInferenceTransportResidencySettlementDaemonEventSupervisorDue ||
+       daemonFileBatchValue.receipt.triggerEventHash != daemonFileBatchValue.events[1].eventHash ||
+       daemonFileBatchValue.receipt.eventSetHash != transport.DepinInferenceTransportResidencySettlementDaemonEventSetHash(daemonFileBatchValue.events):
+        return 251
+    let daemonCliRunOnce = hostops.RunFileLogged(
+        daemonWorkingDirectory,
+        "run_depin_residency_settlement_daemon_once",
+        daemonExecutablePath,
+        [
+            "depin-residency-settlement-daemon",
+            "--daemon-id", daemonConfig.daemonId,
+            "--event-stream-id", daemonConfig.eventStreamId,
+            "--residency-prefix", certifiedResidencyPrefix,
+            "--supervisor-state", daemonConfig.supervisorStatePath,
+            "--daemon-run-receipt", daemonConfig.daemonRunReceiptPath,
+            "--daemon-file-events", daemonWatchPath,
+            "--daemon-startup-bundle", daemonStartupBundlePath,
+            "--config-hash", strings.Int64ToStr(daemonConfig.configHash),
+            "--interval-ns", strings.Int64ToStr(daemonConfig.intervalNs),
+            "--lease-ns", strings.Int64ToStr(daemonConfig.leaseNs),
+            "--max-events", strings.IntToStr(daemonConfig.maxEvents),
+            "--checked-at-ns", strings.Int64ToStr(supervisorNowNs + int64(2000001)),
+            "--run-once"
+        ],
+        [],
+        daemonWorkingDirectory,
+        60,
+        "artifacts/depin_residency_settlement_daemon_smoke/depin_residency_settlement_daemon.run_once.log"
+    )
+    if daemonCliRunOnce.exitCode != 0 ||
+       !strutil.Contains(daemonCliRunOnce.output, "depin_residency_settlement_daemon_run_ready=1"):
+        echo(daemonCliRunOnce.output)
+        return 240
+    let daemonRun = transport.DepinInferenceTransportReadResidencySettlementDaemonRunReceiptFile(daemonRunPath)
+    if IsErr(daemonRun):
+        echo(ErrorText(daemonRun))
+        return 241
+    if Value(daemonRun).runSeq != int64(0) ||
+       Value(daemonRun).previousRunReceiptHash != int64(0) ||
+       Value(daemonRun).eventCount != 3 ||
+       Value(daemonRun).supervisorTickCount != 1 ||
+       !Value(daemonRun).completed ||
+       Value(daemonRun).lastSupervisorReceiptHash <= int64(0) ||
+       Value(daemonRun).lastKvHeadHash != Value(supervisorTick2).kvHeadHash ||
+       Value(daemonRun).lastRepairDaemonStateHash != Value(settlementRepairDaemonTick2).stateHash ||
+       Value(daemonRun).lastRepairReceiptHash != Value(settlementRepairRead2).receiptHash:
+        return 242
+    let daemonRunRead = transport.DepinInferenceTransportReadResidencySettlementDaemonRunReceiptFile(daemonRunPath)
+    if IsErr(daemonRunRead):
+        echo(ErrorText(daemonRunRead))
+        return 243
+    if Value(daemonRunRead).receiptHash != Value(daemonRun).receiptHash ||
+       Value(daemonRunRead).runHash != Value(daemonRun).runHash:
+        return 244
+    var daemonRunDrift = Value(daemonRun)
+    daemonRunDrift.eventCount = daemonRunDrift.eventCount - 1
+    if IsOk(transport.DepinInferenceTransportValidateResidencySettlementDaemonRunReceipt(daemonRunDrift)):
+        return 245
+    let daemonCliRunUntilIdle = hostops.RunFileLogged(
+        daemonWorkingDirectory,
+        "run_depin_residency_settlement_daemon_until_idle",
+        daemonExecutablePath,
+        [
+            "depin-residency-settlement-daemon",
+            "--daemon-id", daemonConfig.daemonId,
+            "--event-stream-id", daemonConfig.eventStreamId,
+            "--residency-prefix", certifiedResidencyPrefix,
+            "--supervisor-state", daemonConfig.supervisorStatePath,
+            "--daemon-run-receipt", daemonConfig.daemonRunReceiptPath,
+            "--daemon-file-events", daemonWatchPath,
+            "--daemon-startup-bundle", daemonStartupBundlePath,
+            "--config-hash", strings.Int64ToStr(daemonConfig.configHash),
+            "--interval-ns", strings.Int64ToStr(daemonConfig.intervalNs),
+            "--lease-ns", strings.Int64ToStr(daemonConfig.leaseNs),
+            "--max-events", strings.IntToStr(daemonConfig.maxEvents),
+            "--checked-at-ns", strings.Int64ToStr(supervisorNowNs + int64(2500000)),
+            "--run-until-idle",
+            "--max-cycles", "1"
+        ],
+        [],
+        daemonWorkingDirectory,
+        60,
+        "artifacts/depin_residency_settlement_daemon_smoke/depin_residency_settlement_daemon.until_idle.log"
+    )
+    if daemonCliRunUntilIdle.exitCode != 0 ||
+       !strutil.Contains(daemonCliRunUntilIdle.output, "depin_residency_settlement_daemon_idle=1"):
+        echo(daemonCliRunUntilIdle.output)
+        return 254
+    let daemonNoEventBatchRead = transport.DepinInferenceTransportReadResidencySettlementDaemonFileEventBatchReceiptFile(daemonWatchPath)
+    if IsErr(daemonNoEventBatchRead):
+        echo(ErrorText(daemonNoEventBatchRead))
+        return 248
+    let daemonNoEventBatchEvents = transport.DepinInferenceTransportRebuildResidencySettlementDaemonEventsFromBatchReceipt(
+        daemonConfig,
+        Value(daemonNoEventBatchRead)
+    )
+    if IsErr(daemonNoEventBatchEvents):
+        echo(ErrorText(daemonNoEventBatchEvents))
+        return 249
+    let daemonNoEventBatchValue = transport.DepinInferenceTransportResidencySettlementDaemonFileEventBatch(
+        receipt: Value(daemonNoEventBatchRead),
+        events: Value(daemonNoEventBatchEvents)
+    )
+    if daemonNoEventBatchValue.receipt.batchSeq != int64(1) ||
+       daemonNoEventBatchValue.receipt.previousBatchReceiptHash != daemonFileBatchValue.receipt.receiptHash ||
+       daemonNoEventBatchValue.receipt.previousRunReceiptHash != Value(daemonRun).receiptHash ||
+       daemonNoEventBatchValue.receipt.emittedEventCount != 0 ||
+       daemonNoEventBatchValue.events.len != 0 ||
+       daemonNoEventBatchValue.receipt.triggerEventHash != int64(0) ||
+       daemonNoEventBatchValue.receipt.firstEventHash != int64(0) ||
+       daemonNoEventBatchValue.receipt.lastEventHash != int64(0):
+        return 255
+    let daemonBadSourceStart = transport.DepinInferenceTransportBuildResidencySettlementDaemonEvent(
+        daemonConfig,
+        transport.DepinInferenceTransportResidencySettlementDaemonEventStart,
+        certifiedResidencyPrefix,
+        int64(0),
+        supervisorNowNs + int64(3000000)
+    )
+    let daemonBadSourceEvent = transport.DepinInferenceTransportBuildResidencySettlementDaemonEvent(
+        daemonConfig,
+        transport.DepinInferenceTransportResidencySettlementDaemonEventSupervisorDue,
+        certifiedResidencyPrefix,
+        int64(1),
+        supervisorNowNs + int64(3000000)
+    )
+    let daemonBadSourceStop = transport.DepinInferenceTransportBuildResidencySettlementDaemonEvent(
+        daemonConfig,
+        transport.DepinInferenceTransportResidencySettlementDaemonEventStop,
+        daemonRunPath,
+        int64(2),
+        supervisorNowNs + int64(3000001)
+    )
+    let daemonBadSource = transport.DepinInferenceTransportRunResidencySettlementDaemonEventLoop(
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        [daemonBadSourceStart, daemonBadSourceEvent, daemonBadSourceStop]
+    )
+    if IsOk(daemonBadSource):
+        return 246
+    let daemonNotDueStart = transport.DepinInferenceTransportBuildResidencySettlementDaemonEvent(
+        daemonConfig,
+        transport.DepinInferenceTransportResidencySettlementDaemonEventStart,
+        certifiedResidencyPrefix,
+        int64(0),
+        supervisorNowNs + int64(2500000)
+    )
+    let daemonNotDueEvent = transport.DepinInferenceTransportBuildResidencySettlementDaemonEvent(
+        daemonConfig,
+        transport.DepinInferenceTransportResidencySettlementDaemonEventSupervisorDue,
+        supervisorPath,
+        int64(1),
+        supervisorNowNs + int64(2500000)
+    )
+    let daemonNotDueStop = transport.DepinInferenceTransportBuildResidencySettlementDaemonEvent(
+        daemonConfig,
+        transport.DepinInferenceTransportResidencySettlementDaemonEventStop,
+        daemonRunPath,
+        int64(2),
+        supervisorNowNs + int64(2500001)
+    )
+    let daemonNotDue = transport.DepinInferenceTransportRunResidencySettlementDaemonEventLoop(
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        [daemonNotDueStart, daemonNotDueEvent, daemonNotDueStop]
+    )
+    if IsOk(daemonNotDue):
+        return 247
+    let daemonWatchBytes = os.ReadFileBytesResult(daemonWatchPath)
+    if IsErr(daemonWatchBytes):
+        echo(ErrorText(daemonWatchBytes))
+        return 256
+    var daemonWatchBytesRaw = Value(daemonWatchBytes)
+    rawbytes.BytesSet(daemonWatchBytesRaw, 40, rawbytes.BytesGet(daemonWatchBytesRaw, 40) ^ 1)
+    let daemonWatchWriteBad = os.WriteFileBytesResult(daemonWatchPath, daemonWatchBytesRaw)
+    if IsErr(daemonWatchWriteBad):
+        rawbytes.BytesFree(daemonWatchBytesRaw)
+        echo(ErrorText(daemonWatchWriteBad))
+        return 257
+    let daemonWatchDrift = transport.DepinInferenceTransportBuildResidencySettlementDaemonFileEventBatchFromStartupBundle(
+        daemonConfig,
+        Value(daemonStartupBundle),
+        supervisorNowNs + int64(2600000)
+    )
+    rawbytes.BytesSet(daemonWatchBytesRaw, 40, rawbytes.BytesGet(daemonWatchBytesRaw, 40) ^ 1)
+    let daemonWatchRestore = os.WriteFileBytesResult(daemonWatchPath, daemonWatchBytesRaw)
+    rawbytes.BytesFree(daemonWatchBytesRaw)
+    if IsErr(daemonWatchRestore):
+        echo(ErrorText(daemonWatchRestore))
+        return 258
+    if IsOk(daemonWatchDrift):
+        return 259
+    let daemonFileBatch2 = transport.DepinInferenceTransportBuildResidencySettlementDaemonFileEventBatchFromStartupBundle(
+        daemonConfig,
+        Value(daemonStartupBundle),
+        supervisorNowNs + int64(3000000)
+    )
+    if IsErr(daemonFileBatch2):
+        echo(ErrorText(daemonFileBatch2))
+        return 260
+    let daemonFileBatchValue2 = Value(daemonFileBatch2)
+    if daemonFileBatchValue2.receipt.batchSeq != int64(2) ||
+       daemonFileBatchValue2.receipt.previousBatchReceiptHash != daemonNoEventBatchValue.receipt.receiptHash ||
+       daemonFileBatchValue2.receipt.previousRunReceiptHash != Value(daemonRun).receiptHash ||
+       daemonFileBatchValue2.receipt.emittedEventCount != 3 ||
+       daemonFileBatchValue2.events.len != 3 ||
+       daemonFileBatchValue2.receipt.triggerEventHash != daemonFileBatchValue2.events[1].eventHash ||
+       daemonFileBatchValue2.events[1].eventKind != transport.DepinInferenceTransportResidencySettlementDaemonEventSupervisorDue:
+        return 261
+    let daemonRun2 = transport.DepinInferenceTransportRunResidencySettlementDaemonEventLoop(
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        daemonFileBatchValue2.events
+    )
+    if IsErr(daemonRun2):
+        echo(ErrorText(daemonRun2))
+        return 248
+    if Value(daemonRun2).runSeq != int64(1) ||
+       Value(daemonRun2).previousRunReceiptHash != Value(daemonRun).receiptHash ||
+       Value(daemonRun2).supervisorTickCount != 1 ||
+       Value(daemonRun2).lastSupervisorReceiptHash == Value(daemonRun).lastSupervisorReceiptHash ||
+       !Value(daemonRun2).completed:
+        return 249
+    if session.kvResidencyStoreHash != Value(certifiedReceipt).kvResidencyStoreHash ||
+       session.kvResidencyStoreOperationHash != Value(certifiedReceipt).kvResidencyStoreOperationHash ||
+       session.kvResidencyWalRecordHash != Value(certifiedReceipt).kvResidencyWalRecordHash ||
+       session.kvResidencyWalLogHash != Value(certifiedReceipt).kvResidencyWalLogHash ||
+       session.kvResidencyWalAppendHash != Value(certifiedReceipt).kvResidencyWalAppendHash ||
+       session.kvResidencyServiceCommitHash != Value(certifiedReceipt).kvResidencyServiceCommitHash ||
+       session.kvResidencyServiceApplyHash != Value(certifiedReceipt).kvResidencyServiceApplyHash:
+        return 141
+    let certifiedReceiptOk = transport.DepinInferenceTransportValidateDispatchSessionReceipt(Value(certifiedReceipt))
+    if IsErr(certifiedReceiptOk):
+        echo(ErrorText(certifiedReceiptOk))
+        return 50
+    var certifiedReceiptSpecPlanDrift = Value(certifiedReceipt)
+    certifiedReceiptSpecPlanDrift.specDecodePlanHash = certifiedReceiptSpecPlanDrift.specDecodePlanHash + int64(1)
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptSpecPlanDrift)):
+        return 263
+    var certifiedReceiptSpecAlgorithmDrift = Value(certifiedReceipt)
+    certifiedReceiptSpecAlgorithmDrift.specDecodeAlgorithm = engine.DistributedSpecDecodeAlgorithmMtp
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptSpecAlgorithmDrift)):
+        return 264
+    var certifiedReceiptSpecProofDrift = Value(certifiedReceipt)
+    certifiedReceiptSpecProofDrift.specDecodeCertifiedReceiptHash = int64(990001)
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptSpecProofDrift)):
+        return 265
+    let transportSpecPlanRes = engine.DistributedBuildSpecDecodePlan(
+        engine.DistributedSpecDecodeAlgorithmMtp,
+        2,
+        1,
+        1
+    )
+    if IsErr(transportSpecPlanRes):
+        echo(ErrorText(transportSpecPlanRes))
+        return 266
+    var transportSpecPlan: engine.DistributedInferencePlan
+    var transportSpecPeers: engine.DistributedInferencePeer[]
+    var transportSpecKvCache: pkv.PagedKVCache
+    var transportSpecKvSeq: pkv.PagedKVSequence
+    var transportSpecEnvelopes: at.ActivationEnvelope[]
+    var transportSpecActivationStore: at.ActivationTensorStore
+    var transportSpecEvidence: engine.DistributedActivationEvidence
+    var transportSpecKvTransferEvidence: engine.DistributedKvPageTransferEvidence
+    var transportSpecManifest: inference_manifest.DepinDistributedInferenceManifest
+    let transportSpecFixtureOk = depinTransportSmokeBuildCertifiedFixtureWithSpecDecodePlan(
+        Value(transportSpecPlanRes),
+        transportSpecPlan,
+        transportSpecPeers,
+        transportSpecKvCache,
+        transportSpecKvSeq,
+        transportSpecEnvelopes,
+        transportSpecActivationStore,
+        transportSpecEvidence,
+        transportSpecKvTransferEvidence,
+        transportSpecManifest
+    )
+    if IsErr(transportSpecFixtureOk):
+        echo(ErrorText(transportSpecFixtureOk))
+        return 274
+    var transportSpecSession: inference_manifest.DepinInferenceSession
+    transportSpecSession = depinTransportSmokeBuildSession(transportSpecPlan.modelGraph.modelCid)
+    var transportSpecReceipt = depinspec.DepinSpecDecodeCertifiedReceipt(
+        schema: depinspec.DepinSpecDecodeCertifiedReceiptSchema,
+        sessionId: transportSpecSession.sessionId,
+        requestId: transportSpecSession.request.requestId,
+        modelCid: transportSpecSession.request.modelCid,
+        manifestHash: transportSpecManifest.manifestHash,
+        enginePlanHash: transportSpecPlan.engineHash,
+        draftEnginePlanHash: transportSpecPlan.engineHash,
+        specDecodePlanHash: transportSpecPlan.specDecodePlan.planHash,
+        draftWindow: transportSpecPlan.specDecodePlan.draftWindow,
+        draftTokenCount: transportSpecPlan.specDecodePlan.draftTokenCount,
+        mtpLayerCount: transportSpecPlan.specDecodePlan.mtpLayerCount,
+        contextTokenHash: int64(990010),
+        draftTokenHash: int64(990011),
+        draftLogitsHash: int64(990012),
+        draftKvStateHash: int64(990013),
+        draftReceiptHash: int64(990014),
+        draftHash: int64(990015),
+        verifyHash: int64(990016),
+        verifyOutputTokenHash: int64(990017),
+        verifyReceiptHash: int64(990018),
+        acceptedPrefixLen: transportSpecPlan.specDecodePlan.draftTokenCount,
+        rollbackFrom: transportSpecPlan.specDecodePlan.draftTokenCount,
+        mismatch: false,
+        receiptHash: int64(0)
+    )
+    transportSpecReceipt.receiptHash = depinspec.DepinSpecDecodeCertifiedReceiptHash(transportSpecReceipt)
+    let transportSpecReceiptOk = transport.DepinInferenceTransportValidateSpecDecodeCertifiedReceiptForPlan(
+        transportSpecSession,
+        transportSpecManifest,
+        transportSpecPlan,
+        transportSpecReceipt
+    )
+    if IsErr(transportSpecReceiptOk):
+        echo(ErrorText(transportSpecReceiptOk))
+        return 267
+    if Value(transportSpecReceiptOk) != transportSpecReceipt.receiptHash:
+        return 268
+    var transportSpecReceiptManifestDrift = transportSpecReceipt
+    transportSpecReceiptManifestDrift.manifestHash = transportSpecReceiptManifestDrift.manifestHash + int64(1)
+    transportSpecReceiptManifestDrift.receiptHash = depinspec.DepinSpecDecodeCertifiedReceiptHash(transportSpecReceiptManifestDrift)
+    let transportSpecReceiptManifestDriftOk = transport.DepinInferenceTransportValidateSpecDecodeCertifiedReceiptForPlan(
+        transportSpecSession,
+        transportSpecManifest,
+        transportSpecPlan,
+        transportSpecReceiptManifestDrift
+    )
+    if IsOk(transportSpecReceiptManifestDriftOk):
+        return 269
+    var transportSpecReceiptPlanDrift = transportSpecReceipt
+    transportSpecReceiptPlanDrift.enginePlanHash = certifiedPlan.engineHash
+    transportSpecReceiptPlanDrift.receiptHash = depinspec.DepinSpecDecodeCertifiedReceiptHash(transportSpecReceiptPlanDrift)
+    let transportSpecReceiptPlanDriftOk = transport.DepinInferenceTransportValidateSpecDecodeCertifiedReceiptForPlan(
+        transportSpecSession,
+        transportSpecManifest,
+        transportSpecPlan,
+        transportSpecReceiptPlanDrift
+    )
+    if IsOk(transportSpecReceiptPlanDriftOk):
+        return 272
+    let transportSpecReceiptOrdinaryPlanOk = transport.DepinInferenceTransportValidateSpecDecodeCertifiedReceiptForPlan(
+        transportSpecSession,
+        certifiedManifest,
+        certifiedPlan,
+        transportSpecReceipt
+    )
+    if IsOk(transportSpecReceiptOrdinaryPlanOk):
+        return 273
+    var transportSpecLinks: transport.DepinInferenceTransportPeerLink[]
+    var transportSpecPeerAPair: quic_transport.Libp2pQuicLoopbackPair
+    var transportSpecPeerBPair: quic_transport.Libp2pQuicLoopbackPair
+    var transportSpecCoordinatorPair: quic_transport.Libp2pQuicLoopbackPair
+    let transportSpecLinksOpen = depinTransportSmokeOpenCertifiedLinks(
+        transportSpecLinks,
+        transportSpecPeerAPair,
+        transportSpecPeerBPair,
+        transportSpecCoordinatorPair
+    )
+    if IsErr(transportSpecLinksOpen):
+        echo(ErrorText(transportSpecLinksOpen))
+        return 275
+    var transportSpecAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport:spec",
+        "keyref:coordinator:transport:spec",
+        uint64(32)
+    )
+    let transportSpecKvResidencyStoreRes = engine.DistributedBuildEmptyKvResidencyStore(
+        transportSpecPlan,
+        transportSpecPeers,
+        "peer:b",
+        transportSpecPlan.kvReceipt.pageCount,
+        int64(910000)
+    )
+    if IsErr(transportSpecKvResidencyStoreRes):
+        echo(ErrorText(transportSpecKvResidencyStoreRes))
+        return 276
+    let transportSpecRun = transport.DepinInferenceTransportRunCertifiedDispatchSessionWithSpecDecodeReceipt(
+        transportSpecSession,
+        transportSpecLinks,
+        transportSpecManifest,
+        transportSpecPlan,
+        transportSpecPeers,
+        transportSpecKvCache,
+        transportSpecKvSeq,
+        transportSpecEnvelopes,
+        transportSpecActivationStore,
+        transportSpecEvidence,
+        transportSpecKvTransferEvidence,
+        Value(transportSpecKvResidencyStoreRes),
+        depinTransportSmokeFreshResidencyPrefix("spec_certified", transportSpecPlan.engineHash),
+        transportSpecReceipt,
+        transportSpecAdapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsErr(transportSpecRun):
+        echo(ErrorText(transportSpecRun))
+        return 277
+    if !transportSpecSession.finished ||
+       transportSpecSession.failed ||
+       transportSpecSession.specDecodeCertifiedReceiptHash != transportSpecReceipt.receiptHash:
+        return 278
+    if Value(transportSpecRun).specDecodeAlgorithm != engine.DistributedSpecDecodeAlgorithmMtp ||
+       Value(transportSpecRun).specDecodePlanHash != transportSpecPlan.specDecodePlan.planHash ||
+       Value(transportSpecRun).specDecodeCertifiedReceiptHash != transportSpecReceipt.receiptHash:
+        return 279
+    if IsErr(transport.DepinInferenceTransportValidateDispatchSessionReceipt(Value(transportSpecRun))):
+        return 280
+    quic_transport.Libp2pQuicLoopbackClose(transportSpecPeerAPair)
+    var specMissingSession: inference_manifest.DepinInferenceSession
+    specMissingSession = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var specMissingLinks: transport.DepinInferenceTransportPeerLink[]
+    var specMissingAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "keyref:coordinator:transport",
+        uint64(31)
+    )
+    let specMissingRun = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        specMissingSession,
+        specMissingLinks,
+        certifiedManifest,
+        transportSpecPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        certifiedKvTransferEvidence,
+        certifiedKvResidencyStore,
+        depinTransportSmokeFreshResidencyPrefix("spec_missing", certifiedPlan.engineHash),
+        specMissingAdapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsOk(specMissingRun):
+        return 270
+    if !specMissingSession.failed ||
+       specMissingSession.failureReason != "depin inference dispatch session: spec certified receipt missing":
+        return 271
+    var certifiedReceiptServiceDrift = Value(certifiedReceipt)
+    certifiedReceiptServiceDrift.kvResidencyServiceApplyHash = certifiedReceiptServiceDrift.kvResidencyServiceApplyHash + int64(1)
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptServiceDrift)):
+        return 164
+    var certifiedReceiptLedgerDrift = Value(certifiedReceipt)
+    certifiedReceiptLedgerDrift.settlementLedgerReceiptHash = certifiedReceiptLedgerDrift.settlementLedgerReceiptHash + int64(1)
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptLedgerDrift)):
+        return 167
+    var certifiedReceiptReplicationDrift = Value(certifiedReceipt)
+    certifiedReceiptReplicationDrift.settlementLedgerReplicationHash = certifiedReceiptReplicationDrift.settlementLedgerReplicationHash + int64(1)
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptReplicationDrift)):
+        return 168
+    var certifiedReceiptAckDrift = Value(certifiedReceipt)
+    certifiedReceiptAckDrift.settlementLedgerAckHash = certifiedReceiptAckDrift.settlementLedgerAckHash + int64(1)
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptAckDrift)):
+        return 176
+    var certifiedReceiptReplicaCountDrift = Value(certifiedReceipt)
+    certifiedReceiptReplicaCountDrift.settlementLedgerReplicaCount = certifiedReceiptReplicaCountDrift.settlementLedgerReplicaCount - 1
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptReplicaCountDrift)):
+        return 191
+    var certifiedReceiptReplicaQuorumDrift = Value(certifiedReceipt)
+    certifiedReceiptReplicaQuorumDrift.settlementLedgerReplicaQuorum = certifiedReceiptReplicaQuorumDrift.settlementLedgerReplicaQuorum + 1
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptReplicaQuorumDrift)):
+        return 192
+    var certifiedReceiptQuorumFileDrift = Value(certifiedReceipt)
+    certifiedReceiptQuorumFileDrift.settlementLedgerQuorumFileReceiptHash = certifiedReceiptQuorumFileDrift.settlementLedgerQuorumFileReceiptHash + int64(1)
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptQuorumFileDrift)):
+        return 202
+    var certifiedReceiptAttemptCountDrift = Value(certifiedReceipt)
+    certifiedReceiptAttemptCountDrift.settlementLedgerReplicaAttemptCount = certifiedReceiptAttemptCountDrift.settlementLedgerReplicaAttemptCount - 1
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptAttemptCountDrift)):
+        return 206
+    var certifiedReceiptAttemptSetDrift = Value(certifiedReceipt)
+    certifiedReceiptAttemptSetDrift.settlementLedgerReplicaAttemptSetHash = certifiedReceiptAttemptSetDrift.settlementLedgerReplicaAttemptSetHash + int64(1)
+    if IsOk(transport.DepinInferenceTransportValidateDispatchSessionReceipt(certifiedReceiptAttemptSetDrift)):
+        return 207
+    var missingSettlementPeerLinks: transport.DepinInferenceTransportPeerLink[]
+    missingSettlementPeerLinks = certifiedLinks
+    var missingSettlementPeerSession: inference_manifest.DepinInferenceSession
+    missingSettlementPeerSession = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var missingSettlementPeerAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "keyref:coordinator:transport",
+        uint64(21)
+    )
+    let missingSettlementPeerPlan = inference_settlement.DepinSettlementPlanBuild(
+        "batch:transport-session",
+        "job:transport-session",
+        "peer:not-present",
+        "escrow:transport-session",
+        int64(100)
+    )
+    let missingSettlementPeerRun = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        missingSettlementPeerSession,
+        missingSettlementPeerLinks,
+        certifiedManifest,
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        certifiedKvTransferEvidence,
+        certifiedKvResidencyStore,
+        depinTransportSmokeFreshResidencyPrefix("settlement_peer_missing", certifiedPlan.engineHash),
+        missingSettlementPeerAdapter,
+        missingSettlementPeerPlan
+    )
+    if IsOk(missingSettlementPeerRun):
+        return 170
+    if !missingSettlementPeerSession.failed:
+        return 171
+
+    var manifestDriftLinks: transport.DepinInferenceTransportPeerLink[]
+    var manifestDriftSession: inference_manifest.DepinInferenceSession
+    manifestDriftSession = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var manifestDriftAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "keyref:coordinator:transport",
+        uint64(10)
+    )
+    let manifestDrift: inference_manifest.DepinDistributedInferenceManifest = DepinBuildDistributedManifestFromPlanFacts(
+        certifiedPlan.modelGraph.modelCid,
+        certifiedPlan.partitionPlan,
+        certifiedPlan.kernelPrograms,
+        certifiedPlan.deviceWeightBindingHash,
+        certifiedPlan.kvReceipt,
+        certifiedPlan.kvStateHash,
+        certifiedPlan.kvShardReceipts.receiptSetHash,
+        certifiedKvTransferEvidence.evidenceHash,
+        certifiedPlan.specDecodePlan.planHash,
+        certifiedPlan.routePlanSet,
+        certifiedEvidence.requests.requestSetHash,
+        certifiedEvidence.transportFrames.frameSetHash + int64(1),
+        certifiedEvidence.evidenceHash,
+        DepinInferenceNowMs()
+    )
+    let manifestDriftRun = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        manifestDriftSession,
+        manifestDriftLinks,
+        manifestDrift,
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        certifiedKvTransferEvidence,
+        certifiedKvResidencyStore,
+        depinTransportSmokeFreshResidencyPrefix("manifest_drift", certifiedPlan.engineHash),
+        manifestDriftAdapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsOk(manifestDriftRun):
+        return 51
+    if !manifestDriftSession.failed:
+        return 52
+
+    var manifestWeightDeviceDriftLinks: transport.DepinInferenceTransportPeerLink[]
+    var manifestWeightDeviceDriftSession: inference_manifest.DepinInferenceSession
+    manifestWeightDeviceDriftSession = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var manifestWeightDeviceDriftAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "keyref:coordinator:transport",
+        uint64(13)
+    )
+    let manifestWeightDeviceDrift: inference_manifest.DepinDistributedInferenceManifest = DepinBuildDistributedManifest(
+        certifiedPlan.modelGraph.modelCid,
+        certifiedManifest.partitionPlanCid,
+        certifiedManifest.tensorShardCids,
+        certifiedManifest.expertShardCids,
+        certifiedManifest.kernelProgramCids,
+        "cid:weight_device_binding:wrong",
+        certifiedManifest.kvPageTableCid,
+        certifiedManifest.kvStateCid,
+        certifiedManifest.kvShardReceiptCid,
+        certifiedManifest.kvPageTransferEvidenceCid,
+        certifiedManifest.routerPlanCid,
+        certifiedEvidence.requests.requestSetHash,
+        certifiedEvidence.transportFrames.frameSetHash,
+        certifiedEvidence.evidenceHash,
+        DepinInferenceNowMs()
+    )
+    let manifestWeightDeviceDriftRun = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        manifestWeightDeviceDriftSession,
+        manifestWeightDeviceDriftLinks,
+        manifestWeightDeviceDrift,
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        certifiedKvTransferEvidence,
+        certifiedKvResidencyStore,
+        depinTransportSmokeFreshResidencyPrefix("weight_device_drift", certifiedPlan.engineHash),
+        manifestWeightDeviceDriftAdapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsOk(manifestWeightDeviceDriftRun):
+        return 59
+    if !manifestWeightDeviceDriftSession.failed:
+        return 60
+
+    var manifestPlanDriftLinks: transport.DepinInferenceTransportPeerLink[]
+    var manifestPlanDriftSession: inference_manifest.DepinInferenceSession
+    manifestPlanDriftSession = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var manifestPlanDriftAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "keyref:coordinator:transport",
+        uint64(15)
+    )
+    let manifestPlanDrift: inference_manifest.DepinDistributedInferenceManifest = DepinBuildDistributedManifest(
+        certifiedPlan.modelGraph.modelCid,
+        "cid:partition:wrong",
+        certifiedManifest.tensorShardCids,
+        certifiedManifest.expertShardCids,
+        certifiedManifest.kernelProgramCids,
+        certifiedManifest.weightDeviceBindingCid,
+        certifiedManifest.kvPageTableCid,
+        certifiedManifest.kvStateCid,
+        certifiedManifest.kvShardReceiptCid,
+        certifiedManifest.kvPageTransferEvidenceCid,
+        certifiedManifest.routerPlanCid,
+        certifiedEvidence.requests.requestSetHash,
+        certifiedEvidence.transportFrames.frameSetHash,
+        certifiedEvidence.evidenceHash,
+        DepinInferenceNowMs()
+    )
+    let manifestPlanDriftRun = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        manifestPlanDriftSession,
+        manifestPlanDriftLinks,
+        manifestPlanDrift,
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        certifiedKvTransferEvidence,
+        certifiedKvResidencyStore,
+        depinTransportSmokeFreshResidencyPrefix("plan_drift", certifiedPlan.engineHash),
+        manifestPlanDriftAdapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsOk(manifestPlanDriftRun):
+        return 53
+    if !manifestPlanDriftSession.failed:
+        return 54
+
+    var manifestKvStateDriftLinks: transport.DepinInferenceTransportPeerLink[]
+    var manifestKvStateDriftSession: inference_manifest.DepinInferenceSession
+    manifestKvStateDriftSession = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var manifestKvStateDriftAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "keyref:coordinator:transport",
+        uint64(16)
+    )
+    let manifestKvStateDrift: inference_manifest.DepinDistributedInferenceManifest = DepinBuildDistributedManifest(
+        certifiedPlan.modelGraph.modelCid,
+        certifiedManifest.partitionPlanCid,
+        certifiedManifest.tensorShardCids,
+        certifiedManifest.expertShardCids,
+        certifiedManifest.kernelProgramCids,
+        certifiedManifest.weightDeviceBindingCid,
+        certifiedManifest.kvPageTableCid,
+        "cid:kv:state:wrong",
+        certifiedManifest.kvShardReceiptCid,
+        certifiedManifest.kvPageTransferEvidenceCid,
+        certifiedManifest.routerPlanCid,
+        certifiedEvidence.requests.requestSetHash,
+        certifiedEvidence.transportFrames.frameSetHash,
+        certifiedEvidence.evidenceHash,
+        DepinInferenceNowMs()
+    )
+    let manifestKvStateDriftRun = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        manifestKvStateDriftSession,
+        manifestKvStateDriftLinks,
+        manifestKvStateDrift,
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        certifiedKvTransferEvidence,
+        certifiedKvResidencyStore,
+        depinTransportSmokeFreshResidencyPrefix("kv_state_drift", certifiedPlan.engineHash),
+        manifestKvStateDriftAdapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsOk(manifestKvStateDriftRun):
+        return 155
+    if !manifestKvStateDriftSession.failed:
+        return 156
+
+    var manifestKvShardDriftLinks: transport.DepinInferenceTransportPeerLink[]
+    var manifestKvShardDriftSession: inference_manifest.DepinInferenceSession
+    manifestKvShardDriftSession = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var manifestKvShardDriftAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "keyref:coordinator:transport",
+        uint64(17)
+    )
+    let manifestKvShardDrift: inference_manifest.DepinDistributedInferenceManifest = DepinBuildDistributedManifest(
+        certifiedPlan.modelGraph.modelCid,
+        certifiedManifest.partitionPlanCid,
+        certifiedManifest.tensorShardCids,
+        certifiedManifest.expertShardCids,
+        certifiedManifest.kernelProgramCids,
+        certifiedManifest.weightDeviceBindingCid,
+        certifiedManifest.kvPageTableCid,
+        certifiedManifest.kvStateCid,
+        "cid:kv:shard_receipt:wrong",
+        certifiedManifest.kvPageTransferEvidenceCid,
+        certifiedManifest.routerPlanCid,
+        certifiedEvidence.requests.requestSetHash,
+        certifiedEvidence.transportFrames.frameSetHash,
+        certifiedEvidence.evidenceHash,
+        DepinInferenceNowMs()
+    )
+    let manifestKvShardDriftRun = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        manifestKvShardDriftSession,
+        manifestKvShardDriftLinks,
+        manifestKvShardDrift,
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        certifiedKvTransferEvidence,
+        certifiedKvResidencyStore,
+        depinTransportSmokeFreshResidencyPrefix("kv_shard_drift", certifiedPlan.engineHash),
+        manifestKvShardDriftAdapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsOk(manifestKvShardDriftRun):
+        return 157
+    if !manifestKvShardDriftSession.failed:
+        return 158
+
+    var manifestKvTransferDriftLinks: transport.DepinInferenceTransportPeerLink[]
+    var manifestKvTransferDriftSession: inference_manifest.DepinInferenceSession
+    manifestKvTransferDriftSession = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var manifestKvTransferDriftAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "keyref:coordinator:transport",
+        uint64(18)
+    )
+    let manifestKvTransferDrift: inference_manifest.DepinDistributedInferenceManifest = DepinBuildDistributedManifest(
+        certifiedPlan.modelGraph.modelCid,
+        certifiedManifest.partitionPlanCid,
+        certifiedManifest.tensorShardCids,
+        certifiedManifest.expertShardCids,
+        certifiedManifest.kernelProgramCids,
+        certifiedManifest.weightDeviceBindingCid,
+        certifiedManifest.kvPageTableCid,
+        certifiedManifest.kvStateCid,
+        certifiedManifest.kvShardReceiptCid,
+        "cid:kv:page_transfer_evidence:wrong",
+        certifiedManifest.routerPlanCid,
+        certifiedEvidence.requests.requestSetHash,
+        certifiedEvidence.transportFrames.frameSetHash,
+        certifiedEvidence.evidenceHash,
+        DepinInferenceNowMs()
+    )
+    let manifestKvTransferDriftRun = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        manifestKvTransferDriftSession,
+        manifestKvTransferDriftLinks,
+        manifestKvTransferDrift,
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        certifiedKvTransferEvidence,
+        certifiedKvResidencyStore,
+        depinTransportSmokeFreshResidencyPrefix("kv_transfer_manifest_drift", certifiedPlan.engineHash),
+        manifestKvTransferDriftAdapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsOk(manifestKvTransferDriftRun):
+        return 159
+    if !manifestKvTransferDriftSession.failed:
+        return 160
+
+    var kvTransferEvidenceDriftLinks: transport.DepinInferenceTransportPeerLink[]
+    var kvTransferEvidenceDriftSession: inference_manifest.DepinInferenceSession
+    kvTransferEvidenceDriftSession = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var kvTransferEvidenceDriftAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "keyref:coordinator:transport",
+        uint64(19)
+    )
+    var kvTransferEvidenceDrift = certifiedKvTransferEvidence
+    kvTransferEvidenceDrift.evidenceHash = kvTransferEvidenceDrift.evidenceHash + int64(1)
+    let kvTransferEvidenceDriftRun = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        kvTransferEvidenceDriftSession,
+        kvTransferEvidenceDriftLinks,
+        certifiedManifest,
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        kvTransferEvidenceDrift,
+        certifiedKvResidencyStore,
+        depinTransportSmokeFreshResidencyPrefix("kv_transfer_evidence_drift", certifiedPlan.engineHash),
+        kvTransferEvidenceDriftAdapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsOk(kvTransferEvidenceDriftRun):
+        return 161
+    if !kvTransferEvidenceDriftSession.failed:
+        return 162
+
+    var evidenceDriftLinks: transport.DepinInferenceTransportPeerLink[]
+    var evidenceDriftSession: inference_manifest.DepinInferenceSession
+    evidenceDriftSession = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var evidenceDriftAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "keyref:coordinator:transport",
+        uint64(20)
+    )
+    var evidenceDrift = certifiedEvidence
+    evidenceDrift.evidenceHash = evidenceDrift.evidenceHash + int64(1)
+    let evidenceDriftRun = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        evidenceDriftSession,
+        evidenceDriftLinks,
+        certifiedManifest,
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        evidenceDrift,
+        certifiedKvTransferEvidence,
+        certifiedKvResidencyStore,
+        depinTransportSmokeFreshResidencyPrefix("activation_evidence_drift", certifiedPlan.engineHash),
+        evidenceDriftAdapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsOk(evidenceDriftRun):
+        return 55
+    if !evidenceDriftSession.failed:
+        return 56
+
+    var signerFailSession: inference_manifest.DepinInferenceSession
+    signerFailSession = depinTransportSmokeBuildSession(certifiedPlan.modelGraph.modelCid)
+    var signerFailAdapter = initDepinRwadDispatcherAdapter(
+        "rwad-local",
+        "did:coordinator:transport",
+        "",
+        uint64(30)
+    )
+    let signerFailRun = transport.DepinInferenceTransportRunCertifiedDispatchSession(
+        signerFailSession,
+        certifiedLinks,
+        certifiedManifest,
+        certifiedPlan,
+        certifiedPeers,
+        certifiedKvCache,
+        certifiedKvSeq,
+        certifiedEnvelopes,
+        certifiedActivationStore,
+        certifiedEvidence,
+        certifiedKvTransferEvidence,
+        certifiedKvResidencyStore,
+        depinTransportSmokeFreshResidencyPrefix("signer_fail", certifiedPlan.engineHash),
+        signerFailAdapter,
+        depinTransportSmokeBuildSettlementPlan()
+    )
+    if IsOk(signerFailRun):
+        return 57
+    if !signerFailSession.failed || signerFailSession.finished:
+        return 58
+
+    let a2RegisterSpec = transport.DepinInferenceTransportWriteResidencySettlementDaemonOsServiceSpec(
+        certifiedPlan,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        Value(daemonStartupBundle),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd,
+        "com.cheng.depin.transport.daemon.a2",
+        daemonExecutablePath,
+        daemonWorkingDirectory,
+        supervisorNowNs + int64(1600000)
+    )
+    if IsErr(a2RegisterSpec):
+        echo(ErrorText(a2RegisterSpec))
+        return 407
+    let a2RegisterHealth = transport.DepinInferenceTransportWriteResidencySettlementDaemonHealthReceiptFromStartupBundle(
+        daemonStartupBundlePath,
+        int64(4242),
+        supervisorNowNs + int64(1605000)
+    )
+    if IsErr(a2RegisterHealth):
+        echo(ErrorText(a2RegisterHealth))
+        return 408
+    let a2Registered = transport.DepinInferenceTransportRegisterResidencySettlementDaemonService(
+        certifiedPlan,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        Value(daemonStartupBundle),
+        Value(a2RegisterSpec),
+        Value(a2RegisterHealth),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd,
+        "com.cheng.depin.transport.daemon.a2",
+        daemonExecutablePath,
+        daemonWorkingDirectory,
+        supervisorNowNs + int64(1610000)
+    )
+    if IsErr(a2Registered):
+        echo(ErrorText(a2Registered))
+        return 409
+    let a2RegisteredPath = transport.DepinInferenceTransportResidencySettlementDaemonRegisteredServicePathFromPrefix(certifiedResidencyPrefix)
+    if Value(a2Registered).receiptPath != a2RegisteredPath ||
+       Value(a2Registered).serviceKind != transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd ||
+       !Value(a2Registered).active ||
+       Value(a2Registered).heartbeatPid != int64(4242) ||
+       Value(a2Registered).osServiceSpecReceiptHash != Value(a2RegisterSpec).receiptHash ||
+       Value(a2Registered).osServiceSpecSpecByteHash != Value(a2RegisterSpec).specByteHash ||
+       Value(a2Registered).startupBundleReceiptHash != Value(daemonStartupBundle).receiptHash ||
+       Value(a2Registered).healthReceiptHash != Value(a2RegisterHealth).receiptHash:
+        return 410
+    let a2RegisteredValidate = transport.DepinInferenceTransportValidateResidencySettlementDaemonRegisteredServiceReceipt(
+        Value(a2Registered),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd,
+        "com.cheng.depin.transport.daemon.a2",
+        true
+    )
+    if IsErr(a2RegisteredValidate):
+        echo(ErrorText(a2RegisteredValidate))
+        return 411
+    let a2SpecBytes = os.ReadFileBytesResult(Value(a2RegisterSpec).specPath)
+    if IsErr(a2SpecBytes):
+        echo(ErrorText(a2SpecBytes))
+        return 412
+    var a2SpecBytesRaw = Value(a2SpecBytes)
+    rawbytes.BytesSet(a2SpecBytesRaw, 16, rawbytes.BytesGet(a2SpecBytesRaw, 16) ^ 1)
+    let a2SpecWriteBad = os.WriteFileBytesResult(Value(a2RegisterSpec).specPath, a2SpecBytesRaw)
+    if IsErr(a2SpecWriteBad):
+        rawbytes.BytesFree(a2SpecBytesRaw)
+        echo(ErrorText(a2SpecWriteBad))
+        return 413
+    if IsOk(transport.DepinInferenceTransportValidateResidencySettlementDaemonRegisteredServiceReceiptSelf(Value(a2Registered))):
+        rawbytes.BytesFree(a2SpecBytesRaw)
+        return 414
+    rawbytes.BytesSet(a2SpecBytesRaw, 16, rawbytes.BytesGet(a2SpecBytesRaw, 16) ^ 1)
+    let a2SpecRestore = os.WriteFileBytesResult(Value(a2RegisterSpec).specPath, a2SpecBytesRaw)
+    rawbytes.BytesFree(a2SpecBytesRaw)
+    if IsErr(a2SpecRestore):
+        echo(ErrorText(a2SpecRestore))
+        return 415
+    let a2RegisterBadExec = transport.DepinInferenceTransportRegisterResidencySettlementDaemonService(
+        certifiedPlan,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        Value(daemonStartupBundle),
+        Value(a2RegisterSpec),
+        Value(a2RegisterHealth),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd,
+        "com.cheng.depin.transport.daemon.a2",
+        strutil.Join([daemonExecutablePath, ".drift"], ""),
+        daemonWorkingDirectory,
+        supervisorNowNs + int64(1610001)
+    )
+    if IsOk(a2RegisterBadExec):
+        return 416
+    let a2SystemdSpec = transport.DepinInferenceTransportWriteResidencySettlementDaemonOsServiceSpec(
+        certifiedPlan,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        Value(daemonStartupBundle),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSystemd,
+        "cheng-depin-transport-daemon-a2",
+        daemonExecutablePath,
+        daemonWorkingDirectory,
+        supervisorNowNs + int64(1620000)
+    )
+    if IsErr(a2SystemdSpec):
+        echo(ErrorText(a2SystemdSpec))
+        return 417
+    let a2SystemdHealth = transport.DepinInferenceTransportWriteResidencySettlementDaemonHealthReceiptFromStartupBundle(
+        daemonStartupBundlePath,
+        int64(4243),
+        supervisorNowNs + int64(1625000)
+    )
+    if IsErr(a2SystemdHealth):
+        echo(ErrorText(a2SystemdHealth))
+        return 418
+    let a2SystemdRegistered = transport.DepinInferenceTransportRegisterResidencySettlementDaemonService(
+        certifiedPlan,
+        certifiedKvResidencyStore,
+        daemonConfig,
+        Value(daemonStartupBundle),
+        Value(a2SystemdSpec),
+        Value(a2SystemdHealth),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSystemd,
+        "cheng-depin-transport-daemon-a2",
+        daemonExecutablePath,
+        daemonWorkingDirectory,
+        supervisorNowNs + int64(1630000)
+    )
+    if IsErr(a2SystemdRegistered):
+        echo(ErrorText(a2SystemdRegistered))
+        return 419
+    let a2SystemdValidate = transport.DepinInferenceTransportValidateResidencySettlementDaemonRegisteredServiceReceipt(
+        Value(a2SystemdRegistered),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceSystemd,
+        "cheng-depin-transport-daemon-a2",
+        true
+    )
+    if IsErr(a2SystemdValidate):
+        echo(ErrorText(a2SystemdValidate))
+        return 420
+    let a2TriggerBytes = os.ReadFileBytesResult(Value(a2SystemdSpec).triggerSpecPath)
+    if IsErr(a2TriggerBytes):
+        echo(ErrorText(a2TriggerBytes))
+        return 421
+    var a2TriggerBytesRaw = Value(a2TriggerBytes)
+    rawbytes.BytesSet(a2TriggerBytesRaw, 16, rawbytes.BytesGet(a2TriggerBytesRaw, 16) ^ 1)
+    let a2TriggerWriteBad = os.WriteFileBytesResult(Value(a2SystemdSpec).triggerSpecPath, a2TriggerBytesRaw)
+    if IsErr(a2TriggerWriteBad):
+        rawbytes.BytesFree(a2TriggerBytesRaw)
+        echo(ErrorText(a2TriggerWriteBad))
+        return 422
+    if IsOk(transport.DepinInferenceTransportValidateResidencySettlementDaemonRegisteredServiceReceiptSelf(Value(a2SystemdRegistered))):
+        rawbytes.BytesFree(a2TriggerBytesRaw)
+        return 423
+    rawbytes.BytesSet(a2TriggerBytesRaw, 16, rawbytes.BytesGet(a2TriggerBytesRaw, 16) ^ 1)
+    let a2TriggerRestore = os.WriteFileBytesResult(Value(a2SystemdSpec).triggerSpecPath, a2TriggerBytesRaw)
+    rawbytes.BytesFree(a2TriggerBytesRaw)
+    if IsErr(a2TriggerRestore):
+        echo(ErrorText(a2TriggerRestore))
+        return 424
+    if !os.RemoveFile(Value(a2RegisterHealth).path):
+        return 425
+    if IsOk(transport.DepinInferenceTransportValidateResidencySettlementDaemonRegisteredServiceReceiptSelf(Value(a2Registered))):
+        return 426
+    let a2RegisterHealthRestore = transport.DepinInferenceTransportWriteResidencySettlementDaemonHealthReceiptFromStartupBundle(
+        daemonStartupBundlePath,
+        int64(4242),
+        supervisorNowNs + int64(1605000)
+    )
+    if IsErr(a2RegisterHealthRestore):
+        echo(ErrorText(a2RegisterHealthRestore))
+        return 427
+    let a2Unregister = transport.DepinInferenceTransportUnregisterResidencySettlementDaemonService(a2RegisteredPath)
+    if IsErr(a2Unregister):
+        echo(ErrorText(a2Unregister))
+        return 428
+    if Value(a2Unregister).active:
+        return 429
+    let a2UnregisterActiveCheck = transport.DepinInferenceTransportValidateResidencySettlementDaemonRegisteredServiceReceipt(
+        Value(a2Unregister),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd,
+        "com.cheng.depin.transport.daemon.a2",
+        true
+    )
+    if IsOk(a2UnregisterActiveCheck):
+        return 430
+    let a2UnregisterInactiveCheck = transport.DepinInferenceTransportValidateResidencySettlementDaemonRegisteredServiceReceipt(
+        Value(a2Unregister),
+        transport.DepinInferenceTransportResidencySettlementDaemonOsServiceLaunchd,
+        "com.cheng.depin.transport.daemon.a2",
+        false
+    )
+    if IsErr(a2UnregisterInactiveCheck):
+        return 431
+    let a2NetworkPrefix = depinTransportSmokeFreshResidencyPrefix("network_replication_a2", certifiedPlan.engineHash)
+    let a2QuorumPath = transport.DepinInferenceTransportSettlementLedgerQuorumPathFromPrefix(a2NetworkPrefix)
+    let a2QuorumWrite = transport.DepinInferenceTransportWriteSettlementLedgerQuorumReceiptFile(a2QuorumPath, Value(settlementQuorumOk))
+    if IsErr(a2QuorumWrite):
+        echo(ErrorText(a2QuorumWrite))
+        return 432
+    let a2QuorumRead = transport.DepinInferenceTransportReadSettlementLedgerQuorumReceiptFile(a2QuorumPath)
+    if IsErr(a2QuorumRead):
+        echo(ErrorText(a2QuorumRead))
+        return 433
+    let a2NetworkReplication = transport.DepinInferenceTransportWriteResidencyStoreNetworkReplicationReceipt(
+        a2NetworkPrefix,
+        certifiedPlan,
+        Value(a2QuorumRead),
+        int64(800500)
+    )
+    if IsErr(a2NetworkReplication):
+        echo(ErrorText(a2NetworkReplication))
+        return 434
+    let a2NetworkOk = transport.DepinInferenceTransportValidateResidencyStoreNetworkReplicationReceipt(
+        Value(a2NetworkReplication),
+        Value(a2QuorumRead).ledgerByteHash,
+        Value(a2QuorumRead).requiredReplicaCount
+    )
+    if IsErr(a2NetworkOk):
+        echo(ErrorText(a2NetworkOk))
+        return 435
+    var a2NetworkDrift = Value(a2NetworkReplication)
+    a2NetworkDrift.replicaLedgerByteHashSetHash = a2NetworkDrift.replicaLedgerByteHashSetHash + int64(1)
+    if IsOk(transport.DepinInferenceTransportValidateResidencyStoreNetworkReplicationReceiptSelf(a2NetworkDrift)):
+        return 436
+    let a2NetworkQuorumCheck = transport.DepinInferenceTransportValidateResidencyStoreNetworkReplicationReceipt(
+        Value(a2NetworkReplication),
+        Value(a2QuorumRead).ledgerByteHash,
+        Value(a2QuorumRead).requiredReplicaCount + 1
+    )
+    if IsOk(a2NetworkQuorumCheck):
+        return 437
+
+    quic_transport.Libp2pQuicLoopbackClose(certifiedPeerAPair)
+
+    echo(" depin_inference_transport_smoke ok")
+    return 0
+
+fn main(): int32 =
+    return RunDepinInferenceTransportSmoke()

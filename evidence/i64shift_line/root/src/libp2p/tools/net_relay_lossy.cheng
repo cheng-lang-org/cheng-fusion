@@ -1,0 +1,303 @@
+# libp2p P2 S5: 用户态确定性有损 UDP 中继 (正典 §11.6 P2 S5)。
+#
+# 独立进程, 无 sudo, 不用 dummynet: 听 --listen-port, 双向转发 client<->server。
+# client 侧 (net pull) dial 本中继, 中继把 c2s 帧转发到真 server (--server-host:--server-port),
+# server 回帧经中继 s2c 转发回 client。s2c 方向按【确定性种子/模式】施加 drop/reorder/dup:
+#   passthrough : 全转发, 不引入损坏 (门②对照)。
+#   drop        : s2cCount 在 (grace, ceiling] 且 %period==0 丢弃; ceiling 之后无损 → 保证收敛。
+#                 丢 s2c 数据帧 → 接收端 (client) 产生 gap → 回 SACK → server 读 SACK 位图重传
+#                 (正是 msquicNativeSackBitGet 选择确认路径)。
+#   reorder     : s2cCount 在 grace 之后且 %period==0 时暂存当前帧, 下一帧先发再补发暂存帧
+#                 (相邻交换); 暂存超 holdMaxMs 或退出前强制 flush → 不丢帧, 只乱序。
+#   dup         : s2cCount %period==0 时把该帧发两遍 (QUIC 按包号去重)。
+# c2s 方向恒透传 (SACK/重传语义在 s2c 数据面)。
+#
+# 生产纪律: 中继是测试基建非 mock — 真 UDP 真两 socket 真转发, policy 只作用于转发时机/份数,
+# 不改字节。硬超时 (--hard-timeout-ms) 与空闲超时 (--idle-timeout-ms) 退出, 挂死不静默。
+
+import std/system
+import std/result
+import std/rawbytes
+import std/cmdline
+import std/os
+import std/strutils as strutil
+import std/times
+import std/net/transports/udp_syscall as udp
+import cheng/core/tooling/path as chengpath
+
+type
+    RelayState =
+        clientFd: int32
+        serverFd: int32
+        serverAddr: udp.UdpSockAddr
+        clientAddr: udp.UdpSockAddr
+        clientKnown: bool
+        mode: str
+        period: int32
+        grace: int32
+        ceiling: int32
+        holdMaxMs: int64
+        s2cCount: int32
+        s2cForwarded: int32
+        s2cDropped: int32
+        s2cDuped: int32
+        s2cReordered: int32
+        heldValid: bool
+        heldData: Bytes
+        heldSinceMs: int64
+        c2sCount: int32
+        c2sForwarded: int32
+
+fn relayErr(msg: str) =
+    os.WriteLine(os.Get_stderr(), msg)
+
+# nonblocking sendto 带小重试: localhost UDP 发送缓冲偶发 EWOULDBLOCK 时不当成 policy 丢包。
+# 重试仍失败 = 硬错 (返回 false), 调用方据此崩, 不静默吞。
+fn relaySendRetry(fd: int32, payload: Bytes, toAddr: udp.UdpSockAddr): bool =
+    var attempt: int32 = 0
+    while attempt < 64:
+        let sendRes: Result[int32] = udp.UdpSendTo(fd, payload, toAddr)
+        if IsOk(sendRes):
+            return true
+        os.SleepMs(1)
+        attempt = attempt + 1
+    return false
+
+fn relaySendClient(state: var RelayState, payload: Bytes): bool =
+    if !state.clientKnown:
+        return true
+    return relaySendRetry(state.clientFd, payload, state.clientAddr)
+
+fn relaySendServer(state: var RelayState, payload: Bytes): bool =
+    return relaySendRetry(state.serverFd, payload, state.serverAddr)
+
+fn relayHandleC2S(state: var RelayState, payload: Bytes): bool =
+    state.c2sCount = state.c2sCount + 1
+    if !relaySendServer(state, payload):
+        return false
+    state.c2sForwarded = state.c2sForwarded + 1
+    return true
+
+fn relayHandleS2C(state: var RelayState, payload: Bytes): bool =
+    state.s2cCount = state.s2cCount + 1
+    if state.mode == "drop":
+        if state.s2cCount > state.grace &&
+           state.s2cCount <= state.ceiling &&
+           (state.s2cCount % state.period) == 0:
+            state.s2cDropped = state.s2cDropped + 1
+            return true
+        if !relaySendClient(state, payload):
+            return false
+        state.s2cForwarded = state.s2cForwarded + 1
+        return true
+    if state.mode == "dup":
+        if !relaySendClient(state, payload):
+            return false
+        state.s2cForwarded = state.s2cForwarded + 1
+        if (state.s2cCount % state.period) == 0:
+            if !relaySendClient(state, payload):
+                return false
+            state.s2cDuped = state.s2cDuped + 1
+        return true
+    if state.mode == "reorder":
+        if state.heldValid:
+            if !relaySendClient(state, payload):
+                return false
+            state.s2cForwarded = state.s2cForwarded + 1
+            if !relaySendClient(state, state.heldData):
+                return false
+            state.s2cForwarded = state.s2cForwarded + 1
+            state.s2cReordered = state.s2cReordered + 1
+            state.heldValid = false
+            return true
+        if state.s2cCount > state.grace && (state.s2cCount % state.period) == 0:
+            state.heldData = payload
+            state.heldValid = true
+            state.heldSinceMs = times.MonotimeMs()
+            return true
+        if !relaySendClient(state, payload):
+            return false
+        state.s2cForwarded = state.s2cForwarded + 1
+        return true
+    # passthrough
+    if !relaySendClient(state, payload):
+        return false
+    state.s2cForwarded = state.s2cForwarded + 1
+    return true
+
+fn relayFlushHeld(state: var RelayState): bool =
+    if state.heldValid:
+        if !relaySendClient(state, state.heldData):
+            return false
+        state.s2cForwarded = state.s2cForwarded + 1
+        state.heldValid = false
+    return true
+
+fn relayStatsLine(state: RelayState): str =
+    return strutil.Join([
+        "net_relay stats mode=", state.mode,
+        " c2s_count=", IntToStr(state.c2sCount),
+        " c2s_fwd=", IntToStr(state.c2sForwarded),
+        " s2c_count=", IntToStr(state.s2cCount),
+        " s2c_fwd=", IntToStr(state.s2cForwarded),
+        " s2c_drop=", IntToStr(state.s2cDropped),
+        " s2c_dup=", IntToStr(state.s2cDuped),
+        " s2c_reorder=", IntToStr(state.s2cReordered)], "")
+
+fn main(): int32 =
+    let listenPort: int32 = cmdline.ReadInt32FlagOrDefault("--listen-port", 0)
+    let serverHost: str = cmdline.ReadFlagOrDefault("--server-host", "127.0.0.1")
+    let serverPort: int32 = cmdline.ReadInt32FlagOrDefault("--server-port", 0)
+    let readyFile: str = cmdline.ReadFlagOrDefault("--ready-file", "")
+    let mode: str = cmdline.ReadFlagOrDefault("--mode", "passthrough")
+    let period: int32 = cmdline.ReadInt32FlagOrDefault("--period", 7)
+    let grace: int32 = cmdline.ReadInt32FlagOrDefault("--grace", 2)
+    let ceiling: int32 = cmdline.ReadInt32FlagOrDefault("--ceiling", 60)
+    let hardTimeoutMs: int64 = int64(cmdline.ReadInt32FlagOrDefault("--hard-timeout-ms", 30000))
+    let idleTimeoutMs: int64 = int64(cmdline.ReadInt32FlagOrDefault("--idle-timeout-ms", 3000))
+    let holdMaxMs: int64 = int64(cmdline.ReadInt32FlagOrDefault("--hold-max-ms", 30))
+
+    if serverPort <= 0:
+        relayErr("net_relay: --server-port 必填 (>0)")
+        return 2
+    if readyFile == "":
+        relayErr("net_relay: --ready-file 必填 (跨进程端口握手)")
+        return 2
+    if mode != "passthrough" && mode != "drop" && mode != "reorder" && mode != "dup":
+        relayErr(strutil.Join(["net_relay: 未知 --mode: ", mode], ""))
+        return 2
+    if period <= 0:
+        relayErr("net_relay: --period 须 > 0")
+        return 2
+
+    let useLenFieldCode: int32 = os.UdpPlatformUseLenFieldBridge()
+
+    # client-facing socket: 显式 open (nonblock) + bind listenPort。
+    let clientSockRes: Result[udp.UdpSocketHandle] = udp.UdpSocketOpenDgram(false)
+    if IsErr(clientSockRes):
+        relayErr(strutil.Join(["net_relay: client socket open: ", ErrorText(clientSockRes)], ""))
+        return 1
+    let clientSock: udp.UdpSocketHandle = Value(clientSockRes)
+    var listenAddr: udp.UdpSockAddr
+    let listenAddrRes: Result[bool] = udp.UdpSockAddrFromHostPort4("127.0.0.1", listenPort, useLenFieldCode, listenAddr)
+    if IsErr(listenAddrRes):
+        udp.UdpSocketClose(clientSock.fd)
+        relayErr(strutil.Join(["net_relay: listen addr: ", ErrorText(listenAddrRes)], ""))
+        return 1
+    let bindRes: Result[bool] = udp.UdpBindAddr(clientSock.fd, listenAddr)
+    if IsErr(bindRes):
+        udp.UdpSocketClose(clientSock.fd)
+        relayErr(strutil.Join(["net_relay: bind: ", ErrorText(bindRes)], ""))
+        return 1
+    var boundName: udp.UdpSockAddr
+    let sockNameRes: Result[bool] = udp.UdpGetSockName(clientSock.fd, boundName)
+    if IsErr(sockNameRes):
+        udp.UdpSocketClose(clientSock.fd)
+        relayErr(strutil.Join(["net_relay: getsockname: ", ErrorText(sockNameRes)], ""))
+        return 1
+    let boundPort: int32 = boundName.port
+
+    # server-facing socket: 显式 open (nonblock), 首次 sendto 自动绑临时源口。
+    let serverSockRes: Result[udp.UdpSocketHandle] = udp.UdpSocketOpenDgram(false)
+    if IsErr(serverSockRes):
+        udp.UdpSocketClose(clientSock.fd)
+        relayErr(strutil.Join(["net_relay: server socket open: ", ErrorText(serverSockRes)], ""))
+        return 1
+    let serverSock: udp.UdpSocketHandle = Value(serverSockRes)
+    var serverAddr: udp.UdpSockAddr
+    let serverAddrRes: Result[bool] = udp.UdpSockAddrFromHostPort4(serverHost, serverPort, useLenFieldCode, serverAddr)
+    if IsErr(serverAddrRes):
+        udp.UdpSocketClose(clientSock.fd)
+        udp.UdpSocketClose(serverSock.fd)
+        relayErr(strutil.Join(["net_relay: server addr: ", ErrorText(serverAddrRes)], ""))
+        return 1
+
+    var state: RelayState
+    state.clientFd = clientSock.fd
+    state.serverFd = serverSock.fd
+    state.serverAddr = serverAddr
+    state.clientKnown = false
+    state.mode = mode
+    state.period = period
+    state.grace = grace
+    state.ceiling = ceiling
+    state.holdMaxMs = holdMaxMs
+    state.heldValid = false
+
+    # ready-file 握手: 写中继监听口 (client 据此 --from 127.0.0.1:<boundPort>)。
+    if !chengpath.WriteTextFile("", readyFile, IntToStr(boundPort)):
+        udp.UdpSocketClose(clientSock.fd)
+        udp.UdpSocketClose(serverSock.fd)
+        relayErr("net_relay: ready-file write failed")
+        return 1
+
+    echo(strutil.Join(["net_relay: listen 127.0.0.1:", IntToStr(boundPort),
+                       " -> server ", serverHost, ":", IntToStr(serverPort),
+                       " mode=", mode,
+                       " period=", IntToStr(period),
+                       " grace=", IntToStr(grace),
+                       " ceiling=", IntToStr(ceiling)], ""))
+
+    let startMs: int64 = times.MonotimeMs()
+    var lastActivityMs: int64 = startMs
+    var failed: bool = false
+    while true:
+        let now: int64 = times.MonotimeMs()
+        if now - startMs > hardTimeoutMs:
+            break
+        if now - lastActivityMs > idleTimeoutMs:
+            break
+        var progressed: bool = false
+
+        # reorder: 暂存帧超龄强制 flush, 限定乱序时距, 保尾帧不滞留。
+        if state.heldValid && (now - state.heldSinceMs) > state.holdMaxMs:
+            if !relayFlushHeld(state):
+                failed = true
+                break
+
+        var drainN: int32 = 0
+        while drainN < 2048:
+            var cRecv: udp.UdpRecvResult
+            let cRes: Result[bool] = udp.UdpRecvFromNonblock(state.clientFd, 65535, cRecv)
+            if IsErr(cRes):
+                break
+            state.clientAddr = cRecv.fromAddr
+            state.clientKnown = true
+            lastActivityMs = now
+            progressed = true
+            if !relayHandleC2S(state, cRecv.data):
+                failed = true
+                break
+            drainN = drainN + 1
+        if failed:
+            break
+
+        drainN = 0
+        while drainN < 2048:
+            var sRecv: udp.UdpRecvResult
+            let sRes: Result[bool] = udp.UdpRecvFromNonblock(state.serverFd, 65535, sRecv)
+            if IsErr(sRes):
+                break
+            lastActivityMs = now
+            progressed = true
+            if !relayHandleS2C(state, sRecv.data):
+                failed = true
+                break
+            drainN = drainN + 1
+        if failed:
+            break
+
+        if !progressed:
+            os.SleepMs(1)
+
+    if !failed:
+        if !relayFlushHeld(state):
+            failed = true
+
+    echo(relayStatsLine(state))
+    udp.UdpSocketClose(clientSock.fd)
+    udp.UdpSocketClose(serverSock.fd)
+    if failed:
+        relayErr("net_relay: forward send failed (硬错, 非 policy 丢包)")
+        return 1
+    return 0

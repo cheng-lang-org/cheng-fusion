@@ -39,7 +39,11 @@ import {
 } from "../src/cheng_semantic_pipeline_matrix_m9024.ts";
 import {canonicalJson} from "../src/cheng_semantic_matrix_m9023.ts";
 import {
+  currentParserReceiptBindingAuthority,
+  tokenKindNamesFromParserSource,
   validateDriverReceiptToolchainIdentityValue,
+  valueExprKindNamesFromParserSource,
+  type MapRow,
 } from "./grammar_receipt_bind.ts";
 import {parseUniqueCurrentJson} from "../src/current_schema_json.ts";
 
@@ -48,6 +52,8 @@ const PARSER_RELATIVE = "src/core/lang/parser.cheng";
 const RECEIPT_PRODUCER_RELATIVE =
   "src/core/tooling/compiler_parser_receipt.cheng";
 const BOOTSTRAP_RELATIVE = "bootstrap/cheng_cold.c";
+const PARSER_NODE_MAP_RELATIVE =
+  "fixtures/semantic/ebnf_parser_node_map.json";
 const UNREGISTERED_ANNOTATION_MUTATION_RELATIVE =
   "src/tests/parser_unregistered_annotation_inline_negative.cheng";
 const UNREGISTERED_ANNOTATION_MUTATION_BYTES =
@@ -326,6 +332,11 @@ async function assertInputsUnchanged(
     executableSha256: string;
     version: string;
   },
+  parserNodeMapBefore: {
+    path: string;
+    sha256: string;
+    byteLength: number;
+  },
   stage: string,
 ): Promise<void> {
   const authorityAfter = resolveCurrentParserHarnessAuthority(
@@ -352,6 +363,16 @@ async function assertInputsUnchanged(
   };
   if (canonicalJson(runtime) !== canonicalJson(runtimeBefore)) {
     fail(`runtime drifted during ${stage}`);
+  }
+  const parserNodeMapBytes = readFileSync(parserNodeMapBefore.path);
+  const parserNodeMapAfter = {
+    path: parserNodeMapBefore.path,
+    sha256: sha256(parserNodeMapBytes),
+    byteLength: parserNodeMapBytes.length,
+  };
+  if (canonicalJson(parserNodeMapAfter) !==
+      canonicalJson(parserNodeMapBefore)) {
+    fail(`parser node map drifted during ${stage}`);
   }
 }
 
@@ -526,6 +547,32 @@ export async function runCurrentParserProductionReceiptHarness(): Promise<void> 
   const grammar = buildChengGrammarObligationContract(
     readFileSync(authority.formalSpecPath),
   );
+  const formalSpecSource =
+    readFileSync(authority.formalSpecPath, "utf8");
+  const parserSource =
+    readFileSync(authority.parserPath, "utf8");
+  const parserNodeMapPath = join(
+    FUSION_ROOT,
+    PARSER_NODE_MAP_RELATIVE,
+  );
+  const parserNodeMapBytes = readFileSync(parserNodeMapPath);
+  const parserNodeMap = parseUniqueCurrentJson(
+    parserNodeMapBytes.toString("utf8"),
+    "ebnf_parser_node_map",
+  ) as {rows: readonly MapRow[]};
+  const parserNodeMapSha256 = sha256(parserNodeMapBytes);
+  const parserNodeMapIdentity = {
+    path: parserNodeMapPath,
+    sha256: parserNodeMapSha256,
+    byteLength: parserNodeMapBytes.length,
+  };
+  const parserNodeMapRows = new Map(
+    parserNodeMap.rows.map((row) => [row.name, row]),
+  );
+  const parserTokenKindNames =
+    tokenKindNamesFromParserSource(parserSource);
+  const parserValueExprKindNames =
+    valueExprKindNamesFromParserSource(parserSource);
   rejectionContext = {
     outDir,
     stage: "production profile admission",
@@ -564,6 +611,7 @@ export async function runCurrentParserProductionReceiptHarness(): Promise<void> 
     frozenSources,
     buildCompiler,
     runtime,
+    parserNodeMapIdentity,
     "seed build",
   );
 
@@ -594,6 +642,7 @@ export async function runCurrentParserProductionReceiptHarness(): Promise<void> 
       frozenSources,
       buildCompiler,
       runtime,
+      parserNodeMapIdentity,
       `driver ${role} build`,
     );
     drivers.push({role, ...fileIdentity(path)});
@@ -669,6 +718,7 @@ export async function runCurrentParserProductionReceiptHarness(): Promise<void> 
       frozenSources,
       buildCompiler,
       runtime,
+      parserNodeMapIdentity,
       `unregistered annotation mutation ${driver.role}`,
     );
   }
@@ -679,6 +729,9 @@ export async function runCurrentParserProductionReceiptHarness(): Promise<void> 
     driverRole: string;
     driverSha256: string;
     parserTraceRootSha256: string;
+    parserBindingSha256: string;
+    parserBindingRequiredResultCount: number;
+    parserBindingHitCount: number;
   }> = [];
   for (const source of sourceRows) {
     for (const driver of drivers) {
@@ -706,6 +759,7 @@ export async function runCurrentParserProductionReceiptHarness(): Promise<void> 
         frozenSources,
         buildCompiler,
         runtime,
+        parserNodeMapIdentity,
         `receipt ${safe}/${driver.role}`,
       );
       const receiptBytes = readFileSync(path);
@@ -727,12 +781,33 @@ export async function runCurrentParserProductionReceiptHarness(): Promise<void> 
           !/^[0-9a-f]{64}$/.test(receipt.parserTraceRootSha256)) {
         fail(`receipt identity invalid: ${path}`);
       }
+      const binding = currentParserReceiptBindingAuthority(
+        receiptBytes.toString("utf8"),
+        readFileSync(source.path, "utf8"),
+        formalSpecSource,
+        grammar.obligations,
+        parserTokenKindNames,
+        parserNodeMapRows,
+        parserNodeMapSha256,
+        parserValueExprKindNames,
+      );
+      if (binding.requiredResultCount !== grammar.requiredCount ||
+          binding.hitCount <= 0 ||
+          binding.parserTraceRootSha256 !==
+            receipt.parserTraceRootSha256 ||
+          binding.parserNodeMapSha256 !== parserNodeMapSha256) {
+        fail(`receipt binding invalid: ${path}`);
+      }
       receipts.push({
         ...fileIdentity(path),
         sourcePath: source.path,
         driverRole: driver.role,
         driverSha256: driver.sha256,
         parserTraceRootSha256: receipt.parserTraceRootSha256,
+        parserBindingSha256: binding.bindingSha256,
+        parserBindingRequiredResultCount:
+          binding.requiredResultCount,
+        parserBindingHitCount: binding.hitCount,
       });
       rejectionContext.completedReceiptCount = receipts.length;
     }
@@ -740,7 +815,14 @@ export async function runCurrentParserProductionReceiptHarness(): Promise<void> 
   for (const source of sourceRows) {
     const pair = receipts.filter((row) => row.sourcePath === source.path);
     if (pair.length !== 2 || pair[0]!.inode === pair[1]!.inode ||
-        pair[0]!.parserTraceRootSha256 !== pair[1]!.parserTraceRootSha256) {
+        pair[0]!.parserTraceRootSha256 !==
+          pair[1]!.parserTraceRootSha256 ||
+        pair[0]!.parserBindingSha256 !==
+          pair[1]!.parserBindingSha256 ||
+        pair[0]!.parserBindingRequiredResultCount !==
+          pair[1]!.parserBindingRequiredResultCount ||
+        pair[0]!.parserBindingHitCount !==
+          pair[1]!.parserBindingHitCount) {
       fail(`receipt fixed point invalid: ${source.path}`);
     }
   }
@@ -752,6 +834,7 @@ export async function runCurrentParserProductionReceiptHarness(): Promise<void> 
     frozenSources,
     buildCompiler,
     runtime,
+    parserNodeMapIdentity,
     "finalization",
   );
   rejectionContext.stage = "manifest staging";
@@ -781,6 +864,10 @@ export async function runCurrentParserProductionReceiptHarness(): Promise<void> 
       sha256: sha256(readFileSync(authority.bootstrapPath)),
     },
     harness: {path: HARNESS, sha256: sha256(readFileSync(HARNESS))},
+    parserNodeMap: {
+      path: parserNodeMapPath,
+      sha256: parserNodeMapSha256,
+    },
     dependencyClosure: before,
     toolClosure,
     buildCompiler,
@@ -801,6 +888,7 @@ export async function runCurrentParserProductionReceiptHarness(): Promise<void> 
     frozenSources,
     buildCompiler,
     runtime,
+    parserNodeMapIdentity,
     "manifest staging",
   );
   renameSync(stagedManifestPath, manifestPath);

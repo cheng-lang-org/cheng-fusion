@@ -1,0 +1,932 @@
+#!/usr/bin/env python3
+"""Create and seal a descriptor-bound RISC-V ISA evidence directory."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import secrets
+import stat
+import sys
+from dataclasses import dataclass
+from typing import Mapping, Sequence
+
+
+RECEIPT_NAME = b".riscv-isa-evidence-root.identity.kv"
+MANIFEST_NAME = b"riscv-isa-evidence-root.manifest.kv"
+PENDING_PREFIX = b".riscv-isa-evidence-root.manifest.pending."
+RECEIPT_SCHEMA = "cheng.riscv_isa_evidence_root_identity.v1"
+MANIFEST_SCHEMA = "cheng.riscv_isa_evidence_root_manifest.v1"
+EVIDENCE_CID_DOMAIN = b"cheng.riscv_isa_evidence_root.cid.v1"
+READ_BYTES = 1024 * 1024
+MAX_METADATA_BYTES = 64 * 1024 * 1024
+MAX_FILE_BYTES = 8 * 1024 * 1024 * 1024
+MAX_FILE_COUNT = 1_000_000
+MAX_PATH_BYTES = 64 * 1024 * 1024
+MAX_PATH_DEPTH = 256
+
+
+class EvidenceRootError(RuntimeError):
+    pass
+
+
+def fail(reason: str) -> None:
+    raise EvidenceRootError(reason)
+
+
+def sha256(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def require_platform() -> None:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        fail("platform_missing_no_follow_directory_open")
+
+
+def valid_decimal(raw: str) -> bool:
+    return (
+        bool(raw)
+        and raw.isascii()
+        and raw.isdigit()
+        and (raw == "0" or not raw.startswith("0"))
+    )
+
+
+def parse_decimal(raw: str, label: str) -> int:
+    if not valid_decimal(raw):
+        fail(label + "_invalid_decimal")
+    return int(raw)
+
+
+def valid_sha256(raw: str) -> bool:
+    return len(raw) == 64 and all(char in "0123456789abcdef" for char in raw)
+
+
+def parse_sha256(raw: str, label: str) -> str:
+    if not valid_sha256(raw):
+        fail(label + "_invalid_sha256")
+    return raw
+
+
+def parse_fshex(raw: str, label: str) -> bytes:
+    if (
+        not raw
+        or len(raw) % 2 != 0
+        or any(char not in "0123456789abcdef" for char in raw)
+    ):
+        fail(label + "_invalid_fshex")
+    try:
+        decoded = bytes.fromhex(raw)
+    except ValueError:
+        fail(label + "_invalid_fshex")
+    if decoded.hex() != raw:
+        fail(label + "_noncanonical_fshex")
+    return decoded
+
+
+def canonical_absolute_path(raw_value: str) -> bytes:
+    try:
+        raw = os.fsencode(raw_value)
+        raw.decode("utf-8", "strict")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        fail("root_path_not_utf8")
+    if not raw.startswith(b"/"):
+        fail("root_path_not_absolute")
+    if b"\x00" in raw or os.path.normpath(raw) != raw or raw == b"/":
+        fail("root_path_not_canonical")
+    components = raw[1:].split(b"/")
+    if (
+        not components
+        or len(components) > MAX_PATH_DEPTH
+        or any(component in (b"", b".", b"..") for component in components)
+    ):
+        fail("root_path_not_canonical")
+    return raw
+
+
+def canonical_relative_path(raw: bytes) -> None:
+    if not raw or raw.startswith(b"/") or b"\x00" in raw or len(raw) > MAX_PATH_BYTES:
+        fail("relative_path_not_canonical")
+    components = raw.split(b"/")
+    if any(component in (b"", b".", b"..") for component in components):
+        fail("relative_path_not_canonical")
+    try:
+        raw.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        fail("relative_path_not_utf8")
+
+
+def directory_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def file_flags() -> int:
+    return os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def object_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+    )
+
+
+def stable_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+class PathChain:
+    def __init__(self, path_raw: bytes, parent_only: bool) -> None:
+        require_platform()
+        self.path_raw = path_raw
+        components = path_raw[1:].split(b"/")
+        traverse = components[:-1] if parent_only else components
+        self.leaf = components[-1]
+        self.descriptors: list[int] = []
+        self.names: list[bytes] = []
+        self.identities: list[tuple[int, int, int, int, int]] = []
+        try:
+            root_descriptor = os.open(b"/", directory_flags())
+            self.descriptors.append(root_descriptor)
+            self.identities.append(object_identity(os.fstat(root_descriptor)))
+            for component in traverse:
+                try:
+                    named = os.stat(
+                        component,
+                        dir_fd=self.descriptors[-1],
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    fail("root_path_component_missing:" + component.hex())
+                if stat.S_ISLNK(named.st_mode):
+                    fail("root_path_component_symlink:" + component.hex())
+                if not stat.S_ISDIR(named.st_mode):
+                    fail("root_path_component_not_directory:" + component.hex())
+                try:
+                    child = os.open(
+                        component,
+                        directory_flags(),
+                        dir_fd=self.descriptors[-1],
+                    )
+                except OSError as error:
+                    fail(
+                        "root_path_component_open_failed:"
+                        + component.hex()
+                        + ":"
+                        + str(error.errno)
+                    )
+                held = os.fstat(child)
+                if object_identity(named) != object_identity(held):
+                    os.close(child)
+                    fail("root_path_component_identity_drift:" + component.hex())
+                self.names.append(component)
+                self.descriptors.append(child)
+                self.identities.append(object_identity(held))
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def descriptor(self) -> int:
+        return self.descriptors[-1]
+
+    def append_created_leaf(self) -> None:
+        parent = self.descriptors[-1]
+        try:
+            named = os.stat(self.leaf, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            fail("created_root_missing")
+        if stat.S_ISLNK(named.st_mode) or not stat.S_ISDIR(named.st_mode):
+            fail("created_root_identity_invalid")
+        child = os.open(self.leaf, directory_flags(), dir_fd=parent)
+        held = os.fstat(child)
+        if object_identity(named) != object_identity(held):
+            os.close(child)
+            fail("created_root_identity_drift")
+        self.names.append(self.leaf)
+        self.descriptors.append(child)
+        self.identities.append(object_identity(held))
+
+    def verify(self) -> None:
+        if len(self.descriptors) != len(self.identities):
+            fail("root_path_chain_shape_invalid")
+        for index, descriptor in enumerate(self.descriptors):
+            held = os.fstat(descriptor)
+            if object_identity(held) != self.identities[index]:
+                fail("root_path_held_identity_drift:" + str(index))
+            if index == 0:
+                continue
+            named = os.stat(
+                self.names[index - 1],
+                dir_fd=self.descriptors[index - 1],
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(named.st_mode) or object_identity(named) != object_identity(
+                held
+            ):
+                fail("root_path_named_identity_drift:" + str(index))
+
+    def close(self) -> None:
+        while self.descriptors:
+            try:
+                os.close(self.descriptors.pop())
+            except OSError:
+                pass
+
+    def __enter__(self) -> "PathChain":
+        return self
+
+    def __exit__(self, _kind: object, _value: object, _trace: object) -> None:
+        self.close()
+
+
+def render_self_sealed(rows: Sequence[tuple[str, str]], self_key: str) -> bytes:
+    prefix = "".join(f"{key}={value}\n" for key, value in rows).encode("ascii")
+    return prefix + f"{self_key}={sha256(prefix)}\n".encode("ascii")
+
+
+def parse_self_sealed(
+    raw: bytes,
+    expected_keys: Sequence[str],
+    self_key: str,
+    label: str,
+) -> dict[str, str]:
+    if (
+        not raw
+        or len(raw) > MAX_METADATA_BYTES
+        or not raw.endswith(b"\n")
+        or b"\r" in raw
+        or b"\x00" in raw
+    ):
+        fail(label + "_encoding_invalid")
+    try:
+        lines = raw.decode("ascii", "strict").splitlines(keepends=True)
+    except UnicodeDecodeError:
+        fail(label + "_not_ascii")
+    if len(lines) != len(expected_keys):
+        fail(label + "_field_count_invalid")
+    rows: dict[str, str] = {}
+    for index, line in enumerate(lines):
+        if not line.endswith("\n") or "=" not in line:
+            fail(label + "_row_invalid")
+        key, value = line[:-1].split("=", 1)
+        if key != expected_keys[index] or key in rows:
+            fail(label + "_field_order_or_duplicate_invalid")
+        rows[key] = value
+    if expected_keys[-1] != self_key:
+        fail(label + "_schema_internal_error")
+    expected = parse_sha256(rows[self_key], label + "_payload")
+    payload = b"".join(line.encode("ascii") for line in lines[:-1])
+    if sha256(payload) != expected:
+        fail(label + "_payload_sha256_mismatch")
+    return rows
+
+
+RECEIPT_KEYS = (
+    "schema",
+    "status",
+    "root_path_fshex",
+    "root_device",
+    "root_inode",
+    "root_mode",
+    "root_uid",
+    "root_gid",
+    "receipt_payload_sha256",
+)
+
+
+def render_receipt(path_raw: bytes, info: os.stat_result) -> bytes:
+    return render_self_sealed(
+        (
+            ("schema", RECEIPT_SCHEMA),
+            ("status", "prepared"),
+            ("root_path_fshex", path_raw.hex()),
+            ("root_device", str(info.st_dev)),
+            ("root_inode", str(info.st_ino)),
+            ("root_mode", str(stat.S_IMODE(info.st_mode))),
+            ("root_uid", str(info.st_uid)),
+            ("root_gid", str(info.st_gid)),
+        ),
+        "receipt_payload_sha256",
+    )
+
+
+def parse_receipt(raw: bytes) -> dict[str, str]:
+    rows = parse_self_sealed(raw, RECEIPT_KEYS, RECEIPT_KEYS[-1], "root_receipt")
+    if rows["schema"] != RECEIPT_SCHEMA or rows["status"] != "prepared":
+        fail("root_receipt_schema_or_status_invalid")
+    try:
+        path_raw = parse_fshex(rows["root_path_fshex"], "root_receipt_path")
+        path_raw.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        fail("root_receipt_path_fshex_invalid")
+    canonical_absolute_path(os.fsdecode(path_raw))
+    for key in ("root_device", "root_inode", "root_mode", "root_uid", "root_gid"):
+        parse_decimal(rows[key], "root_receipt_" + key)
+    return rows
+
+
+def receipt_identity(rows: Mapping[str, str]) -> tuple[int, int, int, int, int]:
+    return (
+        parse_decimal(rows["root_device"], "root_device"),
+        parse_decimal(rows["root_inode"], "root_inode"),
+        parse_decimal(rows["root_mode"], "root_mode"),
+        parse_decimal(rows["root_uid"], "root_uid"),
+        parse_decimal(rows["root_gid"], "root_gid"),
+    )
+
+
+def current_root_receipt_identity(
+    info: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IMODE(info.st_mode),
+        info.st_uid,
+        info.st_gid,
+    )
+
+
+def write_exclusive_at(directory: int, name: bytes, raw: bytes, mode: int) -> None:
+    descriptor = -1
+    created = False
+    try:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            mode,
+            dir_fd=directory,
+        )
+        created = True
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                fail("metadata_write_stalled")
+            offset += written
+        os.fsync(descriptor)
+        held = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(held.st_mode)
+            or held.st_nlink != 1
+            or held.st_size != len(raw)
+            or object_identity(held) != object_identity(named)
+        ):
+            fail("metadata_write_identity_invalid")
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+            descriptor = -1
+        if created:
+            try:
+                os.unlink(name, dir_fd=directory)
+            except OSError:
+                pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    os.fsync(directory)
+
+
+@dataclass(frozen=True)
+class FileRow:
+    relative: bytes
+    size: int
+    digest: str
+    identity: tuple[int, ...]
+
+
+def stable_file_at(
+    directory: int,
+    name: bytes,
+    expected: os.stat_result,
+    relative: bytes,
+    *,
+    capture: bool = False,
+) -> tuple[FileRow, bytes | None]:
+    try:
+        descriptor = os.open(name, file_flags(), dir_fd=directory)
+    except OSError as error:
+        fail("file_no_follow_open_failed:" + relative.hex() + ":" + str(error.errno))
+    digest = hashlib.sha256()
+    chunks: list[bytes] = []
+    try:
+        before = os.fstat(descriptor)
+        named_before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stable_identity(expected) != stable_identity(before)
+            or stable_identity(before) != stable_identity(named_before)
+            or before.st_size < 0
+            or before.st_size > MAX_FILE_BYTES
+        ):
+            fail("file_identity_invalid:" + relative.hex())
+        if capture and before.st_size > MAX_METADATA_BYTES:
+            fail("metadata_file_too_large:" + relative.hex())
+        total = 0
+        while True:
+            chunk = os.read(descriptor, READ_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+            if total > MAX_FILE_BYTES:
+                fail("file_size_limit_exceeded:" + relative.hex())
+            if capture:
+                chunks.append(chunk)
+        after = os.fstat(descriptor)
+        named_after = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (
+            stable_identity(before) != stable_identity(after)
+            or stable_identity(after) != stable_identity(named_after)
+            or total != after.st_size
+        ):
+            fail("file_identity_drifted:" + relative.hex())
+        return (
+            FileRow(relative, total, digest.hexdigest(), stable_identity(after)),
+            b"".join(chunks) if capture else None,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def directory_names(directory: int, relative: bytes) -> list[bytes]:
+    try:
+        decoded = os.listdir(directory)
+    except OSError as error:
+        fail("directory_list_failed:" + relative.hex() + ":" + str(error.errno))
+    names: list[bytes] = []
+    for name in decoded:
+        raw = os.fsencode(name)
+        try:
+            raw.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            fail("directory_entry_not_utf8:" + raw.hex())
+        if not raw or raw in (b".", b"..") or b"/" in raw or b"\x00" in raw:
+            fail("directory_entry_name_invalid:" + raw.hex())
+        names.append(raw)
+    names.sort()
+    if len(names) != len(set(names)):
+        fail("directory_entry_duplicate")
+    return names
+
+
+def collect_snapshot(root_descriptor: int) -> list[FileRow]:
+    rows: list[FileRow] = []
+    path_bytes = 0
+
+    def visit(directory: int, prefix: bytes, depth: int) -> None:
+        nonlocal path_bytes
+        if depth > MAX_PATH_DEPTH:
+            fail("evidence_tree_depth_limit_exceeded")
+        before = os.fstat(directory)
+        names_before = directory_names(directory, prefix)
+        for name in names_before:
+            relative = prefix + b"/" + name if prefix else name
+            canonical_relative_path(relative)
+            if name.startswith(PENDING_PREFIX) and not prefix:
+                fail("stale_manifest_pending_file:" + relative.hex())
+            named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISLNK(named.st_mode):
+                fail("entry_symlink_forbidden:" + relative.hex())
+            if stat.S_ISDIR(named.st_mode):
+                child = os.open(name, directory_flags(), dir_fd=directory)
+                try:
+                    held = os.fstat(child)
+                    if stable_identity(named) != stable_identity(held):
+                        fail("directory_identity_invalid:" + relative.hex())
+                    visit(child, relative, depth + 1)
+                    after = os.fstat(child)
+                    named_after = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if stable_identity(held) != stable_identity(
+                        after
+                    ) or stable_identity(after) != stable_identity(named_after):
+                        fail("directory_identity_drifted:" + relative.hex())
+                finally:
+                    os.close(child)
+                continue
+            if not stat.S_ISREG(named.st_mode):
+                fail("entry_special_file_forbidden:" + relative.hex())
+            row, _ = stable_file_at(directory, name, named, relative)
+            if not prefix and name == MANIFEST_NAME:
+                continue
+            rows.append(row)
+            path_bytes += len(relative)
+            if len(rows) > MAX_FILE_COUNT or path_bytes > MAX_PATH_BYTES:
+                fail("evidence_tree_size_limit_exceeded")
+        names_after = directory_names(directory, prefix)
+        after = os.fstat(directory)
+        if names_before != names_after or stable_identity(before) != stable_identity(
+            after
+        ):
+            fail("directory_contents_drifted:" + prefix.hex())
+
+    visit(root_descriptor, b"", 0)
+    rows.sort(key=lambda row: row.relative)
+    for index in range(1, len(rows)):
+        if rows[index - 1].relative >= rows[index].relative:
+            fail("snapshot_path_order_or_duplicate_invalid")
+    return rows
+
+
+def stable_metadata_at(directory: int, name: bytes, label: str) -> bytes:
+    try:
+        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        fail(label + "_missing")
+    if stat.S_ISLNK(named.st_mode) or not stat.S_ISREG(named.st_mode):
+        fail(label + "_not_regular")
+    _, raw = stable_file_at(directory, name, named, name, capture=True)
+    if raw is None:
+        fail(label + "_capture_failed")
+    return raw
+
+
+def evidence_cid(receipt_raw: bytes, rows: Sequence[FileRow]) -> str:
+    digest = hashlib.sha256()
+
+    def frame(raw: bytes) -> None:
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+
+    frame(EVIDENCE_CID_DOMAIN)
+    frame(hashlib.sha256(receipt_raw).digest())
+    digest.update(len(rows).to_bytes(8, "big"))
+    for row in rows:
+        frame(row.relative)
+        digest.update(row.size.to_bytes(8, "big"))
+        digest.update(bytes.fromhex(row.digest))
+    return digest.hexdigest()
+
+
+def render_manifest(
+    receipt_raw: bytes,
+    receipt: Mapping[str, str],
+    rows: Sequence[FileRow],
+) -> bytes:
+    fields: list[tuple[str, str]] = [
+        ("schema", MANIFEST_SCHEMA),
+        ("status", "sealed"),
+        ("root_receipt_sha256", sha256(receipt_raw)),
+        ("root_path_fshex", receipt["root_path_fshex"]),
+        ("root_device", receipt["root_device"]),
+        ("root_inode", receipt["root_inode"]),
+        ("root_mode", receipt["root_mode"]),
+        ("root_uid", receipt["root_uid"]),
+        ("root_gid", receipt["root_gid"]),
+        ("file_count", str(len(rows))),
+    ]
+    for index, row in enumerate(rows):
+        fields.extend(
+            (
+                (f"file.{index}.path_fshex", row.relative.hex()),
+                (f"file.{index}.size", str(row.size)),
+                (f"file.{index}.sha256", row.digest),
+            )
+        )
+    fields.append(("evidence_root_cid", evidence_cid(receipt_raw, rows)))
+    return render_self_sealed(fields, "manifest_payload_sha256")
+
+
+def parse_manifest(
+    raw: bytes,
+    receipt_raw: bytes,
+    receipt: Mapping[str, str],
+) -> list[tuple[bytes, int, str]]:
+    if (
+        not raw
+        or len(raw) > MAX_METADATA_BYTES
+        or not raw.endswith(b"\n")
+        or b"\r" in raw
+        or b"\x00" in raw
+    ):
+        fail("manifest_encoding_invalid")
+    try:
+        decoded = raw.decode("ascii", "strict")
+    except UnicodeDecodeError:
+        fail("manifest_not_ascii")
+    lines = decoded.splitlines(keepends=True)
+    if len(lines) < 12:
+        fail("manifest_field_count_invalid")
+    parsed: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in lines:
+        if not line.endswith("\n") or "=" not in line:
+            fail("manifest_row_invalid")
+        key, value = line[:-1].split("=", 1)
+        if key in seen:
+            fail("manifest_duplicate_key")
+        seen.add(key)
+        parsed.append((key, value))
+    prefix_keys = [
+        "schema",
+        "status",
+        "root_receipt_sha256",
+        "root_path_fshex",
+        "root_device",
+        "root_inode",
+        "root_mode",
+        "root_uid",
+        "root_gid",
+        "file_count",
+    ]
+    if [key for key, _ in parsed[:10]] != prefix_keys:
+        fail("manifest_header_order_invalid")
+    count = parse_decimal(parsed[9][1], "manifest_file_count")
+    if count > MAX_FILE_COUNT:
+        fail("manifest_file_count_limit_exceeded")
+    expected_keys = prefix_keys[:]
+    for index in range(count):
+        expected_keys.extend(
+            (
+                f"file.{index}.path_fshex",
+                f"file.{index}.size",
+                f"file.{index}.sha256",
+            )
+        )
+    expected_keys.extend(("evidence_root_cid", "manifest_payload_sha256"))
+    if [key for key, _ in parsed] != expected_keys:
+        fail("manifest_field_order_or_count_invalid")
+    values = dict(parsed)
+    if values["schema"] != MANIFEST_SCHEMA or values["status"] != "sealed":
+        fail("manifest_schema_or_status_invalid")
+    if values["root_receipt_sha256"] != sha256(receipt_raw):
+        fail("manifest_root_receipt_sha256_mismatch")
+    for key in (
+        "root_path_fshex",
+        "root_device",
+        "root_inode",
+        "root_mode",
+        "root_uid",
+        "root_gid",
+    ):
+        if values[key] != receipt[key]:
+            fail("manifest_root_identity_mismatch:" + key)
+    expected_payload_sha = parse_sha256(
+        values["manifest_payload_sha256"], "manifest_payload"
+    )
+    payload = b"".join(line.encode("ascii") for line in lines[:-1])
+    if sha256(payload) != expected_payload_sha:
+        fail("manifest_payload_sha256_mismatch")
+    result: list[tuple[bytes, int, str]] = []
+    prior = b""
+    path_bytes = 0
+    for index in range(count):
+        relative = parse_fshex(
+            values[f"file.{index}.path_fshex"],
+            "manifest_path_" + str(index),
+        )
+        canonical_relative_path(relative)
+        if relative == MANIFEST_NAME:
+            fail("manifest_self_inclusion_forbidden")
+        if index > 0 and relative <= prior:
+            fail("manifest_path_order_or_duplicate_invalid")
+        prior = relative
+        path_bytes += len(relative)
+        if path_bytes > MAX_PATH_BYTES:
+            fail("manifest_path_bytes_limit_exceeded")
+        size = parse_decimal(values[f"file.{index}.size"], "manifest_file_size")
+        if size > MAX_FILE_BYTES:
+            fail("manifest_file_size_limit_exceeded")
+        digest = parse_sha256(values[f"file.{index}.sha256"], "manifest_file_digest")
+        result.append((relative, size, digest))
+    root_digest = hashlib.sha256()
+
+    def frame(value: bytes) -> None:
+        root_digest.update(len(value).to_bytes(8, "big"))
+        root_digest.update(value)
+
+    frame(EVIDENCE_CID_DOMAIN)
+    frame(hashlib.sha256(receipt_raw).digest())
+    root_digest.update(len(result).to_bytes(8, "big"))
+    for relative, size, digest in result:
+        frame(relative)
+        root_digest.update(size.to_bytes(8, "big"))
+        root_digest.update(bytes.fromhex(digest))
+    if (
+        parse_sha256(values["evidence_root_cid"], "evidence_root_cid")
+        != root_digest.hexdigest()
+    ):
+        fail("evidence_root_cid_mismatch")
+    return result
+
+
+def manifest_exists(directory: int) -> bool:
+    try:
+        named = os.stat(MANIFEST_NAME, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(named.st_mode) or not stat.S_ISREG(named.st_mode):
+        fail("manifest_not_regular")
+    return True
+
+
+def publish_manifest(directory: int, raw: bytes) -> None:
+    pending = (
+        PENDING_PREFIX
+        + str(os.getpid()).encode("ascii")
+        + b"."
+        + secrets.token_hex(16).encode("ascii")
+    )
+    descriptor = -1
+    pending_created = False
+    linked = False
+    try:
+        descriptor = os.open(
+            pending,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory,
+        )
+        pending_created = True
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                fail("manifest_write_stalled")
+            offset += written
+        os.fsync(descriptor)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size != len(raw)
+        ):
+            fail("manifest_pending_identity_invalid")
+        try:
+            os.link(
+                pending,
+                MANIFEST_NAME,
+                src_dir_fd=directory,
+                dst_dir_fd=directory,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            fail("manifest_publish_target_exists")
+        linked = True
+        os.unlink(pending, dir_fd=directory)
+        os.fsync(directory)
+        named = os.stat(MANIFEST_NAME, dir_fd=directory, follow_symlinks=False)
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or named.st_nlink != 1
+            or stable_identity(named) != stable_identity(after)
+        ):
+            fail("manifest_publish_identity_invalid")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if pending_created and not linked:
+            try:
+                os.unlink(pending, dir_fd=directory)
+            except OSError:
+                pass
+
+
+def require_receipt_row(rows: Sequence[FileRow], receipt_raw: bytes) -> None:
+    matches = [row for row in rows if row.relative == RECEIPT_NAME]
+    if len(matches) != 1 or matches[0].digest != sha256(receipt_raw):
+        fail("root_receipt_snapshot_binding_invalid")
+
+
+def prepare_root(root_value: str) -> bytes:
+    path_raw = canonical_absolute_path(root_value)
+    with PathChain(path_raw, parent_only=True) as chain:
+        parent = chain.descriptor
+        try:
+            named = os.stat(chain.leaf, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            os.mkdir(chain.leaf, 0o700, dir_fd=parent)
+            os.fsync(parent)
+        else:
+            if stat.S_ISLNK(named.st_mode):
+                fail("root_path_component_symlink:" + chain.leaf.hex())
+            if not stat.S_ISDIR(named.st_mode):
+                fail("existing_root_not_directory")
+        chain.append_created_leaf()
+        root_descriptor = chain.descriptor
+        chain.verify()
+        info = os.fstat(root_descriptor)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            fail("root_owner_or_mode_invalid")
+        if directory_names(root_descriptor, b""):
+            fail("existing_root_not_empty")
+        receipt = render_receipt(path_raw, info)
+        write_exclusive_at(root_descriptor, RECEIPT_NAME, receipt, 0o600)
+        chain.verify()
+        if current_root_receipt_identity(
+            os.fstat(root_descriptor)
+        ) != current_root_receipt_identity(info):
+            fail("root_identity_drifted_during_prepare")
+        return receipt
+
+
+def finalize_root(root_value: str) -> bytes:
+    path_raw = canonical_absolute_path(root_value)
+    with PathChain(path_raw, parent_only=False) as chain:
+        root_descriptor = chain.descriptor
+        chain.verify()
+        receipt_raw = stable_metadata_at(root_descriptor, RECEIPT_NAME, "root_receipt")
+        receipt = parse_receipt(receipt_raw)
+        if bytes.fromhex(receipt["root_path_fshex"]) != path_raw:
+            fail("root_receipt_path_mismatch")
+        if receipt_identity(receipt) != current_root_receipt_identity(
+            os.fstat(root_descriptor)
+        ):
+            fail("root_receipt_identity_mismatch")
+        first = collect_snapshot(root_descriptor)
+        require_receipt_row(first, receipt_raw)
+        expected = render_manifest(receipt_raw, receipt, first)
+        if manifest_exists(root_descriptor):
+            observed = stable_metadata_at(root_descriptor, MANIFEST_NAME, "manifest")
+            parse_manifest(observed, receipt_raw, receipt)
+            if observed != expected:
+                fail("manifest_content_mismatch")
+        else:
+            publish_manifest(root_descriptor, expected)
+            observed = stable_metadata_at(root_descriptor, MANIFEST_NAME, "manifest")
+            if observed != expected:
+                fail("manifest_publish_bytes_mismatch")
+            parse_manifest(observed, receipt_raw, receipt)
+        second = collect_snapshot(root_descriptor)
+        require_receipt_row(second, receipt_raw)
+        if first != second:
+            fail("evidence_tree_drifted_during_finalize")
+        if (
+            stable_metadata_at(root_descriptor, RECEIPT_NAME, "root_receipt")
+            != receipt_raw
+        ):
+            fail("root_receipt_drifted_during_finalize")
+        chain.verify()
+        return observed
+
+
+def emit(raw: bytes) -> None:
+    sys.stdout.buffer.write(raw)
+    sys.stdout.buffer.flush()
+
+
+def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="riscv_isa_evidence_root.py",
+        description="Prepare or finalize a descriptor-bound RISC-V ISA evidence root.",
+    )
+    commands = parser.add_subparsers(dest="action", required=True)
+    prepare = commands.add_parser("prepare")
+    prepare.add_argument("--root", required=True)
+    finalize = commands.add_parser("finalize")
+    finalize.add_argument("--root", required=True)
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = parse_arguments(list(sys.argv[1:] if argv is None else argv))
+    try:
+        if arguments.action == "prepare":
+            emit(prepare_root(arguments.root))
+        elif arguments.action == "finalize":
+            emit(finalize_root(arguments.root))
+        else:
+            fail("unsupported_action")
+    except EvidenceRootError as error:
+        sys.stderr.write("schema=cheng.riscv_isa_evidence_root_error.v1\n")
+        sys.stderr.write("status=failed\n")
+        sys.stderr.write("reason=" + str(error) + "\n")
+        return 1
+    except OSError as error:
+        sys.stderr.write("schema=cheng.riscv_isa_evidence_root_error.v1\n")
+        sys.stderr.write("status=failed\n")
+        sys.stderr.write("reason=os_error:" + str(error.errno) + "\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,376 @@
+# Pure-Cheng social send bridge (moment-like over real QUIC).
+#
+# This is the legitimate Cheng-native implementation of the React handler's
+# `libp2pService.socialMomentsLike(postId, like)` await: dial the post-owner peer
+# over the existing pure-Cheng QUIC transport, negotiate a dedicated
+# "/unimaker/moment-like/1.0.0" stream, write a [postId-len][postId][like-byte]
+# request frame, and await the peer's 1-byte ack. REAL bytes go out the UDP
+# socket — the write lowers through Libp2pQuicWriteExact → msquicTransportWrite →
+# qconn.pipeWrite → msquicNativePipeWrite (STREAM frame 14, flush, pump, drain).
+#
+# The dial→negotiate→write→ack sequence mirrors the device-verified media bridge
+# (WebSceneMediaFetchRemoteObject) exactly; the only difference is the protocol id
+# and the request/ack framing. Single-threaded: every call here runs on the render
+# thread inside the async pump — never from a background thread (the QUIC session
+# state is not thread-safe, per the iron rule).
+
+import std/result
+import std/rawbytes
+import std/strings
+import cheng/quic/connection as qconn
+import cheng/quic/msquictransport_native as qtransport
+import cheng/libp2p/transports/quic_transport
+import cheng/libp2p/core/multistream
+import cheng/libp2p/core/types as coretypes
+
+# Diagnostic: last failing step (int-only). 1=dial 2=negotiate-write 3=ack
+# 4=write-frame 5=read-ack 6=ok. Read via WebSceneSocialSendStep.
+var webSceneSocialSendStep: int32
+
+fn WebSceneSocialSendStep(): int32 =
+    return webSceneSocialSendStep
+
+# ---------------------------------------------------------------------------
+# Non-blocking issue seam (the production substitution for the React handler's
+# `await setDistributedContentLike(content.id, !isLiked)`). The blocking
+# WebSceneSocialMomentLikeSend above does dial→negotiate→write→AWAIT-ack in one
+# call — that blocks the render thread on the peer round-trip. The await-split
+# lowering instead splits the handler: seg0 ISSUES the send (dial-once + write,
+# NO ack await) and returns; the recv-done frame later polls for the ack on the
+# stored (side, streamId) and runs the resume. Same persistent-connection model
+# the device-verified media bridge uses: dial ONE QUIC connection, persist only
+# the small token state (pipeIdx/pipeSide/streamIds), rebuild a stack-local
+# Connection per poll via ConnFromPipeIdx. Single-threaded render-thread only.
+# ---------------------------------------------------------------------------
+
+# Dial target for the moment-like peer (the post owner). Configured once at
+# startup via WebSceneSocialConfigurePeer; defaults to the loopback the local
+# publisher serves on so an unconfigured build still talks to its own node.
+var webSceneSocialDialHost: str = "127.0.0.1"
+var webSceneSocialDialPort: int32
+var webSceneSocialServerName: str = "localhost"
+
+# Persistent connection token state (small scalars only; the native session
+# stays alive in the runtime globals keyed by pipeIdx). Reused across issues.
+# webSceneSocialDialedProtocol records WHICH protocol the live connection
+# negotiated; an issue for a different protocol (e.g. moment-comment after
+# moment-like) redials so the token state always matches the in-flight send.
+var webSceneSocialDialed: bool
+var webSceneSocialDialedProtocol: int32
+var webSceneSocialPipeIdx: int32
+var webSceneSocialPipeSide: int32
+var webSceneSocialSendStreamId: int64 = int64(0)
+var webSceneSocialRecvStreamId: int64 = int64(0)
+
+# Set the moment-like peer dial target. The device build calls this once with the
+# resolved post-owner addr; the loopback smoke and a self-hosted node leave the
+# defaults. Re-arming a new peer drops the persisted connection so the next issue
+# redials.
+fn WebSceneSocialConfigurePeer(host: str, port: int32, serverName: str) =
+    webSceneSocialDialHost = host
+    webSceneSocialDialPort = port
+    webSceneSocialServerName = serverName
+    webSceneSocialDialed = false
+
+# Dial (or reuse) the ONE persistent social QUIC connection + negotiate the given
+# protocol. Persists only the token state. Returns false on dial/negotiate fail.
+# If a connection is live for a DIFFERENT protocol, it redials (the token state is
+# single-slot; a moment-comment issue must not poll a moment-like stream).
+fn webSceneSocialEnsureDialed(protocol: int32): bool =
+    if webSceneSocialDialed && webSceneSocialDialedProtocol == protocol:
+        return true
+    webSceneSocialSendStep = 1
+    # Host/server globals are authoritative cross-module state; clone before
+    # handing them to the consuming QUIC dial ABI so the cold ownership pass
+    # never shares an unsupported global source kind.
+    let dialHost = strings.CloneStr(webSceneSocialDialHost)
+    let dialServerName = strings.CloneStr(webSceneSocialServerName)
+    var client = qtransport.InitMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn, dialHost, webSceneSocialDialPort, dialServerName)
+    if IsErr(dialRes):
+        qtransport.Stop(client)
+        return false
+    webSceneSocialSendStep = 2
+    let negRes = quic_transport.Libp2pQuicClientSelectProtocol(client, conn, protocol)
+    if IsErr(negRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    # Persist ONLY the token state; the native session lives in runtime globals
+    # (keyed by pipeIdx), so the stack-local client/conn going out of scope is fine.
+    webSceneSocialPipeIdx = conn.pipeIdx
+    webSceneSocialPipeSide = conn.pipeSide
+    webSceneSocialSendStreamId = conn.sendStreamId
+    webSceneSocialRecvStreamId = conn.recvStreamId
+    webSceneSocialDialed = true
+    webSceneSocialDialedProtocol = protocol
+    return true
+
+# Non-blocking moment-like ISSUE: ensure the persistent connection, transmit the
+# [postIdLen][postId][likeByte] request frame out the socket, and RETURN without
+# awaiting the ack. The (side, streamId) are already persisted by EnsureDialed;
+# the recv-done frame polls them via WebSceneSocialRecvTryAck. This is the fn the
+# generated await-split seg0 calls (recvDoneSendBridges -> this name). Returns
+# Ok(true) once the bytes are written; the ack is the recv-done frame's job.
+fn WebSceneSocialMomentLikeIssue(postId: str, like: bool): Result[bool] =
+    if !webSceneSocialEnsureDialed(coretypes.Libp2pProtocolSocialMomentLike):
+        return Err[bool]("moment-like issue: dial/negotiate failed")
+    webSceneSocialSendStep = 4
+    var pconn = qconn.ConnFromPipeIdx(webSceneSocialPipeIdx, webSceneSocialPipeSide,
+                                      webSceneSocialSendStreamId, webSceneSocialRecvStreamId)
+    var client = qtransport.InitMsQuicTransport()
+    let frame = webSceneSocialBuildLikeFrame(postId, like)
+    let writeRes = quic_transport.Libp2pQuicWriteExact(client, pconn, frame)
+    if IsErr(writeRes):
+        # a broken connection drops the token so the next issue redials
+        webSceneSocialDialed = false
+        return Err[bool](Error(writeRes))
+    return Ok[bool](true)
+
+# Build the moment-comment request frame: [postIdLen:int32-be][postId][commentLen:int32-be][comment].
+# Two fixed 4-byte big-endian length prefixes so the server reads postId then comment without a
+# delimiter (mirrors the like frame's length-prefix scheme; the second field carries the UTF-8 text).
+fn webSceneSocialBuildCommentFrame(postId: str, comment: str): rawbytes.Bytes =
+    let idBytes = rawbytes.BytesFromString(postId)
+    let idLen: int32 = rawbytes.BytesLen(idBytes)
+    let cBytes = rawbytes.BytesFromString(comment)
+    let cLen: int32 = rawbytes.BytesLen(cBytes)
+    var frame = rawbytes.BytesAlloc(4 + idLen + 4 + cLen)
+    rawbytes.BytesSet(frame, 0, (idLen >> 24) & 255)
+    rawbytes.BytesSet(frame, 1, (idLen >> 16) & 255)
+    rawbytes.BytesSet(frame, 2, (idLen >> 8) & 255)
+    rawbytes.BytesSet(frame, 3, idLen & 255)
+    var i: int32
+    while i < idLen:
+        rawbytes.BytesSet(frame, 4 + i, rawbytes.BytesGet(idBytes, i))
+        i = i + 1
+    let cOff: int32 = 4 + idLen
+    rawbytes.BytesSet(frame, cOff, (cLen >> 24) & 255)
+    rawbytes.BytesSet(frame, cOff + 1, (cLen >> 16) & 255)
+    rawbytes.BytesSet(frame, cOff + 2, (cLen >> 8) & 255)
+    rawbytes.BytesSet(frame, cOff + 3, cLen & 255)
+    var j: int32
+    while j < cLen:
+        rawbytes.BytesSet(frame, cOff + 4 + j, rawbytes.BytesGet(cBytes, j))
+        j = j + 1
+    return frame
+
+# Public alias so the loopback transmit harness can exercise the exact comment wire framing.
+fn WebSceneSocialBuildCommentFrameExport(postId: str, comment: str): rawbytes.Bytes =
+    return webSceneSocialBuildCommentFrame(postId, comment)
+
+# Non-blocking moment-comment ISSUE: the production substitution for the React handler's
+# `await addDistributedContentComment(content.id, text)`. Same persistent-connection model as
+# WebSceneSocialMomentLikeIssue, but negotiates the moment-comment protocol and writes the
+# [postId][comment] frame. Persists the (side, streamId) into the shared token slots that the
+# recv-done frame polls via WebSceneSocialRecvTryAck. Returns Ok(true) once the bytes are written.
+fn WebSceneSocialMomentCommentIssue(postId: str, comment: str): Result[bool] =
+    if !webSceneSocialEnsureDialed(coretypes.Libp2pProtocolSocialMomentComment):
+        return Err[bool]("moment-comment issue: dial/negotiate failed")
+    webSceneSocialSendStep = 4
+    var pconn = qconn.ConnFromPipeIdx(webSceneSocialPipeIdx, webSceneSocialPipeSide,
+                                      webSceneSocialSendStreamId, webSceneSocialRecvStreamId)
+    var client = qtransport.InitMsQuicTransport()
+    let frame = webSceneSocialBuildCommentFrame(postId, comment)
+    let writeRes = quic_transport.Libp2pQuicWriteExact(client, pconn, frame)
+    if IsErr(writeRes):
+        webSceneSocialDialed = false
+        return Err[bool](Error(writeRes))
+    return Ok[bool](true)
+
+# Append one length-prefixed [len:int32-be][bytes] field of `s` into `frame` starting at `off`;
+# returns the offset just past the written field. Shared by the moment-report multi-field frame.
+@borrows
+fn webSceneSocialAppendLenPrefixed(frame: rawbytes.Bytes, off: int32, s: str): int32 =
+    let sb = rawbytes.BytesFromString(s)
+    let sl: int32 = rawbytes.BytesLen(sb)
+    rawbytes.BytesSet(frame, off, (sl >> 24) & 255)
+    rawbytes.BytesSet(frame, off + 1, (sl >> 16) & 255)
+    rawbytes.BytesSet(frame, off + 2, (sl >> 8) & 255)
+    rawbytes.BytesSet(frame, off + 3, sl & 255)
+    var i: int32
+    while i < sl:
+        rawbytes.BytesSet(frame, off + 4 + i, rawbytes.BytesGet(sb, i))
+        i = i + 1
+    return off + 4 + sl
+
+# Build the moment-report request frame: four length-prefixed UTF-8 fields, in order,
+# [contentId][channel][reasonCode][detail], each [len:int32-be][bytes]. The server reads
+# the four fields back without delimiters (same length-prefix scheme as like/comment).
+@borrows
+fn webSceneSocialBuildReportFrame(contentId: str, channel: str, reasonCode: str, detail: str): rawbytes.Bytes =
+    let idLen: int32 = rawbytes.BytesLen(rawbytes.BytesFromString(contentId))
+    let chLen: int32 = rawbytes.BytesLen(rawbytes.BytesFromString(channel))
+    let rcLen: int32 = rawbytes.BytesLen(rawbytes.BytesFromString(reasonCode))
+    let dtLen: int32 = rawbytes.BytesLen(rawbytes.BytesFromString(detail))
+    var frame = rawbytes.BytesAlloc(16 + idLen + chLen + rcLen + dtLen)
+    var off: int32
+    off = webSceneSocialAppendLenPrefixed(frame, off, contentId)
+    off = webSceneSocialAppendLenPrefixed(frame, off, channel)
+    off = webSceneSocialAppendLenPrefixed(frame, off, reasonCode)
+    off = webSceneSocialAppendLenPrefixed(frame, off, detail)
+    return frame
+
+# Public alias so the loopback transmit harness can exercise the exact report wire framing.
+fn WebSceneSocialBuildReportFrameExport(contentId: str, channel: str, reasonCode: str, detail: str): rawbytes.Bytes =
+    return webSceneSocialBuildReportFrame(contentId, channel, reasonCode, detail)
+
+# Non-blocking moment-report ISSUE: the production substitution for the React handler's
+# `await libp2pService.socialReportSubmit({contentId, channel, reasonCode, detail})`. Same
+# persistent-connection model as the like/comment issues, but negotiates the moment-report
+# protocol and writes the four-field report frame. The object-literal arg is flattened (in the
+# transpiler) to these four scalar str params, in source order. Persists the (side, streamId)
+# into the shared token slots the recv-done frame polls via WebSceneSocialRecvTryAck. Returns
+# Ok(true) once the bytes are written; the ack is the recv-done frame's job.
+@borrows
+fn WebSceneSocialMomentReportIssue(contentId: str, channel: str, reasonCode: str, detail: str): Result[bool] =
+    if !webSceneSocialEnsureDialed(coretypes.Libp2pProtocolSocialMomentReport):
+        return Err[bool]("moment-report issue: dial/negotiate failed")
+    webSceneSocialSendStep = 4
+    var pconn = qconn.ConnFromPipeIdx(webSceneSocialPipeIdx, webSceneSocialPipeSide,
+                                      webSceneSocialSendStreamId, webSceneSocialRecvStreamId)
+    var client = qtransport.InitMsQuicTransport()
+    let frame = webSceneSocialBuildReportFrame(contentId, channel, reasonCode, detail)
+    let writeRes = quic_transport.Libp2pQuicWriteExact(client, pconn, frame)
+    if IsErr(writeRes):
+        webSceneSocialDialed = false
+        return Err[bool](Error(writeRes))
+    return Ok[bool](true)
+
+# Accessors so the generated __asyncRegisterRecvDone receives the (side, streamId)
+# of the last issue (the recv-done frame polls these). Stored by EnsureDialed.
+fn WebSceneSocialSendSide(): int32 =
+    return webSceneSocialPipeSide
+
+fn WebSceneSocialSendStream(): int64 =
+    return webSceneSocialRecvStreamId
+
+# Production recv-done poll (NOT the test stub): rebuild the stack-local conn from
+# the persisted tokens and do ONE non-blocking transport read of ackLen bytes on
+# the stored (side, streamId). msquicTransportReadNonblocking internally advances
+# the QUIC pump (ingesting inbound ack datagrams) and CONSUMES the bytes from the
+# app-recv ring (msquicNativeAppRecvConsume). Returns 1 once >= ackLen ready bytes
+# have arrived+drained (the real done-signal), else 0. No sleep/timer. side is
+# passed by the frame; we rebuild from the persisted tokens that match it.
+fn WebSceneSocialRecvTryAck(side: int32, streamId: int64, ackLen: int32): int32 =
+    side
+    streamId
+    if !webSceneSocialDialed:
+        return 0
+    var pconn = qconn.ConnFromPipeIdx(webSceneSocialPipeIdx, webSceneSocialPipeSide,
+                                      webSceneSocialSendStreamId, webSceneSocialRecvStreamId)
+    var client = qtransport.InitMsQuicTransport()
+    let rr = qtransport.msquicTransportReadNonblocking(client, pconn, ackLen)
+    if IsErr(rr):
+        return 0
+    if rawbytes.BytesLen(Value(rr)) >= ackLen:
+        webSceneSocialSendStep = 6
+        return 1
+    return 0
+
+# Build the moment-like request frame: [postIdLen:int32-be][postId bytes][likeByte].
+# Length-prefix is a fixed 4-byte big-endian count so the server reads it without a
+# delimiter; like byte is 1 (like) / 0 (unlike). No varint needed at this scale.
+fn webSceneSocialBuildLikeFrame(postId: str, like: bool): rawbytes.Bytes =
+    let idBytes = rawbytes.BytesFromString(postId)
+    let idLen: int32 = rawbytes.BytesLen(idBytes)
+    var frame = rawbytes.BytesAlloc(4 + idLen + 1)
+    rawbytes.BytesSet(frame, 0, (idLen >> 24) & 255)
+    rawbytes.BytesSet(frame, 1, (idLen >> 16) & 255)
+    rawbytes.BytesSet(frame, 2, (idLen >> 8) & 255)
+    rawbytes.BytesSet(frame, 3, idLen & 255)
+    var i: int32
+    while i < idLen:
+        rawbytes.BytesSet(frame, 4 + i, rawbytes.BytesGet(idBytes, i))
+        i = i + 1
+    var likeByte: int32
+    if like:
+        likeByte = 1
+    rawbytes.BytesSet(frame, 4 + idLen, likeByte)
+    return frame
+
+# Public alias for the frame builder so the loopback transmit harness can exercise the
+# exact wire framing the send service uses (no duplicated framing in the test).
+fn WebSceneSocialBuildLikeFrameExport(postId: str, like: bool): rawbytes.Bytes =
+    return webSceneSocialBuildLikeFrame(postId, like)
+
+# Real moment-like send: dial the owner peer, negotiate the moment-like protocol,
+# transmit the request frame over QUIC, await the 1-byte ack. Returns Ok(true) iff
+# the peer acked with byte==1 (applied). Closes conn + transport on every path.
+# This is the substitution point for handler `await socialMomentsLike(postId, like)`.
+fn WebSceneSocialMomentLikeSend(dialHost: str,
+                                port: int32,
+                                serverName: str,
+                                postId: str,
+                                like: bool): Result[bool] =
+    webSceneSocialSendStep = 1
+    var client = qtransport.InitMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn, dialHost, port, serverName)
+    if IsErr(dialRes):
+        qtransport.Stop(client)
+        return Err[bool](Error(dialRes))
+    webSceneSocialSendStep = 2
+    # Negotiate the dedicated moment-like stream (multistream select + echo ack).
+    let negRes = quic_transport.Libp2pQuicClientSelectProtocol(client, conn, coretypes.Libp2pProtocolSocialMomentLike)
+    if IsErr(negRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return Err[bool](Error(negRes))
+    webSceneSocialSendStep = 4
+    # REAL transmit: the request frame goes out the UDP socket as a QUIC STREAM frame.
+    let frame = webSceneSocialBuildLikeFrame(postId, like)
+    let writeRes = quic_transport.Libp2pQuicWriteExact(client, conn, frame)
+    if IsErr(writeRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return Err[bool](Error(writeRes))
+    webSceneSocialSendStep = 5
+    # Real done-signal: the peer's 1-byte ack, driven by the transport pump + recv.
+    let ackRes = quic_transport.Libp2pQuicReadExactWithTimeout(client, conn, 1, 5000)
+    qconn.ConnClose(conn)
+    qtransport.Stop(client)
+    if IsErr(ackRes):
+        return Err[bool](Error(ackRes))
+    let ack = Value(ackRes)
+    if rawbytes.BytesLen(ack) < 1:
+        return Err[bool]("moment-like: short ack")
+    webSceneSocialSendStep = 6
+    if rawbytes.BytesGet(ack, 0) == 1:
+        return Ok[bool](true)
+    return Err[bool]("moment-like: peer rejected")
+
+# Server side: accept ONE moment-like connection on an already-started listener,
+# negotiate the protocol, read the request frame, and write the 1-byte ack. The
+# owner peer (the device hosting the post) runs this. Returns Ok with the applied
+# like flag (so the caller can update its store) or Err on any I/O failure.
+fn WebSceneSocialMomentLikeServeOnce(listener: var qtransport.MsQuicTransport,
+                                     serverConn: var qconn.Connection): Result[bool] =
+    let negRes = quic_transport.Libp2pQuicServerSelectProtocol(listener, serverConn, coretypes.Libp2pProtocolSocialMomentLike)
+    if IsErr(negRes):
+        return Err[bool](Error(negRes))
+    # Read the fixed 4-byte length prefix, then the postId, then the like byte.
+    let lenRes = quic_transport.Libp2pQuicReadExactWithTimeout(listener, serverConn, 4, 5000)
+    if IsErr(lenRes):
+        return Err[bool](Error(lenRes))
+    let lenBytes = Value(lenRes)
+    let idLen: int32 = (rawbytes.BytesGet(lenBytes, 0) << 24) |
+                       (rawbytes.BytesGet(lenBytes, 1) << 16) |
+                       (rawbytes.BytesGet(lenBytes, 2) << 8) |
+                       rawbytes.BytesGet(lenBytes, 3)
+    if idLen < 0 || idLen > 4096:
+        return Err[bool]("moment-like serve: bad id length")
+    let bodyRes = quic_transport.Libp2pQuicReadExactWithTimeout(listener, serverConn, idLen + 1, 5000)
+    if IsErr(bodyRes):
+        return Err[bool](Error(bodyRes))
+    let body = Value(bodyRes)
+    let likeByte: int32 = rawbytes.BytesGet(body, idLen)
+    var ack = rawbytes.BytesAlloc(1)
+    rawbytes.BytesSet(ack, 0, 1)
+    let ackWrite = quic_transport.Libp2pQuicWriteExact(listener, serverConn, ack)
+    if IsErr(ackWrite):
+        return Err[bool](Error(ackWrite))
+    if likeByte == 1:
+        return Ok[bool](true)
+    return Ok[bool](false)

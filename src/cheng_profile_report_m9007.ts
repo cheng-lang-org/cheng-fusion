@@ -22,7 +22,12 @@ const PROFILE_GUARD_STARTUP_TIMEOUT_SECONDS=5;
 const PROFILE_GUARD_CLEANUP_TIMEOUT_SECONDS=10;
 const PROFILE_IMPLEMENTATION_SCHEMA="cheng_profile_report.current_source";
 const PROFILE_IMPLEMENTATION_SOURCE_PATH=fileURLToPath(import.meta.url);
-const PROFILE_IMPLEMENTATION_SOURCE_SHA256=createHash("sha256").update(readFileSync(PROFILE_IMPLEMENTATION_SOURCE_PATH)).digest("hex");
+// 自体源码哈希惰性化(2026-08-27): 首次 profile 动作时计算一次, 不再拖累本模块 import。
+let PROFILE_IMPLEMENTATION_SOURCE_SHA256_CACHE=null;
+function profileImplementationSourceSha256(){
+  if(PROFILE_IMPLEMENTATION_SOURCE_SHA256_CACHE===null)PROFILE_IMPLEMENTATION_SOURCE_SHA256_CACHE=createHash("sha256").update(readFileSync(PROFILE_IMPLEMENTATION_SOURCE_PATH)).digest("hex");
+  return PROFILE_IMPLEMENTATION_SOURCE_SHA256_CACHE;
+}
 const PROFILE_PHASE_NAMES=[
   "system_link_plan",
   "compiler_csg",
@@ -42,7 +47,7 @@ function bindProfileImplementation(report){
     ...report,
     implementationSchema:PROFILE_IMPLEMENTATION_SCHEMA,
     implementationSourcePath:PROFILE_IMPLEMENTATION_SOURCE_PATH,
-    implementationSourceSha256:PROFILE_IMPLEMENTATION_SOURCE_SHA256
+    implementationSourceSha256:profileImplementationSourceSha256()
   };
 }
 

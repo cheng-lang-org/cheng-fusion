@@ -1,0 +1,458 @@
+# src/inference/dflash2_draft.cheng - DFlash2 block-diffusion draft-model core
+# structures and path selector (spec-decode W3 front).
+#
+# DFlash2 (2026-08, inco.ai/z-lab) drafts a whole block of B tokens in one
+# forward pass: every block position keeps its top-K candidate tokens together
+# with the drafter's own logits U_t(b), and a lightweight selector scores
+# adjacent candidate pairs
+#     S_t(a, b) = U_t(b) + <A(a) (*) H(h_t), B(b)>
+# where A/B are per-token embeddings (Dflash2EmbedDim dims each) and
+# H(h) = sigmoid(W_g . h_t) is a gate vector derived from the position hidden
+# state. The selector then walks ONE coherent path by greedy argmax over S,
+# starting from the caller-provided lastVerifiedTokenId (the last *verified*
+# token feeds position 0 exactly like prevVector feeds conv tap x_{-1}).
+#
+# The drafter backbone carries a two-tap dynamic depthwise convolution in
+# front of every attention/FFN sublayer:
+#     Conv_k(x)_t   = k_{t,0} (*) x_t + k_{t,1} (*) x_{t-1}
+#     k_{t,j}[c]    = base_k[j][c] + corr(h_t)[c / Dflash2CorrGroupSize]
+# corr(h) is a linear projection of the hidden state; every group of
+# Dflash2CorrGroupSize channels shares one correction value. Position t = 0
+# reads the caller-provided prevVector as x_{-1}. All positions evaluate in
+# parallel -- no recurrence.
+#
+# Scoring only influences selection: candidate token ids and logits are never
+# rewritten by scoring or walking (lossless contract, enforced by
+# Dflash2CandidatesUnmodifiedAfterWalk).
+#
+# NOTE on Dflash2SyntheticSelectorTables: the LCG-seeded embeddings/gate
+# weight are a deterministic MATH FIXTURE for exercising the selector
+# arithmetic end to end. It is NOT a production weight path -- real
+# deployments bind trained embedding tables here. No fallbacks anywhere in
+# this module: every shape/domain violation is a hard Result failure.
+
+import std/math as m
+import std/result
+
+const
+    Dflash2DraftSchema = "cheng.inference.dflash2_draft.v1"
+    Dflash2AlgorithmName = "dflash2"
+    Dflash2TopK: int32 = 16
+    Dflash2EmbedDim: int32 = 256
+    Dflash2CorrGroupSize: int32 = 16
+
+type
+    Dflash2ConvParams =
+        chanCount: int32        # C, must be a multiple of Dflash2CorrGroupSize
+        hiddenDim: int32        # D, width of the conditioning hidden state
+        baseK0: float64[]       # len C, static tap-0 coefficients
+        baseK1: float64[]       # len C, static tap-1 coefficients
+        corrWeight: float64[]   # len (C/16)*D, hidden -> per-group correction
+
+    Dflash2Candidates =
+        schema: str
+        blockLen: int32         # B draft positions
+        topK: int32             # always Dflash2TopK
+        candTokenIds: int32[]   # len B*topK, SoA flat
+        candLogits: float64[]   # len B*topK, drafter logits U_t(b)
+
+    Dflash2SelectorTables =
+        schema: str
+        vocabSize: int32
+        embedDim: int32         # always Dflash2EmbedDim
+        hiddenDim: int32        # width of h_t feeding the gate projection
+        embedA: float64[]       # len vocabSize*embedDim, flat row-major A(a)
+        embedB: float64[]       # len vocabSize*embedDim, flat row-major B(b)
+        gateWeight: float64[]   # len embedDim*hiddenDim, W_g row-major
+
+    Dflash2SelectedPath =
+        pathTokenIds: int32[]   # len B, chosen token id per block position
+        selectedIndices: int32[]  # len B, chosen top-K slot per position
+        pathScoreSum: float64   # sum of the selected S_t values
+
+fn Dflash2HashStep(hash: int64, value: int64): int64 =
+    let mixed = hash * int64(1000003) + value + int64(7)
+    if mixed < int64(0):
+        return int64(0) - mixed
+    return mixed
+
+@borrows
+fn Dflash2HashTextWith(hashRaw: int64, text: str): int64 =
+    var h: int64 = hashRaw
+    for i in 0..<len(text):
+        h = Dflash2HashStep(h, int64(Int32(text[i])))
+    return h
+
+@borrows
+fn Dflash2HashIntsWith(hashRaw: int64, values: int32[]): int64 =
+    var h: int64 = hashRaw
+    for i in 0..<values.len:
+        h = Dflash2HashStep(h, int64(values[i]))
+    return h
+
+@borrows
+fn Dflash2HashFloatsWith(hashRaw: int64, values: float64[]): int64 =
+    var h: int64 = hashRaw
+    for i in 0..<values.len:
+        h = Dflash2HashStep(h, int64(values[i] * 1000000.0))
+    return h
+
+@borrows
+fn Dflash2CandidatesHash(candidates: Dflash2Candidates): int64 =
+    var h: int64 = int64(31)
+    h = Dflash2HashTextWith(h, candidates.schema)
+    h = Dflash2HashStep(h, int64(candidates.blockLen))
+    h = Dflash2HashStep(h, int64(candidates.topK))
+    h = Dflash2HashIntsWith(h, candidates.candTokenIds)
+    h = Dflash2HashFloatsWith(h, candidates.candLogits)
+    return h
+
+@borrows
+fn Dflash2SelectorTablesHash(tables: Dflash2SelectorTables): int64 =
+    var h: int64 = int64(37)
+    h = Dflash2HashTextWith(h, tables.schema)
+    h = Dflash2HashStep(h, int64(tables.vocabSize))
+    h = Dflash2HashStep(h, int64(tables.embedDim))
+    h = Dflash2HashStep(h, int64(tables.hiddenDim))
+    h = Dflash2HashFloatsWith(h, tables.embedA)
+    h = Dflash2HashFloatsWith(h, tables.embedB)
+    h = Dflash2HashFloatsWith(h, tables.gateWeight)
+    return h
+
+@borrows
+fn Dflash2SelectedPathHash(path: Dflash2SelectedPath): int64 =
+    var h: int64 = int64(41)
+    h = Dflash2HashIntsWith(h, path.pathTokenIds)
+    h = Dflash2HashIntsWith(h, path.selectedIndices)
+    h = Dflash2HashStep(h, int64(path.pathScoreSum * 1000000.0))
+    return h
+
+@borrows
+fn Dflash2ValidateConvParams(params: Dflash2ConvParams): Result[bool] =
+    if params.chanCount <= 0 || params.hiddenDim <= 0:
+        return Err[bool]("dflash2 conv params: dimensions")
+    if params.chanCount % Dflash2CorrGroupSize != 0:
+        return Err[bool]("dflash2 conv params: channel grouping")
+    if params.baseK0.len != params.chanCount || params.baseK1.len != params.chanCount:
+        return Err[bool]("dflash2 conv params: base taps")
+    let groups = params.chanCount / Dflash2CorrGroupSize
+    if int64(groups) * int64(params.hiddenDim) > int64(2147483647):
+        return Err[bool]("dflash2 conv params: corr weight size")
+    if params.corrWeight.len != groups * params.hiddenDim:
+        return Err[bool]("dflash2 conv params: corr weight shape")
+    return Ok[bool](true)
+
+@borrows
+fn Dflash2ValidateCandidates(candidates: Dflash2Candidates): Result[bool] =
+    if candidates.schema != Dflash2DraftSchema:
+        return Err[bool]("dflash2 candidates: schema")
+    if candidates.blockLen <= 0 || candidates.topK != Dflash2TopK:
+        return Err[bool]("dflash2 candidates: shape constants")
+    if int64(candidates.blockLen) * int64(candidates.topK) > int64(2147483647):
+        return Err[bool]("dflash2 candidates: size overflow")
+    let flatLen = candidates.blockLen * candidates.topK
+    if candidates.candTokenIds.len != flatLen || candidates.candLogits.len != flatLen:
+        return Err[bool]("dflash2 candidates: buffer shapes")
+    for i in 0..<candidates.candTokenIds.len:
+        if candidates.candTokenIds[i] < 0:
+            return Err[bool]("dflash2 candidates: token id domain")
+    return Ok[bool](true)
+
+@borrows
+fn Dflash2ValidateSelectorTables(tables: Dflash2SelectorTables): Result[bool] =
+    if tables.schema != Dflash2DraftSchema:
+        return Err[bool]("dflash2 selector tables: schema")
+    if tables.vocabSize <= 0 || tables.hiddenDim <= 0:
+        return Err[bool]("dflash2 selector tables: dimensions")
+    if tables.embedDim != Dflash2EmbedDim:
+        return Err[bool]("dflash2 selector tables: embed dim")
+    if int64(tables.vocabSize) * int64(tables.embedDim) > int64(2147483647):
+        return Err[bool]("dflash2 selector tables: embedding size overflow")
+    if int64(tables.embedDim) * int64(tables.hiddenDim) > int64(2147483647):
+        return Err[bool]("dflash2 selector tables: gate size overflow")
+    let embedFlat = tables.vocabSize * tables.embedDim
+    if tables.embedA.len != embedFlat || tables.embedB.len != embedFlat:
+        return Err[bool]("dflash2 selector tables: embedding buffers")
+    if tables.gateWeight.len != tables.embedDim * tables.hiddenDim:
+        return Err[bool]("dflash2 selector tables: gate buffer")
+    return Ok[bool](true)
+
+fn Dflash2CandidatesBuild(blockLen: int32,
+                          candTokenIds: int32[],
+                          candLogits: float64[]): Result[Dflash2Candidates] =
+    if blockLen <= 0:
+        return Err[Dflash2Candidates]("dflash2 candidates build: block len")
+    if int64(blockLen) * int64(Dflash2TopK) > int64(2147483647):
+        return Err[Dflash2Candidates]("dflash2 candidates build: size overflow")
+    let flatLen = blockLen * Dflash2TopK
+    if candTokenIds.len != flatLen || candLogits.len != flatLen:
+        return Err[Dflash2Candidates]("dflash2 candidates build: buffer shapes")
+    for i in 0..<candTokenIds.len:
+        if candTokenIds[i] < 0:
+            return Err[Dflash2Candidates]("dflash2 candidates build: token id domain")
+    var candidates = Dflash2Candidates(
+        schema: Dflash2DraftSchema,
+        blockLen: blockLen,
+        topK: Dflash2TopK,
+        candTokenIds: candTokenIds,
+        candLogits: candLogits
+    )
+    return Ok[Dflash2Candidates](candidates)
+
+fn Dflash2SelectorTablesBuild(vocabSize: int32,
+                              embedDim: int32,
+                              hiddenDim: int32,
+                              embedA: float64[],
+                              embedB: float64[],
+                              gateWeight: float64[]): Result[Dflash2SelectorTables] =
+    if vocabSize <= 0 || hiddenDim <= 0:
+        return Err[Dflash2SelectorTables]("dflash2 selector tables build: dimensions")
+    if embedDim != Dflash2EmbedDim:
+        return Err[Dflash2SelectorTables]("dflash2 selector tables build: embed dim")
+    if int64(vocabSize) * int64(embedDim) > int64(2147483647):
+        return Err[Dflash2SelectorTables]("dflash2 selector tables build: embedding size overflow")
+    if int64(embedDim) * int64(hiddenDim) > int64(2147483647):
+        return Err[Dflash2SelectorTables]("dflash2 selector tables build: gate size overflow")
+    let embedFlat = vocabSize * embedDim
+    if embedA.len != embedFlat || embedB.len != embedFlat:
+        return Err[Dflash2SelectorTables]("dflash2 selector tables build: embedding buffers")
+    if gateWeight.len != embedDim * hiddenDim:
+        return Err[Dflash2SelectorTables]("dflash2 selector tables build: gate buffer")
+    var tables = Dflash2SelectorTables(
+        schema: Dflash2DraftSchema,
+        vocabSize: vocabSize,
+        embedDim: embedDim,
+        hiddenDim: hiddenDim,
+        embedA: embedA,
+        embedB: embedB,
+        gateWeight: gateWeight
+    )
+    return Ok[Dflash2SelectorTables](tables)
+
+# --- Math fixture -----------------------------------------------------------
+# Fixed-seed 64-bit LCG (state = state*6364136223846793005 +
+# 1442695040888963407, wrapped to non-negative). Each draw takes the top 52
+# mantissa bits scaled by an exact power of two, so values land in [-1, 1)
+# bit-reproducibly across runs. THIS IS A MATH FIXTURE ONLY: it stands in for
+# trained embedding tables while the selector arithmetic is brought up and is
+# never a production weight path.
+const
+    Dflash2LcgMultiplier: int64 = int64(6364136223846793005)
+    Dflash2LcgIncrement: int64 = int64(1442695040888963407)
+    Dflash2LcgPow52: float64 = 4503599627370496.0
+
+fn dflash2LcgDraw(state: var int64): float64 =
+    state = state * Dflash2LcgMultiplier + Dflash2LcgIncrement
+    let magnitude = (state & int64(9223372036854775807)) / int64(2048)
+    return float64(magnitude) / Dflash2LcgPow52 * 2.0 - 1.0
+
+fn Dflash2SyntheticSelectorTables(vocabSize: int32,
+                                  hiddenDim: int32,
+                                  seed: int64): Result[Dflash2SelectorTables] =
+    if vocabSize <= 0 || hiddenDim <= 0:
+        return Err[Dflash2SelectorTables]("dflash2 synthetic tables: dimensions")
+    if int64(vocabSize) * int64(Dflash2EmbedDim) > int64(2147483647):
+        return Err[Dflash2SelectorTables]("dflash2 synthetic tables: embedding size overflow")
+    if int64(Dflash2EmbedDim) * int64(hiddenDim) > int64(2147483647):
+        return Err[Dflash2SelectorTables]("dflash2 synthetic tables: gate size overflow")
+    let embedFlat = vocabSize * Dflash2EmbedDim
+    var state: int64 = seed
+    var embedA: float64[]
+    var embedB: float64[]
+    var gateWeight: float64[]
+    var i: int32 = 0
+    while i < embedFlat:
+        add(embedA, dflash2LcgDraw(state))
+        i = i + 1
+    i = 0
+    while i < embedFlat:
+        add(embedB, dflash2LcgDraw(state))
+        i = i + 1
+    i = 0
+    while i < Dflash2EmbedDim * hiddenDim:
+        add(gateWeight, dflash2LcgDraw(state))
+        i = i + 1
+    let built = Dflash2SelectorTablesBuild(vocabSize, Dflash2EmbedDim, hiddenDim, embedA, embedB, gateWeight)
+    if IsErr(built):
+        return Err[Dflash2SelectorTables]("dflash2 synthetic tables: build rejected")
+    return Ok[Dflash2SelectorTables](Value(built))
+
+# H(h_t) = sigmoid(W_g . h_t) for one block position, appended flat into
+# gateOut (embedDim entries). Callers pre-validate shapes.
+@borrows
+fn dflash2AppendGateVector(tables: Dflash2SelectorTables,
+                           hidden: float64[],
+                           position: int32,
+                           gateOut: var float64[]): Result[bool] =
+    var i: int32 = 0
+    while i < tables.embedDim:
+        var acc: float64 = 0.0
+        for d in 0..<tables.hiddenDim:
+            acc = acc + tables.gateWeight[i * tables.hiddenDim + d] * hidden[position * tables.hiddenDim + d]
+        add(gateOut, 1.0 / (1.0 + m.expFloat(0.0 - acc)))
+        i = i + 1
+    return Ok[bool](true)
+
+# Two-tap dynamic depthwise convolution over B parallel positions.
+# convOut[t*C+c] = k_{t,0}[c]*x[t*C+c] + k_{t,1}[c]*x[(t-1)*C+c], with
+# x_{-1} := prevVector (the last verified token's feature vector) at t = 0.
+# Coefficients carry the grouped hidden-state correction; no recurrence.
+@borrows
+fn Dflash2DynamicDepthwiseConvFill(params: Dflash2ConvParams,
+                                   hidden: float64[],
+                                   x: float64[],
+                                   prevVector: float64[],
+                                   convOut: var float64[]): Result[bool] =
+    let paramsOk = Dflash2ValidateConvParams(params)
+    if IsErr(paramsOk):
+        return Err[bool]("dflash2 conv: invalid params")
+    if hidden.len <= 0 || hidden.len % params.hiddenDim != 0:
+        return Err[bool]("dflash2 conv: hidden shape")
+    let blockLen = hidden.len / params.hiddenDim
+    if int64(blockLen) * int64(params.chanCount) != int64(x.len):
+        return Err[bool]("dflash2 conv: input shape")
+    if prevVector.len != params.chanCount:
+        return Err[bool]("dflash2 conv: prev vector shape")
+    if int64(blockLen) * int64(params.chanCount) != int64(convOut.len):
+        return Err[bool]("dflash2 conv: output shape")
+    let groups = params.chanCount / Dflash2CorrGroupSize
+    # corr(h_t)[g] evaluated once per (position, group); the value is shared
+    # by the group's Dflash2CorrGroupSize channels. Fully parallel in t.
+    var corrValues: float64[]
+    for t in 0..<blockLen:
+        for g in 0..<groups:
+            var acc: float64 = 0.0
+            for d in 0..<params.hiddenDim:
+                acc = acc + params.corrWeight[g * params.hiddenDim + d] * hidden[t * params.hiddenDim + d]
+            add(corrValues, acc)
+    for t in 0..<blockLen:
+        for c in 0..<params.chanCount:
+            let corr = corrValues[t * groups + c / Dflash2CorrGroupSize]
+            let k0 = params.baseK0[c] + corr
+            let k1 = params.baseK1[c] + corr
+            var prevValue: float64 = prevVector[c]
+            if t > 0:
+                prevValue = x[(t - 1) * params.chanCount + c]
+            convOut[t * params.chanCount + c] = k0 * x[t * params.chanCount + c] + k1 * prevValue
+    return Ok[bool](true)
+
+# Score every adjacent candidate pair at once: for pair (t-1, t) and slots
+# (a, b), pairScores[((t-1)*K + a)*K + b] = U_t(b) + <A(a) (*) H(h_t), B(b)>.
+# Flat SoA loop over all (B-1)*K*K pairs; read-only on candidates/tables.
+@borrows
+fn Dflash2ScoreAdjacentPairsFill(candidates: Dflash2Candidates,
+                                 tables: Dflash2SelectorTables,
+                                 hidden: float64[],
+                                 pairScores: var float64[]): Result[bool] =
+    let candOk = Dflash2ValidateCandidates(candidates)
+    if IsErr(candOk):
+        return Err[bool]("dflash2 pair scores: invalid candidates")
+    let tablesOk = Dflash2ValidateSelectorTables(tables)
+    if IsErr(tablesOk):
+        return Err[bool]("dflash2 pair scores: invalid tables")
+    if int64(candidates.blockLen) * int64(tables.hiddenDim) != int64(hidden.len):
+        return Err[bool]("dflash2 pair scores: hidden shape")
+    let pairCount = candidates.blockLen - 1
+    if int64(pairCount) * int64(Dflash2TopK) * int64(Dflash2TopK) > int64(2147483647):
+        return Err[bool]("dflash2 pair scores: size overflow")
+    if pairScores.len != pairCount * Dflash2TopK * Dflash2TopK:
+        return Err[bool]("dflash2 pair scores: output shape")
+    for i in 0..<candidates.candTokenIds.len:
+        if candidates.candTokenIds[i] >= tables.vocabSize:
+            return Err[bool]("dflash2 pair scores: token id out of vocab")
+    if pairCount <= 0:
+        return Ok[bool](true)
+    var gate: float64[]
+    for t in 1..<candidates.blockLen:
+        let gateRes = dflash2AppendGateVector(tables, hidden, t, gate)
+        if IsErr(gateRes):
+            return Err[bool]("dflash2 pair scores: gate vector")
+    var pairBase: int32 = 0
+    var gateOffset: int32 = 0
+    for t in 1..<candidates.blockLen:
+        for a in 0..<Dflash2TopK:
+            let aId = candidates.candTokenIds[(t - 1) * Dflash2TopK + a]
+            for b in 0..<Dflash2TopK:
+                let bId = candidates.candTokenIds[t * Dflash2TopK + b]
+                var dot: float64 = 0.0
+                for i in 0..<tables.embedDim:
+                    dot = dot + tables.embedA[aId * tables.embedDim + i] * gate[gateOffset + i] * tables.embedB[bId * tables.embedDim + i]
+                pairScores[pairBase + a * Dflash2TopK + b] = candidates.candLogits[t * Dflash2TopK + b] + dot
+        pairBase = pairBase + Dflash2TopK * Dflash2TopK
+        gateOffset = gateOffset + tables.embedDim
+    return Ok[bool](true)
+
+# Greedy coherent-path walk. Starting from lastVerifiedTokenId, pick at every
+# block position the top-K slot maximizing S_t(prev, b), then continue from
+# the picked token id. Ties keep the lowest slot index (strict >), so the
+# walk is deterministic. Candidates/logits are never rewritten.
+@borrows
+fn Dflash2GreedyWalkFill(candidates: Dflash2Candidates,
+                         tables: Dflash2SelectorTables,
+                         hidden: float64[],
+                         lastVerifiedTokenId: int32): Result[Dflash2SelectedPath] =
+    let candOk = Dflash2ValidateCandidates(candidates)
+    if IsErr(candOk):
+        return Err[Dflash2SelectedPath]("dflash2 walk: invalid candidates")
+    let tablesOk = Dflash2ValidateSelectorTables(tables)
+    if IsErr(tablesOk):
+        return Err[Dflash2SelectedPath]("dflash2 walk: invalid tables")
+    if int64(candidates.blockLen) * int64(tables.hiddenDim) != int64(hidden.len):
+        return Err[Dflash2SelectedPath]("dflash2 walk: hidden shape")
+    if lastVerifiedTokenId < 0 || lastVerifiedTokenId >= tables.vocabSize:
+        return Err[Dflash2SelectedPath]("dflash2 walk: last verified token id")
+    for i in 0..<candidates.candTokenIds.len:
+        if candidates.candTokenIds[i] >= tables.vocabSize:
+            return Err[Dflash2SelectedPath]("dflash2 walk: token id out of vocab")
+    var pathTokenIds: int32[]
+    var selectedIndices: int32[]
+    var pathScoreSum: float64 = 0.0
+    var prevId: int32 = lastVerifiedTokenId
+    for t in 0..<candidates.blockLen:
+        var gate: float64[]
+        let gateRes = dflash2AppendGateVector(tables, hidden, t, gate)
+        if IsErr(gateRes):
+            return Err[Dflash2SelectedPath]("dflash2 walk: gate vector")
+        var bestIndex: int32 = -1
+        var bestScore: float64 = 0.0
+        for b in 0..<Dflash2TopK:
+            let bId = candidates.candTokenIds[t * Dflash2TopK + b]
+            var dot: float64 = 0.0
+            for i in 0..<tables.embedDim:
+                dot = dot + tables.embedA[prevId * tables.embedDim + i] * gate[i] * tables.embedB[bId * tables.embedDim + i]
+            let score = candidates.candLogits[t * Dflash2TopK + b] + dot
+            if bestIndex < 0 || score > bestScore:
+                bestIndex = b
+                bestScore = score
+        let pickedId = candidates.candTokenIds[t * Dflash2TopK + bestIndex]
+        add(selectedIndices, bestIndex)
+        add(pathTokenIds, pickedId)
+        pathScoreSum = pathScoreSum + bestScore
+        prevId = pickedId
+    var path = Dflash2SelectedPath(
+        pathTokenIds: pathTokenIds,
+        selectedIndices: selectedIndices,
+        pathScoreSum: pathScoreSum
+    )
+    return Ok[Dflash2SelectedPath](path)
+
+# Lossless contract: scoring/walking must never rewrite the candidate pool.
+# Element-wise identity on ids AND logits (exact float equality intended --
+# this is a bitwise no-touch check, not a tolerance check).
+@borrows
+fn Dflash2CandidatesUnmodifiedAfterWalk(before: Dflash2Candidates,
+                                        after: Dflash2Candidates): bool =
+    if before.schema != after.schema:
+        return false
+    if before.blockLen != after.blockLen || before.topK != after.topK:
+        return false
+    if before.candTokenIds.len != after.candTokenIds.len ||
+       before.candLogits.len != after.candLogits.len:
+        return false
+    for i in 0..<before.candTokenIds.len:
+        if before.candTokenIds[i] != after.candTokenIds[i]:
+            return false
+    for i in 0..<before.candLogits.len:
+        if before.candLogits[i] != after.candLogits[i]:
+            return false
+    return true

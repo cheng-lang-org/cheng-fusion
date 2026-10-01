@@ -1,0 +1,1486 @@
+# Mesh render (STL): binary STL loader + whole-mesh triangle rasterizer
+# for the CSG render pipeline. The loader decodes the binary STL layout
+# (80-byte header + uint32 triangle count + 50 bytes per triangle:
+# 3x float32 LE normal + 3 vertices x 3x float32 LE + uint16 attribute)
+# into a flat float64 SoA store (v0x..v2z, nx/ny/nz). Binary STL is
+# detected by size, never by text: the header may start with "COLOR"
+# (Materialise extension), so only "solid" would be ambiguous and we do
+# not sniff text at all. float32 LE words are assembled from raw bytes
+# into the int32 bit pattern, then decoded arithmetically into float64
+# by regrouping sign/exponent/mantissa (1-8-23 -> value = (frac + 2^23)
+# * 2^(e-150), subnormals via frac * 2^-149, negative-exponent powers
+# through std mathPow2); non-finite words (e == 255) abort the load.
+#
+# Rasterization mirrors cpu_raster's contracts: Z-up look-at camera via
+# camera.CameraProject, per-pixel depth in the target's int32-mm zbuf
+# through raster.RasterPut (same depth-test + BGRA store path as every
+# other impostor), Lambert shading under the same directional light
+# constants. Per triangle: world transform (full unit-quaternion
+# orientation through MeshRasterFrameOrient / MeshGpuFrameOrient, or
+# the legacy yaw-around-Z wrappers, uniform scale, translation) ->
+# project -> normal-vs-view backface cull ->
+# screen bbox clip -> barycentric fill with perspective-correct depth
+# (1/depth is screen-linear). Inner loops are allocation-free: the SoA
+# store is preallocated at load time and nothing binds strings.
+import cheng/game/cinema/camera
+import cheng/game/render/cpu_raster as raster
+import cheng/game/csg/numerics
+import std/monotimes
+import std/os
+import std/rawbytes
+import std/rawmem_support
+import std/result
+import std/math as m
+
+const
+    MeshLightX = 0.35
+    MeshLightY = 0.60
+    MeshLightZ = 0.72
+    MeshTriFloatWords = 12
+    MeshTriBytes = 50
+    MeshHeaderBytes = 84
+    MeshTriCountMax = 4000000
+
+type
+    MeshHandle = int32
+
+type
+    MeshData = ref object
+        triCount: int32
+        v0x: float64[]
+        v0y: float64[]
+        v0z: float64[]
+        v1x: float64[]
+        v1y: float64[]
+        v1z: float64[]
+        v2x: float64[]
+        v2y: float64[]
+        v2z: float64[]
+        nx: float64[]
+        ny: float64[]
+        nz: float64[]
+        minX: float64
+        minY: float64
+        minZ: float64
+        maxX: float64
+        maxY: float64
+        maxZ: float64
+
+var meshSlots: MeshData[]
+
+fn MeshU32LE(data: rawbytes.Bytes, off: int32): int32 =
+    let b0: uint64 = uint64(rawbytes.BytesGet(data, off) & 255)
+    let b1: uint64 = uint64(rawbytes.BytesGet(data, off + 1) & 255)
+    let b2: uint64 = uint64(rawbytes.BytesGet(data, off + 2) & 255)
+    let b3: uint64 = uint64(rawbytes.BytesGet(data, off + 3) & 255)
+    return int32(b0 | (b1 << uint64(8)) | (b2 << uint64(16)) | (b3 << uint64(24)))
+
+# logical byte extraction (works for any int32 bit pattern regardless of
+# arithmetic-shift sign extension): low byte first, little-endian
+fn MeshU64BitsFromI32(v: int32): uint64 =
+    return uint64(v & 255) | (uint64((v >> 8) & 255) << uint64(8)) | (uint64((v >> 16) & 255) << uint64(16)) | (uint64((v >> 24) & 255) << uint64(24))
+
+fn MeshF32BitsFinite(bits: int32): bool =
+    let exp32: int32 = int32((MeshU64BitsFromI32(bits) >> uint64(23)) & uint64(255))
+    if exp32 == 255:
+        return false
+    return true
+
+fn MeshF32BitsToF64(bits: int32): float64 =
+    let ub: uint64 = MeshU64BitsFromI32(bits)
+    let sign: int32 = int32((ub >> uint64(31)) & uint64(1))
+    let exp32: int32 = int32((ub >> uint64(23)) & uint64(255))
+    let frac: float64 = float64(int64(ub & uint64(0x7fffff)))
+    var mag: float64 = 0.0
+    if exp32 == 0:
+        # subnormal: frac * 2^-149
+        mag = frac * m.mathPow2(-149)
+    else:
+        # hidden-bit normal: (2^23 + frac) * 2^(e - 150)
+        mag = (8388608.0 + frac) * m.mathPow2(exp32 - 150)
+    if sign == 1:
+        return 0.0 - mag
+    return mag
+
+# One float32 LE word -> finite float64; false on inf/nan (load aborts)
+fn MeshF32Word(data: rawbytes.Bytes, off: int32, outVal: var float64): bool =
+    let bits: int32 = MeshU32LE(data, off)
+    if !MeshF32BitsFinite(bits):
+        return false
+    outVal = MeshF32BitsToF64(bits)
+    return true
+
+fn MeshSlotAt(h: MeshHandle): MeshData =
+    if h < 0:
+        return nil
+    if h >= meshSlots.len:
+        return nil
+    return meshSlots[h]
+
+# Parse a binary STL file into the module SoA table; returns the mesh
+# handle (>= 0) or -1 on any structural failure (short file, zero or
+# absurd triangle count, truncated triangle block).
+fn MeshStlLoad(path: str): MeshHandle =
+    var readRes: Result[rawbytes.Bytes] = os.ReadFileBytesResult(path)
+    if IsErr(readRes):
+        return -1
+    var data: rawbytes.Bytes = Value(readRes)
+    let total: int32 = rawbytes.BytesLen(data)
+    if total < MeshHeaderBytes:
+        rawbytes.BytesFree(data)
+        return -1
+    let triCount: int32 = MeshU32LE(data, 80)
+    if triCount <= 0:
+        rawbytes.BytesFree(data)
+        return -1
+    if triCount > MeshTriCountMax:
+        rawbytes.BytesFree(data)
+        return -1
+    if total < MeshHeaderBytes + triCount * MeshTriBytes:
+        rawbytes.BytesFree(data)
+        return -1
+    var slot = new(MeshData)
+    slot.triCount = triCount
+    setLen(slot.v0x, triCount)
+    setLen(slot.v0y, triCount)
+    setLen(slot.v0z, triCount)
+    setLen(slot.v1x, triCount)
+    setLen(slot.v1y, triCount)
+    setLen(slot.v1z, triCount)
+    setLen(slot.v2x, triCount)
+    setLen(slot.v2y, triCount)
+    setLen(slot.v2z, triCount)
+    setLen(slot.nx, triCount)
+    setLen(slot.ny, triCount)
+    setLen(slot.nz, triCount)
+    var minX: float64 = 0.0
+    var minY: float64 = 0.0
+    var minZ: float64 = 0.0
+    if !MeshF32Word(data, MeshHeaderBytes + 12, minX):
+        rawbytes.BytesFree(data)
+        return -1
+    if !MeshF32Word(data, MeshHeaderBytes + 16, minY):
+        rawbytes.BytesFree(data)
+        return -1
+    if !MeshF32Word(data, MeshHeaderBytes + 20, minZ):
+        rawbytes.BytesFree(data)
+        return -1
+    slot.minX = minX
+    slot.minY = minY
+    slot.minZ = minZ
+    slot.maxX = minX
+    slot.maxY = minY
+    slot.maxZ = minZ
+    var i: int32 = 0
+    while i < triCount:
+        let base: int32 = MeshHeaderBytes + i * MeshTriBytes
+        var x0: float64 = 0.0
+        var y0: float64 = 0.0
+        var z0: float64 = 0.0
+        var x1: float64 = 0.0
+        var y1: float64 = 0.0
+        var z1: float64 = 0.0
+        var x2: float64 = 0.0
+        var y2: float64 = 0.0
+        var z2: float64 = 0.0
+        var n0x: float64 = 0.0
+        var n0y: float64 = 0.0
+        var n0z: float64 = 0.0
+        if !MeshF32Word(data, base, n0x):
+            rawbytes.BytesFree(data)
+            return -1
+        if !MeshF32Word(data, base + 4, n0y):
+            rawbytes.BytesFree(data)
+            return -1
+        if !MeshF32Word(data, base + 8, n0z):
+            rawbytes.BytesFree(data)
+            return -1
+        if !MeshF32Word(data, base + 12, x0):
+            rawbytes.BytesFree(data)
+            return -1
+        if !MeshF32Word(data, base + 16, y0):
+            rawbytes.BytesFree(data)
+            return -1
+        if !MeshF32Word(data, base + 20, z0):
+            rawbytes.BytesFree(data)
+            return -1
+        if !MeshF32Word(data, base + 24, x1):
+            rawbytes.BytesFree(data)
+            return -1
+        if !MeshF32Word(data, base + 28, y1):
+            rawbytes.BytesFree(data)
+            return -1
+        if !MeshF32Word(data, base + 32, z1):
+            rawbytes.BytesFree(data)
+            return -1
+        if !MeshF32Word(data, base + 36, x2):
+            rawbytes.BytesFree(data)
+            return -1
+        if !MeshF32Word(data, base + 40, y2):
+            rawbytes.BytesFree(data)
+            return -1
+        if !MeshF32Word(data, base + 44, z2):
+            rawbytes.BytesFree(data)
+            return -1
+        slot.v0x[i] = x0
+        slot.v0y[i] = y0
+        slot.v0z[i] = z0
+        slot.v1x[i] = x1
+        slot.v1y[i] = y1
+        slot.v1z[i] = z1
+        slot.v2x[i] = x2
+        slot.v2y[i] = y2
+        slot.v2z[i] = z2
+        slot.nx[i] = n0x
+        slot.ny[i] = n0y
+        slot.nz[i] = n0z
+        if x0 < slot.minX:
+            slot.minX = x0
+        if y0 < slot.minY:
+            slot.minY = y0
+        if z0 < slot.minZ:
+            slot.minZ = z0
+        if x0 > slot.maxX:
+            slot.maxX = x0
+        if y0 > slot.maxY:
+            slot.maxY = y0
+        if z0 > slot.maxZ:
+            slot.maxZ = z0
+        if x1 < slot.minX:
+            slot.minX = x1
+        if y1 < slot.minY:
+            slot.minY = y1
+        if z1 < slot.minZ:
+            slot.minZ = z1
+        if x1 > slot.maxX:
+            slot.maxX = x1
+        if y1 > slot.maxY:
+            slot.maxY = y1
+        if z1 > slot.maxZ:
+            slot.maxZ = z1
+        if x2 < slot.minX:
+            slot.minX = x2
+        if y2 < slot.minY:
+            slot.minY = y2
+        if z2 < slot.minZ:
+            slot.minZ = z2
+        if x2 > slot.maxX:
+            slot.maxX = x2
+        if y2 > slot.maxY:
+            slot.maxY = y2
+        if z2 > slot.maxZ:
+            slot.maxZ = z2
+        i = i + 1
+    rawbytes.BytesFree(data)
+    add(meshSlots, slot)
+    return int32(meshSlots.len - 1)
+
+fn MeshValid(h: MeshHandle): bool =
+    let slot = MeshSlotAt(h)
+    if slot == nil:
+        return false
+    return true
+
+fn MeshTriCount(h: MeshHandle): int32 =
+    let slot = MeshSlotAt(h)
+    if slot == nil:
+        return 0
+    return slot.triCount
+
+fn MeshCenterX(h: MeshHandle): float64 =
+    let slot = MeshSlotAt(h)
+    if slot == nil:
+        return 0.0
+    return (slot.minX + slot.maxX) * 0.5
+
+fn MeshCenterY(h: MeshHandle): float64 =
+    let slot = MeshSlotAt(h)
+    if slot == nil:
+        return 0.0
+    return (slot.minY + slot.maxY) * 0.5
+
+fn MeshCenterZ(h: MeshHandle): float64 =
+    let slot = MeshSlotAt(h)
+    if slot == nil:
+        return 0.0
+    return (slot.minZ + slot.maxZ) * 0.5
+
+fn MeshHalfExtentX(h: MeshHandle): float64 =
+    let slot = MeshSlotAt(h)
+    if slot == nil:
+        return 0.0
+    return (slot.maxX - slot.minX) * 0.5
+
+fn MeshHalfExtentY(h: MeshHandle): float64 =
+    let slot = MeshSlotAt(h)
+    if slot == nil:
+        return 0.0
+    return (slot.maxY - slot.minY) * 0.5
+
+fn MeshHalfExtentZ(h: MeshHandle): float64 =
+    let slot = MeshSlotAt(h)
+    if slot == nil:
+        return 0.0
+    return (slot.maxZ - slot.minZ) * 0.5
+
+# Unit quaternion (qw,qx,qy,qz) -> row-major 3x3 rotation matrix rows.
+# The input must be a unit quaternion (world3d poses renormalize every
+# tick); qw=cos(yaw/2), qz=sin(yaw/2) reproduces Rz(yaw), so the legacy
+# yaw entries and the full-orientation entries share one transform
+# contract.
+fn MeshQuatRows(qw: float64,
+                qx: float64,
+                qy: float64,
+                qz: float64,
+                outM00: var float64,
+                outM01: var float64,
+                outM02: var float64,
+                outM10: var float64,
+                outM11: var float64,
+                outM12: var float64,
+                outM20: var float64,
+                outM21: var float64,
+                outM22: var float64) =
+    let xx = qx * qx
+    let yy = qy * qy
+    let zz = qz * qz
+    let xy = qx * qy
+    let xz = qx * qz
+    let yz = qy * qz
+    let xw = qx * qw
+    let yw = qy * qw
+    let zw = qz * qw
+    outM00 = 1.0 - 2.0 * (yy + zz)
+    outM01 = 2.0 * (xy - zw)
+    outM02 = 2.0 * (xz + yw)
+    outM10 = 2.0 * (xy + zw)
+    outM11 = 1.0 - 2.0 * (xx + zz)
+    outM12 = 2.0 * (yz - xw)
+    outM20 = 2.0 * (xz - yw)
+    outM21 = 2.0 * (yz + xw)
+    outM22 = 1.0 - 2.0 * (xx + yy)
+
+# Shared whole-mesh raster core: world = (ox,oy,oz) + scale * R * v with
+# the rigid rotation passed as row-major rows. TWO-SIDED: no backface
+# cull — the shipped STL shells carry open boundaries and mixed
+# winding, and culling read through them as holes; the depth test
+# arbitrates the two sides instead. Depth interpolates 1/depth
+# (screen-linear) and lands in the shared zbuf through raster.RasterPut's
+# depth test. The inner loops are allocation-free: the SoA store is
+# preallocated at load time and nothing binds strings.
+@borrows
+fn MeshRasterCore(t: raster.RasterTarget,
+                  cam: camera.CinemaCamera,
+                  slot: MeshData,
+                  ox: float64,
+                  oy: float64,
+                  oz: float64,
+                  scale: float64,
+                  m00: float64,
+                  m01: float64,
+                  m02: float64,
+                  m10: float64,
+                  m11: float64,
+                  m12: float64,
+                  m20: float64,
+                  m21: float64,
+                  m22: float64,
+                  r: int32,
+                  g: int32,
+                  b: int32) =
+    var i: int32 = 0
+    while i < slot.triCount:
+        let lx0: float64 = slot.v0x[i]
+        let ly0: float64 = slot.v0y[i]
+        let lz0: float64 = slot.v0z[i]
+        let lx1: float64 = slot.v1x[i]
+        let ly1: float64 = slot.v1y[i]
+        let lz1: float64 = slot.v1z[i]
+        let lx2: float64 = slot.v2x[i]
+        let ly2: float64 = slot.v2y[i]
+        let lz2: float64 = slot.v2z[i]
+        let wx0 = ox + scale * (lx0 * m00 + ly0 * m01 + lz0 * m02)
+        let wy0 = oy + scale * (lx0 * m10 + ly0 * m11 + lz0 * m12)
+        let wz0 = oz + scale * (lx0 * m20 + ly0 * m21 + lz0 * m22)
+        let wx1 = ox + scale * (lx1 * m00 + ly1 * m01 + lz1 * m02)
+        let wy1 = oy + scale * (lx1 * m10 + ly1 * m11 + lz1 * m12)
+        let wz1 = oz + scale * (lx1 * m20 + ly1 * m21 + lz1 * m22)
+        let wx2 = ox + scale * (lx2 * m00 + ly2 * m01 + lz2 * m02)
+        let wy2 = oy + scale * (lx2 * m10 + ly2 * m11 + lz2 * m12)
+        let wz2 = oz + scale * (lx2 * m20 + ly2 * m21 + lz2 * m22)
+        let p0 = camera.CameraProject(cam, wx0, wy0, wz0)
+        let p1 = camera.CameraProject(cam, wx1, wy1, wz1)
+        let p2 = camera.CameraProject(cam, wx2, wy2, wz2)
+        if p0.depth > 0.02:
+            if p1.depth > 0.02:
+                if p2.depth > 0.02:
+                    # world-space normal under the same rigid transform
+                    let nwx = slot.nx[i] * m00 + slot.ny[i] * m01 + slot.nz[i] * m02
+                    let nwy = slot.nx[i] * m10 + slot.ny[i] * m11 + slot.nz[i] * m12
+                    let nwz = slot.nx[i] * m20 + slot.ny[i] * m21 + slot.nz[i] * m22
+                    # two-sided Lambert: back faces light with the flipped
+                    # normal (abs), the depth test keeps the near side
+                    var lum = 0.5
+                    let nn = nwx * nwx + nwy * nwy + nwz * nwz
+                    if nn > 0.0:
+                        let nlen = numerics.CsgSqrt(nn)
+                        let ndiff = (nwx * MeshLightX + nwy * MeshLightY + nwz * MeshLightZ) / nlen
+                        lum = 0.25 + 0.75 * m.absFloat(ndiff)
+                        if lum > 1.0:
+                            lum = 1.0
+                        if lum < 0.12:
+                            lum = 0.12
+                    let lumR: int32 = int32(float64(r) * lum)
+                    let lumG: int32 = int32(float64(g) * lum)
+                    let lumB: int32 = int32(float64(b) * lum)
+                    let area = (p1.sx - p0.sx) * (p2.sy - p0.sy) - (p2.sx - p0.sx) * (p1.sy - p0.sy)
+                    if m.absFloat(area) > 0.0001:
+                        let invArea = 1.0 / area
+                        var bx0: int32 = int32(m.floorFloat(m.minFloat(p0.sx, m.minFloat(p1.sx, p2.sx))))
+                        var bx1: int32 = int32(m.floorFloat(m.maxFloat(p0.sx, m.maxFloat(p1.sx, p2.sx)))) + 1
+                        var by0: int32 = int32(m.floorFloat(m.minFloat(p0.sy, m.minFloat(p1.sy, p2.sy))))
+                        var by1: int32 = int32(m.floorFloat(m.maxFloat(p0.sy, m.maxFloat(p1.sy, p2.sy)))) + 1
+                        if bx0 < 0:
+                            bx0 = 0
+                        if by0 < 0:
+                            by0 = 0
+                        if bx1 > t.width - 1:
+                            bx1 = t.width - 1
+                        if by1 > t.height - 1:
+                            by1 = t.height - 1
+                        let invD0 = 1.0 / p0.depth
+                        let invD1 = 1.0 / p1.depth
+                        let invD2 = 1.0 / p2.depth
+                        var py: int32 = by0
+                        while py <= by1:
+                            let pyf: float64 = float64(py) + 0.5
+                            var px: int32 = bx0
+                            while px <= bx1:
+                                let pxf: float64 = float64(px) + 0.5
+                                let w0 = ((p1.sx - pxf) * (p2.sy - pyf) - (p2.sx - pxf) * (p1.sy - pyf)) * invArea
+                                if w0 >= 0.0:
+                                    let w1 = ((p2.sx - pxf) * (p0.sy - pyf) - (p0.sx - pxf) * (p2.sy - pyf)) * invArea
+                                    if w1 >= 0.0:
+                                        let w2 = 1.0 - w0 - w1
+                                        if w2 >= 0.0:
+                                            # perspective-correct: 1/depth
+                                            # is linear in screen space
+                                            let zInv = w0 * invD0 + w1 * invD1 + w2 * invD2
+                                            raster.RasterPut(t, px, py, 1.0 / zInv, lumR, lumG, lumB)
+                                px = px + 1
+                            py = py + 1
+        i = i + 1
+
+# Rasterize one whole mesh into the target with a yaw-around-Z
+# orientation (legacy entry, bit-faithful to the pre-quaternion
+# contract): world = (ox,oy,oz) + scale * Rz(yawRad) * v.
+@borrows
+fn MeshRasterFrame(t: raster.RasterTarget,
+                   cam: camera.CinemaCamera,
+                   mesh: MeshHandle,
+                   ox: float64,
+                   oy: float64,
+                   oz: float64,
+                   scale: float64,
+                   yawRad: float64,
+                   r: int32,
+                   g: int32,
+                   b: int32) =
+    let slot = MeshSlotAt(mesh)
+    if slot == nil:
+        return
+    let cyaw = m.cosFloat(yawRad)
+    let syaw = m.sinFloat(yawRad)
+    MeshRasterCore(t, cam, slot, ox, oy, oz, scale, cyaw, 0.0 - syaw, 0.0, syaw, cyaw, 0.0, 0.0, 0.0, 1.0, r, g, b)
+
+# Rasterize one whole mesh into the target with a full unit-quaternion
+# orientation (world = (ox,oy,oz) + scale * R(q) * v): pitch and roll
+# render with the same contract as yaw.
+@borrows
+fn MeshRasterFrameOrient(t: raster.RasterTarget,
+                         cam: camera.CinemaCamera,
+                         mesh: MeshHandle,
+                         ox: float64,
+                         oy: float64,
+                         oz: float64,
+                         scale: float64,
+                         qw: float64,
+                         qx: float64,
+                         qy: float64,
+                         qz: float64,
+                         r: int32,
+                         g: int32,
+                         b: int32) =
+    let slot = MeshSlotAt(mesh)
+    if slot == nil:
+        return
+    var m00: float64
+    var m01: float64
+    var m02: float64
+    var m10: float64
+    var m11: float64
+    var m12: float64
+    var m20: float64
+    var m21: float64
+    var m22: float64
+    MeshQuatRows(qw, qx, qy, qz, m00, m01, m02, m10, m11, m12, m20, m21, m22)
+    MeshRasterCore(t, cam, slot, ox, oy, oz, scale, m00, m01, m02, m10, m11, m12, m20, m21, m22, r, g, b)
+
+# ---------------------------------------------------------------------------
+# GPU mesh rasterizer (tile-binned Metal compute path).
+#
+# Same math contract as MeshRasterFrame, split across the GPU boundary at
+# triangle granularity: a CPU serial prepass runs the whole float64
+# per-triangle math exactly once per triangle (rotation-matrix rows from
+# the full unit quaternion — the legacy entry builds Rz(yaw) — / uniform
+# scale / translation world transform -> camera.CameraProject ->
+# normal-vs-view backface cull -> Lambert under the same MeshLight*
+# constants -> screen bbox) and bins each visible triangle into every
+# 32x32 screen tile its clamped bbox overlaps, appending in ascending
+# triangle index so every tile list is index-ordered.
+#
+# The kernel runs one thread per pixel: it walks its tile's list and
+# applies the identical barycentric inside test (w0 >= 0, w1 >= 0,
+# w2 = 1 - w0 - w1 >= 0), the identical perspective-correct depth
+# (1/depth linear in screen space, int32-millimetre truncation, strict <
+# test against the shared sentinel zbuf) and the same BGRA store order.
+# One thread per pixel plus index-ordered lists reproduces the CPU's
+# per-pixel arbitration order exactly; the only divergence is float32
+# rounding in the kernel (the CPU prepass hands the kernel float32
+# screen-space payloads), which costs at most ~1 mm truncation flips and
+# sub-1e-4-pixel edge flips. The CPU path above stays the golden
+# reference and the fallback: every MeshGpu* entry returns a negative
+# stage code when Metal is unavailable or any bring-up/dispatch stage
+# fails, and the caller falls back to MeshRasterFrame.
+#
+# Metal wiring copies the gpu_raster.cheng precedent shape for shape:
+# MTLCreateSystemDefaultDevice / newCommandQueue / runtime MSL compile
+# (newLibraryWithSource:options:error:) / newComputePipelineStateWithFunction:error: /
+# shared MTLBuffers via newBufferWithLength:options: (u64_u64 msgSend) /
+# setBuffer:offset:atIndex: / dispatchThreads:threadsPerThreadgroup: /
+# waitUntilCompleted / status == 4. All ObjC/Metal calls stay in the
+# bridge section below. The kernel touches only scalar arrays (no MSL
+# float3, no 16-byte alignment traps) and no camera/world data: the
+# per-triangle payload is 16 float32 words (screen verts x3, 1/depths
+# x3, 1/area, shaded RGB, pad). Grow-on-demand MTLBuffers are never
+# freed (process-lifetime, same policy as gpu_raster); capacity only
+# grows with the loaded mesh, so steady-state frames allocate nothing.
+# ---------------------------------------------------------------------------
+const
+    MeshGpuTileSize = 32
+    MeshGpuTriWords = 16
+    MeshGpuFnName = "meshRasterTiles"
+
+const
+    MeshGpuMslP0 = "kernel void meshRasterTiles(device const int* params, device const int* tris, device const int* tileMeta, device const int* tileTris, device uchar* bgra, device int* depthOut, uint2 gid [[thread_position_in_grid]]) { int px = (int)gid.x; int py = (int)gid.y; int W = params[0]; int H = params[1]; if (px >= W || py >= H) { return; } int tilesX = params[2]; int tile = (py / 32) * tilesX + (px / 32); int start = tileMeta[tile * 2]; int cnt = tileMeta[tile * 2 + 1]; float pxf = (float)px + 0.5f; float pyf = (float)py + 0.5f; int idx = py * W + px;"
+    MeshGpuMslP1 = " for (int k = 0; k < cnt; k++) { int b = tileTris[start + k] * 16; float sx0 = (float)tris[b] * 2.44140625e-4f; float sy0 = (float)tris[b + 1] * 2.44140625e-4f; float sx1 = (float)tris[b + 2] * 2.44140625e-4f; float sy1 = (float)tris[b + 3] * 2.44140625e-4f; float sx2 = (float)tris[b + 4] * 2.44140625e-4f; float sy2 = (float)tris[b + 5] * 2.44140625e-4f; float invArea = as_type<float>(tris[b + 9]); float w0 = ((sx1 - pxf) * (sy2 - pyf) - (sx2 - pxf) * (sy1 - pyf)) * invArea;"
+    MeshGpuMslP2 = " if (w0 >= 0.0f) { float w1 = ((sx2 - pxf) * (sy0 - pyf) - (sx0 - pxf) * (sy2 - pyf)) * invArea; if (w1 >= 0.0f) { float w2 = 1.0f - w0 - w1; if (w2 >= 0.0f) { float zInv = w0 * as_type<float>(tris[b + 6]) + w1 * as_type<float>(tris[b + 7]) + w2 * as_type<float>(tris[b + 8]); float depth = 1.0f / zInv; int mm = (int)(depth * 1000.0f); if (mm < 0) { mm = 0; }"
+    MeshGpuMslP3 = " if (mm < depthOut[idx]) { depthOut[idx] = mm; bgra[idx * 4] = (uchar)tris[b + 12]; bgra[idx * 4 + 1] = (uchar)tris[b + 11]; bgra[idx * 4 + 2] = (uchar)tris[b + 10]; bgra[idx * 4 + 3] = (uchar)255; } } } } } }"
+
+fn MeshGpuMsl(): str =
+    return MeshGpuMslP0 + MeshGpuMslP1 + MeshGpuMslP2 + MeshGpuMslP3
+
+# ---- bridge section (Metal/ObjC boundary), shape-copied from gpu_raster ----
+# dispatchThreads:threadsPerThreadgroup: takes two 24-byte MTLSize structs,
+# which the arm64 ABI passes BY REFERENCE (composites larger than 16 bytes
+# travel as pointers to caller-made copies) — the msgSend variant below
+# therefore takes two ptrs into 24-byte u64 scratch blocks
+@importc("objc_msgSend")
+fn mrMsgSendDispatchSizes(receiver: ptr, sel: ptr, grid: ptr, group: ptr)
+
+@importc("MTLCreateSystemDefaultDevice")
+fn mrMtlCreateSystemDefaultDevice(): ptr
+@importc("objc_getClass")
+fn mrObjcGetClass(name: ptr): ptr
+@importc("sel_registerName")
+fn mrSelRegisterName(name: ptr): ptr
+@importc("objc_autoreleasePoolPush")
+fn mrAutoreleasePoolPush(): ptr
+@importc("objc_autoreleasePoolPop")
+fn mrAutoreleasePoolPop(pool: ptr)
+@importc("objc_msgSend")
+fn mrMsgSend0(receiver: ptr, sel: ptr): ptr
+@importc("objc_msgSend")
+fn mrMsgSendPtr(receiver: ptr, sel: ptr, a0: ptr): ptr
+@importc("objc_msgSend")
+fn mrMsgSendPtrPtr(receiver: ptr, sel: ptr, a0: ptr, a1: ptr): ptr
+@importc("objc_msgSend")
+fn mrMsgSendPtrPtrPtr(receiver: ptr, sel: ptr, a0: ptr, a1: ptr, a2: ptr): ptr
+@importc("objc_msgSend")
+fn mrMsgSendU64U64(receiver: ptr, sel: ptr, a0: uint64, a1: uint64): ptr
+@importc("objc_msgSend")
+fn mrMsgSendU64Return(receiver: ptr, sel: ptr): uint64
+@importc("objc_msgSend")
+fn mrMsgSendSetPipeline(receiver: ptr, sel: ptr, pipeline: ptr)
+@importc("objc_msgSend")
+fn mrMsgSendSetBuffer(receiver: ptr, sel: ptr, buffer: ptr, offset: ptr, index: ptr)
+@importc("objc_msgSend")
+fn mrMsgSendVoid0(receiver: ptr, sel: ptr)
+@importc("cheng_f64_to_bits")
+fn mrF64Bits(value: float64): int64
+@importc("calloc")
+fn mrCalloc(n: int64, size: int64): ptr
+
+fn MrGpuNSString(cstr: ptr): ptr =
+    let cls: ptr = mrObjcGetClass("NSString")
+    if cls == nil:
+        return nil
+    let sel: ptr = mrSelRegisterName("stringWithUTF8String:")
+    return mrMsgSendPtr(cls, sel, cstr)
+
+fn MrGpuContents(buf: ptr): ptr =
+    return mrMsgSend0(buf, mrSelRegisterName("contents"))
+
+# f64 -> binary32 bit pattern, round-to-nearest-even (no float64->float32
+# cast in the cold chain; same integer-bit algorithm as gpu_raster)
+fn mrU64MaskLoBits(n: int32): uint64 =
+    if n <= 0:
+        return uint64(0)
+    if n >= 64:
+        return uint64(0) - uint64(1)
+    return (uint64(1) << uint64(n)) - uint64(1)
+
+fn mrU64RoundShiftRight(v: uint64, shift: int32): uint64 =
+    if shift <= 0:
+        if shift == 0:
+            return v
+        let leftShift: int32 = -shift
+        if leftShift >= 64:
+            return uint64(0)
+        return v << uint64(leftShift)
+    if shift >= 64:
+        return uint64(0)
+    let base: uint64 = v >> uint64(shift)
+    let half: uint64 = uint64(1) << uint64(shift - 1)
+    let lowMask: uint64 = mrU64MaskLoBits(shift)
+    let low: uint64 = v & lowMask
+    if low > half:
+        return base + uint64(1)
+    if low == half && (base & uint64(1)) == uint64(1):
+        return base + uint64(1)
+    return base
+
+fn mrF64ToF32Bits(bits: int64): int32 =
+    let ubits: uint64 = uint64(bits)
+    let sign: uint64 = (ubits >> uint64(63)) & uint64(1)
+    let exp64: int32 = int32((ubits >> uint64(52)) & uint64(0x7ff))
+    let frac64: uint64 = ubits & uint64(0x000fffffffffffff)
+    let signOut: uint64 = sign << uint64(31)
+    if exp64 == int32(0x7ff):
+        if frac64 == 0:
+            return int32(signOut | (uint64(0xff) << uint64(23)))
+        var fracNaN: uint64 = frac64 >> uint64(29)
+        if fracNaN == 0:
+            fracNaN = uint64(1)
+        return int32(signOut | (uint64(0xff) << uint64(23)) | (fracNaN & uint64(0x7fffff)))
+    var exp: int32
+    var mant: uint64 = frac64
+    if exp64 == 0:
+        if mant == 0:
+            return int32(signOut)
+        exp = -1022
+        while (mant & (uint64(1) << uint64(52))) == 0:
+            mant = mant << uint64(1)
+            exp = exp - 1
+        mant = mant & uint64(0x000fffffffffffff)
+    else:
+        exp = exp64 - 1023
+    var exp32: int32 = exp + 127
+    let sig53: uint64 = (uint64(1) << uint64(52)) | mant
+    if exp32 >= 255:
+        return int32(signOut | (uint64(0xff) << uint64(23)))
+    if exp32 <= 0:
+        if exp32 < -23:
+            return int32(signOut)
+        let shiftSub: int32 = (1 - exp32) + 29
+        let fracSub: uint64 = mrU64RoundShiftRight(sig53, shiftSub)
+        if fracSub >= (uint64(1) << uint64(23)):
+            return int32(signOut | (uint64(1) << uint64(23)))
+        return int32(signOut | (fracSub & uint64(0x7fffff)))
+    var sig24: uint64 = mrU64RoundShiftRight(sig53, 29)
+    if sig24 >= (uint64(1) << uint64(24)):
+        sig24 = sig24 >> uint64(1)
+        exp32 = exp32 + 1
+        if exp32 >= 255:
+            return int32(signOut | (uint64(0xff) << uint64(23)))
+    let fracOut: uint64 = sig24 & uint64(0x7fffff)
+    return int32(signOut | (uint64(exp32) << uint64(23)) | fracOut)
+# ---- end bridge section ----
+
+type
+    MeshGpuData = ref object
+        ok: bool
+        device: ptr
+        queue: ptr
+        pipeline: ptr
+        paramBuf: ptr
+        triBuf: ptr
+        metaBuf: ptr
+        idxBuf: ptr
+        bgraBuf: ptr
+        depthBuf: ptr
+        width: int32
+        height: int32
+        tilesX: int32
+        tilesY: int32
+        triCap: int32
+        idxCap: int32
+        # CPU-side staging, C-heap pointers (calloc, zero-filled). Bytes
+        # handles are deliberately avoided here: rawbytes.Bytes carries a
+        # raw data pointer and is therefore not address-free, so a global
+        # slot's Bytes must never be read by value (the ssm1q borrow
+        # contract); plain pointers pass freely.
+        visData: ptr
+        tbData: ptr
+        triWordsData: ptr
+        countsData: ptr
+        metaData: ptr
+        idxData: ptr
+        gridData: ptr
+        groupData: ptr
+
+var meshGpuSlots: MeshGpuData[]
+
+# batch perf buckets (ns): 0 pass-A math+binning, 1 prefix+pass-B,
+# 2 upload, 3 dispatch+wait. No borrow contract needed: scalar module
+# globals are read/written plainly; the reader zeroes them.
+var mrPerfA: int64 = 0
+var mrPerfB: int64 = 0
+var mrPerfC: int64 = 0
+var mrPerfD: int64 = 0
+
+fn MeshGpuAt(): MeshGpuData =
+    if meshGpuSlots.len <= 0:
+        return nil
+    return meshGpuSlots[0]
+
+fn MrI32Get(src: ptr, off: int32): int32 =
+    var v: int32 = 0
+    rawmem_support.RawmemCopy(ptr(&v), rawmem_support.RawmemPtrAdd(src, off * 4), 4)
+    return v
+
+fn MrI32Set(dst: ptr, off: int32, v: int32) =
+    var local: int32 = v
+    rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(dst, off * 4), ptr(&local), 4)
+
+fn MrTriWord(words: ptr, tri: int32, w: int32, x: float64) =
+    MrI32Set(words, tri * MeshGpuTriWords + w, mrF64ToF32Bits(mrF64Bits(x)))
+
+# int32 payload words: screen coords in 1/4096 px (int truncation, ~5
+# ops vs the ~60-op f64->f32 bit dance) and shaded RGB as plain ints.
+# Words 6-9 (1/depths, 1/area) keep the float-bits path; the kernel
+# reinterprets via as_type<float>.
+fn MrTriWordI32(words: ptr, tri: int32, w: int32, v: int32) =
+    MrI32Set(words, tri * MeshGpuTriWords + w, v)
+
+fn MrU64Set(dst: ptr, off: int32, v: uint64) =
+    var local: uint64 = v
+    rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(dst, off * 8), ptr(&local), 8)
+
+# BGRA sky fill (140,120,96,255) with the pattern-doubling fill from
+# RasterClear, on a raw device-contents pointer
+fn MrGpuFillSky(base: ptr, totalBytes: int32) =
+    rawmem_support.RawmemSet(base, 140, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(base, 1), 120, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(base, 2), 96, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(base, 3), 255, 1)
+    var filled: int32 = 4
+    while filled < totalBytes:
+        var chunk: int32 = filled * 2
+        if chunk > totalBytes:
+            chunk = totalBytes
+        chunk = chunk - filled
+        rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(base, filled), base, chunk)
+        filled = filled + chunk
+
+# zbuf sentinel 2147483647 little-endian is the per-pixel byte pattern
+# FF FF FF 7F, exactly what RasterClear writes
+fn MrGpuFillDepthEmpty(base: ptr, totalBytes: int32) =
+    rawmem_support.RawmemSet(base, 255, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(base, 1), 255, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(base, 2), 255, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(base, 3), 127, 1)
+    var filled: int32 = 4
+    while filled < totalBytes:
+        var chunk: int32 = filled * 2
+        if chunk > totalBytes:
+            chunk = totalBytes
+        chunk = chunk - filled
+        rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(base, filled), base, chunk)
+        filled = filled + chunk
+
+# One-time pipeline bring-up (idempotent for the same frame size): device,
+# queue, runtime MSL compile, compute pipeline, and the fixed-size shared
+# buffers (params / per-tile meta / BGRA out / depth out). Triangle-sized
+# buffers grow lazily in MeshGpuFrame. Returns 0 on success, negative
+# stage code on failure (caller falls back to the CPU path).
+fn MeshGpuInit(width: int32, height: int32): int32 =
+    let existing = MeshGpuAt()
+    if existing != nil:
+        if existing.width == width:
+            if existing.height == height:
+                return 0
+        return -13
+    let pool: ptr = mrAutoreleasePoolPush()
+    let device: ptr = mrMtlCreateSystemDefaultDevice()
+    if device == nil:
+        mrAutoreleasePoolPop(pool)
+        return -1
+    let queue: ptr = mrMsgSend0(device, mrSelRegisterName("newCommandQueue"))
+    if queue == nil:
+        mrAutoreleasePoolPop(pool)
+        return -2
+    let msl: str = MeshGpuMsl()
+    let src: ptr = MrGpuNSString(msl.data)
+    if src == nil:
+        mrAutoreleasePoolPop(pool)
+        return -3
+    var libErr: ptr
+    let library: ptr = mrMsgSendPtrPtrPtr(device, mrSelRegisterName("newLibraryWithSource:options:error:"), src, nil, ptr(&libErr))
+    if library == nil:
+        mrAutoreleasePoolPop(pool)
+        return -4
+    let fnObj: ptr = mrMsgSendPtr(library, mrSelRegisterName("newFunctionWithName:"), MrGpuNSString(MeshGpuFnName))
+    if fnObj == nil:
+        mrAutoreleasePoolPop(pool)
+        return -5
+    var pipeErr: ptr
+    let pipeline: ptr = mrMsgSendPtrPtr(device, mrSelRegisterName("newComputePipelineStateWithFunction:error:"), fnObj, ptr(&pipeErr))
+    if pipeline == nil:
+        mrAutoreleasePoolPop(pool)
+        return -6
+    let paramBuf: ptr = mrMsgSendU64U64(device, mrSelRegisterName("newBufferWithLength:options:"), uint64(16), uint64(0))
+    if paramBuf == nil:
+        mrAutoreleasePoolPop(pool)
+        return -7
+    let tilesX: int32 = (width + MeshGpuTileSize - 1) / MeshGpuTileSize
+    let tilesY: int32 = (height + MeshGpuTileSize - 1) / MeshGpuTileSize
+    let tileCount: int32 = tilesX * tilesY
+    let metaBuf: ptr = mrMsgSendU64U64(device, mrSelRegisterName("newBufferWithLength:options:"), uint64(tileCount * 8), uint64(0))
+    if metaBuf == nil:
+        mrAutoreleasePoolPop(pool)
+        return -8
+    let bgraBuf: ptr = mrMsgSendU64U64(device, mrSelRegisterName("newBufferWithLength:options:"), uint64(width * height * 4), uint64(0))
+    if bgraBuf == nil:
+        mrAutoreleasePoolPop(pool)
+        return -9
+    let depthBuf: ptr = mrMsgSendU64U64(device, mrSelRegisterName("newBufferWithLength:options:"), uint64(width * height * 4), uint64(0))
+    if depthBuf == nil:
+        mrAutoreleasePoolPop(pool)
+        return -10
+    let countsData: ptr = mrCalloc(int64(tileCount), int64(4))
+    if countsData == nil:
+        mrAutoreleasePoolPop(pool)
+        return -11
+    let metaData: ptr = mrCalloc(int64(tileCount), int64(8))
+    if metaData == nil:
+        mrAutoreleasePoolPop(pool)
+        return -12
+    let gridData: ptr = mrCalloc(int64(3), int64(8))
+    if gridData == nil:
+        mrAutoreleasePoolPop(pool)
+        return -14
+    let groupData: ptr = mrCalloc(int64(3), int64(8))
+    if groupData == nil:
+        mrAutoreleasePoolPop(pool)
+        return -15
+    MrU64Set(groupData, 0, uint64(16))
+    MrU64Set(groupData, 1, uint64(16))
+    MrU64Set(groupData, 2, uint64(1))
+    var g = new(MeshGpuData)
+    g.ok = true
+    g.device = device
+    g.queue = queue
+    g.pipeline = pipeline
+    g.paramBuf = paramBuf
+    g.triBuf = nil
+    g.metaBuf = metaBuf
+    g.idxBuf = nil
+    g.bgraBuf = bgraBuf
+    g.depthBuf = depthBuf
+    g.width = width
+    g.height = height
+    g.tilesX = tilesX
+    g.tilesY = tilesY
+    g.triCap = 0
+    g.idxCap = 0
+    g.visData = nil
+    g.tbData = nil
+    g.triWordsData = nil
+    g.idxData = nil
+    g.countsData = countsData
+    g.metaData = metaData
+    g.gridData = gridData
+    g.groupData = groupData
+    add(meshGpuSlots, g)
+    mrAutoreleasePoolPop(pool)
+    return 0
+
+# Render one whole mesh frame on the GPU. The CPU prepass does projection,
+# culling, shading and 32x32-tile binning (serial, milliseconds); the
+# kernel does the per-pixel barycentric/depth work. Returns 0 on success,
+# negative stage code on failure. The rotation arrives as row-major rows
+# so the CPU golden path and the GPU prepass always transform a given
+# pose bit-identically.
+fn MeshGpuFrameRows(cam: camera.CinemaCamera,
+                    mesh: MeshHandle,
+                    ox: float64,
+                    oy: float64,
+                    oz: float64,
+                    scale: float64,
+                    m00: float64,
+                    m01: float64,
+                    m02: float64,
+                    m10: float64,
+                    m11: float64,
+                    m12: float64,
+                    m20: float64,
+                    m21: float64,
+                    m22: float64,
+                    r: int32,
+                    g: int32,
+                    b: int32): int32 =
+    let gp = MeshGpuAt()
+    if gp == nil:
+        return -1
+    let slot = MeshSlotAt(mesh)
+    if slot == nil:
+        return -2
+    let pool: ptr = mrAutoreleasePoolPush()
+    let tileCount: int32 = gp.tilesX * gp.tilesY
+    # grow triangle-sized staging (calloc zero-fills; the old block and the
+    # old MTLBuffer are intentionally leaked on the rare grow, same
+    # process-lifetime policy as gpu_raster)
+    if slot.triCount > gp.triCap:
+        gp.visData = mrCalloc(int64(slot.triCount), int64(4))
+        gp.tbData = mrCalloc(int64(slot.triCount), int64(16))
+        gp.triWordsData = mrCalloc(int64(slot.triCount), int64(MeshGpuTriWords * 4))
+        gp.triBuf = mrMsgSendU64U64(gp.device, mrSelRegisterName("newBufferWithLength:options:"), uint64(slot.triCount * MeshGpuTriWords * 4), uint64(0))
+        if gp.triBuf == nil:
+            mrAutoreleasePoolPop(pool)
+            return -3
+        gp.triCap = slot.triCount
+    # zero per-tile counts (counts double as write cursors after pass B)
+    var zi: int32 = 0
+    while zi < tileCount:
+        MrI32Set(gp.countsData, zi, 0)
+        zi = zi + 1
+    # pass A: per-triangle math identical to MeshRasterFrame + binning
+    var i: int32 = 0
+    while i < slot.triCount:
+        MrI32Set(gp.visData, i, 0)
+        let lx0: float64 = slot.v0x[i]
+        let ly0: float64 = slot.v0y[i]
+        let lz0: float64 = slot.v0z[i]
+        let lx1: float64 = slot.v1x[i]
+        let ly1: float64 = slot.v1y[i]
+        let lz1: float64 = slot.v1z[i]
+        let lx2: float64 = slot.v2x[i]
+        let ly2: float64 = slot.v2y[i]
+        let lz2: float64 = slot.v2z[i]
+        let wx0 = ox + scale * (lx0 * m00 + ly0 * m01 + lz0 * m02)
+        let wy0 = oy + scale * (lx0 * m10 + ly0 * m11 + lz0 * m12)
+        let wz0 = oz + scale * (lx0 * m20 + ly0 * m21 + lz0 * m22)
+        let wx1 = ox + scale * (lx1 * m00 + ly1 * m01 + lz1 * m02)
+        let wy1 = oy + scale * (lx1 * m10 + ly1 * m11 + lz1 * m12)
+        let wz1 = oz + scale * (lx1 * m20 + ly1 * m21 + lz1 * m22)
+        let wx2 = ox + scale * (lx2 * m00 + ly2 * m01 + lz2 * m02)
+        let wy2 = oy + scale * (lx2 * m10 + ly2 * m11 + lz2 * m12)
+        let wz2 = oz + scale * (lx2 * m20 + ly2 * m21 + lz2 * m22)
+        let p0 = camera.CameraProject(cam, wx0, wy0, wz0)
+        let p1 = camera.CameraProject(cam, wx1, wy1, wz1)
+        let p2 = camera.CameraProject(cam, wx2, wy2, wz2)
+        if p0.depth > 0.02:
+            if p1.depth > 0.02:
+                if p2.depth > 0.02:
+                    let nwx = slot.nx[i] * m00 + slot.ny[i] * m01 + slot.nz[i] * m02
+                    let nwy = slot.nx[i] * m10 + slot.ny[i] * m11 + slot.nz[i] * m12
+                    let nwz = slot.nx[i] * m20 + slot.ny[i] * m21 + slot.nz[i] * m22
+                    # two-sided: no backface cull (matches MeshRasterCore),
+                    # back faces light with the flipped normal
+                    var lum = 0.5
+                    let nn = nwx * nwx + nwy * nwy + nwz * nwz
+                    if nn > 0.0:
+                        let nlen = numerics.CsgSqrt(nn)
+                        let ndiff = (nwx * MeshLightX + nwy * MeshLightY + nwz * MeshLightZ) / nlen
+                        lum = 0.25 + 0.75 * m.absFloat(ndiff)
+                        if lum > 1.0:
+                            lum = 1.0
+                        if lum < 0.12:
+                            lum = 0.12
+                    let lumR: int32 = int32(float64(r) * lum)
+                    let lumG: int32 = int32(float64(g) * lum)
+                    let lumB: int32 = int32(float64(b) * lum)
+                    let area = (p1.sx - p0.sx) * (p2.sy - p0.sy) - (p2.sx - p0.sx) * (p1.sy - p0.sy)
+                    if m.absFloat(area) > 0.0001:
+                        let invArea = 1.0 / area
+                        var bx0: int32 = int32(m.floorFloat(m.minFloat(p0.sx, m.minFloat(p1.sx, p2.sx))))
+                        var bx1: int32 = int32(m.floorFloat(m.maxFloat(p0.sx, m.maxFloat(p1.sx, p2.sx)))) + 1
+                        var by0: int32 = int32(m.floorFloat(m.minFloat(p0.sy, m.minFloat(p1.sy, p2.sy))))
+                        var by1: int32 = int32(m.floorFloat(m.maxFloat(p0.sy, m.maxFloat(p1.sy, p2.sy)))) + 1
+                        if bx0 < 0:
+                            bx0 = 0
+                        if by0 < 0:
+                            by0 = 0
+                        if bx1 > gp.width - 1:
+                            bx1 = gp.width - 1
+                        if by1 > gp.height - 1:
+                            by1 = gp.height - 1
+                        MrTriWordI32(gp.triWordsData, i, 0, int32(p0.sx * 4096.0))
+                        MrTriWordI32(gp.triWordsData, i, 1, int32(p0.sy * 4096.0))
+                        MrTriWordI32(gp.triWordsData, i, 2, int32(p1.sx * 4096.0))
+                        MrTriWordI32(gp.triWordsData, i, 3, int32(p1.sy * 4096.0))
+                        MrTriWordI32(gp.triWordsData, i, 4, int32(p2.sx * 4096.0))
+                        MrTriWordI32(gp.triWordsData, i, 5, int32(p2.sy * 4096.0))
+                        MrTriWord(gp.triWordsData, i, 6, 1.0 / p0.depth)
+                        MrTriWord(gp.triWordsData, i, 7, 1.0 / p1.depth)
+                        MrTriWord(gp.triWordsData, i, 8, 1.0 / p2.depth)
+                        MrTriWord(gp.triWordsData, i, 9, invArea)
+                        MrTriWordI32(gp.triWordsData, i, 10, lumR)
+                        MrTriWordI32(gp.triWordsData, i, 11, lumG)
+                        MrTriWordI32(gp.triWordsData, i, 12, lumB)
+                        let tx0: int32 = bx0 / MeshGpuTileSize
+                        let tx1: int32 = bx1 / MeshGpuTileSize
+                        let ty0: int32 = by0 / MeshGpuTileSize
+                        let ty1: int32 = by1 / MeshGpuTileSize
+                        MrI32Set(gp.tbData, i * 4, tx0)
+                        MrI32Set(gp.tbData, i * 4 + 1, tx1)
+                        MrI32Set(gp.tbData, i * 4 + 2, ty0)
+                        MrI32Set(gp.tbData, i * 4 + 3, ty1)
+                        MrI32Set(gp.visData, i, 1)
+                        var tty: int32 = ty0
+                        while tty <= ty1:
+                            var ttx: int32 = tx0
+                            while ttx <= tx1:
+                                let tile: int32 = tty * gp.tilesX + ttx
+                                MrI32Set(gp.countsData, tile, MrI32Get(gp.countsData, tile) + 1)
+                                ttx = ttx + 1
+                            tty = tty + 1
+        i = i + 1
+    let pf1: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    mrPerfA = mrPerfA + (pf1 - pf0)
+    # exclusive prefix sum -> per-tile (start, count) meta + exact total
+    var total: int32 = 0
+    var ti: int32 = 0
+    while ti < tileCount:
+        let c: int32 = MrI32Get(gp.countsData, ti)
+        MrI32Set(gp.metaData, ti * 2, total)
+        MrI32Set(gp.metaData, ti * 2 + 1, c)
+        total = total + c
+        ti = ti + 1
+    if total > gp.idxCap:
+        gp.idxData = mrCalloc(int64(total), int64(4))
+        gp.idxBuf = mrMsgSendU64U64(gp.device, mrSelRegisterName("newBufferWithLength:options:"), uint64(total * 4), uint64(0))
+        if gp.idxBuf == nil:
+            mrAutoreleasePoolPop(pool)
+            return -4
+        gp.idxCap = total
+    # counts -> write cursors seeded with the start offsets
+    var ci: int32 = 0
+    while ci < tileCount:
+        MrI32Set(gp.countsData, ci, MrI32Get(gp.metaData, ci * 2))
+        ci = ci + 1
+    # pass B: fill tile index lists in ascending triangle order
+    var bi: int32 = 0
+    while bi < slot.triCount:
+        if MrI32Get(gp.visData, bi) == 1:
+            let tx0: int32 = MrI32Get(gp.tbData, bi * 4)
+            let tx1: int32 = MrI32Get(gp.tbData, bi * 4 + 1)
+            let ty0: int32 = MrI32Get(gp.tbData, bi * 4 + 2)
+            let ty1: int32 = MrI32Get(gp.tbData, bi * 4 + 3)
+            var ty: int32 = ty0
+            while ty <= ty1:
+                var tx: int32 = tx0
+                while tx <= tx1:
+                    let tile: int32 = ty * gp.tilesX + tx
+                    let cur: int32 = MrI32Get(gp.countsData, tile)
+                    MrI32Set(gp.idxData, cur, bi)
+                    MrI32Set(gp.countsData, tile, cur + 1)
+                    tx = tx + 1
+                ty = ty + 1
+        bi = bi + 1
+    # upload: params / triangle payloads / tile meta / tile indices
+    let pBase: ptr = MrGpuContents(gp.paramBuf)
+    var pw: int32 = gp.width
+    var ph: int32 = gp.height
+    var ptx: int32 = gp.tilesX
+    rawmem_support.RawmemCopy(pBase, ptr(&pw), 4)
+    rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(pBase, 4), ptr(&ph), 4)
+    rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(pBase, 8), ptr(&ptx), 4)
+    rawmem_support.RawmemCopy(MrGpuContents(gp.triBuf), gp.triWordsData, slot.triCount * MeshGpuTriWords * 4)
+    rawmem_support.RawmemCopy(MrGpuContents(gp.metaBuf), gp.metaData, tileCount * 8)
+    rawmem_support.RawmemCopy(MrGpuContents(gp.idxBuf), gp.idxData, total * 4)
+    MrGpuFillSky(MrGpuContents(gp.bgraBuf), gp.width * gp.height * 4)
+    MrGpuFillDepthEmpty(MrGpuContents(gp.depthBuf), gp.width * gp.height * 4)
+    let pf3: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    mrPerfC = mrPerfC + (pf3 - pf2)
+    let cmd: ptr = mrMsgSend0(gp.queue, mrSelRegisterName("commandBuffer"))
+    if cmd == nil:
+        mrAutoreleasePoolPop(pool)
+        return -5
+    let enc: ptr = mrMsgSend0(cmd, mrSelRegisterName("computeCommandEncoder"))
+    if enc == nil:
+        mrAutoreleasePoolPop(pool)
+        return -6
+    mrMsgSendSetPipeline(enc, mrSelRegisterName("setComputePipelineState:"), gp.pipeline)
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.paramBuf, ptr(uint64(0)), ptr(uint64(0)))
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.triBuf, ptr(uint64(0)), ptr(uint64(1)))
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.metaBuf, ptr(uint64(0)), ptr(uint64(2)))
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.idxBuf, ptr(uint64(0)), ptr(uint64(3)))
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.bgraBuf, ptr(uint64(0)), ptr(uint64(4)))
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.depthBuf, ptr(uint64(0)), ptr(uint64(5)))
+    MrU64Set(gp.gridData, 0, uint64(gp.width))
+    MrU64Set(gp.gridData, 1, uint64(gp.height))
+    MrU64Set(gp.gridData, 2, uint64(1))
+    mrMsgSendDispatchSizes(enc, mrSelRegisterName("dispatchThreads:threadsPerThreadgroup:"), gp.gridData, gp.groupData)
+    mrMsgSendVoid0(enc, mrSelRegisterName("endEncoding"))
+    mrMsgSendVoid0(cmd, mrSelRegisterName("commit"))
+    mrMsgSendVoid0(cmd, mrSelRegisterName("waitUntilCompleted"))
+    let status: uint64 = mrMsgSendU64Return(cmd, mrSelRegisterName("status"))
+    if status != uint64(4):
+        mrAutoreleasePoolPop(pool)
+        return -7
+    mrAutoreleasePoolPop(pool)
+    return 0
+
+# GPU frame with a yaw-around-Z orientation (legacy entry, same Rz math
+# as MeshRasterFrame).
+fn MeshGpuFrame(cam: camera.CinemaCamera,
+                mesh: MeshHandle,
+                ox: float64,
+                oy: float64,
+                oz: float64,
+                scale: float64,
+                yawRad: float64,
+                r: int32,
+                g: int32,
+                b: int32): int32 =
+    let cyaw = m.cosFloat(yawRad)
+    let syaw = m.sinFloat(yawRad)
+    return MeshGpuFrameRows(cam, mesh, ox, oy, oz, scale, cyaw, 0.0 - syaw, 0.0, syaw, cyaw, 0.0, 0.0, 0.0, 1.0, r, g, b)
+
+# GPU frame with a full unit-quaternion orientation: world =
+# (ox,oy,oz) + scale * R(q) * v, matching MeshRasterFrameOrient.
+fn MeshGpuFrameOrient(cam: camera.CinemaCamera,
+                      mesh: MeshHandle,
+                      ox: float64,
+                      oy: float64,
+                      oz: float64,
+                      scale: float64,
+                      qw: float64,
+                      qx: float64,
+                      qy: float64,
+                      qz: float64,
+                      r: int32,
+                      g: int32,
+                      b: int32): int32 =
+    var m00: float64
+    var m01: float64
+    var m02: float64
+    var m10: float64
+    var m11: float64
+    var m12: float64
+    var m20: float64
+    var m21: float64
+    var m22: float64
+    MeshQuatRows(qw, qx, qy, qz, m00, m01, m02, m10, m11, m12, m20, m21, m22)
+    return MeshGpuFrameRows(cam, mesh, ox, oy, oz, scale, m00, m01, m02, m10, m11, m12, m20, m21, m22, r, g, b)
+
+# Batch GPU composite: n quaternion-oriented mesh instances in ONE
+# dispatch, composited OVER a caller-provided surface (the live
+# ground+wall BGRA + its depth buffer) instead of the sky fill — the
+# per-pixel barycentric/depth work runs on the GPU and the caller pulls
+# the result back with MeshGpuCopyOutBgra/Depth. Prepass math = the
+# (two-sided) MeshGpuFrameRows pass, instance-major with a global
+# triangle index, so tile lists stay index-ordered and the kernel is
+# byte-identical. Returns 0 on success, negative stage code on failure
+# (caller falls back to the CPU mesh path).
+@borrows
+fn MeshGpuBatchOrient(cam: camera.CinemaCamera,
+                      n: int32,
+                      meshes: MeshHandle[],
+                      pxs: float64[],
+                      pys: float64[],
+                      pzs: float64[],
+                      qws: float64[],
+                      qxs: float64[],
+                      qys: float64[],
+                      qzs: float64[],
+                      rs: int32[],
+                      gs: int32[],
+                      bs: int32[],
+                      srcBgra: ptr,
+                      srcDepth: ptr): int32 =
+    let gp = MeshGpuAt()
+    if gp == nil:
+        return 0 - 1
+    if n <= 0:
+        return 0 - 2
+    # sum the instance triangle totals for the grow-on-demand staging
+    var totalTris: int32 = 0
+    var k: int32 = 0
+    while k < n:
+        let slot = MeshSlotAt(meshes[k])
+        if slot == nil:
+            return 0 - 3
+        totalTris = totalTris + slot.triCount
+        k = k + 1
+    let pool: ptr = mrAutoreleasePoolPush()
+    let tileCount: int32 = gp.tilesX * gp.tilesY
+    if totalTris > gp.triCap:
+        gp.visData = mrCalloc(int64(totalTris), int64(4))
+        gp.tbData = mrCalloc(int64(totalTris), int64(16))
+        gp.triWordsData = mrCalloc(int64(totalTris), int64(MeshGpuTriWords * 4))
+        gp.triBuf = mrMsgSendU64U64(gp.device, mrSelRegisterName("newBufferWithLength:options:"), uint64(totalTris * MeshGpuTriWords * 4), uint64(0))
+        if gp.triBuf == nil:
+            mrAutoreleasePoolPop(pool)
+            return 0 - 4
+        gp.triCap = totalTris
+    var zi: int32 = 0
+    while zi < tileCount:
+        MrI32Set(gp.countsData, zi, 0)
+        zi = zi + 1
+    let pf0: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    # pass A: instance-major per-triangle math, global payload index
+    var gi: int32 = 0
+    k = 0
+    while k < n:
+        let slot = MeshSlotAt(meshes[k])
+        var m00: float64
+        var m01: float64
+        var m02: float64
+        var m10: float64
+        var m11: float64
+        var m12: float64
+        var m20: float64
+        var m21: float64
+        var m22: float64
+        MeshQuatRows(qws[k], qxs[k], qys[k], qzs[k], m00, m01, m02, m10, m11, m12, m20, m21, m22)
+        let ox: float64 = pxs[k]
+        let oy: float64 = pys[k]
+        let oz: float64 = pzs[k]
+        let r: int32 = rs[k]
+        let g: int32 = gs[k]
+        let b: int32 = bs[k]
+        # world = pos + R(q) * v (scale 1.0: the dock table bakes the
+        # mesh's native metre scale)
+        var i: int32 = 0
+        while i < slot.triCount:
+            MrI32Set(gp.visData, gi, 0)
+            let lx0: float64 = slot.v0x[i]
+            let ly0: float64 = slot.v0y[i]
+            let lz0: float64 = slot.v0z[i]
+            let lx1: float64 = slot.v1x[i]
+            let ly1: float64 = slot.v1y[i]
+            let lz1: float64 = slot.v1z[i]
+            let lx2: float64 = slot.v2x[i]
+            let ly2: float64 = slot.v2y[i]
+            let lz2: float64 = slot.v2z[i]
+            let wx0 = ox + (lx0 * m00 + ly0 * m01 + lz0 * m02)
+            let wy0 = oy + (lx0 * m10 + ly0 * m11 + lz0 * m12)
+            let wz0 = oz + (lx0 * m20 + ly0 * m21 + lz0 * m22)
+            let wx1 = ox + (lx1 * m00 + ly1 * m01 + lz1 * m02)
+            let wy1 = oy + (lx1 * m10 + ly1 * m11 + lz1 * m12)
+            let wz1 = oz + (lx1 * m20 + ly1 * m21 + lz1 * m22)
+            let wx2 = ox + (lx2 * m00 + ly2 * m01 + lz2 * m02)
+            let wy2 = oy + (lx2 * m10 + ly2 * m11 + lz2 * m12)
+            let wz2 = oz + (lx2 * m20 + ly2 * m21 + lz2 * m22)
+            let p0 = camera.CameraProject(cam, wx0, wy0, wz0)
+            let p1 = camera.CameraProject(cam, wx1, wy1, wz1)
+            let p2 = camera.CameraProject(cam, wx2, wy2, wz2)
+            if p0.depth > 0.02:
+                if p1.depth > 0.02:
+                    if p2.depth > 0.02:
+                        let nwx = slot.nx[i] * m00 + slot.ny[i] * m01 + slot.nz[i] * m02
+                        let nwy = slot.nx[i] * m10 + slot.ny[i] * m11 + slot.nz[i] * m12
+                        let nwz = slot.nx[i] * m20 + slot.ny[i] * m21 + slot.nz[i] * m22
+                        var lum = 0.5
+                        let nn = nwx * nwx + nwy * nwy + nwz * nwz
+                        if nn > 0.0:
+                            let nlen = numerics.CsgSqrt(nn)
+                            let ndiff = (nwx * MeshLightX + nwy * MeshLightY + nwz * MeshLightZ) / nlen
+                            lum = 0.25 + 0.75 * m.absFloat(ndiff)
+                            if lum > 1.0:
+                                lum = 1.0
+                            if lum < 0.12:
+                                lum = 0.12
+                        let lumR: int32 = int32(float64(r) * lum)
+                        let lumG: int32 = int32(float64(g) * lum)
+                        let lumB: int32 = int32(float64(b) * lum)
+                        let area = (p1.sx - p0.sx) * (p2.sy - p0.sy) - (p2.sx - p0.sx) * (p1.sy - p0.sy)
+                        if m.absFloat(area) > 0.0001:
+                            let invArea = 1.0 / area
+                            var bx0: int32 = int32(m.floorFloat(m.minFloat(p0.sx, m.minFloat(p1.sx, p2.sx))))
+                            var bx1: int32 = int32(m.floorFloat(m.maxFloat(p0.sx, m.maxFloat(p1.sx, p2.sx)))) + 1
+                            var by0: int32 = int32(m.floorFloat(m.minFloat(p0.sy, m.minFloat(p1.sy, p2.sy))))
+                            var by1: int32 = int32(m.floorFloat(m.maxFloat(p0.sy, m.maxFloat(p1.sy, p2.sy)))) + 1
+                            if bx0 < 0:
+                                bx0 = 0
+                            if by0 < 0:
+                                by0 = 0
+                            if bx1 > gp.width - 1:
+                                bx1 = gp.width - 1
+                            if by1 > gp.height - 1:
+                                by1 = gp.height - 1
+                            var tw: int32[16]
+                            tw[0] = int32(p0.sx * 4096.0)
+                            tw[1] = int32(p0.sy * 4096.0)
+                            tw[2] = int32(p1.sx * 4096.0)
+                            tw[3] = int32(p1.sy * 4096.0)
+                            tw[4] = int32(p2.sx * 4096.0)
+                            tw[5] = int32(p2.sy * 4096.0)
+                            tw[6] = mrF64ToF32Bits(mrF64Bits(1.0 / p0.depth))
+                            tw[7] = mrF64ToF32Bits(mrF64Bits(1.0 / p1.depth))
+                            tw[8] = mrF64ToF32Bits(mrF64Bits(1.0 / p2.depth))
+                            tw[9] = mrF64ToF32Bits(mrF64Bits(invArea))
+                            tw[10] = lumR
+                            tw[11] = lumG
+                            tw[12] = lumB
+                            rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(gp.triWordsData, gi * (MeshGpuTriWords * 4)), ptr(&tw), MeshGpuTriWords * 4)
+                            let tx0: int32 = bx0 / MeshGpuTileSize
+                            let tx1: int32 = bx1 / MeshGpuTileSize
+                            let ty0: int32 = by0 / MeshGpuTileSize
+                            let ty1: int32 = by1 / MeshGpuTileSize
+                            MrI32Set(gp.tbData, gi * 4, tx0)
+                            MrI32Set(gp.tbData, gi * 4 + 1, tx1)
+                            MrI32Set(gp.tbData, gi * 4 + 2, ty0)
+                            MrI32Set(gp.tbData, gi * 4 + 3, ty1)
+                            MrI32Set(gp.visData, gi, 1)
+                            var tty: int32 = ty0
+                            while tty <= ty1:
+                                var ttx: int32 = tx0
+                                while ttx <= tx1:
+                                    let tile: int32 = tty * gp.tilesX + ttx
+                                    MrI32Set(gp.countsData, tile, MrI32Get(gp.countsData, tile) + 1)
+                                    ttx = ttx + 1
+                                tty = tty + 1
+            gi = gi + 1
+            i = i + 1
+        k = k + 1
+    let pf1: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    mrPerfA = mrPerfA + (pf1 - pf0)
+    # exclusive prefix sum -> per-tile (start, count) meta + exact total
+    var total: int32 = 0
+    var ti: int32 = 0
+    while ti < tileCount:
+        let c: int32 = MrI32Get(gp.countsData, ti)
+        MrI32Set(gp.metaData, ti * 2, total)
+        MrI32Set(gp.metaData, ti * 2 + 1, c)
+        total = total + c
+        ti = ti + 1
+    if total > gp.idxCap:
+        gp.idxData = mrCalloc(int64(total), int64(4))
+        gp.idxBuf = mrMsgSendU64U64(gp.device, mrSelRegisterName("newBufferWithLength:options:"), uint64(total * 4), uint64(0))
+        if gp.idxBuf == nil:
+            mrAutoreleasePoolPop(pool)
+            return 0 - 5
+        gp.idxCap = total
+    var ci: int32 = 0
+    while ci < tileCount:
+        MrI32Set(gp.countsData, ci, MrI32Get(gp.metaData, ci * 2))
+        ci = ci + 1
+    var bi: int32 = 0
+    while bi < totalTris:
+        if MrI32Get(gp.visData, bi) == 1:
+            let tx0: int32 = MrI32Get(gp.tbData, bi * 4)
+            let tx1: int32 = MrI32Get(gp.tbData, bi * 4 + 1)
+            let ty0: int32 = MrI32Get(gp.tbData, bi * 4 + 2)
+            let ty1: int32 = MrI32Get(gp.tbData, bi * 4 + 3)
+            var ty: int32 = ty0
+            while ty <= ty1:
+                var tx: int32 = tx0
+                while tx <= tx1:
+                    let tile: int32 = ty * gp.tilesX + tx
+                    let cur: int32 = MrI32Get(gp.countsData, tile)
+                    MrI32Set(gp.idxData, cur, bi)
+                    MrI32Set(gp.countsData, tile, cur + 1)
+                    tx = tx + 1
+                ty = ty + 1
+        bi = bi + 1
+    let pf2: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    mrPerfB = mrPerfB + (pf2 - pf1)
+    # upload + composite: the live surface comes IN as the kernel's
+    # starting BGRA/depth (ground+wall already painted), the kernel adds
+    # the meshes on top with the depth test
+    let pBase: ptr = MrGpuContents(gp.paramBuf)
+    var pw: int32 = gp.width
+    var ph: int32 = gp.height
+    var ptx: int32 = gp.tilesX
+    rawmem_support.RawmemCopy(pBase, ptr(&pw), 4)
+    rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(pBase, 4), ptr(&ph), 4)
+    rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(pBase, 8), ptr(&ptx), 4)
+    rawmem_support.RawmemCopy(MrGpuContents(gp.triBuf), gp.triWordsData, totalTris * MeshGpuTriWords * 4)
+    rawmem_support.RawmemCopy(MrGpuContents(gp.metaBuf), gp.metaData, tileCount * 8)
+    rawmem_support.RawmemCopy(MrGpuContents(gp.idxBuf), gp.idxData, total * 4)
+    let surfBytes: int32 = gp.width * gp.height * 4
+    rawmem_support.RawmemCopy(MrGpuContents(gp.bgraBuf), srcBgra, surfBytes)
+    rawmem_support.RawmemCopy(MrGpuContents(gp.depthBuf), srcDepth, surfBytes)
+    let pf3: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    mrPerfC = mrPerfC + (pf3 - pf2)
+    let cmd: ptr = mrMsgSend0(gp.queue, mrSelRegisterName("commandBuffer"))
+    if cmd == nil:
+        mrAutoreleasePoolPop(pool)
+        return 0 - 6
+    let enc: ptr = mrMsgSend0(cmd, mrSelRegisterName("computeCommandEncoder"))
+    if enc == nil:
+        mrAutoreleasePoolPop(pool)
+        return 0 - 7
+    mrMsgSendSetPipeline(enc, mrSelRegisterName("setComputePipelineState:"), gp.pipeline)
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.paramBuf, ptr(uint64(0)), ptr(uint64(0)))
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.triBuf, ptr(uint64(0)), ptr(uint64(1)))
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.metaBuf, ptr(uint64(0)), ptr(uint64(2)))
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.idxBuf, ptr(uint64(0)), ptr(uint64(3)))
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.bgraBuf, ptr(uint64(0)), ptr(uint64(4)))
+    mrMsgSendSetBuffer(enc, mrSelRegisterName("setBuffer:offset:atIndex:"), gp.depthBuf, ptr(uint64(0)), ptr(uint64(5)))
+    MrU64Set(gp.gridData, 0, uint64(gp.width))
+    MrU64Set(gp.gridData, 1, uint64(gp.height))
+    MrU64Set(gp.gridData, 2, uint64(1))
+    mrMsgSendDispatchSizes(enc, mrSelRegisterName("dispatchThreads:threadsPerThreadgroup:"), gp.gridData, gp.groupData)
+    mrMsgSendVoid0(enc, mrSelRegisterName("endEncoding"))
+    mrMsgSendVoid0(cmd, mrSelRegisterName("commit"))
+    mrMsgSendVoid0(cmd, mrSelRegisterName("waitUntilCompleted"))
+    let status: uint64 = mrMsgSendU64Return(cmd, mrSelRegisterName("status"))
+    let pf4: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    mrPerfD = mrPerfD + (pf4 - pf3)
+    if status != uint64(4):
+        mrAutoreleasePoolPop(pool)
+        return 0 - 8
+    mrAutoreleasePoolPop(pool)
+    return 0
+
+# Copy the finished GPU frame out into caller-owned BGRA / zbuf surfaces
+# (cpu_raster layout: 4 bytes BGRA + 4 bytes int32 mm per pixel)
+fn MeshGpuCopyOutBgra(dst: rawbytes.Bytes) =
+    let gp = MeshGpuAt()
+    if gp == nil:
+        return
+    rawmem_support.RawmemCopy(rawbytes.BytesDataPtr(dst), MrGpuContents(gp.bgraBuf), gp.width * gp.height * 4)
+
+fn MeshGpuCopyOutDepth(dst: rawbytes.Bytes) =
+    let gp = MeshGpuAt()
+    if gp == nil:
+        return
+    rawmem_support.RawmemCopy(rawbytes.BytesDataPtr(dst), MrGpuContents(gp.depthBuf), gp.width * gp.height * 4)
+
+# ptr-formal variants (a ref object's managed Bytes field cannot be read
+# by value at the call site; the data pointer passes freely)
+fn MeshGpuCopyOutBgraPtr(dst: ptr) =
+    let gp = MeshGpuAt()
+    if gp == nil:
+        return
+    rawmem_support.RawmemCopy(dst, MrGpuContents(gp.bgraBuf), gp.width * gp.height * 4)
+
+fn MeshGpuCopyOutDepthPtr(dst: ptr) =
+    let gp = MeshGpuAt()
+    if gp == nil:
+        return
+    rawmem_support.RawmemCopy(dst, MrGpuContents(gp.depthBuf), gp.width * gp.height * 4)
+
+# zero-copy: the live device-shared BGRA contents pointer (valid until
+# the next MeshGpu* dispatch overwrites it) — callers can push it
+# straight to the display list instead of copying 2 x 3.7 MB per frame
+fn MeshGpuBgraLivePtr(): ptr =
+    let gp = MeshGpuAt()
+    if gp == nil:
+        return nil
+    return MrGpuContents(gp.bgraBuf)

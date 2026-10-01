@@ -1,0 +1,238 @@
+# committee_vote.cheng - VRF sortition, proposal voting and tally.
+#
+# Sortition (Algorand-style self-selection, integer-only):
+#   ticket = first 8 bytes of ECVRF proof-to-hash over seed
+#            "rwad.committee" || epoch(BE4) || round(BE4), forced positive.
+#   selected iff ticket < (MaxI64 / totalStake) * stake.
+#   Division-before-multiplication loses at most one unit of the smallest
+#     stake share - irrelevant for a probabilistic lottery, no bignum need.
+# Ranking: selected tickets ascending by vrf hash; leader is the first.
+#
+# Voting: members sign sha512(proposal_hash || voter_pubkey); tally accepts
+# one vote per pubkey and reaches quorum at 2f+1. Signatures use the
+# in-repo ed25519 wrapper (see architecture doc section 5 item 5 for the
+# external-interop caveat).
+
+import std/system
+import std/rawbytes
+import std/result
+import std/strutils as strutil
+import std/crypto/sha512 as sha512
+import std/crypto/vrf as vrf
+import cheng/libp2p/crypto/ed25519/ed25519 as ed25519
+import cheng/std/bytes_layout as layout
+import cheng/chain/lsmr_types as lt
+
+const
+    CvtSeedPrefix: str = "rwad.committee"
+    CvtMaxI64: int64 = 9223372036854775807
+
+type
+    CommitteeTicket =
+        vrfHash: layout.FixedBytes32
+        stake: int64
+        selected: bool
+        proof: Bytes
+
+    CommitteeMember =
+        sk: Bytes
+        priv64: Bytes
+        pk: Bytes
+        stake: int64
+        ticket: CommitteeTicket
+
+    SignedVote =
+        voterPk: Bytes
+        proposalHash: layout.FixedBytes32
+        sig: Bytes
+
+fn CvtBuildSeed(epoch: int32, round: int32): Bytes =
+    var buf = BytesAlloc(24)
+    let prefix = BytesFromString(CvtSeedPrefix)
+    var i: int32
+    while i < prefix.len:
+        BytesSet(buf, i, BytesGet(prefix, i))
+        i = i + 1
+    # prefix is 14 bytes; epoch BE4 at [14..18), round BE4 at [18..22)
+    BytesSet(buf, 17, epoch % 256)
+    BytesSet(buf, 16, (epoch / 256) % 256)
+    BytesSet(buf, 15, (epoch / 65536) % 256)
+    BytesSet(buf, 14, (epoch / 16777216) % 256)
+    BytesSet(buf, 21, round % 256)
+    BytesSet(buf, 20, (round / 256) % 256)
+    BytesSet(buf, 19, (round / 65536) % 256)
+    BytesSet(buf, 18, (round / 16777216) % 256)
+    BytesSet(buf, 22, 0x00)
+    BytesSet(buf, 23, 0x00)
+    return buf
+
+# Draw one member's lottery ticket for (epoch, round). The ed25519 keypair
+# is derived from sk so priv64 and pubkey are guaranteed to match.
+@borrows
+fn CommitteeDraw(sk: Bytes, stake: int64, totalStake: int64,
+                 epoch: int32, round: int32): Result[CommitteeMember] =
+    if totalStake <= 0:
+        return Err[CommitteeMember]("committee: total stake must be positive")
+    if stake < 0:
+        return Err[CommitteeMember]("committee: stake must be non-negative")
+    let kpRes = ed25519.keyPairFromSeed(sk)
+    if !kpRes.ok:
+        return Err[CommitteeMember](kpRes.err.msg)
+    let kmRes = vrf.VrfExpandSecret(sk)
+    if !kmRes.ok:
+        return Err[CommitteeMember](kmRes.err.msg)
+    var seed = CvtBuildSeed(epoch, round)
+    let proofRes = vrf.VrfProve(sk, seed)
+    if !proofRes.ok:
+        return Err[CommitteeMember](proofRes.err.msg)
+    let betaRes = vrf.VrfProofToHash(proofRes.value)
+    if !betaRes.ok:
+        return Err[CommitteeMember](betaRes.err.msg)
+    # first 8 bytes little-endian, top bit cleared to stay positive
+    var raw: int64 = 0
+    var i: int32 = 0
+    while i < 8:
+        var byteVal: int64 = Int64(BytesGet(betaRes.value, i))
+        if i == 7:
+            byteVal = byteVal % 128
+        raw = raw + byteVal * CvtByteWeight(i)
+        i = i + 1
+    let perStakeUnit: int64 = CvtMaxI64 / totalStake
+    let threshold: int64 = perStakeUnit * stake
+    var member: CommitteeMember
+    member.sk = sk
+    member.priv64 = kpRes.value.privateKey.data
+    member.pk = kpRes.value.publicKey.data
+    member.stake = stake
+    member.ticket.vrfHash = layout.FixedBytes32()
+    var hb = BytesSlice(betaRes.value, 0, 32)
+    let setRes = layout.FixedBytes32FromBytes(hb)
+    if !setRes.ok:
+        return Err[CommitteeMember]("committee: hash truncation failed")
+    member.ticket.vrfHash = setRes.value
+    member.ticket.stake = stake
+    member.ticket.selected = raw < threshold
+    member.ticket.proof = proofRes.value
+    return Ok[CommitteeMember](member)
+
+fn CvtByteWeight(i: int32): int64 =
+    # 256^i as int64 constants (max i=7 -> 2^56 fits comfortably)
+    if i == 0:
+        return 1
+    if i == 1:
+        return 256
+    if i == 2:
+        return 65536
+    if i == 3:
+        return 16777216
+    if i == 4:
+        return 4294967296
+    if i == 5:
+        return 1099511627776
+    if i == 6:
+        return 281474976710656
+    return 72057594037927936
+
+# Rank selected members by vrf hash ascending; leader is index 0 of the
+# output. Emits sorted member copies (the input view is consumed). Selection
+# sort with single-variable subscripts.
+@borrows
+fn CvtCloneBytes(src: Bytes): Bytes =
+    var out = BytesAlloc(src.len)
+    var k: int32
+    while k < src.len:
+        BytesSet(out, k, BytesGet(src, k))
+        k = k + 1
+    return out
+
+@borrows
+fn CvtCloneMember(m: CommitteeMember): CommitteeMember =
+    # Deep copy: every Bytes field gets independent storage so the ranked
+    # output never aliases the caller array (ORC single-owner contract).
+    var out: CommitteeMember
+    out.sk = CvtCloneBytes(m.sk)
+    out.priv64 = CvtCloneBytes(m.priv64)
+    out.pk = CvtCloneBytes(m.pk)
+    out.stake = m.stake
+    out.ticket.vrfHash = m.ticket.vrfHash
+    out.ticket.stake = m.ticket.stake
+    out.ticket.selected = m.ticket.selected
+    out.ticket.proof = CvtCloneBytes(m.ticket.proof)
+    return out
+
+fn CommitteeRankSelected(members: CommitteeMember[], committeeSize: int32,
+                         outMembers: var CommitteeMember[]): int32 =
+    var idx: int32[]
+    var i: int32
+    while i < members.len:
+        if members[i].ticket.selected:
+            add(idx, i)
+        i = i + 1
+    i = 0
+    while i < idx.len and i < committeeSize:
+        var bestPos: int32 = i
+        var j: int32 = i + 1
+        while j < idx.len:
+            if lt.FixedBytes32Less(members[idx[j]].ticket.vrfHash,
+                                   members[idx[bestPos]].ticket.vrfHash):
+                bestPos = j
+            j = j + 1
+        if bestPos != i:
+            let tmp: int32 = idx[i]
+            idx[i] = idx[bestPos]
+            idx[bestPos] = tmp
+        i = i + 1
+    i = 0
+    while i < idx.len and i < committeeSize:
+        add(outMembers, CvtCloneMember(members[idx[i]]))
+        i = i + 1
+    return 0
+
+# Member signs a proposal hash; duplicate voters are rejected at tally.
+@borrows
+fn CommitteeSignVote(member: CommitteeMember,
+                     proposalHash: layout.FixedBytes32): Result[SignedVote] =
+    let phBytes = layout.FixedBytes32ToBytes(proposalHash)
+    let msg = sha512.Sha512Digest2(phBytes, member.pk)
+    let sigRes = ed25519.signEd25519Raw(member.priv64, msg)
+    if !sigRes.ok:
+        return Err[SignedVote](sigRes.err.msg)
+    var vote: SignedVote
+    # member is a borrowed view: clone the pk into the owned result instead
+    # of moving a borrow-sourced field (ORC single-owner contract).
+    vote.voterPk = CvtCloneBytes(member.pk)
+    vote.proposalHash = proposalHash
+    vote.sig = sigRes.value
+    return Ok[SignedVote](vote)
+
+# Count valid distinct votes for proposalHash among the committee set.
+@borrows
+fn CommitteeTally(votes: SignedVote[], committeePks: Bytes[],
+                  proposalHash: layout.FixedBytes32): int32 =
+    var accepted: int32 = 0
+    var i: int32
+    while i < votes.len:
+        let v = votes[i]
+        var inCommittee: bool = false
+        var j: int32
+        while j < committeePks.len:
+            if BytesEqual(committeePks[j], v.voterPk):
+                inCommittee = true
+            j = j + 1
+        if inCommittee and layout.FixedBytes32Equal(v.proposalHash, proposalHash):
+            var duplicate: bool = false
+            var k: int32
+            while k < i:
+                if BytesEqual(votes[k].voterPk, v.voterPk):
+                    duplicate = true
+                k = k + 1
+            if !duplicate:
+                let phBytes = layout.FixedBytes32ToBytes(v.proposalHash)
+                let msg = sha512.Sha512Digest2(phBytes, v.voterPk)
+                if ed25519.verifyEd25519(v.voterPk, msg, v.sig):
+                    accepted = accepted + 1
+        i = i + 1
+    return accepted
+
+fn CommitteeQuorumReached(tallyCount: int32, f: int32): bool =
+    return tallyCount >= 2 * f + 1

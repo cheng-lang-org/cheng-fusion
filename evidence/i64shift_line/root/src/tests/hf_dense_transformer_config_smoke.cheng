@@ -1,0 +1,260 @@
+import std/result
+import std/strings
+import std/strutils as strutil
+import std/math as m
+import cheng/inference/hf_model_graph as hfgraph
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/model_executor as exec
+import cheng/inference/weight_binding as wb
+import cheng/inference/weight_store as ws
+
+// Real Qwen/Qwen2.5-0.5B config.json (fetched from
+// https://huggingface.co/Qwen/Qwen2.5-0.5B/raw/main/config.json on 2026-07-11).
+// Float-typed fields (attention_dropout, initializer_range, rms_norm_eps,
+// rope_theta) are now included: cheng/core/csg_core/json_canonical's number
+// grammar was integer-only (rejected any decimal point or exponent) and has
+// been extended to the full RFC8259 number grammar (frac + exponent), so the
+// real config parses byte-for-byte without dropping any field. Every field
+// below is the untouched real value; nothing is invented.
+fn qwen25HalfBConfigJson(): str =
+    return strutil.Join([
+        "{",
+        "\"architectures\":[\"Qwen2ForCausalLM\"],",
+        "\"attention_dropout\":0.0,",
+        "\"bos_token_id\":151643,",
+        "\"eos_token_id\":151643,",
+        "\"hidden_act\":\"silu\",",
+        "\"hidden_size\":896,",
+        "\"initializer_range\":0.02,",
+        "\"intermediate_size\":4864,",
+        "\"max_position_embeddings\":32768,",
+        "\"max_window_layers\":24,",
+        "\"model_type\":\"qwen2\",",
+        "\"num_attention_heads\":14,",
+        "\"num_hidden_layers\":24,",
+        "\"num_key_value_heads\":2,",
+        "\"rms_norm_eps\":1e-06,",
+        "\"rope_theta\":1000000.0,",
+        "\"sliding_window\":32768,",
+        "\"tie_word_embeddings\":true,",
+        "\"torch_dtype\":\"bfloat16\",",
+        "\"transformers_version\":\"4.40.1\",",
+        "\"use_cache\":true,",
+        "\"use_mrope\":false,",
+        "\"use_sliding_window\":false,",
+        "\"vocab_size\":151936",
+        "}"
+    ], "")
+
+fn qwen25HalfBConfigJsonMissingHiddenSize(): str =
+    return strutil.Join([
+        "{",
+        "\"model_type\":\"qwen2\",",
+        "\"num_attention_heads\":14,",
+        "\"num_hidden_layers\":24,",
+        "\"num_key_value_heads\":2,",
+        "\"intermediate_size\":4864,",
+        "\"tie_word_embeddings\":true,",
+        "\"vocab_size\":151936",
+        "}"
+    ], "")
+
+fn qwen25HalfBConfigJsonWrongModelType(): str =
+    return strutil.Join([
+        "{",
+        "\"model_type\":\"llama\",",
+        "\"hidden_size\":896,",
+        "\"num_attention_heads\":14,",
+        "\"num_hidden_layers\":24,",
+        "\"num_key_value_heads\":2,",
+        "\"intermediate_size\":4864,",
+        "\"tie_word_embeddings\":true,",
+        "\"vocab_size\":151936",
+        "}"
+    ], "")
+
+fn qwen25HalfBConfigJsonBadHeadDivisibility(): str =
+    return strutil.Join([
+        "{",
+        "\"model_type\":\"qwen2\",",
+        "\"hidden_size\":10,",
+        "\"num_attention_heads\":3,",
+        "\"num_hidden_layers\":1,",
+        "\"intermediate_size\":16,",
+        "\"vocab_size\":32",
+        "}"
+    ], "")
+
+// small synthetic dense-transformer config (not a real named model, deliberately
+// tiny dimensions) fed through the *same* parsing + graph-building code path as the
+// real Qwen2.5-0.5B config above, so the executable-weight-store bridge proof stays
+// tractable in a smoke test (a real 24-layer/896-hidden/151936-vocab graph's actual
+// weight bytes would be hundreds of MB, infeasible to materialize here).
+fn tinyDenseConfigJson(): str =
+    return strutil.Join([
+        "{",
+        "\"model_type\":\"qwen2\",",
+        "\"hidden_size\":8,",
+        "\"num_attention_heads\":2,",
+        "\"num_key_value_heads\":1,",
+        "\"num_hidden_layers\":2,",
+        "\"intermediate_size\":12,",
+        "\"vocab_size\":20,",
+        "\"tie_word_embeddings\":false",
+        "}"
+    ], "")
+
+fn findWeightIndex(graph: mg.ModelGraph, tensorName: str): int32 =
+    for i in 0..<graph.weights.len:
+        if graph.weights[i].tensorName == tensorName:
+            return i
+    return -1
+
+fn requireWeight(graph: mg.ModelGraph, tensorName: str): mg.ModelWeightShard =
+    let idx = findWeightIndex(graph, tensorName)
+    assert(idx >= 0, strutil.Join([" hf dense transformer config smoke: missing weight ", tensorName], ""))
+    return graph.weights[idx]
+
+fn denseMakeWeightTensor(weight: mg.ModelWeightShard, ordinal: int32): infer.TensorQ =
+    let countRes = mg.ModelGraphTensorElementCount(weight.shape)
+    assert(IsOk(countRes), " hf dense transformer config smoke: weight count")
+    let elemCount = int32(Value(countRes))
+    var data: int32[]
+    for i in 0..<elemCount:
+        add(data, (ordinal + 1) * 3 + (i % 7) + 1)
+    var out: infer.TensorQ
+    let res = infer.TensorFromDataFill(out, weight.shape, 1000, data)
+    assert(IsOk(res), " hf dense transformer config smoke: tensor fill")
+    return out
+
+fn denseBuildExecFixture(graph: mg.ModelGraph): mg.ModelGraph =
+    var payloads: ws.WeightTensorPayload[]
+    var bindings: wb.WeightShardBinding[]
+    for i in 0..<graph.weights.len:
+        let peerId = strutil.Join(["peer:dense-cfg:", strings.IntToStr(i)], "")
+        let tensor = denseMakeWeightTensor(graph.weights[i], i)
+        let payloadRes = ws.WeightTensorPayloadBuild(
+            graph.weights[i].modelCid,
+            graph.weights[i].tensorName,
+            graph.weights[i].shardCid,
+            graph.weights[i].dtype,
+            graph.weights[i].quantScheme,
+            peerId,
+            tensor
+        )
+        assert(IsOk(payloadRes), " hf dense transformer config smoke: payload")
+        let payload = Value(payloadRes)
+        add(payloads, payload)
+        add(bindings, wb.WeightShardBinding(
+            modelCid: graph.weights[i].modelCid,
+            tensorName: graph.weights[i].tensorName,
+            shardCid: graph.weights[i].shardCid,
+            dtype: graph.weights[i].dtype,
+            quantScheme: graph.weights[i].quantScheme,
+            sizeBytes: graph.weights[i].sizeBytes,
+            peerId: peerId,
+            payloadHash: payload.payloadHash
+        ))
+    let bindingSet = wb.WeightBindingBuildSet(graph.modelCid, bindings)
+    let store = ws.WeightTensorStoreBuild(graph.modelCid, payloads)
+    var hashes: int64[]
+    for i in 0..<payloads.len:
+        add(hashes, payloads[i].payloadHash)
+    let boundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(graph, hashes)
+    assert(IsOk(boundGraphRes), " hf dense transformer config smoke: bind payload hashes")
+    let boundGraph = Value(boundGraphRes)
+    assert(IsOk(wb.WeightBindingValidate(bindingSet, boundGraph)), " hf dense transformer config smoke: binding validate")
+    let validated = exec.ModelExecutorValidateDenseTransformerGraph(boundGraph, bindingSet, store)
+    assert(IsOk(validated) && Value(validated),
+           " hf dense transformer config smoke: parsed graph accepted by slice1 validator")
+    return boundGraph
+
+fn main(): int32 =
+    let configJson = qwen25HalfBConfigJson()
+
+    // 1. field-by-field config parse against the real Qwen2.5-0.5B values.
+    let cfgRes = hfgraph.HfDenseTransformerConfigFromJson(configJson)
+    assert(IsOk(cfgRes), " hf dense transformer config smoke: parse qwen2.5-0.5b config")
+    let cfg = Value(cfgRes)
+    assert(cfg.modelType == "qwen2", " hf dense transformer config smoke: model_type")
+    assert(cfg.vocabSize == 151936, " hf dense transformer config smoke: vocab_size")
+    assert(cfg.hiddenSize == 896, " hf dense transformer config smoke: hidden_size")
+    assert(cfg.layerCount == 24, " hf dense transformer config smoke: num_hidden_layers")
+    assert(cfg.attentionHeads == 14, " hf dense transformer config smoke: num_attention_heads")
+    assert(cfg.keyValueHeads == 2, " hf dense transformer config smoke: num_key_value_heads")
+    assert(cfg.headDim == 64, " hf dense transformer config smoke: derived head_dim (896/14)")
+    assert(cfg.intermediateSize == 4864, " hf dense transformer config smoke: intermediate_size")
+    assert(cfg.tieWordEmbeddings, " hf dense transformer config smoke: tie_word_embeddings")
+    assert(cfg.sourceConfigHash != int64(0), " hf dense transformer config smoke: source config hash")
+    assert(m.ApproxEq(cfg.ropeTheta, 1000000.0, 0.001), " hf dense transformer config smoke: rope_theta")
+
+    // 2. build the full real-scale ModelGraph and structurally validate it (no weight
+    //    payload bytes required for structural validation -- ModelGraphValidate only
+    //    checks declared shapes/byte-count consistency, not actual tensor content).
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        configJson,
+        "cid:model:qwen2.5-0.5b",
+        kir.KernelDtypeFp16,
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsOk(graphRes), " hf dense transformer config smoke: build qwen2.5-0.5b graph")
+    let graph = Value(graphRes)
+    assert(IsOk(mg.ModelGraphValidate(graph)), " hf dense transformer config smoke: qwen2.5-0.5b graph validates")
+    assert(graph.architecture == mg.InferenceModelArchitectureDenseTransformer &&
+           graph.weights.len == 218 &&
+           graph.ops.len == 195,
+           " hf dense transformer config smoke: qwen2.5-0.5b inventory")
+    assert(m.ApproxEq(graph.ropeTheta, 1000000.0, 0.001), " hf dense transformer config smoke: graph rope_theta")
+
+    let embed = requireWeight(graph, "model.embed_tokens.weight")
+    assert(embed.shape.len == 2 && embed.shape[0] == 151936 && embed.shape[1] == 896,
+           " hf dense transformer config smoke: embedding shape")
+    let qProj = requireWeight(graph, "model.layers.0.self_attn.q_proj.weight")
+    assert(qProj.shape[0] == 896 && qProj.shape[1] == 896,
+           " hf dense transformer config smoke: q_proj shape")
+    let kProj = requireWeight(graph, "model.layers.0.self_attn.k_proj.weight")
+    assert(kProj.shape[0] == 128 && kProj.shape[1] == 896,
+           " hf dense transformer config smoke: k_proj shape (kv_heads*head_dim = 2*64)")
+    let gateProj = requireWeight(graph, "model.layers.23.mlp.gate_proj.weight")
+    assert(gateProj.shape[0] == 4864 && gateProj.shape[1] == 896,
+           " hf dense transformer config smoke: last-layer gate_proj shape")
+    let downProj = requireWeight(graph, "model.layers.23.mlp.down_proj.weight")
+    assert(downProj.shape[0] == 896 && downProj.shape[1] == 4864,
+           " hf dense transformer config smoke: last-layer down_proj shape")
+    // tied embeddings: no separate lm_head.weight shard, lm_head op reuses the embedding.
+    assert(findWeightIndex(graph, "lm_head.weight") == -1,
+           " hf dense transformer config smoke: tied embeddings drop lm_head shard")
+
+    // 3. bridge proof: the exact same parsing + graph-building path, fed a tractable
+    //    tiny config, produces a graph that clears slice1's ModelExecutorValidateDenseTransformerGraph
+    //    with real (small) weight payloads bound in.
+    let tinyGraphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        tinyDenseConfigJson(),
+        "cid:model:dense-cfg-tiny",
+        kir.KernelDtypeFp16,
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsOk(tinyGraphRes), " hf dense transformer config smoke: build tiny graph")
+    let tinyGraph = Value(tinyGraphRes)
+    assert(tinyGraph.weights.len == 21 && tinyGraph.ops.len == 19,
+           " hf dense transformer config smoke: tiny inventory (untied lm_head)")
+    let tinyBoundGraph = denseBuildExecFixture(tinyGraph)
+    assert(tinyBoundGraph.weights.len == tinyGraph.weights.len,
+           " hf dense transformer config smoke: tiny bound graph weight count")
+
+    // 4. dishonest/malformed inputs are rejected, not silently guessed.
+    assert(IsErr(hfgraph.HfDenseTransformerConfigFromJson(qwen25HalfBConfigJsonMissingHiddenSize())),
+           " hf dense transformer config smoke: missing hidden_size hard fail")
+    assert(IsErr(hfgraph.HfDenseTransformerConfigFromJson(qwen25HalfBConfigJsonWrongModelType())),
+           " hf dense transformer config smoke: unsupported model_type hard fail")
+    assert(IsErr(hfgraph.HfDenseTransformerConfigFromJson(qwen25HalfBConfigJsonBadHeadDivisibility())),
+           " hf dense transformer config smoke: hidden/head divisibility hard fail")
+    assert(IsErr(hfgraph.HfDenseTransformerConfigFromJson("")),
+           " hf dense transformer config smoke: empty json hard fail")
+    assert(IsErr(hfgraph.HfModelGraphBuildDenseTransformerFromConfig(configJson, "", kir.KernelDtypeFp16, mg.ModelQuantSchemeNone)),
+           " hf dense transformer config smoke: empty model cid hard fail")
+
+    echo(" hf_dense_transformer_config_smoke ok")
+    return 0

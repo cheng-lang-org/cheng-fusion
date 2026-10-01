@@ -1,0 +1,399 @@
+import std/strings
+import std/strutils as strutil
+import std/math as mathlib
+
+# Milestone A slice 7: independent pure-Cheng golden oracle for the
+# dense-transformer greedy generation loop
+# (engine.DistributedGenerateGreedyDenseTransformerTokens over
+# model_executor.ModelExecutorExecuteDenseTransformerTokens, exercised by
+# src/tests/model_executor_dense_transformer_smoke.cheng).
+#
+# Independence contract (per 2026-07-13 R2 instruction: golden oracle must be
+# pure Cheng, no Python):
+#   - This file imports NOTHING from src/inference/* (no kernel.cheng
+#     TensorQ, no model_executor.cheng fill functions, no
+#     distributed_engine.cheng generate loop). Every primitive below
+#     (DgRef-prefixed) is a fresh, from-scratch re-derivation of the fixed-
+#     point spec, written independently against the same public formulas the
+#     production modules implement -- not a copy/import of their code.
+#   - Toolchain independence (honest status, not aspirational): the intent
+#     was to compile+run this file with the pinned zero-C backend driver
+#     (artifacts/backend_driver/cheng) while the smoke test under test stays
+#     on artifacts/bootstrap/cheng.stage3, so two independently-built
+#     compiler front/back ends compute the same fixed-point program. That
+#     driver run was actually attempted and hit real, reproducible driver
+#     frontier gaps (rc=2, 15x ZC_NOT_READY, reproduced twice: std/math.cheng's
+#     pure-Cheng roundFloat/lnFloat/expFloat Taylor-series helpers plus this
+#     file's own DgRefEmbedding/DgRefRopeApply loops all bail on pre-existing
+#     node-eval backend gaps unrelated to this slice -- bail=707/801/8548/
+#     missing_call_target). Per the honest-downgrade instruction this file is
+#     therefore compiled+run with artifacts/bootstrap/cheng.stage3, same as
+#     the smoke test. The cross-check that actually matters for catching SUT
+#     bugs -- a from-scratch, zero-shared-code algorithm re-derivation -- is
+#     unaffected by this: it still independently reproduces the SUT's logits
+#     bit-for-bit (see the smoke test's forward-execution assertions).
+#   - The only facts imported from the production side are: (a) the tiny
+#     fixture's *decoded* fp16 weight stream (the CYCLE constants below --
+#     these were themselves independently fp16-bit-decode-verified back in
+#     the 2026-07-12 slice-6 patch and are asserted byte-for-byte unchanged
+#     in model_executor_dense_transformer_smoke.cheng's
+#     "decode 1.0/-0.5/0.25/4.0/-2.0/0.125" assertions, so re-deriving fp16
+#     bit-pattern decoding here would just be duplicating already-covered,
+#     unrelated code -- out of scope for this slice, which is about the
+#     *generation loop*, not fp16 decoding); (b) the graph topology (op
+#     sequence Embedding->RmsNorm->Qkv->Rope->Attention->RmsNorm->Mlp->LmHead,
+#     hidden=4, vocab=8, ropeTheta=10000.0) which is a structural fixture
+#     shape, not an algorithm.
+#
+# Retired tools/inference_dense_golden.py in the same patch that adds this
+# file (2026-07-13 R2: "golden oracle must be pure Cheng, no Python" is a
+# hard instruction, not a preference). CYCLE constant and its derivation
+# comment below are migrated verbatim from that retired script.
+
+const
+    DgRefHidden: int32 = 4
+    DgRefVocab: int32 = 8
+    DgRefScale: int32 = 1000
+    DgRefSoftmaxScale: int32 = 10000
+    DgRefTrigScale: int32 = 1073741824
+
+# cheng_cold (stage3's chained legacy parser) does not resolve top-level
+# `const NAME: float64 = ...` identifiers referenced from inside a function
+# body (repro'd standalone: `const X: float64 = 1.0` + `fn f(): float64 =
+# return X` -> "unknown identifier 'X'"; the equivalent int32 const resolves
+# fine). model_executor.cheng's own ModelExecutorRopeTrigScale() sidesteps
+# the same class of issue by wrapping its constant in a zero-arg function
+# instead of a top-level const; mirrored here independently for the same
+# reason.
+fn DgRefRopeTheta(): float64 =
+    return 10000.0
+
+# python-verified (tools/inference_dense_golden.py, now retired) IEEE754
+# half-precision raw bit patterns -> decoded scaled ints at scale=1000,
+# mirroring model_executor_dense_transformer_smoke.cheng's denseF16RawAt:
+#   1.0 -> 0x3c00 -> 1000, -0.5 -> 0xb800 -> -500, 0.25 -> 0x3400 -> 250,
+#   4.0 -> 0x4400 -> 4000, -2.0 -> 0xc000 -> -2000, 0.125 -> 0x3000 -> 125
+fn DgRefCycleAt(ordinal: int32): int32 =
+    let slot = ordinal % 6
+    if slot == 0:
+        return 1000
+    if slot == 1:
+        return -500
+    if slot == 2:
+        return 250
+    if slot == 3:
+        return 4000
+    if slot == 4:
+        return -2000
+    return 125
+
+type
+    # Flat row-major matrix, scale is always DgRefScale (1000) except where
+    # a function explicitly documents a different fixed-point scale (RoPE's
+    # transient DgRefTrigScale).
+    DgRefMat =
+        rows: int32
+        cols: int32
+        vals: int32[]
+
+fn DgRefOffset(cols: int32, row: int32, col: int32): int32 =
+    return row * cols + col
+
+fn DgRefSat(value: int64): int32 =
+    if value > int64(2147483647):
+        return 2147483647
+    if value < int64(-2147483648):
+        return -2147483648
+    return int32(value)
+
+# Round-half-away-from-zero integer division. Cheng's int64 '/' truncates
+# toward zero (like C), so nudging the numerator by half the denominator
+# before truncating implements rounding.
+fn DgRefRoundDiv(numer: int64, denom: int64): int64 =
+    if denom <= int64(0):
+        return int64(0)
+    let half = denom / int64(2)
+    if numer >= int64(0):
+        return (numer + half) / denom
+    return (numer - half) / denom
+
+fn DgRefMulQ(a: int32, b: int32, scale: int32): int32 =
+    let product = int64(a) * int64(b)
+    return DgRefSat(DgRefRoundDiv(product, int64(scale)))
+
+# Integer sqrt via Newton's method, mirroring infer.InferenceIntSqrt
+# (kernel.cheng) exactly: same iteration, same int64 truncating division.
+fn DgRefIntSqrt(value: int64): int64 =
+    if value <= int64(0):
+        return int64(0)
+    var x = value
+    var y = (x + int64(1)) / int64(2)
+    while y < x:
+        x = y
+        y = (x + value / x) / int64(2)
+    return x
+
+fn DgRefTakeStream(ordinal: var int32, count: int32): int32[] =
+    var out: int32[]
+    for _ in 0..<count:
+        add(out, DgRefCycleAt(ordinal))
+        ordinal = ordinal + 1
+    return out
+
+fn DgRefEmbedding(tokenIds: int32[], emb: DgRefMat): DgRefMat =
+    let tokenCount = tokenIds.len
+    let hidden = emb.cols
+    var outVals: int32[]
+    for _ in 0..<(tokenCount * hidden):
+        add(outVals, 0)
+    for t in 0..<tokenCount:
+        let tokenId = tokenIds[t]
+        for h in 0..<hidden:
+            outVals[DgRefOffset(hidden, t, h)] = emb.vals[DgRefOffset(hidden, tokenId, h)]
+    return DgRefMat(rows: tokenCount, cols: hidden, vals: outVals)
+
+fn DgRefRmsNormRows(x: DgRefMat, weight: int32[], epsilonScale: int32): DgRefMat =
+    var outVals: int32[]
+    for _ in 0..<x.vals.len:
+        add(outVals, 0)
+    for t in 0..<x.rows:
+        var squareSum: int64
+        for h in 0..<x.cols:
+            let v = x.vals[DgRefOffset(x.cols, t, h)]
+            squareSum = squareSum + int64(v) * int64(v)
+        let meanSquare = squareSum / int64(x.cols)
+        # #153/#154 root fix mirrored here: normBase is the fixed-point sqrt
+        # of (meanSquare + epsilonScale), not a truncated-divide-by-scale --
+        # matches ModelExecutorRmsNormRowsFill/KernelIrRmsNormCpuFill exactly
+        # (model_executor.cheng:918, kernel_ir.cheng:651).
+        var normBase = DgRefIntSqrt(meanSquare + int64(epsilonScale))
+        if normBase <= int64(0):
+            normBase = int64(1)
+        for h in 0..<x.cols:
+            let inputValue = x.vals[DgRefOffset(x.cols, t, h)]
+            let weightValue = weight[h]
+            let weighted = int64(inputValue) * int64(weightValue)
+            outVals[DgRefOffset(x.cols, t, h)] = DgRefSat(weighted / normBase)
+    return DgRefMat(rows: x.rows, cols: x.cols, vals: outVals)
+
+fn DgRefMatMul(left: DgRefMat, right: DgRefMat): DgRefMat =
+    var outVals: int32[]
+    for _ in 0..<(left.rows * right.cols):
+        add(outVals, 0)
+    for row in 0..<left.rows:
+        for col in 0..<right.cols:
+            # #153 root fix mirrored here: accumulate the full-precision
+            # int64 dot product first, then round-divide by scale exactly
+            # once at the end (matches kernel.cheng's MatMul2dFill:249) --
+            # was previously round-dividing every per-term product before
+            # summing, which loses ~30x more quantization precision.
+            var sum: int64
+            for kk in 0..<left.cols:
+                let leftVal = left.vals[DgRefOffset(left.cols, row, kk)]
+                let rightVal = right.vals[DgRefOffset(right.cols, kk, col)]
+                let product = int64(leftVal) * int64(rightVal)
+                sum = sum + product
+            outVals[DgRefOffset(right.cols, row, col)] = DgRefSat(DgRefRoundDiv(sum, int64(DgRefScale)))
+    return DgRefMat(rows: left.rows, cols: right.cols, vals: outVals)
+
+# Prefill-only RoPE (position == row index), full-width span (colStart=0,
+# ropeDim=x.cols), mirroring the same neox rotate_half formula validated
+# against HF in the 2026-07-11 slice-4 patch.
+fn DgRefRopeApply(x: DgRefMat): DgRefMat =
+    let ropeDim = x.cols
+    let halfDim = ropeDim / 2
+    var outVals: int32[]
+    for i in 0..<x.vals.len:
+        add(outVals, x.vals[i])
+    let lnTheta = mathlib.Ln(DgRefRopeTheta())
+    var invFreq: float64[]
+    for j in 0..<halfDim:
+        let exponent = 0.0 - float64(2 * j) / float64(2 * halfDim)
+        add(invFreq, mathlib.Exp(exponent * lnTheta))
+    let trigScaleF = float64(DgRefTrigScale)
+    for row in 0..<x.rows:
+        var cosRow: int32[]
+        var sinRow: int32[]
+        for j in 0..<halfDim:
+            let angle = float64(row) * invFreq[j]
+            add(cosRow, int32(int64(mathlib.Round(mathlib.Cos(angle) * trigScaleF))))
+            add(sinRow, int32(int64(mathlib.Round(mathlib.Sin(angle) * trigScaleF))))
+        for j in 0..<halfDim:
+            let idx1 = DgRefOffset(x.cols, row, j)
+            let idx2 = DgRefOffset(x.cols, row, halfDim + j)
+            let x1 = outVals[idx1]
+            let x2 = outVals[idx2]
+            let c = cosRow[j]
+            let s = sinRow[j]
+            let o1 = DgRefSat(int64(DgRefMulQ(x1, c, DgRefTrigScale)) - int64(DgRefMulQ(x2, s, DgRefTrigScale)))
+            let o2 = DgRefSat(int64(DgRefMulQ(x2, c, DgRefTrigScale)) + int64(DgRefMulQ(x1, s, DgRefTrigScale)))
+            outVals[idx1] = o1
+            outVals[idx2] = o2
+    return DgRefMat(rows: x.rows, cols: x.cols, vals: outVals)
+
+fn DgRefRowDot(x: DgRefMat, leftRow: int32, rightRow: int32): int64 =
+    var sum: int64
+    for h in 0..<x.cols:
+        let a = x.vals[DgRefOffset(x.cols, leftRow, h)]
+        let b = x.vals[DgRefOffset(x.cols, rightRow, h)]
+        sum = sum + int64(a) * int64(b)
+    return sum
+
+# outputScale-domain softmax weight for exp(delta / inputScale), delta <= 0,
+# via the same 12-term fixed-point Taylor series identity
+# exp(x) ~= 1 / sum_{k=0..12} (-x)^k / k! (all terms carried in outputScale
+# fixed point through DgRefRoundDiv, no floats at all).
+fn DgRefExpNegQ(delta: int32, inputScale: int32, outputScale: int32): int32 =
+    if delta >= 0:
+        return outputScale
+    if delta <= 0 - inputScale * 8:
+        return 0
+    let dQ = DgRefSat(DgRefRoundDiv(int64(0 - delta) * int64(outputScale), int64(inputScale)))
+    var term: int64 = int64(outputScale)
+    var total: int64 = int64(outputScale)
+    for k in 1..12:
+        term = DgRefRoundDiv(term * int64(dQ), int64(outputScale * k))
+        total = total + term
+    if total <= int64(0):
+        return 0
+    return DgRefSat(DgRefRoundDiv(int64(outputScale) * int64(outputScale), total))
+
+fn DgRefCausalSoftmaxAttention(x: DgRefMat): DgRefMat =
+    var outVals: int32[]
+    for _ in 0..<x.vals.len:
+        add(outVals, 0)
+    for t in 0..<x.rows:
+        var scores: int32[]
+        var maxScore: int32
+        for c in 0..<t + 1:
+            let score = DgRefSat(DgRefRoundDiv(DgRefRowDot(x, t, c), int64(DgRefScale)))
+            if c == 0 || score > maxScore:
+                maxScore = score
+            add(scores, score)
+        var weights: int32[]
+        var denom: int64
+        for i in 0..<scores.len:
+            let w = DgRefExpNegQ(scores[i] - maxScore, DgRefScale, DgRefSoftmaxScale)
+            add(weights, w)
+            denom = denom + int64(w)
+        for h in 0..<x.cols:
+            var numer: int64
+            for c in 0..<t + 1:
+                let v = x.vals[DgRefOffset(x.cols, c, h)]
+                numer = numer + int64(v) * int64(weights[c])
+            outVals[DgRefOffset(x.cols, t, h)] = DgRefSat(DgRefRoundDiv(numer, denom))
+    return DgRefMat(rows: x.rows, cols: x.cols, vals: outVals)
+
+fn DgRefArgmaxRow(logits: DgRefMat, row: int32): int32 =
+    var bestIndex: int32
+    var bestValue = logits.vals[DgRefOffset(logits.cols, row, 0)]
+    for c in 1..<logits.cols:
+        let v = logits.vals[DgRefOffset(logits.cols, row, c)]
+        if v > bestValue:
+            bestValue = v
+            bestIndex = c
+    return bestIndex
+
+type
+    DgRefWeights =
+        emb: DgRefMat
+        norm0: int32[]
+        qkvW: DgRefMat
+        norm1: int32[]
+        mlpW: DgRefMat
+        lmHeadW: DgRefMat
+
+# Weight order mirrors ModelGraphBuildTinyDenseTransformerFixture's
+# graph.weights list exactly (embedding[8,4] -> norm0[4] -> qkv[4,4] ->
+# norm1[4] -> mlp[4,4] -> lm_head[4,8]), same running element-ordinal cycled
+# through DgRefCycleAt as denseF16RawAt/denseSafetensorsBytes in the smoke
+# fixture builder.
+fn DgRefBuildWeights(): DgRefWeights =
+    var ordinal: int32
+    let embVals = DgRefTakeStream(ordinal, 8 * DgRefHidden)
+    let norm0 = DgRefTakeStream(ordinal, DgRefHidden)
+    let qkvVals = DgRefTakeStream(ordinal, DgRefHidden * DgRefHidden)
+    let norm1 = DgRefTakeStream(ordinal, DgRefHidden)
+    let mlpVals = DgRefTakeStream(ordinal, DgRefHidden * DgRefHidden)
+    let lmHeadVals = DgRefTakeStream(ordinal, DgRefHidden * DgRefVocab)
+    return DgRefWeights(
+        emb: DgRefMat(rows: 8, cols: DgRefHidden, vals: embVals),
+        norm0: norm0,
+        qkvW: DgRefMat(rows: DgRefHidden, cols: DgRefHidden, vals: qkvVals),
+        norm1: norm1,
+        mlpW: DgRefMat(rows: DgRefHidden, cols: DgRefHidden, vals: mlpVals),
+        lmHeadW: DgRefMat(rows: DgRefHidden, cols: DgRefVocab, vals: lmHeadVals)
+    )
+
+# Op sequence mirrors ModelExecutorExecuteDenseTransformerOp's dispatch order
+# exactly: Embedding -> RmsNorm(norm0) -> Qkv(matmul) -> Rope -> Attention
+# (causal softmax) -> RmsNorm(norm1) -> Mlp(matmul) -> LmHead(matmul).
+fn DgRefForward(tokenIds: int32[], w: DgRefWeights): DgRefMat =
+    let hidden0 = DgRefEmbedding(tokenIds, w.emb)
+    let norm0Out = DgRefRmsNormRows(hidden0, w.norm0, 1)
+    let qkv0 = DgRefMatMul(norm0Out, w.qkvW)
+    let rope0 = DgRefRopeApply(qkv0)
+    let attn0 = DgRefCausalSoftmaxAttention(rope0)
+    let norm1Out = DgRefRmsNormRows(attn0, w.norm1, 1)
+    let mlp0 = DgRefMatMul(norm1Out, w.mlpW)
+    let logits = DgRefMatMul(mlp0, w.lmHeadW)
+    return logits
+
+# Bare greedy generate loop, algorithm-independent re-derivation of
+# DistributedGenerateGreedyDenseTransformerTokens's contract: no persisted kv
+# cache, full forward recompute every step over the whole token list so far,
+# next token = argmax over the last row of that step's logits, optional
+# early stop when the produced token equals eosTokenId.
+fn DgRefGenerateGreedy(promptTokenIds: int32[], maxNewTokens: int32, eosTokenId: int32, w: DgRefWeights): int32[] =
+    var current: int32[]
+    for i in 0..<promptTokenIds.len:
+        add(current, promptTokenIds[i])
+    for _ in 0..<maxNewTokens:
+        let logits = DgRefForward(current, w)
+        let lastRow = current.len - 1
+        let token = DgRefArgmaxRow(logits, lastRow)
+        add(current, token)
+        if eosTokenId >= 0 && token == eosTokenId:
+            break
+    return current
+
+fn DgRefIntArrayToString(arr: int32[]): str =
+    var parts: str[]
+    for i in 0..<arr.len:
+        add(parts, strings.IntToStr(arr[i]))
+    return strutil.Join(parts, ",")
+
+fn DgRefMatToString(m: DgRefMat): str =
+    return DgRefIntArrayToString(m.vals)
+
+fn main(): int32 =
+    let w = DgRefBuildWeights()
+    let promptTokenIds = [0, 0]
+
+    # --- checkpoint prints for the hand-derivation anchor (see
+    # model_executor_dense_transformer_smoke.cheng's generate-loop assertion
+    # block for the full by-hand transcription of this chain) ---
+    let hidden0 = DgRefEmbedding(promptTokenIds, w.emb)
+    let norm0Out = DgRefRmsNormRows(hidden0, w.norm0, 1)
+    let qkv0 = DgRefMatMul(norm0Out, w.qkvW)
+    let rope0 = DgRefRopeApply(qkv0)
+    echo(strutil.Join(["rope0: ", DgRefMatToString(rope0)], ""))
+    let attn0 = DgRefCausalSoftmaxAttention(rope0)
+    echo(strutil.Join(["attn0: ", DgRefMatToString(attn0)], ""))
+    let norm1Out = DgRefRmsNormRows(attn0, w.norm1, 1)
+    let mlp0 = DgRefMatMul(norm1Out, w.mlpW)
+    echo(strutil.Join(["mlp0: ", DgRefMatToString(mlp0)], ""))
+    let logits0 = DgRefMatMul(mlp0, w.lmHeadW)
+    echo(strutil.Join(["logits: ", DgRefMatToString(logits0)], ""))
+    echo(strutil.Join(["argmax_row1: ", strings.IntToStr(DgRefArgmaxRow(logits0, 1))], ""))
+
+    # --- generation loop (the actual milestone-A-slice-7 golden output) ---
+    let generated = DgRefGenerateGreedy(promptTokenIds, 3, -1, w)
+    echo(strutil.Join(["generate: ", DgRefIntArrayToString(generated)], ""))
+
+    let eosToken = generated[2]
+    let eosGenerated = DgRefGenerateGreedy(promptTokenIds, 3, eosToken, w)
+    echo(strutil.Join(["generate_eos: ", DgRefIntArrayToString(eosGenerated)], ""))
+
+    echo("inference_dense_golden_ref_main ok")
+    return 0

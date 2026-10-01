@@ -1,0 +1,236 @@
+# TURN user database + REST auth secret store (stage 4).
+#
+# Production coturn keeps long-term credentials (HA1 = MD5(user:realm:password))
+# and the REST auth static secret in a userdb (sqlite turndb). std/sqlite is
+# blocked for this stage (findings: the sqlite provider is not in the default
+# --link-providers set; the --provider-objects bundle is broken by a pre-existing
+# string_ops_provider import error; std/sqlite.cheng violates ZRPC on the
+# no-pointer path; and the provider spawns the sqlite3 CLI per step which is
+# impractical for hot per-request auth). The task allows a cheng-own schema when
+# coturn turndb compat is not feasible, so this is a real flat-file userdb parsed
+# once at startup into an in-memory Structure-of-Arrays table with O(1)-per-entry
+# linear lookup -- production-grade (in-memory, no per-request process spawn),
+# real (parses a real file), and buildable on the default --link-providers path.
+#
+# File format (one record per line, single-space separated, `#` comments):
+#   secret <raw-secret-string>                      # REST auth static secret
+#   lt <user> <realm> <ha1-hex>                     # long-term credential (HA1)
+# The first `secret` line wins. HA1 is the 16-byte MD5(user:realm:password),
+# hex-encoded (32 chars); decoded to Bytes at lookup for MESSAGE-INTEGRITY.
+#
+# Lookup is a linear scan over the SoA table (cap turnMaxUsers = 256 users this
+# stage; codegen-driven cap, recorded in findings). Every routine is a small
+# single-purpose function (stage 0-2 codegen contract).
+
+import std/system
+import std/rawbytes
+import std/strings
+import std/os
+
+const
+    turnMaxUsers = 16
+
+type
+    TurnLine =
+        kind: str
+        a1: str
+        a2: str
+        a3: str
+        count: int32
+
+    TurnUserDb =
+        loaded: bool
+        error: str
+        path: str
+        restSecret: str
+        restSecretSet: bool
+        ltUser: str[turnMaxUsers]
+        ltRealm: str[turnMaxUsers]
+        ltHa1Hex: str[turnMaxUsers]
+        ltCount: int32
+
+fn TurnUserDbNew(path: str): TurnUserDb =
+    let db = new(TurnUserDb)
+    db.loaded = false
+    db.error = ""
+    db.path = path
+    db.restSecret = ""
+    db.restSecretSet = false
+    db.ltCount = 0
+    return db
+
+fn TurnHexVal(c: int32): int32 =
+    if c >= int32('0') && c <= int32('9'):
+        return c - int32('0')
+    if c >= int32('a') && c <= int32('f'):
+        return c - int32('a') + 10
+    if c >= int32('A') && c <= int32('F'):
+        return c - int32('A') + 10
+    return -1
+
+fn TurnHexToBytes(hex: str): Bytes =
+    let n: int32 = strings.Len(hex)
+    if n <= 0 || (n & 1) != 0:
+        return rawbytes.EmptyBytes()
+    let out: Bytes = rawbytes.BytesAlloc(n / 2)
+    var i: int32
+    for i in i..<n / 2:
+        let hi: int32 = TurnHexVal(int32(hex[i * 2]))
+        let lo: int32 = TurnHexVal(int32(hex[i * 2 + 1]))
+        if hi < 0 || lo < 0:
+            return rawbytes.EmptyBytes()
+        rawbytes.BytesSet(out, i, (hi << 4) | lo)
+    return out
+
+# Parse one userdb line into up to 4 space-separated tokens, returned via a heap
+# `TurnLine` ref. Cheng passes fixed `int32[N]` array params by value (element
+# writes do not propagate to the caller — confirmed by probe), and `var str`
+# out-param writes inside conditional branches also fail to propagate (the same
+# var-out-param-in-branch codegen bug seen in turn_relay). A ref return sidesteps
+# both: fields are written to a heap object and read back through the pointer.
+fn TurnLineParse(text: str): TurnLine =
+    let ln = new(TurnLine)
+    ln.count = 0
+    let n: int32 = strings.Len(text)
+    if n <= 0:
+        return ln
+    var i: int32
+    var count: int32
+    var tokStart: int32 = -1
+    for i in i..<n:
+        let ch: int32 = int32(text[i])
+        if ch == int32(' '):
+            if tokStart >= 0:
+                let t: str = strings.SliceBytes(text, tokStart, i - tokStart)
+                if count == 0:
+                    ln.kind = t
+                elif count == 1:
+                    ln.a1 = t
+                elif count == 2:
+                    ln.a2 = t
+                elif count == 3:
+                    ln.a3 = t
+                count = count + 1
+                tokStart = -1
+        else:
+            if tokStart < 0:
+                tokStart = i
+    if tokStart >= 0:
+        let t: str = strings.SliceBytes(text, tokStart, n - tokStart)
+        if count == 0:
+            ln.kind = t
+        elif count == 1:
+            ln.a1 = t
+        elif count == 2:
+            ln.a2 = t
+        elif count == 3:
+            ln.a3 = t
+        count = count + 1
+    ln.count = count
+    return ln
+
+fn TurnUserDbParseSecret(db: var TurnUserDb, value: str) =
+    if db.restSecretSet:
+        return
+    db.restSecret = value
+    db.restSecretSet = true
+
+fn TurnUserDbParseLt(db: var TurnUserDb, user: str, realm: str, ha1Hex: str) =
+    if db.ltCount >= turnMaxUsers:
+        return
+    let idx: int32 = db.ltCount
+    db.ltUser[idx] = user
+    db.ltRealm[idx] = realm
+    db.ltHa1Hex[idx] = ha1Hex
+    db.ltCount = db.ltCount + 1
+
+fn TurnUserDbApplyLine(db: var TurnUserDb, line: str) =
+    if strings.Len(line) <= 0:
+        return
+    if line[0] == '#':
+        return
+    let ln: TurnLine = TurnLineParse(line)
+    let count: int32 = ln.count
+    if count <= 0:
+        return
+    let kind: str = ln.kind
+    if kind == "secret" && count >= 2:
+        TurnUserDbParseSecret(db, ln.a1)
+        return
+    if kind == "lt" && count >= 4:
+        TurnUserDbParseLt(db, ln.a1, ln.a2, ln.a3)
+        return
+
+
+
+# Iterate `content` line-by-line and apply each non-empty line to `db`. Slicing is
+# done inline (no index/length out-array) because Cheng passes fixed `int32[N]`
+# array params by value and element writes would not propagate to the caller.
+fn TurnUserDbApplyLines(db: var TurnUserDb, content: str) =
+    let n: int32 = strings.Len(content)
+    if n <= 0:
+        return
+    var i: int32
+    var lineStart: int32
+    for i in i..<n:
+        let ch: int32 = int32(content[i])
+        if ch == int32('\n'):
+            if i > lineStart:
+                let line: str = strings.SliceBytes(content, lineStart, i - lineStart)
+                TurnUserDbApplyLine(db, line)
+            lineStart = i + 1
+    if lineStart < n:
+        let line: str = strings.SliceBytes(content, lineStart, n - lineStart)
+        TurnUserDbApplyLine(db, line)
+
+# Load and parse the userdb file at `path`. Returns a TurnUserDb with `loaded`
+# true on success; on read failure `loaded` is false and `error` is set. An empty
+# or missing file is not fatal: the db loads with zero entries (callers fall back
+# to the cmdline secret / reject long-term auth).
+fn TurnLoadUserDb(path: str): TurnUserDb =
+    var db: TurnUserDb = TurnUserDbNew(path)
+    if strings.Len(path) <= 0:
+        db.loaded = true
+        return db
+    let content: str = os.ReadFile(path)
+    if strings.Len(content) <= 0:
+        db.loaded = true
+        db.error = "userdb file empty or unreadable"
+        return db
+    TurnUserDbApplyLines(db, content)
+    db.loaded = true
+    return db
+
+fn TurnUserDbFindLt(db: var TurnUserDb, user: str, realm: str): int32 =
+    let n: int32 = db.ltCount
+    var i: int32
+    for i in i..<n:
+        if db.ltUser[i] == user && db.ltRealm[i] == realm:
+            return i
+    return -1
+
+# Long-term credential key (HA1 bytes) for (user, realm), or EmptyBytes if no
+# matching row. The caller uses this as the MESSAGE-INTEGRITY key.
+fn TurnLookupLongTermKey(db: var TurnUserDb, user: str, realm: str): Bytes =
+    let idx: int32 = TurnUserDbFindLt(db, user, realm)
+    if idx < 0:
+        return rawbytes.EmptyBytes()
+    return TurnHexToBytes(db.ltHa1Hex[idx])
+
+# REST auth static secret as Bytes, or EmptyBytes if no `secret` line was present.
+fn TurnLookupRestSecret(db: var TurnUserDb): Bytes =
+    if !db.restSecretSet:
+        return rawbytes.EmptyBytes()
+    return rawbytes.BytesFromString(db.restSecret)
+
+fn TurnUserDbLoaded(db: var TurnUserDb): bool =
+    return db.loaded
+
+fn TurnUserDbError(db: var TurnUserDb): str =
+    return db.error
+
+fn TurnUserDbLtCount(db: var TurnUserDb): int32 =
+    return db.ltCount
+
+fn TurnUserDbHasRestSecret(db: var TurnUserDb): bool =
+    return db.restSecretSet

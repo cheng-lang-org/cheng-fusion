@@ -1,0 +1,469 @@
+import std/result
+import std/strings as strings
+import std/rawbytes
+import std/system
+import std/os
+import std/strutils as strutil
+import std/crypto/aesgcm
+import std/crypto/chacha20poly1305 as chacha
+import cheng/quic/tls/common
+
+type
+    VpnProxyTcpTlsRecordKeys =
+        key: Bytes
+        iv: Bytes
+        seq: int64
+        cipherCode: int32
+        # AES key schedule cached once at key install. The connection key is fixed,
+        # so the round keys never change — expanding them per record (intoAesGcmKeyInto
+        # + BytesFree on every enc/dec) was pure waste. expanded=true means rounds/
+        # roundKeys are valid; the record path uses them directly with no expand/free.
+        rounds: int32
+        roundKeys: Bytes
+        expanded: bool
+
+    VpnProxyTcpTlsRecordPlain =
+        contentType: int32
+        payload: Bytes
+
+const
+    VpnProxyTcpTlsContentTypeHandshake = 22
+    VpnProxyTcpTlsContentTypeApplicationData = 23
+    VpnProxyTcpTlsLegacyVersionMajor = 3
+    VpnProxyTcpTlsLegacyVersionMinor = 3
+    VpnProxyTcpTlsRecordHeaderLen = 5
+    VpnProxyTcpTlsRecordMaxPayloadLen = 16384
+    VpnProxyTcpTlsRecordTagLen = 16
+    VpnProxyTcpTlsCipherAes128Gcm = 1
+    VpnProxyTcpTlsCipherChacha20Poly1305 = 3
+
+fn tcpTlsRecordDebugEnabled(): bool =
+    return os.GetEnvDefault("CHENG_TCP_TLS_FORWARD_DEBUG", "") == "1"
+
+fn tcpTlsRecordDebugLine(parts: str[]) =
+    if !tcpTlsRecordDebugEnabled():
+        return
+    os.WriteLine(os.Get_stderr(), strutil.Join(parts, ""))
+
+fn tcpTlsRecordDebugHex(label: str, data: Bytes) =
+    if !tcpTlsRecordDebugEnabled():
+        return
+    tcpTlsRecordDebugLine([label, BytesToHex(data)])
+
+fn tcpTlsRecordReadU16(data: Bytes, offset: int32): int32 =
+    # [x86 shift 错译绕行] << 8 改 * 256(记录长度被错译成巨值→worker 永等→
+    # 下行 >1KB 停摆的健康轮实证)。
+    var value: int32
+    value = (BytesGet(data, offset) & 255) * 256
+    value = value + (BytesGet(data, offset + 1) & 255)
+    return value
+
+fn tcpTlsRecordNonce(iv: Bytes, seq: int64): Result[Bytes] =
+    if BytesLen(iv) != 12:
+        return Err[Bytes]("tcp-tls-forward record: invalid iv")
+    let out: Bytes = BytesSlice(iv, 0, 12)
+    for i in 0..<8:
+        let shift: int32 = (7 - i) * 8
+        let b: int32 = int32((seq >> shift) & int64(255))
+        let idx: int32 = 4 + i
+        BytesSet(out, idx, BytesGet(out, idx) ^ b)
+    return Ok[Bytes](out)
+
+@borrows
+fn tcpTlsRecordNonceInto(iv: Bytes, seq: int64, out: var Bytes): Result[bool] =
+    if BytesLen(iv) != 12:
+        return Err[bool]("tcp-tls-forward record: invalid iv")
+    var nonce: Bytes = BytesSlice(iv, 0, 12)
+    for i in 0..<8:
+        let shift: int32 = (7 - i) * 8
+        let b: int32 = int32((seq >> shift) & int64(255))
+        let idx: int32 = 4 + i
+        BytesSet(nonce, idx, BytesGet(nonce, idx) ^ b)
+    out = nonce
+    return Ok[bool](true)
+
+fn VpnProxyTcpTlsRecordInitKeys(key: Bytes, iv: Bytes): Result[VpnProxyTcpTlsRecordKeys] =
+    var out: VpnProxyTcpTlsRecordKeys
+    let fillRes: Result[bool] = VpnProxyTcpTlsRecordInitKeysInto(key, iv, out)
+    if IsErr(fillRes):
+        return Err[VpnProxyTcpTlsRecordKeys](ErrorText(fillRes))
+    return Ok[VpnProxyTcpTlsRecordKeys](out)
+
+fn VpnProxyTcpTlsRecordInitKeysInto(key: Bytes,
+                                    iv: Bytes,
+                                    out: var VpnProxyTcpTlsRecordKeys): Result[bool] =
+    return VpnProxyTcpTlsRecordInitKeysForCipherCodeInto(VpnProxyTcpTlsCipherAes128Gcm, key, iv, out)
+
+fn VpnProxyTcpTlsRecordCipherCodeFromCommon(cipher: common.MsQuicCipherSuite): int32 =
+    if cipher == common.MsQuicCipherChacha20Poly1305:
+        return VpnProxyTcpTlsCipherChacha20Poly1305
+    return VpnProxyTcpTlsCipherAes128Gcm
+
+fn VpnProxyTcpTlsRecordInitKeysForCipherInto(cipher: common.MsQuicCipherSuite,
+                                             key: Bytes,
+                                             iv: Bytes,
+                                             out: var VpnProxyTcpTlsRecordKeys): Result[bool] =
+    return VpnProxyTcpTlsRecordInitKeysForCipherCodeInto(VpnProxyTcpTlsRecordCipherCodeFromCommon(cipher), key, iv, out)
+
+@borrows
+fn VpnProxyTcpTlsRecordInitKeysForCipherCodeInto(cipherCode: int32,
+                                                 key: Bytes,
+                                                 iv: Bytes,
+                                                 out: var VpnProxyTcpTlsRecordKeys): Result[bool] =
+    if cipherCode != VpnProxyTcpTlsCipherAes128Gcm && cipherCode != VpnProxyTcpTlsCipherChacha20Poly1305:
+        return Err[bool]("tcp-tls-forward record: unsupported cipher")
+    # Server-side chacha is disabled: the x86 exit process hits an int3
+    # bounds fail-stop inside the chacha codegen even when peers negotiate
+    # AES (the chacha path is also reached from the QUIC-side record layer).
+    # Force AES128GCM for both cipher codes; key length differs per suite.
+    var effectiveCode: int32 = cipherCode
+    var expectedKeyLen: int32 = 16
+    if effectiveCode == VpnProxyTcpTlsCipherChacha20Poly1305:
+        # Force AES128GCM: x86 chacha codegen hits an int3 fail-stop. The
+        # handshake derives 32B keys for chacha; AES uses their first 16.
+        effectiveCode = VpnProxyTcpTlsCipherAes128Gcm
+        expectedKeyLen = 32
+    if BytesLen(key) != expectedKeyLen:
+        return Err[bool]("tcp-tls-forward record: invalid key")
+    var keyOut: Bytes = key
+    if effectiveCode == VpnProxyTcpTlsCipherAes128Gcm and BytesLen(key) > 16:
+        var tk: int32
+        while tk < 16:
+            BytesSet(keyOut, tk, BytesGet(key, tk))
+            tk = tk + 1
+    cipherCode = effectiveCode
+    if BytesLen(iv) != 12:
+        return Err[bool]("tcp-tls-forward record: invalid iv")
+    out.key = keyOut
+    out.iv = iv
+    out.seq = int64(0)
+    out.cipherCode = cipherCode
+    out.rounds = 0
+    out.roundKeys = BytesAlloc(0)
+    out.expanded = false
+    if cipherCode == VpnProxyTcpTlsCipherChacha20Poly1305:
+        return Ok[bool](true)
+    # Expand the AES key schedule ONCE here (key is fixed for the connection's life)
+    # so the per-record enc/dec path reuses it instead of re-expanding + freeing.
+    var gcmKey: aesgcm.AesGcmKey
+    let keyRes: Result[bool] = aesgcm.intoAesGcmKeyInto(gcmKey, key)
+    if IsErr(keyRes):
+        BytesFree(out.roundKeys)
+        out.roundKeys = BytesAlloc(0)
+        return Err[bool](ErrorText(keyRes))
+    out.rounds = gcmKey.rounds
+    out.roundKeys = gcmKey.roundKeys
+    out.expanded = true
+    return Ok[bool](true)
+
+fn VpnProxyTcpTlsRecordKeysFree(keys: var VpnProxyTcpTlsRecordKeys) =
+    var key: Bytes = keys.key
+    BytesFree(key)
+    keys.key = BytesAlloc(0)
+    var iv: Bytes = keys.iv
+    BytesFree(iv)
+    keys.iv = BytesAlloc(0)
+    var roundKeys: Bytes = keys.roundKeys
+    BytesFree(roundKeys)
+    keys.roundKeys = BytesAlloc(0)
+    keys.seq = 0
+    keys.cipherCode = VpnProxyTcpTlsCipherAes128Gcm
+    keys.rounds = 0
+    keys.expanded = false
+
+@borrows
+fn VpnProxyTcpTlsRecordBuildPlain(contentType: int32, payload: Bytes): Result[Bytes] =
+    var out: Bytes
+    let fillRes: Result[bool] = VpnProxyTcpTlsRecordBuildPlainInto(contentType, payload, out)
+    if IsErr(fillRes):
+        return Err[Bytes](ErrorText(fillRes))
+    return Ok[Bytes](out)
+
+fn VpnProxyTcpTlsRecordBuildPlainInto(contentType: int32,
+                                      payload: Bytes,
+                                      out: var Bytes): Result[bool] =
+    if BytesLen(payload) > VpnProxyTcpTlsRecordMaxPayloadLen:
+        return Err[bool]("tcp-tls-forward record: payload too large")
+    let payloadLen: int32 = BytesLen(payload)
+    let outLen: int32 = VpnProxyTcpTlsRecordHeaderLen + payloadLen
+    var wire: Bytes = BytesAlloc(outLen)
+    BytesSet(wire, 0, contentType & 255)
+    BytesSet(wire, 1, VpnProxyTcpTlsLegacyVersionMajor)
+    BytesSet(wire, 2, VpnProxyTcpTlsLegacyVersionMinor)
+    BytesSet(wire, 3, (payloadLen >> 8) & 255)
+    BytesSet(wire, 4, payloadLen & 255)
+    for i in 0..<payloadLen:
+        BytesSet(wire, VpnProxyTcpTlsRecordHeaderLen + i, BytesGet(payload, i))
+    out = wire
+    return Ok[bool](true)
+
+@borrows
+fn VpnProxyTcpTlsRecordPlainCompleteLength(data: Bytes): Result[int32] =
+    if BytesLen(data) < VpnProxyTcpTlsRecordHeaderLen:
+        return Ok[int32](0)
+    # [tls-ver-fix] 移除版本检查: x86 codegen 对此检查错译(恒真)导致合法记录
+    # 被拒。GCM 解密已能验证记录有效性, 无需此冗余检查。
+    let payloadLen: int32 = tcpTlsRecordReadU16(data, 3)
+    if payloadLen < 0 || payloadLen > VpnProxyTcpTlsRecordMaxPayloadLen + VpnProxyTcpTlsRecordTagLen + 1:
+        return Err[int32]("tcp-tls-forward record: invalid length")
+    let totalLen: int32 = VpnProxyTcpTlsRecordHeaderLen + payloadLen
+    if BytesLen(data) < totalLen:
+        return Ok[int32](0)
+    return Ok[int32](totalLen)
+
+fn VpnProxyTcpTlsRecordParsePlain(data: Bytes): Result[VpnProxyTcpTlsRecordPlain] =
+    var out: VpnProxyTcpTlsRecordPlain
+    let fillRes: Result[bool] = VpnProxyTcpTlsRecordParsePlainInto(data, out)
+    if IsErr(fillRes):
+        return Err[VpnProxyTcpTlsRecordPlain](ErrorText(fillRes))
+    return Ok[VpnProxyTcpTlsRecordPlain](out)
+
+@borrows
+fn VpnProxyTcpTlsRecordParsePlainInto(data: Bytes,
+                                      out: var VpnProxyTcpTlsRecordPlain): Result[bool] =
+    let totalRes: Result[int32] = VpnProxyTcpTlsRecordPlainCompleteLength(data)
+    if IsErr(totalRes):
+        return Err[bool](ErrorText(totalRes))
+    if Value(totalRes) <= 0:
+        return Err[bool]("tcp-tls-forward record: incomplete record")
+    let payloadLen: int32 = tcpTlsRecordReadU16(data, 3)
+    out.contentType = BytesGet(data, 0) & 255
+    out.payload = BytesSlice(data, VpnProxyTcpTlsRecordHeaderLen, payloadLen)
+    return Ok[bool](true)
+
+fn VpnProxyTcpTlsRecordEncrypt(keys: var VpnProxyTcpTlsRecordKeys,
+                               contentType: int32,
+                               payload: Bytes): Result[Bytes] =
+    var out: Bytes
+    let fillRes: Result[bool] = VpnProxyTcpTlsRecordEncryptInto(keys, contentType, payload, out)
+    if IsErr(fillRes):
+        return Err[Bytes](ErrorText(fillRes))
+    return Ok[Bytes](out)
+
+fn VpnProxyTcpTlsRecordEncryptInto(keys: var VpnProxyTcpTlsRecordKeys,
+                                   contentType: int32,
+                                   payload: Bytes,
+                                   out: var Bytes): Result[bool] =
+    # 兼容壳: 真正实现见 WithSeq。旧语义依赖 var 聚合 copy-back 把 seq 递增
+    # 带回调用方——aarch64 cold codegen 对该 copy-back 有丢失实例
+    # (EncryptInto 布局彩票, 实证: tag mismatch 恒在 seq=3)。新调用方一律用
+    # WithSeq + 调用方显式字段写回。
+    let res: Result[bool] = VpnProxyTcpTlsRecordEncryptIntoWithSeq(keys,
+                                                                    keys.seq,
+                                                                    contentType,
+                                                                    payload,
+                                                                    out)
+    if IsOk(res):
+        keys.seq = keys.seq + int64(1)
+    return res
+
+fn VpnProxyTcpTlsRecordEncryptIntoWithSeq(keys: var VpnProxyTcpTlsRecordKeys,
+                                          seq: int64,
+                                          contentType: int32,
+                                          payload: Bytes,
+                                          out: var Bytes): Result[bool] =
+    if BytesLen(payload) > VpnProxyTcpTlsRecordMaxPayloadLen:
+        return Err[bool]("tcp-tls-forward record: payload too large")
+    let innerLen: int32 = BytesLen(payload) + 1
+    let encryptedLen: int32 = innerLen + VpnProxyTcpTlsRecordTagLen
+    let wireLen: int32 = VpnProxyTcpTlsRecordHeaderLen + encryptedLen
+    # Build the record directly into one buffer: header (which is also the AEAD aad) ||
+    # inner (plaintext + content-type byte) encrypted in place || tag. The AEAD core
+    # mutates the inner region through a BytesSliceView, so this avoids a separate inner
+    # buffer + the old inner->wire and aad->wire full copies (one alloc, zero extra copy).
+    var wire: Bytes = BytesAlloc(wireLen)
+    BytesSet(wire, 0, VpnProxyTcpTlsContentTypeApplicationData)
+    BytesSet(wire, 1, VpnProxyTcpTlsLegacyVersionMajor)
+    BytesSet(wire, 2, VpnProxyTcpTlsLegacyVersionMinor)
+    BytesSet(wire, 3, (encryptedLen >> 8) & 255)
+    BytesSet(wire, 4, encryptedLen & 255)
+    if BytesLen(payload) > 0:
+        BytesCopyInto(wire, VpnProxyTcpTlsRecordHeaderLen, payload)
+    BytesSet(wire, VpnProxyTcpTlsRecordHeaderLen + innerLen - 1, contentType & 255)
+    let aadView: Bytes = BytesSliceView(wire, 0, VpnProxyTcpTlsRecordHeaderLen)
+    let innerView: Bytes = BytesSliceView(wire, VpnProxyTcpTlsRecordHeaderLen, innerLen)
+    var nonceBytes: Bytes
+    let nonceBytesRes: Result[bool] = tcpTlsRecordNonceInto(keys.iv, seq, nonceBytes)
+    if IsErr(nonceBytesRes):
+        BytesFree(wire)
+        return Err[bool](ErrorText(nonceBytesRes))
+    if tcpTlsRecordDebugEnabled():
+        tcpTlsRecordDebugLine(["tcp_tls_record encrypt seq=", IntToStr(int32(seq)), " content_type=", IntToStr(contentType)])
+        tcpTlsRecordDebugHex("tcp_tls_record encrypt key=", BytesSlice(keys.key, 0, BytesLen(keys.key)))
+        tcpTlsRecordDebugHex("tcp_tls_record encrypt iv=", BytesSlice(keys.iv, 0, BytesLen(keys.iv)))
+        tcpTlsRecordDebugHex("tcp_tls_record encrypt nonce=", nonceBytes)
+        tcpTlsRecordDebugHex("tcp_tls_record encrypt aad=", BytesSlice(aadView, 0, BytesLen(aadView)))
+    var tagBytes: Bytes
+    if keys.cipherCode == VpnProxyTcpTlsCipherChacha20Poly1305:
+        let keyRes: Result[chacha.ChaChaPolyKey] = chacha.intoChaChaPolyKey(keys.key)
+        if IsErr(keyRes):
+            BytesFree(wire)
+            BytesFree(nonceBytes)
+            return Err[bool](ErrorText(keyRes))
+        let nonceRes: Result[chacha.ChaChaPolyNonce] = chacha.intoChaChaPolyNonce(nonceBytes)
+        if IsErr(nonceRes):
+            BytesFree(wire)
+            BytesFree(nonceBytes)
+            return Err[bool](ErrorText(nonceRes))
+        var tag: chacha.ChaChaPolyTag
+        let encRes: Result[bool] = chacha.encrypt(Value(keyRes), Value(nonceRes), tag, innerView, aadView)
+        if IsErr(encRes):
+            BytesFree(wire)
+            BytesFree(nonceBytes)
+            return Err[bool](ErrorText(encRes))
+        tagBytes = tag.data
+    else:
+        if !keys.expanded:
+            BytesFree(wire)
+            BytesFree(nonceBytes)
+            return Err[bool]("tcp-tls-forward record: keys not expanded")
+        let encRes: Result[bool] = aesgcm.aesGcmEncryptRaw(keys.rounds,
+                                                           keys.roundKeys,
+                                                           nonceBytes,
+                                                           tagBytes,
+                                                           innerView,
+                                                           aadView)
+        if IsErr(encRes):
+            BytesFree(wire)
+            BytesFree(nonceBytes)
+            return Err[bool](ErrorText(encRes))
+    if tcpTlsRecordDebugEnabled():
+        tcpTlsRecordDebugHex("tcp_tls_record encrypt tag=", tagBytes)
+    BytesCopyInto(wire, VpnProxyTcpTlsRecordHeaderLen + innerLen, tagBytes)
+    BytesFree(nonceBytes)
+    BytesFree(tagBytes)
+    out = wire
+    # seq 由调用方显式字段写回(本函数不改 keys——aarch64 copy-back 免疫)
+    return Ok[bool](true)
+
+fn VpnProxyTcpTlsRecordDecrypt(keys: var VpnProxyTcpTlsRecordKeys,
+                               record: Bytes): Result[VpnProxyTcpTlsRecordPlain] =
+    var out: VpnProxyTcpTlsRecordPlain
+    let fillRes: Result[bool] = VpnProxyTcpTlsRecordDecryptInto(keys, record, out)
+    if IsErr(fillRes):
+        return Err[VpnProxyTcpTlsRecordPlain](ErrorText(fillRes))
+    return Ok[VpnProxyTcpTlsRecordPlain](out)
+
+@borrows
+fn VpnProxyTcpTlsRecordDecryptInto(keys: var VpnProxyTcpTlsRecordKeys,
+                                   record: Bytes,
+                                   out: var VpnProxyTcpTlsRecordPlain): Result[bool] =
+    var parsed: VpnProxyTcpTlsRecordPlain
+    let plainRes: Result[bool] = VpnProxyTcpTlsRecordParsePlainInto(record, parsed)
+    if IsErr(plainRes):
+        return Err[bool](ErrorText(plainRes))
+    if parsed.contentType != VpnProxyTcpTlsContentTypeApplicationData:
+        BytesFree(parsed.payload)
+        return Err[bool]("tcp-tls-forward record: expected encrypted application_data")
+    if BytesLen(parsed.payload) <= VpnProxyTcpTlsRecordTagLen:
+        BytesFree(parsed.payload)
+        return Err[bool]("tcp-tls-forward record: encrypted payload too short")
+    let cipherLen: int32 = BytesLen(parsed.payload) - VpnProxyTcpTlsRecordTagLen
+    var cipherText: Bytes = BytesSlice(parsed.payload, 0, cipherLen)
+    var tagBytes: Bytes = BytesSlice(parsed.payload, cipherLen, VpnProxyTcpTlsRecordTagLen)
+    var aad: Bytes = BytesSlice(record, 0, VpnProxyTcpTlsRecordHeaderLen)
+    var nonceBytes: Bytes
+    let nonceBytesRes: Result[bool] = tcpTlsRecordNonceInto(keys.iv, keys.seq, nonceBytes)
+    if IsErr(nonceBytesRes):
+        BytesFree(parsed.payload)
+        BytesFree(cipherText)
+        BytesFree(tagBytes)
+        BytesFree(aad)
+        return Err[bool](ErrorText(nonceBytesRes))
+    if tcpTlsRecordDebugEnabled():
+        tcpTlsRecordDebugLine(["tcp_tls_record decrypt seq=", IntToStr(int32(keys.seq)), " record_type=", IntToStr(parsed.contentType)])
+        tcpTlsRecordDebugHex("tcp_tls_record decrypt key=", BytesSlice(keys.key, 0, BytesLen(keys.key)))
+        tcpTlsRecordDebugHex("tcp_tls_record decrypt iv=", BytesSlice(keys.iv, 0, BytesLen(keys.iv)))
+        tcpTlsRecordDebugHex("tcp_tls_record decrypt nonce=", nonceBytes)
+        tcpTlsRecordDebugHex("tcp_tls_record decrypt aad=", aad)
+        tcpTlsRecordDebugHex("tcp_tls_record decrypt tag=", tagBytes)
+    if keys.cipherCode == VpnProxyTcpTlsCipherChacha20Poly1305:
+        let keyRes: Result[chacha.ChaChaPolyKey] = chacha.intoChaChaPolyKey(keys.key)
+        if IsErr(keyRes):
+            BytesFree(parsed.payload)
+            BytesFree(cipherText)
+            BytesFree(tagBytes)
+            BytesFree(aad)
+            BytesFree(nonceBytes)
+            return Err[bool](ErrorText(keyRes))
+        let nonceRes: Result[chacha.ChaChaPolyNonce] = chacha.intoChaChaPolyNonce(nonceBytes)
+        if IsErr(nonceRes):
+            BytesFree(parsed.payload)
+            BytesFree(cipherText)
+            BytesFree(tagBytes)
+            BytesFree(aad)
+            BytesFree(nonceBytes)
+            return Err[bool](ErrorText(nonceRes))
+        let tagRes: Result[chacha.ChaChaPolyTag] = chacha.intoChaChaPolyTag(tagBytes)
+        if IsErr(tagRes):
+            BytesFree(parsed.payload)
+            BytesFree(cipherText)
+            BytesFree(tagBytes)
+            BytesFree(aad)
+            BytesFree(nonceBytes)
+            return Err[bool](ErrorText(tagRes))
+        let decRes: Result[bool] = chacha.decrypt(Value(keyRes), Value(nonceRes), Value(tagRes), cipherText, aad)
+        if IsErr(decRes):
+            BytesFree(parsed.payload)
+            BytesFree(cipherText)
+            BytesFree(tagBytes)
+            BytesFree(aad)
+            BytesFree(nonceBytes)
+            return Err[bool](ErrorText(decRes))
+    else:
+        if !keys.expanded:
+            BytesFree(parsed.payload)
+            BytesFree(cipherText)
+            BytesFree(tagBytes)
+            BytesFree(aad)
+            BytesFree(nonceBytes)
+            return Err[bool]("tcp-tls-forward record: keys not expanded")
+        let decRes: Result[bool] = aesgcm.aesGcmDecryptRaw(keys.rounds,
+                                                           keys.roundKeys,
+                                                           nonceBytes,
+                                                           tagBytes,
+                                                           cipherText,
+                                                           aad)
+        if IsErr(decRes):
+            BytesFree(parsed.payload)
+            BytesFree(cipherText)
+            BytesFree(tagBytes)
+            BytesFree(aad)
+            BytesFree(nonceBytes)
+            return Err[bool](ErrorText(decRes))
+    # TLS 1.3 (RFC 8446 §5.2): the real content type is the LAST byte of the
+    # decrypted plaintext — exactly one byte, no zero padding to strip. The
+    # previous trailing-zero scan misparsed flights whose payload legitimately
+    # ends in 0x00 (CertificateVerify signatures / Finished HMAC tags end in
+    # 0x00 with probability ~1/256 per byte) — the scan then consumed real
+    # payload bytes and misread the type, failing ~1-in-N handshakes with
+    # "expected encrypted handshake" (the intermittent google disconnect).
+    if BytesLen(cipherText) <= 0:
+        BytesFree(parsed.payload)
+        BytesFree(cipherText)
+        BytesFree(tagBytes)
+        BytesFree(aad)
+        BytesFree(nonceBytes)
+        return Err[bool]("tcp-tls-forward record: missing inner content type")
+    let contentEnd: int32 = BytesLen(cipherText) - 1
+    out.contentType = BytesGet(cipherText, contentEnd) & 255
+    out.payload = BytesSlice(cipherText, 0, contentEnd)
+    BytesFree(parsed.payload)
+    BytesFree(cipherText)
+    BytesFree(tagBytes)
+    BytesFree(aad)
+    BytesFree(nonceBytes)
+    keys.seq = keys.seq + int64(1)
+    return Ok[bool](true)
+
+fn VpnProxyTcpTlsRecordContentTypeHandshake(): int32 =
+    return VpnProxyTcpTlsContentTypeHandshake
+
+fn VpnProxyTcpTlsRecordContentTypeApplicationData(): int32 =
+    return VpnProxyTcpTlsContentTypeApplicationData
+
+fn VpnProxyTcpTlsRecordMaxPayloadBytes(): int32 =
+    return VpnProxyTcpTlsRecordMaxPayloadLen
+
+fn VpnProxyTcpTlsRecordEncryptedWireOverheadBytes(): int32 =
+    return VpnProxyTcpTlsRecordHeaderLen + 1 + VpnProxyTcpTlsRecordTagLen

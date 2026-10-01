@@ -1,0 +1,478 @@
+# W4 recovery: RFC 9002 Section 6 loss detection and Appendix A state machine
+# (pure logic layer, event-driven; no clock lives here — every event carries
+# its timestamp and the driver owns the time source).
+#
+# Event interface (W3b wiring feeds real packet events through these):
+#   QuicOnPacketSent / QuicOnAckFrame (the onPacketAcked aggregate, per ACK
+#   frame) / QuicOnTimeout / QuicLossNextTimer (deadline + kind for the
+#   driver's event loop). PTO probe demand is returned via QuicLossTakeProbes.
+#
+# Algorithms, Appendix A form:
+# - RTT: first sample seeds min/latest/smooth; later samples EWMA 7/8 with
+#   rtt_var 3/4 (ack delay folded as 0; the simulator peer acks immediately,
+#   real ack_delay handling is a W3b+ boundary).
+# - Loss: packet-number window (largest_acked - pn > 3) OR time threshold
+#   (now - time_sent > 9/8 * max(latest_rtt, smooth_rtt) + granularity) —
+#   the simplified RACK form of Appendix A; per-packet reordering-depth
+#   tracking (full Section 6.1.2) is out of this slice's boundary.
+# - PTO: smooth + max(4*rtt_var, granularity) + max_ack_delay, doubling
+#   backoff per consecutive expiry, reset on any newly acked packet; probes
+#   are requested in pairs (2PTO), the driver sends them as new packets.
+# - Persistent congestion: the 1 s window ending at the largest acked
+#   packet's send time contains ack-eliciting packets and every one of them
+#   is lost (Section 7.6 check; the CC reset itself lives in recovery_cc).
+#
+# Layout note: the sent-packet ring is uniformly int64 (SoA). Per-packet
+# metadata packs payload size (bits 0..31) and the flag bits (32..35) into
+# one int64 word; every ring access is an int64 element read or write. This
+# shape is deliberate: the stage3 body-store-freeze admission rejects mixed
+# int64-read/int32-array-write flows in one function body (registered as a
+# compiler residual in results/purept_w4.md), and the uniform-int64 SoA form
+# lowers exactly like the proven frames_varint/recovery_ack modules.
+#
+# Every Appendix A transition is counted in trans[] (QuicT* ids) — the
+# driver proves full reachability. No var-record passthrough calls: each
+# function touches its state directly.
+
+import std/rawbytes
+import cheng/quic/pure/frames_varint as quicvarint
+
+const
+    QuicLossRingCap: int32 = 4096
+    QuicGranularityUs: int64 = 1000
+    QuicInitialRttUs: int64 = 333000
+    QuicPacketThreshold: int64 = 3
+    QuicTimeThresholdNum: int64 = 9
+    QuicTimeThresholdDen: int64 = 8
+    QuicMaxAckDelayUs: int64 = 25000
+    QuicPersistentThresholdUs: int64 = 1000000
+    QuicPtoBackoffCap: int32 = 10
+    QuicMaxLostPerRound: int32 = 4096
+    QuicMaxAckRangesPerFrame: int32 = 64
+
+# Appendix A transition ids (loss side; recovery_cc counts its own with the
+# same numbering: 10 persistent, 11 slow start, 12 congestion avoidance,
+# 13 loss reduction).
+const
+    QuicTsent: int32 = 0
+    QuicTsentProbe: int32 = 1
+    QuicTrttFirst: int32 = 2
+    QuicTrttUpdate: int32 = 3
+    QuicTackedNew: int32 = 4
+    QuicTackedDup: int32 = 5
+    QuicTackedUnknown: int32 = 6
+    QuicTspurious: int32 = 7
+    QuicTlostWindow: int32 = 8
+    QuicTlostTime: int32 = 9
+    QuicTpersistent: int32 = 10
+    QuicTccLossReduce: int32 = 13
+    QuicTtimerCancel: int32 = 14
+    QuicTtimerArmLoss: int32 = 15
+    QuicTtimerArmPto: int32 = 16
+    QuicTtimeoutLoss: int32 = 17
+    QuicTtimeoutPto: int32 = 18
+    QuicTptoBackoff: int32 = 19
+    QuicTptoReset: int32 = 20
+    QuicTprobesPending: int32 = 21
+
+# meta word layout: bits 0..31 payload size, bits 32..35 flags.
+const
+    QuicMetaSizeMask: int64 = 4294967295
+    QuicFlagEliciting: int64 = 4294967296
+    QuicFlagInFlight: int64 = 8589934592
+    QuicFlagAcked: int64 = 17179869184
+    QuicFlagLost: int64 = 34359738368
+
+const
+    QuicTimerNone: int32 = 0
+    QuicTimerLoss: int32 = 1
+    QuicTimerPto: int32 = 2
+
+type
+    QuicLossState =
+        # sent-packet ring, slot = pn mod QuicLossRingCap, uniform int64
+        pn: int64[QuicLossRingCap]
+        timeSent: int64[QuicLossRingCap]
+        meta: int64[QuicLossRingCap]
+        used: int64[QuicLossRingCap]
+        liveCount: int32
+        # ack tracking
+        largestAcked: int64
+        hasLargestAcked: bool
+        largestAckedSentTime: int64
+        # RTT (Section 5)
+        latestRtt: int64
+        minRtt: int64
+        smoothRtt: int64
+        rttVar: int64
+        hasRttSample: bool
+        rttSamples: int64
+        # bytes in flight (ack-eliciting, unacked, unlost)
+        bytesInFlight: int64
+        ackElicitingInFlight: int32
+        timeOfLastAckElicitingSent: int64
+        hasAckElicitingSent: bool
+        # loss / timers
+        lossTime: int64
+        timerKind: int32
+        timerDeadline: int64
+        ptoCount: int32
+        ptoExpiries: int64
+        probesPending: int32
+        # round outputs for the driver (last processed ack frame / timeout)
+        lastAckedCount: int32
+        lastAckedBytes: int64
+        lastLostCount: int32
+        lastLostPersistent: bool
+        lostPns: int64[QuicMaxLostPerRound]
+        lostSizes: int64[QuicMaxLostPerRound]
+        # totals
+        ackedPackets: int64
+        ackedBytesTotal: int64
+        lostPackets: int64
+        lostBytesTotal: int64
+        spuriousAcks: int64
+        # transition counters
+        trans: int64[32]
+
+fn QuicLossInit(ls: var QuicLossState) =
+    ls.liveCount = 0
+    var clear: int32
+    while clear < QuicLossRingCap:
+        ls.used[clear] = 0
+        ls.meta[clear] = 0
+        clear = clear + 1
+    ls.hasLargestAcked = false
+    ls.largestAcked = 0
+    ls.largestAckedSentTime = 0
+    ls.latestRtt = 0
+    ls.minRtt = 0
+    ls.smoothRtt = QuicInitialRttUs
+    ls.rttVar = QuicInitialRttUs / 2
+    ls.hasRttSample = false
+    ls.rttSamples = 0
+    ls.bytesInFlight = 0
+    ls.ackElicitingInFlight = 0
+    ls.hasAckElicitingSent = false
+    ls.timeOfLastAckElicitingSent = 0
+    ls.lossTime = 0
+    ls.timerKind = QuicTimerNone
+    ls.timerDeadline = 0
+    ls.ptoCount = 0
+    ls.ptoExpiries = 0
+    ls.probesPending = 0
+    ls.lastAckedCount = 0
+    ls.lastAckedBytes = 0
+    ls.lastLostCount = 0
+    ls.lastLostPersistent = false
+    ls.ackedPackets = 0
+    ls.ackedBytesTotal = 0
+    ls.lostPackets = 0
+    ls.lostBytesTotal = 0
+    ls.spuriousAcks = 0
+    var i: int32
+    while i < 32:
+        ls.trans[i] = 0
+        i = i + 1
+
+fn QuicLossNextTimer(ls: var QuicLossState): int64 =
+    return ls.timerDeadline
+
+fn QuicLossTimerKind(ls: var QuicLossState): int32 =
+    return ls.timerKind
+
+fn QuicLossTakeProbes(ls: var QuicLossState): int32 =
+    let n: int32 = ls.probesPending
+    ls.probesPending = 0
+    return n
+
+# Appendix A SetLossDetectionTimer.
+fn QuicLossSetTimer(ls: var QuicLossState) =
+    if ls.ackElicitingInFlight <= 0:
+        if ls.timerKind != QuicTimerNone:
+            ls.trans[QuicTtimerCancel] = ls.trans[QuicTtimerCancel] + 1
+        ls.timerKind = QuicTimerNone
+        ls.timerDeadline = 0
+        return
+    if ls.lossTime != 0:
+        ls.timerKind = QuicTimerLoss
+        ls.timerDeadline = ls.lossTime
+        ls.trans[QuicTtimerArmLoss] = ls.trans[QuicTtimerArmLoss] + 1
+        return
+    let var4: int64 = 4 * ls.rttVar
+    var base: int64 = ls.smoothRtt + QuicMaxAckDelayUs
+    if var4 > QuicGranularityUs:
+        base = base + var4
+    else:
+        base = base + QuicGranularityUs
+    var shift: int32 = ls.ptoCount
+    if shift > QuicPtoBackoffCap:
+        shift = QuicPtoBackoffCap
+    var interval: int64 = base
+    var i: int32
+    while i < shift:
+        interval = interval * 2
+        i = i + 1
+    ls.timerKind = QuicTimerPto
+    ls.timerDeadline = ls.timeOfLastAckElicitingSent + interval
+    ls.trans[QuicTtimerArmPto] = ls.trans[QuicTtimerArmPto] + 1
+
+fn QuicLossUpdateRtt(ls: var QuicLossState, sample: int64) =
+    ls.rttSamples = ls.rttSamples + 1
+    if !ls.hasRttSample:
+        ls.hasRttSample = true
+        ls.latestRtt = sample
+        ls.minRtt = sample
+        ls.smoothRtt = sample
+        ls.rttVar = sample / 2
+        ls.trans[QuicTrttFirst] = ls.trans[QuicTrttFirst] + 1
+        return
+    ls.latestRtt = sample
+    if sample < ls.minRtt:
+        ls.minRtt = sample
+    let adj: int64 = sample
+    var d: int64 = ls.smoothRtt - adj
+    if d < 0:
+        d = 0 - d
+    ls.rttVar = (3 * ls.rttVar + d) / 4
+    ls.smoothRtt = (7 * ls.smoothRtt + adj) / 8
+    ls.trans[QuicTrttUpdate] = ls.trans[QuicTrttUpdate] + 1
+
+# QuicOnPacketSent: record one sent packet. ackEliciting packets count
+# toward bytes in flight and re-arm the PTO base. Returns 0, or -1 when the
+# ring slot is occupied (unbounded in-flight or pn reuse — the driver
+# hard-fails on this, which is also the pn-uniqueness invariant proof).
+fn QuicOnPacketSent(ls: var QuicLossState, pn: int64, size: int64,
+                    ackEliciting: bool, isProbe: bool, nowUs: int64): int32 =
+    let slot: int32 = int32(pn % int64(QuicLossRingCap))
+    if ls.used[slot] != 0:
+        return 0 - 1
+    if ls.liveCount >= QuicLossRingCap:
+        return 0 - 1
+    var meta: int64 = size & QuicMetaSizeMask
+    if ackEliciting:
+        meta = meta | QuicFlagEliciting
+        meta = meta | QuicFlagInFlight
+    ls.pn[slot] = pn
+    ls.timeSent[slot] = nowUs
+    ls.meta[slot] = meta
+    ls.used[slot] = int64(1)
+    ls.liveCount = ls.liveCount + 1
+    if ackEliciting:
+        ls.bytesInFlight = ls.bytesInFlight + size
+        ls.ackElicitingInFlight = ls.ackElicitingInFlight + 1
+        ls.timeOfLastAckElicitingSent = nowUs
+        ls.hasAckElicitingSent = true
+    ls.trans[QuicTsent] = ls.trans[QuicTsent] + 1
+    if isProbe:
+        ls.trans[QuicTsentProbe] = ls.trans[QuicTsentProbe] + 1
+    QuicLossSetTimer(ls)
+    return 0
+
+# Appendix A DetectLostPackets: marks lost packets, computes the next
+# loss_time, and evaluates the Section 7.6 persistent congestion window for
+# the round. Driver applies the CC reset (recovery_cc) from the round
+# outputs. All ring ops are int64 element reads / RMW.
+fn QuicLossDetectLost(ls: var QuicLossState, nowUs: int64) =
+    var lossDelay: int64 = ls.latestRtt
+    if ls.smoothRtt > lossDelay:
+        lossDelay = ls.smoothRtt
+    lossDelay = (lossDelay * QuicTimeThresholdNum) / QuicTimeThresholdDen
+    var nextLossTime: int64 = 0
+    var newlyLost: int32 = 0
+    var slot: int32
+    while slot < QuicLossRingCap:
+        if ls.used[slot] != 0:
+            let meta: int64 = ls.meta[slot]
+            if (meta & QuicFlagInFlight) != 0:
+                if ls.hasLargestAcked:
+                    let pn: int64 = ls.pn[slot]
+                    if pn <= ls.largestAcked:
+                        let timeSince: int64 = nowUs - ls.timeSent[slot]
+                        let byWindow: bool = (ls.largestAcked - pn) > QuicPacketThreshold
+                        let byTime: bool = timeSince > lossDelay
+                        if byWindow || byTime:
+                            ls.meta[slot] = (meta | QuicFlagLost) & (0 - 1 - QuicFlagInFlight)
+                            ls.liveCount = ls.liveCount - 1
+                            let sz: int64 = meta & QuicMetaSizeMask
+                            ls.bytesInFlight = ls.bytesInFlight - sz
+                            if (meta & QuicFlagEliciting) != 0:
+                                ls.ackElicitingInFlight = ls.ackElicitingInFlight - 1
+                            ls.lostPackets = ls.lostPackets + 1
+                            ls.lostBytesTotal = ls.lostBytesTotal + sz
+                            if newlyLost < QuicMaxLostPerRound:
+                                ls.lostPns[newlyLost] = pn
+                                ls.lostSizes[newlyLost] = sz
+                            newlyLost = newlyLost + 1
+                            if byWindow:
+                                ls.trans[QuicTlostWindow] = ls.trans[QuicTlostWindow] + 1
+                            if byTime:
+                                ls.trans[QuicTlostTime] = ls.trans[QuicTlostTime] + 1
+                        else:
+                            # +granularity margin: the timer fires at the
+                            # candidate and byTime needs now > loss_delay to
+                            # hold there (strict progress, no zero-move rearm)
+                            let cand: int64 = ls.timeSent[slot] + lossDelay + QuicGranularityUs
+                            if nextLossTime == 0 || cand < nextLossTime:
+                                nextLossTime = cand
+        slot = slot + 1
+    ls.lossTime = nextLossTime
+    if newlyLost > 0:
+        ls.lastLostCount = newlyLost
+        # Section 7.6: the 1 s window ending at the largest acked packet's
+        # send time — persistent iff it holds ack-eliciting packets and all
+        # of them are lost. The largest acked packet itself is acked, not
+        # lost, so the upper bound is exclusive.
+        var candidates: int32 = 0
+        var allLost: bool = true
+        var wslot: int32
+        while wslot < QuicLossRingCap:
+            if ls.used[wslot] != 0:
+                let meta: int64 = ls.meta[wslot]
+                if (meta & QuicFlagEliciting) != 0:
+                    let ts: int64 = ls.timeSent[wslot]
+                    if ts < ls.largestAckedSentTime && ts > ls.largestAckedSentTime - QuicPersistentThresholdUs:
+                        candidates = candidates + 1
+                        if (meta & QuicFlagLost) == 0:
+                            allLost = false
+            wslot = wslot + 1
+        if candidates > 0 && allLost:
+            ls.lastLostPersistent = true
+            ls.trans[QuicTpersistent] = ls.trans[QuicTpersistent] + 1
+
+# Appendix A DetectAndRemoveAckedPackets + OnPacketAcked for one decoded ACK
+# frame, then DetectLostPackets. rangesBuf/rangesOff is the W3a codec's view
+# of the additional (Gap, Range Length) pairs; extraCount is the frame's ACK
+# Range Count (additional pairs only). Returns newly acked packets, or a
+# negative code on a malformed frame (-1 truncated pairs, -2 range
+# arithmetic, -3 too many additional ranges).
+@borrows
+fn QuicOnAckFrame(ls: var QuicLossState, largest: int64, firstRange: int64,
+                  rangesBuf: Bytes, rangesOff: int32, extraCount: int64,
+                  nowUs: int64): int32 =
+    ls.lastAckedCount = 0
+    ls.lastAckedBytes = 0
+    ls.lastLostCount = 0
+    ls.lastLostPersistent = false
+    if firstRange > largest:
+        return 0 - 2
+    if extraCount > int64(QuicMaxAckRangesPerFrame - 1):
+        return 0 - 3
+    # Pass 1: decode the ranges into scalars; validate everything before
+    # mutating any state.
+    var rangeLo: int64[QuicMaxAckRangesPerFrame]
+    var rangeHi: int64[QuicMaxAckRangesPerFrame]
+    var hits: int64[QuicMaxAckRangesPerFrame]
+    var nRanges: int32 = 1
+    rangeLo[0] = largest - firstRange
+    rangeHi[0] = largest
+    var off: int32 = rangesOff
+    var prevLow: int64 = largest - firstRange
+    var k: int64
+    while k < extraCount:
+        let pr: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(rangesBuf, off)
+        if !pr.ok:
+            return 0 - 1
+        let rl: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(rangesBuf, off + pr.size)
+        if !rl.ok:
+            return 0 - 1
+        off = off + pr.size + rl.size
+        let hi: int64 = prevLow - pr.value - 1
+        let lo: int64 = hi - rl.value
+        if hi < 0 || lo < 0:
+            return 0 - 2
+        rangeLo[nRanges] = lo
+        rangeHi[nRanges] = hi
+        nRanges = nRanges + 1
+        prevLow = lo
+        k = k + 1
+    # Pass 2: one ring walk; membership = any decoded range. Duplicate and
+    # spurious hits are counted; unknown ranges (zero ring coverage) after.
+    var newlyAcked: int32 = 0
+    var newlyAckedBytes: int64 = 0
+    var maxNewPn: int64 = 0 - 1
+    var maxNewTime: int64 = 0
+    var slot: int32
+    while slot < QuicLossRingCap:
+        if ls.used[slot] != 0:
+            let meta: int64 = ls.meta[slot]
+            let state: int64 = meta & (QuicFlagInFlight | QuicFlagAcked | QuicFlagLost)
+            if state != 0:
+                let pn: int64 = ls.pn[slot]
+                var hitIdx: int32 = 0 - 1
+                var r: int32
+                while r < nRanges:
+                    if pn >= rangeLo[r] && pn <= rangeHi[r]:
+                        hitIdx = r
+                        r = nRanges
+                    else:
+                        r = r + 1
+                if hitIdx >= 0:
+                    hits[hitIdx] = hits[hitIdx] + 1
+                    if (meta & QuicFlagAcked) != 0:
+                        ls.trans[QuicTackedDup] = ls.trans[QuicTackedDup] + 1
+                    else:
+                        if (meta & QuicFlagLost) != 0:
+                            # spurious: bytes already left bytesInFlight
+                            ls.spuriousAcks = ls.spuriousAcks + 1
+                            ls.trans[QuicTspurious] = ls.trans[QuicTspurious] + 1
+                            ls.meta[slot] = meta | QuicFlagAcked
+                        else:
+                            ls.meta[slot] = (meta | QuicFlagAcked) & (0 - 1 - QuicFlagInFlight)
+                            ls.liveCount = ls.liveCount - 1
+                            let sz: int64 = meta & QuicMetaSizeMask
+                            newlyAcked = newlyAcked + 1
+                            newlyAckedBytes = newlyAckedBytes + sz
+                            ls.ackedPackets = ls.ackedPackets + 1
+                            ls.ackedBytesTotal = ls.ackedBytesTotal + sz
+                            if (meta & QuicFlagEliciting) != 0:
+                                ls.ackElicitingInFlight = ls.ackElicitingInFlight - 1
+                                ls.bytesInFlight = ls.bytesInFlight - sz
+                                if pn > maxNewPn:
+                                    maxNewPn = pn
+                                    maxNewTime = ls.timeSent[slot]
+                            ls.trans[QuicTackedNew] = ls.trans[QuicTackedNew] + 1
+        slot = slot + 1
+    var u: int32
+    while u < nRanges:
+        if hits[u] == 0:
+            ls.trans[QuicTackedUnknown] = ls.trans[QuicTackedUnknown] + 1
+        u = u + 1
+    ls.lastAckedCount = newlyAcked
+    ls.lastAckedBytes = newlyAckedBytes
+    if newlyAcked > 0:
+        ls.ptoCount = 0
+        ls.trans[QuicTptoReset] = ls.trans[QuicTptoReset] + 1
+        if maxNewPn >= 0:
+            QuicLossUpdateRtt(ls, nowUs - maxNewTime)
+    # largest_acked advances on every ACK frame (Appendix A), newly acked or
+    # not — loss detection is driven by it even for pure dup/unknown acks.
+    if !ls.hasLargestAcked || largest > ls.largestAcked:
+        ls.largestAcked = largest
+        ls.hasLargestAcked = true
+        let lslot: int32 = int32(largest % int64(QuicLossRingCap))
+        if ls.used[lslot] != 0 && ls.pn[lslot] == largest:
+            ls.largestAckedSentTime = ls.timeSent[lslot]
+    QuicLossDetectLost(ls, nowUs)
+    QuicLossSetTimer(ls)
+    return newlyAcked
+
+# QuicOnTimeout: the driver observed nowUs >= timer deadline. Loss-time
+# expiry re-runs detection; PTO expiry doubles the backoff and requests a
+# probe pair. The timer is always re-armed from current state.
+fn QuicOnTimeout(ls: var QuicLossState, nowUs: int64): int32 =
+    if ls.timerKind == QuicTimerLoss:
+        ls.trans[QuicTtimeoutLoss] = ls.trans[QuicTtimeoutLoss] + 1
+        QuicLossDetectLost(ls, nowUs)
+        QuicLossSetTimer(ls)
+        return 0
+    if ls.timerKind == QuicTimerPto:
+        ls.trans[QuicTtimeoutPto] = ls.trans[QuicTtimeoutPto] + 1
+        ls.ptoCount = ls.ptoCount + 1
+        ls.trans[QuicTptoBackoff] = ls.trans[QuicTptoBackoff] + 1
+        ls.ptoExpiries = ls.ptoExpiries + 1
+        ls.probesPending = ls.probesPending + 2
+        ls.trans[QuicTprobesPending] = ls.trans[QuicTprobesPending] + 1
+        QuicLossSetTimer(ls)
+        return 0
+    return 0

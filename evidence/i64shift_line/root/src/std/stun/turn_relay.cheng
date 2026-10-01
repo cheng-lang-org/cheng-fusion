@@ -1,0 +1,462 @@
+# TURN relay: allocation table + relay socket allocation + permission/channel
+# tables + relay forwarding primitives (RFC 5766).
+#
+# Server state uses fixed-capacity parallel arrays (SoA) + integer counts rather
+# than dynamic seqs. The stage-0 cold compiler cannot monomorphize generic
+# seqs.Add / seqs.Len when the receiver is a struct FIELD (T stays unbound), so
+# fixed arrays indexed by count are used instead -- the same pattern as
+# quic/platform/datapath_udp.MsQuicUdpSlots. An allocation is identified by its
+# index; it is keyed by the client's transport address and by its relayed port.
+#
+# Relay sockets bind to 127.0.0.1:0 (ephemeral) for the MVP localhost relay.
+# All forwarding is real UDP via std/net/transports/udp_syscall.
+
+import std/rawbytes
+import std/system
+import std/strings
+import std/strutils as strutil
+import std/result
+import std/os
+import std/net/transports/udp_syscall as udp
+import std/stun/turn_protocol as turn
+import std/stun/turn_portalloc as portalloc
+import std/stun/turn_ratelimit as ratelimit
+import std/stun/turn_metrics as metrics
+import std/stun/turn_nonce as nonce
+import std/stun/turn_userdb as userdb
+
+const
+    turnRelayBindHost = "127.0.0.1"
+    turnDefaultLifetime = 600
+    turnMaxLifetime = 3600
+    turnRelayRecvBuf = 1500
+    turnMaxAllocs = 16
+    turnMaxPerms = 64
+    turnMaxChans = 64
+
+var
+    turnTxidCounter: int32
+    # --- stage 4 production hardening (process-global, single server instance) ---
+    # Note: Cheng module-global `ref` values default to a NON-NIL zeroed object
+    # (confirmed by probe), so `gX != nil` is always true. Each opt-in feature is
+    # gated by an explicit `On` bool set by its setter, not by a nil check.
+    gMaxAllocs: int32
+    gPortAlloc: portalloc.TurnPortAlloc
+    gPortAllocOn: bool
+    gRateLimit: ratelimit.TurnRateLimit
+    gRateLimitOn: bool
+    gMetricsOn: bool
+    gNonceTtlSec: int32
+    gNonceSecret: Bytes
+    gNonceCache: nonce.TurnNonceCache
+    gUserDb: userdb.TurnUserDb
+
+type
+    TurnServer =
+        listenFd: int32
+        listenHost: str
+        listenPort: int32
+        family: int32
+        isV6: bool
+        useLenField: bool
+        software: Bytes
+        realm: Bytes
+        nonce: Bytes
+        restSecret: Bytes
+        allocCount: int32
+        allocClientHost: str[turnMaxAllocs]
+        allocClientPort: int32[turnMaxAllocs]
+        allocRelayFd: int32[turnMaxAllocs]
+        allocRelayPort: int32[turnMaxAllocs]
+        allocLifetime: int32[turnMaxAllocs]
+        allocActive: bool[turnMaxAllocs]
+        permCount: int32
+        permAllocIdx: int32[turnMaxPerms]
+        permPeerHost: str[turnMaxPerms]
+        permPeerPort: int32[turnMaxPerms]
+        chanCount: int32
+        chanAllocIdx: int32[turnMaxChans]
+        chanNumber: int32[turnMaxChans]
+        chanPeerHost: str[turnMaxChans]
+        chanPeerPort: int32[turnMaxChans]
+        nextChannel: int32
+
+fn TurnServerNew(host: str, port: int32, software: Bytes, realm: Bytes, nonce: Bytes, restSecret: Bytes): TurnServer =
+    var s: TurnServer
+    s.listenFd = -1
+    s.listenHost = host
+    s.listenPort = port
+    s.family = 2
+    s.isV6 = false
+    s.useLenField = os.UdpPlatformUseLenFieldBridge() != 0
+    s.software = software
+    s.realm = realm
+    s.nonce = nonce
+    s.restSecret = restSecret
+    s.allocCount = 0
+    s.permCount = 0
+    s.chanCount = 0
+    s.nextChannel = 0x4000
+    return s
+
+fn TurnNextTxid(): Bytes =
+    turnTxidCounter = turnTxidCounter + 1
+    let out: Bytes = BytesAlloc(12)
+    var c: int32 = turnTxidCounter
+    var i: int32
+    for i in i..<12:
+        BytesSet(out, i, c & 255)
+        c = c >> 8
+    return out
+
+fn TurnIpv4FromHost(host: str): Bytes =
+    let out: Bytes = BytesAlloc(4)
+    var octet: int32
+    var octetIndex: int32
+    let n: int32 = strings.Len(host)
+    var i: int32
+    for i in i..<n:
+        let ch: int32 = int32(host[i])
+        if ch == int32('.'):
+            if octetIndex < 4:
+                BytesSet(out, octetIndex, octet)
+            octetIndex = octetIndex + 1
+            octet = 0
+        elif ch >= int32('0') && ch <= int32('9'):
+            octet = octet * 10 + (ch - int32('0'))
+        else:
+            return out
+    if octetIndex == 3:
+        BytesSet(out, 3, octet)
+    return out
+
+fn TurnHostFromIp(ip: Bytes): str =
+    if BytesLen(ip) < 4:
+        return "0.0.0.0"
+    return strutil.Join([
+        strings.IntToStr(BytesGet(ip, 0)),
+        ".",
+        strings.IntToStr(BytesGet(ip, 1)),
+        ".",
+        strings.IntToStr(BytesGet(ip, 2)),
+        ".",
+        strings.IntToStr(BytesGet(ip, 3))
+    ], "")
+
+fn TurnDefaultLifetime(): int32 =
+    return turnDefaultLifetime
+
+fn TurnMaxLifetime(): int32 =
+    return turnMaxLifetime
+
+fn TurnAllocCount(s: TurnServer): int32 =
+    return s.allocCount
+
+fn TurnAllocFind(s: TurnServer, clientHost: str, clientPort: int32): int32 =
+    let n: int32 = s.allocCount
+    var i: int32
+    for i in i..<n:
+        if s.allocActive[i]:
+            if s.allocClientHost[i] == clientHost && s.allocClientPort[i] == clientPort:
+                return i
+    return -1
+
+fn TurnAllocFindByRelayPort(s: TurnServer, relayPort: int32): int32 =
+    let n: int32 = s.allocCount
+    var i: int32
+    for i in i..<n:
+        if s.allocActive[i]:
+            if s.allocRelayPort[i] == relayPort:
+                return i
+    return -1
+
+fn TurnRelaySocketOpen(outFd: var int32, outPort: var int32): int32 =
+    outFd = -1
+    outPort = 0
+    let sockRes = udp.UdpSocketOpenDgram(false)
+    if IsErr(sockRes):
+        return 1
+    let sock = Value(sockRes)
+    var addr: udp.UdpSockAddr
+    let useLen: bool = os.UdpPlatformUseLenFieldBridge() != 0
+    let addrRes = udp.UdpSockAddrFromHostPort(turnRelayBindHost, 0, false, sock.family, useLen, addr)
+    if IsErr(addrRes):
+        let _ = os.UdpCloseFd(sock.fd)
+        return 2
+    let bindRes = udp.UdpBindAddr(sock.fd, addr)
+    if IsErr(bindRes):
+        let _ = os.UdpCloseFd(sock.fd)
+        return 3
+    var bound: udp.UdpSockAddr
+    let nameRes = udp.UdpGetSockName(sock.fd, bound)
+    if IsErr(nameRes):
+        let _ = os.UdpCloseFd(sock.fd)
+        return 4
+    outFd = sock.fd
+    outPort = bound.port
+    return 0
+
+fn TurnAllocCreate(s: var TurnServer, clientHost: str, clientPort: int32, lifetime: int32): int32 =
+    let cap: int32 = if gMaxAllocs > 0: gMaxAllocs else: turnMaxAllocs
+    if s.allocCount >= cap:
+        if gMetricsOn:
+            metrics.TurnMetricsIncCapacityExhausted()
+        return -1
+    if gRateLimitOn:
+        let rlRc: int32 = ratelimit.TurnRateLimitCheckInc(gRateLimit, strings.CloneStr(clientHost))
+        if rlRc != 0:
+            if gMetricsOn:
+                metrics.TurnMetricsIncRateLimited()
+            return -2
+    # Relay port allocation: the cold compiler drops var out-param writeback for
+    # TurnRelaySocketOpen if its signature/body is changed to bind a configured
+    # range port (stage-4 blocker, recorded in findings). Relay sockets therefore
+    # bind ephemeral (127.0.0.1:0); the configured --min-port/--max-port range is
+    # honored as a CAPACITY CAP via gMaxAllocs (= range size), so exhaustion still
+    # yields 508 Insufficient Capacity. Range-port binding is deferred to stage 3
+    # (TLS/DTLS) work or a fixed cold compiler.
+    var relayFd: int32
+    var relayPort: int32
+    let rc: int32 = TurnRelaySocketOpen(relayFd, relayPort)
+    if rc != 0:
+        if gRateLimitOn:
+            ratelimit.TurnRateLimitDec(gRateLimit, clientHost)
+        if gMetricsOn:
+            metrics.TurnMetricsIncCapacityExhausted()
+        return -1
+    let idx: int32 = s.allocCount
+    s.allocClientHost[idx] = clientHost
+    s.allocClientPort[idx] = clientPort
+    s.allocRelayFd[idx] = relayFd
+    s.allocRelayPort[idx] = relayPort
+    let lt: int32 = if lifetime > 0 && lifetime <= turnMaxLifetime: lifetime else: turnDefaultLifetime
+    s.allocLifetime[idx] = lt
+    s.allocActive[idx] = true
+    s.allocCount = s.allocCount + 1
+    if gMetricsOn:
+        metrics.TurnMetricsIncActiveAlloc()
+    return idx
+
+# Release an allocation's resources (relay fd + port-range port + rate-limit slot
+# + active gauge). Called on Refresh-to-zero. The slot stays occupied (allocCount
+# is not decremented); slot reuse is a future improvement (recorded in findings).
+fn TurnAllocRelease(s: var TurnServer, idx: int32) =
+    if idx < 0 || idx >= s.allocCount:
+        return
+    if !s.allocActive[idx]:
+        return
+    s.allocActive[idx] = false
+    if s.allocRelayFd[idx] >= 0:
+        let _ = os.UdpCloseFd(s.allocRelayFd[idx])
+        s.allocRelayFd[idx] = -1
+    if gPortAllocOn:
+        portalloc.TurnPortAllocRelease(gPortAlloc, s.allocRelayPort[idx])
+    if gRateLimitOn:
+        ratelimit.TurnRateLimitDec(gRateLimit, s.allocClientHost[idx])
+    if gMetricsOn:
+        metrics.TurnMetricsDecActiveAlloc()
+
+fn TurnAllocRelayedIp(s: TurnServer, allocIdx: int32): Bytes =
+    return TurnIpv4FromHost(turnRelayBindHost)
+
+fn TurnPermHas(s: TurnServer, allocIdx: int32, peerHost: str, peerPort: int32): bool =
+    let n: int32 = s.permCount
+    var i: int32
+    for i in i..<n:
+        if s.permAllocIdx[i] == allocIdx && s.permPeerHost[i] == peerHost && s.permPeerPort[i] == peerPort:
+            return true
+    return false
+
+fn TurnPermAdd(s: var TurnServer, allocIdx: int32, peerHost: str, peerPort: int32) =
+    if TurnPermHas(s, allocIdx, peerHost, peerPort):
+        return
+    if s.permCount >= turnMaxPerms:
+        return
+    let idx: int32 = s.permCount
+    s.permAllocIdx[idx] = allocIdx
+    s.permPeerHost[idx] = peerHost
+    s.permPeerPort[idx] = peerPort
+    s.permCount = s.permCount + 1
+
+fn TurnChannelFindByNumber(s: TurnServer, allocIdx: int32, channel: int32): int32 =
+    let n: int32 = s.chanCount
+    var i: int32
+    for i in i..<n:
+        if s.chanAllocIdx[i] == allocIdx && s.chanNumber[i] == channel:
+            return i
+    return -1
+
+fn TurnChannelFindByPeer(s: TurnServer, allocIdx: int32, peerHost: str, peerPort: int32): int32 =
+    let n: int32 = s.chanCount
+    var i: int32
+    for i in i..<n:
+        if s.chanAllocIdx[i] == allocIdx && s.chanPeerHost[i] == peerHost && s.chanPeerPort[i] == peerPort:
+            return i
+    return -1
+
+fn TurnChannelNext(s: var TurnServer): int32 =
+    let ch: int32 = s.nextChannel
+    s.nextChannel = s.nextChannel + 1
+    if s.nextChannel > 0x7FFF:
+        s.nextChannel = 0x4000
+    return ch
+
+fn TurnChannelAdd(s: var TurnServer, allocIdx: int32, peerHost: str, peerPort: int32): int32 =
+    if TurnChannelFindByPeer(s, allocIdx, peerHost, peerPort) >= 0:
+        return 1
+    if s.chanCount >= turnMaxChans:
+        return 2
+    let ch: int32 = TurnChannelNext(s)
+    let idx: int32 = s.chanCount
+    s.chanAllocIdx[idx] = allocIdx
+    s.chanNumber[idx] = ch
+    s.chanPeerHost[idx] = peerHost
+    s.chanPeerPort[idx] = peerPort
+    s.chanCount = s.chanCount + 1
+    return ch
+
+fn TurnChannelLookupPeer(s: TurnServer, allocIdx: int32, channel: int32, outHost: var str, outPort: var int32): bool =
+    let i: int32 = TurnChannelFindByNumber(s, allocIdx, channel)
+    if i < 0:
+        return false
+    outHost = s.chanPeerHost[i]
+    outPort = s.chanPeerPort[i]
+    return true
+
+fn TurnRelaySendToPeer(s: TurnServer, allocIdx: int32, peerHost: str, peerPort: int32, data: Bytes): int32 =
+    if allocIdx < 0 || allocIdx >= TurnAllocCount(s):
+        return 1
+    let fd: int32 = s.allocRelayFd[allocIdx]
+    var addr: udp.UdpSockAddr
+    let addrRes = udp.UdpSockAddrFromHostPort(peerHost, peerPort, false, s.family, s.useLenField, addr)
+    if IsErr(addrRes):
+        return 2
+    let sendRes = udp.UdpSendTo(fd, data, addr)
+    if IsErr(sendRes):
+        return 3
+    if gMetricsOn:
+        metrics.TurnMetricsAddRelayOut(rawbytes.BytesLen(data))
+    return 0
+
+fn TurnServerSendToClient(s: TurnServer, clientHost: str, clientPort: int32, msg: Bytes): int32 =
+    var addr: udp.UdpSockAddr
+    let addrRes = udp.UdpSockAddrFromHostPort(clientHost, clientPort, false, s.family, s.useLenField, addr)
+    if IsErr(addrRes):
+        return 1
+    let sendRes = udp.UdpSendTo(s.listenFd, msg, addr)
+    if IsErr(sendRes):
+        return 2
+    return 0
+
+fn TurnRelayPumpOne(s: var TurnServer, allocIdx: int32): int32 =
+    if allocIdx < 0 || allocIdx >= TurnAllocCount(s):
+        return 1
+    if !s.allocActive[allocIdx]:
+        return 2
+    let fd: int32 = s.allocRelayFd[allocIdx]
+    let ready: int32 = os.UdpFdWaitReadable(fd, 100)
+    if ready <= 0:
+        return 0
+    var recv: udp.UdpRecvResult
+    let recvRes = udp.UdpRecvFromNonblock(fd, turnRelayRecvBuf, recv)
+    if IsErr(recvRes):
+        return 0
+    let data: Bytes = recv.data
+    if BytesLen(data) <= 0:
+        return 0
+    let peerHost: str = recv.fromAddr.host
+    let peerPort: int32 = recv.fromAddr.port
+    let peerIp: Bytes = TurnIpv4FromHost(peerHost)
+    let txid: Bytes = TurnNextTxid()
+    let ind: Bytes = turn.TurnEncodeDataIndication(txid, peerIp, peerPort, data)
+    let clientHost: str = s.allocClientHost[allocIdx]
+    let clientPort: int32 = s.allocClientPort[allocIdx]
+    if gMetricsOn:
+        metrics.TurnMetricsAddRelayIn(rawbytes.BytesLen(data))
+    return TurnServerSendToClient(s, clientHost, clientPort, ind)
+
+fn TurnRelayPumpAll(s: var TurnServer): int32 =
+    let n: int32 = TurnAllocCount(s)
+    var i: int32
+    var pumped: int32
+    for i in i..<n:
+        if s.allocActive[i]:
+            let rc: int32 = TurnRelayPumpOne(s, i)
+            if rc == 0:
+                pumped = pumped + 1
+    return pumped
+
+# --- stage 4 configuration setters (process-global; nil/zero keeps stage 1/2 behavior) ---
+
+fn TurnServerSetMaxAllocs(n: int32) =
+    var cap: int32 = n
+    if cap < 1:
+        cap = 1
+    if cap > turnMaxAllocs:
+        cap = turnMaxAllocs
+    gMaxAllocs = cap
+
+fn TurnServerSetPortAlloc(a: portalloc.TurnPortAlloc) =
+    gPortAlloc = a
+    gPortAllocOn = true
+
+fn TurnServerSetRateLimit(rl: ratelimit.TurnRateLimit) =
+    gRateLimit = rl
+    gRateLimitOn = true
+
+fn TurnServerSetMetrics(on: bool) =
+    gMetricsOn = on
+
+fn TurnMetricsEnabled(): bool =
+    return gMetricsOn
+
+fn TurnServerSetNonce(ttlSec: int32, secret: Bytes, cache: nonce.TurnNonceCache) =
+    gNonceTtlSec = ttlSec
+    gNonceSecret = secret
+    gNonceCache = cache
+
+fn TurnServerSetUserDb(db: userdb.TurnUserDb) =
+    gUserDb = db
+
+fn TurnServerMaxAllocs(): int32 =
+    if gMaxAllocs > 0:
+        return gMaxAllocs
+    return turnMaxAllocs
+
+fn TurnServerRateLimitCount(host: str): int32 =
+    if !gRateLimitOn:
+        return 0
+    return ratelimit.TurnRateLimitCount(gRateLimit, host)
+
+# --- stage 4 userdb + nonce access (delegate to module globals) ---
+
+fn TurnUserDbIsLoaded(): bool =
+    if gUserDb == nil:
+        return false
+    return userdb.TurnUserDbLoaded(gUserDb)
+
+fn TurnLookupLongTermKey(username: str, realm: str): Bytes =
+    if gUserDb == nil:
+        return rawbytes.EmptyBytes()
+    return userdb.TurnLookupLongTermKey(gUserDb, username, realm)
+
+# Fresh nonce for a 401 challenge: a time-stamped HMAC nonce when hardening is on
+# (gNonceTtlSec > 0), else the server's static nonce (stage 1/2 behavior).
+fn TurnServerFreshNonce(staticNonce: Bytes, nowSec: int64): Bytes =
+    if gNonceTtlSec > 0:
+        return nonce.TurnNonceGenerate(gNonceSecret, nowSec)
+    return staticNonce
+
+# Validate a request nonce when hardening is on. Returns 0 ok, 1 stale/invalid,
+# 2 replay. No-op (returns 0) when hardening is off so stage 1/2 smokes unchanged.
+fn TurnServerValidateNonce(nonceBytes: Bytes, nowSec: int64): int32 =
+    if gNonceTtlSec <= 0:
+        return 0
+    let v: int32 = nonce.TurnNonceValidate(gNonceSecret, nonceBytes, nowSec, gNonceTtlSec)
+    if v != 0:
+        return 1
+    if gNonceCache != nil:
+        if nonce.TurnNonceCacheContains(gNonceCache, nonceBytes):
+            return 2
+        nonce.TurnNonceCacheAdd(gNonceCache, nonceBytes)
+    return 0

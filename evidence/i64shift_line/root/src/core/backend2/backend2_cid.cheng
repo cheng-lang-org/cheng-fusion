@@ -1,0 +1,450 @@
+# backend2_cid — funcEmitCid 7-tuple 真计算 + contentCid 产物哈希 (纯值层)。
+# 契约: backend2_types.cheng:11-29 (7-tuple 冻结定义);
+# spec: docs/beat-c.md §8.3 修正全落地 —
+#   §3.1 codegenEpochSalt = Backend2SemanticEpoch()（完整 backend2 codegen
+#        source closure 派生，非人工版本号、非 canonicalGraphCid）;
+#   §3.2 sourcePathHash = 规范路径哈希, 绝不含行号/列号 (第 4 成分的 spec 订正落地);
+#   §3.3 typedFnCanonicalHash 是 alpha 归一后的完整 BodyIR codec + exact global data rows；
+#        除非 global-address，仅局部槽名被置空，canonical allocator 可读的
+#        stackOffset/auxValue/ownership/alias/escape/noAlias 等一律入键；全局初值
+#        来自 typed IR、不在 BodyIR 内，必须显式进入同一分量防 stale fragment hit。
+#   §3.4 calleeAbiViews per-fn 窄视图序列化 (视图构造在 pipeline, 本模块只吃纯值);
+#   §3.5 callTargets/callImportcSymbols/views 显式字典序排序后入哈希 (注册序扰动不变);
+#   §3.7 targetTriple 入键。
+# §4.3 契约原语: contentCid 二次校验 (语义哈希命中 ≠ 产物对) + 空 cid 拒收 + cid 校验,
+# 全部 hard-fail (panic), 绝不静默 — 消费接线归 slice-12 (compile_skip_cache)。
+#
+# 铁律 (同 backend2_types): 零 import 编译器状态 — 只允许 std / coreir / b2t / b2fc,
+# 全部纯函数, 无模块级可变态; fork worker / census / 串行三路径逐字节同结果。
+#
+# 层级注记 (BodyIR-level 哈希的语义边界, 实现定谳):
+#   - 本哈希吃 lower 完成后的 BodyIR (patch call symbols 之后) — lowering 是 typed IR 的
+#     确定性函数, 故 "同 typed 语义 → 同 BodyIR → 同 cid" 成立; 编译器逻辑变更导致的
+#     BodyIR/发射差异由 §3.1 epoch 盐翻转覆盖。
+#   - α 不变量: 局部槽名不入哈希 (槽身份 = 下标; 局部改名 cid 不变)。例外: placeKind ==
+#     BodyPlaceGlobalAddressTag 的槽名是发射语义 (决定 cheng_global_* reloc 标签与
+#     __cheng_function_address#N funcaddr 目标), 必须入哈希。
+#   - frame/layout/residency 等旧 emitter 派生量本就不在 exact BodyIR codec；
+#     codec 中的字段全部入键，禁止再维护一份易漏的手写字段表。
+#   - functionSymbol 入哈希: fragment 内容含符号名与 cstring 标签前缀, 同体异名函数
+#     的 fragment 不同, 键必须区分 (否则跨函数错配 = 静默 miscompile)。
+
+import std/result
+import std/strings
+import std/rawbytes
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
+import cheng/core/ir/core_types as coreir
+import cheng/core/backend2/backend2_types as b2t
+import cheng/core/backend2/backend2_frag_codec as b2fc
+
+# ---- 域隔离字节编码器 (LE 长度前缀框架, 消 concat 歧义; 镜像 csg_normalize 范式) ----
+
+fn backend2CidAppendU32(buf: var layout.ByteBuf, value: int32) =
+    layout.ByteBufAppendByte(buf, value & 255)
+    layout.ByteBufAppendByte(buf, (value >> 8) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 16) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 24) & 255)
+
+@borrows
+fn backend2CidAppendText(buf: var layout.ByteBuf, text: str) =
+    backend2CidAppendU32(buf, len(text))
+    for i in 0..<len(text):
+        layout.ByteBufAppendByte(buf, text[i])
+
+@borrows
+fn backend2CidAppendTexts(buf: var layout.ByteBuf, items: str[]) =
+    backend2CidAppendU32(buf, items.len)
+    for i in 0..<items.len:
+        backend2CidAppendText(buf, items[i])
+
+fn backend2CidAppendI32Seq(buf: var layout.ByteBuf, items: var int32[]) =
+    backend2CidAppendU32(buf, items.len)
+    for i in 0..<items.len:
+        backend2CidAppendU32(buf, items[i])
+
+@borrows
+fn backend2CidAppendFixed32(buf: var layout.ByteBuf, value: layout.FixedBytes32) =
+    layout.ByteBufAppendFixed32(buf, value)
+
+fn backend2CidBufSha256(buf: var layout.ByteBuf): layout.FixedBytes32 =
+    let digest = hash256.Sha256Fixed(layout.ByteBufView(buf))
+    layout.ByteBufFree(buf)
+    return digest
+
+fn backend2CidBufHex(buf: var layout.ByteBuf): str =
+    return layout.FixedBytes32Hex(backend2CidBufSha256(buf))
+
+# ---- 字典序 (逐字节无符号; ASCII 域足够, 符号名/类型拼写均 ASCII) ----
+
+@borrows
+fn Backend2StrLess(a: str, b: str): bool =
+    var n = len(a)
+    if len(b) < n:
+        n = len(b)
+    for i in 0..<n:
+        let ca = int32(a[i]) & 255
+        let cb = int32(b[i]) & 255
+        if ca != cb:
+            return ca < cb
+    return len(a) < len(b)
+
+# §3.5: 排序副本 (插入排序 — 域是单函数调用边表, N 小; 不带比较器依赖, 决定性)。
+@borrows
+fn Backend2SortStrings(items: str[]): str[] =
+    # Sort immutable int32 indices instead of shifting managed str elements.
+    # Element swaps are scalar and loop-carried identity stays on `order`,
+    # so the ownership proof never has to merge live/consumed `out` states.
+    var order: int32[]
+    for i in 0..<items.len:
+        add(order, i)
+    for i in 1..<order.len:
+        var j = i
+        while j > 0 && Backend2StrLess(
+                items[order[j]], items[order[j - 1]]):
+            let tmp = order[j - 1]
+            order[j - 1] = order[j]
+            order[j] = tmp
+            j = j - 1
+    var out: str[]
+    for i in 0..<order.len:
+        add(out, share(items[order[i]]))
+    return out
+
+@borrows
+fn backend2CidViewLess(a: b2t.CalleeAbiView,
+                       b: b2t.CalleeAbiView): bool =
+    if a.functionName != b.functionName:
+        return Backend2StrLess(a.functionName, b.functionName)
+    if a.returnType != b.returnType:
+        return Backend2StrLess(a.returnType, b.returnType)
+    var n = a.paramTypes.len
+    if b.paramTypes.len < n:
+        n = b.paramTypes.len
+    for i in 0..<n:
+        if a.paramTypes[i] != b.paramTypes[i]:
+            return Backend2StrLess(a.paramTypes[i], b.paramTypes[i])
+    return a.paramTypes.len < b.paramTypes.len
+
+@borrows
+fn Backend2SortCalleeAbiViews(
+        views: b2t.CalleeAbiView[]): b2t.CalleeAbiView[] =
+    # Same scalar-index insertion sort as Backend2SortStrings.  The
+    # CalleeAbiView elements remain untouched until the final share pass,
+    # which keeps every managed definition single-owner through the loop.
+    var order: int32[]
+    for i in 0..<views.len:
+        add(order, i)
+    for i in 1..<order.len:
+        var j = i
+        while j > 0 && backend2CidViewLess(
+                views[order[j]], views[order[j - 1]]):
+            let tmp = order[j - 1]
+            order[j - 1] = order[j]
+            order[j] = tmp
+            j = j - 1
+    var out: b2t.CalleeAbiView[]
+    for i in 0..<order.len:
+        add(out, share(views[order[i]]))
+    return out
+
+# ---- §3.4 typeSpelling 规范化 (纯文本层: 空白归一 + 指针统一 "ptr") ----
+# 别名展开需 typedIr typeDefAlias 表 (编译器状态), 由 pipeline 侧
+# backend2CalleeAbiViewCanonicalType 先展开再进本函数; 本函数保持纯值。
+# 指针统一是 ABI 忠实的: 任何指针参数/返回在调用约定层一律 8B 地址。
+
+@borrows
+fn backend2CidStartsWith(text: str, prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    for i in 0..<len(prefix):
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+@borrows
+fn Backend2TypeCanonicalSpelling(typeRaw: str): str =
+    var hasSpace = false
+    for i in 0..<len(typeRaw):
+        let scan = typeRaw[i]
+        if scan == ' ' || scan == '\t' || scan == '\n' || scan == '\r':
+            hasSpace = true
+            break
+    var t = typeRaw
+    if hasSpace:
+        var buf: layout.ByteBuf = layout.ByteBufInit(64)
+        for i in 0..<len(typeRaw):
+            let piece = typeRaw[i]
+            if piece == ' ' || piece == '\t' || piece == '\n' || piece == '\r':
+                continue
+            layout.ByteBufAppendByte(buf, piece)
+        var compactBytes = layout.ByteBufToBytes(buf)
+        let compactLen = layout.ByteBufLen(buf)
+        if compactBytes.len != compactLen ||
+           (compactLen > 0 && compactBytes.data == nil):
+            rawbytes.BytesFree(compactBytes)
+            layout.ByteBufFree(buf)
+            panic("backend2_cid_type_spelling_copy_failed")
+        t = rawbytes.BytesToString(compactBytes)
+        rawbytes.BytesFree(compactBytes)
+        layout.ByteBufFree(buf)
+    if len(t) <= 0:
+        return ""
+    if t == "ptr" || t == "void*":
+        return "ptr"
+    if t[len(t) - 1] == '*':
+        return "ptr"
+    if backend2CidStartsWith(t, "ptr["):
+        return "ptr"
+    return t
+
+# ---- §3.3 typedFnCanonicalHash: 含体规范化哈希 (BodyIR-level, 头注定谳) ----
+
+@borrows
+fn backend2TypedFnCanonicalHashExact(
+        bodyIR: var coreir.BodyIR,
+        functionSymbolRaw: str,
+        globalDataLabelsRaw: var str[],
+        globalDataPayloadTexts: var str[],
+        globalDataPayloadByteCounts: var int32[]): layout.FixedBytes32 =
+    if globalDataLabelsRaw.len != globalDataPayloadTexts.len ||
+       globalDataLabelsRaw.len != globalDataPayloadByteCounts.len:
+        panic("backend2_cid_global_data_rows_not_parallel")
+    # The codec is the allocator-ingress schema.  Hashing a second handwritten
+    # projection previously omitted auxValue/noAlias and allowed a warm-cache
+    # hit to substitute a different canonical allocation input.  Normalize the
+    # sole alpha-invariant field, then hash every encoded ingress byte plus the
+    # exact typed-IR-derived data rows shipped in the fragment.
+    var encoded = b2fc.Backend2BodyIrEncodeCanonicalHashIngress(bodyIR)
+    var buf: layout.ByteBuf = layout.ByteBufInit(4096)
+    backend2CidAppendText(buf, "cheng.backend2.typedfn.canonical")
+    backend2CidAppendText(buf, functionSymbolRaw)
+    backend2CidAppendU32(buf, encoded.len)
+    layout.ByteBufAppendBytes(buf, encoded)
+    backend2CidAppendTexts(buf, globalDataLabelsRaw)
+    backend2CidAppendTexts(buf, globalDataPayloadTexts)
+    backend2CidAppendI32Seq(buf, globalDataPayloadByteCounts)
+    rawbytes.BytesFree(encoded)
+    return backend2CidBufSha256(buf)
+
+@borrows
+fn Backend2TypedFnCanonicalHash(bodyIR: var coreir.BodyIR,
+                                functionSymbolRaw: str): layout.FixedBytes32 =
+    var labels: str[]
+    var payloads: str[]
+    var byteCounts: int32[]
+    return backend2TypedFnCanonicalHashExact(
+        bodyIR, functionSymbolRaw, labels, payloads, byteCounts)
+
+@borrows
+fn Backend2TypedFnCanonicalHashWithGlobalData(
+        bodyIR: var coreir.BodyIR,
+        functionSymbolRaw: str,
+        globalDataLabelsRaw: var str[],
+        globalDataPayloadTexts: var str[],
+        globalDataPayloadByteCounts: var int32[]): layout.FixedBytes32 =
+    return backend2TypedFnCanonicalHashExact(
+        bodyIR,
+        functionSymbolRaw,
+        globalDataLabelsRaw,
+        globalDataPayloadTexts,
+        globalDataPayloadByteCounts)
+
+# ---- §3.2 sourcePathHash: 规范路径 (workspace/package 前缀剥除), 绝不含行号 ----
+
+@borrows
+fn Backend2SourcePathHash(workspaceRoot: str,
+                          packageRoot: str,
+                          sourcePathRaw: str): layout.FixedBytes32 =
+    var start = 0
+    if len(packageRoot) > 0 && backend2CidStartsWith(sourcePathRaw, packageRoot):
+        start = len(packageRoot)
+    elif len(workspaceRoot) > 0 && backend2CidStartsWith(sourcePathRaw, workspaceRoot):
+        start = len(workspaceRoot)
+    while start < len(sourcePathRaw) && sourcePathRaw[start] == '/':
+        start = start + 1
+    var p = strings.SliceBytes(sourcePathRaw, start, len(sourcePathRaw) - start)
+    var buf: layout.ByteBuf = layout.ByteBufInit(128)
+    backend2CidAppendText(buf, "cheng.backend2.srcpath")
+    backend2CidAppendText(buf, p)
+    return backend2CidBufSha256(buf)
+
+# ---- funcEmitCid = sha256(7-tuple) (backend2_types.cheng:12-21 冻结契约的唯一实现) ----
+
+@borrows
+fn Backend2ComputeFuncEmitCid(codegenEpochSalt: str,
+                              targetTriple: str,
+                              typedFnCanonicalHash: layout.FixedBytes32,
+                              sourcePathHash: layout.FixedBytes32,
+                              callTargets: str[],
+                              callImportcSymbols: str[],
+                              calleeAbiViews: b2t.CalleeAbiView[]): str =
+    if codegenEpochSalt == "":
+        panic("backend2_cid_empty_epoch_salt")
+    if targetTriple == "":
+        panic("backend2_cid_empty_target_triple")
+    var buf: layout.ByteBuf = layout.ByteBufInit(1024)
+    backend2CidAppendText(buf, "cheng.backend2.funcemitcid")
+    backend2CidAppendText(buf, codegenEpochSalt)                          # 1 §3.1
+    backend2CidAppendText(buf, targetTriple)                              # 2 §3.7
+    backend2CidAppendFixed32(buf, typedFnCanonicalHash)                   # 3 §3.3
+    backend2CidAppendFixed32(buf, sourcePathHash)                         # 4 §3.2
+    var sortedCallTargets = Backend2SortStrings(callTargets)
+    var sortedImportcSymbols = Backend2SortStrings(callImportcSymbols)
+    backend2CidAppendTexts(buf, sortedCallTargets)                        # 5 §3.5
+    backend2CidAppendTexts(buf, sortedImportcSymbols)                     # 6 §3.5
+    var views = Backend2SortCalleeAbiViews(calleeAbiViews)                # 7 §3.4+§3.5
+    backend2CidAppendU32(buf, views.len)
+    for i in 0..<views.len:
+        backend2CidAppendText(buf, views[i].functionName)
+        backend2CidAppendTexts(buf, views[i].paramTypes)
+        backend2CidAppendText(buf, views[i].returnType)
+    return backend2CidBufHex(buf)
+
+# ---- §4.3 contentCid: fragment 产物内容哈希 (键值双方自指字段留空后走 codec 线格式) ----
+# codec 是唯一序列化事实源 (完整性由 fieldCount/round-trip/jobs 门锁), contentCid 借同一
+# 线格式按构造覆盖全部内容字段 — 加字段漏哈希与漏编码是同一个洞, 被同一组门抓。
+
+fn Backend2ContentCidOfFragment(
+        frag: var b2t.FunctionFragment): str =
+    var enc = b2fc.Backend2FragmentEncodeForContentCid(frag)
+    let hex = layout.FixedBytes32Hex(hash256.Sha256Fixed(layout.ByteSpanFromBytes(enc)))
+    rawbytes.BytesFree(enc)
+    return hex
+
+# ---- §4.3 hard-fail 校验原语 (slice-12 缓存 hit/put 接线消费; 绝不静默) ----
+
+# 命中校验 ①: 存储键 == 查询键 (cid_mismatch = 硬崩)。
+@borrows
+fn Backend2FragmentVerifyCid(
+        frag: var b2t.FunctionFragment, queryCid: str) =
+    if queryCid == "":
+        panic(Fmt"backend2_cache_cid_query_empty sym={frag.functionSymbol}")
+    if frag.funcEmitCid != queryCid:
+        panic(Fmt"backend2_cache_cid_mismatch sym={frag.functionSymbol} query={queryCid} stored={frag.funcEmitCid}")
+
+# 命中校验 ②: 重算 contentCid == 存储 contentCid (语义哈希命中 ≠ 产物对; 篡改/伪造 = 硬崩)。
+fn Backend2FragmentVerifyContent(frag: var b2t.FunctionFragment) =
+    if frag.contentCid == "":
+        panic(Fmt"backend2_content_cid_empty sym={frag.functionSymbol}")
+    let recomputed = Backend2ContentCidOfFragment(frag)
+    if recomputed != frag.contentCid:
+        panic(Fmt"backend2_content_cid_mismatch sym={frag.functionSymbol} stored={frag.contentCid} recomputed={recomputed}")
+
+# put 前置: 空键拒收 (全函数空键碰撞 = 任意函数命中他人机器码, spec §4.3/§9#4)。
+fn Backend2FragmentCacheKeyGuard(frag: var b2t.FunctionFragment) =
+    if frag.funcEmitCid == "":
+        panic(Fmt"backend2_empty_func_emit_cid_reject sym={frag.functionSymbol}")
+    if frag.contentCid == "":
+        panic(Fmt"backend2_empty_content_cid_reject sym={frag.functionSymbol}")
+
+# ---- funcLowerCid = sha256(6-tuple) (spec §12.2 skip-lower 键, ≠ funcEmitCid) ----
+# 6-tuple: lowerEpochSalt, targetTriple, typedFnCanonicalHash(含体, typed 级指纹),
+#          sourcePathHash(无行号, 同 §3.2), callSeqHash(callTargets∥importc 排序后),
+#          calleeAbiViews。Lowering reads callee ABI to build arg/result pass kinds and sizes;
+#          omitting it turns a signature-only edit into a stale BodyIR hit.
+# typedFnCanonicalHash 在此为 typed 级指纹
+#   (pipeline 侧 Backend2SkipLowerTypedFingerprint 产出, 覆盖 irFunction.statements
+#   全字段-行号 + 签名 + returnExpr) — 与 emit 第 3 成分"同算法, 含体"语义对齐,
+#   输入域不同 (typed 级 vs bodyIR 级), 故为独立键非重用 funcEmitCid。
+# 确定性: callSeq/ABI views 显式字典序排序 (§3.5); typed 指纹由 pipeline 决定性构建。
+
+# [wall99] 6-tuple 编码单一配方核心：hex 出口（skip-lower 缓存键）与
+# FixedBytes32 出口（data relocation identity cstring owner 绑定）共用，
+# 两出口字节配方永不漂移。
+@borrows
+fn backend2FuncLowerCidAppend(buf: var layout.ByteBuf,
+                              lowerEpochSalt: str,
+                              targetTriple: str,
+                              typedFnCanonicalHash: layout.FixedBytes32,
+                              sourcePathHash: layout.FixedBytes32,
+                              callTargets: str[],
+                              callImportcSymbols: str[],
+                              calleeAbiViews: b2t.CalleeAbiView[]) =
+    var sortedCallTargets = Backend2SortStrings(callTargets)
+    var sortedImportcSymbols = Backend2SortStrings(callImportcSymbols)
+    backend2CidAppendText(buf, "cheng.backend2.funclowercid")
+    backend2CidAppendText(buf, lowerEpochSalt)                            # 1 §3.1
+    backend2CidAppendText(buf, targetTriple)                              # 2 §3.7
+    backend2CidAppendFixed32(buf, typedFnCanonicalHash)                   # 3 §3.3 含体
+    backend2CidAppendFixed32(buf, sourcePathHash)                         # 4 §3.2 无行号
+    backend2CidAppendTexts(buf, sortedCallTargets)                        # 5 §3.5
+    backend2CidAppendTexts(buf, sortedImportcSymbols)                     # 5 §3.5
+    var views = Backend2SortCalleeAbiViews(calleeAbiViews)                # 6 §3.4+§3.5
+    backend2CidAppendU32(buf, views.len)
+    for i in 0..<views.len:
+        backend2CidAppendText(buf, views[i].functionName)
+        backend2CidAppendTexts(buf, views[i].paramTypes)
+        backend2CidAppendText(buf, views[i].returnType)
+
+@borrows
+fn Backend2ComputeFuncLowerCid(lowerEpochSalt: str,
+                               targetTriple: str,
+                               typedFnCanonicalHash: layout.FixedBytes32,
+                               sourcePathHash: layout.FixedBytes32,
+                               callTargets: str[],
+                               callImportcSymbols: str[],
+                               calleeAbiViews: b2t.CalleeAbiView[]): str =
+    if lowerEpochSalt == "":
+        panic("backend2_cid_empty_lower_epoch_salt")
+    if targetTriple == "":
+        panic("backend2_cid_empty_lower_target_triple")
+    var buf: layout.ByteBuf = layout.ByteBufInit(1024)
+    backend2FuncLowerCidAppend(buf, lowerEpochSalt, targetTriple,
+                               typedFnCanonicalHash, sourcePathHash,
+                               callTargets, callImportcSymbols,
+                               calleeAbiViews)
+    return backend2CidBufHex(buf)
+
+# [wall99] funcLowerCid 的 FixedBytes32 形态（同一 6-tuple、仅哈希出口形态
+# 不同）：data relocation identity 的 cstring owner 绑定按契约收 32 字节
+# CID，经此出口直取，杜绝 hex 往返二次解析配方。
+@borrows
+fn Backend2FuncLowerCidFixed32(lowerEpochSalt: str,
+                               targetTriple: str,
+                               typedFnCanonicalHash: layout.FixedBytes32,
+                               sourcePathHash: layout.FixedBytes32,
+                               callTargets: str[],
+                               callImportcSymbols: str[],
+                               calleeAbiViews: b2t.CalleeAbiView[]): layout.FixedBytes32 =
+    if lowerEpochSalt == "":
+        panic("backend2_cid_empty_lower_epoch_salt")
+    if targetTriple == "":
+        panic("backend2_cid_empty_lower_target_triple")
+    var buf: layout.ByteBuf = layout.ByteBufInit(1024)
+    backend2FuncLowerCidAppend(buf, lowerEpochSalt, targetTriple,
+                               typedFnCanonicalHash, sourcePathHash,
+                               callTargets, callImportcSymbols,
+                               calleeAbiViews)
+    return backend2CidBufSha256(buf)
+
+# ---- S4-A 取件纯值层复用面 (docs/cheng-csg-pickup-design.md §2/§6; 开放问题 #5 主案落地) ----
+# 4 个一行转发别名把既有小写 append 族提升为跨模块可复用面 (纯布局, 零行为变化),
+# 供 backend2_plugin_cid.cheng 逐字节复用同一 LE 编码配方; 备选案 (plugin 侧镜像
+# 第二份 10 行副本) 按 §7#5 取舍记录放弃 — 单份实现保双端字节配方永不漂移。
+# Backend2CidFixed32IsZero 是 §3 provenance 零值判定与 sentinel 识别共用的
+# 逐字节比较原语 (设计 :62 要求落本文件)。
+
+fn Backend2CidAppendU32(buf: var layout.ByteBuf, value: int32) =
+    backend2CidAppendU32(buf, value)
+
+@borrows
+fn Backend2CidAppendText(buf: var layout.ByteBuf, text: str) =
+    backend2CidAppendText(buf, text)
+
+@borrows
+fn Backend2CidAppendTexts(buf: var layout.ByteBuf, items: str[]) =
+    backend2CidAppendTexts(buf, items)
+
+@borrows
+fn Backend2CidAppendFixed32(buf: var layout.ByteBuf, value: layout.FixedBytes32) =
+    backend2CidAppendFixed32(buf, value)
+
+fn Backend2CidBufSha256(buf: var layout.ByteBuf): layout.FixedBytes32 =
+    return backend2CidBufSha256(buf)
+
+fn Backend2CidFixed32IsZero(value: layout.FixedBytes32): bool =
+    for i in 0..<32:
+        if Int32(value.data[i]) != 0:
+            return false
+    return true

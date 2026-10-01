@@ -1,0 +1,223 @@
+# D8 真双机 worker (dosg)。四相位, 每相位一次进程:
+#   --phase wire   : QUIC join/lease/barrier (3 请求), 打印 lease 与各调用 RTT
+#   --phase inner  : 纯本地真实 SGD (墙钟计时, 零网络) -> delta 字节落本仓 ->
+#                    打印 blobCID/相对路径/inner_ms (公网不传张量, 只传 CID)
+#   --phase submit : SubmitOuterDelta (1 请求, RTT 打印; base cid/outer step 由 gate 传入)
+#   --phase verify : FetchGlobalVersion/FetchLineage (2 请求), 断言外步推进与 lineage
+import std/cmdline as cmdline
+import std/os
+import std/rawbytes as rawbytes
+import std/strings as strings
+import cheng/std/bytes_layout as layout
+import cheng/std/monotimes as monotimes
+import cheng/core/tooling/path as chengpath
+import cheng/libp2p/core/types
+import cheng/DiLoCo/core/diloco as core
+import cheng/DiLoCo/artifact/store as astore
+import cheng/DiLoCo/train/codec as codec
+import cheng/DiLoCo/train/inner_step as inner
+import cheng/DiLoCo/host/diloco_client as dclient
+import cheng/DiLoCo/protocol/wire
+import cheng/DiLoCo/tests/support
+
+const
+    D8InnerSteps: int32 = 4
+    D8Out: int32 = 2
+    D8In: int32 = 4
+
+fn die(msg: str): int32 =
+    echo(msg)
+    return 1
+
+@borrows
+fn workerBatchFill(xs: var int32[], ys: var int32[]) =
+    for s in 0..<3:
+        add(xs, 0)
+        add(xs, 1000)
+        add(xs, 0)
+        add(xs, 0)
+        add(ys, 0)
+        add(ys, 1000)
+
+fn rttUsSince(start: monotimes.MonoTime): int64 =
+    let now = monotimes.GetMonoTime()
+    return (now.ns - start.ns) / 1000
+
+fn main(): int32 =
+    let port = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    var phase: str
+    let hasPhase = cmdline.ReadFirstFlagValue("--phase", phase)
+    var hostAddr: str
+    let hasHost = cmdline.ReadFirstFlagValue("--host", hostAddr)
+    var storeDir: str
+    let hasStore = cmdline.ReadFirstFlagValue("--store-dir", storeDir)
+    if port <= 0 || !hasPhase || !hasHost || !hasStore:
+        return die(" diloco d8 worker: flags missing")
+
+    let jobBundleCid = support.DiLoCoTestJobBundleCid("d8-two-machine")
+    var workerPeer: types.Libp2pPeerId
+    workerPeer.value = support.DiLoCoTestJobBundleCid("d8-worker-peer")
+
+    if strings.StrContains(phase, "wire"):
+        var joinReq = wire.DiLoCoJoinCohortRequest()
+        joinReq.jobBundleCid = jobBundleCid
+        joinReq.peerId = workerPeer
+        let tJoin = monotimes.GetMonoTime()
+        let joinRes = dclient.DiLoCoJoinCohortRequestNamed(hostAddr, port, "localhost", joinReq)
+        let rttJoin = rttUsSince(tJoin)
+        assert(joinRes.ok, " diloco d8 worker wire: join")
+        echo(strings.ConcatStr("d8_rtt_join_us=", strings.Int64ToStr(rttJoin)))
+
+        var leaseReq = wire.DiLoCoFetchLeaseRequest()
+        leaseReq.jobBundleCid = jobBundleCid
+        leaseReq.peerId = workerPeer
+        let tLease = monotimes.GetMonoTime()
+        let leaseRes = dclient.DiLoCoFetchLeaseRequestNamed(hostAddr, port, "localhost", leaseReq)
+        let rttLease = rttUsSince(tLease)
+        assert(leaseRes.ok, " diloco d8 worker wire: lease")
+        let lease = Value(leaseRes).lease
+        echo(strings.ConcatStr("d8_rtt_lease_us=", strings.Int64ToStr(rttLease)))
+        assert(lease.outerStep == 1, " diloco d8 worker wire: lease outer step")
+        echo(strings.ConcatStr("d8_base_version_cid=", layout.FixedBytes32Hex(lease.baseVersionCid)))
+
+        var barrierReq = wire.DiLoCoReportInnerStepDoneRequest()
+        barrierReq.jobBundleCid = jobBundleCid
+        barrierReq.peerId = workerPeer
+        let tBarrier = monotimes.GetMonoTime()
+        let barrierRes = dclient.DiLoCoReportInnerStepDoneRequestNamed(hostAddr, port, "localhost", barrierReq)
+        let rttBarrier = rttUsSince(tBarrier)
+        assert(barrierRes.ok, " diloco d8 worker wire: barrier")
+        echo(strings.ConcatStr("d8_rtt_barrier_us=", strings.Int64ToStr(rttBarrier)))
+        echo(" diloco_quic_d8_worker wire ok")
+        return 0
+
+    if strings.StrContains(phase, "inner"):
+        var store = astore.DiLoCoArtifactStore()
+        let initRes = astore.DiLoCoArtifactStoreInitFill(store, storeDir)
+        if IsErr(initRes):
+            return die(Error(initRes))
+        var zeros: int32[]
+        let zeroRes = inner.DiLoCoLinearZerosFill(zeros, D8Out, D8In)
+        if IsErr(zeroRes):
+            return die(Error(zeroRes))
+        var xs: int32[]
+        var ys: int32[]
+        workerBatchFill(xs, ys)
+
+        # 墙钟内步段: 零网络, 纯本地整数 SGD (内步期间无跨机张量流的结构性证据)
+        let t0 = monotimes.GetMonoTime()
+        var wOut: int32[]
+        var deltaOut: int32[]
+        let sgdRes = inner.DiLoCoInnerSgdLinearFill(wOut, deltaOut, zeros, xs, ys, 3, D8InnerSteps, D8Out, D8In, 1, 2)
+        let t1 = monotimes.GetMonoTime()
+        assert(sgdRes.ok, " diloco d8 worker inner: sgd")
+        let innerNs = t1.ns - t0.ns
+        let innerMs = innerNs / 1000000
+        echo(strings.ConcatStr("d8_inner_ns=", strings.Int64ToStr(innerNs)))
+
+        var packedBytes = rawbytes.EmptyBytes()
+        let packRes = codec.DiLoCoTrainPackI32Fill(packedBytes, deltaOut)
+        if IsErr(packRes):
+            return die(Error(packRes))
+        var artifactRef = core.DiLoCoArtifactRef()
+        let putRes = astore.DiLoCoArtifactStorePutFill(artifactRef, store, jobBundleCid, packedBytes, 64)
+        if IsErr(putRes):
+            return die(Error(putRes))
+        let cidHex = layout.FixedBytes32Hex(artifactRef.blobCid)
+        echo(strings.ConcatStr("d8_inner_ms=", strings.IntToStr(int32(innerMs))))
+        echo(strings.ConcatStr("d8_delta_cid=", cidHex))
+        echo(strings.ConcatStr("d8_delta_relpath=", strings.ConcatStr(strings.ConcatStr(chengpath.TextSlice(cidHex, 0, 2), "/"), strings.ConcatStr(cidHex, ".blob"))))
+        echo(" diloco_quic_d8_worker inner ok")
+        return 0
+
+    if strings.StrContains(phase, "submit"):
+        echo("d8_submit_stage=start")
+        var store = astore.DiLoCoArtifactStore()
+        let initRes = astore.DiLoCoArtifactStoreInitFill(store, storeDir)
+        echo("d8_submit_stage=store_init")
+        if IsErr(initRes):
+            return die(Error(initRes))
+        var cidRaw: str
+        let hasCid = cmdline.ReadFirstFlagValue("--delta-cid", cidRaw)
+        var baseCidRaw: str
+        let hasBase = cmdline.ReadFirstFlagValue("--base-cid", baseCidRaw)
+        let outerStep = cmdline.ReadInt32FlagOrDefault("--outer-step", 1)
+        if !hasCid || !hasBase:
+            return die(" diloco d8 worker submit: cid flags missing")
+        var deltaRef = core.DiLoCoArtifactRef()
+        let cidRes = layout.FixedBytes32FromHex(cidRaw)
+        assert(cidRes.ok, " diloco d8 worker submit: cid parse")
+        deltaRef.blobCid = Value(cidRes)
+        var baseCid = layout.FixedBytes32()
+        let baseRes = layout.FixedBytes32FromHex(baseCidRaw)
+        assert(baseRes.ok, " diloco d8 worker submit: base cid parse")
+        baseCid = Value(baseRes)
+
+        var zeros: int32[]
+        let zeroRes = inner.DiLoCoLinearZerosFill(zeros, D8Out, D8In)
+        if IsErr(zeroRes):
+            return die(Error(zeroRes))
+        var packedOpt = rawbytes.EmptyBytes()
+        let packOpt = codec.DiLoCoTrainPackI32Fill(packedOpt, zeros)
+        if IsErr(packOpt):
+            return die(Error(packOpt))
+        var optRef = core.DiLoCoArtifactRef()
+        let optPutRes = astore.DiLoCoArtifactStorePutFill(optRef, store, jobBundleCid, packedOpt, 64)
+        if IsErr(optPutRes):
+            return die(Error(optPutRes))
+
+        var deltaReq = wire.DiLoCoSubmitOuterDeltaRequest()
+        deltaReq.jobBundleCid = jobBundleCid
+        deltaReq.baseVersionCid = baseCid
+        deltaReq.outerStep = outerStep
+        deltaReq.publisherPeerId = workerPeer
+        deltaReq.modelDeltaRef = deltaRef
+        deltaReq.optimizerDeltaRef = optRef
+        deltaReq.sampleCount = 3
+        deltaReq.tokenCount = 3 * D8InnerSteps
+        deltaReq.innerStepCount = D8InnerSteps
+        deltaReq.weightNumerator = 1
+        deltaReq.weightDenominator = 2
+        echo("d8_submit_stage=request")
+        let tSubmit = monotimes.GetMonoTime()
+        let deltaRes = dclient.DiLoCoSubmitOuterDeltaRequestNamed(hostAddr, port, "localhost", deltaReq)
+        let rttSubmit = rttUsSince(tSubmit)
+        echo("d8_submit_stage=response")
+        assert(deltaRes.ok, " diloco d8 worker submit: delta")
+        echo(strings.ConcatStr("d8_rtt_submit_us=", strings.Int64ToStr(rttSubmit)))
+        echo(" diloco_quic_d8_worker submit ok")
+        return 0
+
+    if strings.StrContains(phase, "verify"):
+        # 窗口2在 leader 合并后才开监听: 连接失败短重试
+        var versionReq0 = wire.DiLoCoFetchGlobalVersionRequest()
+        versionReq0.jobBundleCid = jobBundleCid
+        let tFirst = monotimes.GetMonoTime()
+        var versionRes = dclient.DiLoCoFetchGlobalVersionRequestNamed(hostAddr, port, "localhost", versionReq0)
+        let rttVersion = rttUsSince(tFirst)
+        if IsErr(versionRes):
+            var attempt: int32 = 0
+            while IsErr(versionRes) && attempt < 40:
+                os.SleepMs(250)
+                attempt = attempt + 1
+                var versionReqN = wire.DiLoCoFetchGlobalVersionRequest()
+                versionReqN.jobBundleCid = jobBundleCid
+                let tVersion = monotimes.GetMonoTime()
+                versionRes = dclient.DiLoCoFetchGlobalVersionRequestNamed(hostAddr, port, "localhost", versionReqN)
+                let rttTry = rttUsSince(tVersion)
+                if !IsErr(versionRes):
+                    echo(strings.ConcatStr("d8_rtt_retry_count=", strings.IntToStr(attempt)))
+                    echo(strings.ConcatStr("d8_rtt_version_us=", strings.Int64ToStr(rttTry)))
+        assert(!IsErr(versionRes), " diloco d8 worker verify: version")
+        let version = Value(versionRes).version
+        assert(version.committedOuterStep == 1, " diloco d8 worker verify: outer step advanced")
+        var lineageReq = wire.DiLoCoFetchLineageRequest()
+        lineageReq.jobBundleCid = jobBundleCid
+        let lineageRes = dclient.DiLoCoFetchLineageRequestNamed(hostAddr, port, "localhost", lineageReq)
+        assert(lineageRes.ok, " diloco d8 worker verify: lineage")
+        assert(Value(lineageRes).versions.len == 2, " diloco d8 worker verify: lineage len")
+        echo(strings.ConcatStr("d8_rtt_version_us=", strings.Int64ToStr(rttVersion)))
+        echo(" diloco_quic_d8_worker verify ok")
+        return 0
+
+    return die(" diloco d8 worker: unknown phase")

@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   openSync,
   readSync,
+  readdirSync,
   realpathSync,
   rmSync,
 } from "node:fs";
@@ -37,12 +38,39 @@ const SEMANTIC_SNAPSHOT_AUDIT_MAX_GUARD_REPORT_BYTES = 4 * 1024 * 1024;
 const SEMANTIC_SNAPSHOT_AUDIT_FAILURE_DIAGNOSTIC_CHARS = 16 * 1024;
 const SEMANTIC_SNAPSHOT_PUBLISHED_CANDIDATE_GATE_PATH = "tools/lsp_multifile_exact_snapshot_acceptance_gate.sh";
 const SEMANTIC_SNAPSHOT_PUBLISHED_CANDIDATE_MIN_TIMEOUT_SECONDS = 1230;
+const SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_ENV_PREFIX =
+  "CHENG_LSP_PUBLISHED_";
+const SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_MAX_BYTES = 512 * 1024 * 1024;
+const SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_SPECS = Object.freeze([
+  Object.freeze({
+    env: "CHENG_LSP_PUBLISHED_BINDING_NEXT",
+    basename: "published-binding.bin.next",
+    role: "published_binding_next",
+  }),
+  Object.freeze({
+    env: "CHENG_LSP_PUBLISHED_QUERY_PROJECTION_NEXT",
+    basename: "published-query-projection.bin.next",
+    role: "published_query_projection_next",
+  }),
+  Object.freeze({
+    env: "CHENG_LSP_PUBLISHED_OPEN_DOCUMENT_UNIVERSE_NEXT",
+    basename: "published-open-document-universe.bin.next",
+    role: "published_open_document_universe_next",
+  }),
+  Object.freeze({
+    env: "CHENG_LSP_PUBLISHED_SNAPSHOT_NEXT",
+    basename: "published-snapshot.bin.next",
+    role: "published_snapshot_next",
+  }),
+]);
 const SEMANTIC_SNAPSHOT_AUDIT_MONITOR_PYTHON = process.env.CHENG_FUSION_SEMANTIC_SNAPSHOT_MONITOR_PYTHON || "/opt/miniconda3/bin/python3.13";
 
 const SEMANTIC_SNAPSHOT_AUDIT_INPUT_SPECS = Object.freeze([
   {path: "cheng-package.toml", maxBytes: 64 * 1024, role: "project_manifest"},
+  {path: "docs/cheng-formal-spec.md", maxBytes: 8 * 1024 * 1024, role: "formal_language_spec"},
   {path: "src/core/tooling/semantic_snapshot.cheng", maxBytes: 8 * 1024 * 1024, role: "core_source"},
   {path: "src/core/tooling/semantic_snapshot_production.cheng", maxBytes: 8 * 1024 * 1024, role: "production_source"},
+  {path: "src/core/tooling/semantic_snapshot_incremental_plan.cheng", maxBytes: 8 * 1024 * 1024, role: "incremental_plan_source"},
   {path: "src/core/tooling/compiler_snapshot_builder.cheng", maxBytes: 16 * 1024 * 1024, role: "snapshot_builder_source"},
   {path: "src/core/tooling/compiler_csg.cheng", maxBytes: 32 * 1024 * 1024, role: "compiler_csg_source"},
   {path: "src/core/tooling/lsp_server.cheng", maxBytes: 16 * 1024 * 1024, role: "lsp_producer_source"},
@@ -59,12 +87,16 @@ const SEMANTIC_SNAPSHOT_AUDIT_INPUT_SPECS = Object.freeze([
   {path: "src/core/backend/macho_object_writer.cheng", maxBytes: 8 * 1024 * 1024, role: "macho_object_writer_source"},
   {path: "src/tests/semantic_snapshot_core_smoke.cheng", maxBytes: 8 * 1024 * 1024, role: "core_smoke_source"},
   {path: "src/tests/semantic_snapshot_production_binding_smoke.cheng", maxBytes: 8 * 1024 * 1024, role: "production_smoke_source"},
+  {path: "src/tests/semantic_snapshot_candidate_job_smoke.cheng", maxBytes: 8 * 1024 * 1024, role: "candidate_job_smoke_source"},
+  {path: "src/tests/semantic_snapshot_source_membership_event_smoke.cheng", maxBytes: 8 * 1024 * 1024, role: "source_membership_smoke_source"},
   {path: "src/tests/semantic_snapshot_rejection_smoke.cheng", maxBytes: 8 * 1024 * 1024, role: "rejection_smoke_source"},
-  {path: "src/tests/lsp_multifile_exact_snapshot_acceptance_smoke.cheng", maxBytes: 8 * 1024 * 1024, role: "lsp_version_isolation_smoke_source"},
+  {path: "src/tests/lsp_multifile_exact_snapshot_acceptance_smoke.cheng", maxBytes: 8 * 1024 * 1024, role: "lsp_multifile_smoke_source"},
   {path: "tools/semantic_snapshot_core_gate.sh", maxBytes: 4 * 1024 * 1024, role: "core_gate_source"},
   {path: "tools/semantic_snapshot_production_binding_gate.sh", maxBytes: 4 * 1024 * 1024, role: "production_gate_source"},
   {path: "tools/semantic_snapshot_rejection_gate.sh", maxBytes: 4 * 1024 * 1024, role: "rejection_gate_source"},
   {path: SEMANTIC_SNAPSHOT_PUBLISHED_CANDIDATE_GATE_PATH, maxBytes: 4 * 1024 * 1024, role: "published_candidate_gate_source"},
+  {path: "tools/lsp_candidate_job_scheduler_contract.py", maxBytes: 4 * 1024 * 1024, role: "candidate_scheduler_contract_source"},
+  {path: "tools/semantic_snapshot_source_membership_event_gate.sh", maxBytes: 4 * 1024 * 1024, role: "source_membership_gate_source"},
   {path: "tools/beat_c_process_group_guard.sh", maxBytes: 8 * 1024 * 1024, role: "process_tree_guard"},
   {path: "artifacts/bootstrap/cheng.stage3", maxBytes: 512 * 1024 * 1024, role: "compiler"},
   {path: "bootstrap/cheng_cold.c", maxBytes: 16 * 1024 * 1024, role: "cold_compiler_source"},
@@ -141,6 +173,290 @@ function domainSeparatedCid(domain, parts) {
   const hash = createHash("sha256");
   for (const framed of [domain, ...parts].flatMap(framePart)) hash.update(framed);
   return hash.digest("hex");
+}
+
+const PUBLISHED_CANDIDATE_RUNTIME_RECEIPT_FIELDS = Object.freeze([
+  "schema",
+  "status",
+  "sourceVersion",
+  "documentCount",
+  "openDocumentCount",
+  "compilerSha256",
+  "formalSpecSha256",
+  "sourceClosureCid",
+  "objectSha256",
+  "bindingReceiptCid",
+  "queryProjectionCid",
+  "openDocumentUniverseCid",
+  "snapshotPayloadCid",
+  "stdoutSha256",
+  "receiptCid",
+]);
+
+const PUBLISHED_CANDIDATE_EXECUTION_RECEIPT_FIELDS = Object.freeze([
+  "schema",
+  "status",
+  "executionBound",
+  "sourceSetCid",
+  "sourceVersion",
+  "documentCount",
+  "openDocumentCount",
+  "compilerSha256",
+  "formalSpecSha256",
+  "sourceClosureCid",
+  "objectSha256",
+  "bindingReceiptCid",
+  "queryProjectionCid",
+  "openDocumentUniverseCid",
+  "snapshotPayloadCid",
+  "stdoutSha256",
+  "runtimeReceiptCid",
+  "routingReceiptCid",
+  "receiptCid",
+]);
+const publishedCandidateGateExecutionReceipts = new WeakSet();
+
+function requireExactObjectFields(value, expectedFields, label) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} is not an object`);
+  }
+  const actualFields = Object.keys(value);
+  const expected = new Set(expectedFields);
+  if (actualFields.length !== expectedFields.length ||
+      actualFields.some((field) => !expected.has(field))) {
+    throw new Error(`${label} field set is not the unique current schema`);
+  }
+}
+
+function requirePublishedCandidateCount(value, label, minimum) {
+  if (!Number.isSafeInteger(value) || value < minimum) {
+    throw new Error(`${label} is invalid: ${value}`);
+  }
+  return value;
+}
+
+function publishedCandidateRuntimeAuthorityExact(
+  runtimeReceipt,
+  sourceSetCid,
+  label = "published candidate runtime receipt",
+) {
+  requireExactObjectFields(
+    runtimeReceipt, PUBLISHED_CANDIDATE_RUNTIME_RECEIPT_FIELDS, label);
+  if (runtimeReceipt.schema !==
+        "cheng.semantic_snapshot.published_candidate_stdout_receipt" ||
+      runtimeReceipt.status !== "validated") {
+    throw new Error(`${label} schema or status is invalid`);
+  }
+  const exactSourceSetCid = requireSha(
+    sourceSetCid, `${label} source set CID`);
+  const sourceVersion = requirePublishedCandidateCount(
+    runtimeReceipt.sourceVersion, `${label} sourceVersion`, 2);
+  const documentCount = requirePublishedCandidateCount(
+    runtimeReceipt.documentCount, `${label} documentCount`, 2);
+  const openDocumentCount = requirePublishedCandidateCount(
+    runtimeReceipt.openDocumentCount, `${label} openDocumentCount`, 2);
+  if (openDocumentCount > documentCount) {
+    throw new Error(`${label} open document count exceeds document count`);
+  }
+  const authority = Object.freeze({
+    sourceVersion,
+    documentCount,
+    openDocumentCount,
+    compilerSha256: requireSha(
+      runtimeReceipt.compilerSha256, `${label} compiler SHA-256`),
+    formalSpecSha256: requireSha(
+      runtimeReceipt.formalSpecSha256, `${label} formal spec SHA-256`),
+    sourceClosureCid: requireSha(
+      runtimeReceipt.sourceClosureCid, `${label} source closure CID`),
+    objectSha256: requireSha(
+      runtimeReceipt.objectSha256, `${label} object SHA-256`),
+    bindingReceiptCid: requireSha(
+      runtimeReceipt.bindingReceiptCid, `${label} binding receipt CID`),
+    queryProjectionCid: requireSha(
+      runtimeReceipt.queryProjectionCid, `${label} query projection CID`),
+    openDocumentUniverseCid: requireSha(
+      runtimeReceipt.openDocumentUniverseCid,
+      `${label} open document universe CID`),
+    snapshotPayloadCid: requireSha(
+      runtimeReceipt.snapshotPayloadCid, `${label} snapshot payload CID`),
+    stdoutSha256: requireSha(
+      runtimeReceipt.stdoutSha256, `${label} stdout SHA-256`),
+  });
+  const publicationIdentities = [
+    authority.bindingReceiptCid,
+    authority.queryProjectionCid,
+    authority.openDocumentUniverseCid,
+    authority.snapshotPayloadCid,
+  ];
+  if (publicationIdentities.some((cid) => cid === "0".repeat(64)) ||
+      new Set(publicationIdentities).size !== publicationIdentities.length) {
+    throw new Error(`${label} publication identities are empty or aliased`);
+  }
+  const expectedReceiptCid = domainSeparatedCid(
+    "cheng.semantic_snapshot.published_candidate_receipt", [
+      exactSourceSetCid,
+      authority.stdoutSha256,
+      authority.compilerSha256,
+      authority.formalSpecSha256,
+      authority.sourceClosureCid,
+      authority.objectSha256,
+      String(authority.sourceVersion),
+      String(authority.documentCount),
+      String(authority.openDocumentCount),
+      authority.bindingReceiptCid,
+      authority.queryProjectionCid,
+      authority.openDocumentUniverseCid,
+      authority.snapshotPayloadCid,
+    ]);
+  if (requireSha(runtimeReceipt.receiptCid, `${label} CID`) !==
+      expectedReceiptCid) {
+    throw new Error(`${label} CID does not bind its complete authority`);
+  }
+  return Object.freeze({
+    ...authority,
+    sourceSetCid: exactSourceSetCid,
+    receiptCid: expectedReceiptCid,
+  });
+}
+
+function publishedCandidateExecutionReceiptCid(
+  authority,
+  routingReceiptCid,
+) {
+  return domainSeparatedCid(
+    "cheng.semantic_snapshot.published_candidate_execution_receipt", [
+      authority.sourceSetCid,
+      authority.receiptCid,
+      routingReceiptCid,
+      String(authority.sourceVersion),
+      String(authority.documentCount),
+      String(authority.openDocumentCount),
+      authority.compilerSha256,
+      authority.formalSpecSha256,
+      authority.sourceClosureCid,
+      authority.objectSha256,
+      authority.bindingReceiptCid,
+      authority.queryProjectionCid,
+      authority.openDocumentUniverseCid,
+      authority.snapshotPayloadCid,
+      authority.stdoutSha256,
+    ]);
+}
+
+function publishedCandidateExecutionReceiptExact(receipt) {
+  try {
+    requireExactObjectFields(
+      receipt, PUBLISHED_CANDIDATE_EXECUTION_RECEIPT_FIELDS,
+      "published candidate execution receipt");
+    if (receipt.schema !==
+          "cheng.semantic_snapshot.published_candidate_receipt" ||
+        receipt.status !== "pass" ||
+        receipt.executionBound !== true) {
+      return false;
+    }
+    const runtimeProjection = Object.freeze({
+      schema: "cheng.semantic_snapshot.published_candidate_stdout_receipt",
+      status: "validated",
+      sourceVersion: receipt.sourceVersion,
+      documentCount: receipt.documentCount,
+      openDocumentCount: receipt.openDocumentCount,
+      compilerSha256: receipt.compilerSha256,
+      formalSpecSha256: receipt.formalSpecSha256,
+      sourceClosureCid: receipt.sourceClosureCid,
+      objectSha256: receipt.objectSha256,
+      bindingReceiptCid: receipt.bindingReceiptCid,
+      queryProjectionCid: receipt.queryProjectionCid,
+      openDocumentUniverseCid: receipt.openDocumentUniverseCid,
+      snapshotPayloadCid: receipt.snapshotPayloadCid,
+      stdoutSha256: receipt.stdoutSha256,
+      receiptCid: receipt.runtimeReceiptCid,
+    });
+    const authority = publishedCandidateRuntimeAuthorityExact(
+      runtimeProjection, receipt.sourceSetCid,
+      "published candidate execution runtime authority");
+    const routingReceiptCid = requireSha(
+      receipt.routingReceiptCid,
+      "published candidate execution routing receipt CID");
+    return requireSha(
+      receipt.receiptCid, "published candidate execution receipt CID") ===
+      publishedCandidateExecutionReceiptCid(authority, routingReceiptCid);
+  } catch {
+    return false;
+  }
+}
+
+function semanticSnapshotPublishedCandidateReceiptBindingCid(receipt) {
+  const domain = "cheng.semantic_snapshot.published_candidate_receipt_presence";
+  if (receipt === null) {
+    return domainSeparatedCid(domain, [
+      "published_candidate_receipt_absent",
+    ]);
+  }
+  if (receipt === undefined ||
+      typeof receipt !== "object" ||
+      Array.isArray(receipt)) {
+    return domainSeparatedCid(domain, [
+      "published_candidate_receipt_present_invalid_type",
+      receipt === undefined ? "undefined" : typeof receipt,
+    ]);
+  }
+  const receiptCid = receipt.receiptCid;
+  if (receiptCid === undefined) {
+    return domainSeparatedCid(domain, [
+      "published_candidate_receipt_present_missing_cid",
+    ]);
+  }
+  if (typeof receiptCid !== "string") {
+    return domainSeparatedCid(domain, [
+      "published_candidate_receipt_present_non_string_cid",
+      typeof receiptCid,
+    ]);
+  }
+  if (receiptCid.length === 0) {
+    return domainSeparatedCid(domain, [
+      "published_candidate_receipt_present_empty_cid",
+    ]);
+  }
+  if (receiptCid === "0".repeat(64)) {
+    return domainSeparatedCid(domain, [
+      "published_candidate_receipt_present_zero_cid",
+      receiptCid,
+    ]);
+  }
+  if (!/^[0-9a-f]{64}$/.test(receiptCid)) {
+    return domainSeparatedCid(domain, [
+      "published_candidate_receipt_present_malformed_cid",
+      sha256(Buffer.from(receiptCid, "utf8")),
+    ]);
+  }
+  return domainSeparatedCid(domain, [
+    publishedCandidateExecutionReceiptExact(receipt)
+      ? "published_candidate_receipt_present_valid"
+      : "published_candidate_receipt_present_invalid",
+    receiptCid,
+  ]);
+}
+
+function semanticSnapshotProductionClosureOuterAuditCid(
+  sourceSetCid,
+  structuralReceiptCid,
+  closureReceiptCid,
+  compilerInputReceiptCid,
+  publishedCandidateReceipt,
+) {
+  return domainSeparatedCid("cheng.semantic_snapshot.audit", [
+    SEMANTIC_SNAPSHOT_AUDIT_PRODUCTION_CLOSURE_SCOPE,
+    requireSha(sourceSetCid, "semantic snapshot audit source set CID"),
+    requireSha(
+      structuralReceiptCid, "semantic snapshot structural audit receipt CID"),
+    requireSha(
+      closureReceiptCid, "semantic snapshot production closure receipt CID"),
+    requireSha(
+      compilerInputReceiptCid,
+      "semantic snapshot compiler input audit receipt CID"),
+    semanticSnapshotPublishedCandidateReceiptBindingCid(
+      publishedCandidateReceipt),
+  ]);
 }
 
 function sameGeneration(left, right) {
@@ -317,6 +633,139 @@ function maskChengCommentsAndStrings(source) {
   return out;
 }
 
+function chengExecutableStringLiteralValues(source) {
+  const values = [];
+  let index = 0;
+  let state = "code";
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1] || "";
+    const third = source[index + 2] || "";
+    if (state === "code") {
+      if (char === '"' && next === '"' && third === '"') {
+        index += 3;
+        state = "triple";
+        continue;
+      }
+      if (char === '"') {
+        const start = index;
+        index++;
+        let escaped = false;
+        let closed = false;
+        while (index < source.length) {
+          const current = source[index];
+          if (escaped) {
+            escaped = false;
+            index++;
+            continue;
+          }
+          if (current === "\\") {
+            escaped = true;
+            index++;
+            continue;
+          }
+          if (current === '"') {
+            index++;
+            let value;
+            try {
+              value = JSON.parse(source.slice(start, index));
+            } catch (error) {
+              throw new Error(
+                `semantic snapshot audit string literal is not canonical: ${
+                  error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+            values.push(value);
+            closed = true;
+            break;
+          }
+          if (current === "\n" || current === "\r") {
+            throw new Error(
+              "semantic snapshot audit string literal crosses a line",
+            );
+          }
+          index++;
+        }
+        if (!closed) {
+          throw new Error(
+            "semantic snapshot source has an unterminated string",
+          );
+        }
+        continue;
+      }
+      if (char === "'") {
+        index++;
+        state = "char";
+        continue;
+      }
+      if (char === "#") {
+        index++;
+        state = "line";
+        continue;
+      }
+      if (char === "/" && next === "/") {
+        index += 2;
+        state = "line";
+        continue;
+      }
+      if (char === "/" && next === "*") {
+        index += 2;
+        state = "block";
+        continue;
+      }
+      index++;
+      continue;
+    }
+    if (state === "line") {
+      if (char === "\n") state = "code";
+      index++;
+      continue;
+    }
+    if (state === "block") {
+      if (char === "*" && next === "/") {
+        index += 2;
+        state = "code";
+        continue;
+      }
+      index++;
+      continue;
+    }
+    if (state === "triple") {
+      if (char === '"' && next === '"' && third === '"') {
+        index += 3;
+        state = "code";
+        continue;
+      }
+      index++;
+      continue;
+    }
+    if (char === "\\") {
+      index += Math.min(2, source.length - index);
+      continue;
+    }
+    if (char === "'") state = "code";
+    index++;
+  }
+  if (state !== "code" && state !== "line") {
+    throw new Error(`semantic snapshot source has an unterminated ${state}`);
+  }
+  return Object.freeze(values);
+}
+
+function exactOrderedSubsequenceCount(values, expected) {
+  if (expected.length === 0 || values.length < expected.length) return 0;
+  let count = 0;
+  for (let start = 0;
+       start <= values.length - expected.length;
+       start++) {
+    if (expected.every((value, offset) =>
+      values[start + offset] === value)) {
+      count++;
+    }
+  }
+  return count;
+}
+
 function extractTopLevelFunction(source, functionName) {
   const escaped = functionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const startMatch = new RegExp(`^fn[ \\t]+${escaped}\\(`, "m").exec(source);
@@ -422,7 +871,11 @@ function hasOrderedFragments(source, fragments) {
   return true;
 }
 
-function auditSemanticSnapshotProductionClosure(sources, publishedCandidateReceipt = null) {
+function auditSemanticSnapshotProductionClosure(
+  sources,
+  publishedCandidateReceipt = null,
+  requirePublishedCandidateGateProvenance = false,
+) {
   const {
     builderSource,
     lspSource,
@@ -479,11 +932,19 @@ function auditSemanticSnapshotProductionClosure(sources, publishedCandidateRecei
       "panic(",
       "SemanticSnapshotProductionRejectFailureInto(",
     ]);
-  const publishedCandidateFixture = squashMaskedCheng(lspVersionIsolationSmokeSource);
+  const publishedCandidateFixtureMasked =
+    maskChengCommentsAndStrings(lspVersionIsolationSmokeSource);
+  const publishedCandidateFixture = publishedCandidateFixtureMasked.replace(/\s+/g, "");
+  const publishedCandidateFixtureUriBindingsExact =
+    (publishedCandidateFixtureMasked.match(/\bvar\s+uriMain\s*=/g) || []).length === 1 &&
+    (publishedCandidateFixtureMasked.match(/\bvar\s+uriHelper\s*=/g) || []).length === 1 &&
+    (publishedCandidateFixtureMasked.match(/\blet\s+uriMain\s*=/g) || []).length === 0 &&
+    (publishedCandidateFixtureMasked.match(/\blet\s+uriHelper\s*=/g) || []).length === 0;
   const publishedCandidateFixtureMultifileExact =
+    publishedCandidateFixtureUriBindingsExact &&
     hasOrderedFragments(publishedCandidateFixture, [
-      "leturiMain=",
-      "leturiHelper=",
+      "varuriMain=",
+      "varuriHelper=",
       "LspWorkspaceBindDocumentCompilerIdentityInto(workspace,uriHelper,",
       "LspWorkspaceBindDocumentCompilerIdentityInto(workspace,uriMain,",
       "LspWorkspaceDidOpenInto(workspace,uriHelper,",
@@ -653,28 +1114,75 @@ function auditSemanticSnapshotProductionClosure(sources, publishedCandidateRecei
       "tables.references.targetSymbolIds[row] = newByOld[tables.references.targetSymbolIds[row]]",
       "tables.references.ownerSymbolIds[row] = newByOld[tables.references.ownerSymbolIds[row]]",
     ]);
-  const cargoReferences = extractTopLevelFunctionOrEmpty(
-    cargoSource, "csgCompilerCargoReferencesLine").replace(/\s+/g, "");
-  const cargoDecode = extractTopLevelFunctionOrEmpty(
-    cargoValidatorSource, "csgCompilerWireDecodeInto").replace(/\s+/g, "");
+  const cargoReferencesSource = extractTopLevelFunctionOrEmpty(
+    cargoSource, "csgCompilerCargoReferencesLine");
+  const cargoReferencesExecutable =
+    squashMaskedCheng(cargoReferencesSource);
+  const cargoReferenceLiterals =
+    chengExecutableStringLiteralValues(cargoReferencesSource);
+  const expectedCargoReferenceLiterals = Object.freeze([
+    "{\"bindingTypedNodeIds\":",
+    ",\"kind\":\"csg_dialect::cheng_compiler::references\",\"ownerFunctionIds\":",
+    ",\"ownerSymbolIds\":",
+    ",\"referenceKinds\":",
+    ",\"sourceIds\":",
+    ",\"spanIds\":",
+    ",\"targetSymbolIds\":",
+    "}",
+  ]);
+  const cargoReferenceLiteralSchemaExact =
+    cargoReferenceLiterals.length ===
+      expectedCargoReferenceLiterals.length &&
+    expectedCargoReferenceLiterals.every((value, index) =>
+      cargoReferenceLiterals[index] === value);
+  const cargoDecodeSource = extractTopLevelFunctionOrEmpty(
+    cargoValidatorSource, "csgCompilerWireDecodeInto");
+  const cargoDecodeExecutable = squashMaskedCheng(cargoDecodeSource);
+  const cargoDecodeLiterals =
+    chengExecutableStringLiteralValues(cargoDecodeSource);
+  const expectedCargoReferenceDecodeLiterals = Object.freeze([
+    "sourceIds",
+    "spanIds",
+    "ownerFunctionIds",
+    "ownerSymbolIds",
+    "targetSymbolIds",
+    "referenceKinds",
+  ]);
+  const cargoReferenceDecodeLiteralSchemaExact =
+    exactOrderedSubsequenceCount(
+      cargoDecodeLiterals,
+      expectedCargoReferenceDecodeLiterals,
+    ) === 1;
+  const cargoValidatorExecutable =
+    squashMaskedCheng(cargoValidatorSource);
+  const legacyReferenceCargoBindingsAbsent = [
+    "facts.referenceSourceIds",
+    "facts.referenceSpanIds",
+    "facts.referenceOwnerFunctionIds",
+    "facts.referenceOwnerSymbolIds",
+    "facts.referenceTargetSymbolIds",
+    "facts.referenceKinds",
+  ].every((binding) => !cargoValidatorExecutable.includes(binding));
   const referenceCargoBindingExact =
-    hasOrderedFragments(cargoReferences, [
-      "csg_dialect::cheng_compiler::references",
-      "snapshot.references.ownerFunctionIds",
-      "snapshot.references.ownerSymbolIds",
-      "snapshot.references.referenceKinds",
-      "snapshot.references.sourceIds",
-      "snapshot.references.spanIds",
-      "snapshot.references.targetSymbolIds",
+    legacyReferenceCargoBindingsAbsent &&
+    cargoReferenceLiteralSchemaExact &&
+    hasOrderedFragments(cargoReferencesExecutable, [
+      "csgCompilerCargoAppendIntArray(out, snapshot.references.bindingTypedNodeIds)",
+      "csgCompilerCargoAppendIntArray(out, snapshot.references.ownerFunctionIds)",
+      "csgCompilerCargoAppendIntArray(out, snapshot.references.ownerSymbolIds)",
+      "csgCompilerCargoAppendIntArray(out, snapshot.references.referenceKinds)",
+      "csgCompilerCargoAppendIntArray(out, snapshot.references.sourceIds)",
+      "csgCompilerCargoAppendIntArray(out, snapshot.references.spanIds)",
+      "csgCompilerCargoAppendIntArray(out, snapshot.references.targetSymbolIds)",
     ]) &&
-    cargoReferences.includes('\\"ownerSymbolIds\\"') &&
-    hasOrderedFragments(cargoDecode, [
-      'lines[16], "sourceIds", facts.referenceSourceIds',
-      'lines[16], "spanIds", facts.referenceSpanIds',
-      'lines[16], "ownerFunctionIds", facts.referenceOwnerFunctionIds',
-      'lines[16], "ownerSymbolIds", facts.referenceOwnerSymbolIds',
-      'lines[16], "targetSymbolIds", facts.referenceTargetSymbolIds',
-      'lines[16], "referenceKinds", facts.referenceKinds',
+    cargoReferenceDecodeLiteralSchemaExact &&
+    hasOrderedFragments(cargoDecodeExecutable, [
+      "lines[16], , facts.snapshot.references.sourceIds",
+      "lines[16], , facts.snapshot.references.spanIds",
+      "lines[16], , facts.snapshot.references.ownerFunctionIds",
+      "lines[16], , facts.snapshot.references.ownerSymbolIds",
+      "lines[16], , facts.snapshot.references.targetSymbolIds",
+      "lines[16], , facts.snapshot.references.referenceKinds",
     ]);
   const compilerReferenceFact = squashMaskedCheng(extractTopLevelFunctionOrEmpty(
     compilerFactsSource, "CompilerFactSnapshotFillReference"));
@@ -685,15 +1193,19 @@ function auditSemanticSnapshotProductionClosure(sources, publishedCandidateRecei
     : compilerReferenceFact;
   const compilerReferenceDisplayProjection =
     "lettargetNameTextId=snapshot.symbols.nameTextIds[target]" +
-    "reference.targetName=snapshot.texts[targetNameTextId]";
+    "reference.targetName=system.SystemToStringStr(" +
+    "snapshot.texts[targetNameTextId])";
   const compilerReferenceIdentityWithoutDisplay =
     compilerReferenceFact.replace(compilerReferenceDisplayProjection, "");
   const compilerReferenceFactProjectionExact =
+    compilerReferenceIdentityEnd >= 0 &&
     compilerReferenceFact.includes(compilerReferenceDisplayProjection) &&
     compilerReferenceIdentityWithoutDisplay !== compilerReferenceFact &&
     [
       "sourceId", "spanId", "ownerFunctionId", "ownerSymbolId",
-      "targetSymbolId", "referenceKind", "ownerSymbolCid", "targetSymbolCid",
+      "ownerDeclId", "targetSymbolId", "targetDeclId", "referenceKind",
+      "documentCid", "ownerSymbolCid", "targetSymbolCid", "ownerDeclKeyCid",
+      "targetDeclKeyCid", "declarationTableCid", "targetName",
     ].every((field) =>
       (compilerReferenceFact.match(new RegExp(`reference\\.${field}=`, "g")) || []).length === 1) &&
     hasOrderedFragments(
@@ -709,12 +1221,13 @@ function auditSemanticSnapshotProductionClosure(sources, publishedCandidateRecei
       "reference.targetSymbolId = target",
       "reference.targetDeclId = snapshot.symbols.declIds[target]",
       "reference.referenceKind = snapshot.references.referenceKinds[row]",
-      "reference.documentCid = snapshot.sources.documentCids[sourceId]",
-      "reference.ownerSymbolCid = snapshot.symbols.symbolCids[ownerSymbolId]",
-      "reference.targetSymbolCid = snapshot.symbols.symbolCids[target]",
-      "reference.ownerDeclKeyCid = snapshot.symbols.declKeyCids[ownerSymbolId]",
-      "reference.targetDeclKeyCid = snapshot.symbols.declKeyCids[target]",
-      "reference.declarationTableCid = snapshot.declarations.tableCid",
+      "reference.bindingTypedNodeId = snapshot.references.bindingTypedNodeIds[row]",
+      "reference.documentCid = layout.FixedBytes32Copy(snapshot.sources.documentCids[sourceId])",
+      "reference.ownerSymbolCid = layout.FixedBytes32Copy(snapshot.symbols.symbolCids[ownerSymbolId])",
+      "reference.targetSymbolCid = layout.FixedBytes32Copy(snapshot.symbols.symbolCids[target])",
+      "reference.ownerDeclKeyCid = layout.FixedBytes32Copy(snapshot.symbols.declKeyCids[ownerSymbolId])",
+      "reference.targetDeclKeyCid = layout.FixedBytes32Copy(snapshot.symbols.declKeyCids[target])",
+      "reference.declarationTableCid = layout.FixedBytes32Copy(snapshot.declarations.tableCid)",
     ]);
   const lspReferenceIdentity = squashMaskedCheng(extractTopLevelFunctionOrEmpty(
     lspSource, "lspPinnedReferenceIdentityInto"));
@@ -740,7 +1253,7 @@ function auditSemanticSnapshotProductionClosure(sources, publishedCandidateRecei
     /(?:arity|calleeText|targetName|nameTextIds|qualifiedNameTextIds|functionNames)/;
   const referenceIdentityNoTextOrNameArity =
     !approximateReferenceIdentityPattern.test(referenceValidation) &&
-    !approximateReferenceIdentityPattern.test(cargoReferences) &&
+    !approximateReferenceIdentityPattern.test(cargoReferencesExecutable) &&
     !approximateReferenceIdentityPattern.test(
       compilerReferenceIdentityWithoutDisplay) &&
     !approximateReferenceIdentityPattern.test(lspReferenceIdentity);
@@ -807,6 +1320,10 @@ function auditSemanticSnapshotProductionClosure(sources, publishedCandidateRecei
     "workspace.snapshotStore.core.states[publishedIndex] != snapshot_core.SemanticSnapshotStatePublished",
     "snapshot_production.SemanticSnapshotProductionStorePinCurrentInto(",
     "pin.corePin.sourceVersion != acceptedVersion",
+    "pin.payloadIndex >= workspace.snapshotStore.payloadBindings.len",
+    "if !layout.FixedBytes32Equal(",
+    "workspace.eventState.eventStateReceiptCid",
+    "workspace.snapshotStore.payloadBindings[pin.payloadIndex].sourceEventStateReceiptCid",
   ]);
   const fiveRequestsRaw = extractTopLevelFunctionOrEmpty(
     lspVersionIsolationSmokeSource, "FiveSemanticRequestsContentModified");
@@ -908,12 +1425,16 @@ function auditSemanticSnapshotProductionClosure(sources, publishedCandidateRecei
   // Source literals never prove publication. The only accepted evidence is the
   // independently executed, hash-bound acceptance gate receipt, combined with
   // the exact zero-missing admission route and the real two-document fixture.
+  const publishedCandidateGateProvenanceExact =
+    publishedCandidateReceipt !== null &&
+    typeof publishedCandidateReceipt === "object" &&
+    publishedCandidateGateExecutionReceipts.has(
+      publishedCandidateReceipt);
   const publishedCandidateEvidence =
     publishedCandidateReceipt !== null &&
-    publishedCandidateReceipt.schema === "cheng.semantic_snapshot.published_candidate_receipt" &&
-    publishedCandidateReceipt.status === "pass" &&
-    publishedCandidateReceipt.executionBound === true &&
-    /^[0-9a-f]{64}$/.test(publishedCandidateReceipt.receiptCid || "") &&
+    publishedCandidateExecutionReceiptExact(publishedCandidateReceipt) &&
+    (!requirePublishedCandidateGateProvenance ||
+      publishedCandidateGateProvenanceExact) &&
     candidatePublicationRequiresZeroMissingFacts &&
     publishedCandidateFixtureMultifileExact;
   const blockers = [];
@@ -961,6 +1482,7 @@ function auditSemanticSnapshotProductionClosure(sources, publishedCandidateRecei
     directObjectDebugConsumptionExact,
     machoDwarfWriterExact,
     machoDwarfSectionRelocationConsumptionExact,
+    publishedCandidateGateProvenanceExact,
     publishedCandidateEvidence,
     functionOnlyCardinality,
     functionOnlyKind,
@@ -991,7 +1513,14 @@ function auditSemanticSnapshotProductionClosure(sources, publishedCandidateRecei
       sha256(Buffer.from(primaryObjectPlanSource, "utf8")),
       sha256(Buffer.from(directObjectEmitSource, "utf8")),
       sha256(Buffer.from(machoObjectWriterSource, "utf8")),
-      publishedCandidateReceipt?.receiptCid || "",
+      requirePublishedCandidateGateProvenance
+        ? "published_candidate_gate_provenance_required"
+        : "published_candidate_gate_provenance_not_required",
+      publishedCandidateGateProvenanceExact
+        ? "published_candidate_gate_provenance_valid"
+        : "published_candidate_gate_provenance_absent",
+      semanticSnapshotPublishedCandidateReceiptBindingCid(
+        publishedCandidateReceipt),
       ...Object.entries(observations).flatMap(([key, value]) => [key, value ? "1" : "0"]),
       ...blockers,
     ]),
@@ -1333,6 +1862,7 @@ function auditPublishedCandidateGateRouting(source, guardSha256) {
     'SOURCE_CLOSURE_AFTER_RUNTIME_CID="$(source_closure_cid source-closure-after-runtime)"',
     "lsp_multifile_exact_snapshot_acceptance_gate_status=pass",
     "compiler_source_sha256=%s",
+    "formal_spec_sha256=%s",
     "lsp_module_sha256=%s",
     "query_projection_module_sha256=%s",
     "compiler_csg_module_sha256=%s",
@@ -1342,6 +1872,13 @@ function auditPublishedCandidateGateRouting(source, guardSha256) {
   ];
   for (const fragment of required) {
     if (!logical.includes(fragment)) throw new Error(`published candidate gate routing missing: ${fragment}`);
+  }
+  const formalSpecClosureRoute =
+    /git -C "\$ROOT" ls-files -co --exclude-standard -z --[ \t]+src[ \t]+bootstrap[ \t]+cheng-package\.toml[ \t]+cheng\.lock\.toml[ \t]+docs\/cheng-formal-spec\.md[ \t]*\|/.test(
+      logical);
+  if (!formalSpecClosureRoute) {
+    throw new Error(
+      "published candidate gate routing missing: src bootstrap cheng-package.toml cheng.lock.toml docs/cheng-formal-spec.md");
   }
   const runGuardCalls = [...logical.matchAll(/^[ \t]*run_guard[ \t]+(compiler_build|smoke_build|object_first|object_second)\b/gm)];
   if (runGuardCalls.length !== 4 || new Set(runGuardCalls.map((match) => match[1])).size !== 4) {
@@ -1362,6 +1899,7 @@ function auditPublishedCandidateGateRouting(source, guardSha256) {
       sha256(Buffer.from(source, "utf8")),
       guardSha256,
       ...required,
+      "formal_spec_inner_source_closure",
     ]),
   });
 }
@@ -1375,6 +1913,7 @@ function verifyPublishedCandidateGateStdout(stdoutEntry, baseline, sourceSetCid)
     "gate_sha256",
     "compiler_sha256",
     "compiler_source_sha256",
+    "formal_spec_sha256",
     "lsp_module_sha256",
     "query_projection_module_sha256",
     "compiler_csg_module_sha256",
@@ -1393,6 +1932,7 @@ function verifyPublishedCandidateGateStdout(stdoutEntry, baseline, sourceSetCid)
     source_sha256: "src/tests/lsp_multifile_exact_snapshot_acceptance_smoke.cheng",
     gate_sha256: SEMANTIC_SNAPSHOT_PUBLISHED_CANDIDATE_GATE_PATH,
     compiler_source_sha256: "bootstrap/cheng_cold.c",
+    formal_spec_sha256: "docs/cheng-formal-spec.md",
     lsp_module_sha256: "src/core/tooling/lsp_server.cheng",
     query_projection_module_sha256: "src/core/tooling/semantic_snapshot_query_projection.cheng",
     compiler_csg_module_sha256: "src/core/tooling/compiler_csg.cheng",
@@ -1404,10 +1944,13 @@ function verifyPublishedCandidateGateStdout(stdoutEntry, baseline, sourceSetCid)
     }
   }
   const compilerSha256 = requireSha(requiredField(parsed.fields, "compiler_sha256", label), `${label} compiler_sha256`);
+  const formalSpecSha256 = requireSha(
+    requiredField(parsed.fields, "formal_spec_sha256", label),
+    `${label} formal_spec_sha256`);
   const sourceClosureCid = requireSha(requiredField(parsed.fields, "source_closure_cid", label), `${label} source_closure_cid`);
   const objectSha256 = requireSha(requiredField(parsed.fields, "object_sha256", label), `${label} object_sha256`);
   const runtime = requiredField(parsed.fields, "lsp_multifile_exact_snapshot_acceptance_status", label);
-  const match = /^pass published=1 source_version=([1-9][0-9]*) documents=([1-9][0-9]*) open_documents=([1-9][0-9]*) binding_receipt=([0-9a-f]{64}) query_projection=([0-9a-f]{64}) open_document_universe=([0-9a-f]{64})$/.exec(runtime);
+  const match = /^pass published=1 source_version=([1-9][0-9]*) documents=([1-9][0-9]*) open_documents=([1-9][0-9]*) binding_receipt=([0-9a-f]{64}) query_projection=([0-9a-f]{64}) open_document_universe=([0-9a-f]{64}) snapshot_payload=([0-9a-f]{64})$/.exec(runtime);
   if (!match) throw new Error(`${label} runtime publication receipt is malformed`);
   const sourceVersion = Number(match[1]);
   if (!Number.isSafeInteger(sourceVersion) || sourceVersion <= 1) throw new Error(`${label} source version is not a real transition`);
@@ -1422,29 +1965,38 @@ function verifyPublishedCandidateGateStdout(stdoutEntry, baseline, sourceSetCid)
   const bindingReceiptCid = requireSha(match[4], `${label} binding_receipt`);
   const queryProjectionCid = requireSha(match[5], `${label} query_projection`);
   const openDocumentUniverseCid = requireSha(match[6], `${label} open_document_universe`);
+  const snapshotPayloadCid = requireSha(match[7], `${label} snapshot_payload`);
   const zeroCid = "0".repeat(64);
-  const publicationIdentities = [bindingReceiptCid, queryProjectionCid, openDocumentUniverseCid];
+  const publicationIdentities = [
+    bindingReceiptCid,
+    queryProjectionCid,
+    openDocumentUniverseCid,
+    snapshotPayloadCid,
+  ];
   if (publicationIdentities.some((cid) => cid === zeroCid) ||
       new Set(publicationIdentities).size !== publicationIdentities.length) {
     throw new Error(`${label} publication identities are empty or aliased`);
   }
-  return Object.freeze({
+  const receipt = Object.freeze({
     schema: "cheng.semantic_snapshot.published_candidate_stdout_receipt",
     status: "validated",
     sourceVersion,
     documentCount,
     openDocumentCount,
     compilerSha256,
+    formalSpecSha256,
     sourceClosureCid,
     objectSha256,
     bindingReceiptCid,
     queryProjectionCid,
     openDocumentUniverseCid,
+    snapshotPayloadCid,
     stdoutSha256: stdoutEntry.sha256,
     receiptCid: domainSeparatedCid("cheng.semantic_snapshot.published_candidate_receipt", [
       sourceSetCid,
       stdoutEntry.sha256,
       compilerSha256,
+      formalSpecSha256,
       sourceClosureCid,
       objectSha256,
       String(sourceVersion),
@@ -1453,8 +2005,11 @@ function verifyPublishedCandidateGateStdout(stdoutEntry, baseline, sourceSetCid)
       bindingReceiptCid,
       queryProjectionCid,
       openDocumentUniverseCid,
+      snapshotPayloadCid,
     ]),
   });
+  publishedCandidateRuntimeAuthorityExact(receipt, sourceSetCid, label);
+  return receipt;
 }
 
 function composePublishedCandidateExecutionReceipt(
@@ -1467,33 +2022,236 @@ function composePublishedCandidateExecutionReceipt(
       routingAudit?.status !== "pass") {
     throw new Error("published candidate execution receipt inputs are not validated");
   }
-  const runtimeReceiptCid = requireSha(
-    runtimeReceipt.receiptCid, "published candidate runtime receipt CID");
+  const authority = publishedCandidateRuntimeAuthorityExact(
+    runtimeReceipt, sourceSetCid);
   const routingReceiptCid = requireSha(
     routingAudit.receiptCid, "published candidate routing receipt CID");
-  requireSha(sourceSetCid, "published candidate source set CID");
   return Object.freeze({
     schema: "cheng.semantic_snapshot.published_candidate_receipt",
     status: "pass",
     executionBound: true,
-    sourceVersion: runtimeReceipt.sourceVersion,
-    documentCount: runtimeReceipt.documentCount,
-    openDocumentCount: runtimeReceipt.openDocumentCount,
-    compilerSha256: runtimeReceipt.compilerSha256,
-    sourceClosureCid: runtimeReceipt.sourceClosureCid,
-    objectSha256: runtimeReceipt.objectSha256,
-    bindingReceiptCid: runtimeReceipt.bindingReceiptCid,
-    queryProjectionCid: runtimeReceipt.queryProjectionCid,
-    openDocumentUniverseCid: runtimeReceipt.openDocumentUniverseCid,
-    stdoutSha256: runtimeReceipt.stdoutSha256,
-    runtimeReceiptCid,
+    sourceSetCid: authority.sourceSetCid,
+    sourceVersion: authority.sourceVersion,
+    documentCount: authority.documentCount,
+    openDocumentCount: authority.openDocumentCount,
+    compilerSha256: authority.compilerSha256,
+    formalSpecSha256: authority.formalSpecSha256,
+    sourceClosureCid: authority.sourceClosureCid,
+    objectSha256: authority.objectSha256,
+    bindingReceiptCid: authority.bindingReceiptCid,
+    queryProjectionCid: authority.queryProjectionCid,
+    openDocumentUniverseCid: authority.openDocumentUniverseCid,
+    snapshotPayloadCid: authority.snapshotPayloadCid,
+    stdoutSha256: authority.stdoutSha256,
+    runtimeReceiptCid: authority.receiptCid,
     routingReceiptCid,
-    receiptCid: domainSeparatedCid("cheng.semantic_snapshot.published_candidate_execution_receipt", [
-      sourceSetCid,
-      runtimeReceiptCid,
-      routingReceiptCid,
-    ]),
+    receiptCid: publishedCandidateExecutionReceiptCid(
+      authority, routingReceiptCid),
   });
+}
+
+function createPublishedCandidateNextPathAuthority() {
+  const root = realpathSync.native(mkdtempSync(join(
+    tmpdir(),
+    "cheng-semantic-snapshot-published-next-",
+  )));
+  chmodSync(root, 0o700);
+  const stat = lstatSync(root, {bigint: true});
+  if (stat.isSymbolicLink() || !stat.isDirectory() ||
+      Number(stat.mode & 0o777n) !== 0o700 ||
+      stat.uid !== BigInt(process.geteuid?.() ?? -1) ||
+      stat.gid !== BigInt(process.getegid?.() ?? -1) ||
+      readdirSync(root).length !== 0) {
+    throw new Error(
+      "published candidate next authority root identity invalid",
+    );
+  }
+  const paths = Object.freeze(Object.fromEntries(
+    SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_SPECS.map((spec) => [
+      spec.env,
+      join(root, spec.basename),
+    ]),
+  ));
+  return Object.freeze({
+    root,
+    generation: generationFromStat(stat),
+    uid: stat.uid,
+    gid: stat.gid,
+    paths,
+  });
+}
+
+function samePublishedCandidateNextRootIdentity(generation, stat) {
+  return generation.dev === stat.dev &&
+    generation.ino === stat.ino &&
+    generation.mode === stat.mode;
+}
+
+function publishedCandidateNextEnvironment(authority, inheritedEnv) {
+  const allowed = new Set(
+    SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_SPECS.map((spec) => spec.env),
+  );
+  const unknown = Object.keys(inheritedEnv).filter((key) =>
+    key.startsWith(SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_ENV_PREFIX) &&
+    !allowed.has(key));
+  if (unknown.length !== 0) {
+    throw new Error(
+      `published candidate next environment has extra authority: ${unknown.sort().join(",")}`,
+    );
+  }
+  const env = {...inheritedEnv};
+  for (const spec of SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_SPECS) {
+    env[spec.env] = authority.paths[spec.env];
+  }
+  return Object.freeze(env);
+}
+
+function validatePublishedCandidateNextPathAuthority(
+  authority,
+  env,
+  requireFiles,
+  expectedEntries = null,
+) {
+  const root = resolve(authority.root);
+  const rootStat = lstatSync(root, {bigint: true});
+  if (realpathSync.native(root) !== root ||
+      rootStat.isSymbolicLink() ||
+      !rootStat.isDirectory() ||
+      !samePublishedCandidateNextRootIdentity(
+        authority.generation, rootStat) ||
+      rootStat.uid !== authority.uid ||
+      rootStat.gid !== authority.gid ||
+      Number(rootStat.mode & 0o777n) !== 0o700) {
+    throw new Error("published candidate next authority root identity drift");
+  }
+  const expectedEnvNames = SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_SPECS
+    .map((spec) => spec.env)
+    .sort();
+  const observedEnvNames = Object.keys(env)
+    .filter((key) =>
+      key.startsWith(SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_ENV_PREFIX))
+    .sort();
+  if (observedEnvNames.length !== expectedEnvNames.length ||
+      observedEnvNames.some((key, index) => key !== expectedEnvNames[index])) {
+    throw new Error(
+      "published candidate next environment authority set invalid",
+    );
+  }
+  const pathSet = new Set();
+  for (const spec of SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_SPECS) {
+    const expectedPath = join(root, spec.basename);
+    if (authority.paths[spec.env] !== expectedPath ||
+        env[spec.env] !== expectedPath ||
+        resolve(expectedPath) !== expectedPath ||
+        dirname(expectedPath) !== root ||
+        pathSet.has(expectedPath)) {
+      throw new Error(
+        `published candidate next path authority invalid: ${spec.env}`,
+      );
+    }
+    pathSet.add(expectedPath);
+  }
+  const expectedNames = requireFiles
+    ? SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_SPECS
+      .map((spec) => spec.basename)
+      .sort()
+    : [];
+  const observedNames = readdirSync(root).sort();
+  if (observedNames.length !== expectedNames.length ||
+      observedNames.some((name, index) => name !== expectedNames[index])) {
+    throw new Error(
+      "published candidate next artifact path set invalid",
+    );
+  }
+  if (!requireFiles) return Object.freeze([]);
+
+  const previous = expectedEntries === null
+    ? null
+    : new Map(expectedEntries.map((entry) => [entry.role, entry]));
+  const entries = SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_SPECS.map((spec) => {
+    const path = authority.paths[spec.env];
+    const entry = readStableGeneratedFile(
+      path,
+      spec.role,
+      SEMANTIC_SNAPSHOT_PUBLISHED_NEXT_MAX_BYTES,
+    );
+    const stat = lstatSync(path, {bigint: true});
+    if (entry.bytes <= 0 ||
+        stat.uid !== authority.uid ||
+        stat.gid !== authority.gid ||
+        stat.nlink !== 1n ||
+        !sameGeneration(entry.generation, stat)) {
+      throw new Error(
+        `published candidate next artifact identity invalid: ${spec.role}`,
+      );
+    }
+    const before = previous?.get(spec.role);
+    if (before !== undefined &&
+        (before.path !== entry.path ||
+         before.bytes !== entry.bytes ||
+         before.sha256 !== entry.sha256 ||
+         !sameGeneration(before.generation, entry.generation))) {
+      throw new Error(
+        `published candidate next artifact identity drift: ${spec.role}`,
+      );
+    }
+    return Object.freeze({
+      ...entry,
+      absolutePath: path,
+    });
+  });
+  if (previous !== null && previous.size !== entries.length) {
+    throw new Error(
+      "published candidate next prior authority set invalid",
+    );
+  }
+  return Object.freeze(entries);
+}
+
+function verifyPublishedCandidateNextArtifactBindings(
+  entries,
+  runtimeReceipt,
+) {
+  const expected = new Map([
+    ["published_binding_next", runtimeReceipt.bindingReceiptCid],
+    [
+      "published_query_projection_next",
+      runtimeReceipt.queryProjectionCid,
+    ],
+    [
+      "published_open_document_universe_next",
+      runtimeReceipt.openDocumentUniverseCid,
+    ],
+    ["published_snapshot_next", runtimeReceipt.snapshotPayloadCid],
+  ]);
+  if (entries.length !== expected.size) {
+    throw new Error(
+      "published candidate next artifact binding set invalid",
+    );
+  }
+  for (const entry of entries) {
+    if (entry.sha256 !== expected.get(entry.role)) {
+      throw new Error(
+        `published candidate next artifact CID drift: ${entry.role}`,
+      );
+    }
+  }
+}
+
+function cleanupPublishedCandidateNextPathAuthority(authority) {
+  try {
+    const stat = lstatSync(authority.root, {bigint: true});
+    if (stat.isSymbolicLink() || !stat.isDirectory() ||
+        !samePublishedCandidateNextRootIdentity(
+          authority.generation, stat) ||
+        stat.uid !== authority.uid ||
+        stat.gid !== authority.gid) {
+      return;
+    }
+    rmSync(authority.root, {recursive: true, force: false});
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
 }
 
 async function runPublishedCandidateGate(root, baseline, sourceSetCid, timeoutSeconds) {
@@ -1508,32 +2266,61 @@ async function runPublishedCandidateGate(root, baseline, sourceSetCid, timeoutSe
   accessSync(gatePath, fsConstants.X_OK);
   const routingAudit = auditPublishedCandidateGateRouting(
     decodeUtf8(gateEntry.raw, "published candidate gate source"), guardEntry.sha256);
-  const env = {
-    ...process.env,
-    CHENG_LSP_MULTIFILE_VERSION_ISOLATION_ONLY: "0",
-    CHENG_LSP_MULTIFILE_CANDIDATE_PREFLIGHT_ONLY: "0",
-  };
-  const run = await runGuardProcess(gatePath, [], {
-    cwd: root,
-    env,
-    timeoutMs: timeoutSeconds * 1000,
-  });
-  verifySemanticSnapshotAuditInputs(root, baseline, "after published candidate gate");
-  if (run.timedOut) throw new Error("published candidate gate exceeded its bounded timeout");
-  if (run.overflow) throw new Error("published candidate gate output exceeded its bound");
-  if (run.exitCode !== 0 || run.signal) {
-    throw new Error(`published candidate gate failed: exit=${run.exitCode} signal=${run.signal || "none"} stdout=${decodeUtf8(run.stdout, "published candidate stdout")} stderr=${decodeUtf8(run.stderr, "published candidate stderr")}`);
+  const nextAuthority = createPublishedCandidateNextPathAuthority();
+  try {
+    const env = publishedCandidateNextEnvironment(nextAuthority, {
+      ...process.env,
+      CHENG_LSP_MULTIFILE_VERSION_ISOLATION_ONLY: "0",
+      CHENG_LSP_MULTIFILE_CANDIDATE_PREFLIGHT_ONLY: "0",
+    });
+    validatePublishedCandidateNextPathAuthority(
+      nextAuthority, env, false);
+    const run = await runGuardProcess(gatePath, [], {
+      cwd: root,
+      env,
+      timeoutMs: timeoutSeconds * 1000,
+    });
+    verifySemanticSnapshotAuditInputs(
+      root, baseline, "after published candidate gate");
+    if (run.timedOut) {
+      throw new Error(
+        "published candidate gate exceeded its bounded timeout");
+    }
+    if (run.overflow) {
+      throw new Error("published candidate gate output exceeded its bound");
+    }
+    if (run.exitCode !== 0 || run.signal) {
+      throw new Error(
+        `published candidate gate failed: exit=${run.exitCode} ` +
+        `signal=${run.signal || "none"} ` +
+        `stdout=${decodeUtf8(
+          run.stdout, "published candidate stdout")} ` +
+        `stderr=${decodeUtf8(
+          run.stderr, "published candidate stderr")}`);
+    }
+    if (run.stderr.length !== 0) {
+      throw new Error("published candidate gate wrote stderr on success");
+    }
+    const nextEntries = validatePublishedCandidateNextPathAuthority(
+      nextAuthority, env, true);
+    const stdoutEntry = Object.freeze({
+      raw: run.stdout,
+      sha256: sha256(run.stdout),
+      bytes: run.stdout.length,
+    });
+    const runtimeReceipt = verifyPublishedCandidateGateStdout(
+      stdoutEntry, baseline, sourceSetCid);
+    verifyPublishedCandidateNextArtifactBindings(
+      nextEntries, runtimeReceipt);
+    validatePublishedCandidateNextPathAuthority(
+      nextAuthority, env, true, nextEntries);
+    const executionReceipt = composePublishedCandidateExecutionReceipt(
+      runtimeReceipt, routingAudit, sourceSetCid);
+    publishedCandidateGateExecutionReceipts.add(executionReceipt);
+    return executionReceipt;
+  } finally {
+    cleanupPublishedCandidateNextPathAuthority(nextAuthority);
   }
-  if (run.stderr.length !== 0) throw new Error("published candidate gate wrote stderr on success");
-  const stdoutEntry = Object.freeze({
-    raw: run.stdout,
-    sha256: sha256(run.stdout),
-    bytes: run.stdout.length,
-  });
-  const runtimeReceipt = verifyPublishedCandidateGateStdout(
-    stdoutEntry, baseline, sourceSetCid);
-  return composePublishedCandidateExecutionReceipt(
-    runtimeReceipt, routingAudit, sourceSetCid);
 }
 
 async function runOneGate(root, gate, baseline, timeoutSeconds) {
@@ -1721,18 +2508,16 @@ async function runSemanticSnapshotAudit(
     primaryObjectPlanSource: decodeUtf8(baseline.byPath.get("src/core/backend/primary_object_plan.cheng").raw, "primary_object_plan.cheng"),
     directObjectEmitSource: decodeUtf8(baseline.byPath.get("src/core/backend/direct_object_emit.cheng").raw, "direct_object_emit.cheng"),
     machoObjectWriterSource: decodeUtf8(baseline.byPath.get("src/core/backend/macho_object_writer.cheng").raw, "macho_object_writer.cheng"),
-  }, publishedCandidateReceipt);
+  }, publishedCandidateReceipt, true);
   const compilerInputAudit = auditColdCompilerIncludeClosure(baseline);
   if (scope === SEMANTIC_SNAPSHOT_AUDIT_PRODUCTION_CLOSURE_SCOPE) {
     verifySemanticSnapshotAuditInputs(canonicalRoot, baseline, "production closure publication check");
-    const auditCid = domainSeparatedCid("cheng.semantic_snapshot.audit", [
-      scope,
+    const auditCid = semanticSnapshotProductionClosureOuterAuditCid(
       sourceSetCid,
       structuralAudit.receiptCid,
       closureAudit.receiptCid,
       compilerInputAudit.receiptCid,
-      publishedCandidateReceipt?.receiptCid || "",
-    ]);
+      publishedCandidateReceipt);
     return Object.freeze({
       schema: SEMANTIC_SNAPSHOT_AUDIT_SCHEMA,
       status: closureAudit.status,
@@ -1830,9 +2615,16 @@ export {
   auditInternallyGuardedGate,
   auditColdCompilerIncludeClosure,
   captureSemanticSnapshotAuditInputs,
+  cleanupPublishedCandidateNextPathAuthority,
+  createPublishedCandidateNextPathAuthority,
   initChengSemanticSnapshotAuditModule,
+  publishedCandidateNextEnvironment,
   runPublishedCandidateGate,
   runSemanticSnapshotAudit,
+  semanticSnapshotProductionClosureOuterAuditCid,
+  semanticSnapshotPublishedCandidateReceiptBindingCid,
+  validatePublishedCandidateNextPathAuthority,
+  verifyPublishedCandidateNextArtifactBindings,
   verifyPublishedCandidateGateStdout,
   verifySemanticSnapshotAuditInputs,
 };

@@ -1,0 +1,757 @@
+import std/strings
+import std/os
+import std/rawbytes
+import std/result
+import std/cmdline
+import cheng/game/csg/schema as csgschema
+import cheng/game/csg/csgworld
+import cheng/game/world3d
+import cheng/game/csg/ball_servo_rigid
+import cheng/game/csg/execution
+import cheng/game/assets/semantic_video/schema as svschema
+import cheng/game/assets/semantic_video/reader
+import cheng/game/assets/semantic_video/validator
+import cheng/game/assets/semantic_video/writer
+import cheng/game/assets/semantic_video/source_index
+import cheng/game/assets/semantic_video/snapshot_codec
+import cheng/game/assets/semantic_video/snapshot_block
+
+# semantic_hub — CSG 语义视频 v0.1 单一消费入口 (f 闭环 S4)。
+# stdout 逐行 k=v; rc=0/1; 任一失败结构化拒绝, 不降级。
+#
+#   semantic_hub verify-footage <svblock> <source.mp4>
+#     validator + 源 CID (resCid[0]) + 重建索引 CID (resCid[1]) 双绑定。
+#   semantic_hub verify-snap <svblock> <world.csgworld>
+#     validator + 快照 payload 资源 CID 绑定: 共享确定性驱动从 bound
+#     csgworld 重推导各检查点 payload (F1 已证与 capture 侧逐字节一致,
+#     故无需外部 res-dir), 派生 payload CID == snapshot.worldCid ==
+#     manifest resCid[state_payload], 且 SvSnapDecode 前置校验通过。
+#     快照消费模式 (verify-snap/restore, chain 的两快照臂) 均先做物理默认
+#     行为基线对拍 (manifest x-physicsBaseline, snapshot_block 单一入口
+#     SvSnapBaselineGuard): 缺键/失配 = 夹具基线过期, rc=1。
+#   semantic_hub restore <svblock> <world.csgworld> <ckpt> <aheadTicks>
+#     恢复 + 续跑 + 逐 tick cid 行, 末行 replayCidMatch=1。
+#   semantic_hub query <svblock> <source.mp4> <t1> <t2>
+#     [t1,t2) 左闭右开样本级证据行 (offset/size) + matched/bytes。
+#   semantic_hub seek <svblock> <source.mp4> <tick>
+#     覆盖 tick 的恢复单元 (关键帧 GOP) 字节行。
+#   semantic_hub chain <svblock> <source.mp4> <world.csgworld> <ckpt>
+#                      <ahead> <t1> <t2>
+#     全链一入口: verify-footage → verify-snap → restore → query(窗口
+#     [t1,t2)) → seek(tick=t1), 五段依次 rc=0, 末行 chain=ok。
+#     要求块同时携带 footage (video_sample+index) 与 snapshot
+#     (state_payload) 两族资源。
+#
+# 诚实边界: 仓内无 H.264 解码/渲染桥。本入口消费的是记录时间轴 +
+# 证据锚 (按索引 offset/size 实际绑定的源字节) + 快照恢复链
+# (sv-snap.v1 payload), 像素呈现依赖尚不存在的解码/渲染路径。
+#
+# 驱动 tick 换算: 快照世界时基 = snapshot_block 的 1/240; 记录 tick 按
+# manifest 时基存放, driveTick = tick * 240 / tbDen (必须整除, 否则拒绝)。
+
+const
+    HubSnapTbNum: int32 = 1      # = snapshot_block.SvSnapTbNum
+    HubSnapTbDen: int32 = 240    # = snapshot_block.SvSnapTbDen
+
+type
+    HubTickParse =
+        ok: bool
+        value: int64
+
+    HubParsed =
+        ok: bool
+        error: str
+        records: svschema.SvRecords
+
+    HubFootageRes =
+        ok: bool
+        error: str
+        sourceCid: str
+        indexCid: str
+        timeStart: int64
+        timeEnd: int64
+        idx: source_index.SvSourceIndex
+
+    HubSnapRec =
+        ckpt: str
+        worldCid: str
+        driveTick: int64
+
+    HubSnapPrep =
+        ok: bool
+        error: str
+        recs: HubSnapRec[]
+
+@borrows
+fn HubClone(e: str): str =
+    return strings.CloneStr(e)
+
+# 纯数字 int64 解析 (溢出拒绝); 禁负号/空白/其它字符。
+@borrows
+fn HubParseTick(text: str): HubTickParse =
+    var out: HubTickParse
+    if text.len == 0:
+        return out
+    var at: int32 = 0
+    var value: int64 = int64(0)
+    while at < text.len:
+        let ch = text[at]
+        if ch < '0' || ch > '9':
+            return out
+        let digit = int64(int32(ch) - int32('0'))
+        if value > (Int64(9223372036854775807) - digit) / int64(10):
+            return out
+        value = value * int64(10) + digit
+        at = at + 1
+    out.ok = true
+    out.value = value
+    return out
+
+# 公共块验证链: decode → parse → validate → manifest 恰 1。
+@borrows
+fn HubBlockLoad(blockBytes: rawbytes.Bytes): HubParsed =
+    var out: HubParsed
+    var decoded = reader.SvReaderDecode(blockBytes)
+    if !decoded.ok:
+        out.error = HubClone(decoded.error)
+        return out
+    var parsed = reader.SvParseRecords(decoded.lines)
+    if !parsed.ok:
+        out.error = HubClone(parsed.error)
+        return out
+    var validation = validator.SvValidate(blockBytes)
+    if !validation.ok:
+        out.error = HubClone(validation.error)
+        return out
+    if parsed.records.manifests.len != 1:
+        out.error = "sv_ref_duplicate manifest"
+        return out
+    out.records = parsed.records
+    out.ok = true
+    return out
+
+# footage 验证链: resType[0]=video_sample / [1]=index + 源 CID +
+# 重建索引 CID 双绑定 (B2/B3 同合同; 合并块允许尾部追加 state_payload)。
+@borrows
+fn HubFootageChain(blockBytes: rawbytes.Bytes,
+                   data: rawbytes.Bytes): HubFootageRes =
+    var out: HubFootageRes
+    var loaded = HubBlockLoad(blockBytes)
+    if !loaded.ok:
+        out.error = HubClone(loaded.error)
+        return out
+    let m = loaded.records.manifests[0]
+    if m.resCid.len != m.resLength.len || m.resCid.len != m.resType.len ||
+       m.resCid.len < 2:
+        out.error = "sv_cap_arrays_mismatch res"
+        return out
+    if m.resType[0] != "video_sample" || m.resType[1] != "index":
+        out.error = "sv_res_type_mismatch"
+        return out
+    out.sourceCid = writer.SvResourceCid(data)
+    if out.sourceCid != m.resCid[0]:
+        var line = strings.ConcatStr(
+            "sv_cid_malformed source expected=", m.resCid[0])
+        line = strings.ConcatStr(line, " actual=")
+        line = strings.ConcatStr(line, out.sourceCid)
+        out.error = line
+        return out
+    var idx = source_index.SvSourceIndexBuild(data)
+    if !idx.ok:
+        out.error = HubClone(idx.error)
+        return out
+    var indexBytes = source_index.SvSourceIndexEncodeResource(idx)
+    out.indexCid = writer.SvResourceCid(indexBytes)
+    if out.indexCid != m.resCid[1]:
+        var line = strings.ConcatStr(
+            "sv_cid_malformed index expected=", m.resCid[1])
+        line = strings.ConcatStr(line, " actual=")
+        line = strings.ConcatStr(line, out.indexCid)
+        out.error = line
+        return out
+    out.timeStart = m.timeStart
+    out.timeEnd = m.timeEnd
+    out.idx = idx
+    out.ok = true
+    return out
+
+# 二分下界: 首个 pts >= tick 的样本号 (无则 sampleCount)。
+@borrows
+fn HubLowerBound(idx: source_index.SvSourceIndex, tick: int64): int32 =
+    var lo: int32 = 0
+    var hi: int32 = idx.sampleCount
+    while lo < hi:
+        let mid = (lo + hi) / 2
+        if idx.pts[mid] < tick:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+# 快照记录收集 + 依赖绑定 + 时基换算 + 按 driveTick 升序 (CSGC 打包
+# 不保证行序, 消费端必须按 ckpt id 定位)。wantCkpt 非空时仅收该 ckpt
+# (缺失拒绝); 空则收全部。同时绑定 manifest: 每个 worldCid 必须出现在
+# resCid 且对应 resType==state_payload, 且 state_payload 数 == 快照数。
+@borrows
+fn HubSnapPrep(records: svschema.SvRecords, m: svschema.SvManifestRec,
+               factsCid: str, wantCkpt: str): HubSnapPrep =
+    var out: HubSnapPrep
+    if records.snapshots.len < 1:
+        out.error = "sv_snap_no_snapshots"
+        return out
+    var spCount: int32 = 0
+    for i in 0..<m.resCid.len:
+        if m.resType[i] == "state_payload":
+            spCount = spCount + 1
+    if spCount != records.snapshots.len:
+        out.error = "sv_cap_arrays_mismatch state_payload"
+        return out
+    if m.tbNum != HubSnapTbNum || m.tbDen < HubSnapTbDen:
+        out.error = "sv_timebase_invalid manifest"
+        return out
+    var collected: HubSnapRec[]
+    var picked: int32 = 0
+    for i in 0..<records.snapshots.len:
+        let s = records.snapshots[i]
+        if wantCkpt.len > 0 && s.ckpt != wantCkpt:
+            continue
+        picked = picked + 1
+        if s.deps.len != 1 || s.deps[0] != factsCid:
+            out.error = strings.ConcatStr("sv_snap_facts_unbound ", s.ckpt)
+            return out
+        var bound: int32 = 0 - 1
+        for j in 0..<m.resCid.len:
+            if m.resCid[j] == s.worldCid && m.resType[j] == "state_payload":
+                bound = j
+        if bound < 0:
+            out.error = strings.ConcatStr("sv_snap_cid_unbound ", s.ckpt)
+            return out
+        if s.tick < int64(0) ||
+           s.tick > Int64(9223372036854775807) / int64(HubSnapTbDen):
+            out.error = "sv_tick_out_of_range snapshot"
+            return out
+        let scaled = s.tick * int64(HubSnapTbDen)
+        if scaled % int64(m.tbDen) != 0:
+            out.error = strings.ConcatStr("sv_timebase_invalid ", s.ckpt)
+            return out
+        var rec: HubSnapRec
+        rec.ckpt = strings.CloneStr(s.ckpt)
+        rec.worldCid = strings.CloneStr(s.worldCid)
+        rec.driveTick = scaled / int64(m.tbDen)
+        add(collected, rec)
+    if wantCkpt.len > 0 && picked == 0:
+        out.error = strings.ConcatStr("sv_snap_ckpt_unknown ", wantCkpt)
+        return out
+    # 稳定选择排序进新数组 (只用 add, 不做托管结构体数组槽赋值)。
+    var used: bool[]
+    setLen(used, collected.len)
+    while out.recs.len < collected.len:
+        var best: int32 = 0 - 1
+        for i in 0..<collected.len:
+            if used[i]:
+                continue
+            if best < 0 || collected[i].driveTick < collected[best].driveTick:
+                best = i
+        used[best] = true
+        if out.recs.len > 0 &&
+           collected[best].driveTick == out.recs[out.recs.len - 1].driveTick:
+            out.error = "sv_snap_ckpt_duplicate_tick"
+            return out
+        var rec: HubSnapRec
+        rec.ckpt = strings.CloneStr(collected[best].ckpt)
+        rec.worldCid = strings.CloneStr(collected[best].worldCid)
+        rec.driveTick = collected[best].driveTick
+        add(out.recs, rec)
+    out.ok = true
+    return out
+
+# 加载 csgworld 并核嵌 CID (文件 = 分发权威)。返回 "" 为过。
+@borrows
+fn HubWorldLoad(worldPath: str, facts: var csgschema.CsgWorldFacts): str =
+    let embedded: str = csgworld.CsgWorldLoad(worldPath, facts)
+    if embedded.len == 0:
+        return "csgworld load failed"
+    let factsCid: str = Fmt"{csgschema.CsgWorldFactsCid(facts)}"
+    if factsCid != embedded:
+        return "facts cid mismatch"
+    return ""
+
+# 派生 payload 三重校验: 资源 CID 绑定 (世界 CID 域 = payload 字节
+# sha256, F1 同合同) + SvSnapDecode 前置校验 + 解码世界 CID 对拍采集态
+# (World3dCid 结构哈希域, 与资源 CID 分域)。返回 "" 为过。
+@borrows
+fn HubSnapCheckPayload(encoded: rawbytes.Bytes, worldCid: str,
+                       wantStateCid: str, outBytes: var int32): str =
+    outBytes = rawbytes.BytesLen(encoded)
+    let cid = snapshot_block.SvSnapResourceCid(encoded)
+    if cid != worldCid:
+        var line = strings.ConcatStr("sv_snap_cid_mismatch expected=", worldCid)
+        line = strings.ConcatStr(line, " actual=")
+        line = strings.ConcatStr(line, cid)
+        return line
+    var decoded = snapshot_codec.SvSnapDecode(encoded)
+    if !decoded.ok:
+        return strings.ConcatStr("sv_snap_decode ", decoded.error)
+    let decodedCid = world3d.World3dCid(decoded.w)
+    if decodedCid != wantStateCid:
+        var line = strings.ConcatStr(
+            "sv_snap_decode_cid_mismatch expected=", wantStateCid)
+        line = strings.ConcatStr(line, " actual=")
+        line = strings.ConcatStr(line, decodedCid)
+        return line
+    return ""
+
+# ---- verify-footage -----------------------------------------------------
+
+@borrows
+fn HubModeVerifyFootage(blockPath: str, sourcePath: str): int32 =
+    let blockResult = os.ReadFileBytesResult(blockPath)
+    if result.IsErr(blockResult):
+        echo("semantic_hub error: read svblock failed")
+        return 1
+    var blockBytes = result.Value(blockResult)
+    let sourceResult = os.ReadFileBytesResult(sourcePath)
+    if result.IsErr(sourceResult):
+        echo("semantic_hub error: read source failed")
+        return 1
+    var data = result.Value(sourceResult)
+    var fc = HubFootageChain(blockBytes, data)
+    if !fc.ok:
+        echo(strings.ConcatStr("semantic_hub error: ", fc.error))
+        return 1
+    echo("mode=verify-footage")
+    var line = strings.ConcatStr("sourceCid=", fc.sourceCid)
+    line = strings.ConcatStr(line, " indexCid=")
+    line = strings.ConcatStr(line, fc.indexCid)
+    echo(line)
+    line = strings.ConcatStr("samples=", strings.IntToStr(fc.idx.sampleCount))
+    line = strings.ConcatStr(line, " keyframes=")
+    line = strings.ConcatStr(line, strings.IntToStr(fc.idx.keyframeCount))
+    line = strings.ConcatStr(line, " timescale=")
+    line = strings.ConcatStr(line, strings.IntToStr(fc.idx.timescale))
+    line = strings.ConcatStr(line, " timeEnd=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(fc.timeEnd))
+    echo(line)
+    echo("verifyFootage=ok")
+    return 0
+
+# ---- verify-snap --------------------------------------------------------
+
+# 单检查点: 从当前 drive 状态编码 payload, 三重校验, 回显 ckpt 行。
+# 过则返回 "", 否则结构化错误码。
+@borrows
+fn HubSnapCaptureEcho(drive: snapshot_block.SvSnapDrive,
+                      facts: csgschema.CsgWorldFacts,
+                      rec: HubSnapRec): str =
+    var servo: ball_servo_rigid.BallServoRigidState
+    var captureStateCid = world3d.World3dCid(drive.st.w)
+    var sw = world3d.World3dClone(drive.st.w)
+    var ss = execution.CsgExecutionSnapshot(drive.st)
+    var encoded = snapshot_codec.SvSnapEncode(sw, ss, servo)
+    if !encoded.ok:
+        return strings.ConcatStr("encode ", encoded.error)
+    var got: int32 = 0
+    let checkError = HubSnapCheckPayload(encoded.bytes, rec.worldCid,
+        captureStateCid, got)
+    rawbytes.BytesFree(encoded.bytes)
+    if checkError.len > 0:
+        return checkError
+    var line = strings.ConcatStr("ckpt=", rec.ckpt)
+    line = strings.ConcatStr(line, " tick=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(rec.driveTick))
+    line = strings.ConcatStr(line, " payloadBytes=")
+    line = strings.ConcatStr(line, strings.IntToStr(got))
+    line = strings.ConcatStr(line, " worldCid=")
+    line = strings.ConcatStr(line, rec.worldCid)
+    echo(line)
+    return ""
+
+@borrows
+fn HubModeVerifySnap(blockPath: str, worldPath: str): int32 =
+    let blockResult = os.ReadFileBytesResult(blockPath)
+    if result.IsErr(blockResult):
+        echo("semantic_hub error: read svblock failed")
+        return 1
+    var blockBytes = result.Value(blockResult)
+    var loaded = HubBlockLoad(blockBytes)
+    if !loaded.ok:
+        echo(strings.ConcatStr("semantic_hub error: ", loaded.error))
+        return 1
+    let m = loaded.records.manifests[0]
+    var facts: csgschema.CsgWorldFacts
+    let worldError = HubWorldLoad(worldPath, facts)
+    if worldError.len > 0:
+        echo(strings.ConcatStr("semantic_hub error: ", worldError))
+        return 1
+    let factsCid: str = Fmt"{csgschema.CsgWorldFactsCid(facts)}"
+    var prep = HubSnapPrep(loaded.records, m, factsCid, "")
+    if !prep.ok:
+        echo(strings.ConcatStr("semantic_hub error: ", prep.error))
+        return 1
+    # 基线对拍（单一入口 SvSnapBaselineGuard，semantic_snapshot CLI restore
+    # 与 f3 smoke 装载段同款）：manifest x-physicsBaseline（录制时物理默认
+    # 行为指纹）对拍现树探针值。时序 = facts 装载（load + embedded CID 校验
+    # + HubSnapPrep dep 绑定）之后、payload 消费（驱动重推导 payload CID 判
+    # 定）之前；缺键/探针失败/失配统一结构化报「夹具基线过期（物理默认行为
+    # 已变，请重录）」rc=1，不裸撞 sv_snap_cid_mismatch。
+    var baselineError = snapshot_block.SvSnapBaselineGuard(
+        m.xPhysicsBaseline, facts)
+    if baselineError.len > 0:
+        echo(strings.ConcatStr("semantic_hub error: ", baselineError))
+        return 1
+    var drive = snapshot_block.SvSnapDriveStartFromFacts(facts)
+    if !drive.ok:
+        echo(strings.ConcatStr("semantic_hub error: drive ", drive.error))
+        return 1
+    echo("mode=verify-snap")
+    echo(strings.ConcatStr("factsCid=", factsCid))
+    var next: int32 = 0
+    while next < prep.recs.len && prep.recs[next].driveTick == int64(0):
+        let captureError = HubSnapCaptureEcho(drive, facts, prep.recs[next])
+        if captureError.len > 0:
+            echo(strings.ConcatStr("semantic_hub error: ", captureError))
+            return 1
+        next = next + 1
+    while drive.st.w.tick < prep.recs[prep.recs.len - 1].driveTick:
+        if !snapshot_block.SvSnapDriveTick(drive.st, facts):
+            echo("semantic_hub error: drive rejected at tick " +
+                strings.Int64ToStr(drive.st.w.tick))
+            return 1
+        while next < prep.recs.len &&
+              prep.recs[next].driveTick == drive.st.w.tick:
+            let captureError = HubSnapCaptureEcho(drive, facts,
+                prep.recs[next])
+            if captureError.len > 0:
+                echo(strings.ConcatStr("semantic_hub error: ", captureError))
+                return 1
+            next = next + 1
+    echo("verifySnap=ok")
+    return 0
+
+# ---- restore ------------------------------------------------------------
+
+@borrows
+fn HubModeRestore(blockPath: str, worldPath: str, ckptId: str,
+                  ahead: int32): int32 =
+    let blockResult = os.ReadFileBytesResult(blockPath)
+    if result.IsErr(blockResult):
+        echo("semantic_hub error: read svblock failed")
+        return 1
+    var blockBytes = result.Value(blockResult)
+    var loaded = HubBlockLoad(blockBytes)
+    if !loaded.ok:
+        echo(strings.ConcatStr("semantic_hub error: ", loaded.error))
+        return 1
+    let m = loaded.records.manifests[0]
+    var facts: csgschema.CsgWorldFacts
+    let worldError = HubWorldLoad(worldPath, facts)
+    if worldError.len > 0:
+        echo(strings.ConcatStr("semantic_hub error: ", worldError))
+        return 1
+    let factsCid: str = Fmt"{csgschema.CsgWorldFactsCid(facts)}"
+    var prep = HubSnapPrep(loaded.records, m, factsCid, ckptId)
+    if !prep.ok:
+        echo(strings.ConcatStr("semantic_hub error: ", prep.error))
+        return 1
+    # 基线对拍（同 verify-snap：facts 装载 + dep 绑定之后、payload 消费之
+    # 前，guard 单一入口），缺键/探针失败/失配统一报「夹具基线过期（物理
+    # 默认行为已变，请重录）」rc=1，先于 payload CID/replay 判定。
+    var baselineError = snapshot_block.SvSnapBaselineGuard(
+        m.xPhysicsBaseline, facts)
+    if baselineError.len > 0:
+        echo(strings.ConcatStr("semantic_hub error: ", baselineError))
+        return 1
+    let rec = prep.recs[0]
+    var drive = snapshot_block.SvSnapDriveStartFromFacts(facts)
+    if !drive.ok:
+        echo(strings.ConcatStr("semantic_hub error: drive ", drive.error))
+        return 1
+    while drive.st.w.tick < rec.driveTick:
+        if !snapshot_block.SvSnapDriveTick(drive.st, facts):
+            echo("semantic_hub error: replay rejected at tick " +
+                strings.Int64ToStr(drive.st.w.tick))
+            return 1
+    let replayCid: str = world3d.World3dCid(drive.st.w)
+    # 派生恢复单元 payload; 先绑定后解码 (SvSnapDecode 前置校验)。
+    var servo: ball_servo_rigid.BallServoRigidState
+    var sw = world3d.World3dClone(drive.st.w)
+    var ss = execution.CsgExecutionSnapshot(drive.st)
+    var encoded = snapshot_codec.SvSnapEncode(sw, ss, servo)
+    if !encoded.ok:
+        echo(strings.ConcatStr("semantic_hub error: encode ", encoded.error))
+        return 1
+    let payloadCid = snapshot_block.SvSnapResourceCid(encoded.bytes)
+    if payloadCid != rec.worldCid:
+        var line = strings.ConcatStr(
+            "semantic_hub error: sv_snap_cid_mismatch expected=", rec.worldCid)
+        line = strings.ConcatStr(line, " actual=")
+        line = strings.ConcatStr(line, payloadCid)
+        echo(line)
+        rawbytes.BytesFree(encoded.bytes)
+        return 1
+    var restored = snapshot_codec.SvSnapDecode(encoded.bytes)
+    rawbytes.BytesFree(encoded.bytes)
+    if !restored.ok:
+        echo(strings.ConcatStr("semantic_hub error: sv_snap_decode ",
+            restored.error))
+        return 1
+    let decodedCid: str = world3d.World3dCid(restored.st.w)
+    echo("mode=restore")
+    var line = strings.ConcatStr("ckpt=", rec.ckpt)
+    line = strings.ConcatStr(line, " tick=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(rec.driveTick))
+    echo(line)
+    echo(strings.ConcatStr("factsCid=", factsCid))
+    echo(strings.ConcatStr("replayCid=", replayCid))
+    echo(strings.ConcatStr("decodedCid=", decodedCid))
+    if replayCid != decodedCid:
+        echo("semantic_hub error: replay diverged from payload")
+        return 1
+    # 在解码覆盖后的状态上续跑 ahead tick, 逐 tick 回显 cid。
+    var j: int32 = 0
+    while j < ahead:
+        if !snapshot_block.SvSnapDriveTick(restored.st, facts):
+            echo("semantic_hub error: continuation rejected at tick " +
+                strings.Int64ToStr(restored.st.w.tick))
+            return 1
+        var tline = strings.ConcatStr("tick=",
+            strings.Int64ToStr(restored.st.w.tick))
+        tline = strings.ConcatStr(tline, " cid=")
+        tline = strings.ConcatStr(tline, world3d.World3dCid(restored.st.w))
+        echo(tline)
+        j = j + 1
+    echo(strings.ConcatStr("finalTick=",
+        strings.Int64ToStr(restored.st.w.tick)))
+    echo("replayCidMatch=1")
+    return 0
+
+# ---- query --------------------------------------------------------------
+
+@borrows
+fn HubSampleLine(idx: source_index.SvSourceIndex, i: int32): str =
+    var line = strings.ConcatStr("sample=", strings.IntToStr(i))
+    line = strings.ConcatStr(line, " pts=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(idx.pts[i]))
+    line = strings.ConcatStr(line, " offset=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(idx.offset[i]))
+    line = strings.ConcatStr(line, " size=")
+    line = strings.ConcatStr(line, strings.IntToStr(idx.size[i]))
+    line = strings.ConcatStr(line, " key=")
+    line = strings.ConcatStr(line, strings.IntToStr(idx.key[i]))
+    return line
+
+@borrows
+fn HubModeQuery(blockPath: str, sourcePath: str, t1: int64,
+                t2: int64): int32 =
+    let blockResult = os.ReadFileBytesResult(blockPath)
+    if result.IsErr(blockResult):
+        echo("semantic_hub error: read svblock failed")
+        return 1
+    var blockBytes = result.Value(blockResult)
+    let sourceResult = os.ReadFileBytesResult(sourcePath)
+    if result.IsErr(sourceResult):
+        echo("semantic_hub error: read source failed")
+        return 1
+    var data = result.Value(sourceResult)
+    var fc = HubFootageChain(blockBytes, data)
+    if !fc.ok:
+        echo(strings.ConcatStr("semantic_hub error: ", fc.error))
+        return 1
+    if t1 < int64(0) || t1 >= t2 || t2 > fc.timeEnd:
+        echo("semantic_hub error: sv_interval_reversed query")
+        return 1
+    echo("mode=query")
+    var at = HubLowerBound(fc.idx, t1)
+    var matched: int32 = 0
+    var total: int64 = int64(0)
+    var prev: int64 = int64(-1)
+    while at < fc.idx.sampleCount && fc.idx.pts[at] < t2:
+        echo(HubSampleLine(fc.idx, at))
+        if fc.idx.pts[at] <= prev:
+            echo("semantic_hub error: sv_index_order pts")
+            return 1
+        prev = fc.idx.pts[at]
+        total = total + int64(fc.idx.size[at])
+        matched = matched + 1
+        at = at + 1
+    var last = strings.ConcatStr("matched=", strings.IntToStr(matched))
+    last = strings.ConcatStr(last, " bytes=")
+    last = strings.ConcatStr(last, strings.Int64ToStr(total))
+    echo(last)
+    return 0
+
+# ---- seek ---------------------------------------------------------------
+
+@borrows
+fn HubModeSeek(blockPath: str, sourcePath: str, tick: int64): int32 =
+    let blockResult = os.ReadFileBytesResult(blockPath)
+    if result.IsErr(blockResult):
+        echo("semantic_hub error: read svblock failed")
+        return 1
+    var blockBytes = result.Value(blockResult)
+    let sourceResult = os.ReadFileBytesResult(sourcePath)
+    if result.IsErr(sourceResult):
+        echo("semantic_hub error: read source failed")
+        return 1
+    var data = result.Value(sourceResult)
+    var fc = HubFootageChain(blockBytes, data)
+    if !fc.ok:
+        echo(strings.ConcatStr("semantic_hub error: ", fc.error))
+        return 1
+    if tick < int64(0) || tick >= fc.timeEnd:
+        echo("semantic_hub error: sv_tick_out_of_range seek")
+        return 1
+    var target = HubLowerBound(fc.idx, tick + int64(1)) - 1
+    if target < 0:
+        echo("semantic_hub error: sv_tick_out_of_range seek")
+        return 1
+    var kf = target
+    while kf >= 0 && fc.idx.key[kf] != 1:
+        kf = kf - 1
+    if kf < 0:
+        echo("semantic_hub error: sv_seek_no_keyframe")
+        return 1
+    var nextKf = kf + 1
+    while nextKf < fc.idx.sampleCount && fc.idx.key[nextKf] != 1:
+        nextKf = nextKf + 1
+    var intervalEnd = fc.timeEnd
+    if nextKf < fc.idx.sampleCount:
+        intervalEnd = fc.idx.pts[nextKf]
+    var readahead: int64 = int64(0)
+    for i in kf..target:
+        readahead = readahead + int64(fc.idx.size[i])
+    echo("mode=seek")
+    var line = strings.ConcatStr("kf_pts=", strings.Int64ToStr(fc.idx.pts[kf]))
+    line = strings.ConcatStr(line, " interval=[")
+    line = strings.ConcatStr(line, strings.Int64ToStr(fc.idx.pts[kf]))
+    line = strings.ConcatStr(line, ",")
+    line = strings.ConcatStr(line, strings.Int64ToStr(intervalEnd))
+    line = strings.ConcatStr(line, ") readahead_samples=")
+    line = strings.ConcatStr(line, strings.IntToStr(target - kf + 1))
+    line = strings.ConcatStr(line, " readahead_bytes=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(readahead))
+    line = strings.ConcatStr(line, " from_sample=")
+    line = strings.ConcatStr(line, strings.IntToStr(kf))
+    echo(line)
+    return 0
+
+# ---- chain --------------------------------------------------------------
+
+@borrows
+fn HubModeChain(blockPath: str, sourcePath: str, worldPath: str,
+                ckptId: str, ahead: int32, t1: int64, t2: int64): int32 =
+    echo("seg=verify-footage")
+    var rc = HubModeVerifyFootage(blockPath, sourcePath)
+    if rc != 0:
+        return rc
+    echo("seg=verify-snap")
+    rc = HubModeVerifySnap(blockPath, worldPath)
+    if rc != 0:
+        return rc
+    echo("seg=restore")
+    rc = HubModeRestore(blockPath, worldPath, ckptId, ahead)
+    if rc != 0:
+        return rc
+    echo("seg=query")
+    rc = HubModeQuery(blockPath, sourcePath, t1, t2)
+    if rc != 0:
+        return rc
+    echo("seg=seek")
+    rc = HubModeSeek(blockPath, sourcePath, t1)
+    if rc != 0:
+        return rc
+    echo("chain=ok")
+    return 0
+
+# ---- help / main --------------------------------------------------------
+
+fn HubPrintHelp() =
+    echo("semantic_hub <mode> ... — CSG semantic video v0.1 single consumer entry")
+    echo("modes:")
+    echo("  verify-footage <svblock> <source.mp4>")
+    echo("  verify-snap <svblock> <world.csgworld>")
+    echo("  restore <svblock> <world.csgworld> <ckpt> <aheadTicks>")
+    echo("  query <svblock> <source.mp4> <t1> <t2>    [t1,t2) left-closed right-open")
+    echo("  seek <svblock> <source.mp4> <tick>        recovery unit covering tick")
+    echo("  chain <svblock> <source.mp4> <world.csgworld> <ckpt> <ahead> <t1> <t2>")
+    echo("      verify-footage -> verify-snap -> restore -> query -> seek,")
+    echo("      all five segments rc=0, last line chain=ok; the block must carry")
+    echo("      both footage (video_sample+index) and snapshot (state_payload)")
+    echo("      resource families.")
+    echo("validation: every mode runs the full binding chain (validator, source/")
+    echo("index CID double binding, snapshot payload resource CID binding via the")
+    echo("shared deterministic drive re-derivation + SvSnapDecode precondition);")
+    echo("any mismatch rejects with rc=1, no fallback.")
+    echo("honest boundary: no pixel decode. The hub consumes the record timeline,")
+    echo("evidence anchors (sample bytes read back from the bound source by")
+    echo("offset/size) and the snapshot restore chain (sv-snap.v1 payloads);")
+    echo("pixel presentation depends on a decoder/render path this repo does not")
+    echo("wire yet.")
+
+fn main(): int32 =
+    if cmdline.ParamCount() == 2:
+        if cmdline.ParamStr(1) == "--help":
+            HubPrintHelp()
+            return 0
+    if cmdline.ParamCount() < 2:
+        echo("semantic_hub error: usage semantic_hub <mode> ... (try --help)")
+        return 1
+    let mode = cmdline.ParamStr(1)
+    if mode == "verify-footage":
+        if cmdline.ParamCount() != 4:
+            echo("semantic_hub error: usage verify-footage <svblock> <source.mp4>")
+            return 1
+        return HubModeVerifyFootage(cmdline.ParamStr(2), cmdline.ParamStr(3))
+    if mode == "verify-snap":
+        if cmdline.ParamCount() != 4:
+            echo("semantic_hub error: usage verify-snap <svblock> <world.csgworld>")
+            return 1
+        return HubModeVerifySnap(cmdline.ParamStr(2), cmdline.ParamStr(3))
+    if mode == "restore":
+        if cmdline.ParamCount() != 6:
+            echo("semantic_hub error: usage restore <svblock> <world.csgworld> <ckpt> <aheadTicks>")
+            return 1
+        var aheadParse = HubParseTick(cmdline.ParamStr(5))
+        if !aheadParse.ok || aheadParse.value > int64(2147483647):
+            echo("semantic_hub error: sv_tick_out_of_range ahead")
+            return 1
+        return HubModeRestore(cmdline.ParamStr(2), cmdline.ParamStr(3),
+            cmdline.ParamStr(4), int32(aheadParse.value))
+    if mode == "query":
+        if cmdline.ParamCount() != 6:
+            echo("semantic_hub error: usage query <svblock> <source.mp4> <t1> <t2>")
+            return 1
+        var q1 = HubParseTick(cmdline.ParamStr(4))
+        var q2 = HubParseTick(cmdline.ParamStr(5))
+        if !q1.ok || !q2.ok:
+            echo("semantic_hub error: sv_tick_out_of_range query_args")
+            return 1
+        return HubModeQuery(cmdline.ParamStr(2), cmdline.ParamStr(3),
+            q1.value, q2.value)
+    if mode == "seek":
+        if cmdline.ParamCount() != 5:
+            echo("semantic_hub error: usage seek <svblock> <source.mp4> <tick>")
+            return 1
+        var t = HubParseTick(cmdline.ParamStr(4))
+        if !t.ok:
+            echo("semantic_hub error: sv_tick_out_of_range seek_args")
+            return 1
+        return HubModeSeek(cmdline.ParamStr(2), cmdline.ParamStr(3), t.value)
+    if mode == "chain":
+        if cmdline.ParamCount() != 9:
+            echo("semantic_hub error: usage chain <svblock> <source.mp4> <world.csgworld> <ckpt> <ahead> <t1> <t2>")
+            return 1
+        var aheadParse = HubParseTick(cmdline.ParamStr(6))
+        var q1 = HubParseTick(cmdline.ParamStr(7))
+        var q2 = HubParseTick(cmdline.ParamStr(8))
+        if !aheadParse.ok || aheadParse.value > int64(2147483647):
+            echo("semantic_hub error: sv_tick_out_of_range ahead")
+            return 1
+        if !q1.ok || !q2.ok:
+            echo("semantic_hub error: sv_tick_out_of_range query_args")
+            return 1
+        return HubModeChain(cmdline.ParamStr(2), cmdline.ParamStr(3),
+            cmdline.ParamStr(4), cmdline.ParamStr(5),
+            int32(aheadParse.value), q1.value, q2.value)
+    echo(strings.ConcatStr("semantic_hub error: unknown_mode ", mode))
+    return 1

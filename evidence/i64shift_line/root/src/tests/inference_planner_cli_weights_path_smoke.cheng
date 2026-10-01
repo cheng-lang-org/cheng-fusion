@@ -1,0 +1,351 @@
+import std/result
+import std/os
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/hf_model_graph as hfgraph
+import cheng/inference/weight_store as ws
+import cheng/inference/weight_binding as wb
+import cheng/inference/model_executor as mexec
+import cheng/inference/distributed_engine as engine
+
+# 小优 S4 冒烟: planner CLI 真权重路径入口 (夹具小 safetensors)。
+#
+# 覆盖:
+#   1. 缺 config/weights 路径 → hard-fail (不静默合成权重)
+#   2. 路径指向不存在文件 → hard-fail
+#   3. 写真实 config.json + 匹配图库存的 safetensors 到磁盘
+#   4. WeightSafetensorsLoadGraphFilePath 真解码
+#   5. dense HF 形状图 gate + DistributedGenerateGreedyDenseTransformerTokens
+#   6. mutation 哨兵: 首张量首字节 +1 → 生成序列必须变化 (证明不是摆设)
+#
+# 夹具维度与片8/片9 同款极小 qwen2 config (vocab=6/hidden=8/2层), 仓库无
+# 真 Qwen 权重时的合法生产级替代; 换真文件时只换 path, 加载入口不变。
+
+fn smokeConfigJson(): str =
+    return strutil.Join([
+        "{",
+        "\"architectures\":[\"Qwen2ForCausalLM\"],",
+        "\"model_type\":\"qwen2\",",
+        "\"vocab_size\":6,",
+        "\"hidden_size\":8,",
+        "\"num_hidden_layers\":2,",
+        "\"num_attention_heads\":4,",
+        "\"num_key_value_heads\":2,",
+        "\"intermediate_size\":6,",
+        "\"tie_word_embeddings\":false,",
+        "\"rope_theta\":10000.0",
+        "}"
+    ], "")
+
+fn writeU64LE(buf: var rawbytes.Bytes, offset: int32, value: int64) =
+    rawbytes.BytesSet(buf, offset, int32(value & int64(255)))
+    rawbytes.BytesSet(buf, offset + 1, int32((value >> 8) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 2, int32((value >> 16) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 3, int32((value >> 24) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 4, int32((value >> 32) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 5, int32((value >> 40) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 6, int32((value >> 48) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 7, int32((value >> 56) & int64(255)))
+
+fn writeF16LE(buf: var rawbytes.Bytes, offset: int32, raw: int32) =
+    rawbytes.BytesSet(buf, offset, raw & 255)
+    rawbytes.BytesSet(buf, offset + 1, (raw >> 8) & 255)
+
+# Same F16 cycle + element0 sentinel as weight_safetensors_dense_hf_shape_bridge_smoke.
+fn smokeF16RawAt(elementIndex: int32): int32 =
+    if elementIndex == 0:
+        return 0x44ff
+    let slot = elementIndex % 6
+    if slot == 0:
+        return 0x3c00
+    if slot == 1:
+        return 0xbc00
+    if slot == 2:
+        return 0x3800
+    if slot == 3:
+        return 0x0000
+    if slot == 4:
+        return 0x4000
+    return 0xc000
+
+@borrows
+fn smokeShapeJson(shape: int32[]): str =
+    var parts: str[]
+    for i in 0..<shape.len:
+        add(parts, strings.IntToStr(shape[i]))
+    return strutil.Join(["[", strutil.Join(parts, ","), "]"], "")
+
+@borrows
+fn smokeTotalDataBytes(graph: mg.ModelGraph): int64 =
+    var total: int64
+    for i in 0..<graph.weights.len:
+        total = total + graph.weights[i].sizeBytes
+    return total
+
+@borrows
+fn smokeHeader(graph: mg.ModelGraph): str =
+    var parts: str[]
+    var cursor: int64
+    for i in 0..<graph.weights.len:
+        let start = cursor
+        let end = cursor + graph.weights[i].sizeBytes
+        add(parts, strutil.Join([
+            "\"",
+            strings.ConcatStr(graph.weights[i].tensorName, ""),
+            "\":{\"dtype\":\"F16\",\"shape\":",
+            smokeShapeJson(graph.weights[i].shape),
+            ",\"data_offsets\":[",
+            strings.Int64ToStr(start),
+            ",",
+            strings.Int64ToStr(end),
+            "]}"
+        ], ""))
+        cursor = cursor + graph.weights[i].sizeBytes
+    return strutil.Join(["{", strutil.Join(parts, ","), "}"], "")
+
+@borrows
+fn smokeSerializeGraph(graph: mg.ModelGraph): rawbytes.Bytes =
+    let header = smokeHeader(graph)
+    let headerBytes = rawbytes.BytesFromString(header)
+    let totalData = int32(smokeTotalDataBytes(graph))
+    let outLen = 8 + rawbytes.BytesLen(headerBytes) + totalData
+    var out = rawbytes.BytesAlloc(outLen)
+    writeU64LE(out, 0, int64(rawbytes.BytesLen(headerBytes)))
+    rawbytes.BytesCopyInto(out, 8, headerBytes)
+    let dataBase = 8 + rawbytes.BytesLen(headerBytes)
+    var cursor: int32
+    var elementOrdinal: int32
+    for i in 0..<graph.weights.len:
+        let tensorBytes = int32(graph.weights[i].sizeBytes)
+        var j: int32
+        while j < tensorBytes:
+            writeF16LE(out, dataBase + cursor + j, smokeF16RawAt(elementOrdinal))
+            j = j + 2
+            elementOrdinal = elementOrdinal + 1
+        cursor = cursor + tensorBytes
+    return out
+
+@borrows
+fn smokePeerIds(count: int32): str[] =
+    var peers: str[]
+    for i in 0..<count:
+        add(peers, strutil.Join(["peer:xiaoyou-planner-smoke:", strings.IntToStr(i)], ""))
+    return peers
+
+@borrows
+fn smokeTokensToString(tokens: int32[]): str =
+    var parts: str[]
+    for i in 0..<tokens.len:
+        add(parts, strings.IntToStr(tokens[i]))
+    return strutil.Join(parts, ",")
+
+@borrows
+fn smokeTokensEqual(a: int32[], b: int32[]): bool =
+    if a.len != b.len:
+        return false
+    for i in 0..<a.len:
+        if a[i] != b[i]:
+            return false
+    return true
+
+# Mirrors inference_planner_cli_main.cliLoadFromPaths: missing path / missing
+# file hard-fail; present path goes through WeightSafetensorsLoadGraphFilePath.
+@borrows
+fn smokeLoadFromPaths(configPath: str,
+                      weightsPath: str,
+                      modelCid: str,
+                      tensorScale: int32): Result[bool] =
+    if configPath == "":
+        return Err[bool]("inference planner cli: missing --config / CHENG_PLANNER_CONFIG")
+    if weightsPath == "":
+        return Err[bool]("inference planner cli: missing --weights / CHENG_PLANNER_WEIGHTS")
+    if !os.FileExists(configPath):
+        return Err[bool](strutil.Join([
+            "inference planner cli: config path not found: ", strings.ConcatStr(configPath, "")
+        ], ""))
+    if !os.FileExists(weightsPath):
+        return Err[bool](strutil.Join([
+            "inference planner cli: weights path not found: ", strings.ConcatStr(weightsPath, "")
+        ], ""))
+
+    let configRes = os.ReadFileResult(configPath)
+    if IsErr(configRes):
+        return Err[bool](Error(configRes))
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        Value(configRes),
+        strings.ConcatStr(modelCid, ""),
+        kir.KernelDtypeFp16,
+        mg.ModelQuantSchemeNone
+    )
+    if IsErr(graphRes):
+        return Err[bool](Error(graphRes))
+    let graph = Value(graphRes)
+    let graphOk = mg.ModelGraphValidate(graph)
+    if IsErr(graphOk):
+        return Err[bool](Error(graphOk))
+
+    let peerIds = smokePeerIds(graph.weights.len)
+    let loaded = ws.WeightSafetensorsLoadGraphFilePath(strings.ConcatStr(weightsPath, ""), graph, peerIds, tensorScale)
+    if IsErr(loaded):
+        return Err[bool](Error(loaded))
+    let loadResult = Value(loaded)
+
+    var hashes: int64[]
+    for i in 0..<loadResult.store.payloads.len:
+        add(hashes, loadResult.store.payloads[i].payloadHash)
+    let boundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(graph, hashes)
+    if IsErr(boundGraphRes):
+        return Err[bool](Error(boundGraphRes))
+    let boundGraph = Value(boundGraphRes)
+    let gateRes = mexec.ModelExecutorValidateDenseTransformerGraph(
+        boundGraph, loadResult.bindings, loadResult.store)
+    if IsErr(gateRes) || !Value(gateRes):
+        return Err[bool]("inference planner cli weights path smoke: graph gate")
+    return Ok[bool](true)
+
+@borrows
+fn smokeRunGenerate(configPath: str,
+                    weightsPath: str,
+                    modelCid: str,
+                    promptTokenIds: infer.TensorQ,
+                    maxNewTokens: int32): Result[int32[]] =
+    let configRes = os.ReadFileResult(configPath)
+    if IsErr(configRes):
+        return Err[int32[]](Error(configRes))
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        Value(configRes),
+        strings.ConcatStr(modelCid, ""),
+        kir.KernelDtypeFp16,
+        mg.ModelQuantSchemeNone
+    )
+    if IsErr(graphRes):
+        return Err[int32[]](Error(graphRes))
+    let graph = Value(graphRes)
+    let peerIds = smokePeerIds(graph.weights.len)
+    let loaded = ws.WeightSafetensorsLoadGraphFilePath(strings.ConcatStr(weightsPath, ""), graph, peerIds, 1000)
+    if IsErr(loaded):
+        return Err[int32[]](Error(loaded))
+    let loadResult = Value(loaded)
+    var hashes: int64[]
+    for i in 0..<loadResult.store.payloads.len:
+        add(hashes, loadResult.store.payloads[i].payloadHash)
+    let boundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(graph, hashes)
+    if IsErr(boundGraphRes):
+        return Err[int32[]](Error(boundGraphRes))
+    let boundGraph = Value(boundGraphRes)
+    let generatedRes = engine.DistributedGenerateGreedyDenseTransformerTokens(
+        boundGraph, loadResult.bindings, loadResult.store, promptTokenIds, maxNewTokens, -1)
+    if IsErr(generatedRes):
+        return Err[int32[]](Error(generatedRes))
+    # 字段投影不得直接装入 owned Ok(投影视为借用视图): 逐元素克隆出新数组
+    let generated = Value(generatedRes)
+    var tokens: int32[]
+    tokens = []
+    for i in 0..<generated.data.len:
+        add(tokens, generated.data[i])
+    return Ok[int32[]](tokens)
+
+fn main(): int32 =
+    # --- hard-fail contract: empty / missing paths never invent weights ---
+    let missEmpty = smokeLoadFromPaths("", "", "cid:x", 1000)
+    assert(IsErr(missEmpty), " planner weights path smoke: empty paths must hard-fail")
+    echo(strutil.Join(["hard_fail_empty_paths: ", Error(missEmpty)], ""))
+
+    let missConfig = smokeLoadFromPaths(
+        "/tmp/cheng_planner_cli_weights_path_smoke_MISSING_config.json",
+        "/tmp/cheng_planner_cli_weights_path_smoke_MISSING.safetensors",
+        "cid:x",
+        1000
+    )
+    assert(IsErr(missConfig), " planner weights path smoke: missing files must hard-fail")
+    echo(strutil.Join(["hard_fail_missing_files: ", Error(missConfig)], ""))
+
+    # --- write real fixture files matching dense HF shape inventory ---
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        smokeConfigJson(),
+        "cid:model:xiaoyou-planner-cli-weights-path-smoke",
+        kir.KernelDtypeFp16,
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsOk(graphRes), " planner weights path smoke: build graph")
+    let graph = Value(graphRes)
+    assert(IsOk(mg.ModelGraphValidate(graph)), " planner weights path smoke: graph valid")
+    assert(graph.weights.len == 21 && graph.ops.len == 19,
+           " planner weights path smoke: inventory matches dense hf fixture")
+
+    let configPath = "/tmp/cheng_planner_cli_weights_path_smoke_config.json"
+    let weightsPath = "/tmp/cheng_planner_cli_weights_path_smoke.safetensors"
+    let mutatedPath = "/tmp/cheng_planner_cli_weights_path_smoke_mutated.safetensors"
+    if os.FileExists(configPath):
+        assert(os.RemoveFile(configPath), " planner weights path smoke: remove old config")
+    if os.FileExists(weightsPath):
+        assert(os.RemoveFile(weightsPath), " planner weights path smoke: remove old weights")
+    if os.FileExists(mutatedPath):
+        assert(os.RemoveFile(mutatedPath), " planner weights path smoke: remove old mutated")
+
+    let configWrite = os.WriteFileResult(configPath, smokeConfigJson())
+    assert(IsOk(configWrite), " planner weights path smoke: write config")
+
+    # 序列化两份独立 bytes(纯函数): weights 落盘一份, 篡改实验一份——
+    # 同一 managed bytes 经 var 拷贝别名分叉后再借用会失去 exact live source
+    let weightsWrite = os.WriteFileBytesResult(weightsPath, smokeSerializeGraph(graph))
+    assert(IsOk(weightsWrite), " planner weights path smoke: write weights")
+    assert(os.FileExists(configPath) && os.FileExists(weightsPath),
+           " planner weights path smoke: fixture files exist")
+
+    let loadOk = smokeLoadFromPaths(
+        configPath,
+        weightsPath,
+        "cid:model:xiaoyou-planner-cli-weights-path-smoke",
+        1000
+    )
+    assert(IsOk(loadOk) && Value(loadOk),
+           " planner weights path smoke: load from real paths")
+    echo("load_from_paths_ok: true")
+
+    # Prompt last token = 0 so embed row0 (mutation sentinel) drives first step.
+    var promptTokenIds: infer.TensorQ
+    let promptOk = infer.TensorFromDataFill(promptTokenIds, [3], 1, [2, 1, 0])
+    assert(IsOk(promptOk), " planner weights path smoke: prompt tensor")
+
+    let tokens1Res = smokeRunGenerate(
+        configPath,
+        weightsPath,
+        "cid:model:xiaoyou-planner-cli-weights-path-smoke",
+        promptTokenIds,
+        3
+    )
+    assert(IsOk(tokens1Res), " planner weights path smoke: generate original")
+    let tokens1 = Value(tokens1Res)
+    echo(strutil.Join(["generated tokens (original): ", smokeTokensToString(tokens1)], ""))
+
+    let originalBytes = smokeSerializeGraph(graph)
+    var mutatedBytes = rawbytes.BytesSlice(originalBytes, 0, rawbytes.BytesLen(originalBytes))
+    let headerLenRes = ws.WeightSafetensorsHeaderLength(mutatedBytes)
+    assert(IsOk(headerLenRes), " planner weights path smoke: mutation header length")
+    let dataBase = 8 + Value(headerLenRes)
+    let oldByte = rawbytes.BytesGet(mutatedBytes, dataBase)
+    rawbytes.BytesSet(mutatedBytes, dataBase, (oldByte + 1) % 256)
+    var mutatedWrite = mutatedBytes
+    let mutatedWriteOk = os.WriteFileBytesResult(mutatedPath, mutatedWrite)
+    assert(IsOk(mutatedWriteOk), " planner weights path smoke: write mutated weights")
+
+    let tokens2Res = smokeRunGenerate(
+        configPath,
+        mutatedPath,
+        "cid:model:xiaoyou-planner-cli-weights-path-smoke",
+        promptTokenIds,
+        3
+    )
+    assert(IsOk(tokens2Res), " planner weights path smoke: generate mutated")
+    let tokens2 = Value(tokens2Res)
+    echo(strutil.Join(["generated tokens (mutated):  ", smokeTokensToString(tokens2)], ""))
+    assert(!smokeTokensEqual(tokens1, tokens2),
+           " planner weights path smoke: mutation sentinel must change generated tokens")
+
+    echo("inference_planner_cli_weights_path_smoke ok")
+    return 0

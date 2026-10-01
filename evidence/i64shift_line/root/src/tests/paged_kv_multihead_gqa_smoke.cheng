@@ -1,0 +1,117 @@
+import std/result
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/device as device
+import cheng/inference/paged_kv_cache as pkv
+
+fn makeTensor(shape: int32[], scale: int32, data: int32[]): infer.TensorQ =
+    var out: infer.TensorQ
+    let res = infer.TensorFromDataFill(out, shape, scale, data)
+    assert(IsOk(res), " paged kv multihead gqa smoke: tensor")
+    return out
+
+fn main(): int32 =
+    # 2 kv heads (headDim=2 each, keyDim=valueDim=4), 4 query heads
+    # (repeat=2), 3 tokens over 2 pages (tokensPerPage=2) -- deliberately
+    # different K/V data per kv head so a wrong kvBase (e.g. always
+    # reading kv head0) would show up as a mismatch even when the two
+    # query-head groups are given the identical query vector.
+    let cacheRes = pkv.PagedKVInit(2, 4, 4, 1000, 1000)
+    assert(IsOk(cacheRes), " paged kv multihead gqa smoke: init")
+    var cache = Value(cacheRes)
+    var seq = pkv.PagedKVSequenceInit(9)
+
+    # kv head0 dims[0:2] mirrors paged_kv_cache_smoke's proven [18,25]
+    # fixture; kv head1 dims[2:4] is an independent, differently-scaled
+    # series.
+    let append0 = pkv.PagedKVAppendToken(cache, seq,
+        makeTensor([4], 1000, [1000, 0, 300, 0]),
+        makeTensor([4], 1000, [10, 0, 7, 0]))
+    assert(IsOk(append0), " paged kv multihead gqa smoke: append0")
+    let append1 = pkv.PagedKVAppendToken(cache, seq,
+        makeTensor([4], 1000, [0, 1000, 0, 300]),
+        makeTensor([4], 1000, [0, 20, 0, 11]))
+    assert(IsOk(append1), " paged kv multihead gqa smoke: append1")
+    let append2 = pkv.PagedKVAppendToken(cache, seq,
+        makeTensor([4], 1000, [1000, 1000, 300, 300]),
+        makeTensor([4], 1000, [30, 40, 13, 17]))
+    assert(IsOk(append2), " paged kv multihead gqa smoke: append2")
+    assert(seq.tokenCount == 3 && cache.pages.len == 2, " paged kv multihead gqa smoke: shape")
+
+    let headDim = 2
+    let attentionHeads = 4
+    # qh0,qh1 -> kvHead0 ; qh2,qh3 -> kvHead1. qh0/qh2 share one query
+    # vector, qh1/qh3 share another -- same query, different kv head data.
+    let fullQuery = makeTensor([8], 1000, [1000, 1000, 2000, 0, 1000, 1000, 2000, 0])
+
+    var cpuOut: infer.TensorQ
+    let cpuRes = pkv.PagedKVAttentionQueryFill(cpuOut, cache, seq, fullQuery, headDim, attentionHeads)
+    assert(IsOk(cpuRes), " paged kv multihead gqa smoke: cpu oracle")
+    assert(cpuOut.data.len == 8, " paged kv multihead gqa smoke: cpu oracle shape")
+
+    let metalRes = device.DeviceProbeMetal()
+    assert(IsOk(metalRes), " paged kv multihead gqa smoke: metal probe")
+    let metal = Value(metalRes)
+
+    let repeat = 2
+    var qh = 0
+    while qh < attentionHeads:
+        let kvHead = qh / repeat
+        let queryBase = qh * headDim
+        let kvBase = kvHead * headDim
+        var queryVector: infer.TensorQ
+        var qData: int32[]
+        add(qData, fullQuery.data[queryBase])
+        add(qData, fullQuery.data[queryBase + 1])
+        let qFill = infer.TensorFromDataFill(queryVector, [headDim], fullQuery.scale, qData)
+        assert(IsOk(qFill), " paged kv multihead gqa smoke: query slice")
+
+        var headKeyPageTensors: infer.TensorQ[]
+        var headValuePageTensors: infer.TensorQ[]
+        var pageOrdinal = 0
+        while pageOrdinal < cache.pages.len:
+            let headKeyRes = pkv.PagedKVBuildPageKeyHeadTensor(cache.pages[pageOrdinal], cache.tokensPerPage, cache.keyDim, headDim, kvBase, cache.keyScale)
+            assert(IsOk(headKeyRes), " paged kv multihead gqa smoke: head key tensor")
+            let headValueRes = pkv.PagedKVBuildPageValueHeadTensor(cache.pages[pageOrdinal], cache.tokensPerPage, cache.valueDim, headDim, kvBase, cache.valueScale)
+            assert(IsOk(headValueRes), " paged kv multihead gqa smoke: head value tensor")
+            add(headKeyPageTensors, Value(headKeyRes))
+            add(headValuePageTensors, Value(headValueRes))
+            pageOrdinal = pageOrdinal + 1
+
+        var inputs: pkv.PagedKVAttentionInputTensors
+        let inputsOk = pkv.PagedKVBuildAttentionInputTensorsFill(inputs, cache, seq)
+        assert(IsOk(inputsOk), " paged kv multihead gqa smoke: attention input tensors")
+
+        let pagedProgram = kir.KernelIrPagedAttentionProgram(
+            seq.tokenCount, headDim, headDim, cache.tokensPerPage, cache.pages.len,
+            seq.blockPageIds.len, kir.KernelDtypeFp16, queryVector.scale
+        )
+        assert(IsOk(kir.KernelIrValidateProgram(pagedProgram)), " paged kv multihead gqa smoke: kernel ir")
+
+        let attentionResult = pkv.PagedKVDeviceMetalPagedAttentionTensorPageBuffersToBufferFill(
+            cache, seq, metal, pagedProgram, queryVector,
+            headKeyPageTensors, headValuePageTensors, inputs.pageTable, kvBase
+        )
+        assert(IsOk(attentionResult), " paged kv multihead gqa smoke: metal per-head attention")
+        let metalHeadOut = Value(attentionResult).output
+        assert(metalHeadOut.data.len == headDim, " paged kv multihead gqa smoke: metal head out shape")
+
+        var d = 0
+        while d < headDim:
+            if metalHeadOut.data[d] != cpuOut.data[queryBase + d]:
+                echo("MISMATCH qh=")
+                echo(qh)
+                echo(" d=")
+                echo(d)
+                echo(" metal=")
+                echo(metalHeadOut.data[d])
+                echo(" cpu=")
+                echo(cpuOut.data[queryBase + d])
+                assert(false, " paged kv multihead gqa smoke: cpu/metal per-head bit-exact")
+            d = d + 1
+        let releaseOk = device.DeviceMetalReleaseBuffer(Value(attentionResult).buffer)
+        assert(IsOk(releaseOk), " paged kv multihead gqa smoke: release")
+        qh = qh + 1
+
+    echo("paged_kv_multihead_gqa_smoke ok")
+    return 0

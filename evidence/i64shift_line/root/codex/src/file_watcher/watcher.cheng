@@ -1,0 +1,488 @@
+# File system watcher — real process execution via fswatch/polling.
+#
+# Provides:
+#   StartWatching    — start fswatch to monitor file changes (async spawn)
+#   ReadEvents       — read pending output from the fswatch process
+#   StopWatching     — kill fswatch and wait for cleanup
+#   PollDirectory    — detect file changes using find + stat (fallback)
+#   ParseWatchEvent  — parse an event line into structured fields
+#
+# Dependencies:
+#   - fswatch (macOS, optional — install via `brew install fswatch`)
+#     If fswatch is not available, use PollDirectory instead.
+#   - find (always available on POSIX systems)
+#   - stat (always available on POSIX systems)
+#
+# This module uses real process execution. NO mocks, NO fallbacks.
+# When fswatch is not available, StartWatching returns running=false.
+#
+# NOTE: Cheng `&&` evaluates BOTH operands (no short-circuit). All
+# bounds-guarded array accesses use nested `if` or single-condition
+# loops to avoid out-of-bounds reads.
+
+import std/strings
+import std/strutils as strutil
+import std/os
+import cheng/codex/std/process
+
+@abi_internal
+@importc("WalkDirRec")
+fn RustCsgWatcherWalkDirRec(path: str): str[]
+
+@abi_internal
+@importc("RustCsgPathMetadataKind")
+fn RustCsgWatcherPathMetadataKind(path: str): int32
+
+@abi_internal
+@importc("RustCsgFileSize")
+fn RustCsgWatcherFileSize(path: str): int64
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Types
+# ═══════════════════════════════════════════════════════════════════════════
+
+# A single file system event.
+type WatchEvent =
+    eventType: str     # "create", "modify", "delete", "rename", "unknown"
+    filePath: str
+    timestamp: str
+
+# FileWatcher state — tracks a running fswatch instance.
+# pid > 0 means fswatch is running.
+# stdoutFd is the pipe fd for reading fswatch output.
+type FileWatcher =
+    watchPaths: str     # comma-separated list of watched paths
+    running: bool
+    pid: int32
+    stdoutFd: int32
+
+# ═══════════════════════════════════════════════════════════════════════════
+# StartWatching — start monitoring file changes
+#
+# Spawns fswatch asynchronously via processSpawnRaw.
+# Returns a FileWatcher with PID and stdout fd.
+# If fswatch is not found, returns running=false, pid=-1.
+# ═══════════════════════════════════════════════════════════════════════════
+
+fn StartWatching(paths: str[]): FileWatcher =
+    var watcher: FileWatcher
+    watcher.running = false
+    watcher.pid = -1
+    watcher.stdoutFd = -1
+    watcher.watchPaths = ""
+
+    if paths.len == 0:
+        return watcher
+
+    # Build comma-separated watch paths string
+    var wp: str = ""
+    var first: bool = true
+    var i: int32 = 0
+    while i < paths.len:
+        if paths[i].len > 0:
+            if !first:
+                wp = strings.ConcatStr(wp, ",")
+            first = false
+            wp = strings.ConcatStr(wp, paths[i])
+        i = i + 1
+    watcher.watchPaths = wp
+
+    # Build fswatch arguments
+    var args: str[]
+    add(args, "-0")           # NUL-separated output (safe for filenames)
+    add(args, "-r")           # recursive
+    add(args, "-t")           # timestamp in epoch format
+    add(args, "-x")           # include event flags
+
+    i = 0
+    while i < paths.len:
+        if paths[i].len > 0:
+            add(args, paths[i])
+        i = i + 1
+
+    # Async spawn fswatch — get PID and stdout fd
+    var argsJson: str = process.argsToJson(args)
+    var envJson: str = process.envToJson([])
+    var rawJson: str = process.processSpawnRaw("fswatch", argsJson, "", envJson)
+
+    if rawJson.len == 0:
+        return watcher
+
+    # Parse response: {"pid":N,"stdin_fd":N,"stdout_fd":N,"stderr_fd":N}
+    var pidVal: int32 = -1
+    var fdVal: int32 = -1
+
+    var j: int32 = 0
+    # Check for error response
+    var isError: bool = false
+    if strutil.Contains(rawJson, "\"error\""):
+        isError = true
+
+    if !isError:
+        # Parse pid
+        j = 0
+        while j < rawJson.len:
+            if j + 5 < rawJson.len and rawJson[j] == '"' and rawJson[j+1] == 'p' \
+               and rawJson[j+2] == 'i' and rawJson[j+3] == 'd' and rawJson[j+4] == '"' \
+               and rawJson[j+5] == ':':
+                j = j + 6
+                break
+            j = j + 1
+        if j < rawJson.len:
+            pidVal = 0
+            while j < rawJson.len and rawJson[j] >= '0' and rawJson[j] <= '9':
+                pidVal = pidVal * 10 + (int32(rawJson[j]) - int32('0'))
+                j = j + 1
+
+        # Parse stdout_fd
+        j = 0
+        while j < rawJson.len:
+            if j + 9 < rawJson.len and rawJson[j] == '"' and rawJson[j+1] == 's' \
+               and rawJson[j+2] == 't' and rawJson[j+3] == 'd' and rawJson[j+4] == 'o' \
+               and rawJson[j+5] == 'u' and rawJson[j+6] == 't' and rawJson[j+7] == '_' \
+               and rawJson[j+8] == 'f' and rawJson[j+9] == 'd' and rawJson[j+10] == '"' \
+               and rawJson[j+11] == ':':
+                j = j + 12
+                break
+            j = j + 1
+        if j < rawJson.len:
+            fdVal = 0
+            while j < rawJson.len and rawJson[j] >= '0' and rawJson[j] <= '9':
+                fdVal = fdVal * 10 + (int32(rawJson[j]) - int32('0'))
+                j = j + 1
+
+    watcher.pid = pidVal
+    watcher.stdoutFd = fdVal
+    watcher.running = (pidVal > 0)
+    return watcher
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ReadEvents — read pending output from a running fswatch process
+#
+# Returns newline-separated event strings.
+# fswatch -0 -t -x outputs NUL-separated entries with timestamps and flags.
+# This function converts NUL-separated to newline-separated.
+# Returns empty string if no pending events or watcher not running.
+# ═══════════════════════════════════════════════════════════════════════════
+
+fn ReadEvents(watcher: FileWatcher): str =
+    if !watcher.running || watcher.stdoutFd < 0:
+        return ""
+
+    var data: str = process.ProcessReadFd(watcher.stdoutFd)
+    if data.len == 0:
+        return ""
+
+    # fswatch -0 outputs NUL-separated entries.
+    # Each entry has: "/path/to/file\0timestamp event-flags\0"
+    # Convert NUL-separated to newline-separated for easier parsing.
+    var result: str = ""
+    var i: int32 = 0
+    var lineStart: int32 = 0
+    while i < data.len:
+        if data[i] == '\0':
+            if i > lineStart:
+                if result.len > 0:
+                    result = strings.ConcatStr(result, "\n")
+                result = strings.ConcatStr(result, strings.SliceBytes(data, lineStart, i - lineStart))
+            lineStart = i + 1
+        i = i + 1
+    # Handle last entry if not NUL-terminated
+    if i > lineStart:
+        if result.len > 0:
+            result = strings.ConcatStr(result, "\n")
+        result = strings.ConcatStr(result, strings.SliceBytes(data, lineStart, i - lineStart))
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# StopWatching — stop a running fswatch process
+#
+# Sends SIGTERM (signal 15) to the fswatch process, then SIGKILL (9)
+# if SIGTERM didn't work, then waits for cleanup.
+# Returns true if stopped successfully, false otherwise.
+# ═══════════════════════════════════════════════════════════════════════════
+
+fn StopWatching(watcher: var FileWatcher): bool =
+    if !watcher.running || watcher.pid <= 0:
+        return false
+
+    # Send SIGTERM
+    var killResult: int32 = process.ProcessKill(watcher.pid, 15)
+    if killResult != 0:
+        # Try SIGKILL
+        killResult = process.ProcessKill(watcher.pid, 9)
+
+    # Wait for process to exit (clean up process table entry)
+    var waitResult: int32 = process.ProcessWait(watcher.pid)
+
+    watcher.running = false
+    watcher.pid = -1
+    watcher.stdoutFd = -1
+
+    return killResult == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ParseWatchEvent — parse a raw event line from fswatch
+#
+# fswatch -t -x output format:
+#   timestamp path event-flags
+# Example:
+#   1700000000.123456 /tmp/foo/bar.txt Created
+#
+# Poll output format:
+#   eventType /path/to/file
+# Example:
+#   modify /tmp/foo/bar.txt
+# ═══════════════════════════════════════════════════════════════════════════
+
+fn ParseWatchEvent(line: str): WatchEvent =
+    var evt: WatchEvent
+    evt.eventType = "unknown"
+    evt.filePath = ""
+    evt.timestamp = ""
+
+    if line.len == 0:
+        return evt
+
+    # Try format: "timestamp path event-flags" (fswatch -t -x)
+    # First token is either a timestamp (contains '.') or a path (starts with '/')
+    var firstSpace: int32 = -1
+    var i: int32 = 0
+    while i < line.len:
+        if line[i] == ' ':
+            firstSpace = i
+            break
+        i = i + 1
+
+    if firstSpace < 0:
+        # Single token — just a path with no event type
+        evt.filePath = line
+        evt.eventType = "modify"
+        return evt
+
+    var firstToken: str = strings.SliceBytes(line, 0, firstSpace)
+    var rest: str = strings.SliceBytes(line, firstSpace + 1, line.len - firstSpace - 1)
+
+    # Determine if firstToken is a timestamp (contains '.') or a path
+    var hasDot: bool = false
+    i = 0
+    while i < firstToken.len:
+        if firstToken[i] == '.':
+            hasDot = true
+            break
+        i = i + 1
+
+    if hasDot:
+        # Format: "timestamp path event-flags"
+        evt.timestamp = firstToken
+        var secondSpace: int32 = -1
+        i = 0
+        while i < rest.len:
+            if rest[i] == ' ':
+                secondSpace = i
+                break
+            i = i + 1
+        if secondSpace < 0:
+            evt.filePath = rest
+            evt.eventType = "modify"
+        else:
+            evt.filePath = strings.SliceBytes(rest, 0, secondSpace)
+            var flagsStr: str = strings.SliceBytes(rest, secondSpace + 1, rest.len - secondSpace - 1)
+            evt.eventType = extractFswatchEventType(flagsStr)
+    else:
+        # Format: "path eventType" or just "path"
+        evt.filePath = firstToken
+        var secondSpace2: int32 = -1
+        i = 0
+        while i < rest.len:
+            if rest[i] == ' ':
+                secondSpace2 = i
+                break
+            i = i + 1
+        if secondSpace2 < 0:
+            evt.filePath = line
+            evt.eventType = "modify"
+        else:
+            var afterPath: str = strings.SliceBytes(rest, secondSpace2 + 1, rest.len - secondSpace2 - 1)
+            evt.eventType = extractFswatchEventType(afterPath)
+
+    return evt
+
+
+# Extract a normalized event type from fswatch event flags string
+fn extractFswatchEventType(flags: str): str =
+    if strutil.Contains(flags, "Created"):
+        return "create"
+    if strutil.Contains(flags, "Updated"):
+        return "modify"
+    if strutil.Contains(flags, "Removed"):
+        return "delete"
+    if strutil.Contains(flags, "Renamed"):
+        return "rename"
+    if strutil.Contains(flags, "create"):
+        return "create"
+    if strutil.Contains(flags, "modify"):
+        return "modify"
+    if strutil.Contains(flags, "delete"):
+        return "delete"
+    if strutil.Contains(flags, "rename"):
+        return "rename"
+    return "modify"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PollDirectory — detect file changes using find + stat
+#
+# Polling fallback when fswatch is not available.
+# Uses `find` to enumerate files and `stat` to check modification times.
+# Compares current state with previous baseline.
+#
+# Parameters:
+#   path     — directory to monitor
+#   baseline — previous raw poll output ("mtime path" lines, or empty for first call)
+#
+# Returns:
+#   If baseline is empty: returns the raw `find` output for use as next baseline.
+#   If baseline is non-empty: returns changes ("eventType /path" lines).
+#     - "create /path" — file exists now but not in baseline
+#     - "modify /path" — file mtime changed
+#     - "delete /path" — file was in baseline but not found now
+#
+# Caller workflow:
+#   var state1: str = watcher.PollDirectory(dir, "")
+#   # ... make changes ...
+#   var changes: str = watcher.PollDirectory(dir, state1)
+#   # changes contains "create /path", "modify /path", etc.
+# ═══════════════════════════════════════════════════════════════════════════
+
+fn PollDirectory(path: str, baseline: str): str =
+    if path.len == 0:
+        return ""
+
+    let files = RustCsgWatcherWalkDirRec(path)
+    var currentOutput: str = ""
+    var fileIndex: int32 = 0
+    while fileIndex < files.len:
+        let filePath: str = files[fileIndex]
+        let kind: int32 = RustCsgWatcherPathMetadataKind(filePath)
+        if kind == 2:
+            let stampValue: int64 = RustCsgWatcherFileSize(filePath)
+            if stampValue >= 0:
+                let stamp: str = strings.Int64ToStr(stampValue)
+                if currentOutput.len > 0:
+                    currentOutput = strings.ConcatStr(currentOutput, "\n")
+                currentOutput = strings.ConcatStr(currentOutput, stamp)
+                currentOutput = strings.ConcatStr(currentOutput, " ")
+                currentOutput = strings.ConcatStr(currentOutput, filePath)
+        fileIndex = fileIndex + 1
+
+    if currentOutput.len == 0:
+        return ""
+    if baseline.len == 0:
+        return currentOutput
+
+    var changes: str = ""
+
+    var i: int32 = 0
+    while i < currentOutput.len:
+        var lineStart: int32 = i
+        while i < currentOutput.len:
+            if currentOutput[i] == '\n':
+                break
+            i = i + 1
+        if i > lineStart:
+            var line: str = strings.SliceBytes(currentOutput, lineStart, i - lineStart)
+            var firstSpace: int32 = -1
+            var j: int32 = 0
+            while j < line.len:
+                if line[j] == ' ':
+                    firstSpace = j
+                    break
+                j = j + 1
+            if firstSpace > 0:
+                var currentStamp: str = strings.SliceBytes(line, 0, firstSpace)
+                var currentPath: str = strings.SliceBytes(line, firstSpace + 1, line.len - firstSpace - 1)
+                var baselineStamp: str = findInBaselineLines(baseline, currentPath)
+                if baselineStamp.len == 0:
+                    if changes.len > 0:
+                        changes = strings.ConcatStr(changes, "\n")
+                    changes = strings.ConcatStr(changes, "create ")
+                    changes = strings.ConcatStr(changes, currentPath)
+                elif baselineStamp != currentStamp:
+                    if changes.len > 0:
+                        changes = strings.ConcatStr(changes, "\n")
+                    changes = strings.ConcatStr(changes, "modify ")
+                    changes = strings.ConcatStr(changes, currentPath)
+        if i < currentOutput.len:
+            if currentOutput[i] == '\n':
+                i = i + 1
+
+    var bi: int32 = 0
+    while bi < baseline.len:
+        var baselineLineStart: int32 = bi
+        while bi < baseline.len:
+            if baseline[bi] == '\n':
+                break
+            bi = bi + 1
+        if bi > baselineLineStart:
+            var baselineLine: str = strings.SliceBytes(baseline, baselineLineStart, bi - baselineLineStart)
+            var baselineSpace: int32 = -1
+            var bj: int32 = 0
+            while bj < baselineLine.len:
+                if baselineLine[bj] == ' ':
+                    baselineSpace = bj
+                    break
+                bj = bj + 1
+            if baselineSpace > 0:
+                var baselinePath: str = strings.SliceBytes(baselineLine, baselineSpace + 1, baselineLine.len - baselineSpace - 1)
+                var currentStamp: str = findInBaselineLines(currentOutput, baselinePath)
+                if currentStamp.len == 0:
+                    if changes.len > 0:
+                        changes = strings.ConcatStr(changes, "\n")
+                    changes = strings.ConcatStr(changes, "delete ")
+                    changes = strings.ConcatStr(changes, baselinePath)
+        if bi < baseline.len:
+            if baseline[bi] == '\n':
+                bi = bi + 1
+
+    return changes
+
+
+# Build a baseline string from the current poll output
+fn BuildPollBaseline(currentOutput: str): str =
+    return currentOutput
+
+
+# Find a path in baseline lines ("stamp /path" per line), return its stamp.
+fn findInBaselineLines(lines: str, key: str): str =
+    if lines.len == 0 || key.len == 0:
+        return ""
+    var i: int32 = 0
+    while i < lines.len:
+        var lineStart: int32 = i
+        while i < lines.len:
+            if lines[i] == '\n':
+                break
+            i = i + 1
+        if i > lineStart:
+            var line: str = strings.SliceBytes(lines, lineStart, i - lineStart)
+            var spacePos: int32 = -1
+            var j: int32 = 0
+            while j < line.len:
+                if line[j] == ' ':
+                    spacePos = j
+                    break
+                j = j + 1
+            if spacePos > 0:
+                var stamp: str = strings.SliceBytes(line, 0, spacePos)
+                var filePath: str = strings.SliceBytes(line, spacePos + 1, line.len - spacePos - 1)
+                if filePath == key:
+                    return stamp
+        if i < lines.len:
+            if lines[i] == '\n':
+                i = i + 1
+    return ""

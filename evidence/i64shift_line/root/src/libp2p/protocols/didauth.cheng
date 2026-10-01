@@ -1,0 +1,512 @@
+# DID auth connection-level handshake.
+
+import cheng/libp2p/utils/result
+import cheng/libp2p/utils/option
+import cheng/libp2p/utils/bytes
+import cheng/libp2p/utils/strings
+import std/stringlist
+import std/times
+import cheng/libp2p/peerid
+import cheng/libp2p/crypto/crypto
+import std/crypto/rand
+import cheng/libp2p/muxers/muxer
+import cheng/libp2p/stream/lpstream
+import cheng/libp2p/multistream
+import cheng/libp2p/vbuffer
+import cheng/libp2p/did/types
+import cheng/libp2p/did/document
+import cheng/libp2p/did/credential
+import cheng/libp2p/did/biometric as biometricmod
+import cheng/libp2p/did/resolver
+import cheng/libp2p/did/identity_store
+import cheng/libp2p/protocols/didauth/protobuf as didauthprotobuf
+
+const
+    didAuthCodec = "/libp2p/did-auth/1.0.0"
+    didAuthMaxPayload = 65536
+    didAuthNonceCacheMax = 256
+
+
+type
+    DidAuthNonceEntry =
+        seenAtMs: int64
+        value: Bytes
+
+    DidAuthState =
+        config: DidAuthConfig
+        identityStorePath: str
+        hasIdentity: bool
+        identity: DidIdentity
+        nonceCount: int32
+        nonces: DidAuthNonceEntry[didAuthNonceCacheMax]
+
+fn initDidAuthState(): DidAuthState =
+    DidAuthState(config: initDidAuthConfig(), identityStorePath: "", hasIdentity: false, nonceCount: 0)
+
+fn didAuthShouldRun(state: var DidAuthState): bool =
+    return state.config.enabled || state.config.required
+
+fn setDidAuthConfig(state: var DidAuthState, cfg: DidAuthConfig) =
+    state.config = cfg
+
+fn setDidAuthIdentityStorePath(state: var DidAuthState, path: str) =
+    state.identityStorePath = path
+
+fn setDidAuthIdentity(state: var DidAuthState, identity: DidIdentity) =
+    state.identity = identity
+    state.hasIdentity = true
+    didResolverPutDocument(identity.document, identity.signedDocument)
+
+fn didAuthLoadIdentity(state: var DidAuthState): Result[bool] =
+    if len(state.identityStorePath) <= 0:
+        return Err[bool]("didauth: identity store path missing")
+    let idRes: Result[DidIdentity] = didLoadOrCreateIdentity(state.identityStorePath)
+    if IsErr(idRes):
+        return Err[bool](Error(idRes))
+    setDidAuthIdentity(state, Value(idRes))
+    return Ok[bool](true)
+
+fn didAuthEnsureIdentity(state: var DidAuthState): Result[bool] =
+    if state.hasIdentity:
+        return Ok[bool](true)
+    let loadRes: Result[bool] = didAuthLoadIdentity(state)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    return Ok[bool](true)
+
+fn didAuthSaveIdentity(state: DidAuthState): Result[bool] =
+    if ! state.hasIdentity:
+        return Err[bool]("didauth: identity missing")
+    if len(state.identityStorePath) <= 0:
+        return Err[bool]("didauth: identity store path missing")
+    return didSaveIdentity(state.identityStorePath, state.identity)
+
+fn didAuthIdentitySummary(state: var DidAuthState): Result[DidIdentitySummary] =
+    let idRes: Result[bool] = didAuthEnsureIdentity(state)
+    if IsErr(idRes):
+        return Err[DidIdentitySummary](Error(idRes))
+    let identityCopy: DidIdentity = state.identity
+    let summary: DidIdentitySummary = didIdentitySummary(identityCopy)
+    return Ok[DidIdentitySummary](summary)
+
+fn didAuthSignedDocument(state: var DidAuthState): Result[Bytes] =
+    let idRes: Result[bool] = didAuthEnsureIdentity(state)
+    if IsErr(idRes):
+        return Err[Bytes](Error(idRes))
+    return Ok[Bytes](state.identity.signedDocument)
+
+fn didAuthEnrollDevice(
+    state: var DidAuthState,
+    devicePub: PublicKey,
+    biometricClass: str,
+    capabilities: StringList,
+    outProof: var Bytes
+): Result[bool] =
+    let idRes: Result[bool] = didAuthEnsureIdentity(state)
+    if IsErr(idRes):
+        return Err[bool](Error(idRes))
+    let nowNs: int64 = EpochTimeNs()
+    let enrollRes: Result[bool] = didIdentityEnrollDevice(
+        state.identity,
+        devicePub,
+        biometricClass,
+        capabilities,
+        nowNs,
+        outProof
+    )
+    if IsErr(enrollRes):
+        return Err[bool](Error(enrollRes))
+    didResolverPutDocument(state.identity.document, state.identity.signedDocument)
+    if len(state.identityStorePath) > 0:
+        let saveRes: Result[bool] = didSaveIdentity(state.identityStorePath, state.identity)
+        if IsErr(saveRes):
+            return Err[bool](Error(saveRes))
+    return Ok[bool](true)
+
+fn didAuthRevokeDevice(
+    state: var DidAuthState,
+    devicePeerText: str,
+    outRevocation: var Bytes
+): Result[bool] =
+    let idRes: Result[bool] = didAuthEnsureIdentity(state)
+    if IsErr(idRes):
+        return Err[bool](Error(idRes))
+    let nowNs: int64 = EpochTimeNs()
+    let revokeRes: Result[bool] = didIdentityRevokeDevice(state.identity, devicePeerText, nowNs, outRevocation)
+    if IsErr(revokeRes):
+        return Err[bool](Error(revokeRes))
+    didResolverPutDocument(state.identity.document, state.identity.signedDocument)
+    let revocationLen: int32 = outRevocation.len
+    var revocationPayload: Bytes = BytesAlloc(revocationLen)
+    for i in 0..<revocationLen:
+        BytesSet(revocationPayload, i, BytesGet(outRevocation, i))
+    let applyRes: Result[DidRevocationV1] = didResolverApplySignedRevocation(revocationPayload)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    if len(state.identityStorePath) > 0:
+        let saveRes: Result[bool] = didSaveIdentity(state.identityStorePath, state.identity)
+        if IsErr(saveRes):
+            return Err[bool](Error(saveRes))
+    return Ok[bool](true)
+
+fn didAuthNowMs(): int64 =
+    return EpochTimeNs() / 1000000
+
+fn didAuthAbsI64(v: int64): int64 =
+    if v < 0:
+        return -v
+    return v
+
+fn didAuthTimestampValid(state: var DidAuthState, tsMs: int64, nowMs: int64): bool =
+    if tsMs <= 0:
+        return false
+    let diff: int64 = didAuthAbsI64(nowMs - tsMs)
+    let cfg: DidAuthConfig = state.config
+    return diff <= cfg.maxSkewMs
+
+fn didAuthPruneNonces(state: var DidAuthState, nowMs: int64) =
+    let cfg: DidAuthConfig = state.config
+    var window: int64 = 600000
+    if cfg.nonceWindowMs > 0:
+        window = cfg.nonceWindowMs
+    var writeIdx: int32
+    for i in 0..<state.nonceCount:
+        let entry: DidAuthNonceEntry = state.nonces[i]
+        if nowMs - entry.seenAtMs <= window:
+            if writeIdx != i:
+                state.nonces[writeIdx] = entry
+            writeIdx = writeIdx + 1
+    state.nonceCount = writeIdx
+
+fn didAuthNonceSeen(state: var DidAuthState, nonce: Bytes): bool =
+    if BytesLen(nonce) <= 0:
+        return true
+    for i in 0..<state.nonceCount:
+        let entry: DidAuthNonceEntry = state.nonces[i]
+        if BytesEqual(entry.value, nonce):
+            return true
+    return false
+
+fn didAuthRememberNonce(state: var DidAuthState, nonce: Bytes, nowMs: int64) =
+    if BytesLen(nonce) <= 0:
+        return
+    if didAuthNonceSeen(state, nonce):
+        return
+    var entry: DidAuthNonceEntry = DidAuthNonceEntry(seenAtMs: nowMs, value: nonce)
+    if state.nonceCount < didAuthNonceCacheMax:
+        state.nonces[state.nonceCount] = entry
+        state.nonceCount = state.nonceCount + 1
+        return
+    var replaceIdx: int32
+    for i in 1..<state.nonceCount:
+        let candidate: DidAuthNonceEntry = state.nonces[i]
+        let current: DidAuthNonceEntry = state.nonces[replaceIdx]
+        if candidate.seenAtMs < current.seenAtMs:
+            replaceIdx = i
+    state.nonces[replaceIdx] = entry
+
+fn didAuthPositiveInt64ToStr(value: int64): str =
+    if value == 0:
+        return "0"
+    let tmp: Bytes = BytesAlloc(20)
+    var n: int64 = value
+    var pos: int32 = 20
+    while n > 0:
+        pos = pos - 1
+        let digit: int32 = int32(n % 10)
+        BytesSet(tmp, pos, 48 + digit)
+        n = n / 10
+    return BytesToString(BytesSlice(tmp, pos, 20 - pos))
+
+fn didAuthInt64ToStr(value: int64): str =
+    if value >= 0:
+        return didAuthPositiveInt64ToStr(value)
+    if value < Int64(-9223372036854775807):
+        return "-9223372036854775808"
+    let bodyText: str = didAuthPositiveInt64ToStr(Int64(0) - value)
+    let body: Bytes = BytesFromString(bodyText)
+    let out: Bytes = BytesAlloc(BytesLen(body) + 1)
+    BytesSet(out, 0, 45)
+    BytesCopyInto(out, 1, body)
+    return BytesToString(out)
+
+fn didAuthProofDevice(proof: DeviceDelegationProofV1): DeviceMethodV1 =
+    let device: DeviceMethodV1 = proof.device
+    return device
+
+fn didAuthDevicePeerId(device: DeviceMethodV1): str =
+    return device.devicePeerId
+
+fn didAuthDeviceStatus(device: DeviceMethodV1): DidDeviceStatus =
+    return device.status
+
+fn didAuthDevicePublicKey(device: DeviceMethodV1): PublicKey =
+    let key: PublicKey = device.devicePubKey
+    return key
+
+fn didAuthInitSigPayload(msg: DidAuthInitMessage): Bytes =
+    let did: str = msg.did
+    let peerId: str = msg.peerId
+    let nonceC: Bytes = msg.nonceC
+    let tsMs: int64 = msg.tsMs
+    let delegationProof: Bytes = msg.delegationProof
+    let biometricAssertion: Bytes = msg.biometricAssertion
+    var vb: VBuffer = newVBuffer()
+    writeSeq(vb, did)
+    writeSeq(vb, peerId)
+    writeSeq(vb, nonceC)
+    writeSeq(vb, didAuthInt64ToStr(tsMs))
+    writeSeq(vb, delegationProof)
+    writeSeq(vb, biometricAssertion)
+    return toBytes(vb)
+
+fn didAuthRespSigPayload(msg: DidAuthRespMessage): Bytes =
+    let did: str = msg.did
+    let peerId: str = msg.peerId
+    let nonceS: Bytes = msg.nonceS
+    let echoNonceC: Bytes = msg.echoNonceC
+    let tsMs: int64 = msg.tsMs
+    let delegationProof: Bytes = msg.delegationProof
+    let biometricAssertion: Bytes = msg.biometricAssertion
+    var vb: VBuffer = newVBuffer()
+    writeSeq(vb, did)
+    writeSeq(vb, peerId)
+    writeSeq(vb, nonceS)
+    writeSeq(vb, echoNonceC)
+    writeSeq(vb, didAuthInt64ToStr(tsMs))
+    writeSeq(vb, delegationProof)
+    writeSeq(vb, biometricAssertion)
+    return toBytes(vb)
+
+fn didAuthVerifyInitSignature(msg: DidAuthInitMessage, pub: PublicKey): bool =
+    let keyType: KeyType = PublicKeyType(pub)
+    let sigBytes: Bytes = msg.sigC
+    let sig: Signature = decodeSignature(keyType, sigBytes)
+    if ! validateSignature(sig):
+        return false
+    return verify(pub, didAuthInitSigPayload(msg), sig)
+
+fn didAuthVerifyRespSignature(msg: DidAuthRespMessage, pub: PublicKey): bool =
+    let keyType: KeyType = PublicKeyType(pub)
+    let sigBytes: Bytes = msg.sigS
+    let sig: Signature = decodeSignature(keyType, sigBytes)
+    if ! validateSignature(sig):
+        return false
+    return verify(pub, didAuthRespSigPayload(msg), sig)
+
+fn didAuthBuildAndSignInit(
+    identity: DidIdentity,
+    nonceC: Bytes,
+    nowMs: int64
+): Result[DidAuthInitMessage] =
+    let peerText: str = toString(identity.devicePeerId)
+    let bioRes: Result[BiometricAssertionV1] = biometricmod.BuildBiometricAssertion(
+        identity.did,
+        peerText,
+        nonceC,
+        nonceC,
+        nowMs * 1000000,
+        identity.biometricCapabilities
+    )
+    if IsErr(bioRes):
+        return Err[DidAuthInitMessage](Error(bioRes))
+    let bioEncRes: Result[Bytes] = biometricmod.EncodeBiometricAssertion(Value(bioRes))
+    if IsErr(bioEncRes):
+        return Err[DidAuthInitMessage](Error(bioEncRes))
+    var msg: DidAuthInitMessage = initDidAuthInitMessage()
+    msg.did = identity.did
+    msg.peerId = peerText
+    msg.nonceC = nonceC
+    msg.tsMs = nowMs
+    msg.delegationProof = identity.delegationProof
+    msg.biometricAssertion = Value(bioEncRes)
+    let sigRes: Result[Signature] = sign(identity.devicePrivateKey, didAuthInitSigPayload(msg))
+    if IsErr(sigRes):
+        return Err[DidAuthInitMessage](Error(sigRes))
+    msg.sigC = encodeSignature(Value(sigRes))
+    return Ok[DidAuthInitMessage](msg)
+
+fn didAuthBuildAndSignResp(
+    identity: DidIdentity,
+    nonceS: Bytes,
+    echoNonceC: Bytes,
+    nowMs: int64
+): Result[DidAuthRespMessage] =
+    let peerText: str = toString(identity.devicePeerId)
+    let bioRes: Result[BiometricAssertionV1] = biometricmod.BuildBiometricAssertion(
+        identity.did,
+        peerText,
+        echoNonceC,
+        nonceS,
+        nowMs * 1000000,
+        identity.biometricCapabilities
+    )
+    if IsErr(bioRes):
+        return Err[DidAuthRespMessage](Error(bioRes))
+    let bioEncRes: Result[Bytes] = biometricmod.EncodeBiometricAssertion(Value(bioRes))
+    if IsErr(bioEncRes):
+        return Err[DidAuthRespMessage](Error(bioEncRes))
+    var msg: DidAuthRespMessage = initDidAuthRespMessage()
+    msg.did = identity.did
+    msg.peerId = peerText
+    msg.nonceS = nonceS
+    msg.echoNonceC = echoNonceC
+    msg.tsMs = nowMs
+    msg.delegationProof = identity.delegationProof
+    msg.biometricAssertion = Value(bioEncRes)
+    let sigRes: Result[Signature] = sign(identity.devicePrivateKey, didAuthRespSigPayload(msg))
+    if IsErr(sigRes):
+        return Err[DidAuthRespMessage](Error(sigRes))
+    msg.sigS = encodeSignature(Value(sigRes))
+    return Ok[DidAuthRespMessage](msg)
+
+fn didAuthReadInit(stream: var Stream): Result[DidAuthInitMessage] =
+    let dataRes: Result[Bytes] = readLp(stream, didAuthMaxPayload)
+    if IsErr(dataRes):
+        return Err[DidAuthInitMessage](Error(dataRes))
+    return DecodeDidAuthInitMessage(Value(dataRes))
+
+fn didAuthWriteInit(stream: var Stream, msg: DidAuthInitMessage): Result[bool] =
+    let encRes: Result[Bytes] = EncodeDidAuthInitMessage(msg)
+    if IsErr(encRes):
+        return Err[bool](Error(encRes))
+    let writeRes: Result[int32] = writeLp(stream, Value(encRes))
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    return Ok[bool](true)
+
+fn didAuthReadResp(stream: var Stream): Result[DidAuthRespMessage] =
+    let dataRes: Result[Bytes] = readLp(stream, didAuthMaxPayload)
+    if IsErr(dataRes):
+        return Err[DidAuthRespMessage](Error(dataRes))
+    return DecodeDidAuthRespMessage(Value(dataRes))
+
+fn didAuthWriteResp(stream: var Stream, msg: DidAuthRespMessage): Result[bool] =
+    let encRes: Result[Bytes] = EncodeDidAuthRespMessage(msg)
+    if IsErr(encRes):
+        return Err[bool](Error(encRes))
+    let writeRes: Result[int32] = writeLp(stream, Value(encRes))
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    return Ok[bool](true)
+
+fn didAuthSelectDial(stream: var Stream): Result[bool] =
+    var ms: MultistreamSelect = newMultistreamSelect()
+    addProtocol(ms, didAuthCodec)
+    return dialerSelectProtocol(ms, stream, didAuthCodec)
+
+fn didAuthSelectAccept(stream: var Stream): Result[bool] =
+    var ms: MultistreamSelect = newMultistreamSelect()
+    addProtocol(ms, didAuthCodec)
+    let selRes: Result[str] = responderSelectProtocol(ms, stream)
+    if IsErr(selRes):
+        return Err[bool](Error(selRes))
+    if (Value(selRes) != didAuthCodec):
+        return Err[bool]("didauth: protocol mismatch")
+    return Ok[bool](true)
+
+fn didAuthVerifyPeerAndProof(
+    did: str,
+    peerText: str,
+    proofBytes: Bytes
+): Result[DeviceDelegationProofV1] =
+    var doc: DidDocumentV1 = initDidDocumentV1()
+    if didResolverTryGetDocument(did, doc):
+        let proofRes: Result[DeviceDelegationProofV1] = VerifyDeviceDelegationProofWithDocument(proofBytes, doc)
+        if IsErr(proofRes):
+            return Err[DeviceDelegationProofV1](Error(proofRes))
+        let proof: DeviceDelegationProofV1 = Value(proofRes)
+        let device: DeviceMethodV1 = didAuthProofDevice(proof)
+        if (didAuthDevicePeerId(device) != peerText):
+            return Err[DeviceDelegationProofV1]("didauth: peer/proof mismatch")
+        if didResolverIsDeviceRevoked(did, peerText):
+            return Err[DeviceDelegationProofV1]("didauth: device revoked")
+        return Ok[DeviceDelegationProofV1](proof)
+    let proofRes: Result[DeviceDelegationProofV1] = VerifyDeviceDelegationProofWithDid(proofBytes, did)
+    if IsErr(proofRes):
+        return Err[DeviceDelegationProofV1](Error(proofRes))
+    let proof: DeviceDelegationProofV1 = Value(proofRes)
+    let device: DeviceMethodV1 = didAuthProofDevice(proof)
+    if (didAuthDevicePeerId(device) != peerText):
+        return Err[DeviceDelegationProofV1]("didauth: peer/proof mismatch")
+    if didAuthDeviceStatus(device) != didDeviceActive:
+        return Err[DeviceDelegationProofV1]("didauth: device ! active")
+    if didResolverIsDeviceRevoked(did, peerText):
+        return Err[DeviceDelegationProofV1]("didauth: device revoked")
+    return Ok[DeviceDelegationProofV1](proof)
+
+fn didAuthValidateInit(state: var DidAuthState, msg: DidAuthInitMessage, nowMs: int64): Result[DeviceDelegationProofV1] =
+    let did: str = msg.did
+    let peerId: str = msg.peerId
+    let nonceC: Bytes = msg.nonceC
+    let tsMs: int64 = msg.tsMs
+    let delegationProof: Bytes = msg.delegationProof
+    let biometricAssertion: Bytes = msg.biometricAssertion
+    if ! didAuthTimestampValid(state, tsMs, nowMs):
+        return Err[DeviceDelegationProofV1]("didauth: init timestamp skew")
+    didAuthPruneNonces(state, nowMs)
+    if didAuthNonceSeen(state, nonceC):
+        return Err[DeviceDelegationProofV1]("didauth: init nonce replay")
+    let proofRes: Result[DeviceDelegationProofV1] = didAuthVerifyPeerAndProof(did, peerId, delegationProof)
+    if IsErr(proofRes):
+        return Err[DeviceDelegationProofV1](Error(proofRes))
+    let proof: DeviceDelegationProofV1 = Value(proofRes)
+    let device: DeviceMethodV1 = didAuthProofDevice(proof)
+    let devicePubKey: PublicKey = didAuthDevicePublicKey(device)
+    if ! didAuthVerifyInitSignature(msg, devicePubKey):
+        return Err[DeviceDelegationProofV1]("didauth: init signature invalid")
+    let bioRes: Result[BiometricAssertionV1] = biometricmod.DecodeBiometricAssertion(biometricAssertion)
+    if IsErr(bioRes):
+        return Err[DeviceDelegationProofV1](Error(bioRes))
+    let bio: BiometricAssertionV1 = Value(bioRes)
+    if ! biometricmod.VerifyBiometricAssertion(bio, did, peerId, nonceC, nonceC):
+        return Err[DeviceDelegationProofV1]("didauth: init biometric invalid")
+    didAuthRememberNonce(state, nonceC, nowMs)
+    return Ok[DeviceDelegationProofV1](proof)
+
+fn didAuthValidateResp(
+    state: var DidAuthState,
+    msg: DidAuthRespMessage,
+    expectedNonceC: Bytes,
+    nowMs: int64
+): Result[DeviceDelegationProofV1] =
+    let did: str = msg.did
+    let peerId: str = msg.peerId
+    let nonceS: Bytes = msg.nonceS
+    let echoNonceC: Bytes = msg.echoNonceC
+    let tsMs: int64 = msg.tsMs
+    let delegationProof: Bytes = msg.delegationProof
+    let biometricAssertion: Bytes = msg.biometricAssertion
+    if ! BytesEqual(echoNonceC, expectedNonceC):
+        return Err[DeviceDelegationProofV1]("didauth: resp challenge mismatch")
+    if ! didAuthTimestampValid(state, tsMs, nowMs):
+        return Err[DeviceDelegationProofV1]("didauth: resp timestamp skew")
+    didAuthPruneNonces(state, nowMs)
+    if didAuthNonceSeen(state, nonceS):
+        return Err[DeviceDelegationProofV1]("didauth: resp nonce replay")
+    let proofRes: Result[DeviceDelegationProofV1] = didAuthVerifyPeerAndProof(did, peerId, delegationProof)
+    if IsErr(proofRes):
+        return Err[DeviceDelegationProofV1](Error(proofRes))
+    let proof: DeviceDelegationProofV1 = Value(proofRes)
+    let device: DeviceMethodV1 = didAuthProofDevice(proof)
+    let devicePubKey: PublicKey = didAuthDevicePublicKey(device)
+    if ! didAuthVerifyRespSignature(msg, devicePubKey):
+        return Err[DeviceDelegationProofV1]("didauth: resp signature invalid")
+    let bioRes: Result[BiometricAssertionV1] = biometricmod.DecodeBiometricAssertion(biometricAssertion)
+    if IsErr(bioRes):
+        return Err[DeviceDelegationProofV1](Error(bioRes))
+    let bio: BiometricAssertionV1 = Value(bioRes)
+    if ! biometricmod.VerifyBiometricAssertion(bio, did, peerId, echoNonceC, nonceS):
+        return Err[DeviceDelegationProofV1]("didauth: resp biometric invalid")
+    didAuthRememberNonce(state, nonceS, nowMs)
+    return Ok[DeviceDelegationProofV1](proof)
+
+fn didAuthDial(state: var DidAuthState, localPeer: PeerId, mux: var Muxer): Result[bool] =
+    if ! didAuthShouldRun(state):
+        return Ok[bool](true)
+    return Err[bool]("didauth: handshake compile path disabled for mobile ffi")
+
+fn didAuthAccept(state: var DidAuthState, localPeer: PeerId, mux: var Muxer): Result[bool] =
+    if ! didAuthShouldRun(state):
+        return Ok[bool](true)
+    return Err[bool]("didauth: handshake compile path disabled for mobile ffi")

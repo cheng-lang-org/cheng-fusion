@@ -1,0 +1,174 @@
+# TURN nonce TTL + replay cache (stage 4).
+#
+# RFC 5389 long-term auth uses a server-issued nonce to defeat replay. The
+# production hardening here issues time-based nonces (timestamp + HMAC-SHA1 over
+# the timestamp, keyed by the REST secret) with a configurable TTL, and rejects
+# reuse of an already-consumed nonce (one-time nonces within the TTL window).
+#
+# Nonce format (36 opaque bytes, carried in the STUN NONCE attribute):
+#   bytes  0..7  : timestamp seconds as 8 lowercase hex chars (ASCII)
+#   bytes  8..15 : per-issuance counter as 8 lowercase hex chars (uniqueness
+#                  within a second, so the replay cache does not reject distinct
+#                  same-second allocations)
+#   bytes 16..35 : HMAC-SHA1(secret, tsHex||ctrHex) (20 bytes)
+# Validation re-derives the HMAC and checks the timestamp is within
+# [now - ttl, now + 60s skew]. The replay cache stores the hex of consumed nonces
+# in a fixed ring buffer (cap turnMaxNonceCache = 16).
+#
+# Nonce TTL/replay is OPT-IN: when ttlSec <= 0 the server keeps the stage 1/2
+# static-nonce behavior (no replay cache), so existing smokes are unchanged.
+# Every routine is a small single-purpose function (stage 0-2 codegen contract).
+
+import std/system
+import std/rawbytes
+import std/strings
+import std/thread
+import std/crypto/hkdf
+
+const
+    turnNonceTsLen = 8
+    turnNonceCtrLen = 8
+    turnNoncePayloadLen = 16
+    turnNonceHmacLen = 20
+    turnNonceTotal = 36
+    turnMaxNonceCache = 16
+    turnNonceSkewSec = 60
+
+type
+    TurnNonceCache =
+        lock: int32
+        slots: str[turnMaxNonceCache]
+        head: int32
+        count: int32
+
+@importc("cheng_atomic_cas_i32")
+fn ncCas(p: ptr, expect: int32, desired: int32): int32
+
+@importc("cheng_atomic_store_i32")
+fn ncStore(p: ptr, val: int32)
+
+@importc("cheng_atomic_fetch_add_i32")
+fn ncFetchAdd(p: ptr, delta: int32): int32
+
+var
+    gNonceCounter: int32
+
+fn TurnNonceHexNibble(n: int32): int32 =
+    if n < 10:
+        return int32('0') + n
+    return int32('a') + (n - 10)
+
+fn TurnNonceHexVal(c: int32): int32 =
+    if c >= int32('0') && c <= int32('9'):
+        return c - int32('0')
+    if c >= int32('a') && c <= int32('f'):
+        return c - int32('a') + 10
+    if c >= int32('A') && c <= int32('F'):
+        return c - int32('A') + 10
+    return -1
+
+# 8 lowercase hex chars encoding the low 32 bits of `value` (big-endian nibbles).
+fn TurnNonceHex8(value: int32): Bytes =
+    let out: Bytes = rawbytes.BytesAlloc(turnNonceTsLen)
+    var i: int32
+    for i in i..<turnNonceTsLen:
+        let shift: int32 = (turnNonceTsLen - 1 - i) * 4
+        let nibble: int32 = (value >> shift) & 0xF
+        rawbytes.BytesSet(out, i, TurnNonceHexNibble(nibble))
+    return out
+
+fn TurnNonceParseTs(nonce: Bytes): int64 =
+    if rawbytes.BytesLen(nonce) < turnNonceTsLen:
+        return int64(-1)
+    var s: int32
+    var i: int32
+    for i in i..<turnNonceTsLen:
+        let v: int32 = TurnNonceHexVal(int32(rawbytes.BytesGet(nonce, i)))
+        if v < 0:
+            return int64(-1)
+        s = (s << 4) | v
+    return int64(s)
+
+# Generate a fresh nonce for a 401 challenge. The nonce binds a timestamp, a
+# per-issuance counter (so two 401s in the same second differ -- without it the
+# replay cache would reject every same-second allocation), and an HMAC over the
+# two. Format: tsHex(8) || ctrHex(8) || HMAC-SHA1(secret, tsHex||ctrHex)(20).
+fn TurnNonceGenerate(secret: Bytes, nowSec: int64): Bytes =
+    let tsHex: Bytes = TurnNonceHex8(int32(nowSec & int64(0xFFFFFFFF)))
+    let ctr: int32 = ncFetchAdd(&gNonceCounter, 1)
+    let ctrHex: Bytes = TurnNonceHex8(ctr)
+    let payload: Bytes = rawbytes.BytesConcat(tsHex, ctrHex)
+    let mac: Bytes = hkdf.hmacDigestSha1(secret, payload)
+    return rawbytes.BytesConcat(payload, mac)
+
+# Validate a nonce carried in a request. Returns 0 valid, 1 bad format/length,
+# 2 expired (outside TTL + skew), 3 bad HMAC.
+fn TurnNonceValidate(secret: Bytes, nonce: Bytes, nowSec: int64, ttlSec: int32): int32 =
+    if ttlSec <= 0:
+        return 0
+    if rawbytes.BytesLen(nonce) != turnNonceTotal:
+        return 1
+    let ts: int64 = TurnNonceParseTs(nonce)
+    if ts < 0:
+        return 1
+    let payload: Bytes = rawbytes.BytesSlice(nonce, 0, turnNoncePayloadLen)
+    let expected: Bytes = hkdf.hmacDigestSha1(secret, payload)
+    let actual: Bytes = rawbytes.BytesSlice(nonce, turnNoncePayloadLen, turnNonceHmacLen)
+    if !rawbytes.BytesEqual(expected, actual):
+        return 3
+    let age: int64 = nowSec - ts
+    if age > int64(ttlSec):
+        return 2
+    if age < int64(-turnNonceSkewSec):
+        return 2
+    return 0
+
+fn TurnNonceCacheNew(): TurnNonceCache =
+    let c = new(TurnNonceCache)
+    c.lock = 0
+    c.head = 0
+    c.count = 0
+    return c
+
+fn TurnNonceCacheLock(c: var TurnNonceCache) =
+    while ncCas(&c.lock, 0, 1) == 0:
+        thread.Yield()
+
+fn TurnNonceCacheUnlock(c: var TurnNonceCache) =
+    ncStore(&c.lock, 0)
+
+# True if the nonce has already been consumed (replay). Linear scan over the ring
+# comparing the nonce hex; empty slots never match (a real nonce is never "").
+fn TurnNonceCacheContains(c: var TurnNonceCache, nonce: Bytes): bool =
+    let hex: str = rawbytes.BytesToHex(nonce)
+    if strings.Len(hex) <= 0:
+        return false
+    TurnNonceCacheLock(c)
+    let n: int32 = c.count
+    var i: int32
+    var hit: bool
+    for i in i..<n:
+        if c.slots[i] == hex:
+            hit = true
+    TurnNonceCacheUnlock(c)
+    return hit
+
+# Mark a nonce as consumed. Ring buffer: overwrites the oldest entry when full.
+fn TurnNonceCacheAdd(c: var TurnNonceCache, nonce: Bytes) =
+    let hex: str = rawbytes.BytesToHex(nonce)
+    if strings.Len(hex) <= 0:
+        return
+    TurnNonceCacheLock(c)
+    c.slots[c.head] = hex
+    c.head = c.head + 1
+    if c.head >= turnMaxNonceCache:
+        c.head = 0
+    if c.count < turnMaxNonceCache:
+        c.count = c.count + 1
+    TurnNonceCacheUnlock(c)
+
+fn TurnNonceCacheCount(c: var TurnNonceCache): int32 =
+    TurnNonceCacheLock(c)
+    let n: int32 = c.count
+    TurnNonceCacheUnlock(c)
+    return n

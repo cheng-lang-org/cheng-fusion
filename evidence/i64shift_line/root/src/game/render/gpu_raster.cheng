@@ -1,0 +1,368 @@
+# GPU background rasterizer (G-stage vertical slice): the ground plane
+# and the wall face — the two analytic surfaces that dominate the CPU
+# raster profile (~100 ms/frame) — move to one Metal compute kernel that
+# ray-casts per pixel and writes BGRA + depth directly into shared
+# MTLBuffers. The character/rope stay on the CPU path (small pixel
+# counts, zbuf-tested through RasterPut against the GPU depth column).
+#
+# Purity: all ObjC/Metal calls stay in the bridge section (@importc,
+# same boundary discipline as aac.cheng / core_runtime_provider_darwin);
+# the camera math contract (CameraRayDir formula, checker/wall shading,
+# int32 truncation, C-style %) is replicated in MSL. Colors are computed
+# in float32 so pixels may differ from the CPU path by 1/255 at
+# truncation boundaries — rendering is a post-activity of the CID chain
+# (physics chainCid never crosses this file), so determinism of the
+# world state is unaffected.
+#
+# Layout notes: kernel params pass as a float array (index constants
+# below) — MSL float3 has 16-byte alignment traps, a scalar float array
+# has none. Depth is the same int32-millimetre column the CPU zbuf uses
+# (RasterDepthEmpty = 2147483647 = 0x7FFFFFFF sentinel). Bridge call
+# shapes follow the core_runtime_provider_darwin inference-Metal precedent.
+import cheng/game/cinema/camera
+import std/strings as strings
+import std/rawbytes
+import std/rawmem_support
+
+# packed camera block indices (float32 each)
+const
+    GpuCamFloats = 20
+    GpuIdxPosX = 0
+    GpuIdxPosY = 1
+    GpuIdxPosZ = 2
+    GpuIdxFx = 3
+    GpuIdxFy = 4
+    GpuIdxFz = 5
+    GpuIdxRx = 6
+    GpuIdxRy = 7
+    GpuIdxRz = 8
+    GpuIdxUx = 9
+    GpuIdxUy = 10
+    GpuIdxUz = 11
+    GpuIdxFocal = 12
+    GpuIdxWallY = 13
+    GpuIdxXLo = 14
+    GpuIdxXHi = 15
+    GpuIdxZLo = 16
+    GpuIdxZHi = 17
+    GpuIdxWidth = 18
+    GpuIdxHeight = 19
+
+const
+    GpuMslP0 = "kernel void rasterBackground(device const float* cam, device uchar* bgra, device int* depthOut, uint2 gid [[thread_position_in_grid]]) { int W = (int)cam[18]; int H = (int)cam[19]; int px = (int)gid.x; int py = (int)gid.y; if (px >= W || py >= H) { return; }"
+    GpuMslP1 = " float fx = cam[3]; float fy = cam[4]; float rx = cam[6]; float ry = cam[7]; float uz = cam[11]; float focal = cam[12];"
+    GpuMslP2 = " float su = ((float)px + 0.5 - (float)W * 0.5) / focal; float sv = ((float)H * 0.5 - (float)py - 0.5) / focal;"
+    GpuMslP3 = " float dx = fx + rx * su; float dy = fy + ry * su; float dzg = cam[5] + uz * sv;"
+    GpuMslP4 = " float wy = cam[13]; float xlo = cam[14]; float xhi = cam[15]; float zlo = cam[16]; float zhi = cam[17];"
+    GpuMslP5 = " float wdx = fx + rx * su + cam[9] * sv; float wdy = fy + ry * su + cam[10] * sv; float wdz = cam[5] + cam[8] * su + uz * sv;"
+    GpuMslP6 = " int hit = 0; float btt = 0.0; float br = 140.0; float bgc = 120.0; float bb = 96.0;"
+    GpuMslP7 = " if (dzg < -0.0001) { float tt = (0.0 - cam[2]) / dzg; if (tt > 0.1) { float hx = cam[0] + dx * tt; float hy = cam[1] + dy * tt; if (hx > -20.0 && hx < 20.0 && hy > -20.0 && hy < 20.0) { float fxr = (float)((int)hx); if (hx < fxr) { fxr = fxr - 1.0; } float fyr = (float)((int)hy); if (hy < fyr) { fyr = fyr - 1.0; } int band = ((int)fxr + (int)fyr) % 2; float lum = 0.35 + 0.65 * 0.72; if (band == 0) { lum = lum * 0.82; } hit = 1; btt = tt; br = 90.0 * lum; bgc = 80.0 * lum; bb = 70.0 * lum; } } }"
+    GpuMslP8 = " int whit = 0; float wtt = 0.0; float wr = 0.0; float wgc = 0.0; float wb = 0.0;"
+    GpuMslP9 = " if (wdy < -0.0001) { float tt = (wy - cam[1]) / wdy; if (tt > 0.1) { float hx = cam[0] + wdx * tt; float hz = cam[2] + wdz * tt; if (hx > xlo && hx < xhi && hz > zlo && hz < zhi) { int band = (int)(hz * 3.0) % 2; float lum = 0.47; if (band == 0) { lum = lum * 0.88; } whit = 1; wtt = tt; wr = 110.0 * lum; wgc = 105.0 * lum; wb = 100.0 * lum; } } }"
+    GpuMslPA = " int dout = 2147483647; if (hit == 1) { dout = (int)(btt * 1000.0); if (dout < 0) { dout = 0; } }"
+    GpuMslPB = " if (whit == 1) { int wd = (int)(wtt * 1000.0); if (wd < 0) { wd = 0; } if (wd < dout || dout == 2147483647) { dout = wd; br = wr; bgc = wgc; bb = wb; } }"
+    GpuMslPC = " if (dout == 2147483647) { br = 140.0; bgc = 120.0; bb = 96.0; } int idx = py * W + px;"
+    GpuMslPD = " bgra[idx * 4] = (uchar)bb; bgra[idx * 4 + 1] = (uchar)bgc; bgra[idx * 4 + 2] = (uchar)br; bgra[idx * 4 + 3] = (uchar)255; depthOut[idx] = dout; }"
+
+fn GpuRasterMsl(): str =
+    return Fmt"{GpuMslP0}{GpuMslP1}{GpuMslP2}{GpuMslP3}{GpuMslP4}{GpuMslP5}{GpuMslP6}{GpuMslP7}{GpuMslP8}{GpuMslP9}{GpuMslPA}{GpuMslPB}{GpuMslPC}{GpuMslPD}"
+
+# ---- bridge section (Metal/ObjC boundary) ----
+type
+    GpuMetalSize =
+        width: uint64
+        height: uint64
+        depth: uint64
+
+@importc("MTLCreateSystemDefaultDevice")
+fn gpuMtlCreateSystemDefaultDevice(): ptr
+@importc("objc_getClass")
+fn gpuObjcGetClass(name: ptr): ptr
+@importc("sel_registerName")
+fn gpuSelRegisterName(name: ptr): ptr
+@importc("objc_autoreleasePoolPush")
+fn gpuAutoreleasePoolPush(): ptr
+@importc("objc_autoreleasePoolPop")
+fn gpuAutoreleasePoolPop(pool: ptr)
+@importc("objc_msgSend")
+fn gpuMsgSend0(receiver: ptr, sel: ptr): ptr
+@importc("objc_msgSend")
+fn gpuMsgSendPtr(receiver: ptr, sel: ptr, a0: ptr): ptr
+@importc("objc_msgSend")
+fn gpuMsgSendPtrPtr(receiver: ptr, sel: ptr, a0: ptr, a1: ptr): ptr
+@importc("objc_msgSend")
+fn gpuMsgSendPtrPtrPtr(receiver: ptr, sel: ptr, a0: ptr, a1: ptr, a2: ptr): ptr
+@importc("objc_msgSend")
+fn gpuMsgSendU64U64(receiver: ptr, sel: ptr, a0: uint64, a1: uint64): ptr
+@importc("objc_msgSend")
+fn gpuMsgSendU64Return(receiver: ptr, sel: ptr): uint64
+@importc("objc_msgSend")
+fn gpuMsgSendSetPipeline(receiver: ptr, sel: ptr, pipeline: ptr)
+@importc("objc_msgSend")
+fn gpuMsgSendSetBuffer(receiver: ptr, sel: ptr, buffer: ptr, offset: ptr, index: ptr)
+@importc("objc_msgSend")
+fn gpuMsgSendDispatch(receiver: ptr, sel: ptr, grid: GpuMetalSize, group: GpuMetalSize)
+@importc("objc_msgSend")
+fn gpuMsgSendVoid0(receiver: ptr, sel: ptr)
+@importc("cheng_ptr_plus")
+fn gpuPtrPlus(base: ptr, off: int32): ptr
+
+# f64 -> binary32 bit pattern, round-to-nearest-even (the runtime
+# cheng_f32_to_bits helper is outside the provider closure for window
+# builds; the exact same integer-bit algorithm lives here, self-contained)
+fn gpuU64MaskLoBits(n: int32): uint64 =
+    if n <= 0:
+        return uint64(0)
+    if n >= 64:
+        return uint64(0) - uint64(1)
+    return (uint64(1) << uint64(n)) - uint64(1)
+
+fn gpuU64RoundShiftRight(v: uint64, shift: int32): uint64 =
+    if shift <= 0:
+        if shift == 0:
+            return v
+        let leftShift: int32 = -shift
+        if leftShift >= 64:
+            return uint64(0)
+        return v << uint64(leftShift)
+    if shift >= 64:
+        return uint64(0)
+    let base: uint64 = v >> uint64(shift)
+    let half: uint64 = uint64(1) << uint64(shift - 1)
+    let lowMask: uint64 = gpuU64MaskLoBits(shift)
+    let low: uint64 = v & lowMask
+    if low > half:
+        return base + uint64(1)
+    if low == half && (base & uint64(1)) == uint64(1):
+        return base + uint64(1)
+    return base
+
+fn gpuF64ToF32Bits(bits: int64): int32 =
+    let ubits: uint64 = uint64(bits)
+    let sign: uint64 = (ubits >> uint64(63)) & uint64(1)
+    let exp64: int32 = int32((ubits >> uint64(52)) & uint64(0x7ff))
+    let frac64: uint64 = ubits & uint64(0x000fffffffffffff)
+    let signOut: uint64 = sign << uint64(31)
+    if exp64 == int32(0x7ff):
+        if frac64 == 0:
+            return int32(signOut | (uint64(0xff) << uint64(23)))
+        var fracNaN: uint64 = frac64 >> uint64(29)
+        if fracNaN == 0:
+            fracNaN = uint64(1)
+        return int32(signOut | (uint64(0xff) << uint64(23)) | (fracNaN & uint64(0x7fffff)))
+    var exp: int32
+    var mant: uint64 = frac64
+    if exp64 == 0:
+        if mant == 0:
+            return int32(signOut)
+        exp = -1022
+        while (mant & (uint64(1) << uint64(52))) == 0:
+            mant = mant << uint64(1)
+            exp = exp - 1
+        mant = mant & uint64(0x000fffffffffffff)
+    else:
+        exp = exp64 - 1023
+    var exp32: int32 = exp + 127
+    let sig53: uint64 = (uint64(1) << uint64(52)) | mant
+    if exp32 >= 255:
+        return int32(signOut | (uint64(0xff) << uint64(23)))
+    if exp32 <= 0:
+        if exp32 < -23:
+            return int32(signOut)
+        let shiftSub: int32 = (1 - exp32) + 29
+        let fracSub: uint64 = gpuU64RoundShiftRight(sig53, shiftSub)
+        if fracSub >= (uint64(1) << uint64(23)):
+            return int32(signOut | (uint64(1) << uint64(23)))
+        return int32(signOut | (fracSub & uint64(0x7fffff)))
+    var sig24: uint64 = gpuU64RoundShiftRight(sig53, 29)
+    if sig24 >= (uint64(1) << uint64(24)):
+        sig24 = sig24 >> uint64(1)
+        exp32 = exp32 + 1
+        if exp32 >= 255:
+            return int32(signOut | (uint64(0xff) << uint64(23)))
+    let fracOut: uint64 = sig24 & uint64(0x7fffff)
+    return int32(signOut | (uint64(exp32) << uint64(23)) | fracOut)
+
+@importc("cheng_f64_to_bits")
+fn gpuF64Bits(value: float64): int64
+# ---- end bridge section ----
+
+type
+    GpuRaster =
+        ok: bool
+        failStage: int32
+        queue: ptr
+        pipeline: ptr
+        camBuf: ptr
+        # two surface groups (A/B): the CPU pushes one while the GPU
+        # writes the other next frame — same front/back contract as the
+        # CPU-only rotation, no buffer is ever written while displayed
+        bgraA: ptr
+        depthA: ptr
+        bgraB: ptr
+        depthB: ptr
+        width: int32
+        height: int32
+
+fn gpuNSString(cstr: ptr): ptr =
+    let cls: ptr = gpuObjcGetClass("NSString")
+    if cls == nil:
+        return nil
+    let sel: ptr = gpuSelRegisterName("stringWithUTF8String:")
+    return gpuMsgSendPtr(cls, sel, cstr)
+
+# One-time pipeline bring-up: device, queue, runtime MSL compile, pipeline,
+# and the three shared buffers (camera params / BGRA out / depth out).
+# The BGRA and depth buffers are allocated once and reused every frame;
+# their contents pointers are adopted by the caller as display surfaces.
+fn GpuRasterInit(width: int32, height: int32): GpuRaster =
+    var out: GpuRaster
+    out.ok = false
+    out.failStage = 0
+    out.width = width
+    out.height = height
+    let pool: ptr = gpuAutoreleasePoolPush()
+    let device: ptr = gpuMtlCreateSystemDefaultDevice()
+    if device == nil:
+        gpuAutoreleasePoolPop(pool)
+        out.failStage = 1
+        return out
+    let queue: ptr = gpuMsgSend0(device, gpuSelRegisterName("newCommandQueue"))
+    if queue == nil:
+        gpuAutoreleasePoolPop(pool)
+        out.failStage = 2
+        return out
+    let msl: str = GpuRasterMsl()
+    let src: ptr = gpuNSString(msl.data)
+    if src == nil:
+        gpuAutoreleasePoolPop(pool)
+        out.failStage = 3
+        return out
+    var libErr: ptr
+    let library: ptr = gpuMsgSendPtrPtrPtr(device, gpuSelRegisterName("newLibraryWithSource:options:error:"), src, nil, ptr(&libErr))
+    if library == nil:
+        gpuAutoreleasePoolPop(pool)
+        out.failStage = 4
+        return out
+    let fnObj: ptr = gpuMsgSendPtr(library, gpuSelRegisterName("newFunctionWithName:"), gpuNSString("rasterBackground"))
+    if fnObj == nil:
+        gpuAutoreleasePoolPop(pool)
+        out.failStage = 5
+        return out
+    var pipeErr: ptr
+    let pipeline: ptr = gpuMsgSendPtrPtr(device, gpuSelRegisterName("newComputePipelineStateWithFunction:error:"), fnObj, ptr(&pipeErr))
+    if pipeline == nil:
+        gpuAutoreleasePoolPop(pool)
+        out.failStage = 6
+        return out
+    let camBuf: ptr = gpuMsgSendU64U64(device, gpuSelRegisterName("newBufferWithLength:options:"), uint64(GpuCamFloats * 4), uint64(0))
+    if camBuf == nil:
+        gpuAutoreleasePoolPop(pool)
+        out.failStage = 7
+        return out
+    let pxBytes: uint64 = uint64(width) * uint64(height) * 4
+    let bgraA: ptr = gpuMsgSendU64U64(device, gpuSelRegisterName("newBufferWithLength:options:"), pxBytes, uint64(0))
+    if bgraA == nil:
+        gpuAutoreleasePoolPop(pool)
+        out.failStage = 8
+        return out
+    let depthA: ptr = gpuMsgSendU64U64(device, gpuSelRegisterName("newBufferWithLength:options:"), pxBytes, uint64(0))
+    if depthA == nil:
+        gpuAutoreleasePoolPop(pool)
+        out.failStage = 9
+        return out
+    let bgraB: ptr = gpuMsgSendU64U64(device, gpuSelRegisterName("newBufferWithLength:options:"), pxBytes, uint64(0))
+    if bgraB == nil:
+        gpuAutoreleasePoolPop(pool)
+        out.failStage = 10
+        return out
+    let depthB: ptr = gpuMsgSendU64U64(device, gpuSelRegisterName("newBufferWithLength:options:"), pxBytes, uint64(0))
+    if depthB == nil:
+        gpuAutoreleasePoolPop(pool)
+        out.failStage = 11
+        return out
+    out.ok = true
+    out.queue = queue
+    out.pipeline = pipeline
+    out.camBuf = camBuf
+    out.bgraA = bgraA
+    out.depthA = depthA
+    out.bgraB = bgraB
+    out.depthB = depthB
+    gpuAutoreleasePoolPop(pool)
+    return out
+
+fn GpuRasterContents(buf: ptr): ptr =
+    return gpuMsgSend0(buf, gpuSelRegisterName("contents"))
+
+# Render the background (ground + wall) for one frame: pack the camera
+# block, dispatch one thread per pixel, wait for completion. The output
+# contents pointers stay valid until the next call (front/back surface
+# rotation is the caller's concern via CPU-side targets).
+fn GpuRasterFrame(g: GpuRaster,
+                  useSurfA: bool,
+                  cam: camera.CinemaCamera,
+                  wallY: float64, xLo: float64, xHi: float64, zLo: float64, zHi: float64) =
+    let camBase: ptr = GpuRasterContents(g.camBuf)
+    var block: float64[20]
+    block[0] = cam.posX
+    block[1] = cam.posY
+    block[2] = cam.posZ
+    block[3] = cam.fx
+    block[4] = cam.fy
+    block[5] = cam.fz
+    block[6] = cam.rx
+    block[7] = cam.ry
+    block[8] = cam.rz
+    block[9] = cam.ux
+    block[10] = cam.uy
+    block[11] = cam.uz
+    block[12] = cam.focalPx
+    block[13] = wallY
+    block[14] = xLo
+    block[15] = xHi
+    block[16] = zLo
+    block[17] = zHi
+    block[18] = float64(g.width)
+    block[19] = float64(g.height)
+    var fi: int32 = 0
+    while fi < GpuCamFloats:
+        # cold chain has no float64->float32 cast yet; write the IEEE-754
+        # binary32 bit pattern (round-to-nearest, runtime helper) instead
+        let b32: int32 = gpuF64ToF32Bits(gpuF64Bits(block[fi]))
+        rawmem_support.RawmemCopy(gpuPtrPlus(camBase, fi * 4), ptr(&b32), 4)
+        fi = fi + 1
+    let cmd: ptr = gpuMsgSend0(g.queue, gpuSelRegisterName("commandBuffer"))
+    if cmd == nil:
+        panic("gpu raster: command buffer nil")
+    let enc: ptr = gpuMsgSend0(cmd, gpuSelRegisterName("computeCommandEncoder"))
+    if enc == nil:
+        panic("gpu raster: encoder nil")
+    gpuMsgSendSetPipeline(enc, gpuSelRegisterName("setComputePipelineState:"), g.pipeline)
+    var bgraSel: ptr = g.bgraB
+    var depthSel: ptr = g.depthB
+    if useSurfA:
+        bgraSel = g.bgraA
+        depthSel = g.depthA
+    gpuMsgSendSetBuffer(enc, gpuSelRegisterName("setBuffer:offset:atIndex:"), g.camBuf, ptr(uint64(0)), ptr(uint64(0)))
+    gpuMsgSendSetBuffer(enc, gpuSelRegisterName("setBuffer:offset:atIndex:"), bgraSel, ptr(uint64(0)), ptr(uint64(1)))
+    gpuMsgSendSetBuffer(enc, gpuSelRegisterName("setBuffer:offset:atIndex:"), depthSel, ptr(uint64(0)), ptr(uint64(2)))
+    let grid: GpuMetalSize = GpuMetalSize(width: uint64(g.width), height: uint64(g.height), depth: uint64(1))
+    let group: GpuMetalSize = GpuMetalSize(width: uint64(16), height: uint64(16), depth: uint64(1))
+    gpuMsgSendDispatch(enc, gpuSelRegisterName("dispatchThreads:threadsPerThreadgroup:"), grid, group)
+    gpuMsgSendVoid0(enc, gpuSelRegisterName("endEncoding"))
+    gpuMsgSendVoid0(cmd, gpuSelRegisterName("commit"))
+    gpuMsgSendVoid0(cmd, gpuSelRegisterName("waitUntilCompleted"))
+    let status: uint64 = gpuMsgSendU64Return(cmd, gpuSelRegisterName("status"))
+    if status != uint64(4):
+        panic("gpu raster: command buffer status " + strings.IntToStr(int32(status)))
+
+fn GpuRasterBgraPtr(g: GpuRaster, useSurfA: bool): ptr =
+    if useSurfA:
+        return GpuRasterContents(g.bgraA)
+    return GpuRasterContents(g.bgraB)
+
+fn GpuRasterDepthPtr(g: GpuRaster, useSurfA: bool): ptr =
+    if useSurfA:
+        return GpuRasterContents(g.depthA)
+    return GpuRasterContents(g.depthB)

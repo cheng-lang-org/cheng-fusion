@@ -1,0 +1,2255 @@
+import std/result
+import std/rawbytes as rawbytes
+import std/strings as strings
+import std/strutils as strutil
+import std/crypto/rand as rand
+import std/net/transports/tcp_syscall as tcp
+import std/rawmem_support
+import cheng/apps/vpn_proxy/vpn_proxy_tun_policy as policy
+import cheng/apps/vpn_proxy/vpn_proxy_exit_dns as exitdns
+import cheng/core/tooling/path as chengpath
+
+# Monotonic clock via the runtime provider bridge (cheng_monotime_ns is supplied
+# by the linked program-support/core-runtime objects). Importing std/times here
+# instead drags Darwin epoch-time provider stubs into the cross-compiled Android
+# object (an inline gettimeofday svc), so reference the bridge symbol directly.
+# Non-blocking readiness probe for the async direct-DNS pump connect phase. Same
+# fd-wait bridge the relay path uses in vpn_proxy_main.cheng; declared here so the
+# pump can poll connect-writable with timeoutMs=0 (never blocking). The recv-readable
+# probe reuses tcp.TcpConnectionWaitReadable(conn, 0) so no extra bridge is needed.
+@importc("cheng_fd_wait_writable_bridge")
+fn VpnTunFdWaitWritable(fd: int32, timeoutMs: int32): int32
+@importc("cheng_monotime_ns")
+fn VpnTunMonotimeNs(): int64
+
+const
+    VpnTunProtoTcp = 6
+    VpnTunProtoUdp = 17
+    VpnTunDarwinAfInet = 2
+    VpnTunDarwinHeaderLen = 4
+    VpnTunFrameModeRawIpv4 = 0
+    VpnTunFrameModeDarwinUtun = 1
+    VpnTunPacketDrop = 0
+    VpnTunPacketUdpForward = 1
+    VpnTunPacketUdpDrop = 2
+    VpnTunPacketTcpOpen = 3
+    VpnTunPacketTcpPayload = 4
+    VpnTunPacketTcpAck = 5
+    VpnTunPacketTcpClose = 6
+    VpnTunPacketTcpSynRetransmit = 7
+    VpnTunEventNone = 0
+    VpnTunEventStarted = 1
+    VpnTunEventStopped = 2
+    VpnTunEventSessionOpen = 3
+    VpnTunEventSessionClose = 4
+    VpnTunEventTraffic = 5
+    VpnTunEventDns = 6
+    VpnTunEventError = 7
+    VpnTunDnsPort = 53
+    VpnTunDnsQtypeA = 1
+    VpnTunDnsQtypeAaaa = 28
+    VpnTunDnsQtypeHttps = 65
+    VpnTunDnsClassIn = 1
+    VpnTunFakeDnsFirstHost = 10
+    VpnTunFakeDnsMaxHost = 65534
+    VpnTunFakeDnsCap = 256
+    VpnTunFakeDnsDomainStride = 64
+    VpnTunSessMetaStride = 48
+    VpnTunSessHostStride = 256
+    VpnTunIpv4VersionIhl = 69
+    VpnTunTcpHeaderNoOptions = 80
+    VpnTunTcpFlagsSynAck = 18
+    VpnTunTcpFlagsAck = 16
+    VpnTunTcpFlagsPshAck = 24
+    VpnTunTcpFlagsFinAck = 17
+    VpnTunTcpFlagsRstAck = 20
+    VpnTunDnsResponseFlagsNoError = 33152
+    VpnTunDnsCompressedQuestionName = 192
+    VpnTunDnsQuestionOffset12 = 12
+    VpnTunDirectResolverHost = "223.5.5.5"
+    VpnTunDirectResolverPort = 53
+    VpnTunDirectDnsTimeoutMs = 2000
+    VpnTunDirectDnsMaxResponseBytes = 4096
+    VpnTunDirectDnsMinTtlSeconds = 60
+    VpnTunDirectDnsMaxTtlSeconds = 3600
+    VpnTunDirectDnsMaxEntries = 1024
+    VpnTunPendingStateConnecting = 0
+    VpnTunPendingStateQuerySent = 1
+    VpnTunPendingStateReceiving = 2
+    VpnTunDirectPendingMaxInFlight = 64
+
+type
+    VpnTunIpv4Packet =
+        valid: bool
+        proto: int32
+        srcIp: int32
+        dstIp: int32
+        srcPort: int32
+        dstPort: int32
+        ipHeaderLen: int32
+        transportHeaderLen: int32
+        payloadOffset: int32
+        payloadLen: int32
+        tcpFlags: int32
+        tcpSeq: int32
+        tcpAck: int32
+        dstIpText: str
+
+    VpnTunPacketDecision =
+        action: int32
+        transport: int32
+        targetHost: str
+        targetPort: int32
+        payloadSkip: int32
+        eventKind: int32
+        uploadBytes: int64
+        downloadBytes: int64
+
+    VpnTunServerSegment =
+        seq: int32
+        payload: rawbytes.Bytes
+
+    VpnTunDirectDnsEntry =
+        domain: str
+        ip: int32
+        expiresAtNs: int64
+
+    VpnTunDnsQuestion =
+        valid: bool
+        domain: str
+        qtype: int32
+        qclass: int32
+        questionEnd: int32
+
+    VpnTunPendingDirectResolve =
+        domain: str
+        conn: tcp.TcpConnectionHandle
+        state: int32
+        queryId: int32
+        sendOffset: int32
+        framedQuery: rawbytes.Bytes
+        recvBuf: rawbytes.Bytes
+        recvExpected: int32
+        expiresAtNs: int64
+        queryPacket: rawbytes.Bytes
+        framePayload: rawbytes.Bytes
+        question: VpnTunDnsQuestion
+
+    VpnTunTcpSession =
+        key: int64
+        srcIp: int32
+        dstIp: int32
+        srcPort: int32
+        dstPort: int32
+        clientSeq: int32
+        clientAck: int32
+        serverSeq: int32
+        state: int32
+        transport: int32
+        targetHost: str
+        serverHistoryBytes: int32
+
+    VpnTunRuntimeStats =
+        activeSessions: int32
+        openedSessions: int64
+        closedSessions: int64
+        uploadBytes: int64
+        downloadBytes: int64
+        droppedPackets: int64
+        dnsQueries: int64
+        errors: int64
+
+    VpnTunRuntime =
+        sessions: VpnTunTcpSession[]
+        serverSegKeys: int64[]
+        serverSegs: VpnTunServerSegment[]
+        fakeDnsDomainArena: rawbytes.Bytes
+        fakeDnsHostArena: rawbytes.Bytes
+        fakeDnsSeenArena: rawbytes.Bytes
+        fakeDnsCount: int32
+        directDnsEntries: VpnTunDirectDnsEntry[]
+        pendingDirectResolves: VpnTunPendingDirectResolve[]
+        stats: VpnTunRuntimeStats
+        routeMode: int32
+        running: bool
+        lastEventKind: int32
+        lastEventText: str
+
+var g_vpnTunDnsDiag: str
+
+fn VpnTunDnsDiagText(): str =
+    return g_vpnTunDnsDiag
+
+@borrows
+fn VpnTunSetDnsDiag(mark: str) =
+    g_vpnTunDnsDiag = strings.CloneStr(mark)
+
+@borrows
+fn VpnTunReadU8(packet: rawbytes.Bytes, offset: int32): int32 =
+    if rawbytes.BytesLen(packet) <= offset:
+        return 0
+    return rawbytes.BytesGet(packet, offset) & 255
+
+@borrows
+fn VpnTunReadU16BE(packet: rawbytes.Bytes, offset: int32): int32 =
+    if rawbytes.BytesLen(packet) < offset + 2:
+        return 0
+    return (VpnTunReadU8(packet, offset) << 8) | VpnTunReadU8(packet, offset + 1)
+
+@borrows
+fn VpnTunReadU32BE(packet: rawbytes.Bytes, offset: int32): int32 =
+    if rawbytes.BytesLen(packet) < offset + 4:
+        return 0
+    var value: int32 = VpnTunReadU8(packet, offset) << 24
+    value = value | (VpnTunReadU8(packet, offset + 1) << 16)
+    value = value | (VpnTunReadU8(packet, offset + 2) << 8)
+    value = value | VpnTunReadU8(packet, offset + 3)
+    return value
+
+@borrows
+fn VpnTunIpTextAt(packet: rawbytes.Bytes, offset: int32): str =
+    # The str[]-literal + Join form corrupts transient element storage on
+    # arm64-android (same class as the fake-DNS question name). This runs for
+    # EVERY parsed packet, so build "a.b.c.d" directly into ONE owned buffer.
+    var buf: rawbytes.Bytes = rawbytes.BytesAlloc(15)
+    var n: int32
+    var i: int32
+    while i < 4:
+        if i > 0:
+            rawbytes.BytesSet(buf, n, 46)
+            n = n + 1
+        let octet: int32 = VpnTunReadU8(packet, offset + i) & 255
+        let hundreds: int32 = octet / 100
+        let rest: int32 = octet - hundreds * 100
+        let tens: int32 = rest / 10
+        let ones: int32 = rest - tens * 10
+        if hundreds > 0:
+            rawbytes.BytesSet(buf, n, 48 + hundreds)
+            n = n + 1
+        if hundreds > 0 or tens > 0:
+            rawbytes.BytesSet(buf, n, 48 + tens)
+            n = n + 1
+        rawbytes.BytesSet(buf, n, 48 + ones)
+        n = n + 1
+        i = i + 1
+    # Free every intermediate raw block: leaked heap blocks accumulate in the
+    # allocation ledger and end in ORC registry-miss fail-stops minutes later.
+    var sliced: rawbytes.Bytes = rawbytes.BytesSlice(buf, 0, n)
+    let outText: str = rawbytes.BytesToString(sliced)
+    rawbytes.BytesFree(sliced)
+    rawbytes.BytesFree(buf)
+    return outText
+
+fn VpnTunIpFromParts(a: int32, b: int32, c: int32, d: int32): int32 =
+    var value: int32 = (a & 255) << 24
+    value = value | ((b & 255) << 16)
+    value = value | ((c & 255) << 8)
+    value = value | (d & 255)
+    return value
+
+fn VpnTunFakeIpForHost(host: int32): int32 =
+    let third: int32 = (host >> 8) & 255
+    let fourth: int32 = host & 255
+    return VpnTunIpFromParts(198, 18, third, fourth)
+
+fn VpnTunFakeIpTextForHost(host: int32): str =
+    # Same corruption class as VpnTunIpTextAt: build the fake address in ONE
+    # owned buffer instead of a str[]-literal + Join.
+    let third: int32 = (host >> 8) & 255
+    let fourth: int32 = host & 255
+    var buf: rawbytes.Bytes = rawbytes.BytesAlloc(15)
+    rawbytes.BytesSet(buf, 0, 49)
+    rawbytes.BytesSet(buf, 1, 57)
+    rawbytes.BytesSet(buf, 2, 56)
+    rawbytes.BytesSet(buf, 3, 46)
+    rawbytes.BytesSet(buf, 4, 49)
+    rawbytes.BytesSet(buf, 5, 56)
+    rawbytes.BytesSet(buf, 6, 46)
+    var n: int32 = 7
+    if third >= 100:
+        rawbytes.BytesSet(buf, n, 48 + third / 100)
+        n = n + 1
+    if third >= 10:
+        rawbytes.BytesSet(buf, n, 48 + (third / 10) - (third / 100) * 10)
+        n = n + 1
+    rawbytes.BytesSet(buf, n, 48 + third - (third / 10) * 10)
+    n = n + 1
+    rawbytes.BytesSet(buf, n, 46)
+    n = n + 1
+    if fourth >= 100:
+        rawbytes.BytesSet(buf, n, 48 + fourth / 100)
+        n = n + 1
+    if fourth >= 10:
+        rawbytes.BytesSet(buf, n, 48 + (fourth / 10) - (fourth / 100) * 10)
+        n = n + 1
+    rawbytes.BytesSet(buf, n, 48 + fourth - (fourth / 10) * 10)
+    n = n + 1
+    var sliced: rawbytes.Bytes = rawbytes.BytesSlice(buf, 0, n)
+    let outText: str = rawbytes.BytesToString(sliced)
+    rawbytes.BytesFree(sliced)
+    rawbytes.BytesFree(buf)
+    return outText
+
+
+@borrows
+fn VpnTunFakeDnsHashHost(domain: str): int32 =
+    # Shift-add rolling hash over the ASCII-folded domain. Deterministic across
+    # worker restarts so a fake IP cached by the phone resolver keeps mapping to
+    # its domain even when this session table starts empty.
+    #
+    # Deliberately multiply-free: the previous FNV-1a form relied on uint32
+    # multiply wraparound, and on arm64-android selected domains hashed OUT of
+    # the [FirstHost, MaxHost] window entirely -- the probe loop never ran and
+    # every such query got a zero-answer reply (deterministic per-domain misses
+    # that the same algorithm passes in a reference interpreter). Shifting and
+    # masking keeps the intermediate value a bounded positive int32 by
+    # construction, so the derived host index always lands inside the pool.
+    var h: int32 = 7
+    for i in 0..<len(domain):
+        var ch: int32 = Int32(domain[i])
+        if ch >= 65 && ch <= 90:
+            ch = ch + 32
+        h = ((h << 5) - h) + (ch & 255)
+    return VpnTunFakeDnsFirstHost + (h & 16383)
+
+
+@borrows
+fn VpnTunAsciiFoldEquals(a: str, b: str): bool =
+    if len(a) != len(b):
+        return false
+    # str 索引在 aarch64 cold codegen 下失配(见 policy StrByteAt 注释), 走 BytesGet。
+    for i in 0..<len(a):
+        if policy.VpnProxyTunLowerAsciiChar(Char(policy.VpnProxyTunStrByteAt(a, i))) != policy.VpnProxyTunLowerAsciiChar(Char(policy.VpnProxyTunStrByteAt(b, i))):
+            return false
+    return true
+
+fn VpnTunSessionKey(srcIp: int32, srcPort: int32, dstIp: int32, dstPort: int32): int64 =
+    var h: int64 = int64(146959810)
+    h = (h * int64(16777619)) + Int64(srcIp)
+    h = (h * int64(16777619)) + Int64(srcPort)
+    h = (h * int64(16777619)) + Int64(dstIp)
+    h = (h * int64(16777619)) + Int64(dstPort)
+    return h
+
+fn VpnTunProtocolSupported(proto: int32): bool =
+    if proto == VpnTunProtoTcp:
+        return true
+    if proto == VpnTunProtoUdp:
+        return true
+    return false
+
+fn VpnTunProtocolRejected(proto: int32): bool =
+    return !VpnTunProtocolSupported(proto)
+
+@borrows
+fn VpnTunParseIpv4(packet: rawbytes.Bytes, out: var VpnTunIpv4Packet): bool =
+    out.valid = false
+    if rawbytes.BytesLen(packet) < 20:
+        return false
+    let verIhl: int32 = VpnTunReadU8(packet, 0)
+    let version: int32 = (verIhl >> 4) & 15
+    let ihl: int32 = (verIhl & 15) * 4
+    if version != 4 || ihl < 20:
+        return false
+    let totalLen: int32 = VpnTunReadU16BE(packet, 2)
+    if totalLen < ihl || totalLen > rawbytes.BytesLen(packet):
+        return false
+    out.proto = VpnTunReadU8(packet, 9)
+    out.srcIp = VpnTunReadU32BE(packet, 12)
+    out.dstIp = VpnTunReadU32BE(packet, 16)
+    out.ipHeaderLen = ihl
+    out.dstIpText = VpnTunIpTextAt(packet, 16)
+    if out.proto == VpnTunProtoUdp:
+        if totalLen < ihl + 8:
+            return false
+        out.srcPort = VpnTunReadU16BE(packet, ihl)
+        out.dstPort = VpnTunReadU16BE(packet, ihl + 2)
+        out.transportHeaderLen = 8
+        out.payloadOffset = ihl + 8
+        out.payloadLen = totalLen - out.payloadOffset
+        out.valid = true
+        return true
+    if out.proto == VpnTunProtoTcp:
+        if totalLen < ihl + 20:
+            return false
+        let tcpOff: int32 = ((VpnTunReadU8(packet, ihl + 12) >> 4) & 15) * 4
+        if tcpOff < 20 || totalLen < ihl + tcpOff:
+            return false
+        out.srcPort = VpnTunReadU16BE(packet, ihl)
+        out.dstPort = VpnTunReadU16BE(packet, ihl + 2)
+        out.tcpSeq = VpnTunReadU32BE(packet, ihl + 4)
+        out.tcpAck = VpnTunReadU32BE(packet, ihl + 8)
+        out.tcpFlags = VpnTunReadU8(packet, ihl + 13)
+        out.transportHeaderLen = tcpOff
+        out.payloadOffset = ihl + tcpOff
+        out.payloadLen = totalLen - out.payloadOffset
+        out.valid = true
+        return true
+    out.valid = true
+    return true
+
+fn VpnTunFindSession(runtime: var VpnTunRuntime, key: int64): int32 =
+    var i: int32
+    while i < g_vpn_tun_sess_count:
+        let mBase: int32 = i * VpnTunSessMetaStride
+        if VpnTunSessReadLong(g_vpn_tun_sess_meta, mBase, 0) == key:
+            return i
+        i = i + 1
+    return -1
+
+# The table used to be a managed seq of structs holding str fields; after the
+# table grew past a handful of entries on arm64-android the stored domains came
+# back corrupted (empty export file, ans=0 for known entries) -- the same
+# managed-storage corruption class as the Join/array transients. Slots now live
+# in two fixed raw arenas: NUL-padded domain bytes and little-endian host ints.
+# Nothing managed is stored, grown, or copied on the DNS hot path.
+
+fn VpnTunFakeSlotDomainLen(runtime: var VpnTunRuntime, slot: int32): int32 =
+    let base: int32 = slot * VpnTunFakeDnsDomainStride
+    var i: int32
+    while i < VpnTunFakeDnsDomainStride:
+        if rawbytes.BytesGet(runtime.fakeDnsDomainArena, base + i) == 0:
+            return i
+        i = i + 1
+    return VpnTunFakeDnsDomainStride
+
+fn VpnTunFakeSlotHost(runtime: var VpnTunRuntime, slot: int32): int32 =
+    let base: int32 = slot * 4
+    let b0: int32 = rawbytes.BytesGet(runtime.fakeDnsHostArena, base) & 255
+    let b1: int32 = rawbytes.BytesGet(runtime.fakeDnsHostArena, base + 1) & 255
+    let b2: int32 = rawbytes.BytesGet(runtime.fakeDnsHostArena, base + 2) & 255
+    let b3: int32 = rawbytes.BytesGet(runtime.fakeDnsHostArena, base + 3) & 255
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+# Fake-DNS slot last-seen timestamps (int64 LE, 8 bytes/slot) for LRU eviction.
+# Kept dependency-free of the session helpers so every use site stays
+# definition-before-use in this single-pass file.
+fn VpnTunFakeSlotSeenGet(runtime: var VpnTunRuntime, slot: int32): int64 =
+    let base: int32 = slot * 8
+    let b0: int64 = int64(rawbytes.BytesGet(runtime.fakeDnsSeenArena, base) & 255)
+    let b1: int64 = int64(rawbytes.BytesGet(runtime.fakeDnsSeenArena, base + 1) & 255)
+    let b2: int64 = int64(rawbytes.BytesGet(runtime.fakeDnsSeenArena, base + 2) & 255)
+    let b3: int64 = int64(rawbytes.BytesGet(runtime.fakeDnsSeenArena, base + 3) & 255)
+    let b4: int64 = int64(rawbytes.BytesGet(runtime.fakeDnsSeenArena, base + 4) & 255)
+    let b5: int64 = int64(rawbytes.BytesGet(runtime.fakeDnsSeenArena, base + 5) & 255)
+    let b6: int64 = int64(rawbytes.BytesGet(runtime.fakeDnsSeenArena, base + 6) & 255)
+    let b7: int64 = int64(rawbytes.BytesGet(runtime.fakeDnsSeenArena, base + 7) & 255)
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+
+fn VpnTunFakeSlotSeenSet(runtime: var VpnTunRuntime, slot: int32, seenNs: int64) =
+    let base: int32 = slot * 8
+    rawbytes.BytesSet(runtime.fakeDnsSeenArena, base, int32(seenNs & 255))
+    rawbytes.BytesSet(runtime.fakeDnsSeenArena, base + 1, int32((seenNs >> 8) & 255))
+    rawbytes.BytesSet(runtime.fakeDnsSeenArena, base + 2, int32((seenNs >> 16) & 255))
+    rawbytes.BytesSet(runtime.fakeDnsSeenArena, base + 3, int32((seenNs >> 24) & 255))
+    rawbytes.BytesSet(runtime.fakeDnsSeenArena, base + 4, int32((seenNs >> 32) & 255))
+    rawbytes.BytesSet(runtime.fakeDnsSeenArena, base + 5, int32((seenNs >> 40) & 255))
+    rawbytes.BytesSet(runtime.fakeDnsSeenArena, base + 6, int32((seenNs >> 48) & 255))
+    rawbytes.BytesSet(runtime.fakeDnsSeenArena, base + 7, int32((seenNs >> 56) & 255))
+
+
+@borrows
+fn VpnTunFakeWriteSlot(runtime: var VpnTunRuntime, slot: int32, host: int32, domain: str) =
+    let base: int32 = slot * VpnTunFakeDnsDomainStride
+    let dLen: int32 = len(domain)
+    var pad: int32 = dLen
+    while pad < VpnTunFakeDnsDomainStride:
+        rawbytes.BytesSet(runtime.fakeDnsDomainArena, base + pad, 0)
+        pad = pad + 1
+    var i: int32
+    while i < dLen:
+        rawbytes.BytesSet(runtime.fakeDnsDomainArena, base + i, Int32(policy.VpnProxyTunLowerAsciiChar(domain[i])))
+        i = i + 1
+    let hBase: int32 = slot * 4
+    rawbytes.BytesSet(runtime.fakeDnsHostArena, hBase, host & 255)
+    rawbytes.BytesSet(runtime.fakeDnsHostArena, hBase + 1, (host >> 8) & 255)
+    rawbytes.BytesSet(runtime.fakeDnsHostArena, hBase + 2, (host >> 16) & 255)
+    rawbytes.BytesSet(runtime.fakeDnsHostArena, hBase + 3, (host >> 24) & 255)
+
+
+@borrows
+fn VpnTunFakeSlotDomainEquals(runtime: var VpnTunRuntime, slot: int32, domain: str): bool =
+    let dLen: int32 = len(domain)
+    if dLen <= 0 || dLen >= VpnTunFakeDnsDomainStride:
+        return false
+    let base: int32 = slot * VpnTunFakeDnsDomainStride
+    if rawbytes.BytesGet(runtime.fakeDnsDomainArena, base + dLen) != 0:
+        return false
+    var i: int32
+    var same: bool = true
+    while i < dLen:
+        if policy.VpnProxyTunLowerAsciiChar(rawbytes.BytesGet(runtime.fakeDnsDomainArena, base + i)) != policy.VpnProxyTunLowerAsciiChar(Int32(domain[i])):
+            same = false
+        i = i + 1
+    return same
+
+
+@borrows
+fn VpnTunFindFakeDnsByDomain(runtime: var VpnTunRuntime, domain: str): int32 =
+    var i: int32
+    while i < runtime.fakeDnsCount:
+        if VpnTunFakeSlotDomainEquals(runtime, i, domain):
+            return i
+        i = i + 1
+    return -1
+
+
+@borrows
+fn VpnTunFindFakeDnsByIpText(runtime: var VpnTunRuntime, ipText: str): int32 =
+    var i: int32
+    while i < runtime.fakeDnsCount:
+        let slotHost: int32 = VpnTunFakeSlotHost(runtime, i)
+        let candidateIpText: str = VpnTunFakeIpTextForHost(slotHost)
+        if candidateIpText == ipText:
+            return i
+        i = i + 1
+    return -1
+
+
+@borrows
+fn VpnTunFakeDomainForIp(runtime: var VpnTunRuntime, ipText: str): str =
+    let index: int32 = VpnTunFindFakeDnsByIpText(runtime, ipText)
+    if index < 0:
+        return ""
+    let dLen: int32 = VpnTunFakeSlotDomainLen(runtime, index)
+    if dLen <= 0:
+        return ""
+    let base: int32 = index * VpnTunFakeDnsDomainStride
+    let view: rawbytes.Bytes = rawbytes.BytesSliceView(runtime.fakeDnsDomainArena, base, dLen)
+    return rawbytes.BytesToString(view)
+
+# First free fake-ip host for this domain: probe hash..MaxHost, then wrap
+# First..hash-1. Callers re-probe after an LRU eviction, and the freed host
+# may sit anywhere in the pool — including below the new domain's hash.
+
+@borrows
+fn VpnTunFakeDnsProbeFreeHost(runtime: var VpnTunRuntime, domain: str): int32 =
+    var host: int32 = VpnTunFakeDnsHashHost(domain)
+    while host <= VpnTunFakeDnsMaxHost:
+        let candidateIpText: str = VpnTunFakeIpTextForHost(host)
+        let byIp: int32 = VpnTunFindFakeDnsByIpText(runtime, candidateIpText)
+        if byIp < 0:
+            return host
+        host = host + 1
+    host = VpnTunFakeDnsFirstHost
+    let stop: int32 = VpnTunFakeDnsHashHost(domain)
+    while host < stop:
+        let candidateIpText: str = VpnTunFakeIpTextForHost(host)
+        let byIp: int32 = VpnTunFindFakeDnsByIpText(runtime, candidateIpText)
+        if byIp < 0:
+            return host
+        host = host + 1
+    return -1
+
+# Table-full fallback: drop the least-recently-used fake-ip mapping and let
+# the caller seat the new domain in its place. Standard fake-ip LRU behavior:
+# apps re-resolve on their next navigation, so an evicted entry costs at most
+# one fresh DNS round trip, while a full table used to silence EVERY new
+# domain (a=0.0.0.0) for the rest of the session.
+
+fn VpnTunFakeDnsEvictLru(runtime: var VpnTunRuntime): bool =
+    if runtime.fakeDnsCount <= 0:
+        return false
+    var oldest: int32
+    var oldestSeen: int64 = VpnTunFakeSlotSeenGet(runtime, 0)
+    var i: int32 = 1
+    while i < runtime.fakeDnsCount:
+        let seen: int64 = VpnTunFakeSlotSeenGet(runtime, i)
+        if seen < oldestSeen:
+            oldestSeen = seen
+            oldest = i
+        i = i + 1
+    var j: int32 = oldest
+    while j < runtime.fakeDnsCount - 1:
+        # Byte-level slot shift: the managed str round-trip
+        # (SliceView+BytesToString+WriteSlot) inside this loop is the exact
+        # arm64 transient-corruption class this file documents, so move the
+        # raw arena bytes directly instead.
+        var k: int32
+        let srcD: int32 = (j + 1) * VpnTunFakeDnsDomainStride
+        let dstD: int32 = j * VpnTunFakeDnsDomainStride
+        while k < VpnTunFakeDnsDomainStride:
+            rawbytes.BytesSet(runtime.fakeDnsDomainArena, dstD + k, rawbytes.BytesGet(runtime.fakeDnsDomainArena, srcD + k))
+            k = k + 1
+        k = 0
+        let srcH: int32 = (j + 1) * 4
+        let dstH: int32 = j * 4
+        while k < 4:
+            rawbytes.BytesSet(runtime.fakeDnsHostArena, dstH + k, rawbytes.BytesGet(runtime.fakeDnsHostArena, srcH + k))
+            k = k + 1
+        k = 0
+        let srcS: int32 = (j + 1) * 8
+        let dstS: int32 = j * 8
+        while k < 8:
+            rawbytes.BytesSet(runtime.fakeDnsSeenArena, dstS + k, rawbytes.BytesGet(runtime.fakeDnsSeenArena, srcS + k))
+            k = k + 1
+        j = j + 1
+    runtime.fakeDnsCount = runtime.fakeDnsCount - 1
+    VpnTunSetDnsDiag("seat_evicted_lru")
+    return true
+
+@borrows
+fn VpnTunRememberFakeDns(runtime: var VpnTunRuntime, domain: str): int32 =
+    # Returns the mapped fake IP (>0), or -1 when the domain cannot be seated.
+    let nowNs: int64 = VpnTunMonotimeNs()
+    VpnTunSetDnsDiag("seat_enter")
+    let existing: int32 = VpnTunFindFakeDnsByDomain(runtime, domain)
+    if existing >= 0:
+        VpnTunSetDnsDiag("seat_existing")
+        VpnTunFakeSlotSeenSet(runtime, existing, nowNs)
+        let slotHost: int32 = VpnTunFakeSlotHost(runtime, existing)
+        if slotHost >= VpnTunFakeDnsFirstHost && slotHost <= VpnTunFakeDnsMaxHost:
+            let mappedExisting: int32 = VpnTunFakeIpForHost(slotHost)
+            if mappedExisting != -1:
+                return mappedExisting
+        # Stored invariant violated (host outside the pool window): treat the
+        # slot as absent and seat a fresh mapping instead of returning a
+        # non-IP. Falls through to the normal hash-probe seating below.
+    # Deterministic hash-derived allocation with linear probing. The first
+    # free slot in the hash order is stable across restarts, so a fake IP
+    # handed out in an earlier session still resolves here. The probe WRAPS
+    # the host pool (hash..Max, then First..hash-1): without the wrap, a host
+    # freed by LRU eviction below the new domain's hash is never found and
+    # that domain answers 0.0.0.0 forever (ratchet failure, live 2026-08-27).
+    var chosenHost: int32 = VpnTunFakeDnsProbeFreeHost(runtime, domain)
+    if chosenHost < 0 or runtime.fakeDnsCount >= VpnTunFakeDnsCap:
+        # Long-lived sessions seat every distinct foreign domain the device
+        # touches (CDN shards, trackers); without eviction the table fills
+        # within hours and every NEW domain answers a=0.0.0.0 forever while
+        # the app still shows connected -- observed live on device after ~2h
+        # (session 7, 2026-08-27). Evict the least-recently-used mapping and
+        # re-probe once; apps re-resolve on their next navigation, so an
+        # evicted entry costs one fresh DNS round trip.
+        if !VpnTunFakeDnsEvictLru(runtime):
+            VpnTunSetDnsDiag("seat_table_full")
+            runtime.stats.errors = runtime.stats.errors + int64(1)
+            runtime.lastEventKind = VpnTunEventError
+            runtime.lastEventText = "vpn tun fake dns table full"
+            return -1
+        chosenHost = VpnTunFakeDnsProbeFreeHost(runtime, domain)
+        if chosenHost < 0:
+            VpnTunSetDnsDiag("seat_probe_exhausted")
+            runtime.stats.errors = runtime.stats.errors + int64(1)
+            runtime.lastEventKind = VpnTunEventError
+            runtime.lastEventText = "vpn tun fake dns address pool exhausted"
+            return -1
+    let slot: int32 = runtime.fakeDnsCount
+    VpnTunFakeWriteSlot(runtime, slot, chosenHost, domain)
+    runtime.fakeDnsCount = slot + 1
+    VpnTunFakeSlotSeenSet(runtime, slot, nowNs)
+    return VpnTunFakeIpForHost(chosenHost)
+
+# Byte-buffer accumulation instead of str[] + Join: the array-based version
+# crossed call boundaries with managed arrays and exported an empty string on
+# arm64-android even when entries existed.
+fn VpnTunFakeDnsExportDomains(runtime: var VpnTunRuntime): str =
+    var buf: rawbytes.Bytes = rawbytes.BytesAlloc(4096)
+    var n: int32
+    var i: int32
+    while i < runtime.fakeDnsCount:
+        let dLen: int32 = VpnTunFakeSlotDomainLen(runtime, i)
+        if dLen > 0:
+            # [fake-ip] ipText|domain 精确配对导出: 重启后导入按原 IP 原位
+            # 复位, netd 缓存永不与映射错位(哈希重探会因碰撞移位)。
+            let slotHost: int32 = VpnTunFakeSlotHost(runtime, i)
+            let ipText: str = VpnTunFakeIpTextForHost(slotHost)
+            let ipLen: int32 = len(ipText)
+            if n + ipLen + dLen + 2 > 4090:
+                break
+            for j in 0..<ipLen:
+                rawbytes.BytesSet(buf, n + j, Int32(ipText[j]) & 255)
+            n = n + ipLen
+            rawbytes.BytesSet(buf, n, 124)
+            n = n + 1
+            let base: int32 = i * VpnTunFakeDnsDomainStride
+            for j in 0..<dLen:
+                rawbytes.BytesSet(buf, n + j, rawbytes.BytesGet(runtime.fakeDnsDomainArena, base + j))
+            n = n + dLen
+            rawbytes.BytesSet(buf, n, 10)
+            n = n + 1
+        i = i + 1
+    let view: rawbytes.Bytes = rawbytes.BytesSliceView(buf, 0, n)
+    let outText: str = rawbytes.BytesToString(view)
+    rawbytes.BytesFree(buf)
+    return outText
+
+@borrows
+# [fake-ip] "198.18.X.Y" → host((X<<8)|Y); malformed → -1
+@borrows
+fn VpnTunFakeHostFromIpText(ipText: str): int32 =
+    # "198.18.X.Y" → (X<<8)|Y; malformed → -1
+    var a: int32 = -1
+    var b: int32 = -1
+    var c: int32 = -1
+    var d: int32 = -1
+    var cur: int32
+    var hasCur: bool
+    var part: int32
+    var i: int32
+    while i < len(ipText):
+        let ch: int32 = Int32(ipText[i]) & 255
+        if ch == 46:
+            if part == 0:
+                a = cur
+            elif part == 1:
+                b = cur
+            elif part == 2:
+                c = cur
+            else:
+                d = cur
+            cur = 0
+            hasCur = false
+            part = part + 1
+        elif ch >= 48 && ch <= 57:
+            cur = (cur * 10) + (ch - 48)
+            hasCur = true
+        else:
+            return -1
+        i = i + 1
+    if hasCur:
+        if part == 0:
+            a = cur
+        elif part == 1:
+            b = cur
+        elif part == 2:
+            c = cur
+        elif part == 3:
+            d = cur
+    if a != 198 || b != 18 || c < 0 || d < 0:
+        return -1
+    return (c * 256) + d
+
+fn VpnTunFakeDnsImportDomains(runtime: var VpnTunRuntime, text: str): int32 =
+    var count: int32
+    var start: int32
+    var i: int32
+    while i <= len(text):
+        var splitHere: bool
+        if i == len(text):
+            splitHere = true
+        else:
+            if text[i] == '\n':
+                splitHere = true
+            elif text[i] == '\r':
+                splitHere = true
+        if splitHere:
+            let rawLine: str = strings.SliceBytes(text, start, i - start)
+            let domain: str = strutil.Strip(rawLine)
+            if len(domain) > 0:
+                # [fake-ip] ip|domain 精确配对导入: 原位复位(哈希重探会因
+                # 碰撞移位与 netd 缓存错位)。无 '|' 的旧行回退哈希探测。
+                var pipeIdx: int32 = -1
+                var scanIdx: int32 = len(rawLine) - 1
+                while scanIdx >= 0:
+                    if Int32(rawLine[scanIdx]) == 124:
+                        pipeIdx = scanIdx
+                        scanIdx = -1
+                        continue
+                    scanIdx = scanIdx - 1
+                if pipeIdx > 0:
+                    let ipPart: str = strings.SliceBytes(rawLine, 0, pipeIdx)
+                    let domPart: str = strings.SliceBytes(rawLine, pipeIdx + 1, len(rawLine) - pipeIdx - 1)
+                    let host: int32 = VpnTunFakeHostFromIpText(ipPart)
+                    if host >= VpnTunFakeDnsFirstHost && host <= VpnTunFakeDnsMaxHost && len(domPart) > 0:
+                        VpnTunFakeWriteSlot(runtime, runtime.fakeDnsCount, host, domPart)
+                        runtime.fakeDnsCount = runtime.fakeDnsCount + 1
+                        count = count + 1
+                else:
+                    let mappedIp: int32 = VpnTunRememberFakeDns(runtime, domain)
+                    if mappedIp != -1:
+                        count = count + 1
+            start = i + 1
+        i = i + 1
+    return count
+
+fn VpnTunFreeServerSegmentsForKey(runtime: var VpnTunRuntime, sessionKey: int64) =
+    var keptKeys: int64[]
+    keptKeys = []
+    var keptSegs: VpnTunServerSegment[]
+    keptSegs = []
+    for i in 0..<runtime.serverSegs.len:
+        if runtime.serverSegKeys[i] == sessionKey:
+            var dropSegment: VpnTunServerSegment = runtime.serverSegs[i]
+            var segmentPayload: Bytes = dropSegment.payload
+            rawbytes.BytesFree(segmentPayload)
+        else:
+            var keepKey: int64 = runtime.serverSegKeys[i]
+            var keepSegment: VpnTunServerSegment = runtime.serverSegs[i]
+            add(keptKeys, keepKey)
+            add(keptSegs, keepSegment)
+    runtime.serverSegKeys = keptKeys
+    runtime.serverSegs = keptSegs
+
+fn VpnTunRemoveSessionAt(runtime: var VpnTunRuntime, dropIndex: int32) =
+    if dropIndex >= 0 && dropIndex < g_vpn_tun_sess_count:
+        let mBase: int32 = dropIndex * VpnTunSessMetaStride
+        let dropKey: int64 = VpnTunSessReadLong(g_vpn_tun_sess_meta, mBase, 0)
+        VpnTunFreeServerSegmentsForKey(runtime, dropKey)
+        var j: int32 = dropIndex
+        while j < g_vpn_tun_sess_count - 1:
+            VpnTunSessCopySlot(j + 1, j)
+            j = j + 1
+        g_vpn_tun_sess_count = g_vpn_tun_sess_count - 1
+
+@borrows
+fn VpnTunDropSessionForPacket(runtime: var VpnTunRuntime, packet: rawbytes.Bytes): bool =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(packet, parsed):
+        return false
+    if parsed.proto != VpnTunProtoTcp:
+        return false
+    let key: int64 = VpnTunSessionKey(parsed.srcIp, parsed.srcPort, parsed.dstIp, parsed.dstPort)
+    let index: int32 = VpnTunFindSession(runtime, key)
+    if index < 0:
+        return false
+    VpnTunRemoveSessionAt(runtime, index)
+    runtime.stats.closedSessions = runtime.stats.closedSessions + int64(1)
+    runtime.stats.activeSessions = g_vpn_tun_sess_count
+    runtime.lastEventKind = VpnTunEventSessionClose
+    runtime.lastEventText = parsed.dstIpText
+    return true
+
+fn VpnTunDropAckedServerSegments(runtime: var VpnTunRuntime, sessionKey: int64, ack: int32) =
+    var keptKeys: int64[]
+    keptKeys = []
+    var keptSegs: VpnTunServerSegment[]
+    keptSegs = []
+    var keptBytes: int32
+    for i in 0..<runtime.serverSegs.len:
+        if runtime.serverSegKeys[i] == sessionKey:
+            var segment = runtime.serverSegs[i]
+            let endSeq: int32 = segment.seq + rawbytes.BytesLen(segment.payload)
+            if endSeq > ack:
+                add(keptSegs, segment)
+                var keepKey: int64 = runtime.serverSegKeys[i]
+                add(keptKeys, keepKey)
+                keptBytes = keptBytes + rawbytes.BytesLen(segment.payload)
+            else:
+                var dropPayload: Bytes = segment.payload
+                rawbytes.BytesFree(dropPayload)
+        else:
+            var otherKey: int64 = runtime.serverSegKeys[i]
+            var otherSegment: VpnTunServerSegment = runtime.serverSegs[i]
+            add(keptKeys, otherKey)
+            add(keptSegs, otherSegment)
+    runtime.serverSegKeys = keptKeys
+    runtime.serverSegs = keptSegs
+
+fn VpnTunRememberServerSegmentRange(runtime: var VpnTunRuntime,
+                                    sessionKey: int64,
+                                    seq: int32,
+                                    src: rawbytes.Bytes,
+                                    srcOffset: int32,
+                                    count: int32) =
+    # [rss-batch] 从 src[srcOffset..srcOffset+count) 直接 owned 拷贝入段表,
+    # 免去先 BytesSlice 一份 piece 再整份拷贝的双重分配(原 piece 还泄漏)。
+    if count <= 0:
+        return
+    var segLimit: int32 = policy.VpnProxyTunMaxRetransmitSegments()
+    var byteLimit: int32 = policy.VpnProxyTunMaxRetransmitBytes()
+    var keyCount: int32
+    var totalBytes: int32
+    for i in 0..<runtime.serverSegs.len:
+        if runtime.serverSegKeys[i] == sessionKey:
+            keyCount = keyCount + 1
+            var countSegment: VpnTunServerSegment = runtime.serverSegs[i]
+            totalBytes = totalBytes + rawbytes.BytesLen(countSegment.payload)
+    if keyCount >= segLimit:
+        return
+    if totalBytes + count > byteLimit:
+        return
+    var outSeg: VpnTunServerSegment
+    outSeg.seq = seq
+    var segPayloadOwned: Bytes = rawbytes.BytesAlloc(count)
+    rawbytes.BytesCopyRangeInto(segPayloadOwned, 0, src, srcOffset, count)
+    outSeg.payload = segPayloadOwned
+    var newKey: int64 = sessionKey
+    add(runtime.serverSegKeys, newKey)
+    add(runtime.serverSegs, outSeg)
+
+@borrows
+fn VpnTunRememberServerSegment(runtime: var VpnTunRuntime, sessionKey: int64, seq: int32, payload: rawbytes.Bytes) =
+    VpnTunRememberServerSegmentRange(runtime, sessionKey, seq, payload, 0, rawbytes.BytesLen(payload))
+
+@borrows
+fn VpnTunRecordServerPayload(runtime: var VpnTunRuntime,
+                               srcIp: int32,
+                               srcPort: int32,
+                               dstIp: int32,
+                               dstPort: int32,
+                               seq: int32,
+                               payload: rawbytes.Bytes): bool =
+    if rawbytes.BytesLen(payload) <= 0:
+        return true
+    let key: int64 = VpnTunSessionKey(srcIp, srcPort, dstIp, dstPort)
+    let index: int32 = VpnTunFindSession(runtime, key)
+    if index < 0:
+        runtime.stats.errors = runtime.stats.errors + int64(1)
+        runtime.lastEventKind = VpnTunEventError
+        runtime.lastEventText = "vpn tun dataplane server payload without session"
+        return false
+    var session = VpnTunSessionAt(index)
+    VpnTunRememberServerSegment(runtime, session.key, seq, payload)
+    VpnTunStoreSessionAt(index, session)
+    runtime.stats.downloadBytes = runtime.stats.downloadBytes + Int64(rawbytes.BytesLen(payload))
+    runtime.lastEventKind = VpnTunEventTraffic
+    runtime.lastEventText = VpnTunSessionAt(index).targetHost
+    return true
+
+# TCP session registry lives in module-level storage so every dataplane
+# entry point shares one explicit identity. Struct-resident state passed by
+# `var` was observed diverging across call boundaries on aarch64 (see
+# scratchpad/HANDOFF-vpn-e2e-round2.md); module globals keep a single
+# storage identity regardless of parameter passing.
+# Session table storage: the managed-seq-of-structs form reproduced the fake-DNS
+# corruption class under load (stored targetHost strings came back as garbage
+# like "msquic:accept:<port>" on the wire, and ORC flagged double releases).
+# Slots now live in two fixed raw arenas -- packed little-endian scalars and
+# NUL-padded host bytes. Nothing managed is stored, grown, or copied here.
+var g_vpn_tun_sess_meta: rawbytes.Bytes
+var g_vpn_tun_sess_hosts: rawbytes.Bytes
+var g_vpn_tun_sess_count: int32
+
+fn VpnTunSessWriteInt(buf: var rawbytes.Bytes, base: int32, off: int32, value: int32) =
+    rawbytes.BytesSet(buf, base + off, value & 255)
+    rawbytes.BytesSet(buf, base + off + 1, (value >> 8) & 255)
+    rawbytes.BytesSet(buf, base + off + 2, (value >> 16) & 255)
+    rawbytes.BytesSet(buf, base + off + 3, (value >> 24) & 255)
+
+fn VpnTunSessReadInt(buf: var rawbytes.Bytes, base: int32, off: int32): int32 =
+    let b0: int32 = rawbytes.BytesGet(buf, base + off) & 255
+    let b1: int32 = rawbytes.BytesGet(buf, base + off + 1) & 255
+    let b2: int32 = rawbytes.BytesGet(buf, base + off + 2) & 255
+    let b3: int32 = rawbytes.BytesGet(buf, base + off + 3) & 255
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+fn VpnTunSessWriteLong(buf: var rawbytes.Bytes, base: int32, off: int32, value: int64) =
+    VpnTunSessWriteInt(buf, base, off, value & 4294967295)
+    VpnTunSessWriteInt(buf, base, off + 4, (value >> 32) & 4294967295)
+
+fn VpnTunSessReadLong(buf: var rawbytes.Bytes, base: int32, off: int32): int64 =
+    let lo: int64 = int64(VpnTunSessReadInt(buf, base, off) & 4294967295)
+    let hi: int64 = int64(VpnTunSessReadInt(buf, base, off + 4) & 4294967295)
+    return lo | (hi << 32)
+
+
+@borrows
+fn VpnTunSessWriteSlot(index: int32, session: VpnTunTcpSession) =
+    let mBase: int32 = index * VpnTunSessMetaStride
+    VpnTunSessWriteLong(g_vpn_tun_sess_meta, mBase, 0, session.key)
+    VpnTunSessWriteInt(g_vpn_tun_sess_meta, mBase, 8, session.srcIp)
+    VpnTunSessWriteInt(g_vpn_tun_sess_meta, mBase, 12, session.dstIp)
+    VpnTunSessWriteInt(g_vpn_tun_sess_meta, mBase, 16, session.srcPort)
+    VpnTunSessWriteInt(g_vpn_tun_sess_meta, mBase, 20, session.dstPort)
+    VpnTunSessWriteInt(g_vpn_tun_sess_meta, mBase, 24, session.clientSeq)
+    VpnTunSessWriteInt(g_vpn_tun_sess_meta, mBase, 28, session.clientAck)
+    VpnTunSessWriteInt(g_vpn_tun_sess_meta, mBase, 32, session.serverSeq)
+    VpnTunSessWriteInt(g_vpn_tun_sess_meta, mBase, 36, session.state)
+    VpnTunSessWriteInt(g_vpn_tun_sess_meta, mBase, 40, session.transport)
+    VpnTunSessWriteInt(g_vpn_tun_sess_meta, mBase, 44, session.serverHistoryBytes)
+    let hBase: int32 = index * VpnTunSessHostStride
+    let hLen: int32 = len(session.targetHost)
+    var pad: int32 = hLen
+    while pad < VpnTunSessHostStride:
+        rawbytes.BytesSet(g_vpn_tun_sess_hosts, hBase + pad, 0)
+        pad = pad + 1
+    if hLen > 0:
+        if hLen > VpnTunSessHostStride - 1:
+            return
+        var hostView: rawbytes.Bytes = rawbytes.BytesView(StrDataPtr(session.targetHost), hLen)
+        rawbytes.BytesCopyRangeInto(g_vpn_tun_sess_hosts, hBase, hostView, 0, hLen)
+
+fn VpnTunSessLoadSession(index: int32): VpnTunTcpSession =
+    var outSession: VpnTunTcpSession
+    let mBase: int32 = index * VpnTunSessMetaStride
+    outSession.key = VpnTunSessReadLong(g_vpn_tun_sess_meta, mBase, 0)
+    outSession.srcIp = VpnTunSessReadInt(g_vpn_tun_sess_meta, mBase, 8)
+    outSession.dstIp = VpnTunSessReadInt(g_vpn_tun_sess_meta, mBase, 12)
+    outSession.srcPort = VpnTunSessReadInt(g_vpn_tun_sess_meta, mBase, 16)
+    outSession.dstPort = VpnTunSessReadInt(g_vpn_tun_sess_meta, mBase, 20)
+    outSession.clientSeq = VpnTunSessReadInt(g_vpn_tun_sess_meta, mBase, 24)
+    outSession.clientAck = VpnTunSessReadInt(g_vpn_tun_sess_meta, mBase, 28)
+    outSession.serverSeq = VpnTunSessReadInt(g_vpn_tun_sess_meta, mBase, 32)
+    outSession.state = VpnTunSessReadInt(g_vpn_tun_sess_meta, mBase, 36)
+    outSession.transport = VpnTunSessReadInt(g_vpn_tun_sess_meta, mBase, 40)
+    outSession.serverHistoryBytes = VpnTunSessReadInt(g_vpn_tun_sess_meta, mBase, 44)
+    let hBase: int32 = index * VpnTunSessHostStride
+    var hLen: int32
+    while hLen < VpnTunSessHostStride:
+        if rawbytes.BytesGet(g_vpn_tun_sess_hosts, hBase + hLen) == 0:
+            break
+        hLen = hLen + 1
+    if hLen > 0:
+        let view: rawbytes.Bytes = rawbytes.BytesSliceView(g_vpn_tun_sess_hosts, hBase, hLen)
+        outSession.targetHost = rawbytes.BytesToString(view)
+    return outSession
+
+fn VpnTunSessCopySlot(srcIndex: int32, dstIndex: int32) =
+    let srcM: int32 = srcIndex * VpnTunSessMetaStride
+    let dstM: int32 = dstIndex * VpnTunSessMetaStride
+    var k: int32
+    while k < VpnTunSessMetaStride:
+        rawbytes.BytesSet(g_vpn_tun_sess_meta, dstM + k, rawbytes.BytesGet(g_vpn_tun_sess_meta, srcM + k))
+        k = k + 1
+    let srcH: int32 = srcIndex * VpnTunSessHostStride
+    let dstH: int32 = dstIndex * VpnTunSessHostStride
+    k = 0
+    while k < VpnTunSessHostStride:
+        rawbytes.BytesSet(g_vpn_tun_sess_hosts, dstH + k, rawbytes.BytesGet(g_vpn_tun_sess_hosts, srcH + k))
+        k = k + 1
+
+fn VpnTunSessionsCount(): int32 =
+    return g_vpn_tun_sess_count
+
+fn VpnTunSessionAt(index: int32): VpnTunTcpSession =
+    return VpnTunSessLoadSession(index)
+
+@borrows
+fn VpnTunStoreSessionAt(index: int32, session: VpnTunTcpSession) =
+    VpnTunSessWriteSlot(index, session)
+
+@borrows
+fn VpnTunAddSession(session: VpnTunTcpSession): bool =
+    if g_vpn_tun_sess_count >= policy.VpnProxyTunSessionLimit():
+        return false
+    VpnTunSessWriteSlot(g_vpn_tun_sess_count, session)
+    g_vpn_tun_sess_count = g_vpn_tun_sess_count + 1
+    return true
+
+fn VpnTunClearSessions() =
+    g_vpn_tun_sess_count = 0
+
+fn VpnTunInitRuntime(out: var VpnTunRuntime) =
+    VpnTunClearSessions()
+    out.sessions = []
+    g_vpn_tun_sess_meta = rawbytes.BytesAlloc(policy.VpnProxyTunSessionLimit() * VpnTunSessMetaStride)
+    g_vpn_tun_sess_hosts = rawbytes.BytesAlloc(policy.VpnProxyTunSessionLimit() * VpnTunSessHostStride)
+    g_vpn_tun_sess_count = 0
+    out.fakeDnsDomainArena = rawbytes.BytesAlloc(VpnTunFakeDnsCap * VpnTunFakeDnsDomainStride)
+    out.fakeDnsHostArena = rawbytes.BytesAlloc(VpnTunFakeDnsCap * 4)
+    out.fakeDnsSeenArena = rawbytes.BytesAlloc(VpnTunFakeDnsCap * 8)
+    out.fakeDnsCount = 0
+    out.directDnsEntries = []
+    out.pendingDirectResolves = []
+    out.routeMode = policy.VpnProxyTunRouteModeFast
+    out.running = true
+    out.lastEventKind = VpnTunEventStarted
+    out.lastEventText = "vpn tun dataplane started"
+
+fn VpnTunSetRouteMode(runtime: var VpnTunRuntime, routeMode: int32) =
+    if routeMode == policy.VpnProxyTunRouteModeGlobal:
+        runtime.routeMode = policy.VpnProxyTunRouteModeGlobal
+        return
+    runtime.routeMode = policy.VpnProxyTunRouteModeFast
+
+fn VpnTunStopRuntime(runtime: var VpnTunRuntime) =
+    for i in 0..<runtime.serverSegs.len:
+        var oldSegment: VpnTunServerSegment = runtime.serverSegs[i]
+        var oldPayload: Bytes = oldSegment.payload
+        rawbytes.BytesFree(oldPayload)
+    runtime.serverSegKeys = []
+    runtime.serverSegs = []
+    VpnTunClearSessions()
+    rawbytes.BytesFree(g_vpn_tun_sess_meta)
+    rawbytes.BytesFree(g_vpn_tun_sess_hosts)
+    g_vpn_tun_sess_count = 0
+    rawbytes.BytesFree(runtime.fakeDnsDomainArena)
+    rawbytes.BytesFree(runtime.fakeDnsHostArena)
+    runtime.fakeDnsCount = 0
+    runtime.directDnsEntries = []
+    for i in 0..<runtime.pendingDirectResolves.len:
+        var pending: VpnTunPendingDirectResolve = runtime.pendingDirectResolves[i]
+        VpnTunPendingFree(pending)
+        runtime.pendingDirectResolves[i] = pending
+    runtime.pendingDirectResolves = []
+    runtime.stats.activeSessions = 0
+    runtime.running = false
+    runtime.lastEventKind = VpnTunEventStopped
+    runtime.lastEventText = "vpn tun dataplane stopped"
+
+@borrows
+fn VpnTunDecidePacket(runtime: var VpnTunRuntime,
+                      packet: rawbytes.Bytes,
+                      fakeDomain: str,
+                      out: var VpnTunPacketDecision): bool =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(packet, parsed):
+        runtime.stats.droppedPackets = runtime.stats.droppedPackets + int64(1)
+        runtime.lastEventKind = VpnTunEventError
+        runtime.lastEventText = "vpn tun dataplane invalid packet"
+        out.action = VpnTunPacketDrop
+        return false
+
+    if parsed.proto == VpnTunProtoUdp:
+        runtime.stats.droppedPackets = runtime.stats.droppedPackets + int64(1)
+        out.action = VpnTunPacketUdpDrop
+        out.eventKind = VpnTunEventTraffic
+        return true
+
+    if parsed.proto != VpnTunProtoTcp:
+        runtime.stats.droppedPackets = runtime.stats.droppedPackets + int64(1)
+        runtime.stats.errors = runtime.stats.errors + int64(1)
+        runtime.lastEventKind = VpnTunEventError
+        runtime.lastEventText = "vpn tun dataplane unsupported protocol"
+        out.action = VpnTunPacketDrop
+        return true
+
+    let key: int64 = VpnTunSessionKey(parsed.srcIp, parsed.srcPort, parsed.dstIp, parsed.dstPort)
+    let index: int32 = VpnTunFindSession(runtime, key)
+    let isSyn: bool = (parsed.tcpFlags & 2) != 0
+    let isAck: bool = (parsed.tcpFlags & 16) != 0
+    let isFin: bool = (parsed.tcpFlags & 1) != 0
+    let isRst: bool = (parsed.tcpFlags & 4) != 0
+
+    if isSyn && !isAck:
+        if index >= 0:
+            out.action = VpnTunPacketTcpSynRetransmit
+            out.transport = VpnTunSessionAt(index).transport
+            out.targetHost = VpnTunSessionAt(index).targetHost
+            out.targetPort = VpnTunSessionAt(index).dstPort
+            return true
+        var session: VpnTunTcpSession
+        session.key = key
+        session.srcIp = parsed.srcIp
+        session.dstIp = parsed.dstIp
+        session.srcPort = parsed.srcPort
+        session.dstPort = parsed.dstPort
+        session.clientSeq = parsed.tcpSeq + 1
+        session.clientAck = parsed.tcpAck
+        session.serverSeq = 1
+        session.state = 2
+        # [mtproto-diag] 非 fake-IP 的 TCP SYN: 打印目标 IP+port 判定去向。
+        if runtime.routeMode == policy.VpnProxyTunRouteModeGlobal && ! policy.VpnProxyTunIsFakeIp(parsed.dstIpText):
+            VpnProxyTunRecordRelayError(strutil.Join(["RAWSYN dst=", strings.CloneStr(parsed.dstIpText), " port=", strings.Int64ToStr(int64(parsed.dstPort))], ""))
+        var effectiveFakeDomain: str = fakeDomain
+        if len(effectiveFakeDomain) <= 0:
+            effectiveFakeDomain = VpnTunFakeDomainForIp(runtime, parsed.dstIpText)
+        if len(effectiveFakeDomain) <= 0 && policy.VpnProxyTunIsFakeIp(parsed.dstIpText) && runtime.routeMode == policy.VpnProxyTunRouteModeGlobal:
+            # Stale fake IP cached by the phone resolver across worker
+            # restarts. Global mode keeps a session with an empty target;
+            # the ClientHello SNI recovers the real destination before the
+            # exit connection is dialed.
+            session.transport = policy.VpnProxyTunTransportDirectSs
+            session.targetHost = ""
+            out.action = VpnTunPacketTcpOpen
+            out.targetHost = ""
+            out.targetPort = parsed.dstPort
+            out.eventKind = VpnTunEventSessionOpen
+            if g_vpn_tun_sess_count < policy.VpnProxyTunSessionLimit():
+                VpnTunAddSession(session)
+                return true
+            runtime.stats.droppedPackets = runtime.stats.droppedPackets + int64(1)
+            out.action = VpnTunPacketDrop
+            return true
+        if len(effectiveFakeDomain) <= 0:
+            if policy.VpnProxyTunIsFakeIp(parsed.dstIpText):
+                runtime.stats.droppedPackets = runtime.stats.droppedPackets + int64(1)
+                runtime.stats.errors = runtime.stats.errors + int64(1)
+                runtime.lastEventKind = VpnTunEventError
+                runtime.lastEventText = "vpn tun dataplane unknown fake ip"
+                out.action = VpnTunPacketTcpOpen
+                out.targetHost = ""
+                out.targetPort = parsed.dstPort
+                out.eventKind = VpnTunEventError
+                # The SNI-recovery accept path needs the session row to
+                # exist; TcpOpen without a stored session blackholes.
+                if g_vpn_tun_sess_count < policy.VpnProxyTunSessionLimit():
+                    VpnTunAddSession(session)
+                    return true
+        session.transport = policy.VpnProxyTunTransportForTargetMode(parsed.dstIpText, effectiveFakeDomain, runtime.routeMode)
+        if len(effectiveFakeDomain) > 0:
+            session.targetHost = strings.CloneStr(effectiveFakeDomain)
+        elif session.transport == policy.VpnProxyTunTransportDirectSs:
+            # [raw-ip-tunnel] fast 模式命中 ShouldProxyIpDirectly 的裸 IP
+            # (电报 DC 149.154/91.108、Google 直连段等): 必须按字面地址中继。
+            # 旧逻辑只在 Global 模式赋字面 IP → fast 模式空目标即拨即 RST,
+            # 电报 App 永远"连接中"(浏览器走 fake-IP 域名不受影响, 掩盖此洞)。
+            session.targetHost = strings.CloneStr(parsed.dstIpText)
+        elif runtime.routeMode == policy.VpnProxyTunRouteModeGlobal:
+            # Global mode relays unknown raw-IP flows by literal address.
+            session.targetHost = strings.CloneStr(parsed.dstIpText)
+        let sessionHostText: str = strings.CloneStr(session.targetHost)
+        let outTransport: int32 = session.transport
+        let outTargetHost: str = strings.CloneStr(session.targetHost)
+        let outTargetPort: int32 = parsed.dstPort
+        if g_vpn_tun_sess_count >= policy.VpnProxyTunSessionLimit():
+            runtime.stats.droppedPackets = runtime.stats.droppedPackets + int64(1)
+            out.action = VpnTunPacketDrop
+            return true
+        VpnTunAddSession(session)
+        runtime.stats.openedSessions = runtime.stats.openedSessions + int64(1)
+        runtime.stats.activeSessions = g_vpn_tun_sess_count
+        runtime.lastEventKind = VpnTunEventSessionOpen
+        runtime.lastEventText = sessionHostText
+        out.action = VpnTunPacketTcpOpen
+        out.transport = outTransport
+        out.targetHost = outTargetHost
+        out.targetPort = outTargetPort
+        out.eventKind = VpnTunEventSessionOpen
+        return true
+
+    if index < 0:
+        out.action = VpnTunPacketDrop
+        return true
+
+    var ackSession = VpnTunSessionAt(index)
+    ackSession.clientAck = parsed.tcpAck
+    VpnTunDropAckedServerSegments(runtime, ackSession.key, parsed.tcpAck)
+    VpnTunStoreSessionAt(index, ackSession)
+
+    if isRst:
+        let _ = VpnTunDropSessionForPacket(runtime, packet)
+        out.action = VpnTunPacketTcpClose
+        out.eventKind = VpnTunEventSessionClose
+        return true
+
+    if isFin:
+        var finSession: VpnTunTcpSession = VpnTunSessionAt(index)
+        let finSeq: int32 = parsed.tcpSeq + parsed.payloadLen + 1
+        if finSeq > finSession.clientSeq:
+            finSession.clientSeq = finSeq
+        finSession.clientAck = parsed.tcpAck
+        finSession.state = 3
+        VpnTunStoreSessionAt(index, finSession)
+        runtime.lastEventKind = VpnTunEventSessionClose
+        runtime.lastEventText = parsed.dstIpText
+        out.action = VpnTunPacketTcpClose
+        out.eventKind = VpnTunEventSessionClose
+        return true
+
+    if parsed.payloadLen > 0:
+        let expectedSeq: int32 = VpnTunSessionAt(index).clientSeq
+        let packetEndSeq: int32 = parsed.tcpSeq + parsed.payloadLen
+        if packetEndSeq <= expectedSeq:
+            out.action = VpnTunPacketTcpAck
+            out.transport = VpnTunSessionAt(index).transport
+            out.targetHost = VpnTunSessionAt(index).targetHost
+            out.targetPort = VpnTunSessionAt(index).dstPort
+            return true
+        if parsed.tcpSeq > expectedSeq:
+            out.action = VpnTunPacketTcpAck
+            out.transport = VpnTunSessionAt(index).transport
+            out.targetHost = VpnTunSessionAt(index).targetHost
+            out.targetPort = VpnTunSessionAt(index).dstPort
+            return true
+        if parsed.tcpSeq < expectedSeq:
+            out.payloadSkip = expectedSeq - parsed.tcpSeq
+        var seqSession: VpnTunTcpSession = VpnTunSessionAt(index)
+        seqSession.clientSeq = packetEndSeq
+        VpnTunStoreSessionAt(index, seqSession)
+        runtime.stats.uploadBytes = runtime.stats.uploadBytes + Int64(parsed.payloadLen)
+        runtime.lastEventKind = VpnTunEventTraffic
+        runtime.lastEventText = VpnTunSessionAt(index).targetHost
+        out.action = VpnTunPacketTcpPayload
+        out.transport = VpnTunSessionAt(index).transport
+        out.targetHost = VpnTunSessionAt(index).targetHost
+        out.targetPort = VpnTunSessionAt(index).dstPort
+        out.eventKind = VpnTunEventTraffic
+        out.uploadBytes = Int64(parsed.payloadLen)
+        return true
+
+    out.action = VpnTunPacketTcpAck
+    out.transport = VpnTunSessionAt(index).transport
+    out.targetHost = VpnTunSessionAt(index).targetHost
+    out.targetPort = VpnTunSessionAt(index).dstPort
+    return true
+
+fn VpnTunWriteU8(buf: var rawbytes.Bytes, offset: int32, value: int32) =
+    rawbytes.BytesSet(buf, offset, value & 255)
+
+fn VpnTunWriteU16BE(buf: var rawbytes.Bytes, offset: int32, value: int32) =
+    VpnTunWriteU8(buf, offset, (value >> 8) & 255)
+    VpnTunWriteU8(buf, offset + 1, value & 255)
+
+fn VpnTunWriteU32BE(buf: var rawbytes.Bytes, offset: int32, value: int32) =
+    VpnTunWriteU8(buf, offset, (value >> 24) & 255)
+    VpnTunWriteU8(buf, offset + 1, (value >> 16) & 255)
+    VpnTunWriteU8(buf, offset + 2, (value >> 8) & 255)
+    VpnTunWriteU8(buf, offset + 3, value & 255)
+
+@borrows
+fn VpnTunChecksumBytes(data: rawbytes.Bytes, offset: int32, count: int32): int64 =
+    var sum: int64
+    var i: int32
+    while i + 1 < count:
+        let word: int32 = (VpnTunReadU8(data, offset + i) << 8) |
+                          VpnTunReadU8(data, offset + i + 1)
+        sum = sum + int64(word)
+        i = i + 2
+    if i < count:
+        sum = sum + int64(VpnTunReadU8(data, offset + i) << 8)
+    return sum
+
+fn VpnTunChecksumFold(sumRaw: int64): int32 =
+    var sum: int64 = sumRaw
+    while sum > int64(65535):
+        sum = (sum & int64(65535)) + (sum >> int64(16))
+    return int32(int64(65535) - (sum & int64(65535))) & 65535
+
+@borrows
+fn VpnTunPseudoHeaderChecksum(packet: rawbytes.Bytes, proto: int32, transportLen: int32): int64 =
+    var sum: int64
+    sum = sum + int64(VpnTunReadU16BE(packet, 12))
+    sum = sum + int64(VpnTunReadU16BE(packet, 14))
+    sum = sum + int64(VpnTunReadU16BE(packet, 16))
+    sum = sum + int64(VpnTunReadU16BE(packet, 18))
+    sum = sum + int64(proto)
+    sum = sum + int64(transportLen)
+    return sum
+
+
+@borrows
+fn VpnTunBuildIpv4HeaderAt(out: var rawbytes.Bytes,
+                           base: int32,
+                           totalLen: int32,
+                           proto: int32,
+                           srcIp: int32,
+                           dstIp: int32) =
+    VpnTunWriteU8(out, base, VpnTunIpv4VersionIhl)
+    VpnTunWriteU8(out, base + 1, 0)
+    VpnTunWriteU16BE(out, base + 2, totalLen)
+    VpnTunWriteU16BE(out, base + 4, 0)
+    VpnTunWriteU16BE(out, base + 6, 0)
+    VpnTunWriteU8(out, base + 8, 64)
+    VpnTunWriteU8(out, base + 9, proto)
+    VpnTunWriteU16BE(out, base + 10, 0)
+    VpnTunWriteU32BE(out, base + 12, srcIp)
+    VpnTunWriteU32BE(out, base + 16, dstIp)
+    VpnTunWriteU16BE(out, base + 10, VpnTunChecksumFold(VpnTunChecksumBytes(out, base, 20)))
+
+@borrows
+fn VpnTunBuildIpv4Header(out: var rawbytes.Bytes,
+                         totalLen: int32,
+                         proto: int32,
+                         srcIp: int32,
+                         dstIp: int32) =
+    VpnTunBuildIpv4HeaderAt(out, 0, totalLen, proto, srcIp, dstIp)
+
+@borrows
+fn VpnTunTcpChecksum(packet: rawbytes.Bytes, tcpOffset: int32, tcpLen: int32): int32 =
+    let sum: int64 = VpnTunPseudoHeaderChecksum(packet, VpnTunProtoTcp, tcpLen) +
+                     VpnTunChecksumBytes(packet, tcpOffset, tcpLen)
+    return VpnTunChecksumFold(sum)
+
+@borrows
+fn VpnTunTcpChecksumAt(packet: rawbytes.Bytes, ipBase: int32, tcpLen: int32): int32 =
+    # [rss-batch] 任意 IP 包基址的 TCP checksum: 伪头从 ipBase+12..19 读,
+    # TCP 段从 ipBase+20 起读 —— 批量拼接缓冲中非 0 基址包用。
+    var sum: int64
+    sum = sum + int64(VpnTunReadU16BE(packet, ipBase + 12))
+    sum = sum + int64(VpnTunReadU16BE(packet, ipBase + 14))
+    sum = sum + int64(VpnTunReadU16BE(packet, ipBase + 16))
+    sum = sum + int64(VpnTunReadU16BE(packet, ipBase + 18))
+    sum = sum + int64(VpnTunProtoTcp)
+    sum = sum + int64(tcpLen)
+    sum = sum + VpnTunChecksumBytes(packet, ipBase + 20, tcpLen)
+    return VpnTunChecksumFold(sum)
+
+@borrows
+fn VpnTunUdpChecksum(packet: rawbytes.Bytes, udpOffset: int32, udpLen: int32): int32 =
+    let sum: int64 = VpnTunPseudoHeaderChecksum(packet, VpnTunProtoUdp, udpLen) +
+                     VpnTunChecksumBytes(packet, udpOffset, udpLen)
+    let folded: int32 = VpnTunChecksumFold(sum)
+    if folded == 0:
+        return 65535
+    return folded
+
+@borrows
+fn VpnTunBuildTcpPacketFromParsed(parsed: VpnTunIpv4Packet,
+                                  seq: int32,
+                                  ack: int32,
+                                  flags: int32,
+                                  payload: rawbytes.Bytes): rawbytes.Bytes =
+    let payloadLen: int32 = rawbytes.BytesLen(payload)
+    let tcpLen: int32 = 20 + payloadLen
+    let totalLen: int32 = 20 + tcpLen
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(totalLen)
+    VpnTunBuildIpv4Header(out, totalLen, VpnTunProtoTcp, parsed.dstIp, parsed.srcIp)
+    VpnTunWriteU16BE(out, 20, parsed.dstPort)
+    VpnTunWriteU16BE(out, 22, parsed.srcPort)
+    VpnTunWriteU32BE(out, 24, seq)
+    VpnTunWriteU32BE(out, 28, ack)
+    VpnTunWriteU8(out, 32, VpnTunTcpHeaderNoOptions)
+    VpnTunWriteU8(out, 33, flags)
+    VpnTunWriteU16BE(out, 34, 65535)
+    VpnTunWriteU16BE(out, 36, 0)
+    VpnTunWriteU16BE(out, 38, 0)
+    if payloadLen > 0:
+        rawbytes.BytesCopyInto(out, 40, payload)
+    VpnTunWriteU16BE(out, 36, VpnTunTcpChecksum(out, 20, tcpLen))
+    return out
+
+fn VpnTunEmptyPacket(): rawbytes.Bytes =
+    return rawbytes.EmptyBytes()
+
+@borrows
+fn VpnTunSessionIndexForPacket(runtime: var VpnTunRuntime, packet: rawbytes.Bytes): int32 =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(packet, parsed):
+        return -1
+    if parsed.proto != VpnTunProtoTcp:
+        return -1
+    let key: int64 = VpnTunSessionKey(parsed.srcIp, parsed.srcPort, parsed.dstIp, parsed.dstPort)
+    return VpnTunFindSession(runtime, key)
+
+@borrows
+fn VpnTunPacketPayload(packet: rawbytes.Bytes): rawbytes.Bytes =
+    return VpnTunPacketPayloadFrom(packet, 0)
+
+@borrows
+fn VpnTunPacketPayloadFrom(packet: rawbytes.Bytes, skip: int32): rawbytes.Bytes =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(packet, parsed):
+        return rawbytes.EmptyBytes()
+    if parsed.payloadLen <= 0:
+        return rawbytes.EmptyBytes()
+    var safeSkip: int32 = skip
+    if safeSkip < 0:
+        safeSkip = 0
+    if safeSkip >= parsed.payloadLen:
+        return rawbytes.EmptyBytes()
+    # [seq-fix] owned 拷贝代替内点视图: 视图 len 的二读在 aarch64 衰减
+    # (实证 PAYLOAD len=517 → 写时 9B), 调用方需要跨调用的稳定数据。
+    var outLen: int32 = parsed.payloadLen - safeSkip
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(outLen)
+    var cpIdx: int32
+    while cpIdx < outLen:
+        rawbytes.BytesSet(out, cpIdx, rawbytes.BytesGet(packet, parsed.payloadOffset + safeSkip + cpIdx) & 255)
+        cpIdx = cpIdx + 1
+    return out
+
+@borrows
+fn VpnTunBuildTcpSynAck(runtime: var VpnTunRuntime, request: rawbytes.Bytes): rawbytes.Bytes =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(request, parsed):
+        return VpnTunEmptyPacket()
+    let idx: int32 = VpnTunSessionIndexForPacket(runtime, request)
+    if idx < 0:
+        return VpnTunEmptyPacket()
+    var session: VpnTunTcpSession = VpnTunSessionAt(idx)
+    let synSeq: int32 = session.serverSeq
+    # [tcp-opt] SYN-ACK 带 MSS+NOP+WS+NOP TCP 选项(16B): 提升 TCP 兼容性,
+    # 部分内核实现缺少 MSS 选项时会对后续大 segment 处理异常。
+    let tcpHdrLen: int32 = 36
+    let totalLen: int32 = 20 + tcpHdrLen
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(totalLen)
+    VpnTunBuildIpv4Header(out, totalLen, VpnTunProtoTcp, parsed.dstIp, parsed.srcIp)
+    VpnTunWriteU16BE(out, 20, parsed.dstPort)
+    VpnTunWriteU16BE(out, 22, parsed.srcPort)
+    VpnTunWriteU32BE(out, 24, synSeq)
+    VpnTunWriteU32BE(out, 28, session.clientSeq)
+    VpnTunWriteU8(out, 32, 0x90)
+    VpnTunWriteU8(out, 33, VpnTunTcpFlagsSynAck)
+    VpnTunWriteU16BE(out, 34, 65535)
+    VpnTunWriteU16BE(out, 36, 0)
+    VpnTunWriteU16BE(out, 38, 0)
+    # options(16B): MSS(4) + NOP,NOP(2) + WS shift6(3) + NOP×7 —— shift6
+    # 窗口 = 65535×64 ≈ 4MB（shift4 只有 1MB，250ms RTT 下单流 ~1MB/s 封顶）。
+    VpnTunWriteU8(out, 40, 2)
+    VpnTunWriteU8(out, 41, 4)
+    VpnTunWriteU16BE(out, 42, 1420)
+    VpnTunWriteU8(out, 44, 1)
+    VpnTunWriteU8(out, 45, 1)
+    VpnTunWriteU8(out, 46, 3)
+    VpnTunWriteU8(out, 47, 3)
+    VpnTunWriteU8(out, 48, 6)
+    VpnTunWriteU8(out, 49, 1)
+    VpnTunWriteU8(out, 50, 1)
+    VpnTunWriteU8(out, 51, 1)
+    VpnTunWriteU8(out, 52, 1)
+    VpnTunWriteU8(out, 53, 1)
+    VpnTunWriteU8(out, 54, 1)
+    VpnTunWriteU8(out, 55, 1)
+    VpnTunWriteU16BE(out, 36, VpnTunTcpChecksum(out, 20, tcpHdrLen))
+    session.serverSeq = synSeq + 1
+    VpnTunStoreSessionAt(idx, session)
+    return out
+
+@borrows
+fn VpnTunBuildTcpSynAckRetransmit(runtime: var VpnTunRuntime, request: rawbytes.Bytes): rawbytes.Bytes =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(request, parsed):
+        return VpnTunEmptyPacket()
+    let idx: int32 = VpnTunSessionIndexForPacket(runtime, request)
+    if idx < 0:
+        return VpnTunEmptyPacket()
+    let session: VpnTunTcpSession = VpnTunSessionAt(idx)
+    var synSeq: int32 = session.serverSeq - 1
+    if synSeq < 1:
+        synSeq = session.serverSeq
+    return VpnTunBuildTcpPacketFromParsed(parsed, synSeq, session.clientSeq, VpnTunTcpFlagsSynAck, rawbytes.EmptyBytes())
+
+@borrows
+fn VpnTunBuildTcpAck(runtime: var VpnTunRuntime, request: rawbytes.Bytes): rawbytes.Bytes =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(request, parsed):
+        return VpnTunEmptyPacket()
+    let idx: int32 = VpnTunSessionIndexForPacket(runtime, request)
+    if idx < 0:
+        return VpnTunEmptyPacket()
+    let session: VpnTunTcpSession = VpnTunSessionAt(idx)
+    return VpnTunBuildTcpPacketFromParsed(parsed, session.serverSeq, session.clientSeq, VpnTunTcpFlagsAck, rawbytes.EmptyBytes())
+
+@borrows
+fn VpnTunBuildTcpRetransmit(runtime: var VpnTunRuntime, request: rawbytes.Bytes): rawbytes.Bytes =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(request, parsed):
+        return VpnTunEmptyPacket()
+    let idx: int32 = VpnTunSessionIndexForPacket(runtime, request)
+    if idx < 0:
+        return VpnTunEmptyPacket()
+    let session: VpnTunTcpSession = VpnTunSessionAt(idx)
+    var i: int32
+    while i < runtime.serverSegs.len:
+        if runtime.serverSegKeys[i] != session.key:
+            i = i + 1
+            continue
+        let segment: VpnTunServerSegment = runtime.serverSegs[i]
+        let segmentLen: int32 = rawbytes.BytesLen(segment.payload)
+        let segmentEnd: int32 = segment.seq + segmentLen
+        if segmentLen > 0 && segmentEnd > parsed.tcpAck:
+            var skip: int32 = parsed.tcpAck - segment.seq
+            if skip < 0:
+                skip = 0
+            if skip < segmentLen:
+                let resendSeq: int32 = segment.seq + skip
+                let resendPayload: rawbytes.Bytes = rawbytes.BytesSlice(segment.payload,
+                                                                        skip,
+                                                                        segmentLen - skip)
+                let out: rawbytes.Bytes = VpnTunBuildTcpPacketFromParsed(parsed,
+                                                                         resendSeq,
+                                                                         session.clientSeq,
+                                                                         VpnTunTcpFlagsPshAck,
+                                                                         resendPayload)
+                rawbytes.BytesFree(resendPayload)
+                return out
+        i = i + 1
+    return VpnTunEmptyPacket()
+
+@borrows
+fn VpnTunBuildTcpPayload(runtime: var VpnTunRuntime,
+                         request: rawbytes.Bytes,
+                         payload: rawbytes.Bytes): rawbytes.Bytes =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(request, parsed):
+        return VpnTunEmptyPacket()
+    let idx: int32 = VpnTunSessionIndexForPacket(runtime, request)
+    if idx < 0 || rawbytes.BytesLen(payload) <= 0:
+        return VpnTunEmptyPacket()
+    var session: VpnTunTcpSession = VpnTunSessionAt(idx)
+    # [tun-mtu] 大 payload 必须按 MTU chunk 分片成多个完整 IP 包(拼接返回,
+    # 写侧按 IP total-length 逐包 write)。不分片=4KB 巨包直撞 TUN 被内核丢弃
+    # =TLS 首飞丢失(模拟器实证 tun_write len=4303 mtu=1500)。
+    # [rss-batch] 单次精确预分配整段缓冲, 各分片包(20B IP 头+20B TCP 头
+    # +payload)in-place 写入各自偏移, 段表记录直接从 payload 区间拷贝。
+    # 消除旧形状的每分片 piece/pkt 分配 + BytesConcat 全量重拷(O(n²)
+    # churn 是下行热路径 RSS 滞留主源之一)。产线字节与旧拼接输出一致。
+    let chunkBytes: int32 = policy.VpnProxyTunTcpChunkBytes(1500)
+    let totalLen: int32 = rawbytes.BytesLen(payload)
+    var chunkCount: int32 = (totalLen + chunkBytes - 1) / chunkBytes
+    let outTotal: int32 = chunkCount * 40 + totalLen
+    var outPackets: rawbytes.Bytes = rawbytes.BytesAlloc(outTotal)
+    var offset: int32
+    var outPos: int32
+    while offset < totalLen:
+        var take: int32 = chunkBytes
+        if offset + take > totalLen:
+            take = totalLen - offset
+        let tcpLen: int32 = 20 + take
+        VpnTunBuildIpv4HeaderAt(outPackets, outPos, 20 + tcpLen, VpnTunProtoTcp, parsed.dstIp, parsed.srcIp)
+        VpnTunWriteU16BE(outPackets, outPos + 20, parsed.dstPort)
+        VpnTunWriteU16BE(outPackets, outPos + 22, parsed.srcPort)
+        VpnTunWriteU32BE(outPackets, outPos + 24, session.serverSeq)
+        VpnTunWriteU32BE(outPackets, outPos + 28, session.clientSeq)
+        VpnTunWriteU8(outPackets, outPos + 32, VpnTunTcpHeaderNoOptions)
+        VpnTunWriteU8(outPackets, outPos + 33, VpnTunTcpFlagsPshAck)
+        VpnTunWriteU16BE(outPackets, outPos + 34, 65535)
+        VpnTunWriteU16BE(outPackets, outPos + 36, 0)
+        VpnTunWriteU16BE(outPackets, outPos + 38, 0)
+        rawbytes.BytesCopyRangeInto(outPackets, outPos + 40, payload, offset, take)
+        VpnTunWriteU16BE(outPackets, outPos + 36, VpnTunTcpChecksumAt(outPackets, outPos, tcpLen))
+        VpnTunRememberServerSegmentRange(runtime, session.key, session.serverSeq, payload, offset, take)
+        session.serverSeq = session.serverSeq + take
+        offset = offset + take
+        outPos = outPos + 40 + take
+    VpnTunStoreSessionAt(idx, session)
+    runtime.lastEventKind = VpnTunEventTraffic
+    runtime.lastEventText = strings.CloneStr(session.targetHost)
+    runtime.stats.downloadBytes = runtime.stats.downloadBytes + Int64(totalLen)
+    return outPackets
+
+@borrows
+fn VpnTunBuildTcpFin(runtime: var VpnTunRuntime, request: rawbytes.Bytes): rawbytes.Bytes =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(request, parsed):
+        return VpnTunEmptyPacket()
+    let idx: int32 = VpnTunSessionIndexForPacket(runtime, request)
+    if idx < 0:
+        return VpnTunEmptyPacket()
+    var session: VpnTunTcpSession = VpnTunSessionAt(idx)
+    let out: rawbytes.Bytes = VpnTunBuildTcpPacketFromParsed(parsed, session.serverSeq, session.clientSeq, VpnTunTcpFlagsFinAck, rawbytes.EmptyBytes())
+    session.serverSeq = session.serverSeq + 1
+    VpnTunStoreSessionAt(idx, session)
+    return out
+
+
+@borrows
+fn VpnTunBuildTcpRst(request: rawbytes.Bytes): rawbytes.Bytes =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(request, parsed):
+        return VpnTunEmptyPacket()
+    var ack: int32 = parsed.tcpSeq + parsed.payloadLen
+    if (parsed.tcpFlags & 2) != 0 || (parsed.tcpFlags & 1) != 0:
+        ack = ack + 1
+    return VpnTunBuildTcpPacketFromParsed(parsed, 0, ack, VpnTunTcpFlagsRstAck, rawbytes.EmptyBytes())
+
+
+@borrows
+fn VpnTunBuildUdpResponse(request: rawbytes.Bytes, payload: rawbytes.Bytes): rawbytes.Bytes =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(request, parsed):
+        return VpnTunEmptyPacket()
+    if parsed.proto != VpnTunProtoUdp:
+        return VpnTunEmptyPacket()
+    let payloadLen: int32 = rawbytes.BytesLen(payload)
+    let udpLen: int32 = 8 + payloadLen
+    let totalLen: int32 = 20 + udpLen
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(totalLen)
+    VpnTunBuildIpv4Header(out, totalLen, VpnTunProtoUdp, parsed.dstIp, parsed.srcIp)
+    VpnTunWriteU16BE(out, 20, parsed.dstPort)
+    VpnTunWriteU16BE(out, 22, parsed.srcPort)
+    VpnTunWriteU16BE(out, 24, udpLen)
+    VpnTunWriteU16BE(out, 26, 0)
+    if payloadLen > 0:
+        rawbytes.BytesCopyInto(out, 28, payload)
+    VpnTunWriteU16BE(out, 26, VpnTunUdpChecksum(out, 20, udpLen))
+    return out
+
+@borrows
+fn VpnTunPacketIsFakeDnsQuery(packet: rawbytes.Bytes): bool =
+    var parsed: VpnTunIpv4Packet
+    if !VpnTunParseIpv4(packet, parsed):
+        return false
+    if parsed.proto != VpnTunProtoUdp:
+        return false
+    if parsed.dstPort != VpnTunDnsPort:
+        return false
+    return true
+
+@borrows
+fn VpnTunParseDnsQuestion(query: rawbytes.Bytes, out: var VpnTunDnsQuestion): bool =
+    let parsedRes: Result[VpnTunDnsQuestion] = VpnTunParseDnsQuestionValue(query)
+    if IsErr(parsedRes):
+        out.valid = false
+        return false
+    var parsedQuestion: VpnTunDnsQuestion = Value(parsedRes)
+    out = parsedQuestion
+    return true
+
+# The question name is accumulated into ONE raw bytes buffer via the same
+# proven BytesGet/BytesSet primitives used by the packet builders, then
+# converted once with BytesToString on an exact-length view. The previous
+# per-label str[] accumulation plus strutil.Join crossed a call boundary
+# with a managed array and produced garbage names on arm64-android.
+@borrows
+fn VpnTunParseDnsQuestionValue(query: rawbytes.Bytes): Result[VpnTunDnsQuestion] =
+    var out: VpnTunDnsQuestion
+    out.valid = false
+    if rawbytes.BytesLen(query) < 17:
+        return Err[VpnTunDnsQuestion]("vpn tun fake dns short query")
+    let qdCount: int32 = VpnTunReadU16BE(query, 4)
+    if qdCount <= 0:
+        return Err[VpnTunDnsQuestion]("vpn tun fake dns empty question")
+    var pos: int32 = 12
+    var labels: int32
+    var nameBuf: rawbytes.Bytes = rawbytes.BytesAlloc(256)
+    var nameLen: int32
+    while true:
+        if pos >= rawbytes.BytesLen(query):
+            rawbytes.BytesFree(nameBuf)
+            return Err[VpnTunDnsQuestion]("vpn tun fake dns truncated name")
+        let labelLen: int32 = VpnTunReadU8(query, pos)
+        if labelLen == 0:
+            pos = pos + 1
+            break
+        if (labelLen & 192) != 0:
+            rawbytes.BytesFree(nameBuf)
+            return Err[VpnTunDnsQuestion]("vpn tun fake dns compressed name")
+        if labelLen > 63:
+            rawbytes.BytesFree(nameBuf)
+            return Err[VpnTunDnsQuestion]("vpn tun fake dns long label")
+        if pos + 1 + labelLen > rawbytes.BytesLen(query):
+            rawbytes.BytesFree(nameBuf)
+            return Err[VpnTunDnsQuestion]("vpn tun fake dns label overflow")
+        if nameLen + labelLen + 1 > 255:
+            rawbytes.BytesFree(nameBuf)
+            return Err[VpnTunDnsQuestion]("vpn tun fake dns name too long")
+        if labels > 0:
+            rawbytes.BytesSet(nameBuf, nameLen, 46)
+            nameLen = nameLen + 1
+        for i in 0..<labelLen:
+            rawbytes.BytesSet(nameBuf, nameLen + i, rawbytes.BytesGet(query, pos + 1 + i))
+        nameLen = nameLen + labelLen
+        labels = labels + 1
+        pos = pos + 1 + labelLen
+        if labels > 32:
+            rawbytes.BytesFree(nameBuf)
+            return Err[VpnTunDnsQuestion]("vpn tun fake dns too many labels")
+    if labels <= 0:
+        rawbytes.BytesFree(nameBuf)
+        return Err[VpnTunDnsQuestion]("vpn tun fake dns no labels")
+    if pos + 4 > rawbytes.BytesLen(query):
+        rawbytes.BytesFree(nameBuf)
+        return Err[VpnTunDnsQuestion]("vpn tun fake dns truncated tail")
+    let nameView: rawbytes.Bytes = rawbytes.BytesSliceView(nameBuf, 0, nameLen)
+    out.domain = rawbytes.BytesToString(nameView)
+    rawbytes.BytesFree(nameBuf)
+    out.qtype = VpnTunReadU16BE(query, pos)
+    out.qclass = VpnTunReadU16BE(query, pos + 2)
+    out.questionEnd = pos + 4
+    out.valid = true
+    return Ok[VpnTunDnsQuestion](out)
+
+@borrows
+fn VpnTunBuildDnsPayloadResponse(query: rawbytes.Bytes,
+                                 question: VpnTunDnsQuestion,
+                                 answerIp: int32,
+                                 answerCount: int32): rawbytes.Bytes =
+    let questionLen: int32 = question.questionEnd - 12
+    if questionLen <= 0:
+        return rawbytes.EmptyBytes()
+    var answerLen: int32
+    if answerCount > 0:
+        if question.qtype == VpnTunDnsQtypeA:
+            answerLen = 16
+    let totalLen: int32 = 12 + questionLen + answerLen
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(totalLen)
+    VpnTunWriteU8(out, 0, VpnTunReadU8(query, 0))
+    VpnTunWriteU8(out, 1, VpnTunReadU8(query, 1))
+    VpnTunWriteU16BE(out, 2, VpnTunDnsResponseFlagsNoError)
+    VpnTunWriteU16BE(out, 4, 1)
+    VpnTunWriteU16BE(out, 6, answerCount)
+    VpnTunWriteU16BE(out, 8, 0)
+    VpnTunWriteU16BE(out, 10, 0)
+    var questionBytes: rawbytes.Bytes = rawbytes.BytesSlice(query, 12, questionLen)
+    rawbytes.BytesCopyInto(out, 12, questionBytes)
+    rawbytes.BytesFree(questionBytes)
+    if answerCount > 0:
+        let answerOffset: int32 = 12 + questionLen
+        VpnTunWriteU8(out, answerOffset, VpnTunDnsCompressedQuestionName)
+        VpnTunWriteU8(out, answerOffset + 1, VpnTunDnsQuestionOffset12)
+        VpnTunWriteU16BE(out, answerOffset + 2, question.qtype)
+        VpnTunWriteU16BE(out, answerOffset + 4, VpnTunDnsClassIn)
+        # [fake-ip] TTL 60→1: 假 IP 映射随 worker 生命周期存亡, TTL=60 会让
+        # netd 缓存跨越 worker 重启 → app 连到失联假 IP 黑洞(Telegram App
+        # 实证)。TTL=1 强制秒级重查询, 重启后自动拿到有效映射。
+        VpnTunWriteU32BE(out, answerOffset + 6, 1)
+        if question.qtype == VpnTunDnsQtypeA:
+            VpnTunWriteU16BE(out, answerOffset + 10, 4)
+            VpnTunWriteU32BE(out, answerOffset + 12, answerIp)
+    return out
+
+# Direct-DNS cache. Per the cold-backend miscompile constraint (exit_dns.cheng
+# 392-394) a single fn that both scans and appends the same struct seq is
+# miscompiled, so find-only and append-only are kept in separate leaf helpers.
+
+@borrows
+fn VpnTunDirectDnsFind(runtime: var VpnTunRuntime, domain: str, nowNs: int64): int32 =
+    for i in 0..<runtime.directDnsEntries.len:
+        if runtime.directDnsEntries[i].expiresAtNs > nowNs:
+            if VpnTunAsciiFoldEquals(runtime.directDnsEntries[i].domain, domain):
+                return i
+    return -1
+
+fn VpnTunDirectDnsAppendLeaf(runtime: var VpnTunRuntime, entry: VpnTunDirectDnsEntry) =
+    add(runtime.directDnsEntries, entry)
+
+fn VpnTunDirectDnsCompact(runtime: var VpnTunRuntime, nowNs: int64) =
+    var kept: VpnTunDirectDnsEntry[]
+    kept = []
+    for i in 0..<runtime.directDnsEntries.len:
+        if runtime.directDnsEntries[i].expiresAtNs > nowNs:
+            add(kept, share(runtime.directDnsEntries[i]))
+    runtime.directDnsEntries = kept
+
+@borrows
+fn VpnTunDirectDnsRemember(runtime: var VpnTunRuntime,
+                           domain: str,
+                           ip: int32,
+                           ttlSeconds: int32,
+                           nowNs: int64) =
+    var ttl: int32 = ttlSeconds
+    if ttl <= 0:
+        return
+    if ttl < VpnTunDirectDnsMinTtlSeconds:
+        ttl = VpnTunDirectDnsMinTtlSeconds
+    if ttl > VpnTunDirectDnsMaxTtlSeconds:
+        ttl = VpnTunDirectDnsMaxTtlSeconds
+    let expiresAtNs: int64 = nowNs + int64(ttl) * int64(1000000000)
+    let existing: int32 = VpnTunDirectDnsFind(runtime, domain, nowNs)
+    if existing >= 0:
+        var entry: VpnTunDirectDnsEntry = runtime.directDnsEntries[existing]
+        entry.ip = ip
+        entry.expiresAtNs = expiresAtNs
+        runtime.directDnsEntries[existing] = entry
+        return
+    if runtime.directDnsEntries.len >= VpnTunDirectDnsMaxEntries:
+        VpnTunDirectDnsCompact(runtime, nowNs)
+    if runtime.directDnsEntries.len >= VpnTunDirectDnsMaxEntries:
+        return
+    var fresh: VpnTunDirectDnsEntry
+    fresh.domain = domain
+    fresh.ip = ip
+    fresh.expiresAtNs = expiresAtNs
+    VpnTunDirectDnsAppendLeaf(runtime, fresh)
+
+# Async pending-resolve list. Same cold-backend constraint as the direct-dns
+# cache: find-only and append-only are kept in separate leaf helpers, and the
+# pump rewrites the list via the proven "build kept[] then assign" compact
+# pattern (never in-place delete on a seq we are also scanning).
+
+@borrows
+fn VpnTunPendingFindByDomain(runtime: var VpnTunRuntime, domain: str): int32 =
+    for i in 0..<runtime.pendingDirectResolves.len:
+        var probeEntry: VpnTunPendingDirectResolve = runtime.pendingDirectResolves[i]
+        if VpnTunAsciiFoldEquals(probeEntry.domain, domain):
+            return i
+    return -1
+
+fn VpnTunPendingAppendLeaf(runtime: var VpnTunRuntime, entry: VpnTunPendingDirectResolve) =
+    add(runtime.pendingDirectResolves, entry)
+
+fn VpnTunPendingFree(entry: var VpnTunPendingDirectResolve) =
+    if entry.conn.open:
+        tcp.TcpClose(entry.conn)
+    rawbytes.BytesFree(entry.framedQuery)
+    rawbytes.BytesFree(entry.recvBuf)
+    rawbytes.BytesFree(entry.queryPacket)
+    rawbytes.BytesFree(entry.framePayload)
+
+@borrows
+fn VpnTunParseOctet(part: str): int32 =
+    if len(part) < 1 || len(part) > 3:
+        return -1
+    var value: int32
+    for j in 0..<len(part):
+        let c: char = part[j]
+        if c < '0' || c > '9':
+            return -1
+        value = value * 10 + (int32(c) - int32('0'))
+    if value > 255:
+        return -1
+    return value
+
+@borrows
+fn VpnTunIpFromDottedText(ipText: str): Result[int32] =
+    let parts: str[] = strutil.Split(ipText, '.')
+    if parts.len != 4:
+        return Err[int32](strutil.Join(["vpn tun direct dns: malformed ipv4: ", strings.CloneStr(ipText)], ""))
+    let a: int32 = VpnTunParseOctet(strings.CloneStr(parts[0]))
+    let b: int32 = VpnTunParseOctet(strings.CloneStr(parts[1]))
+    let c: int32 = VpnTunParseOctet(strings.CloneStr(parts[2]))
+    let d: int32 = VpnTunParseOctet(strings.CloneStr(parts[3]))
+    if a < 0 || b < 0 || c < 0 || d < 0:
+        return Err[int32](strutil.Join(["vpn tun direct dns: malformed ipv4: ", strings.CloneStr(ipText)], ""))
+    return Ok[int32](VpnTunIpFromParts(a, b, c, d))
+
+fn VpnTunDirectDnsQueryId(): Result[int32] =
+    let idBytesRes: Result[rawbytes.Bytes] = rand.RandomBytes(2)
+    if IsErr(idBytesRes):
+        return Err[int32](ErrorText(idBytesRes))
+    var idBytes: rawbytes.Bytes = Value(idBytesRes)
+    let id: int32 = ((rawbytes.BytesGet(idBytes, 0) << 8) | rawbytes.BytesGet(idBytes, 1)) & 65535
+    rawbytes.BytesFree(idBytes)
+    return Ok[int32](id)
+
+var g_vpnTunDnsDiagDirectCount: int32
+
+@borrows
+fn VpnTunMaybeBuildDnsResponse(runtime: var VpnTunRuntime, packet: rawbytes.Bytes): rawbytes.Bytes =
+    if !VpnTunPacketIsFakeDnsQuery(packet):
+        return rawbytes.EmptyBytes()
+    var payload: rawbytes.Bytes = VpnTunPacketPayload(packet)
+    let questionRes: Result[VpnTunDnsQuestion] = VpnTunParseDnsQuestionValue(payload)
+    if IsErr(questionRes):
+        runtime.stats.droppedPackets = runtime.stats.droppedPackets + int64(1)
+        runtime.stats.errors = runtime.stats.errors + int64(1)
+        runtime.lastEventKind = VpnTunEventError
+        runtime.lastEventText = "vpn tun fake dns malformed query"
+        rawbytes.BytesFree(payload)
+        return rawbytes.EmptyBytes()
+    var question: VpnTunDnsQuestion = Value(questionRes)
+    runtime.stats.dnsQueries = runtime.stats.dnsQueries + int64(1)
+    runtime.lastEventKind = VpnTunEventDns
+    let questionDomain: str = strings.CloneStr(question.domain)
+    runtime.lastEventText = questionDomain
+    var answerCount: int32
+    var answerIp: int32
+    var deferred: bool
+    if question.qclass == VpnTunDnsClassIn:
+        if question.qtype == VpnTunDnsQtypeA:
+            var isYtDomain: bool = VpnTunAsciiFoldEquals(questionDomain, "www.youtube.com")
+            if policy.VpnProxyTunShouldFakeDomain(questionDomain):
+                let matchChunk: int32 = policy.VpnProxyTunLastMatchChunk()
+                let answerMappedIp: int32 = VpnTunRememberFakeDns(runtime, questionDomain)
+                if answerMappedIp != -1:
+                    answerCount = 1
+                    answerIp = answerMappedIp
+                    var fkParts: str[] = ["DNSQ", strings.CloneStr(questionDomain), "fk", strings.Int64ToStr(int64(matchChunk))]
+                    VpnTunSetDnsDiag(strutil.Join(fkParts, " "))
+            else:
+                if isYtDomain:
+                    if policy.VpnProxyTunRunSelfTestH():
+                        VpnTunSetDnsDiag("yt_pred_f_self_t")
+                    else:
+                        VpnTunSetDnsDiag("yt_pred_f_self_f")
+                let nowNs: int64 = VpnTunMonotimeNs()
+                let cachedIdx: int32 = VpnTunDirectDnsFind(runtime, question.domain, nowNs)
+                if cachedIdx >= 0:
+                    answerCount = 1
+                    answerIp = runtime.directDnsEntries[cachedIdx].ip
+                else:
+                    if g_vpnTunDnsDiagDirectCount < 20:
+                        g_vpnTunDnsDiagDirectCount = g_vpnTunDnsDiagDirectCount + 1
+                        var dirParts: str[] = ["DNSQ", strings.CloneStr(questionDomain), "dir"]
+                        VpnTunSetDnsDiag(strutil.Join(dirParts, " "))
+                    VpnTunMaybeRegisterPendingResolve(runtime, packet, payload, questionDomain, question.qtype, question.qclass, nowNs)
+                    deferred = true
+        else:
+            if g_vpnTunDnsDiagDirectCount < 30:
+                g_vpnTunDnsDiagDirectCount = g_vpnTunDnsDiagDirectCount + 1
+                var qtParts: str[] = ["DNSQ", strings.CloneStr(questionDomain), "qt", strings.Int64ToStr(int64(question.qtype))]
+                VpnTunSetDnsDiag(strutil.Join(qtParts, " "))
+    # Cache miss for a direct A query: drop (don't answer). Replying NOERROR with
+    # ANCOUNT=0 here would tell the app "no IPv4 for this domain" and it gives up.
+    # Instead we stay silent; the async pump writes the real-IP answer back to this
+    # same query socket once the upstream resolve completes (well within the app's
+    # DNS timeout), and a failed/timed-out resolve still emits the 0-answer from the
+    # pump — so this is never worse, only better, than answering immediately.
+    if deferred:
+        rawbytes.BytesFree(payload)
+        return rawbytes.EmptyBytes()
+    var dnsPayload: rawbytes.Bytes = VpnTunBuildDnsPayloadResponse(payload, question, answerIp, answerCount)
+    rawbytes.BytesFree(payload)
+    if rawbytes.BytesLen(dnsPayload) <= 0:
+        return rawbytes.EmptyBytes()
+    let out: rawbytes.Bytes = VpnTunBuildUdpResponse(packet, dnsPayload)
+    rawbytes.BytesFree(dnsPayload)
+    return out
+
+# Cache-miss registration. NEVER blocks: dedups by domain, caps concurrency, kicks
+# off a non-blocking connect to the upstream resolver and stores owned copies of the
+# app's query packet/payload so the pump can address the async answer back later.
+
+@borrows
+fn VpnTunMaybeRegisterPendingResolve(runtime: var VpnTunRuntime,
+                                     packet: rawbytes.Bytes,
+                                     payload: rawbytes.Bytes,
+                                     domainRaw: str,
+                                     qtypeIn: int32,
+                                     qclassIn: int32,
+                                     nowNs: int64) =
+    if VpnTunPendingFindByDomain(runtime, domainRaw) >= 0:
+        return
+    if runtime.pendingDirectResolves.len >= VpnTunDirectPendingMaxInFlight:
+        runtime.stats.droppedPackets = runtime.stats.droppedPackets + int64(1)
+        return
+    let queryIdRes: Result[int32] = VpnTunDirectDnsQueryId()
+    if IsErr(queryIdRes):
+        return
+    let queryId: int32 = Value(queryIdRes)
+    let queryRes: Result[rawbytes.Bytes] = exitdns.VpnProxyExitDnsBuildQuery(queryId, domainRaw, VpnTunDnsQtypeA)
+    if IsErr(queryRes):
+        return
+    var query: rawbytes.Bytes = Value(queryRes)
+    let msgLen: int32 = rawbytes.BytesLen(query)
+    var framed: rawbytes.Bytes = rawbytes.BytesAlloc(2 + msgLen)
+    VpnTunWriteU16BE(framed, 0, msgLen)
+    rawbytes.BytesCopyInto(framed, 2, query)
+    rawbytes.BytesFree(query)
+
+    var conn: tcp.TcpConnectionHandle
+    let connRes: Result[bool] = tcp.TcpConnect4StartNonblocking(VpnTunDirectResolverHost, VpnTunDirectResolverPort, conn)
+    if IsErr(connRes):
+        rawbytes.BytesFree(framed)
+        return
+
+    var pending: VpnTunPendingDirectResolve
+    pending.domain = strings.CloneStr(domainRaw)
+    pending.conn = conn
+    if Value(connRes):
+        pending.state = VpnTunPendingStateQuerySent
+    else:
+        pending.state = VpnTunPendingStateConnecting
+    pending.queryId = queryId
+    pending.sendOffset = 0
+    pending.framedQuery = framed
+    pending.recvBuf = rawbytes.EmptyBytes()
+    pending.recvExpected = -1
+    pending.expiresAtNs = nowNs + int64(VpnTunDirectDnsTimeoutMs) * int64(1000000)
+    pending.queryPacket = rawbytes.BytesSlice(packet, 0, rawbytes.BytesLen(packet))
+    pending.framePayload = rawbytes.BytesSlice(payload, 0, rawbytes.BytesLen(payload))
+    var questionLocal: VpnTunDnsQuestion
+    questionLocal.domain = strings.CloneStr(domainRaw)
+    questionLocal.qtype = qtypeIn
+    questionLocal.qclass = qclassIn
+    questionLocal.valid = true
+    pending.question = questionLocal
+    VpnTunPendingAppendLeaf(runtime, pending)
+
+# Build and write the app-facing DNS response from a pending entry's stored bytes.
+# answerCount=1 with the resolved ip on success; answerCount=0 (no-answer) on
+# failure/timeout. Mirrors VpnTunMaybeBuildDnsResponse's tail exactly.
+fn VpnTunPendingWriteAppResponse(entry: var VpnTunPendingDirectResolve,
+                                 fd: int32,
+                                 frameMode: int32,
+                                 answerIp: int32,
+                                 answerCount: int32): bool =
+    var dnsPayload: rawbytes.Bytes = VpnTunBuildDnsPayloadResponse(entry.framePayload, entry.question, answerIp, answerCount)
+    if rawbytes.BytesLen(dnsPayload) <= 0:
+        rawbytes.BytesFree(dnsPayload)
+        return true
+    var out: rawbytes.Bytes = VpnTunBuildUdpResponse(entry.queryPacket, dnsPayload)
+    rawbytes.BytesFree(dnsPayload)
+    if rawbytes.BytesLen(out) <= 0:
+        rawbytes.BytesFree(out)
+        return true
+    let wrote: bool = VpnTunWritePacketFrameMode(fd, frameMode, out)
+    rawbytes.BytesFree(out)
+    return wrote
+
+# Single non-blocking sweep advancing every pending resolve one state. Scan the
+# current list and rebuild kept[] (the cold-backend-safe compact pattern); never
+# does blocking I/O. Terminal entries (success/timeout/error) write the app answer
+# to the TUN fd, close the socket, free owned bytes, and drop from kept.
+fn VpnTunPumpDirectResolves(runtime: var VpnTunRuntime, fd: int32, frameMode: int32): Result[bool] =
+    let nowNs: int64 = VpnTunMonotimeNs()
+    var kept: VpnTunPendingDirectResolve[]
+    kept = []
+    var writeFailed: bool
+    for i in 0..<runtime.pendingDirectResolves.len:
+        var p: VpnTunPendingDirectResolve = runtime.pendingDirectResolves[i]
+
+        # Deadline -> no-answer to app, drop.
+        if p.expiresAtNs <= nowNs:
+            if !VpnTunPendingWriteAppResponse(p, fd, frameMode, 0, 0):
+                writeFailed = true
+            tcp.TcpClose(p.conn)
+            VpnTunPendingFree(p)
+            continue
+
+        var failed: bool
+        var done: bool
+
+        # Advance connect.
+        if p.state == VpnTunPendingStateConnecting:
+            if VpnTunFdWaitWritable(p.conn.fd, 0) > 0:
+                let pollRes: Result[bool] = tcp.TcpConnectPoll(p.conn)
+                if IsErr(pollRes):
+                    failed = true
+                else:
+                    if Value(pollRes):
+                        p.state = VpnTunPendingStateQuerySent
+
+        # Send the framed query incrementally (partial-send cursor).
+        if !failed:
+            if p.state == VpnTunPendingStateQuerySent:
+                let total: int32 = rawbytes.BytesLen(p.framedQuery)
+                if p.sendOffset < total:
+                    let chunk: rawbytes.Bytes = rawbytes.BytesSliceView(p.framedQuery, p.sendOffset, total - p.sendOffset)
+                    let sendRes: Result[int32] = tcp.TcpSendNonblocking(p.conn, chunk)
+                    if IsErr(sendRes):
+                        failed = true
+                    else:
+                        p.sendOffset = p.sendOffset + Value(sendRes)
+                if p.sendOffset >= total:
+                    p.state = VpnTunPendingStateReceiving
+
+        # Read and reassemble the upstream reply.
+        if !failed:
+            if p.state == VpnTunPendingStateReceiving:
+                let readableRes: Result[bool] = tcp.TcpConnectionWaitReadable(p.conn, 0)
+                var readable: bool
+                if !IsErr(readableRes):
+                    readable = Value(readableRes)
+                if readable:
+                    let recvRes: Result[rawbytes.Bytes] = tcp.TcpRecvNonblocking(p.conn, VpnTunDirectDnsMaxResponseBytes)
+                    if IsErr(recvRes):
+                        if ErrorText(recvRes) != "tcp syscall: would block":
+                            failed = true
+                    else:
+                        var chunk: rawbytes.Bytes = Value(recvRes)
+                        if rawbytes.BytesLen(chunk) <= 0:
+                            rawbytes.BytesFree(chunk)
+                            failed = true
+                        else:
+                            let accLen: int32 = rawbytes.BytesLen(p.recvBuf)
+                            var merged: rawbytes.Bytes = rawbytes.BytesAlloc(accLen + rawbytes.BytesLen(chunk))
+                            rawbytes.BytesCopyInto(merged, 0, p.recvBuf)
+                            rawbytes.BytesCopyInto(merged, accLen, chunk)
+                            rawbytes.BytesFree(chunk)
+                            rawbytes.BytesFree(p.recvBuf)
+                            p.recvBuf = merged
+                            let bufLen: int32 = rawbytes.BytesLen(p.recvBuf)
+                            if p.recvExpected < 0:
+                                if bufLen >= 2:
+                                    p.recvExpected = ((rawbytes.BytesGet(p.recvBuf, 0) << 8) | rawbytes.BytesGet(p.recvBuf, 1)) & 65535
+                            if p.recvExpected >= 0:
+                                if bufLen >= 2 + p.recvExpected:
+                                    var msg: rawbytes.Bytes = rawbytes.BytesSlice(p.recvBuf, 2, p.recvExpected)
+                                    let answerRes: Result[exitdns.VpnProxyExitDnsAnswer] = exitdns.VpnProxyExitDnsParseAnswer(msg, p.queryId, VpnTunDnsQtypeA)
+                                    rawbytes.BytesFree(msg)
+                                    if IsErr(answerRes):
+                                        failed = true
+                                    else:
+                                        let answer: exitdns.VpnProxyExitDnsAnswer = Value(answerRes)
+                                        let ipRes: Result[int32] = VpnTunIpFromDottedText(answer.ipText)
+                                        if IsErr(ipRes):
+                                            failed = true
+                                        else:
+                                            let ip: int32 = Value(ipRes)
+                                            VpnTunDirectDnsRemember(runtime, p.domain, ip, answer.ttlSeconds, nowNs)
+                                            if !VpnTunPendingWriteAppResponse(p, fd, frameMode, ip, 1):
+                                                writeFailed = true
+                                            done = true
+
+        if failed:
+            if !VpnTunPendingWriteAppResponse(p, fd, frameMode, 0, 0):
+                writeFailed = true
+            tcp.TcpClose(p.conn)
+            VpnTunPendingFree(p)
+            continue
+        if done:
+            tcp.TcpClose(p.conn)
+            VpnTunPendingFree(p)
+            continue
+        add(kept, p)
+    runtime.pendingDirectResolves = kept
+    # A best-effort async DNS-response write failure must NOT tear down the TUN
+    # worker (the proxied data path likewise ignores per-packet write failures);
+    # the app's resolver simply retransmits and is served from cache next tick.
+    let _ = writeFailed
+    return Ok[bool](true)
+
+// ─── TUN fd I/O (pure Cheng event loop) ───────────────────────────────
+
+@importc("cheng_mobile_tun_fd_wait_readable")
+fn VpnTunFdWaitReadable(fd: int32, timeoutMs: int32): int32
+
+@importc("cheng_mobile_tun_fd_read")
+fn VpnTunFdRead(fd: int32, data: ptr, dataLen: int32): int64
+
+@importc("cheng_mobile_tun_fd_write")
+fn VpnTunFdWrite(fd: int32, data: ptr, dataLen: int32): int64
+
+@borrows
+fn VpnTunDarwinHeaderIsIpv4(packet: rawbytes.Bytes): bool =
+    if rawbytes.BytesLen(packet) < VpnTunDarwinHeaderLen:
+        return false
+    let b0: int32 = rawbytes.BytesGet(packet, 0) & 255
+    let b1: int32 = rawbytes.BytesGet(packet, 1) & 255
+    let b2: int32 = rawbytes.BytesGet(packet, 2) & 255
+    let b3: int32 = rawbytes.BytesGet(packet, 3) & 255
+    if b0 == 0:
+        if b1 == 0:
+            if b2 == 0:
+                if b3 == VpnTunDarwinAfInet:
+                    return true
+    if b0 == VpnTunDarwinAfInet:
+        if b1 == 0:
+            if b2 == 0:
+                if b3 == 0:
+                    return true
+    return false
+
+@borrows
+fn VpnTunPacketLooksIpv4(packet: rawbytes.Bytes): bool =
+    if rawbytes.BytesLen(packet) < 20:
+        return false
+    if ((rawbytes.BytesGet(packet, 0) >> 4) & 15) != 4:
+        return false
+    return true
+
+@borrows
+fn VpnTunAddDarwinHeader(packet: rawbytes.Bytes): rawbytes.Bytes =
+    let packetLen: int32 = rawbytes.BytesLen(packet)
+    if packetLen <= 0:
+        return rawbytes.EmptyBytes()
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(packetLen + VpnTunDarwinHeaderLen)
+    VpnTunWriteU8(out, 0, 0)
+    VpnTunWriteU8(out, 1, 0)
+    VpnTunWriteU8(out, 2, 0)
+    VpnTunWriteU8(out, 3, VpnTunDarwinAfInet)
+    rawbytes.BytesCopyInto(out, VpnTunDarwinHeaderLen, packet)
+    return out
+
+# One reusable scratch read buffer for the tun ingress (the tun reader is a single
+# thread), instead of BytesAlloc(1504)+BytesFree per packet. The Darwin-header and
+# IPv4 probes run on a zero-copy view of the scratch; only the returned packet is an
+# owned slice the caller frees — so the hot path is 1 alloc/packet (raw-IPv4 / Android)
+# instead of 2-3, with no change to the caller's ownership contract.
+var vpnTunReadScratch: rawbytes.Bytes
+var vpnTunReadScratchReady: bool
+
+fn VpnTunReadPacketWithTimeout(fd: int32, outPacket: var rawbytes.Bytes, timeoutMs: int32): bool =
+    let waitRet: int32 = VpnTunFdWaitReadable(fd, timeoutMs)
+    if waitRet <= 0: return false
+
+    if !vpnTunReadScratchReady:
+        vpnTunReadScratch = rawbytes.BytesAlloc(1504)
+        vpnTunReadScratchReady = true
+    let got64: int64 = VpnTunFdRead(fd, vpnTunReadScratch.data, rawbytes.BytesLen(vpnTunReadScratch))
+    if got64 <= int64(0):
+        return false
+    let n: int32 = Int32(got64)
+    let frameView: rawbytes.Bytes = rawbytes.BytesSliceView(vpnTunReadScratch, 0, n)
+    if VpnTunDarwinHeaderIsIpv4(frameView):
+        outPacket = rawbytes.BytesSlice(vpnTunReadScratch, VpnTunDarwinHeaderLen, n - VpnTunDarwinHeaderLen)
+        if VpnTunPacketLooksIpv4(outPacket):
+            return true
+        rawbytes.BytesFree(outPacket)
+        return false
+    if VpnTunPacketLooksIpv4(frameView):
+        outPacket = rawbytes.BytesSlice(vpnTunReadScratch, 0, n)
+        return true
+    return false
+
+fn VpnTunReadPacket(fd: int32, outPacket: var rawbytes.Bytes): bool =
+    return VpnTunReadPacketWithTimeout(fd, outPacket, 100)
+
+@borrows
+fn VpnTunWritePacket(fd: int32, packet: rawbytes.Bytes): bool =
+    return VpnTunWritePacketFrameMode(fd, VpnTunFrameModeDarwinUtun, packet)
+
+@borrows
+fn VpnTunWritePacketFrameMode(fd: int32,
+                              frameMode: int32,
+                              packet: rawbytes.Bytes): bool =
+    let dataLen: int32 = rawbytes.BytesLen(packet)
+    if dataLen <= 0: return false
+    if frameMode != VpnTunFrameModeRawIpv4:
+        var frame: rawbytes.Bytes = VpnTunAddDarwinHeader(packet)
+        let frameLen: int32 = rawbytes.BytesLen(frame)
+        let wrote: int64 = VpnTunFdWrite(fd, frame.data, frameLen)
+        rawbytes.BytesFree(frame)
+        return wrote >= int64(frameLen)
+    # [tun-mtu] raw ipv4: 缓冲可为多个拼接的完整 IP 包,按 IP total-length
+    # 逐包 write(TUN 一次 write 只吃一包)。长度不合理时退化整段单写。
+    var offset: int32
+    while offset < dataLen:
+        if offset + 20 > dataLen:
+            return false
+        let b2: int32 = rawbytes.BytesGet(packet, offset + 2) & 255
+        let b3: int32 = rawbytes.BytesGet(packet, offset + 3) & 255
+        let ipTotal: int32 = (b2 * 256) + b3
+        if ipTotal < 20 || offset + ipTotal > dataLen:
+            let restLen: int32 = dataLen - offset
+            let restPtr: ptr = rawmem_support.RawmemPtrAdd(packet.data, offset)
+            let wrote: int64 = VpnTunFdWrite(fd, restPtr, restLen)
+            return wrote >= int64(restLen)
+        let pktPtr: ptr = rawmem_support.RawmemPtrAdd(packet.data, offset)
+        let w: int64 = VpnTunFdWrite(fd, pktPtr, ipTotal)
+        if w < int64(ipTotal):
+            return false
+        offset = offset + ipTotal
+    return true

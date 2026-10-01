@@ -1,0 +1,809 @@
+import std/result
+import std/math as m
+
+# CPU reference forward kernel for Qwen3.5/3.8-style linear attention
+# (gated delta net, one layer). Float64 end-to-end, fixed summation orders,
+# no fallbacks: every entry point is Result[T] with complete shape gates.
+#
+# Layer dataflow (per token t, hidden H):
+#   qpre/kpre/vpre = x @ Wq/Wk/Wv          (row-major [out, in])
+#   causal depthwise short conv (kernel=4, left zero pad) on q/k/v planes
+#   per k-head h:  alpha_th = exp(-softplus(g_h)),  beta_th = sigmoid(b_h)
+#                  g_h = gateAlpha[h] . x_t ,  b_h = gateBeta[h] . x_t
+#   S_th = alpha_th * S_(t-1),h * (I - beta_th k k^T) + beta_th k v^T
+#          S is [dv, dk] (rows = v dim, cols = k dim)
+#   attn_t[vh*d + i] = sum_u S_t,kh(vh)[i][u] * q_t,kh(vh)[u],  kh = vh/3
+#   og = attn * sigmoid(outGate . x_t)  (elementwise over v width)
+#   y_t = og @ outProj^T                 ([H, vW] row-major)
+
+const
+    GatedDeltaNetSchema = "cheng.inference.gated_delta_net.v1"
+    GatedDeltaNetKeyHeads = 16
+    GatedDeltaNetValueHeads = 48
+    GatedDeltaNetHeadDim = 128
+    GatedDeltaNetConvKernel = 4
+    GatedDeltaNetChunkLen = 64
+
+type
+    GatedDeltaNetParams =
+        schema: str
+        keyHeads: int32
+        valueHeads: int32
+        headDim: int32
+        hiddenSize: int32
+        convKernel: int32
+        qProj: float64[]
+        kProj: float64[]
+        vProj: float64[]
+        gateAlpha: float64[]
+        gateBeta: float64[]
+        outGate: float64[]
+        outProj: float64[]
+        convW: float64[]
+        sourceHash: int64
+
+    GatedDeltaNetState =
+        keyHeads: int32
+        headDim: int32
+        data: float64[]
+        stateHash: int64
+
+    GdnF64Bits =
+        signBit: int64
+        expUnbiased: int64
+        mantissa52: int64
+
+# --- hashing (model_graph style mixer; floats hashed via exact IEEE bit
+# decomposition because the backend exposes no f64 bitcast) ---
+
+fn GdnHashStep(hash: int64, value: int64): int64 =
+    let mixed = hash * int64(1315423911) + value + int64(31)
+    if mixed < int64(0):
+        return int64(0) - mixed
+    return mixed
+
+@borrows
+fn GdnHashTextWith(hashRaw: int64, text: str): int64 =
+    var h: int64 = hashRaw
+    for i in 0..<len(text):
+        h = GdnHashStep(h, int64(Int32(text[i])))
+    return h
+
+fn GdnDecomposeF64(x: float64): Result[GdnF64Bits] =
+    var sign: int64 = int64(0)
+    var v: float64 = x
+    if v < 0.0:
+        sign = int64(1)
+        v = 0.0 - v
+    if v == 0.0:
+        return Ok[GdnF64Bits](GdnF64Bits(signBit: sign, expUnbiased: int64(0) - int64(1023), mantissa52: int64(0)))
+    var e: int32 = 0
+    while v < 1.0:
+        v = v * 2.0
+        e = e - 1
+        if e < -2200:
+            return Err[GdnF64Bits]("gated delta net hash: non finite float")
+    while v >= 2.0:
+        v = v / 2.0
+        e = e + 1
+        if e > 2200:
+            return Err[GdnF64Bits]("gated delta net hash: non finite float")
+    var frac: int64 = int64(0)
+    var f: float64 = v - 1.0
+    for i in 0..<52:
+        f = f * 2.0
+        let digit: int64 = int64(f)
+        frac = frac * int64(2) + digit
+        f = f - float64(digit)
+    return Ok[GdnF64Bits](GdnF64Bits(signBit: sign, expUnbiased: int64(e), mantissa52: frac))
+
+@borrows
+fn GdnHashF64With(hashRaw: int64, values: float64[]): Result[int64] =
+    var h: int64 = hashRaw
+    h = GdnHashStep(h, int64(values.len))
+    for i in 0..<values.len:
+        let bitsRes = GdnDecomposeF64(values[i])
+        if IsErr(bitsRes):
+            return Err[int64]("gated delta net hash: non finite float")
+        let bits = Value(bitsRes)
+        h = GdnHashStep(h, bits.signBit)
+        h = GdnHashStep(h, bits.expUnbiased + int64(1023))
+        h = GdnHashStep(h, bits.mantissa52)
+    return Ok[int64](h)
+
+# --- internal numeric primitives (callers gate all shapes before use) ---
+
+@borrows
+fn GdnDot(a: float64[], b: float64[], baseA: int32, baseB: int32, n: int32): float64 =
+    var s: float64 = 0.0
+    for i in 0..<n:
+        s = s + a[baseA + i] * b[baseB + i]
+    return s
+
+@borrows
+fn GdnAxpyInPlace(z: var float64[], baseZ: int32, x: float64[], baseX: int32,
+                  n: int32, scale: float64) =
+    for i in 0..<n:
+        z[baseZ + i] = z[baseZ + i] - scale * x[baseX + i]
+
+fn GdnSigmoidStable(z: float64): float64 =
+    if z < -35.0:
+        return 0.0
+    if z > 35.0:
+        return 1.0
+    return 1.0 / (1.0 + m.Exp(0.0 - z))
+
+fn GdnSoftplusStable(z: float64): float64 =
+    if z > 20.0:
+        return z
+    return m.Ln(1.0 + m.Exp(z))
+
+# --- shape gates ---
+
+@borrows
+fn GatedDeltaNetParamsValidate(params: GatedDeltaNetParams): Result[bool] =
+    if params.schema != GatedDeltaNetSchema:
+        return Err[bool]("gated delta net: schema")
+    if params.keyHeads <= 0 || params.headDim <= 0 || params.hiddenSize <= 0:
+        return Err[bool]("gated delta net: dims")
+    if params.valueHeads != params.keyHeads * 3:
+        return Err[bool]("gated delta net: value head ratio")
+    if params.convKernel != GatedDeltaNetConvKernel:
+        return Err[bool]("gated delta net: conv kernel")
+    if params.sourceHash == int64(0):
+        return Err[bool]("gated delta net: source hash")
+    let kW = params.keyHeads * params.headDim
+    let vW = params.valueHeads * params.headDim
+    let h = params.hiddenSize
+    if int64(kW) * int64(h) > int64(9223372036854775807) / int64(2):
+        return Err[bool]("gated delta net: size overflow")
+    if params.qProj.len != kW * h:
+        return Err[bool]("gated delta net: q proj len")
+    if params.kProj.len != kW * h:
+        return Err[bool]("gated delta net: k proj len")
+    if params.vProj.len != vW * h:
+        return Err[bool]("gated delta net: v proj len")
+    if params.gateAlpha.len != params.keyHeads * h:
+        return Err[bool]("gated delta net: gate alpha len")
+    if params.gateBeta.len != params.keyHeads * h:
+        return Err[bool]("gated delta net: gate beta len")
+    if params.outGate.len != vW * h:
+        return Err[bool]("gated delta net: out gate len")
+    if params.outProj.len != vW * h:
+        return Err[bool]("gated delta net: out proj len")
+    let convTotal = GatedDeltaNetConvKernel * (kW + kW + vW)
+    if params.convW.len != convTotal:
+        return Err[bool]("gated delta net: conv weight len")
+    return Ok[bool](true)
+
+fn GatedDeltaNetStateInit(out: var GatedDeltaNetState, keyHeads: int32, headDim: int32): Result[bool] =
+    if keyHeads <= 0 || headDim <= 0:
+        return Err[bool]("gated delta net state: dims")
+    if int64(keyHeads) * int64(headDim) * int64(headDim) > int64(9223372036854775807) / int64(2):
+        return Err[bool]("gated delta net state: size overflow")
+    var data: float64[]
+    let total = keyHeads * headDim * headDim
+    for i in 0..<total:
+        add(data, 0.0)
+    out.keyHeads = keyHeads
+    out.headDim = headDim
+    out.data = data
+    let hashRes = GatedDeltaNetStateRefreshHash(out)
+    if IsErr(hashRes):
+        return Err[bool]("gated delta net state: hash")
+    return Ok[bool](true)
+
+fn GatedDeltaNetStateRefreshHash(state: var GatedDeltaNetState): Result[bool] =
+    if state.keyHeads <= 0 || state.headDim <= 0:
+        return Err[bool]("gated delta net state: dims")
+    if state.data.len != state.keyHeads * state.headDim * state.headDim:
+        return Err[bool]("gated delta net state: len")
+    var h: int64 = GdnHashTextWith(int64(2166136261), GatedDeltaNetSchema)
+    h = GdnHashStep(h, int64(state.keyHeads))
+    h = GdnHashStep(h, int64(state.headDim))
+    let hashRes = GdnHashF64With(h, state.data)
+    if IsErr(hashRes):
+        return Err[bool]("gated delta net state: hash")
+    state.stateHash = Value(hashRes)
+    return Ok[bool](true)
+
+# --- projections + per-head gates for one token row ---
+# qRow [kW], kRow [kW], vRow [vW], alphaOut/betaOut [keyHeads]
+
+@borrows
+fn GatedDeltaNetProjectTokenFill(qRow: var float64[], kRow: var float64[], vRow: var float64[],
+                                 alphaOut: var float64[], betaOut: var float64[],
+                                 params: GatedDeltaNetParams, xRow: float64[]): Result[bool] =
+    if params.keyHeads <= 0 || params.headDim <= 0 || params.hiddenSize <= 0:
+        return Err[bool]("gated delta net project: dims")
+    let kW = params.keyHeads * params.headDim
+    let vW = params.valueHeads * params.headDim
+    let h = params.hiddenSize
+    if xRow.len != h || qRow.len < kW || kRow.len < kW || vRow.len < vW:
+        return Err[bool]("gated delta net project: row shape")
+    if alphaOut.len < params.keyHeads || betaOut.len < params.keyHeads:
+        return Err[bool]("gated delta net project: gate shape")
+    for o in 0..<kW:
+        qRow[o] = GdnDot(params.qProj, xRow, o * h, 0, h)
+    for o in 0..<kW:
+        kRow[o] = GdnDot(params.kProj, xRow, o * h, 0, h)
+    for o in 0..<vW:
+        vRow[o] = GdnDot(params.vProj, xRow, o * h, 0, h)
+    for hd in 0..<params.keyHeads:
+        let g = GdnDot(params.gateAlpha, xRow, hd * h, 0, h)
+        alphaOut[hd] = m.Exp(0.0 - GdnSoftplusStable(g))
+    for hd in 0..<params.keyHeads:
+        let b = GdnDot(params.gateBeta, xRow, hd * h, 0, h)
+        betaOut[hd] = GdnSigmoidStable(b)
+    return Ok[bool](true)
+
+# --- causal depthwise short conv over one projected plane ---
+# inRows/outRows: [seqLen, width] row major. convW holds tap-major weights for
+# the plane starting at convOffset: weight[tap][ch] = convW[convOffset + tap*width + ch].
+# Boundary rule: taps reaching before t=0 are skipped, never added as zeros.
+
+@borrows
+fn GatedDeltaNetConvSequenceFill(outRows: var float64[], inRows: float64[],
+                                 width: int32, seqLen: int32,
+                                 convW: float64[], convOffset: int32): Result[bool] =
+    if width <= 0 || seqLen <= 0:
+        return Err[bool]("gated delta net conv: dims")
+    if inRows.len < seqLen * width || outRows.len < seqLen * width:
+        return Err[bool]("gated delta net conv: plane shape")
+    if convOffset < 0 || convOffset + GatedDeltaNetConvKernel * width > convW.len:
+        return Err[bool]("gated delta net conv: weight range")
+    for t in 0..<seqLen:
+        for c in 0..<width:
+            var s: float64 = 0.0
+            for j in 0..<GatedDeltaNetConvKernel:
+                let src = t - (GatedDeltaNetConvKernel - 1) + j
+                if src >= 0:
+                    s = s + convW[convOffset + j * width + c] * inRows[src * width + c]
+            outRows[t * width + c] = s
+    return Ok[bool](true)
+
+# --- output gate + output projection for one token row ---
+# attnRow [vW], xRow [hidden], outRow [hidden]
+
+@borrows
+fn GatedDeltaNetOutputProjectFill(outRow: var float64[], attnRow: float64[], attnBase: int32,
+                                  params: GatedDeltaNetParams, xRow: float64[],
+                                  xBase: int32,
+                                  gateScratch: var float64[]): Result[bool] =
+    let vW = params.valueHeads * params.headDim
+    let h = params.hiddenSize
+    if attnRow.len < attnBase + vW || xRow.len < xBase + h || outRow.len < h:
+        return Err[bool]("gated delta net out proj: row shape")
+    if gateScratch.len < vW:
+        return Err[bool]("gated delta net out proj: scratch")
+    for x in 0..<vW:
+        let g = GdnDot(params.outGate, xRow, x * h, xBase, h)
+        gateScratch[x] = attnRow[attnBase + x] * GdnSigmoidStable(g)
+    for o in 0..<h:
+        outRow[o] = GdnDot(params.outProj, gateScratch, o * vW, 0, vW)
+    return Ok[bool](true)
+
+# --- single-token delta rule step (public streaming surface) ---
+# Reads conv'd rows for token t (qRow/kRow [kW], vRow [vW]), per-head scalars
+# alphaHead/betaHead [keyHeads], updates state in place, emits outRow [hidden].
+
+@borrows
+fn GatedDeltaNetStepRecurrentFill(state: var GatedDeltaNetState,
+                                  outRow: var float64[],
+                                  params: GatedDeltaNetParams,
+                                  qRow: float64[], kRow: float64[], vRow: float64[],
+                                  alphaHead: float64[], betaHead: float64[],
+                                  xRow: float64[], xBase: int32,
+                                  attnScratch: var float64[],
+                                  gateScratch: var float64[]): Result[bool] =
+    let valOk = GatedDeltaNetParamsValidate(params)
+    if IsErr(valOk):
+        return Err[bool]("gated delta net step: params")
+    if state.keyHeads != params.keyHeads || state.headDim != params.headDim:
+        return Err[bool]("gated delta net step: state dims")
+    let kW = params.keyHeads * params.headDim
+    let vW = params.valueHeads * params.headDim
+    let d = params.headDim
+    if qRow.len < kW || kRow.len < kW || vRow.len < vW:
+        return Err[bool]("gated delta net step: rows")
+    if alphaHead.len < params.keyHeads || betaHead.len < params.keyHeads:
+        return Err[bool]("gated delta net step: gates")
+    if xRow.len < xBase + params.hiddenSize:
+        return Err[bool]("gated delta net step: input row")
+    if attnScratch.len < vW || gateScratch.len < vW || outRow.len < params.hiddenSize:
+        return Err[bool]("gated delta net step: scratch")
+    for hd in 0..<params.keyHeads:
+        if alphaHead[hd] <= 0.0 || alphaHead[hd] > 1.0:
+            return Err[bool]("gated delta net step: alpha range")
+        if betaHead[hd] <= 0.0 || betaHead[hd] >= 1.0:
+            return Err[bool]("gated delta net step: beta range")
+    let stateOk = GatedDeltaNetStateRefreshHash(state)
+    if IsErr(stateOk):
+        return Err[bool]("gated delta net step: state hash")
+    for hd in 0..<params.keyHeads:
+        let kb = hd * d * d
+        let alpha = alphaHead[hd]
+        let beta = betaHead[hd]
+        let kBase = hd * d
+        let vBase = (hd * 3) * d
+        # pass 1 + 2 fused per row: the dot for row v reads only row v of the
+        # pre-update state, and the update below rewrites exactly that row,
+        # so in-place evolution preserves the recurrence semantics.
+        for v in 0..<d:
+            let dotv = GdnDot(state.data, kRow, kb + v * d, kBase, d)
+            for u in 0..<d:
+                let idx = kb + v * d + u
+                state.data[idx] = alpha * (state.data[idx] - beta * dotv * kRow[kBase + u]) +
+                                  beta * kRow[kBase + u] * vRow[vBase + v]
+        # attention output for this head's three v heads, reading S_t: all
+        # three subheads share the parent k-head's attention vector.
+        for v in 0..<d:
+            var aBox: float64[]
+            add(aBox, 0.0)
+            for u in 0..<d:
+                aBox[0] = aBox[0] + state.data[kb + v * d + u] * qRow[kBase + u]
+            attnScratch[vBase + v] = aBox[0]
+            attnScratch[vBase + d + v] = aBox[0]
+            attnScratch[vBase + 2 * d + v] = aBox[0]
+    let outOk = GatedDeltaNetOutputProjectFill(outRow, attnScratch, 0, params, xRow, xBase, gateScratch)
+    if IsErr(outOk):
+        return Err[bool]("gated delta net step: output")
+    let hashOk = GatedDeltaNetStateRefreshHash(state)
+    if IsErr(hashOk):
+        return Err[bool]("gated delta net step: state hash")
+    return Ok[bool](true)
+
+# --- whole-sequence feature preparation (project + conv + gates) ---
+# Buffers (all filled): qC/kC [seqLen*kW] conv'd, vC [seqLen*vW] conv'd,
+# alphaAll/betaAll [seqLen*keyHeads]. Pre-projection planes are transient.
+
+@borrows
+fn GatedDeltaNetPrepareSequenceFill(qC: var float64[], kC: var float64[], vC: var float64[],
+                                    alphaAll: var float64[], betaAll: var float64[],
+                                    params: GatedDeltaNetParams, xAll: float64[],
+                                    seqLen: int32): Result[bool] =
+    let valOk = GatedDeltaNetParamsValidate(params)
+    if IsErr(valOk):
+        return Err[bool]("gated delta net prepare: params")
+    if seqLen <= 0:
+        return Err[bool]("gated delta net prepare: seq len")
+    if xAll.len < seqLen * params.hiddenSize:
+        return Err[bool]("gated delta net prepare: input shape")
+    let kW = params.keyHeads * params.headDim
+    let vW = params.valueHeads * params.headDim
+    let h = params.hiddenSize
+    let kh = params.keyHeads
+    if qC.len < seqLen * kW || kC.len < seqLen * kW || vC.len < seqLen * vW:
+        return Err[bool]("gated delta net prepare: plane shape")
+    if alphaAll.len < seqLen * kh || betaAll.len < seqLen * kh:
+        return Err[bool]("gated delta net prepare: gate shape")
+    var qPre: float64[]
+    var kPre: float64[]
+    var vPre: float64[]
+    for i in 0..<seqLen * kW:
+        add(qPre, 0.0)
+    for i in 0..<seqLen * kW:
+        add(kPre, 0.0)
+    for i in 0..<seqLen * vW:
+        add(vPre, 0.0)
+    var qRowScratch: float64[]
+    var kRowScratch: float64[]
+    var vRowScratch: float64[]
+    var alphaScratch: float64[]
+    var betaScratch: float64[]
+    for i in 0..<kW:
+        add(qRowScratch, 0.0)
+    for i in 0..<kW:
+        add(kRowScratch, 0.0)
+    for i in 0..<vW:
+        add(vRowScratch, 0.0)
+    for i in 0..<kh:
+        add(alphaScratch, 0.0)
+        add(betaScratch, 0.0)
+    for t in 0..<seqLen:
+        let xBase = t * h
+        var xView: float64[]
+        for i in 0..<h:
+            add(xView, xAll[xBase + i])
+        let projOk = GatedDeltaNetProjectTokenFill(qRowScratch, kRowScratch, vRowScratch,
+                                                   alphaScratch, betaScratch, params, xView)
+        if IsErr(projOk):
+            return Err[bool]("gated delta net prepare: project")
+        for hd in 0..<kh:
+            alphaAll[t * kh + hd] = alphaScratch[hd]
+            betaAll[t * kh + hd] = betaScratch[hd]
+        for i in 0..<kW:
+            qPre[t * kW + i] = qRowScratch[i]
+            kPre[t * kW + i] = kRowScratch[i]
+        for i in 0..<vW:
+            vPre[t * vW + i] = vRowScratch[i]
+    let convQ = GatedDeltaNetConvSequenceFill(qC, qPre, kW, seqLen, params.convW, 0)
+    if IsErr(convQ):
+        return Err[bool]("gated delta net prepare: conv q")
+    let convK = GatedDeltaNetConvSequenceFill(kC, kPre, kW, seqLen, params.convW, GatedDeltaNetConvKernel * kW)
+    if IsErr(convK):
+        return Err[bool]("gated delta net prepare: conv k")
+    let convV = GatedDeltaNetConvSequenceFill(vC, vPre, vW, seqLen, params.convW, GatedDeltaNetConvKernel * (kW + kW))
+    if IsErr(convV):
+        return Err[bool]("gated delta net prepare: conv v")
+    return Ok[bool](true)
+
+# --- whole-sequence naive recurrent forward ---
+# Zero-initialised carry state, one GatedDeltaNetStepRecurrentFill per token.
+@borrows
+fn GatedDeltaNetRecurrentForwardFill(outAll: var float64[],
+                                     stateOut: var GatedDeltaNetState,
+                                     params: GatedDeltaNetParams,
+                                     xAll: float64[],
+                                     seqLen: int32): Result[bool] =
+    let valOk = GatedDeltaNetParamsValidate(params)
+    if IsErr(valOk):
+        return Err[bool]("gated delta net recurrent: params")
+    if seqLen <= 0 || xAll.len < seqLen * params.hiddenSize:
+        return Err[bool]("gated delta net recurrent: input shape")
+    if outAll.len < seqLen * params.hiddenSize:
+        return Err[bool]("gated delta net recurrent: out shape")
+    let kW = params.keyHeads * params.headDim
+    let vW = params.valueHeads * params.headDim
+    let h = params.hiddenSize
+    let kh = params.keyHeads
+    var qC: float64[]
+    var kC: float64[]
+    var vC: float64[]
+    var alphaAll: float64[]
+    var betaAll: float64[]
+    for i in 0..<seqLen * kW:
+        add(qC, 0.0)
+        add(kC, 0.0)
+    for i in 0..<seqLen * vW:
+        add(vC, 0.0)
+    for i in 0..<seqLen * kh:
+        add(alphaAll, 0.0)
+        add(betaAll, 0.0)
+    let prepOk = GatedDeltaNetPrepareSequenceFill(qC, kC, vC, alphaAll, betaAll, params, xAll, seqLen)
+    if IsErr(prepOk):
+        return Err[bool]("gated delta net recurrent: prepare")
+    let initOk = GatedDeltaNetStateInit(stateOut, params.keyHeads, params.headDim)
+    if IsErr(initOk):
+        return Err[bool]("gated delta net recurrent: state init")
+    var qRow: float64[]
+    var kRow: float64[]
+    var vRow: float64[]
+    var alphaHead: float64[]
+    var betaHead: float64[]
+    var attnScratch: float64[]
+    var gateScratch: float64[]
+    for i in 0..<kW:
+        add(qRow, 0.0)
+        add(kRow, 0.0)
+    for i in 0..<vW:
+        add(vRow, 0.0)
+        add(attnScratch, 0.0)
+        add(gateScratch, 0.0)
+    for i in 0..<kh:
+        add(alphaHead, 0.0)
+        add(betaHead, 0.0)
+    var outView: float64[]
+    for i in 0..<h:
+        add(outView, 0.0)
+    for t in 0..<seqLen:
+        for i in 0..<kW:
+            qRow[i] = qC[t * kW + i]
+            kRow[i] = kC[t * kW + i]
+        for i in 0..<vW:
+            vRow[i] = vC[t * vW + i]
+        for hd in 0..<kh:
+            alphaHead[hd] = alphaAll[t * kh + hd]
+            betaHead[hd] = betaAll[t * kh + hd]
+        let stepOk = GatedDeltaNetStepRecurrentFill(stateOut, outView, params,
+                                                    qRow, kRow, vRow, alphaHead, betaHead,
+                                                    xAll, t * h, attnScratch, gateScratch)
+        if IsErr(stepOk):
+            return Err[bool]("gated delta net recurrent: step")
+        for i in 0..<h:
+            outAll[t * h + i] = outView[i]
+    let hashOk = GatedDeltaNetStateRefreshHash(stateOut)
+    if IsErr(hashOk):
+        return Err[bool]("gated delta net recurrent: state hash")
+    return Ok[bool](true)
+
+# --- whole-sequence chunked forward ---
+# Block length chunkLen (model canonical: GatedDeltaNetChunkLen). Within each
+# chunk the state evolution is expanded into small-matrix form over the chunk's
+# C tokens (decay ratios as explicit prefix products, no division anywhere):
+#   S_i = gamma_i S_0 X_i + sum_{j<=i} rho_ij beta_j v_j (X_j^iT k_j)^T
+#   X_i = M_1..M_i (right-action composite), M_m = I - beta_m k_m k_m^T
+# Outputs and final state are assembled from three O(L^2 d)/O(L d^2) block
+# passes; summation orders are fixed by the loops below.
+@borrows
+fn GatedDeltaNetChunkedForwardFill(outAll: var float64[],
+                                   stateOut: var GatedDeltaNetState,
+                                   params: GatedDeltaNetParams,
+                                   xAll: float64[],
+                                   seqLen: int32,
+                                   chunkLen: int32): Result[bool] =
+    let valOk = GatedDeltaNetParamsValidate(params)
+    if IsErr(valOk):
+        return Err[bool]("gated delta net chunked: params")
+    if seqLen <= 0 || chunkLen <= 0:
+        return Err[bool]("gated delta net chunked: lens")
+    if xAll.len < seqLen * params.hiddenSize:
+        return Err[bool]("gated delta net chunked: input shape")
+    if outAll.len < seqLen * params.hiddenSize:
+        return Err[bool]("gated delta net chunked: out shape")
+    let kW = params.keyHeads * params.headDim
+    let vW = params.valueHeads * params.headDim
+    let h = params.hiddenSize
+    let kh = params.keyHeads
+    let d = params.headDim
+    var qC: float64[]
+    var kC: float64[]
+    var vC: float64[]
+    var alphaAll: float64[]
+    var betaAll: float64[]
+    for i in 0..<seqLen * kW:
+        add(qC, 0.0)
+        add(kC, 0.0)
+    for i in 0..<seqLen * vW:
+        add(vC, 0.0)
+    for i in 0..<seqLen * kh:
+        add(alphaAll, 0.0)
+        add(betaAll, 0.0)
+    let prepOk = GatedDeltaNetPrepareSequenceFill(qC, kC, vC, alphaAll, betaAll, params, xAll, seqLen)
+    if IsErr(prepOk):
+        return Err[bool]("gated delta net chunked: prepare")
+    let initOk = GatedDeltaNetStateInit(stateOut, params.keyHeads, params.headDim)
+    if IsErr(initOk):
+        return Err[bool]("gated delta net chunked: state init")
+    # chunk scratch
+    var gamma: float64[]
+    var betaLoc: float64[]
+    var alphaLoc: float64[]
+    var amat: float64[]
+    var diagC: float64[]
+    var ybuf: float64[]
+    var zbuf: float64[]
+    var tstore: float64[]
+    var coefj: float64[]
+    var snew: float64[]
+    var attnChunk: float64[]
+    var gateScratch: float64[]
+    for i in 0..<chunkLen:
+        add(gamma, 0.0)
+        add(betaLoc, 0.0)
+        add(alphaLoc, 0.0)
+        add(diagC, 0.0)
+        add(coefj, 0.0)
+    for i in 0..<chunkLen * chunkLen:
+        add(amat, 0.0)
+    for i in 0..<d:
+        add(ybuf, 0.0)
+        add(zbuf, 0.0)
+    for i in 0..<chunkLen * d:
+        add(tstore, 0.0)
+    for i in 0..<d * d:
+        add(snew, 0.0)
+    for i in 0..<chunkLen * vW:
+        add(attnChunk, 0.0)
+    for i in 0..<vW:
+        add(gateScratch, 0.0)
+    var c0: int32 = 0
+    while c0 < seqLen:
+        var ln: int32 = seqLen - c0
+        if ln > chunkLen:
+            ln = chunkLen
+        for hd in 0..<kh:
+            let kb = hd * d * d
+            let kOff = hd * d
+            let vOff = (hd * 3) * d
+            for i in 0..<ln:
+                alphaLoc[i] = alphaAll[(c0 + i) * kh + hd]
+                betaLoc[i] = betaAll[(c0 + i) * kh + hd]
+            gamma[0] = alphaLoc[0]
+            for i in 1..<ln:
+                gamma[i] = gamma[i - 1] * alphaLoc[i]
+            # outputs for the chunk (read chunk-start state, no mutation yet)
+            for i in 0..<ln:
+                let qiB = (c0 + i) * kW + kOff
+                let viB = (c0 + i) * vW + vOff
+                diagC[i] = betaLoc[i] * GdnDot(kC, qC, (c0 + i) * kW + kOff, qiB, d)
+                # ybuf <- q_i, then descend applying M_jj, recording coeffs
+                for x in 0..<d:
+                    ybuf[x] = qC[qiB + x]
+                var rr: float64 = 1.0
+                var jj: int32 = i
+                while jj >= 1:
+                    let kjB = (c0 + jj) * kW + kOff
+                    let dp = GdnDot(kC, ybuf, kjB, 0, d)
+                    GdnAxpyInPlace(ybuf, 0, kC, kjB, d, betaLoc[jj] * dp)
+                    rr = rr * alphaLoc[jj]
+                    let knB = (c0 + jj - 1) * kW + kOff
+                    let cp = GdnDot(kC, ybuf, knB, 0, d)
+                    amat[i * chunkLen + (jj - 1)] = rr * betaLoc[jj - 1] * cp
+                    jj = jj - 1
+                # the descent stops at jj=1 (coefficients need M_1..M_i); the
+                # S0 term itself requires X_i = M_0..M_i, so apply M_0 once more
+                let k0B = (c0 + 0) * kW + kOff
+                var d0B: float64[]
+                add(d0B, 0.0)
+                for u in 0..<d:
+                    d0B[0] = d0B[0] + kC[k0B + u] * ybuf[u]
+                GdnAxpyInPlace(ybuf, 0, kC, k0B, d, betaLoc[0] * d0B[0])
+                # ybuf now holds X_i q_i
+                for v in 0..<d:
+                    var acc: float64 = gamma[i] * GdnDot(stateOut.data, ybuf, kb + v * d, 0, d)
+                    acc = acc + diagC[i] * vC[viB + v]
+                    for j in 0..<i:
+                        acc = acc + amat[i * chunkLen + j] * vC[(c0 + j) * vW + vOff + v]
+                    # all three subheads share the parent k-head's attention row
+                    attnChunk[i * vW + vOff + v] = acc
+                    attnChunk[i * vW + vOff + d + v] = acc
+                    attnChunk[i * vW + vOff + 2 * d + v] = acc
+            # transformed keys t_j = (M_{j+1}^T .. M_{ln-1}^T) k_j, ascending
+            var rp: float64 = 1.0
+            var jj2: int32 = ln - 1
+            while jj2 >= 0:
+                if jj2 < ln - 1:
+                    rp = rp * alphaLoc[jj2 + 1]
+                coefj[jj2] = betaLoc[jj2] * rp
+                let kjB = (c0 + jj2) * kW + kOff
+                for x in 0..<d:
+                    zbuf[x] = kC[kjB + x]
+                var mm: int32 = jj2 + 1
+                while mm <= ln - 1:
+                    let kmB = (c0 + mm) * kW + kOff
+                    let cc = GdnDot(kC, zbuf, kmB, 0, d)
+                    GdnAxpyInPlace(zbuf, 0, kC, kmB, d, betaLoc[mm] * cc)
+                    mm = mm + 1
+                for x in 0..<d:
+                    tstore[jj2 * d + x] = zbuf[x]
+                jj2 = jj2 - 1
+            # new state: base term rows through X_ln^T, plus rank terms.
+            # Row identity: (S0 X_ln)[v][:] = (X_ln^T S0[v,:])^T; X_ln^T has
+            # M factors symmetric, so column application runs ascending m.
+            for v in 0..<d:
+                for x in 0..<d:
+                    zbuf[x] = stateOut.data[kb + v * d + x]
+                var mm2: int32 = 0
+                while mm2 <= ln - 1:
+                    let kmB = (c0 + mm2) * kW + kOff
+                    let cc = GdnDot(kC, zbuf, kmB, 0, d)
+                    GdnAxpyInPlace(zbuf, 0, kC, kmB, d, betaLoc[mm2] * cc)
+                    mm2 = mm2 + 1
+                for x in 0..<d:
+                    snew[v * d + x] = gamma[ln - 1] * zbuf[x]
+            for v in 0..<d:
+                for u in 0..<d:
+                    var acc: float64 = snew[v * d + u]
+                    for j in 0..<ln:
+                        acc = acc + coefj[j] * vC[(c0 + j) * vW + vOff + v] * tstore[j * d + u]
+                    snew[v * d + u] = acc
+            for i in 0..<d * d:
+                stateOut.data[kb + i] = snew[i]
+        # output gate + projection for the chunk's tokens
+        var outView: float64[]
+        for x in 0..<h:
+            add(outView, 0.0)
+        for i in 0..<ln:
+            let outOk = GatedDeltaNetOutputProjectFill(outView, attnChunk, i * vW, params,
+                                                       xAll, (c0 + i) * h, gateScratch)
+            if IsErr(outOk):
+                return Err[bool]("gated delta net chunked: output")
+            for x in 0..<h:
+                outAll[(c0 + i) * h + x] = outView[x]
+        c0 = c0 + ln
+    let hashOk = GatedDeltaNetStateRefreshHash(stateOut)
+    if IsErr(hashOk):
+        return Err[bool]("gated delta net chunked: state hash")
+    return Ok[bool](true)
+
+# --- comparison utilities ---
+# Float64 control flow on this backend cannot be trusted through raw scalar
+# compares or additive-shift tricks (sub-ulp differences flatten to zero
+# against large headrooms). Everything below routes magnitudes through the
+# exact IEEE bit decomposition (GdnDecomposeF64) and compares integers;
+# running maximums live in array elements, whose read-modify-write semantics
+# are verified reliable.
+
+@borrows
+fn GdnKeyAtLeast(a: GdnF64Bits, b: GdnF64Bits): bool =
+    if a.expUnbiased > b.expUnbiased:
+        return true
+    if a.expUnbiased < b.expUnbiased:
+        return false
+    return a.mantissa52 >= b.mantissa52
+
+fn GatedDeltaNetWithinTolerance(x: float64, tol: float64): Result[bool] =
+    let xRes = GdnDecomposeF64(x)
+    if IsErr(xRes):
+        return Err[bool]("gated delta net tolerance: non finite")
+    let tolRes = GdnDecomposeF64(tol)
+    if IsErr(tolRes):
+        return Err[bool]("gated delta net tolerance: non finite")
+    let xb = Value(xRes)
+    let tb = Value(tolRes)
+    if xb.signBit == int64(1) && !(xb.expUnbiased == int64(0) - int64(1023) && xb.mantissa52 == int64(0)):
+        return Ok[bool](false)
+    return Ok[bool](GdnKeyAtLeast(tb, xb))
+
+@borrows
+fn GatedDeltaNetMaxAbsDiff(a: float64[], b: float64[]): Result[float64] =
+    if a.len != b.len:
+        return Err[float64]("gated delta net diff: len mismatch")
+    var bestBox: float64[]
+    add(bestBox, 0.0)
+    var bestExp: int64 = int64(0) - int64(1023)
+    var bestMan: int64 = int64(0)
+    for i in 0..<a.len:
+        var df: float64 = a[i] - b[i]
+        let dfRes = GdnDecomposeF64(df)
+        if IsErr(dfRes):
+            return Err[float64]("gated delta net diff: non finite")
+        let db = Value(dfRes)
+        if db.signBit == int64(1):
+            df = 0.0 - df
+        if db.expUnbiased > bestExp ||
+           (db.expUnbiased == bestExp && db.mantissa52 >= bestMan):
+            bestBox[0] = df
+            bestExp = db.expUnbiased
+            bestMan = db.mantissa52
+    return Ok[float64](bestBox[0])
+
+# Tolerance decision without any float control flow: the tolerance is given
+# as an exact IEEE key (exponent, 52-bit mantissa) for a non-negative bound,
+# e.g. 2^-40 ~== 8.6e-13 is (-40, 0). Every decision below is integer-only.
+@borrows
+fn GatedDeltaNetArraysWithinToleranceKey(a: float64[], b: float64[],
+                                         tolExp: int64, tolMan: int64): Result[bool] =
+    if a.len != b.len:
+        return Err[bool]("gated delta net tolerance key: len mismatch")
+    if tolExp < int64(0) - int64(1023):
+        return Err[bool]("gated delta net tolerance key: exponent")
+    for i in 0..<a.len:
+        let dfRes = GdnDecomposeF64(a[i] - b[i])
+        if IsErr(dfRes):
+            return Err[bool]("gated delta net tolerance key: non finite")
+        let db = Value(dfRes)
+        # magnitude key: exponent+magnitude are identical for both signs, so
+        # signBit is irrelevant here; zeros sort below every positive normal.
+        if db.expUnbiased > tolExp:
+            return Ok[bool](false)
+        if db.expUnbiased == tolExp && db.mantissa52 > tolMan:
+            return Ok[bool](false)
+    return Ok[bool](true)
+
+# Bitwise equality of two buffers (+0 and -0 fold together; NaN hard-fails).
+@borrows
+fn GatedDeltaNetArraysBitEqual(a: float64[], b: float64[]): Result[bool] =
+    if a.len != b.len:
+        return Err[bool]("gated delta net bit equal: len mismatch")
+    for i in 0..<a.len:
+        let xa = GdnDecomposeF64(a[i])
+        if IsErr(xa):
+            return Err[bool]("gated delta net bit equal: non finite")
+        let xb = GdnDecomposeF64(b[i])
+        if IsErr(xb):
+            return Err[bool]("gated delta net bit equal: non finite")
+        let ba = Value(xa)
+        let bb = Value(xb)
+        if ba.signBit != bb.signBit:
+            let aZero: bool = ba.expUnbiased == int64(0) - int64(1023) && ba.mantissa52 == int64(0)
+            let bZero: bool = bb.expUnbiased == int64(0) - int64(1023) && bb.mantissa52 == int64(0)
+            if !(aZero && bZero):
+                return Ok[bool](false)
+        else:
+            if ba.expUnbiased != bb.expUnbiased || ba.mantissa52 != bb.mantissa52:
+                return Ok[bool](false)
+    return Ok[bool](true)
+
+@borrows
+fn GatedDeltaNetStatesEqualWithin(a: GatedDeltaNetState, b: GatedDeltaNetState,
+                                  tol: float64): Result[bool] =
+    if a.keyHeads != b.keyHeads || a.headDim != b.headDim:
+        return Err[bool]("gated delta net states equal: dims mismatch")
+    if a.data.len != b.data.len:
+        return Err[bool]("gated delta net states equal: len mismatch")
+    let diffRes = GatedDeltaNetMaxAbsDiff(a.data, b.data)
+    if IsErr(diffRes):
+        return Err[bool]("gated delta net states equal: diff")
+    return GatedDeltaNetWithinTolerance(Value(diffRes), tol)

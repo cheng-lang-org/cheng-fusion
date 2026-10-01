@@ -1,0 +1,792 @@
+import std/result
+import std/strings
+import std/strutils as strutil
+import std/math as mathlib
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/hf_model_graph as hfgraph
+import cheng/inference/weight_store as ws
+import cheng/inference/weight_binding as wb
+import cheng/inference/model_executor as mexec
+import cheng/inference/distributed_engine as engine
+
+# #141: KV-cache-aware Dense generation path equivalence gate.
+#
+# Fixture is a byte-for-byte copy of model_executor_dense_hf_shape_golden_ref_main.cheng's
+# HF-shape (real GQA, weightNames.len==1 attention) 2-layer/hidden=8/
+# attentionHeads=4/keyValueHeads=2 (GQA 2:1)/headDim=2/vocab=6 synthetic
+# config + deterministic weight cycle, and its independent from-scratch
+# HfDgRef* oracle (zero shared code with model_executor.cheng/
+# distributed_engine.cheng -- see that file's header for the independence
+# contract this test continues to follow). Reusing the exact same fixture
+# numbers (rather than inventing a new one) means the "SUT full == independent
+# oracle full" cross-check below inherits that file's already hand-verified
+# anchor instead of re-deriving a fresh one.
+#
+# What this file adds beyond the golden ref file: the golden ref file only
+# exercises the frozen no-kv path (ModelExecutorExecuteDenseTransformerOp /
+# ModelExecutorExecuteDenseTransformerTokens / DistributedGenerateGreedyDenseTransformerTokens).
+# This file is the #141 KV-cache path's own equivalence gate:
+#   1. engine full-recompute vs engine KV-incremental, swept across every
+#      possible prefill/decode split point (stronger than the existing GLM-MoE
+#      precedent at hf_model_graph_smoke.cheng:1126-1209, which only checks
+#      one split point).
+#   2. engine KV-incremental vs the independent oracle's full recompute over
+#      the same growing prefix -- rules out "engine full and engine
+#      incremental share the same bug so they agree with each other but are
+#      both wrong". Includes one split point on a 20-token sequence chosen so
+#      the decode loop crosses paged_kv_cache.cheng's tokensPerPage=16 page
+#      boundary mid-loop (asserted via cache.pages.len==2), exercising both a
+#      cross-page append and cross-page causal attention retrieval, not just
+#      the single-page case the shorter 5-token sweep above covers.
+#   3. the KV-cache generation loop (DistributedGenerateGreedyDenseTransformerTokensWithKvState)
+#      vs the frozen full-recompute generation loop vs the independent
+#      oracle's generation loop, including an early-EOS-stop case.
+#   4. budget/cancellation control flow (deadline-expired and
+#      cancel-at-a-specific-step), pure logic, reusing outcomes from #3.
+#   5. a deliberate double-truth negative control: feeding a single decode
+#      token through Prefill (basePosition forced to 0) instead of Decode
+#      (basePosition = true cached position) must produce DIFFERENT logits --
+#      proving this test net is not vacuous and would catch the exact "RoPE
+#      position dropped/hardcoded" regression the design calls out.
+
+const
+    HfDgRefScale: int32 = 1000
+    HfDgRefTrigScale: int32 = 1073741824
+    HfDgRefSoftmaxScale: int32 = 10000
+
+fn HfDgRefRopeTheta(): float64 =
+    return 10000.0
+
+fn HfDgRefCycleAt(ordinal: int32): int32 =
+    let slot = ordinal % 6
+    if slot == 0:
+        return 1000
+    if slot == 1:
+        return -500
+    if slot == 2:
+        return 250
+    if slot == 3:
+        return 4000
+    if slot == 4:
+        return -2000
+    return 125
+
+fn HfDgRefTakeStream(ordinal: var int32, count: int32): int32[] =
+    var out: int32[]
+    for _ in 0..<count:
+        add(out, HfDgRefCycleAt(ordinal))
+        ordinal = ordinal + 1
+    return out
+
+type
+    HfDgRefMat =
+        rows: int32
+        cols: int32
+        vals: int32[]
+
+fn HfDgRefOffset(cols: int32, row: int32, col: int32): int32 =
+    return row * cols + col
+
+fn HfDgRefSat(value: int64): int32 =
+    if value > int64(2147483647):
+        return 2147483647
+    if value < int64(-2147483648):
+        return -2147483648
+    return int32(value)
+
+fn HfDgRefRoundDiv(numer: int64, denom: int64): int64 =
+    if denom <= int64(0):
+        return int64(0)
+    let half = denom / int64(2)
+    if numer >= int64(0):
+        return (numer + half) / denom
+    return (numer - half) / denom
+
+fn HfDgRefIntSqrt(value: int64): int64 =
+    if value <= int64(0):
+        return int64(0)
+    var x = value
+    var y = (x + int64(1)) / int64(2)
+    while y < x:
+        x = y
+        y = (x + value / x) / int64(2)
+    return x
+
+fn HfDgRefMulQ(a: int32, b: int32, scale: int32): int32 =
+    let product = int64(a) * int64(b)
+    return HfDgRefSat(HfDgRefRoundDiv(product, int64(scale)))
+
+fn HfDgRefEmbedding(tokenIds: int32[], emb: HfDgRefMat): HfDgRefMat =
+    let tokenCount = tokenIds.len
+    let hidden = emb.cols
+    var outVals: int32[]
+    for _ in 0..<(tokenCount * hidden):
+        add(outVals, 0)
+    for t in 0..<tokenCount:
+        let tokenId = tokenIds[t]
+        for h in 0..<hidden:
+            outVals[HfDgRefOffset(hidden, t, h)] = emb.vals[HfDgRefOffset(hidden, tokenId, h)]
+    return HfDgRefMat(rows: tokenCount, cols: hidden, vals: outVals)
+
+fn HfDgRefRmsNormRows(x: HfDgRefMat, weight: int32[], epsilonScale: int32): HfDgRefMat =
+    var outVals: int32[]
+    for _ in 0..<x.vals.len:
+        add(outVals, 0)
+    for t in 0..<x.rows:
+        var squareSum: int64
+        for h in 0..<x.cols:
+            let v = x.vals[HfDgRefOffset(x.cols, t, h)]
+            squareSum = squareSum + int64(v) * int64(v)
+        let meanSquare = squareSum / int64(x.cols)
+        var normBase = HfDgRefIntSqrt(meanSquare + int64(epsilonScale))
+        if normBase <= int64(0):
+            normBase = int64(1)
+        for h in 0..<x.cols:
+            let inputValue = x.vals[HfDgRefOffset(x.cols, t, h)]
+            let weightValue = weight[h]
+            let weighted = int64(inputValue) * int64(weightValue)
+            outVals[HfDgRefOffset(x.cols, t, h)] = HfDgRefSat(weighted / normBase)
+    return HfDgRefMat(rows: x.rows, cols: x.cols, vals: outVals)
+
+fn HfDgRefLinear(x: HfDgRefMat, w: HfDgRefMat): HfDgRefMat =
+    var outVals: int32[]
+    for row in 0..<x.rows:
+        for outF in 0..<w.rows:
+            var sum: int64
+            for inF in 0..<x.cols:
+                let product = int64(x.vals[HfDgRefOffset(x.cols, row, inF)]) *
+                              int64(w.vals[HfDgRefOffset(w.cols, outF, inF)])
+                sum = sum + product
+            add(outVals, HfDgRefSat(HfDgRefRoundDiv(sum, int64(HfDgRefScale))))
+    return HfDgRefMat(rows: x.rows, cols: w.rows, vals: outVals)
+
+# Full-recompute RoPE: position == row index (basePosition is always 0
+# because this oracle always sees the whole prefix from token 0, never a
+# kv-carrying decode call) -- used only to build the two "ground truth" full
+# forwards (oracleFullLogits/oracleGenerated below), never to reproduce the
+# SUT's incremental decode path (that would defeat the point of an
+# independent cross-check).
+fn HfDgRefRopeApplyHeads(x: HfDgRefMat, headCount: int32, headDim: int32, theta: float64): HfDgRefMat =
+    let halfDim = headDim / 2
+    var outVals: int32[]
+    for i in 0..<x.vals.len:
+        add(outVals, x.vals[i])
+    let lnTheta = mathlib.Ln(theta)
+    var invFreq: float64[]
+    for j in 0..<halfDim:
+        let exponent = 0.0 - float64(2 * j) / float64(2 * halfDim)
+        add(invFreq, mathlib.Exp(exponent * lnTheta))
+    let trigScaleF = float64(HfDgRefTrigScale)
+    for row in 0..<x.rows:
+        var cosRow: int32[]
+        var sinRow: int32[]
+        for j in 0..<halfDim:
+            let angle = float64(row) * invFreq[j]
+            add(cosRow, int32(int64(mathlib.Round(mathlib.Cos(angle) * trigScaleF))))
+            add(sinRow, int32(int64(mathlib.Round(mathlib.Sin(angle) * trigScaleF))))
+        for head in 0..<headCount:
+            let colStart = head * headDim
+            for j in 0..<halfDim:
+                let idx1 = HfDgRefOffset(x.cols, row, colStart + j)
+                let idx2 = HfDgRefOffset(x.cols, row, colStart + halfDim + j)
+                let x1 = outVals[idx1]
+                let x2 = outVals[idx2]
+                let c = cosRow[j]
+                let s = sinRow[j]
+                let o1 = HfDgRefSat(int64(HfDgRefMulQ(x1, c, HfDgRefTrigScale)) - int64(HfDgRefMulQ(x2, s, HfDgRefTrigScale)))
+                let o2 = HfDgRefSat(int64(HfDgRefMulQ(x2, c, HfDgRefTrigScale)) + int64(HfDgRefMulQ(x1, s, HfDgRefTrigScale)))
+                outVals[idx1] = o1
+                outVals[idx2] = o2
+    return HfDgRefMat(rows: x.rows, cols: x.cols, vals: outVals)
+
+fn HfDgRefAttention(qRoped: HfDgRefMat, kRoped: HfDgRefMat, v: HfDgRefMat, oW: HfDgRefMat,
+                    attentionHeads: int32, keyValueHeads: int32, headDim: int32): HfDgRefMat =
+    let repeat = attentionHeads / keyValueHeads
+    let hidden = attentionHeads * headDim
+    let sqrtFix: int64 = int64(10000)
+    let isqrtHead = HfDgRefIntSqrt(int64(headDim) * sqrtFix * sqrtFix)
+    var contextVals: int32[]
+    for _ in 0..<(qRoped.rows * hidden):
+        add(contextVals, 0)
+    for t in 0..<qRoped.rows:
+        for qh in 0..<attentionHeads:
+            let kvHead = qh / repeat
+            let queryBase = qh * headDim
+            let kvBase = kvHead * headDim
+            var scores: int32[]
+            var maxScore: int32
+            var sawCandidate: bool
+            for c in 0..<t + 1:
+                var dot: int64
+                for d in 0..<headDim:
+                    dot = dot + int64(qRoped.vals[HfDgRefOffset(qRoped.cols, t, queryBase + d)]) *
+                                int64(kRoped.vals[HfDgRefOffset(kRoped.cols, c, kvBase + d)])
+                let score = HfDgRefSat(HfDgRefRoundDiv(dot * sqrtFix, int64(HfDgRefScale) * isqrtHead))
+                if !sawCandidate || score > maxScore:
+                    maxScore = score
+                    sawCandidate = true
+                add(scores, score)
+            var weights: int32[]
+            var denom: int64
+            for i in 0..<scores.len:
+                let weight = HfDgRefExpNegQ(scores[i] - maxScore, HfDgRefScale, HfDgRefSoftmaxScale)
+                add(weights, weight)
+                denom = denom + int64(weight)
+            for d in 0..<headDim:
+                var numer: int64
+                for c in 0..<t + 1:
+                    numer = numer + int64(v.vals[HfDgRefOffset(v.cols, c, kvBase + d)]) * int64(weights[c])
+                contextVals[HfDgRefOffset(hidden, t, queryBase + d)] = HfDgRefSat(HfDgRefRoundDiv(numer, denom))
+    let context = HfDgRefMat(rows: qRoped.rows, cols: hidden, vals: contextVals)
+    return HfDgRefLinear(context, oW)
+
+fn HfDgRefAddBiasRows(x: HfDgRefMat, bias: int32[]): HfDgRefMat =
+    var outVals: int32[]
+    for row in 0..<x.rows:
+        for f in 0..<x.cols:
+            let off = HfDgRefOffset(x.cols, row, f)
+            add(outVals, HfDgRefSat(int64(x.vals[off]) + int64(bias[f])))
+    return HfDgRefMat(rows: x.rows, cols: x.cols, vals: outVals)
+
+fn HfDgRefResidualAdd(a: HfDgRefMat, b: HfDgRefMat): HfDgRefMat =
+    var outVals: int32[]
+    for i in 0..<a.vals.len:
+        add(outVals, HfDgRefSat(int64(a.vals[i]) + int64(b.vals[i])))
+    return HfDgRefMat(rows: a.rows, cols: a.cols, vals: outVals)
+
+fn HfDgRefExpNegQ(delta: int32, inputScale: int32, outputScale: int32): int32 =
+    if delta >= 0:
+        return outputScale
+    if delta <= 0 - inputScale * 8:
+        return 0
+    let dQ = HfDgRefSat(HfDgRefRoundDiv(int64(0 - delta) * int64(outputScale), int64(inputScale)))
+    var term: int64 = int64(outputScale)
+    var total: int64 = int64(outputScale)
+    for k in 1..12:
+        term = HfDgRefRoundDiv(term * int64(dQ), int64(outputScale * k))
+        total = total + term
+    if total <= int64(0):
+        return 0
+    return HfDgRefSat(HfDgRefRoundDiv(int64(outputScale) * int64(outputScale), total))
+
+fn HfDgRefSigmoidQ(value: int32, scale: int32): int32 =
+    var expTerm: int32
+    if value >= 0:
+        expTerm = HfDgRefExpNegQ(0 - value, scale, scale)
+        let denom = int64(scale) + int64(expTerm)
+        return HfDgRefSat(HfDgRefRoundDiv(int64(scale) * int64(scale), denom))
+    expTerm = HfDgRefExpNegQ(value, scale, scale)
+    let denom = int64(scale) + int64(expTerm)
+    return HfDgRefSat(HfDgRefRoundDiv(int64(expTerm) * int64(scale), denom))
+
+fn HfDgRefSwiGlu(gate: HfDgRefMat, up: HfDgRefMat): HfDgRefMat =
+    var outVals: int32[]
+    for i in 0..<gate.vals.len:
+        let sigmoid = HfDgRefSigmoidQ(gate.vals[i], HfDgRefScale)
+        let silu = HfDgRefSat(HfDgRefRoundDiv(int64(gate.vals[i]) * int64(sigmoid), int64(HfDgRefScale)))
+        add(outVals, HfDgRefSat(HfDgRefRoundDiv(int64(silu) * int64(up.vals[i]), int64(HfDgRefScale))))
+    return HfDgRefMat(rows: gate.rows, cols: gate.cols, vals: outVals)
+
+type
+    HfDgRefLayerWeights =
+        inputNorm: int32[]
+        qW: HfDgRefMat
+        kW: HfDgRefMat
+        vW: HfDgRefMat
+        oW: HfDgRefMat
+        qBias: int32[]
+        kBias: int32[]
+        vBias: int32[]
+        postNorm: int32[]
+        gateW: HfDgRefMat
+        upW: HfDgRefMat
+        downW: HfDgRefMat
+
+    HfDgRefWeights =
+        emb: HfDgRefMat
+        layers: HfDgRefLayerWeights[]
+        finalNorm: int32[]
+        lmHeadW: HfDgRefMat
+
+fn HfDgRefBuildWeights(layerCount: int32, hiddenSize: int32, kvRows: int32,
+                       intermediateSize: int32, vocabSize: int32): HfDgRefWeights =
+    var ordinal: int32
+    let embVals = HfDgRefTakeStream(ordinal, vocabSize * hiddenSize)
+    var layers: HfDgRefLayerWeights[]
+    for _ in 0..<layerCount:
+        let inputNorm = HfDgRefTakeStream(ordinal, hiddenSize)
+        let qVals = HfDgRefTakeStream(ordinal, hiddenSize * hiddenSize)
+        let kVals = HfDgRefTakeStream(ordinal, kvRows * hiddenSize)
+        let vVals = HfDgRefTakeStream(ordinal, kvRows * hiddenSize)
+        let oVals = HfDgRefTakeStream(ordinal, hiddenSize * hiddenSize)
+        let qBias = HfDgRefTakeStream(ordinal, hiddenSize)
+        let kBias = HfDgRefTakeStream(ordinal, kvRows)
+        let vBias = HfDgRefTakeStream(ordinal, kvRows)
+        let postNorm = HfDgRefTakeStream(ordinal, hiddenSize)
+        let gateVals = HfDgRefTakeStream(ordinal, intermediateSize * hiddenSize)
+        let upVals = HfDgRefTakeStream(ordinal, intermediateSize * hiddenSize)
+        let downVals = HfDgRefTakeStream(ordinal, hiddenSize * intermediateSize)
+        add(layers, HfDgRefLayerWeights(
+            inputNorm: inputNorm,
+            qW: HfDgRefMat(rows: hiddenSize, cols: hiddenSize, vals: qVals),
+            kW: HfDgRefMat(rows: kvRows, cols: hiddenSize, vals: kVals),
+            vW: HfDgRefMat(rows: kvRows, cols: hiddenSize, vals: vVals),
+            oW: HfDgRefMat(rows: hiddenSize, cols: hiddenSize, vals: oVals),
+            qBias: qBias,
+            kBias: kBias,
+            vBias: vBias,
+            postNorm: postNorm,
+            gateW: HfDgRefMat(rows: intermediateSize, cols: hiddenSize, vals: gateVals),
+            upW: HfDgRefMat(rows: intermediateSize, cols: hiddenSize, vals: upVals),
+            downW: HfDgRefMat(rows: hiddenSize, cols: intermediateSize, vals: downVals)
+        ))
+    let finalNorm = HfDgRefTakeStream(ordinal, hiddenSize)
+    let lmHeadVals = HfDgRefTakeStream(ordinal, vocabSize * hiddenSize)
+    return HfDgRefWeights(
+        emb: HfDgRefMat(rows: vocabSize, cols: hiddenSize, vals: embVals),
+        layers: layers,
+        finalNorm: finalNorm,
+        lmHeadW: HfDgRefMat(rows: vocabSize, cols: hiddenSize, vals: lmHeadVals)
+    )
+
+fn HfDgRefLayerForward(x: HfDgRefMat, w: HfDgRefLayerWeights,
+                       attentionHeads: int32, keyValueHeads: int32, headDim: int32,
+                       theta: float64): HfDgRefMat =
+    let normed = HfDgRefRmsNormRows(x, w.inputNorm, 1)
+    let q = HfDgRefAddBiasRows(HfDgRefLinear(normed, w.qW), w.qBias)
+    let k = HfDgRefAddBiasRows(HfDgRefLinear(normed, w.kW), w.kBias)
+    let v = HfDgRefAddBiasRows(HfDgRefLinear(normed, w.vW), w.vBias)
+    let qRoped = HfDgRefRopeApplyHeads(q, attentionHeads, headDim, theta)
+    let kRoped = HfDgRefRopeApplyHeads(k, keyValueHeads, headDim, theta)
+    let attnOut = HfDgRefAttention(qRoped, kRoped, v, w.oW, attentionHeads, keyValueHeads, headDim)
+    let attnResidual = HfDgRefResidualAdd(x, attnOut)
+    let postNormed = HfDgRefRmsNormRows(attnResidual, w.postNorm, 1)
+    let gate = HfDgRefLinear(postNormed, w.gateW)
+    let up = HfDgRefLinear(postNormed, w.upW)
+    let activated = HfDgRefSwiGlu(gate, up)
+    let mlpOut = HfDgRefLinear(activated, w.downW)
+    return HfDgRefResidualAdd(attnResidual, mlpOut)
+
+fn HfDgRefForward(tokenIds: int32[], w: HfDgRefWeights,
+                  attentionHeads: int32, keyValueHeads: int32, headDim: int32,
+                  theta: float64): HfDgRefMat =
+    var hidden = HfDgRefEmbedding(tokenIds, w.emb)
+    for i in 0..<w.layers.len:
+        hidden = HfDgRefLayerForward(hidden, w.layers[i], attentionHeads, keyValueHeads, headDim, theta)
+    let normed = HfDgRefRmsNormRows(hidden, w.finalNorm, 1)
+    return HfDgRefLinear(normed, w.lmHeadW)
+
+fn HfDgRefArgmaxRow(logits: HfDgRefMat, row: int32): int32 =
+    var bestIndex: int32
+    var bestValue = logits.vals[HfDgRefOffset(logits.cols, row, 0)]
+    for c in 1..<logits.cols:
+        let v = logits.vals[HfDgRefOffset(logits.cols, row, c)]
+        if v > bestValue:
+            bestValue = v
+            bestIndex = c
+    return bestIndex
+
+fn HfDgRefGenerateGreedy(promptTokenIds: int32[], maxNewTokens: int32, eosTokenId: int32,
+                         w: HfDgRefWeights, attentionHeads: int32, keyValueHeads: int32,
+                         headDim: int32, theta: float64): int32[] =
+    var current: int32[]
+    for i in 0..<promptTokenIds.len:
+        add(current, promptTokenIds[i])
+    for _ in 0..<maxNewTokens:
+        let logits = HfDgRefForward(current, w, attentionHeads, keyValueHeads, headDim, theta)
+        let lastRow = current.len - 1
+        let token = HfDgRefArgmaxRow(logits, lastRow)
+        add(current, token)
+        if eosTokenId >= 0 && token == eosTokenId:
+            break
+    return current
+
+fn HfDgRefIntArrayToString(arr: int32[]): str =
+    var parts: str[]
+    for i in 0..<arr.len:
+        add(parts, strings.IntToStr(arr[i]))
+    return strutil.Join(parts, ",")
+
+# ============ SUT-side setup (this half imports cheng/inference/*) ============
+
+fn hfShapeConfigJson(): str =
+    return strutil.Join([
+        "{",
+        "\"architectures\":[\"Qwen2ForCausalLM\"],",
+        "\"model_type\":\"qwen2\",",
+        "\"vocab_size\":6,",
+        "\"hidden_size\":8,",
+        "\"num_hidden_layers\":2,",
+        "\"num_attention_heads\":4,",
+        "\"num_key_value_heads\":2,",
+        "\"intermediate_size\":6,",
+        "\"tie_word_embeddings\":false,",
+        "\"rope_theta\":10000.0",
+        "}"
+    ], "")
+
+fn sutCycleAt(ordinal: int32): int32 =
+    let slot = ordinal % 6
+    if slot == 0:
+        return 1000
+    if slot == 1:
+        return -500
+    if slot == 2:
+        return 250
+    if slot == 3:
+        return 4000
+    if slot == 4:
+        return -2000
+    return 125
+
+fn sutTakeStream(ordinal: var int32, count: int32): int32[] =
+    var out: int32[]
+    for _ in 0..<count:
+        add(out, sutCycleAt(ordinal))
+        ordinal = ordinal + 1
+    return out
+
+type
+    HfShapeSutFixture =
+        graph: mg.ModelGraph
+        bindings: wb.WeightBindingSet
+        store: ws.WeightTensorStore
+
+fn hfShapeBuildSutFixture(): HfShapeSutFixture =
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        hfShapeConfigJson(),
+        "cid:model:dense-kv-state-equivalence",
+        kir.KernelDtypeFp16,
+        mg.ModelQuantSchemeNone
+    )
+    assert(IsOk(graphRes), " model executor dense kv state equivalence: build graph")
+    let graph = Value(graphRes)
+    assert(IsOk(mg.ModelGraphValidate(graph)), " model executor dense kv state equivalence: graph valid")
+    assert(graph.architecture == mg.InferenceModelArchitectureDenseTransformer &&
+           graph.weights.len == 27 && graph.ops.len == 19 &&
+           graph.hiddenSize == 8 && graph.attentionHeads == 4 &&
+           graph.keyValueHeads == 2 && graph.headDim == 2 && graph.layerCount == 2,
+           " model executor dense kv state equivalence: graph inventory (real HF-shape dims)")
+
+    var ordinal: int32
+    var payloads: ws.WeightTensorPayload[]
+    var bindings: wb.WeightShardBinding[]
+    for i in 0..<graph.weights.len:
+        let countRes = mg.ModelGraphTensorElementCount(graph.weights[i].shape)
+        assert(IsOk(countRes), " model executor dense kv state equivalence: weight element count")
+        let elemCount = int32(Value(countRes))
+        let data = sutTakeStream(ordinal, elemCount)
+        var tensor: infer.TensorQ
+        let fillOk = infer.TensorFromDataFill(tensor, graph.weights[i].shape, HfDgRefScale, data)
+        assert(IsOk(fillOk), " model executor dense kv state equivalence: weight tensor fill")
+        let peerId = strutil.Join(["peer:dense-kv-state:", strings.IntToStr(i)], "")
+        let payloadRes = ws.WeightTensorPayloadBuild(
+            graph.weights[i].modelCid,
+            graph.weights[i].tensorName,
+            graph.weights[i].shardCid,
+            graph.weights[i].dtype,
+            graph.weights[i].quantScheme,
+            peerId,
+            tensor
+        )
+        assert(IsOk(payloadRes), " model executor dense kv state equivalence: weight payload")
+        let payload = Value(payloadRes)
+        add(payloads, payload)
+        add(bindings, wb.WeightShardBinding(
+            modelCid: graph.weights[i].modelCid,
+            tensorName: graph.weights[i].tensorName,
+            shardCid: graph.weights[i].shardCid,
+            dtype: graph.weights[i].dtype,
+            quantScheme: graph.weights[i].quantScheme,
+            sizeBytes: graph.weights[i].sizeBytes,
+            peerId: peerId,
+            payloadHash: payload.payloadHash
+        ))
+    let set = wb.WeightBindingBuildSet(graph.modelCid, bindings)
+    let store = ws.WeightTensorStoreBuild(graph.modelCid, payloads)
+    var hashes: int64[]
+    for i in 0..<payloads.len:
+        add(hashes, payloads[i].payloadHash)
+    let boundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(graph, hashes)
+    assert(IsOk(boundGraphRes), " model executor dense kv state equivalence: bind weight anchors")
+    let boundGraph = Value(boundGraphRes)
+    assert(IsOk(wb.WeightBindingValidate(set, boundGraph)), " model executor dense kv state equivalence: weight bindings")
+    assert(IsOk(ws.WeightTensorValidateStore(store, set, boundGraph)), " model executor dense kv state equivalence: weight store")
+    return HfShapeSutFixture(graph: boundGraph, bindings: set, store: store)
+
+fn kvSmokeNeverCancel(): bool =
+    return false
+
+var gKvSmokeCancelCallCount: int32 = 0
+
+fn kvSmokeCancelAtCallFour(): bool =
+    gKvSmokeCancelCallCount = gKvSmokeCancelCallCount + 1
+    return gKvSmokeCancelCallCount >= 4
+
+fn kvSmokeSingleTokenTensor(tokenId: int32): infer.TensorQ =
+    var out: infer.TensorQ
+    var data: int32[]
+    add(data, tokenId)
+    let fillOk = infer.TensorFromDataFill(out, [1], 1, data)
+    assert(IsOk(fillOk), " model executor dense kv state equivalence: single token tensor")
+    return out
+
+fn main(): int32 =
+    let fixture = hfShapeBuildSutFixture()
+    let graph = fixture.graph
+    let attentionHeads: int32 = 4
+    let keyValueHeads: int32 = 2
+    let headDim: int32 = 2
+    let hiddenSize: int32 = 8
+    let kvRows = keyValueHeads * headDim
+    let intermediateSize: int32 = 6
+    let vocabSize: int32 = 6
+    let layerCount: int32 = 2
+
+    let oracleWeights = HfDgRefBuildWeights(layerCount, hiddenSize, kvRows, intermediateSize, vocabSize)
+
+    # -------- 1+2: split-point sweep, engine full vs engine incremental vs
+    # independent oracle, for every K in [1, N-1] on a 5-token sequence --------
+    let fullTokens = [1, 2, 3, 0, 4]
+    var fullTensor: infer.TensorQ
+    let fullOk = infer.TensorFromDataFill(fullTensor, [fullTokens.len], 1, fullTokens)
+    assert(IsOk(fullOk), " model executor dense kv state equivalence: full tensor build")
+    let lastRow = fullTokens.len - 1
+
+    let sutFullRes = mexec.ModelExecutorExecuteDenseTransformerTokens(graph, fixture.bindings, fixture.store, fullTensor)
+    assert(IsOk(sutFullRes), " model executor dense kv state equivalence: sut full forward")
+    let sutFullLogits = Value(sutFullRes).logits
+
+    let oracleFullLogits = HfDgRefForward(fullTokens, oracleWeights, attentionHeads, keyValueHeads, headDim, HfDgRefRopeTheta())
+    echo(strutil.Join(["sut full last row: ", HfDgRefIntArrayToString([
+        sutFullLogits.data[infer.TensorOffset2(sutFullLogits.shape, lastRow, 0)],
+        sutFullLogits.data[infer.TensorOffset2(sutFullLogits.shape, lastRow, 1)],
+        sutFullLogits.data[infer.TensorOffset2(sutFullLogits.shape, lastRow, 2)],
+        sutFullLogits.data[infer.TensorOffset2(sutFullLogits.shape, lastRow, 3)],
+        sutFullLogits.data[infer.TensorOffset2(sutFullLogits.shape, lastRow, 4)],
+        sutFullLogits.data[infer.TensorOffset2(sutFullLogits.shape, lastRow, 5)]
+    ])], ""))
+
+    # sanity: sut full == independent oracle full before either is trusted as
+    # ground truth for the split-point sweep below.
+    for c in 0..<vocabSize:
+        let sutV = sutFullLogits.data[infer.TensorOffset2(sutFullLogits.shape, lastRow, c)]
+        let oracleV = oracleFullLogits.vals[HfDgRefOffset(vocabSize, lastRow, c)]
+        assert(sutV == oracleV, " model executor dense kv state equivalence: sut full vs oracle full (sanity)")
+
+    var referenceStateSetHash: int64
+    var haveReferenceHash: bool = false
+    for k in 1..<fullTokens.len:
+        var prefixTokens: int32[]
+        for i in 0..<k:
+            add(prefixTokens, fullTokens[i])
+        var prefixTensor: infer.TensorQ
+        let prefixOk = infer.TensorFromDataFill(prefixTensor, [k], 1, prefixTokens)
+        assert(IsOk(prefixOk), " model executor dense kv state equivalence: prefix tensor build")
+        let prefillRes = mexec.ModelExecutorExecuteDenseTransformerPrefillWithKvState(graph, fixture.bindings, fixture.store, prefixTensor)
+        assert(IsOk(prefillRes), " model executor dense kv state equivalence: prefill")
+        var kvState = Value(prefillRes).kvStateSet
+        var lastLogits = Value(prefillRes).output.logits
+        for j in k..<fullTokens.len:
+            let decodeRes = mexec.ModelExecutorExecuteDenseTransformerDecodeWithKvState(
+                graph, fixture.bindings, fixture.store, kvSmokeSingleTokenTensor(fullTokens[j]), kvState)
+            assert(IsOk(decodeRes), " model executor dense kv state equivalence: decode")
+            kvState = Value(decodeRes).kvStateSet
+            lastLogits = Value(decodeRes).output.logits
+        assert(lastLogits.shape.len == 2 && lastLogits.shape[0] == 1,
+               " model executor dense kv state equivalence: split sweep final row shape")
+        for c in 0..<vocabSize:
+            let gotV = lastLogits.data[infer.TensorOffset2(lastLogits.shape, 0, c)]
+            let wantFull = sutFullLogits.data[infer.TensorOffset2(sutFullLogits.shape, lastRow, c)]
+            let wantOracle = oracleFullLogits.vals[HfDgRefOffset(vocabSize, lastRow, c)]
+            assert(gotV == wantFull, " model executor dense kv state equivalence: split K engine incremental vs engine full")
+            assert(gotV == wantOracle, " model executor dense kv state equivalence: split K engine incremental vs independent oracle")
+        if !haveReferenceHash:
+            referenceStateSetHash = kvState.stateSetHash
+            haveReferenceHash = true
+        else:
+            assert(kvState.stateSetHash == referenceStateSetHash,
+                   " model executor dense kv state equivalence: stateSetHash differs across split points")
+    echo(" model executor dense kv state equivalence: split-point sweep ok")
+
+    # -------- 1b+2b: cross-page equivalence (paged_kv_cache.cheng's
+    # tokensPerPage==16, hardcoded in ModelExecutorPagedCausalAttentionFill --
+    # the split-point sweep above never exceeds 5 total tokens, so it never
+    # allocates a second physical page. This block uses a 20-token sequence
+    # split at K=10: the resulting decode loop appends tokens at logical
+    # indices 10..19, crossing the page boundary at index 16
+    # (paged_kv_cache.PagedKVAppendPage allocates a fresh page there)
+    # mid-loop -- so this single split point exercises (a) an append that
+    # crosses into a new physical page, and (b) every decode step after that
+    # (token index 17..19) whose causal attention must retrieve candidates
+    # spanning *both* page 0 (16 tokens) and page 1 (1..3 tokens), not just a
+    # single page's PagedKVBuildPageKeyHeadTensor/PagedKVBuildPageValueHeadTensor
+    # call.
+    let pageTokens = [1, 2, 3, 0, 4, 5, 1, 2, 3, 0, 4, 5, 1, 2, 3, 0, 4, 5, 1, 2]
+    var pageFullTensor: infer.TensorQ
+    let pageFullOk = infer.TensorFromDataFill(pageFullTensor, [pageTokens.len], 1, pageTokens)
+    assert(IsOk(pageFullOk), " model executor dense kv state equivalence: page full tensor build")
+    let pageLastRow = pageTokens.len - 1
+
+    let sutPageFullRes = mexec.ModelExecutorExecuteDenseTransformerTokens(graph, fixture.bindings, fixture.store, pageFullTensor)
+    assert(IsOk(sutPageFullRes), " model executor dense kv state equivalence: sut page full forward")
+    let sutPageFullLogits = Value(sutPageFullRes).logits
+    let oraclePageFullLogits = HfDgRefForward(pageTokens, oracleWeights, attentionHeads, keyValueHeads, headDim, HfDgRefRopeTheta())
+    for c in 0..<vocabSize:
+        let sutV = sutPageFullLogits.data[infer.TensorOffset2(sutPageFullLogits.shape, pageLastRow, c)]
+        let oracleV = oraclePageFullLogits.vals[HfDgRefOffset(vocabSize, pageLastRow, c)]
+        assert(sutV == oracleV, " model executor dense kv state equivalence: page sut full vs oracle full (sanity)")
+
+    let pageK: int32 = 10
+    var pagePrefixTokens: int32[]
+    for i in 0..<pageK:
+        add(pagePrefixTokens, pageTokens[i])
+    var pagePrefixTensor: infer.TensorQ
+    let pagePrefixOk = infer.TensorFromDataFill(pagePrefixTensor, [pageK], 1, pagePrefixTokens)
+    assert(IsOk(pagePrefixOk), " model executor dense kv state equivalence: page prefix tensor build")
+    let pagePrefillRes = mexec.ModelExecutorExecuteDenseTransformerPrefillWithKvState(graph, fixture.bindings, fixture.store, pagePrefixTensor)
+    assert(IsOk(pagePrefillRes), " model executor dense kv state equivalence: page prefill")
+    var pageKvState = Value(pagePrefillRes).kvStateSet
+    var pageLastLogits = Value(pagePrefillRes).output.logits
+    for j in pageK..<pageTokens.len:
+        let pageDecodeRes = mexec.ModelExecutorExecuteDenseTransformerDecodeWithKvState(
+            graph, fixture.bindings, fixture.store, kvSmokeSingleTokenTensor(pageTokens[j]), pageKvState)
+        assert(IsOk(pageDecodeRes), " model executor dense kv state equivalence: page decode (crosses tokensPerPage=16 boundary at j=16)")
+        pageKvState = Value(pageDecodeRes).kvStateSet
+        pageLastLogits = Value(pageDecodeRes).output.logits
+    assert(pageKvState.layerStates[0].cache.pages.len == 2,
+           " model executor dense kv state equivalence: page test sanity -- expected exactly 2 physical pages (20 tokens, tokensPerPage=16)")
+    for c in 0..<vocabSize:
+        let gotV = pageLastLogits.data[infer.TensorOffset2(pageLastLogits.shape, 0, c)]
+        let wantFull = sutPageFullLogits.data[infer.TensorOffset2(sutPageFullLogits.shape, pageLastRow, c)]
+        let wantOracle = oraclePageFullLogits.vals[HfDgRefOffset(vocabSize, pageLastRow, c)]
+        assert(gotV == wantFull, " model executor dense kv state equivalence: cross-page engine incremental vs engine full")
+        assert(gotV == wantOracle, " model executor dense kv state equivalence: cross-page engine incremental vs independent oracle")
+    echo(" model executor dense kv state equivalence: cross-page (tokensPerPage=16 boundary) ok")
+
+    # -------- 5: double-truth negative control (must go red if RoPE
+    # basePosition wiring regresses) --------
+    let negK: int32 = 2
+    var negPrefixTokens: int32[]
+    for i in 0..<negK:
+        add(negPrefixTokens, fullTokens[i])
+    var negPrefixTensor: infer.TensorQ
+    let negPrefixOk = infer.TensorFromDataFill(negPrefixTensor, [negK], 1, negPrefixTokens)
+    assert(IsOk(negPrefixOk), " model executor dense kv state equivalence: neg prefix tensor build")
+    let negPrefillRes = mexec.ModelExecutorExecuteDenseTransformerPrefillWithKvState(graph, fixture.bindings, fixture.store, negPrefixTensor)
+    assert(IsOk(negPrefillRes), " model executor dense kv state equivalence: neg prefill")
+    let negKvState = Value(negPrefillRes).kvStateSet
+    let negNextTensor = kvSmokeSingleTokenTensor(fullTokens[negK])
+    let correctDecodeRes = mexec.ModelExecutorExecuteDenseTransformerDecodeWithKvState(
+        graph, fixture.bindings, fixture.store, negNextTensor, negKvState)
+    assert(IsOk(correctDecodeRes), " model executor dense kv state equivalence: neg correct decode")
+    # Wrong on purpose: the same single token, fed through Prefill instead of
+    # Decode, so basePosition is forced to 0 instead of the true cached
+    # position negK -- exactly the "hardcoded basePosition=0" regression the
+    # #141 design calls out.
+    let wrongDecodeRes = mexec.ModelExecutorExecuteDenseTransformerPrefillWithKvState(graph, fixture.bindings, fixture.store, negNextTensor)
+    assert(IsOk(wrongDecodeRes), " model executor dense kv state equivalence: neg wrong decode")
+    var negMismatchFound: bool = false
+    for c in 0..<vocabSize:
+        if Value(correctDecodeRes).output.logits.data[c] != Value(wrongDecodeRes).output.logits.data[c]:
+            negMismatchFound = true
+    assert(negMismatchFound,
+           " model executor dense kv state equivalence: NEGATIVE CONTROL VACUOUS -- wrong-basePosition decode produced identical logits, RoPE position sensitivity not exercised")
+    echo(" model executor dense kv state equivalence: negative control (RoPE basePosition) correctly diverges")
+
+    # -------- 3: generation loop -- KV-cache loop vs frozen full-recompute
+    # loop vs independent oracle --------
+    let genPromptTokens = [1, 2]
+    var genPromptTensor: infer.TensorQ
+    let genPromptOk = infer.TensorFromDataFill(genPromptTensor, [genPromptTokens.len], 1, genPromptTokens)
+    assert(IsOk(genPromptOk), " model executor dense kv state equivalence: gen prompt tensor build")
+    let maxNewTokens: int32 = 3
+    let unbounded = engine.DistributedGenerationBudgetUnbounded()
+
+    let frozenGen = engine.DistributedGenerateGreedyDenseTransformerTokens(
+        graph, fixture.bindings, fixture.store, genPromptTensor, maxNewTokens, -1)
+    assert(IsOk(frozenGen), " model executor dense kv state equivalence: frozen generate")
+    let kvGen = engine.DistributedGenerateGreedyDenseTransformerTokensWithKvState(
+        graph, fixture.bindings, fixture.store, genPromptTensor, maxNewTokens, -1, unbounded)
+    assert(IsOk(kvGen), " model executor dense kv state equivalence: kv generate")
+    let oracleGen = HfDgRefGenerateGreedy(genPromptTokens, maxNewTokens, -1, oracleWeights, attentionHeads, keyValueHeads, headDim, HfDgRefRopeTheta())
+
+    let frozenTokens = Value(frozenGen)
+    let kvOutcome = Value(kvGen)
+    echo(strutil.Join(["frozen generate: ", HfDgRefIntArrayToString(frozenTokens.data)], ""))
+    echo(strutil.Join(["kv generate: ", HfDgRefIntArrayToString(kvOutcome.tokenIds.data)], ""))
+    echo(strutil.Join(["oracle generate: ", HfDgRefIntArrayToString(oracleGen)], ""))
+    assert(kvOutcome.stepsRun == maxNewTokens && !kvOutcome.budgetExceeded && !kvOutcome.cancelled,
+           " model executor dense kv state equivalence: kv generate outcome flags (unbounded)")
+    assert(frozenTokens.shape[0] == oracleGen.len && kvOutcome.tokenIds.shape[0] == oracleGen.len,
+           " model executor dense kv state equivalence: generate token count")
+    for i in 0..<oracleGen.len:
+        assert(frozenTokens.data[i] == oracleGen[i],
+               " model executor dense kv state equivalence: frozen generate vs independent oracle")
+        assert(kvOutcome.tokenIds.data[i] == oracleGen[i],
+               " model executor dense kv state equivalence: kv generate vs independent oracle")
+
+    # early-EOS-stop case: eosTokenId chosen to hit on the very first
+    # generated token (matches this fixture's known-deterministic first
+    # generated token, see model_executor_dense_hf_shape_golden_ref_main.cheng's
+    # "generate: 1,2,2,2" anchor for the same weights/prompt convention).
+    let eosMaxNewTokens: int32 = 3
+    let eosTokenId: int32 = 2
+    let frozenEosGen = engine.DistributedGenerateGreedyDenseTransformerTokens(
+        graph, fixture.bindings, fixture.store, genPromptTensor, eosMaxNewTokens, eosTokenId)
+    assert(IsOk(frozenEosGen), " model executor dense kv state equivalence: frozen eos generate")
+    let kvEosGen = engine.DistributedGenerateGreedyDenseTransformerTokensWithKvState(
+        graph, fixture.bindings, fixture.store, genPromptTensor, eosMaxNewTokens, eosTokenId, unbounded)
+    assert(IsOk(kvEosGen), " model executor dense kv state equivalence: kv eos generate")
+    let oracleEosGen = HfDgRefGenerateGreedy(genPromptTokens, eosMaxNewTokens, eosTokenId, oracleWeights, attentionHeads, keyValueHeads, headDim, HfDgRefRopeTheta())
+    let frozenEosTokens = Value(frozenEosGen)
+    let kvEosOutcome = Value(kvEosGen)
+    echo(strutil.Join(["kv eos generate: ", HfDgRefIntArrayToString(kvEosOutcome.tokenIds.data),
+                        " stepsRun=", strings.IntToStr(kvEosOutcome.stepsRun)], ""))
+    assert(frozenEosTokens.shape[0] == oracleEosGen.len && kvEosOutcome.tokenIds.shape[0] == oracleEosGen.len,
+           " model executor dense kv state equivalence: eos generate token count")
+    for i in 0..<oracleEosGen.len:
+        assert(frozenEosTokens.data[i] == oracleEosGen[i],
+               " model executor dense kv state equivalence: frozen eos generate vs oracle")
+        assert(kvEosOutcome.tokenIds.data[i] == oracleEosGen[i],
+               " model executor dense kv state equivalence: kv eos generate vs oracle")
+    assert(kvEosOutcome.stepsRun < eosMaxNewTokens,
+           " model executor dense kv state equivalence: eos negative-vacuous-check -- expected an early stop before exhausting the budget")
+    echo(" model executor dense kv state equivalence: generation loop (incl. eos early-stop) ok")
+
+    # -------- 4: budget/cancellation control flow --------
+    let expiredBudget = engine.DistributedGenerationBudget(deadlineMs: int64(1), cancelPoll: kvSmokeNeverCancel)
+    let expiredGen = engine.DistributedGenerateGreedyDenseTransformerTokensWithKvState(
+        graph, fixture.bindings, fixture.store, genPromptTensor, maxNewTokens, -1, expiredBudget)
+    assert(IsOk(expiredGen), " model executor dense kv state equivalence: expired-budget generate")
+    let expiredOutcome = Value(expiredGen)
+    assert(expiredOutcome.stepsRun == 0 && expiredOutcome.budgetExceeded && !expiredOutcome.cancelled,
+           " model executor dense kv state equivalence: expired-budget outcome flags")
+    assert(expiredOutcome.tokenIds.shape[0] == genPromptTokens.len,
+           " model executor dense kv state equivalence: expired-budget token count == prompt")
+    for i in 0..<genPromptTokens.len:
+        assert(expiredOutcome.tokenIds.data[i] == genPromptTokens[i],
+               " model executor dense kv state equivalence: expired-budget tokens unchanged from prompt")
+
+    gKvSmokeCancelCallCount = 0
+    let cancelBudget = engine.DistributedGenerationBudget(deadlineMs: int64(0), cancelPoll: kvSmokeCancelAtCallFour)
+    let cancelMaxNewTokens: int32 = 5
+    let cancelGen = engine.DistributedGenerateGreedyDenseTransformerTokensWithKvState(
+        graph, fixture.bindings, fixture.store, genPromptTensor, cancelMaxNewTokens, -1, cancelBudget)
+    assert(IsOk(cancelGen), " model executor dense kv state equivalence: cancel-mid-generate")
+    let cancelOutcome = Value(cancelGen)
+    assert(cancelOutcome.stepsRun == 3 && cancelOutcome.cancelled && !cancelOutcome.budgetExceeded,
+           " model executor dense kv state equivalence: cancel outcome flags")
+    assert(cancelOutcome.tokenIds.shape[0] == genPromptTokens.len + 3,
+           " model executor dense kv state equivalence: cancel token count")
+    assert(cancelOutcome.tokenIds.shape[0] == kvOutcome.tokenIds.shape[0],
+           " model executor dense kv state equivalence: cancel prefix length matches unbudgeted 3-step run")
+    for i in 0..<cancelOutcome.tokenIds.shape[0]:
+        assert(cancelOutcome.tokenIds.data[i] == kvOutcome.tokenIds.data[i],
+               " model executor dense kv state equivalence: cancel prefix matches unbudgeted run (early exit doesn't perturb already-produced tokens)")
+    echo(" model executor dense kv state equivalence: budget/cancel control flow ok")
+
+    echo(" model_executor_dense_kv_state_equivalence_smoke ok")
+    return 0

@@ -1,0 +1,160 @@
+# libp2p P3 收尾片: 委托 cert 链验签 (depth-1) + resolver 委托 head 接受 (正典 §11.6 P3)。
+# exe run 非 census: 断言失败即 abort 非零。crypto 断言 DEFAULT-ON (无 env 逃生)。
+#
+# 委托: channel 根钥签发 cert 授权 delegate key 签 head; delegate 发布 v1 自证 head
+# (channelId=sha256(delegateKey)); B 沿 cert 链 (depth-1) 验签接受。
+# 正路径: 根签 cert(A=L, B=delegatePub, notAfter=10) → delegate 签 head(epoch=3) → resolver 接受。
+# 负路径矩阵 (每条独立 rejectReason):
+#   - 伪造 cert (非根钥签) → cert 签发者非根钥
+#   - 子委托 (delegate 签 cert, depth-2) → cert 签发者非根钥 (depth-1 结构化拒)
+#   - 越权 (head epoch > cert.notAfter) → 越权拒
+#   - cert.delegatePubKey != head.signer → cert 未授权此 head signer
+#   - cert.channel != L → cert channel 不符请求
+#   - 撤销后的 delegate (撤销集命中) → 先取撤销硬拒
+
+import std/system
+import std/result
+import std/rawbytes as rawbytes
+import cheng/std/bytes_layout as layout
+import std/crypto/sha512 as sha512
+import std/crypto/ed25519/ref10 as ref10
+import std/os as os
+import cheng/libp2p/protocols/cas_source/channel_head/head_codec as head
+import cheng/libp2p/protocols/cas_source/channel_head/authz_codec as authz
+import cheng/libp2p/protocols/cas_source/channel_head/authz_store as store
+import cheng/libp2p/protocols/cas_source/channel_head/authz_resolver as resolver
+
+fn deriveKeypair(seedv: int32, priv: var Bytes, pub: var Bytes) =
+    var seed = BytesAlloc(32)
+    for i in 0..<32:
+        BytesSet(seed, i, (seedv + i) & 255)
+    var digest = sha512.Sha512Digest(seed)
+    BytesSet(digest, 0, BytesGet(digest, 0) & 248)
+    BytesSet(digest, 31, (BytesGet(digest, 31) & 63) | 64)
+    var r: ref10.GeP3
+    ref10.geScalarMultBase(r, BytesSlice(digest, 0, 32))
+    pub = ref10.geP3ToBytes(r)
+    priv = BytesConcat(seed, pub)
+
+fn pubFixed(pub: Bytes): layout.FixedBytes32 =
+    let r = layout.FixedBytes32FromBytes(pub)
+    assert(!IsErr(r), " pubFixed 32B")
+    return Value(r)
+
+fn mkHeadCid(seed: int32): layout.FixedBytes32 =
+    var b = BytesAlloc(32)
+    for i in 0..<32:
+        BytesSet(b, i, (seed * 19 + i + 1) & 255)
+    return pubFixed(b)
+
+# 签一个 delegate 的 v1 自证 head → 线格式字节。
+fn signHeadWire(priv: Bytes, pub: Bytes, epoch: int64): Bytes =
+    let hc = mkHeadCid(int32(epoch) + 3)
+    let genesis = head.ChannelHeadGenesisPrev()
+    var signRes = head.ChannelHeadSign(priv, epoch, hc, genesis, pub)
+    assert(!IsErr(signRes), " signHeadWire sign: " + Error(signRes))
+    var encRes = head.ChannelHeadEncode(Value(signRes))
+    assert(!IsErr(encRes), " signHeadWire encode: " + Error(encRes))
+    return Value(encRes)
+
+fn certWireOf(rec: authz.AuthzRecord): Bytes =
+    var encRes = authz.AuthzRecordEncode(rec)
+    assert(!IsErr(encRes), " certWireOf encode: " + Error(encRes))
+    return Value(encRes)
+
+fn main(): int32 =
+    let base = os.GetEnvDefault("TMPDIR", "/tmp") + "/cheng_channel_delegation_p3"
+    let storeRoot = base + "/store"
+    os.MkdirAll(storeRoot, 493)
+    # 确定性起点: 清 rotation (无 rotation, currentRoot==L) + 相关撤销 wire
+    if os.FileExists(store.AuthzRotationPath(storeRoot)):
+        let _r = os.RemoveFile(store.AuthzRotationPath(storeRoot))
+
+    var rootPriv: Bytes
+    var rootPub: Bytes
+    deriveKeypair(51, rootPriv, rootPub)
+    let logicalL = head.ChannelIdForPubKey(rootPub)   # currentRoot == L (无 rotation)
+
+    var delPriv: Bytes
+    var delPub: Bytes
+    deriveKeypair(88, delPriv, delPub)
+    let delPubFixed = pubFixed(delPub)
+
+    # 清委托 head signer 在 L 的撤销 wire (跨重跑残留)
+    let lHex = layout.FixedBytes32Hex(logicalL)
+    let delHex = rawbytes.BytesToHex(delPub)
+    if os.FileExists(store.AuthzRevocationPath(storeRoot, lHex, delHex)):
+        let _rr = os.RemoveFile(store.AuthzRevocationPath(storeRoot, lHex, delHex))
+
+    # ---- 正: 根签 cert(A=L, B=delegatePub, notAfter=10) ----
+    var certSign = authz.AuthzRecordSign(authz.AuthzTagDelegate, rootPriv, logicalL, delPubFixed, int64(10), rootPub)
+    assert(!IsErr(certSign), " cert sign: " + Error(certSign))
+    let cert = Value(certSign)
+    var certVerify = authz.DelegationVerify(cert, logicalL)
+    assert(!IsErr(certVerify), " DelegationVerify(cert, currentRoot): " + Error(certVerify))
+    let certWire = certWireOf(cert)
+    assert(BytesLen(certWire) == 169, " cert wire = 169B")
+    assert(BytesGet(certWire, 0) == 0x40, " cert tag 0x40")
+
+    # ---- 正: delegate 签 head(epoch=3 <= notAfter 10) → resolver 接受 ----
+    let headWire = signHeadWire(delPriv, delPub, int64(3))
+    var acceptRes = resolver.AuthzResolveHeadAccept(storeRoot, logicalL, headWire, true, certWire)
+    assert(!IsErr(acceptRes), " resolver 接受委托 head: " + Error(acceptRes))
+    var acceptedRec = Value(acceptRes)
+    assert(rawbytes.BytesEqual(acceptedRec.signerPubKey, delPub), " 接受 head signer == delegate")
+    assert(layout.FixedBytes32Equal(acceptedRec.channelId, head.ChannelIdForPubKey(delPub)), " 委托 head channelId==sha256(delegate) (v1 自证)")
+
+    # ---- 负: 伪造 cert (非根钥签) ----
+    var forgePriv: Bytes
+    var forgePub: Bytes
+    deriveKeypair(150, forgePriv, forgePub)
+    var forgeCertSign = authz.AuthzRecordSign(authz.AuthzTagDelegate, forgePriv, logicalL, delPubFixed, int64(10), forgePub)
+    assert(!IsErr(forgeCertSign), " forge cert sign (sig 本身合法)")
+    var forgeAccept = resolver.AuthzResolveHeadAccept(storeRoot, logicalL, headWire, true, certWireOf(Value(forgeCertSign)))
+    assert(IsErr(forgeAccept), " 负: 伪造 cert (非根钥签) 拒")
+    assert(Error(forgeAccept) == "delegate: cert 签发者非根钥 (伪造/子委托拒)", " 负: 伪造 cert rejectReason 精确")
+
+    # ---- 负: 子委托 (delegate 签 cert, depth-2) ----
+    var d2Priv: Bytes
+    var d2Pub: Bytes
+    deriveKeypair(191, d2Priv, d2Pub)
+    var subCertSign = authz.AuthzRecordSign(authz.AuthzTagDelegate, delPriv, logicalL, pubFixed(d2Pub), int64(10), delPub)
+    assert(!IsErr(subCertSign), " sub-cert sign (delegate 签)")
+    var d2HeadWire = signHeadWire(d2Priv, d2Pub, int64(3))
+    var subAccept = resolver.AuthzResolveHeadAccept(storeRoot, logicalL, d2HeadWire, true, certWireOf(Value(subCertSign)))
+    assert(IsErr(subAccept), " 负: 子委托 (depth-2) 拒")
+    assert(Error(subAccept) == "delegate: cert 签发者非根钥 (伪造/子委托拒)", " 负: 子委托 rejectReason 精确 (depth-1 结构化拒)")
+
+    # ---- 负: 越权 (head epoch=15 > cert.notAfter 10) ----
+    let overHeadWire = signHeadWire(delPriv, delPub, int64(15))
+    var overAccept = resolver.AuthzResolveHeadAccept(storeRoot, logicalL, overHeadWire, true, certWire)
+    assert(IsErr(overAccept), " 负: 越权 (head epoch > notAfter) 拒")
+    assert(Error(overAccept) == "resolver: delegate head epoch 越 cert 有效期 (越权拒)", " 负: 越权 rejectReason 精确")
+
+    # ---- 负: cert.delegatePubKey != head.signer ----
+    # cert 授权 delPub, 但 head 由 d2 签 (channelId=sha256(d2), epoch<=notAfter)
+    var mismatchAccept = resolver.AuthzResolveHeadAccept(storeRoot, logicalL, d2HeadWire, true, certWire)
+    assert(IsErr(mismatchAccept), " 负: cert.delegate != head.signer 拒")
+    assert(Error(mismatchAccept) == "resolver: cert 未授权此 head signer", " 负: signer 不符 rejectReason 精确")
+
+    # ---- 负: cert.channel != L ----
+    let otherChannel = head.ChannelIdForPubKey(forgePub)
+    var wrongChanCert = authz.AuthzRecordSign(authz.AuthzTagDelegate, rootPriv, otherChannel, delPubFixed, int64(10), rootPub)
+    assert(!IsErr(wrongChanCert), " wrong-channel cert sign")
+    var wrongChanAccept = resolver.AuthzResolveHeadAccept(storeRoot, logicalL, headWire, true, certWireOf(Value(wrongChanCert)))
+    assert(IsErr(wrongChanAccept), " 负: cert.channel != L 拒")
+    assert(Error(wrongChanAccept) == "delegate: cert channel 不符请求", " 负: cert channel 不符 rejectReason 精确")
+
+    # ---- 负: 撤销后的 delegate (先取撤销硬拒) ----
+    # 根钥在 L 撤销 delegate → 撤销集命中 → resolver 先取撤销拒 (授权前)
+    var delRevoke = authz.AuthzRecordSign(authz.AuthzTagRevoke, rootPriv, logicalL, delPubFixed, int64(1), rootPub)
+    assert(!IsErr(delRevoke), " 撤 delegate sign")
+    var delRevokeAdmit = store.AuthzRevocationAdmit(storeRoot, Value(delRevoke))
+    assert(!IsErr(delRevokeAdmit), " 撤 delegate admit: " + Error(delRevokeAdmit))
+    assert(store.AuthzRevocationExists(storeRoot, logicalL, delPub), " delegate 已入 L 撤销集")
+    var revokedAccept = resolver.AuthzResolveHeadAccept(storeRoot, logicalL, headWire, true, certWire)
+    assert(IsErr(revokedAccept), " 负: 撤销后 delegate head 拒")
+    assert(Error(revokedAccept) == "resolver: signer 已撤销 (先取撤销硬拒)", " 负: 撤销后 delegate rejectReason 精确 (先取撤销)")
+
+    echo(" channel_delegation_smoke ok")
+    return 0

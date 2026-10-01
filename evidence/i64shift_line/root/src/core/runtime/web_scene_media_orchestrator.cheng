@@ -1,0 +1,250 @@
+# Pure-Cheng media orchestrator.
+#
+# Bridges WebSceneGraph media control actions (PublishAsset / OpenAsset) to the
+# MoQ segment-stream + fountain transport, so the native GPU GUI itself drives
+# "本地秒发 / 对端秒开" with no Kotlin/ArkTS orchestration layer. The same Cheng
+# code runs on Android and Harmony; each platform supplies only the local file
+# path (picker) and the UDP socket (already in the QUIC transport).
+#
+# Send half: ingest a local media file into the MoQ fountain manifest and
+# register the resulting asset onto the scene graph so the GUI can show + serve
+# it. The serve loop and the OpenAsset fetch mirror media_moq_publisher_main /
+# media_video_e2e_native_player_smoke.
+
+import std/result
+import std/rawbytes
+import std/strutils as strutil
+import cheng/quic/connection as qconn
+import cheng/quic/native_runtime as qnative
+import cheng/core/runtime/web_scene_runtime as scene
+import cheng/moq/media_asset_manifest as media
+import cheng/libp2p/protocols/media/moq_segment_stream as moqstream
+
+# #139 (涓流无界根修): whole-fetch cumulative deadline. The per-READ idle timeout
+# (msquicNativePipeReadTimeoutMs = 20000, quic/native_runtime.cheng) resets on EVERY
+# Libp2pMoqSegmentStreamRead call, and the underlying msquicNativeAppRecvConsume returns
+# whatever prefix is available (≥1 byte = a successful read) — so a peer that drips at
+# least one byte per sub-20s window but never completes the object keeps the drain loop
+# in WebSceneMediaOrchestrateFetchAll alive FOREVER (S8 上界论证 区制 C, case file
+# ~/cheng-patches/20260719/14gap/bound_analysis.md). No layer held a "fetch started at"
+# timestamp, which was the structural gap. The budget below caps the WHOLE fetch call
+# instead: each drain-loop iteration compares elapsed wall-clock since fetch start
+# against it and fails the fetch loudly (Err) instead of issuing another read.
+# Budget = BASE + totalBytes/FLOOR:
+#   - BASE 60000ms is the upper end of the audit's suggested 30-60s band; the ES
+#     production path's largest single fetch is a ~1.1MB video GOP (14gap measured
+#     worst, 5×256KB chunks), so a legitimate ES fetch trips it only on a sustained
+#     sub-~18KB/s link — which cannot play the video anyway.
+#   - FLOOR (bytes/ms, i.e. KB/s) extends the budget with transfer size so the
+#     whole-file path (announce/poster/asset pulls up to ~5.9MB, e.g.
+#     WebSceneMediaFetchRemoteAnnouncedToFile) is never killed on a merely-slow but
+#     working link (5.9MB ⇒ +118s). A ≥1-byte-per-<20s-window trickle is ≈0.00005
+#     bytes/ms — five orders below ANY floor, so the extension cannot reintroduce the
+#     unbounded case: every fetch is still capped at a finite, nameable constant.
+# Worst-case blockage of one fetch call = budget + one in-flight read's idle window
+# (≤20000ms); that is the bound the Harmony teardown's pthread_join now inherits.
+const webSceneMediaFetchAllDeadlineBaseMs: int64 = 60000
+const webSceneMediaFetchAllMinThroughputBytesPerMs: int64 = 50
+
+# Cancel fast-path for host teardown (#139 pthread_join half). A plain cross-thread
+# int32 flag — the ONLY global in the media fetch path a non-pump thread may write: it
+# carries no QUIC/session state, so the single-thread-owns-the-pump invariant
+# (native_runtime session slots, bridge pump globals) is untouched by the writer. The
+# Harmony teardown sets it via the cheng_scene_media_fetch_cancel_set export right
+# before pthread_join, so an in-flight trickling fetch aborts at the NEXT drain-loop
+# iteration (≤ one read idle window) instead of running to the cumulative deadline. The
+# deadline above stays the hard backstop, so even arbitrarily delayed flag visibility
+# cannot push the abort past it. Cleared on every new ES open
+# (WebSceneMediaEsOpen/WebSceneMediaAudioEsOpen in the bridge).
+var webSceneMediaFetchCancelRequested: int32
+
+fn WebSceneMediaFetchCancelSet(v: int32) =
+    webSceneMediaFetchCancelRequested = v
+
+fn WebSceneMediaFetchCancelClear() =
+    webSceneMediaFetchCancelRequested = 0
+
+# Project a MoQ fountain asset manifest onto the GUI's media-asset record so the
+# pure-Cheng scene graph carries the same fountain identity the transport serves.
+fn WebSceneMediaAssetFromManifest(slotId: str,
+                                  manifest: media.MediaAssetManifest): scene.WebSceneMediaAsset =
+    var asset: scene.WebSceneMediaAsset
+    asset.assetFactId = slotId
+    asset.assetCid = manifest.assetCid
+    asset.bundleCid = manifest.bundleCid
+    asset.mime = manifest.mime
+    asset.kindCode = manifest.kindCode
+    asset.durationMs = IntToStr(int32(manifest.durationMs))
+    asset.codec = manifest.codec
+    asset.posterCid = manifest.posterCid
+    asset.initSegmentCid = manifest.initSegmentCid
+    asset.initSegmentByteLength = manifest.initSegmentByteLength
+    asset.keyframeIndex = manifest.keyframeIndex
+    asset.transport = manifest.transport
+    asset.fecScheme = manifest.fecScheme
+    asset.contentSignature = manifest.contentSignature
+    asset.catalogCid = manifest.catalogCid
+    asset.catalogKey = manifest.catalogKey
+    asset.rebuildTemplateCid = manifest.rebuildTemplateCid
+    asset.rebuildTemplateKey = manifest.rebuildTemplateKey
+    asset.objectTargetBytes = manifest.objectTargetBytes
+    asset.sourceBlockBytes = manifest.sourceBlockBytes
+    asset.objectCount = manifest.objects.len
+    asset.dropletCount = manifest.droplets.len
+    return asset
+
+# PublishAsset: ingest a local media file (本地秒发) and register the resulting
+# fountain asset onto the scene graph. Returns the ingest receipt; the caller
+# serves its object ranges over MoQ.
+fn WebSceneMediaOrchestratePublishLocalFile(graph: var scene.WebSceneGraph,
+                                            index: var media.MediaLocalIndex,
+                                            slotId: str,
+                                            sourcePath: str,
+                                            ownerPeerId: str,
+                                            remotePeersCsv: str,
+                                            mime: str,
+                                            codec: str,
+                                            durationMs: int64,
+                                            posterBytes: rawbytes.Bytes,
+                                            contentSignature: str,
+                                            objectTargetBytes: int32,
+                                            sourceBlockBytes: int32,
+                                            repairDropletCount: int32): Result[media.MediaIngestReceipt] =
+    var fileReq: media.MediaVideoFileIngestRequest
+    fileReq.sourcePath = sourcePath
+    fileReq.ownerPeerId = ownerPeerId
+    fileReq.remotePeersCsv = remotePeersCsv
+    fileReq.mime = mime
+    fileReq.durationMs = durationMs
+    fileReq.codec = codec
+    fileReq.posterBytes = posterBytes
+    fileReq.contentSignature = contentSignature
+    fileReq.objectTargetBytes = objectTargetBytes
+    fileReq.sourceBlockBytes = sourceBlockBytes
+    fileReq.repairDropletCount = repairDropletCount
+    let receiptRes = media.MediaIngestVideoFilePin(index, fileReq)
+    if IsErr(receiptRes):
+        return receiptRes
+    let receipt = Value(receiptRes)
+    let manifestRes = media.MediaLocalIndexFind(index, receipt.assetCid)
+    if IsErr(manifestRes):
+        return Err[media.MediaIngestReceipt](strutil.Join(["orchestrator: manifest find: ", Error(manifestRes)], ""))
+    let manifest = Value(manifestRes)
+    let asset = WebSceneMediaAssetFromManifest(slotId, manifest)
+    if !scene.WebSceneAddMediaAsset(graph, asset):
+        return Err[media.MediaIngestReceipt]("orchestrator: register media asset onto scene graph failed")
+    return Ok[media.MediaIngestReceipt](receipt)
+
+# OpenAsset render binding (对端秒开): build the GUI playback slot that binds a
+# registered fountain asset to a scene node so the pure-Cheng decode/texture
+# pipeline renders the fetched media. The bytes themselves arrive over the MoQ
+# segment-stream client (mirrors media_video_e2e_native_player_smoke); this slot
+# is the render target the transport fills.
+fn WebSceneMediaPlaybackSlotFromAsset(asset: scene.WebSceneMediaAsset,
+                                      slotId: str,
+                                      manifestCid: str,
+                                      routeIndex: int32,
+                                      nodeId: int32,
+                                      nodeTemplate: str,
+                                      stateRef: str,
+                                      decodeProvider: str,
+                                      textureProvider: str,
+                                      audioProvider: str,
+                                      objectFit: str): scene.WebSceneMediaPlaybackSlot =
+    var slot: scene.WebSceneMediaPlaybackSlot
+    slot.slotId = slotId
+    slot.assetFactId = asset.assetFactId
+    slot.assetCid = asset.assetCid
+    slot.manifestCid = manifestCid
+    slot.nodeTemplate = nodeTemplate
+    slot.routeIndex = routeIndex
+    slot.nodeId = nodeId
+    slot.providerKind = "media-decode-provider"
+    slot.stateRef = stateRef
+    slot.decodeProvider = decodeProvider
+    slot.textureProvider = textureProvider
+    slot.audioProvider = audioProvider
+    slot.objectFit = objectFit
+    slot.playbackState = 0
+    return slot
+
+# OpenAsset render binding (full): build the playback slot from a registered
+# fountain asset and register it onto the scene graph, validated against the live
+# GUI node (the transpiled <video> element on the active route). Returns false if
+# the graph validator rejects the binding (unknown node/asset, bad provider).
+fn WebSceneMediaOrchestrateBindPlaybackSlot(graph: var scene.WebSceneGraph,
+                                            asset: scene.WebSceneMediaAsset,
+                                            slotId: str,
+                                            manifestCid: str,
+                                            routeIndex: int32,
+                                            nodeId: int32,
+                                            nodeTemplate: str,
+                                            stateRef: str,
+                                            decodeProvider: str,
+                                            textureProvider: str,
+                                            audioProvider: str,
+                                            objectFit: str): bool =
+    let slot = WebSceneMediaPlaybackSlotFromAsset(asset, slotId, manifestCid, routeIndex, nodeId,
+                                                  nodeTemplate, stateRef, decodeProvider,
+                                                  textureProvider, audioProvider, objectFit)
+    return scene.WebSceneAddMediaPlaybackSlot(graph, slot)
+
+# 本地秒发 transport: read the peer's range request and serve it over the MoQ
+# segment stream (server side). Thin delegate to the proven moqstream read+serve
+# primitive; the platform accept loop calls this per inbound stream.
+fn WebSceneMediaOrchestrateServeRequestedRange(conn: var qconn.Connection,
+                                               segmentBytes: rawbytes.Bytes): Result[moqstream.Libp2pMoqSegmentStreamRequest] =
+    return moqstream.Libp2pMoqSegmentStreamServerHandleRequestedRange(conn, segmentBytes)
+
+# 对端秒开 transport: drain a MoQ segment-stream reader into a single byte
+# buffer (client side), assembling the fetched object for the decode provider.
+# Mirrors media_video_e2e_native_player_smoke's read loop.
+#
+# The target size (reader.expectedBytes - reader.bytesRead) is known up front — the
+# reader was opened with an exact request.lengthBytes — so this pre-allocates ONE
+# buffer and copies each read chunk straight into its final offset. The previous
+# implementation grew the accumulator via Libp2pMoqSegmentStreamAppendBytes (realloc +
+# copy the ENTIRE accumulated prefix on every chunk): O(chunks^2) time AND it leaked
+# every intermediate accumulator buffer (each AppendBytes result replaced `out` without
+# freeing the old one). Called once per MoQ run for every access unit fetched during
+# playback (WebSceneMediaEsStreamLoop), so on a live device this compounded into both
+# an unbounded per-run memory leak and a monotonically slowing read loop (the copy cost
+# of each chunk grows with how much of the run has already been read) — see
+# unimaker.playback_endurance.v1 es_sink_rate decline / RSS growth during real playback.
+fn WebSceneMediaOrchestrateFetchAll(reader: var moqstream.Libp2pMoqSegmentStreamReader,
+                                    maxChunkBytes: int32): Result[rawbytes.Bytes] =
+    let totalBytes: int32 = reader.expectedBytes - reader.bytesRead
+    if totalBytes <= 0:
+        var empty: rawbytes.Bytes
+        return Ok[rawbytes.Bytes](empty)
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(totalBytes)
+    var written: int32
+    let fetchStartMs: int64 = qnative.MsQuicNativeNowMs()
+    # Size-aware whole-fetch budget: 60000ms base + totalBytes / (50 bytes/ms) — see the
+    # constants' header comment for why the throughput-floor extension cannot reintroduce
+    # the unbounded trickle.
+    let fetchBudgetMs: int64 = webSceneMediaFetchAllDeadlineBaseMs + int64(totalBytes) / webSceneMediaFetchAllMinThroughputBytesPerMs
+    while !reader.closed:
+        # #139 guards, checked BEFORE issuing another read (each read below gets its own
+        # fresh 20000ms idle window, so without these two checks a ≥1-byte-per-window
+        # trickle loops forever — see the constant's header comment):
+        #   1. host teardown cancel (fast path, ≤ one in-flight read window);
+        #   2. whole-fetch cumulative deadline (hard backstop, cancel-visibility-proof).
+        if webSceneMediaFetchCancelRequested != 0:
+            rawbytes.BytesFree(out)
+            return Err[rawbytes.Bytes]("orchestrator: fetch cancelled by host teardown (#139)")
+        if qnative.MsQuicNativeNowMs() - fetchStartMs > fetchBudgetMs:
+            rawbytes.BytesFree(out)
+            return Err[rawbytes.Bytes]("orchestrator: cumulative fetch deadline exceeded (#139 trickle bound)")
+        let readRes = moqstream.Libp2pMoqSegmentStreamRead(reader, maxChunkBytes)
+        if IsErr(readRes):
+            rawbytes.BytesFree(out)
+            return Err[rawbytes.Bytes](Error(readRes))
+        var chunk = Value(readRes)
+        let chunkLen = rawbytes.BytesLen(chunk)
+        if chunkLen <= 0:
+            return Ok[rawbytes.Bytes](out)
+        rawbytes.BytesCopyInto(out, written, chunk)
+        rawbytes.BytesFree(chunk)
+        written = written + chunkLen
+    return Ok[rawbytes.Bytes](out)

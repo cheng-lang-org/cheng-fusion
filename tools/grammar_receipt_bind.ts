@@ -170,6 +170,29 @@ export interface DriverAnnotationArg {
   readonly childStart: number; readonly childCount: number;
   readonly identitySha256: string;
 }
+export interface DriverForwardingProduction {
+  readonly index: number; readonly producerSourceIndex: number;
+  readonly sourceLocalRow: number;
+  readonly kind: number; readonly kindText: string;
+  readonly armIndex: number; readonly ownerIndex: number;
+  readonly anchorTokenIndex: number;
+  readonly spanStartTokenIndex: number;
+  readonly spanEndTokenIndex: number;
+  readonly spanStart: number; readonly spanEnd: number;
+  readonly authorityKind: number; readonly authorityKindText: string;
+  readonly authorityRow: number;
+  readonly annotationStart: number; readonly annotationCount: number;
+  readonly childStart: number; readonly childCount: number;
+  readonly identitySha256: string;
+}
+export interface DriverForwardingProductionChild {
+  readonly parentIndex: number; readonly ordinal: number;
+  readonly role: number; readonly roleText: string;
+  readonly kind: number; readonly kindText: string; readonly row: number;
+  readonly producerSourceIndex: number; readonly sourceTextId: number;
+  readonly spanStart: number; readonly spanEnd: number;
+  readonly targetIdentitySha256: string;
+}
 interface DriverTypeSyntax {
   readonly index: number; readonly producerSourceIndex: number;
   readonly sourceLocalRow: number;
@@ -252,7 +275,7 @@ interface DriverPattern {
   readonly childStart: number; readonly childCount: number;
   readonly identitySha256: string;
 }
-interface DriverReceipt {
+export interface DriverReceipt {
   readonly schema: string; readonly stage: string;
   readonly producerIdentity: string;
   readonly relativePath: string; readonly sourcePath: string;
@@ -276,6 +299,8 @@ interface DriverReceipt {
     readonly annotationCount: number; readonly annotationArgCount: number;
     readonly annotationArgRootCount: number;
     readonly annotationArgChildCount: number;
+    readonly forwardingProductionCount: number;
+    readonly forwardingProductionChildCount: number;
     readonly typeSyntaxCount: number; readonly typeSyntaxChildCount: number;
     readonly typeEnumVariantCount: number;
     readonly typeSyntaxBracketArgCount: number;
@@ -299,6 +324,10 @@ interface DriverReceipt {
   readonly annotationArgRoots: readonly number[];
   readonly annotationArgs: readonly DriverAnnotationArg[];
   readonly annotationArgChildren: readonly number[];
+  readonly forwardingProductions:
+    readonly DriverForwardingProduction[];
+  readonly forwardingProductionChildren:
+    readonly DriverForwardingProductionChild[];
   readonly typeSyntaxes: readonly DriverTypeSyntax[];
   readonly typeSyntaxChildren: readonly number[];
   readonly typeEnumVariants: readonly DriverTypeEnumVariant[];
@@ -356,6 +385,8 @@ export function validateDriverReceiptToolchainIdentityValue(
     "annotationArgRoots",
     "annotationArgs",
     "annotationArgChildren",
+    "forwardingProductions",
+    "forwardingProductionChildren",
     "typeSyntaxes",
     "typeSyntaxChildren",
     "typeEnumVariants",
@@ -395,6 +426,8 @@ export function validateDriverReceiptToolchainIdentityValue(
     "annotationArgCount",
     "annotationArgRootCount",
     "annotationArgChildCount",
+    "forwardingProductionCount",
+    "forwardingProductionChildCount",
     "sourceTextCount",
   ], "driver_receipt_counts");
   const manifest = receipt.toolchainManifest;
@@ -526,6 +559,10 @@ interface Ctx {
   readonly annotationArgs: readonly DriverAnnotationArg[];
   readonly annotationArgChildren: readonly number[];
   readonly annotationArgParents: readonly number[];
+  readonly forwardingProductions:
+    readonly DriverForwardingProduction[];
+  readonly forwardingProductionChildren:
+    readonly DriverForwardingProductionChild[];
   readonly typeSyntaxes: readonly DriverTypeSyntax[];
   readonly typeSyntaxChildren: readonly number[];
   readonly typeSyntaxParents: readonly number[];
@@ -899,6 +936,211 @@ export function parserAnnotationArgIdentity(
     ...children.flatMap((child) => [
       parserReceiptFrameI32(child),
       parserReceiptFrameFixed32(priorIdentities[child]!),
+    ]),
+  ]));
+}
+
+export function parserForwardingProductionIdentity(
+  row: DriverForwardingProduction,
+  source: string,
+  tokens: readonly DriverToken[],
+  children: readonly DriverForwardingProductionChild[],
+): string {
+  const anchor = tokens[row.anchorTokenIndex]!;
+  const spanStartToken = tokens[row.spanStartTokenIndex]!;
+  const spanEndToken = tokens[row.spanEndTokenIndex]!;
+  const rowChildren = children.slice(
+    row.childStart,
+    row.childStart + row.childCount,
+  );
+  return sha256(Buffer.concat([
+    parserReceiptFrameText(
+      "cheng.parser_span_receipt.forwarding_production",
+    ),
+    parserReceiptFrameI32(row.index),
+    parserReceiptFrameI32(row.producerSourceIndex),
+    parserReceiptFrameI32(row.sourceLocalRow),
+    parserReceiptFrameI32(row.kind),
+    parserReceiptFrameI32(row.armIndex),
+    parserReceiptFrameI32(row.ownerIndex),
+    ...parserReceiptTokenIdentityFrames(source, anchor),
+    ...parserReceiptTokenIdentityFrames(source, spanStartToken),
+    ...parserReceiptTokenIdentityFrames(source, spanEndToken),
+    parserReceiptFrameI32(row.spanStart),
+    parserReceiptFrameI32(row.spanEnd),
+    parserReceiptFrameI32(row.authorityKind),
+    parserReceiptFrameI32(row.authorityRow),
+    parserReceiptFrameI32(row.annotationStart),
+    parserReceiptFrameI32(row.annotationCount),
+    parserReceiptFrameI32(row.childStart),
+    parserReceiptFrameI32(row.childCount),
+    ...rowChildren.flatMap((child) => [
+      parserReceiptFrameI32(child.role),
+      parserReceiptFrameI32(child.parentIndex),
+      parserReceiptFrameI32(child.ordinal),
+      parserReceiptFrameI32(child.kind),
+      parserReceiptFrameI32(child.row),
+      parserReceiptFrameI32(child.producerSourceIndex),
+      parserReceiptFrameI32(child.sourceTextId),
+      parserReceiptFrameI32(child.spanStart),
+      parserReceiptFrameI32(child.spanEnd),
+      parserReceiptFrameFixed32(child.targetIdentitySha256),
+    ]),
+  ]));
+}
+
+const FORWARDING_STATEMENT_ROLE_NAMES = [
+  "ParserValueExprStatementInvalid",
+  "ParserValueExprStatementBindingInitializer",
+  "ParserValueExprStatementAssignmentRhs",
+  "ParserValueExprStatementReturnValue",
+  "ParserValueExprStatementImplicitReturnValue",
+  "ParserValueExprStatementYieldValue",
+  "ParserValueExprStatementExpression",
+  "ParserValueExprStatementCondition",
+  "ParserValueExprStatementLoopSource",
+  "ParserValueExprStatementParameterDefault",
+  "ParserValueExprStatementTypeDefault",
+  "ParserValueExprStatementWhereCondition",
+  "ParserValueExprStatementCaseEntry",
+  "ParserValueExprStatementCaseGuard",
+] as const;
+
+const FORWARDING_REGION_KIND_NAMES = [
+  "ParserValueExprRegionInvalid",
+  "ParserValueExprRegionModuleHeaderLine",
+  "ParserValueExprRegionConceptTraitHeader",
+  "ParserValueExprRegionAnnotationLine",
+  "ParserValueExprRegionAnnotationArgs",
+  "ParserValueExprRegionTypeDeclHeader",
+  "ParserValueExprRegionTypeExprText",
+  "ParserValueExprRegionTypeParamList",
+  "ParserValueExprRegionParamType",
+  "ParserValueExprRegionReturnType",
+  "ParserValueExprRegionFieldDeclType",
+  "ParserValueExprRegionPattern",
+  "ParserValueExprRegionCaseArm",
+  "ParserValueExprRegionLValue",
+  "ParserValueExprRegionFieldBlock",
+] as const;
+
+export function parserForwardingChildTargetIdentity(
+  child: DriverForwardingProductionChild,
+  source: string,
+  receipt: DriverReceipt,
+  forwardingProductions: readonly DriverForwardingProduction[],
+  declarations: readonly DriverDeclaration[],
+  patterns: readonly DriverPattern[],
+  annotations: readonly DriverAnnotation[],
+  declarationLexicalScopes: readonly DriverDeclarationLexicalScope[],
+  typeSyntaxes: readonly DriverTypeSyntax[],
+): string {
+  let canonicalIdentity = "";
+  if (child.kind === 1) {
+    canonicalIdentity =
+      forwardingProductions[child.row]?.identitySha256 ?? "";
+  } else if (child.kind === 2) {
+    canonicalIdentity = receipt.nodes[child.row]?.identitySha256 ?? "";
+  } else if (child.kind === 3) {
+    const statement = receipt.statementRoots[child.row];
+    const node = statement === undefined
+      ? undefined : receipt.nodes[statement.nodeIndex];
+    const anchor = statement === undefined
+      ? undefined : receipt.tokens[statement.anchorTokenIndex];
+    const role = statement === undefined
+      ? -1 : FORWARDING_STATEMENT_ROLE_NAMES.indexOf(
+        statement.role as typeof FORWARDING_STATEMENT_ROLE_NAMES[number],
+      );
+    if (statement !== undefined && node !== undefined &&
+        anchor !== undefined && role >= 0) {
+      canonicalIdentity = sha256(Buffer.concat([
+        parserReceiptFrameText(
+          "cheng.parser_span_receipt.forwarding_statement_root_target",
+        ),
+        parserReceiptFrameI32(statement.index),
+        parserReceiptFrameFixed32(node.identitySha256),
+        parserReceiptFrameI32(role),
+        ...parserReceiptTokenIdentityFrames(source, anchor),
+        parserReceiptFrameI32(statement.bindingDeclarationStart),
+        parserReceiptFrameI32(statement.bindingDeclarationCount),
+      ]));
+    }
+  } else if (child.kind === 4) {
+    const region = receipt.regions[child.row];
+    const anchor = region === undefined
+      ? undefined : receipt.tokens[region.anchorTokenIndex];
+    const kind = region === undefined
+      ? -1 : FORWARDING_REGION_KIND_NAMES.indexOf(
+        region.kind as typeof FORWARDING_REGION_KIND_NAMES[number],
+      );
+    if (region !== undefined && anchor !== undefined && kind >= 0) {
+      canonicalIdentity = sha256(Buffer.concat([
+        parserReceiptFrameText(
+          "cheng.parser_span_receipt.forwarding_region_target",
+        ),
+        parserReceiptFrameI32(region.index),
+        parserReceiptFrameI32(kind),
+        parserReceiptFrameI32(region.sourceTextId),
+        parserReceiptFrameI32(region.spanStart),
+        parserReceiptFrameI32(region.spanEnd),
+        ...parserReceiptTokenIdentityFrames(source, anchor),
+      ]));
+    }
+  } else if (child.kind === 5) {
+    const token = receipt.tokens[child.row];
+    if (token !== undefined) {
+      canonicalIdentity = sha256(Buffer.concat([
+        parserReceiptFrameText(
+          "cheng.parser_span_receipt.forwarding_token_target",
+        ),
+        ...parserReceiptTokenIdentityFrames(source, token),
+      ]));
+    }
+  } else if (child.kind === 6) {
+    canonicalIdentity = declarations[child.row]?.identitySha256 ?? "";
+  } else if (child.kind === 7) {
+    canonicalIdentity = patterns[child.row]?.identitySha256 ?? "";
+  } else if (child.kind === 8) {
+    canonicalIdentity = annotations[child.row]?.identitySha256 ?? "";
+  } else if (child.kind === 9) {
+    canonicalIdentity =
+      declarationLexicalScopes[child.row]?.identitySha256 ?? "";
+  } else if (child.kind === 10) {
+    canonicalIdentity = typeSyntaxes[child.row]?.identitySha256 ?? "";
+  }
+  if (!/^[0-9a-f]{64}$/.test(canonicalIdentity)) return "";
+  return sha256(Buffer.concat([
+    parserReceiptFrameText(
+      "cheng.parser_span_receipt.forwarding_child_target",
+    ),
+    parserReceiptFrameI32(child.kind),
+    parserReceiptFrameI32(child.row),
+    parserReceiptFrameI32(child.producerSourceIndex),
+    parserReceiptFrameI32(child.sourceTextId),
+    parserReceiptFrameI32(child.spanStart),
+    parserReceiptFrameI32(child.spanEnd),
+    parserReceiptFrameFixed32(canonicalIdentity),
+  ]));
+}
+
+export function parserCurrentForwardingTraceRoot(
+  receipt: DriverReceipt,
+  source: string,
+): string {
+  return sha256(Buffer.concat([
+    parserReceiptFrameText(
+      "cheng.parser_span_receipt.current_forwarding_trace",
+    ),
+    parserReceiptFrameI32(receipt.tokens.length),
+    ...receipt.tokens.flatMap((token) =>
+      parserReceiptTokenIdentityFrames(source, token)),
+    parserReceiptFrameI32(receipt.forwardingProductions.length),
+    ...receipt.forwardingProductions.map((row) =>
+      parserReceiptFrameFixed32(row.identitySha256)),
+    parserReceiptFrameI32(receipt.forwardingProductionChildren.length),
+    ...receipt.forwardingProductionChildren.flatMap((child) => [
+      parserReceiptFrameI32(child.kind),
+      parserReceiptFrameI32(child.row),
     ]),
   ]));
 }
@@ -1522,6 +1764,9 @@ function buildCtx(
   const annotationArgRoots = receipt.annotationArgRoots;
   const annotationArgs = receipt.annotationArgs;
   const annotationArgChildren = receipt.annotationArgChildren;
+  const forwardingProductions = receipt.forwardingProductions;
+  const forwardingProductionChildren =
+    receipt.forwardingProductionChildren;
   const typeSyntaxes = receipt.typeSyntaxes;
   const typeSyntaxChildren = receipt.typeSyntaxChildren;
   const typeEnumVariants = receipt.typeEnumVariants;
@@ -4337,10 +4582,638 @@ function buildCtx(
       }
     }
   }
+  if (!Array.isArray(forwardingProductions) ||
+      !Array.isArray(forwardingProductionChildren) ||
+      receipt.counts.forwardingProductionCount !==
+        forwardingProductions.length ||
+      receipt.counts.forwardingProductionChildCount !==
+        forwardingProductionChildren.length) {
+    throw new Error(
+      "driver forwarding production receipt count/array mismatch",
+    );
+  }
+  const forwardingKindByOrdinal = [
+    "ParserForwardingProductionInvalid",
+    "ParserForwardingProductionTopLevelDecl",
+    "ParserForwardingProductionTopLevelCore",
+    "ParserForwardingProductionTemplateBody",
+    "ParserForwardingProductionStatement",
+    "ParserForwardingProductionStatementCore",
+    "ParserForwardingProductionMatchArm",
+    "ParserForwardingProductionBlockStmt",
+  ];
+  const forwardingChildKindByOrdinal = [
+    "ParserForwardingProductionChildInvalid",
+    "ParserForwardingProductionChildForwardingProduction",
+    "ParserForwardingProductionChildValueNode",
+    "ParserForwardingProductionChildStatementRoot",
+    "ParserForwardingProductionChildRegion",
+    "ParserForwardingProductionChildToken",
+    "ParserForwardingProductionChildDeclaration",
+    "ParserForwardingProductionChildPattern",
+    "ParserForwardingProductionChildAnnotation",
+    "ParserForwardingProductionChildLexicalScope",
+    "ParserForwardingProductionChildTypeSyntax",
+  ];
+  const forwardingOwnerKindValid = (
+    row: DriverForwardingProduction,
+  ): boolean => {
+    if (row.kind === 1) return row.ownerIndex === -1;
+    const owner = forwardingProductions[row.ownerIndex];
+    if (owner === undefined || owner.index >= row.index) return false;
+    if (row.kind === 2) return owner.kind === 1;
+    if (row.kind === 5) return owner.kind === 4;
+    if (row.kind === 3) {
+      return owner.kind === 5 && owner.armIndex === 16;
+    }
+    if (row.kind === 6) {
+      return owner.kind === 5 &&
+        (owner.armIndex === 9 || owner.armIndex === 12);
+    }
+    if (row.kind === 7) {
+      return owner.kind === 5 && owner.armIndex === 14;
+    }
+    if (row.kind === 4) {
+      return [2, 3, 5, 6, 7].includes(owner.kind);
+    }
+    return false;
+  };
+  const forwardingAuthorityRowValid = (
+    kind: number,
+    row: number,
+  ): boolean => {
+    if (kind === 0) return row === -1;
+    const lengths = [
+      0,
+      forwardingProductions.length,
+      receipt.nodes.length,
+      receipt.statementRoots.length,
+      receipt.regions.length,
+      receipt.tokens.length,
+      declarations.length,
+      patterns.length,
+      annotations.length,
+      declarationLexicalScopes.length,
+      typeSyntaxes.length,
+    ];
+    return kind > 0 && kind < lengths.length &&
+      row >= 0 && row < lengths[kind]!;
+  };
+  const forwardingChildFact = (
+    child: DriverForwardingProductionChild,
+  ): {
+    producerSourceIndex: number;
+    sourceTextId: number;
+    spanStart: number;
+    spanEnd: number;
+  } | undefined => {
+    if (!forwardingAuthorityRowValid(child.kind, child.row) ||
+        child.kind === 0) {
+      return undefined;
+    }
+    if (child.kind === 1) {
+      const value = forwardingProductions[child.row]!;
+      const token = receipt.tokens[value.anchorTokenIndex]!;
+      return {
+        producerSourceIndex: value.producerSourceIndex,
+        sourceTextId: token.sourceTextId,
+        spanStart: value.spanStart,
+        spanEnd: value.spanEnd,
+      };
+    }
+    if (child.kind === 2) {
+      const value = receipt.nodes[child.row]!;
+      const token = receipt.tokens[value.tokenStart];
+      return {
+        producerSourceIndex: token?.producerSourceIndex ?? -1,
+        sourceTextId: value.sourceTextId,
+        spanStart: value.spanStart,
+        spanEnd: value.spanEnd,
+      };
+    }
+    if (child.kind === 3) {
+      const statement = receipt.statementRoots[child.row]!;
+      const value = receipt.nodes[statement.nodeIndex]!;
+      const token = receipt.tokens[value.tokenStart];
+      return {
+        producerSourceIndex: token?.producerSourceIndex ?? -1,
+        sourceTextId: value.sourceTextId,
+        spanStart: value.spanStart,
+        spanEnd: value.spanEnd,
+      };
+    }
+    if (child.kind === 4) {
+      const value = receipt.regions[child.row]!;
+      const token = receipt.tokens[value.anchorTokenIndex]!;
+      return {
+        producerSourceIndex: token.producerSourceIndex,
+        sourceTextId: value.sourceTextId,
+        spanStart: value.spanStart,
+        spanEnd: value.spanEnd,
+      };
+    }
+    if (child.kind === 5) {
+      const value = receipt.tokens[child.row]!;
+      return {
+        producerSourceIndex: value.producerSourceIndex,
+        sourceTextId: value.sourceTextId,
+        spanStart: value.start,
+        spanEnd: value.end,
+      };
+    }
+    if (child.kind === 6) {
+      const value = declarations[child.row]!;
+      return {
+        producerSourceIndex: value.producerSourceIndex,
+        sourceTextId: value.sourceTextId,
+        spanStart: value.spanStart,
+        spanEnd: value.spanEnd,
+      };
+    }
+    if (child.kind === 7) {
+      const value = patterns[child.row]!;
+      const token = value.nameTokenIndex >= 0
+        ? receipt.tokens[value.nameTokenIndex]
+        : receipt.tokens.find((candidate) =>
+          candidate.producerSourceIndex === value.producerSourceIndex &&
+          candidate.start >= value.spanStart &&
+          candidate.end <= value.spanEnd);
+      return {
+        producerSourceIndex: value.producerSourceIndex,
+        sourceTextId: token?.sourceTextId ?? -1,
+        spanStart: value.spanStart,
+        spanEnd: value.spanEnd,
+      };
+    }
+    if (child.kind === 8) {
+      const value = annotations[child.row]!;
+      return {
+        producerSourceIndex: value.producerSourceIndex,
+        sourceTextId: value.sourceTextId,
+        spanStart: value.spanStart,
+        spanEnd: value.spanEnd,
+      };
+    }
+    if (child.kind === 9) {
+      const value = declarationLexicalScopes[child.row]!;
+      const token = receipt.tokens.find((candidate) =>
+        candidate.producerSourceIndex === value.producerSourceIndex &&
+        candidate.start >= value.spanStart &&
+        candidate.end <= value.spanEnd);
+      return {
+        producerSourceIndex: value.producerSourceIndex,
+        sourceTextId: token?.sourceTextId ?? -1,
+        spanStart: value.spanStart,
+        spanEnd: value.spanEnd,
+      };
+    }
+    const value = typeSyntaxes[child.row]!;
+    return {
+      producerSourceIndex: value.producerSourceIndex,
+      sourceTextId: value.sourceTextId,
+      spanStart: value.spanStart,
+      spanEnd: value.spanEnd,
+    };
+  };
+  const forwardingExpectedAuthorityKind = (
+    row: DriverForwardingProduction,
+  ): number => {
+    if (row.kind === 6) return 7;
+    if (row.kind !== 5) return 0;
+    if ([0, 1, 15, 16, 17, 18, 19, 20].includes(row.armIndex)) {
+      return 6;
+    }
+    if ([2, 8, 9, 10, 11, 12, 13, 21].includes(row.armIndex)) {
+      return 3;
+    }
+    if ([7, 14].includes(row.armIndex)) return 9;
+    if ([3, 4, 5, 6].includes(row.armIndex)) return 5;
+    return 0;
+  };
+  const forwardingAuthorityTargetValid = (
+    row: DriverForwardingProduction,
+  ): boolean => {
+    if (row.authorityKind !== forwardingExpectedAuthorityKind(row)) {
+      return false;
+    }
+    if (row.authorityKind === 0) return row.authorityRow === -1;
+    if (row.authorityKind === 5) {
+      return row.authorityRow === row.anchorTokenIndex;
+    }
+    if (row.authorityKind === 6) {
+      const declaration = declarations[row.authorityRow];
+      let expectedKind = 3;
+      if (row.armIndex === 0) expectedKind = 6;
+      else if (row.armIndex === 1) expectedKind = 2;
+      else if (row.armIndex === 17) expectedKind = 7;
+      else if (row.armIndex === 18) expectedKind = 8;
+      return declaration !== undefined &&
+        declaration.kind === expectedKind &&
+        declaration.spanStart === row.spanStart &&
+        declaration.spanEnd === row.spanEnd &&
+        declarations.filter((candidate) =>
+          candidate.kind === expectedKind &&
+          candidate.spanStart === row.spanStart &&
+          candidate.spanEnd === row.spanEnd).length === 1;
+    }
+    if (row.authorityKind === 3) {
+      const statement = receipt.statementRoots[row.authorityRow];
+      if (statement === undefined) return false;
+      let expectedRole = "ParserValueExprStatementCondition";
+      if (row.armIndex === 2) {
+        expectedRole = "ParserValueExprStatementAssignmentRhs";
+      } else if (row.armIndex === 11) {
+        expectedRole = "ParserValueExprStatementLoopSource";
+      } else if (row.armIndex === 21) {
+        if (![
+          "ParserValueExprStatementExpression",
+          "ParserValueExprStatementImplicitReturnValue",
+        ].includes(statement.role)) return false;
+      } else if (statement.role !== expectedRole) {
+        return false;
+      }
+      if (row.armIndex !== 21 && statement.role !== expectedRole) {
+        return false;
+      }
+      const authorityAnchor = receipt.tokens[statement.anchorTokenIndex];
+      if (authorityAnchor === undefined) return false;
+      if (row.armIndex === 2) {
+        let parenDepth = 0;
+        let bracketDepth = 0;
+        let braceDepth = 0;
+        let topLevelAssign = -1;
+        for (let tokenIndex = row.spanStartTokenIndex;
+             tokenIndex <= row.spanEndTokenIndex; tokenIndex += 1) {
+          const token = receipt.tokens[tokenIndex];
+          if (token === undefined) return false;
+          const kind = tokenNames[token.kind];
+          if (kind === "ParserValueTokenAssign" &&
+              parenDepth === 0 &&
+              bracketDepth === 0 &&
+              braceDepth === 0) {
+            topLevelAssign = tokenIndex;
+            break;
+          }
+          if (kind === "ParserValueTokenLeftParen") parenDepth += 1;
+          else if (kind === "ParserValueTokenRightParen") parenDepth -= 1;
+          else if (kind === "ParserValueTokenLeftBracket") bracketDepth += 1;
+          else if (kind === "ParserValueTokenRightBracket") bracketDepth -= 1;
+          else if (kind === "ParserValueTokenLeftBrace") braceDepth += 1;
+          else if (kind === "ParserValueTokenRightBrace") braceDepth -= 1;
+        }
+        return statement.anchorTokenIndex === topLevelAssign &&
+          receipt.statementRoots.filter((candidate) =>
+            candidate.role ===
+              "ParserValueExprStatementAssignmentRhs" &&
+            candidate.anchorTokenIndex === topLevelAssign).length === 1;
+      }
+      return statement.anchorTokenIndex === row.anchorTokenIndex &&
+        receipt.statementRoots.filter((candidate) => {
+          const roleMatches = row.armIndex === 21
+            ? [
+              "ParserValueExprStatementExpression",
+              "ParserValueExprStatementImplicitReturnValue",
+            ].includes(candidate.role)
+            : candidate.role === expectedRole;
+          return roleMatches &&
+            candidate.anchorTokenIndex === row.anchorTokenIndex;
+        }).length === 1;
+    }
+    if (row.authorityKind === 9) {
+      const scope = declarationLexicalScopes[row.authorityRow];
+      return scope !== undefined && scope.kind === 4 &&
+        scope.spanStart === row.spanStart &&
+        scope.spanEnd === row.spanEnd &&
+        declarationLexicalScopes.filter((candidate) =>
+          candidate.kind === 4 &&
+          candidate.spanStart === row.spanStart &&
+          candidate.spanEnd === row.spanEnd).length === 1;
+    }
+    if (row.authorityKind === 7) {
+      const pattern = patterns[row.authorityRow];
+      const region = pattern === undefined
+        ? undefined : receipt.regions[pattern.ownerRow];
+      return pattern !== undefined && pattern.ownerKind === 1 &&
+        region !== undefined &&
+        region.kind === "ParserValueExprRegionCaseArm" &&
+        region.spanStart === row.spanStart &&
+        region.spanEnd === row.spanEnd &&
+        patterns.filter((candidate) => {
+          if (candidate.ownerKind !== 1) return false;
+          const candidateRegion = receipt.regions[candidate.ownerRow];
+          return candidateRegion?.kind ===
+              "ParserValueExprRegionCaseArm" &&
+            candidateRegion.spanStart === row.spanStart &&
+            candidateRegion.spanEnd === row.spanEnd;
+        }).length === 1;
+    }
+    return false;
+  };
+  const forwardingChildContractValid = (
+    row: DriverForwardingProduction,
+    children: readonly DriverForwardingProductionChild[],
+  ): boolean => {
+    const forwarding = children.filter((child) => child.role === 3);
+    const kinds = new Set(forwarding.map((child) =>
+      forwardingProductions[child.row]?.kind ?? -1));
+    if (kinds.size > 1) return false;
+    const childKind = forwarding.length === 0
+      ? -1 : forwardingProductions[forwarding[0]!.row]!.kind;
+    if (row.kind === 1) return forwarding.length === 1 && childKind === 2;
+    if (row.kind === 2) {
+      if (forwarding.length !== 1 || childKind !== 4) return false;
+      const statement = forwardingProductions[forwarding[0]!.row]!;
+      const statementChildren = forwardingProductionChildren
+        .slice(
+          statement.childStart,
+          statement.childStart + statement.childCount,
+        )
+        .filter((child) => child.role === 3);
+      if (statementChildren.length !== 1) return false;
+      const statementCore =
+        forwardingProductions[statementChildren[0]!.row];
+      if (statementCore?.kind !== 5) return false;
+      const topLevelArmByStatementCoreArm = new Map([
+        [0, 0],
+        [19, 1],
+        [20, 2],
+        [15, 3],
+        [16, 4],
+        [17, 5],
+        [18, 6],
+        [1, 7],
+        [21, 8],
+      ]);
+      return topLevelArmByStatementCoreArm.get(
+        statementCore.armIndex,
+      ) === row.armIndex;
+    }
+    if (row.kind === 4) return forwarding.length === 1 && childKind === 5;
+    if ([3, 6, 7].includes(row.kind)) {
+      return forwarding.length > 0 && childKind === 4;
+    }
+    if (row.kind !== 5) return false;
+    if (row.armIndex === 9) {
+      return forwarding.length > 0 && childKind === 6;
+    }
+    if (row.armIndex === 14) {
+      return forwarding.length === 1 && childKind === 7;
+    }
+    if (row.armIndex === 16) {
+      return forwarding.length === 1 && childKind === 3;
+    }
+    if ([5, 6].includes(row.armIndex)) return forwarding.length === 0;
+    return forwarding.length === 0 || childKind === 4;
+  };
+  let forwardingChildCursor = 0;
+  const forwardingAuthorityTargets = new Set<string>();
+  for (const row of forwardingProductions) {
+    const anchor = receipt.tokens[row.anchorTokenIndex];
+    const spanStartToken = receipt.tokens[row.spanStartTokenIndex];
+    const spanEndToken = receipt.tokens[row.spanEndTokenIndex];
+    const armValid =
+      ([1, 4, 6].includes(row.kind) && row.armIndex === -1) ||
+      (row.kind === 2 && row.armIndex >= 0 && row.armIndex <= 8) ||
+      ([3, 7].includes(row.kind) &&
+        row.armIndex >= 0 && row.armIndex <= 1) ||
+      (row.kind === 5 && row.armIndex >= 0 && row.armIndex <= 21);
+    if (canonicalJson(Object.keys(row).sort()) !== canonicalJson([
+      "anchorTokenIndex",
+      "annotationCount",
+      "annotationStart",
+      "armIndex",
+      "authorityKind",
+      "authorityKindText",
+      "authorityRow",
+      "childCount",
+      "childStart",
+      "identitySha256",
+      "index",
+      "kind",
+      "kindText",
+      "ownerIndex",
+      "producerSourceIndex",
+      "sourceLocalRow",
+      "spanEnd",
+      "spanEndTokenIndex",
+      "spanStart",
+      "spanStartTokenIndex",
+    ]) ||
+        row.index < 0 || row.index >= forwardingProductions.length ||
+        forwardingProductions[row.index] !== row ||
+        row.sourceLocalRow !== row.index ||
+        forwardingKindByOrdinal[row.kind] !== row.kindText ||
+        !armValid ||
+        row.ownerIndex < -1 || row.ownerIndex >= row.index ||
+        !forwardingOwnerKindValid(row) ||
+        (row.ownerIndex >= 0 &&
+          forwardingProductions[row.ownerIndex]!.producerSourceIndex !==
+            row.producerSourceIndex) ||
+        anchor === undefined ||
+        anchor.producerSourceIndex !== row.producerSourceIndex ||
+        spanStartToken === undefined ||
+        spanEndToken === undefined ||
+        spanStartToken.producerSourceIndex !== row.producerSourceIndex ||
+        spanEndToken.producerSourceIndex !== row.producerSourceIndex ||
+        spanStartToken.sourceTextId !== anchor.sourceTextId ||
+        spanEndToken.sourceTextId !== anchor.sourceTextId ||
+        row.spanStart < 0 || row.spanEnd <= row.spanStart ||
+        row.spanStart !== spanStartToken.start ||
+        row.spanEnd !== spanEndToken.end ||
+        row.spanEnd >
+          (receipt.sourceTexts[anchor.sourceTextId]?.byteLength ?? -1) ||
+        anchor.start < row.spanStart || anchor.end > row.spanEnd ||
+        (row.ownerIndex >= 0 &&
+          (row.spanStart <
+             forwardingProductions[row.ownerIndex]!.spanStart ||
+           row.spanEnd >
+             forwardingProductions[row.ownerIndex]!.spanEnd)) ||
+        forwardingChildKindByOrdinal[row.authorityKind] !==
+          row.authorityKindText ||
+        !forwardingAuthorityRowValid(
+          row.authorityKind,
+          row.authorityRow,
+        ) ||
+        !forwardingAuthorityTargetValid(row) ||
+        row.annotationCount < 0 ||
+        (row.annotationCount > 0 && ![1, 4].includes(row.kind)) ||
+        (row.annotationCount === 0 && row.annotationStart !== -1) ||
+        (row.annotationCount > 0 &&
+          (row.annotationStart < 0 ||
+           row.annotationStart + row.annotationCount >
+             annotations.length)) ||
+        row.childStart !== forwardingChildCursor ||
+        row.childCount <= 0 ||
+        row.childStart + row.childCount >
+          forwardingProductionChildren.length ||
+        !hex64.test(row.identitySha256)) {
+      throw new Error(
+        `driver forwarding production receipt row invalid: ${row.index}`,
+      );
+    }
+    if (row.authorityKind !== 0) {
+      const authorityTarget =
+        `${row.authorityKind}:${row.authorityRow}`;
+      if (forwardingAuthorityTargets.has(authorityTarget)) {
+        throw new Error(
+          `driver forwarding production authority target reused: ${row.index}`,
+        );
+      }
+      forwardingAuthorityTargets.add(authorityTarget);
+    }
+    const expectedChildren: {
+      role: number;
+      kind: number;
+      row: number;
+    }[] = [];
+    if (row.authorityKind !== 0) {
+      expectedChildren.push({
+        role: 1,
+        kind: row.authorityKind,
+        row: row.authorityRow,
+      });
+    }
+    let previousAnnotationEnd = -1;
+    for (let offset = 0; offset < row.annotationCount; offset += 1) {
+      const annotation = annotations[row.annotationStart + offset];
+      if (annotation === undefined ||
+          annotation.targetTokenIndex !== row.anchorTokenIndex ||
+          (previousAnnotationEnd >= 0 &&
+           annotation.spanStart < previousAnnotationEnd)) {
+        throw new Error(
+          `driver forwarding production annotation contract invalid: ${row.index}/${offset}`,
+        );
+      }
+      previousAnnotationEnd = annotation.spanEnd;
+      expectedChildren.push({
+        role: 2,
+        kind: 8,
+        row: row.annotationStart + offset,
+      });
+    }
+    for (const child of forwardingProductions) {
+      if (child.ownerIndex === row.index) {
+        expectedChildren.push({
+          role: 3,
+          kind: 1,
+          row: child.index,
+        });
+      }
+    }
+    const actualChildren = forwardingProductionChildren.slice(
+      row.childStart,
+      row.childStart + row.childCount,
+    );
+    let exactSpanStart = anchor.start;
+    let exactSpanEnd = anchor.end;
+    for (let ordinal = 0; ordinal < actualChildren.length; ordinal += 1) {
+      const child = actualChildren[ordinal]!;
+      const fact = forwardingChildFact(child);
+      const expected = expectedChildren[ordinal];
+      const expectedRoleText = child.role === 1
+        ? "authority" : child.role === 2 ? "annotation" : "forwarding";
+      if (canonicalJson(Object.keys(child).sort()) !== canonicalJson([
+        "kind",
+        "kindText",
+        "ordinal",
+        "parentIndex",
+        "producerSourceIndex",
+        "role",
+        "roleText",
+        "row",
+        "sourceTextId",
+        "spanEnd",
+        "spanStart",
+        "targetIdentitySha256",
+      ]) ||
+          expected === undefined ||
+          child.parentIndex !== row.index ||
+          child.ordinal !== ordinal ||
+          child.role !== expected.role ||
+          child.roleText !== expectedRoleText ||
+          child.kind !== expected.kind ||
+          child.kindText !== forwardingChildKindByOrdinal[child.kind] ||
+          child.row !== expected.row ||
+          fact === undefined ||
+          child.producerSourceIndex !== fact.producerSourceIndex ||
+          child.sourceTextId !== fact.sourceTextId ||
+          child.spanStart !== fact.spanStart ||
+          child.spanEnd !== fact.spanEnd ||
+          !hex64.test(child.targetIdentitySha256) ||
+          fact.producerSourceIndex !== row.producerSourceIndex ||
+          fact.sourceTextId !== anchor.sourceTextId ||
+          fact.spanStart < row.spanStart ||
+          fact.spanEnd > row.spanEnd ||
+          fact.spanEnd <= fact.spanStart) {
+        throw new Error(
+          `driver forwarding production child source/span invalid: ${row.index}`,
+        );
+      }
+      exactSpanStart = Math.min(exactSpanStart, fact.spanStart);
+      exactSpanEnd = Math.max(exactSpanEnd, fact.spanEnd);
+    }
+    if (actualChildren.length !== expectedChildren.length ||
+        row.spanStart !== exactSpanStart ||
+        row.spanEnd !== exactSpanEnd ||
+        !forwardingChildContractValid(row, actualChildren)) {
+      throw new Error(
+        `driver forwarding production child/CID invalid: ${row.index}`,
+      );
+    }
+    forwardingChildCursor += row.childCount;
+  }
+  if (forwardingChildCursor !== forwardingProductionChildren.length) {
+    throw new Error(
+      "driver forwarding production child CSR coverage invalid",
+    );
+  }
+  for (let rowIndex = forwardingProductions.length - 1;
+       rowIndex >= 0; rowIndex -= 1) {
+    const row = forwardingProductions[rowIndex]!;
+    const children = forwardingProductionChildren.slice(
+      row.childStart,
+      row.childStart + row.childCount,
+    );
+    for (const child of children) {
+      const targetIdentity = parserForwardingChildTargetIdentity(
+        child,
+        source,
+        receipt,
+        forwardingProductions,
+        declarations,
+        patterns,
+        annotations,
+        declarationLexicalScopes,
+        typeSyntaxes,
+      );
+      if (child.targetIdentitySha256 !== targetIdentity) {
+        throw new Error(
+          `driver forwarding production child target CID invalid: ${row.index}/${child.ordinal}`,
+        );
+      }
+    }
+    if (row.identitySha256 !== parserForwardingProductionIdentity(
+      row,
+      source,
+      receipt.tokens,
+      forwardingProductionChildren,
+    )) {
+      throw new Error(
+        `driver forwarding production row CID invalid: ${row.index}`,
+      );
+    }
+  }
+  if (receipt.parserTraceRootSha256 !==
+      parserCurrentForwardingTraceRoot(receipt, source)) {
+    throw new Error(
+      "driver parser trace root forwarding structure invalid",
+    );
+  }
   const ctx: Ctx = {
     receipt, source, tokenNames, nodesByKind: byKind,
     annotations, annotationArgRoots, annotationArgs, annotationArgChildren,
     annotationArgParents: parent,
+    forwardingProductions, forwardingProductionChildren,
     typeSyntaxes, typeSyntaxChildren, typeSyntaxParents: typeParents,
     typeEnumVariants,
     typeSyntaxBracketArgs, typeConstExprs,
@@ -4742,6 +5615,75 @@ export interface MatchMiss {
   readonly reason: string;
 }
 export type MatchResult = MatchHit | MatchMiss;
+
+const FORWARDING_KIND_BY_PRODUCTION: Readonly<Record<string, string>> = {
+  topLevelDecl: "ParserForwardingProductionTopLevelDecl",
+  topLevelCore: "ParserForwardingProductionTopLevelCore",
+  templateBody: "ParserForwardingProductionTemplateBody",
+  statement: "ParserForwardingProductionStatement",
+  statementCore: "ParserForwardingProductionStatementCore",
+  matchArm: "ParserForwardingProductionMatchArm",
+  blockStmt: "ParserForwardingProductionBlockStmt",
+};
+
+function forwardingRows(
+  ctx: Ctx,
+  production: string,
+): readonly DriverForwardingProduction[] {
+  const kind = FORWARDING_KIND_BY_PRODUCTION[production];
+  return kind === undefined
+    ? []
+    : ctx.forwardingProductions.filter((row) => row.kindText === kind);
+}
+
+function forwardingChildren(
+  ctx: Ctx,
+  row: DriverForwardingProduction,
+): readonly DriverForwardingProduction[] {
+  return ctx.forwardingProductionChildren
+    .slice(row.childStart, row.childStart + row.childCount)
+    .filter((child) => child.kind === 1)
+    .map((child) => ctx.forwardingProductions[child.row]!);
+}
+
+function forwardingSameKindDepth(
+  ctx: Ctx,
+  row: DriverForwardingProduction,
+): number {
+  let maximum = 0;
+  const stack = forwardingChildren(ctx, row).map((child) => ({
+    child,
+    sameKindDepth: child.kind === row.kind ? 1 : 0,
+  }));
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (current.sameKindDepth > maximum) {
+      maximum = current.sameKindDepth;
+    }
+    for (const child of forwardingChildren(ctx, current.child)) {
+      stack.push({
+        child,
+        sameKindDepth: current.sameKindDepth +
+          (child.kind === row.kind ? 1 : 0),
+      });
+    }
+  }
+  return maximum;
+}
+
+function hitForwardingProduction(
+  row: DriverForwardingProduction,
+  channel: string,
+): MatchHit {
+  return {
+    kind: "hit",
+    charStart: row.spanStart,
+    charEnd: row.spanEnd,
+    parserNodeKind: row.kindText,
+    parserNodeIdentitySha256: row.identitySha256,
+    channel: `forwarding_production_span:${channel}`,
+  };
+}
 
 function hitNode(ctx: Ctx, node: DriverNode, channel: string): MatchHit {
   return {kind: "hit", charStart: node.spanStart, charEnd: node.spanEnd,
@@ -6883,6 +7825,12 @@ export function matchObligation(
 }
 
 function matchProductionRoot(P: string, ctx: Ctx, mapRow: MapRow | undefined): MatchResult {
+  const forwarding = forwardingRows(ctx, P)[0];
+  if (FORWARDING_KIND_BY_PRODUCTION[P] !== undefined) {
+    return forwarding === undefined
+      ? miss(`${P}: 缺 parser-owned forwarding production row`)
+      : hitForwardingProduction(forwarding, `${P}:production`);
+  }
   if (P === "caseArm") {
     const arm = structuredCaseArms(ctx)[0];
     return arm === undefined
@@ -7187,6 +8135,14 @@ function matchChoice(
   mapRow: MapRow | undefined,
 ): MatchResult {
   const armIndex = obligation.bound;
+  if (FORWARDING_KIND_BY_PRODUCTION[P] !== undefined) {
+    const row = forwardingRows(ctx, P).find(
+      (entry) => entry.armIndex === armIndex);
+    return row === undefined
+      ? miss(`${P}: forwarding choice arm ${armIndex} 缺失`)
+      : hitForwardingProduction(
+          row, `${P}:choice:${armIndex}`);
+  }
   if (P === "implicitObjectType" || P === "objectType") {
     const surface: ObjectTypeSurface =
       P === "implicitObjectType" ? "implicit" : "explicit";
@@ -7965,6 +8921,18 @@ function matchOptional(
   const present = obligation.variant === "present";
   const path = obligation.structuralPath;
   const T = (name: string) => tokensNamed(ctx, name);
+  if (P === "blockStmt") {
+    const wantedArm = present ? 1 : 0;
+    const row = forwardingRows(ctx, P).find(
+      (entry) => entry.armIndex === wantedArm);
+    return row === undefined
+      ? miss(
+          `blockStmt: forwarding optional ${obligation.variant} 缺失`)
+      : hitForwardingProduction(
+          row,
+          `blockStmt:optional:${obligation.variant}`,
+        );
+  }
   if (P === "conceptDecl" || P === "traitDecl") {
     const expectedKind = P === "conceptDecl"
       ? "ParserDeclarationConcept"
@@ -9396,6 +10364,16 @@ function matchRepetition(
 
 function matchRecursion(P: string, variant: string, ctx: Ctx, mapRow: MapRow | undefined): MatchResult {
   const want = variant === "depth_zero" ? 0 : variant === "depth_one" ? 1 : 3;
+  if (FORWARDING_KIND_BY_PRODUCTION[P] !== undefined) {
+    const row = forwardingRows(ctx, P).find((entry) => {
+      const depth = forwardingSameKindDepth(ctx, entry);
+      return variant === "bounded_depth" ? depth >= want : depth === want;
+    });
+    return row === undefined
+      ? miss(`${P}: forwarding recursion ${variant} 缺失`)
+      : hitForwardingProduction(
+          row, `${P}:recursion:${variant}`);
+  }
   if (P === "suite") {
     const scope = ctx.normalizedScopeFacts.find((entry) => {
       if (entry.kindText === "NormalizedScopeRoot") return false;
@@ -9885,6 +10863,82 @@ export function bindCurrentReceiptAgainstObligations(
     }
   }
   return bound;
+}
+
+export const CHENG_CURRENT_PARSER_RECEIPT_BINDING_SCHEMA =
+  "cheng_current_parser_receipt_binding";
+
+export interface CurrentParserReceiptBindingAuthority {
+  readonly schema:
+    typeof CHENG_CURRENT_PARSER_RECEIPT_BINDING_SCHEMA;
+  readonly parserTraceRootSha256: string;
+  readonly parserNodeMapSha256: string;
+  readonly requiredResultCount: number;
+  readonly hitCount: number;
+  readonly bindingSha256: string;
+}
+
+export function currentParserReceiptBindingAuthority(
+  receiptJson: string,
+  source: string,
+  formalSpecSource: string,
+  obligations: readonly ChengGrammarObligation[],
+  tokenNames: readonly string[],
+  mapRows: ReadonlyMap<string, MapRow>,
+  parserNodeMapSha256: string,
+  valueExprKindNames: readonly string[] =
+    valueExprKindNamesFromParserSource(
+      readFileSync(PARSER_PATH, "utf8"),
+    ),
+): CurrentParserReceiptBindingAuthority {
+  if (!/^[0-9a-f]{64}$/.test(parserNodeMapSha256)) {
+    throw new Error("current_parser_receipt_binding_node_map_invalid");
+  }
+  const bound = bindCurrentReceiptAgainstObligations(
+    receiptJson,
+    source,
+    formalSpecSource,
+    obligations,
+    tokenNames,
+    mapRows,
+    valueExprKindNames,
+  );
+  const rows = bound.results.map((entry) => ({
+    obligationId: entry.obligationId,
+    production: entry.production,
+    kind: entry.kind,
+    variant: entry.variant,
+    resultKind: entry.result.kind,
+    resultDetail: entry.result.kind === "hit"
+      ? {
+        charStart: entry.result.charStart,
+        charEnd: entry.result.charEnd,
+        parserNodeKind: entry.result.parserNodeKind,
+        parserNodeIdentitySha256:
+          entry.result.parserNodeIdentitySha256,
+        channel: entry.result.channel,
+      }
+      : {reason: entry.result.reason},
+    receiptSha256: entry.receipt?.receiptSha256 ?? "",
+  }));
+  const identity = {
+    schema: CHENG_CURRENT_PARSER_RECEIPT_BINDING_SCHEMA,
+    parserTraceRootSha256:
+      bound.ctx.receipt.parserTraceRootSha256,
+    parserNodeMapSha256,
+    requiredResultCount: rows.length,
+    hitCount: rows.filter(
+      (entry) => entry.resultKind === "hit").length,
+    rows,
+  };
+  return Object.freeze({
+    schema: CHENG_CURRENT_PARSER_RECEIPT_BINDING_SCHEMA,
+    parserTraceRootSha256: identity.parserTraceRootSha256,
+    parserNodeMapSha256,
+    requiredResultCount: identity.requiredResultCount,
+    hitCount: identity.hitCount,
+    bindingSha256: hashCanonical(identity),
+  });
 }
 
 // ---------------------------------------------------------------- CLI

@@ -1,0 +1,486 @@
+# backend2_plugin_cache_smoke — S4-B 取件客户端与本地缓存契约: 缓存布局 /
+# CID→缓存解析 / 先过门再落盘 / 篡改必拒 / 离线 fail-closed 含已装清单。
+# spec: docs/cheng-csg-pickup-design.md §2.2/§4/§6 S4-B;
+# gate: tools/backend2_plugin_cache_gate.sh。
+#
+# 模式 (argv[1], 缺省 unit; argv[2]=缓存根, 由门禁按腿 mktemp 隔离):
+#   unit                — 正路径全断言: 分片布局 / 未配置 root 显式 Err / Store→
+#                         LoadCached 往返 (字段级+字节级) / 二次读取逐次过门 /
+#                         Acquire 离线命中 / MissingError 格式 / FetchRemote
+#                         链根未配置传输 Err (S4-C)。全绿输出 PLUGIN_CACHE_UNIT_OK。
+#   installed-list      — 已装清单只列合法条目 (损坏条目被排除), 字典序确定,
+#                         输出 PLUGIN_CACHE_INSTALLED_OK。
+#   corrupt-entry       — 截断 receipt 文件 → 缓存污染 hard-fail。
+#   tamper-artifact     — 缓存 artifact 翻单字节 → 字节门硬崩 (含 offset=)。
+#   tamper-receipt-cid  — receipt 内 cid hex 翻一字符 → 键二次校验硬崩。
+#   tamper-receipt-quad — receipt 四元组字段 (contractVersion) 翻值 → BindCheck 硬崩。
+#   tamper-proof-local  — 伪造 local provenance → 门 d 硬崩。
+#   store-gate-reject   — 带病 artifact 直接 Store → 先过门再落盘, 字节门硬崩。
+#   offline-miss        — 缓存有他 triple 合法件, 离线取缺件 → 显式 Err 报文含
+#                         codegen_plugin_missing + installed 清单 + 无 fallback
+#                         写, rc=1 (fail-closed exit≠0 演示)。
+#   offline-miss-empty  — 空缓存离线取件 → Err installed=[], rc=1。
+#   online-miss-stub    — allowNetwork=true + 链根未配置 (S4-C) → Err 区分
+#                         csg_pickup_fetch_failed, rc=1。
+#   missing-msg-contract— S4-D 组合准入: 契约 CodegenPluginMissingError 基形
+#                         输出 (首行, 供门禁与 build_kernel_driver.sh 脚本级
+#                         报文逐字对拍) + 两侧报文对齐/覆盖谓词真值表断言,
+#                         输出 PLUGIN_MISSING_MSG_CONTRACT_OK; argv[2]=triple
+#                         (缺省 x86_64-unknown-linux-gnu)。
+
+import std/cmdline as cmdline
+import std/os
+import std/result
+import std/strings
+import std/rawbytes
+import cheng/std/bytes_layout as layout
+import cheng/core/backend/codegen_contract as contract
+import cheng/core/backend2/backend2_plugin_cid as pcid
+import cheng/core/backend/csg_plugin_pickup as pickup
+
+# ---- 夹具 ----
+
+fn zeroFixed32(): layout.FixedBytes32 =
+    var out: layout.FixedBytes32
+    for i in 0..<32:
+        out.data[i] = UInt8(0)
+    return out
+
+fn patternFixed32(seed: int32): layout.FixedBytes32 =
+    var out: layout.FixedBytes32
+    for i in 0..<32:
+        out.data[i] = UInt8((seed + i * 7) & 255)
+    return out
+
+# local receipt: signer 恒 "local"; proofCid 由 Make 派生为 artifactSha256
+# (自证), 实参零值仅占位, local 分支不消费 (S4-A 同款夹具)。
+fn buildLocalReceipt(triple: str): pcid.PluginPickupReceipt =
+    var artifact = rawbytes.BytesFromString("cheng-plugin-artifact-fixture-v1")
+    return pcid.PluginPickupReceiptMake(
+        pcid.PluginPickupOriginLocal,
+        patternFixed32(11), patternFixed32(23),
+        triple, contract.CodegenContractVersion,
+        artifact, "local", zeroFixed32())
+
+fn assertReceiptEqual(a: var pcid.PluginPickupReceipt,
+                      b: var pcid.PluginPickupReceipt,
+                      label: str) =
+    assert(a.origin == b.origin, label + " origin")
+    assert(a.pickupCidHex == b.pickupCidHex, label + " pickupCidHex")
+    assert(layout.FixedBytes32Equal(a.sourceClosureHash, b.sourceClosureHash),
+        label + " sourceClosureHash")
+    assert(layout.FixedBytes32Equal(a.compilerHash, b.compilerHash),
+        label + " compilerHash")
+    assert(a.targetTriple == b.targetTriple, label + " targetTriple")
+    assert(a.contractVersion == b.contractVersion, label + " contractVersion")
+    assert(a.artifactByteCount == b.artifactByteCount, label + " artifactByteCount")
+    assert(layout.FixedBytes32Equal(a.artifactSha256, b.artifactSha256),
+        label + " artifactSha256")
+    assert(a.provenanceSignerId == b.provenanceSignerId, label + " provenanceSignerId")
+    assert(layout.FixedBytes32Equal(a.provenanceProofCid, b.provenanceProofCid),
+        label + " provenanceProofCid")
+
+@borrows
+fn storeOrFail(root: str, receipt: var pcid.PluginPickupReceipt,
+               artifact: rawbytes.Bytes, label: str) =
+    var storeRes = pickup.CsgPluginPickupStore(root, receipt, artifact)
+    if IsErr(storeRes):
+        panic(Fmt"store failed ({label}): {Error(storeRes)}")
+
+# ---- 正路径 ----
+
+fn runUnit(root: str): int32 =
+    assert(contract.CodegenContractVersion == 1, "contract version is 1 (S4-B epoch)")
+    var artifact = rawbytes.BytesFromString("cheng-plugin-artifact-fixture-v1")
+    var receipt = buildLocalReceipt("arm64-apple-darwin")
+    let cid = receipt.pickupCidHex
+
+    # 缓存布局: <root>/<cid[:2]>/<cid>.csgplugin + 同名 .receipt
+    let artifactPath = pickup.CsgPluginPickupCachePath(root, cid)
+    let receiptPath = pickup.CsgPluginPickupReceiptPath(root, cid)
+    let shard = strings.CloneStrRange(cid, 0, 2)
+    assert(strings.StrContains(artifactPath, "/" + shard + "/" + cid + ".csgplugin"),
+        "shard layout <root>/<cid[:2]>/<cid>.csgplugin")
+    assert(strings.HasSuffix(artifactPath, ".csgplugin"), "artifact suffix")
+    assert(strings.HasSuffix(receiptPath, ".csgplugin.receipt"), "receipt suffix")
+
+    # root 未配置 (空): Store/LoadCached 显式 Err 不 panic (fail-closed 判定面)
+    var unArt: rawbytes.Bytes
+    var unStore = pickup.CsgPluginPickupStore("", receipt, artifact)
+    assert(IsErr(unStore), "store with unconfigured root is Err")
+    assert(Error(unStore) == "csg_pickup_cache_root_unconfigured",
+        "store unconfigured msg")
+    var unLoad = pickup.CsgPluginPickupLoadCached("", cid, unArt)
+    assert(IsErr(unLoad), "load with unconfigured root is Err")
+    assert(Error(unLoad) == "csg_pickup_cache_root_unconfigured",
+        "load unconfigured msg")
+
+    # 写件: 过门后双文件原子落盘
+    storeOrFail(root, receipt, artifact, "unit")
+    assert(os.FileExists(artifactPath), "artifact file landed at shard path")
+    assert(os.FileExists(receiptPath), "receipt file landed at shard path")
+
+    # 读件: CID→缓存解析往返恒等 (字段级 + 字节级), 命中已逐次过全门
+    var outArt: rawbytes.Bytes
+    var loadRes = pickup.CsgPluginPickupLoadCached(root, cid, outArt)
+    assert(!IsErr(loadRes), "load cached hit")
+    var loaded = Value(loadRes)
+    assertReceiptEqual(loaded, receipt, "cache roundtrip")
+    assert(rawbytes.BytesEqual(outArt, artifact), "artifact bytes roundtrip")
+    rawbytes.BytesFree(outArt)
+
+    # 落盘即可信但读件仍逐次过门: 第二次读取同一 VerifyGates 全量重跑
+    var outArt2: rawbytes.Bytes
+    var loadRes2 = pickup.CsgPluginPickupLoadCached(root, cid, outArt2)
+    assert(!IsErr(loadRes2), "second load cached hit")
+    var loaded2 = Value(loadRes2)
+    pcid.PluginPickupVerifyGates(outArt2, loaded2)
+    rawbytes.BytesFree(outArt2)
+
+    # Acquire 状态机: 离线有缓存 → 命中过门 → Ok (§4 离线有缓存态)
+    var acqArt: rawbytes.Bytes
+    var acqRes = pickup.CsgPluginPickupAcquire(
+        root, false, patternFixed32(11), patternFixed32(23),
+        "arm64-apple-darwin",
+        contract.CodegenContractVersion, acqArt)
+    assert(!IsErr(acqRes), "offline acquire hit")
+    var acqReceipt = Value(acqRes)
+    assert(acqReceipt.pickupCidHex == cid, "acquire cid matches")
+    assert(rawbytes.BytesEqual(acqArt, artifact), "acquire artifact bytes")
+    rawbytes.BytesFree(acqArt)
+
+    # MissingError 落位契约 TODO: 报文形 codegen_plugin_missing=<t> installed=[..]
+    var units: str[]
+    add(units, "x86_64-unknown-linux-gnu@deadbeef")
+    let msg = pickup.CsgPluginPickupMissingError("arm64-apple-darwin", units)
+    assert(msg == "codegen_plugin_missing=arm64-apple-darwin installed=[x86_64-unknown-linux-gnu@deadbeef]",
+        "missing error format")
+    var noUnits: str[]
+    let msgEmpty = pickup.CsgPluginPickupMissingError("arm64-apple-darwin", noUnits)
+    assert(msgEmpty == "codegen_plugin_missing=arm64-apple-darwin installed=[]",
+        "missing error empty list")
+
+    # FetchRemote S4-C 已接线: 链根未配置 → 传输 Err (reason 逐字断言)
+    var stubArt: rawbytes.Bytes
+    var fetchRes = pickup.CsgPluginPickupFetchRemote(cid, stubArt)
+    assert(IsErr(fetchRes), "fetch remote without chain root is Err")
+    assert(strings.StrContains(Error(fetchRes),
+        "csg_pickup_fetch_chain_root_unconfigured"), "chain root reason")
+
+    echo("PLUGIN_CACHE_UNIT_OK")
+    return 0
+
+fn runInstalledList(root: str): int32 =
+    var artifact = rawbytes.BytesFromString("cheng-plugin-artifact-fixture-v1")
+    var receiptA = buildLocalReceipt("x86_64-unknown-linux-gnu")
+    storeOrFail(root, receiptA, artifact, "A")
+    var receiptB = buildLocalReceipt("riscv64-unknown-linux-gnu")
+    storeOrFail(root, receiptB, artifact, "B")
+    # 第三条目人为损坏 (截断 receipt) → 不得列入已装清单
+    var receiptC = buildLocalReceipt("arm64-apple-darwin")
+    let cidC = receiptC.pickupCidHex
+    storeOrFail(root, receiptC, artifact, "C")
+    let receiptPathC = pickup.CsgPluginPickupReceiptPath(root, cidC)
+    var readRes = os.ReadFileBytesResult(receiptPathC)
+    assert(!IsErr(readRes), "read C receipt")
+    var disk = Value(readRes)
+    var piece = rawbytes.BytesSlice(disk, 0, rawbytes.BytesLen(disk) / 2)
+    rawbytes.BytesFree(disk)
+    var writeRes = os.WriteFileBytesResult(receiptPathC, piece)
+    rawbytes.BytesFree(piece)
+    assert(!IsErr(writeRes), "write corrupt C receipt")
+    let units = pickup.CsgPluginPickupInstalledUnits(root)
+    assert(units.len == 2, "only legal entries listed (corrupt excluded)")
+    assert(strings.HasPrefix(units[0], "riscv64-unknown-linux-gnu@"),
+        "installed list sorted (riscv64 first)")
+    assert(strings.HasPrefix(units[1], "x86_64-unknown-linux-gnu@"),
+        "installed list sorted (x86_64 second)")
+    echo(Fmt"installed={units[0]}")
+    echo(Fmt"installed={units[1]}")
+    echo("PLUGIN_CACHE_INSTALLED_OK")
+    return 0
+
+# ---- 缓存损坏条目: hard-fail，禁止伪装 cache miss ----
+
+fn runCorruptEntry(root: str): int32 =
+    var artifact = rawbytes.BytesFromString("cheng-plugin-artifact-fixture-v1")
+    var receipt = buildLocalReceipt("arm64-apple-darwin")
+    let cid = receipt.pickupCidHex
+    storeOrFail(root, receipt, artifact, "corrupt")
+    let receiptPath = pickup.CsgPluginPickupReceiptPath(root, cid)
+    var readRes = os.ReadFileBytesResult(receiptPath)
+    assert(!IsErr(readRes), "read receipt")
+    var disk = Value(readRes)
+    # 结构性损坏: 截断 receipt 文件 (Decode 严式必拒)
+    var piece = rawbytes.BytesSlice(disk, 0, rawbytes.BytesLen(disk) / 2)
+    rawbytes.BytesFree(disk)
+    var writeRes = os.WriteFileBytesResult(receiptPath, piece)
+    rawbytes.BytesFree(piece)
+    assert(!IsErr(writeRes), "write truncated receipt")
+    var outArt: rawbytes.Bytes
+    var loadRes = pickup.CsgPluginPickupLoadCached(root, cid, outArt)
+    assert(!IsErr(loadRes), "corrupt cache entry must panic")
+    echo("PLUGIN_CACHE_CORRUPT_NOT_CAUGHT")
+    return 1
+
+# ---- 篡改必拒 (panic 路径, rc!=0 + stderr 标记) ----
+
+fn runTamperArtifact(root: str): int32 =
+    var artifact = rawbytes.BytesFromString("cheng-plugin-artifact-fixture-v1")
+    var receipt = buildLocalReceipt("arm64-apple-darwin")
+    let cid = receipt.pickupCidHex
+    storeOrFail(root, receipt, artifact, "tamper-artifact")
+    let artifactPath = pickup.CsgPluginPickupCachePath(root, cid)
+    var readRes = os.ReadFileBytesResult(artifactPath)
+    assert(!IsErr(readRes), "read artifact")
+    var disk = Value(readRes)
+    # 篡改缓存条目单字节 (中部偏移 7)
+    rawbytes.BytesSet(disk, 7, (rawbytes.BytesGet(disk, 7) + 1) & 255)
+    var writeRes = os.WriteFileBytesResult(artifactPath, disk)
+    rawbytes.BytesFree(disk)
+    assert(!IsErr(writeRes), "write tampered artifact")
+    var outArt: rawbytes.Bytes
+    var loadRes = pickup.CsgPluginPickupLoadCached(root, cid, outArt)
+    if IsErr(loadRes):
+        echo("PLUGIN_CACHE_TAMPER_ERR_NOT_PANIC")
+        return 1
+    echo("PLUGIN_CACHE_TAMPER_ARTIFACT_NOT_CAUGHT")
+    return 1
+
+fn runTamperReceiptCid(root: str): int32 =
+    var artifact = rawbytes.BytesFromString("cheng-plugin-artifact-fixture-v1")
+    var receipt = buildLocalReceipt("arm64-apple-darwin")
+    let cid = receipt.pickupCidHex
+    storeOrFail(root, receipt, artifact, "tamper-receipt-cid")
+    let receiptPath = pickup.CsgPluginPickupReceiptPath(root, cid)
+    var readRes = os.ReadFileBytesResult(receiptPath)
+    assert(!IsErr(readRes), "read receipt")
+    var disk = Value(readRes)
+    # 翻 pickupCidHex 首字符 (保持合法 hex 过解码层): 线格式偏移 =
+    # 4B 标签长度前缀 + 标签 + 4B 格式版本 + 4B origin + 4B cid 长度前缀
+    let off = 4 + len("cheng.backend2.plugin.receipt") + 4 + 4 + 4
+    if rawbytes.BytesGet(disk, off) == Int32('f'):
+        rawbytes.BytesSet(disk, off, Int32('e'))
+    else:
+        rawbytes.BytesSet(disk, off, Int32('f'))
+    var writeRes = os.WriteFileBytesResult(receiptPath, disk)
+    rawbytes.BytesFree(disk)
+    assert(!IsErr(writeRes), "write tampered receipt")
+    # 解码 Ok 但 receipt 自指 cid != 查询键 → 键二次校验硬崩 (门③)
+    var outArt: rawbytes.Bytes
+    var loadRes = pickup.CsgPluginPickupLoadCached(root, cid, outArt)
+    if IsErr(loadRes):
+        echo("PLUGIN_CACHE_TAMPER_ERR_NOT_PANIC")
+        return 1
+    echo("PLUGIN_CACHE_TAMPER_RECEIPT_CID_NOT_CAUGHT")
+    return 1
+
+fn runTamperReceiptQuad(root: str): int32 =
+    var artifact = rawbytes.BytesFromString("cheng-plugin-artifact-fixture-v1")
+    var receipt = buildLocalReceipt("arm64-apple-darwin")
+    let cid = receipt.pickupCidHex
+    storeOrFail(root, receipt, artifact, "tamper-receipt-quad")
+    let receiptPath = pickup.CsgPluginPickupReceiptPath(root, cid)
+    var readRes = os.ReadFileBytesResult(receiptPath)
+    assert(!IsErr(readRes), "read receipt")
+    var disk = Value(readRes)
+    # 半吊子篡改: 单把 contractVersion 1→2 (cid 字段不动; 解码放行,
+    # 键二次校验过, BindCheck 重算必失配, §5.3 双重校验)
+    let off = 4 + len("cheng.backend2.plugin.receipt") + 4 + 4 + 4 + 64 +
+        32 + 32 + 4 + len("arm64-apple-darwin")
+    rawbytes.BytesSet(disk, off, 2)
+    var writeRes = os.WriteFileBytesResult(receiptPath, disk)
+    rawbytes.BytesFree(disk)
+    assert(!IsErr(writeRes), "write tampered receipt")
+    var outArt: rawbytes.Bytes
+    var loadRes = pickup.CsgPluginPickupLoadCached(root, cid, outArt)
+    if IsErr(loadRes):
+        echo("PLUGIN_CACHE_TAMPER_ERR_NOT_PANIC")
+        return 1
+    echo("PLUGIN_CACHE_TAMPER_RECEIPT_QUAD_NOT_CAUGHT")
+    return 1
+
+fn runTamperProofLocal(root: str): int32 =
+    var artifact = rawbytes.BytesFromString("cheng-plugin-artifact-fixture-v1")
+    var receipt = buildLocalReceipt("arm64-apple-darwin")
+    let cid = receipt.pickupCidHex
+    storeOrFail(root, receipt, artifact, "tamper-proof-local")
+    let receiptPath = pickup.CsgPluginPickupReceiptPath(root, cid)
+    var readRes = os.ReadFileBytesResult(receiptPath)
+    assert(!IsErr(readRes), "read receipt")
+    var disk = Value(readRes)
+    var decRes = pcid.PluginPickupReceiptDecode(disk)
+    rawbytes.BytesFree(disk)
+    assert(!IsErr(decRes), "decode stored receipt")
+    var dec = Value(decRes)
+    # 伪造 provenance: proofCid 翻一字节 (bind/字节门不受影响, 门 d 必硬崩)
+    dec.provenanceProofCid.data[0] = UInt8(
+        (Int32(dec.provenanceProofCid.data[0]) + 1) & 255)
+    var enc2 = pcid.PluginPickupReceiptEncode(dec)
+    var writeRes = os.WriteFileBytesResult(receiptPath, enc2)
+    rawbytes.BytesFree(enc2)
+    assert(!IsErr(writeRes), "write forged receipt")
+    var outArt: rawbytes.Bytes
+    var loadRes = pickup.CsgPluginPickupLoadCached(root, cid, outArt)
+    if IsErr(loadRes):
+        echo("PLUGIN_CACHE_TAMPER_ERR_NOT_PANIC")
+        return 1
+    echo("PLUGIN_CACHE_TAMPER_PROOF_NOT_CAUGHT")
+    return 1
+
+fn runStoreGateReject(root: str): int32 =
+    var artifact = rawbytes.BytesFromString("cheng-plugin-artifact-fixture-v1")
+    var receipt = buildLocalReceipt("arm64-apple-darwin")
+    # 带病写件: artifact 翻单字节, Store 先过门再落盘 → 字节门硬崩
+    var tampered = rawbytes.BytesSlice(artifact, 0, rawbytes.BytesLen(artifact))
+    rawbytes.BytesSet(tampered, 0, (rawbytes.BytesGet(tampered, 0) + 1) & 255)
+    var storeRes = pickup.CsgPluginPickupStore(root, receipt, tampered)
+    rawbytes.BytesFree(tampered)
+    if IsErr(storeRes):
+        echo("PLUGIN_CACHE_STORE_GATE_ERR_NOT_PANIC")
+        return 1
+    echo("PLUGIN_CACHE_STORE_GATE_NOT_CAUGHT")
+    return 1
+
+# ---- 离线 fail-closed (显式 Err + 报文含已装清单, rc=1 演示 exit≠0) ----
+
+fn runOfflineMiss(root: str): int32 =
+    # 预装一个 x86_64 合法条目, 再离线取 arm64 缺件
+    var artifact = rawbytes.BytesFromString("cheng-plugin-artifact-fixture-v1")
+    var receiptX = buildLocalReceipt("x86_64-unknown-linux-gnu")
+    storeOrFail(root, receiptX, artifact, "offline-miss")
+    var acqArt: rawbytes.Bytes
+    var acqRes = pickup.CsgPluginPickupAcquire(
+        root, false, patternFixed32(11), patternFixed32(23),
+        "arm64-apple-darwin",
+        contract.CodegenContractVersion, acqArt)
+    assert(IsErr(acqRes), "offline miss must be explicit Err")
+    let msg = Error(acqRes)
+    assert(strings.StrContains(msg, "codegen_plugin_missing=arm64-apple-darwin"),
+        "missing marker")
+    assert(strings.StrContains(msg, "installed=[x86_64-unknown-linux-gnu@"),
+        "report contains installed list")
+    # miss 不产生任何 fallback 写: 缓存仍只有 x86 条目
+    let armCid = pcid.Backend2ComputePluginPickupCid(
+        patternFixed32(11), patternFixed32(23), "arm64-apple-darwin",
+        contract.CodegenContractVersion)
+    assert(!os.FileExists(pickup.CsgPluginPickupCachePath(root, armCid)),
+        "no fallback artifact write on miss")
+    assert(!os.FileExists(pickup.CsgPluginPickupReceiptPath(root, armCid)),
+        "no fallback receipt write on miss")
+    echo(Fmt"{msg}")
+    return 1
+
+fn runOfflineMissEmpty(root: str): int32 =
+    var acqArt: rawbytes.Bytes
+    var acqRes = pickup.CsgPluginPickupAcquire(
+        root, false, patternFixed32(11), patternFixed32(23),
+        "arm64-apple-darwin",
+        contract.CodegenContractVersion, acqArt)
+    assert(IsErr(acqRes), "empty cache offline must be explicit Err")
+    let msg = Error(acqRes)
+    assert(strings.StrContains(msg, "codegen_plugin_missing=arm64-apple-darwin"),
+        "missing marker")
+    assert(strings.StrContains(msg, "installed=[]"), "empty installed list")
+    echo(Fmt"{msg}")
+    return 1
+
+fn runOnlineMissStub(root: str): int32 =
+    var acqArt: rawbytes.Bytes
+    var acqRes = pickup.CsgPluginPickupAcquire(
+        root, true, patternFixed32(11), patternFixed32(23),
+        "arm64-apple-darwin",
+        contract.CodegenContractVersion, acqArt)
+    assert(IsErr(acqRes), "online miss must be explicit Err")
+    let msg = Error(acqRes)
+    assert(strings.StrContains(msg, "csg_pickup_fetch_failed"),
+        "fetch failed marker (§4 ③ 区分)")
+    assert(strings.StrContains(msg, "csg_pickup_fetch_chain_root_unconfigured"),
+        "chain root reason (S4-C)")
+    assert(strings.StrContains(msg, "codegen_plugin_missing=arm64-apple-darwin"),
+        "missing marker")
+    echo(Fmt"{msg}")
+    return 1
+
+# S4-D 组合准入: 契约 CodegenPluginMissingError / CodegenUnitCoversTriple 与
+# 本层 CsgPluginPickupMissingError 对齐验证; 首行输出契约基形报文供门禁与
+# tools/build_kernel_driver.sh 脚本级报文 (exit 9) 逐字对拍。
+fn runMissingMsgContract(tripleArg: str): int32 =
+    var triple = tripleArg
+    if triple == "":
+        triple = "x86_64-unknown-linux-gnu"
+    var noUnits: str[]
+    let base = contract.CodegenPluginMissingError(triple, noUnits)
+    assert(base == "codegen_plugin_missing=" + triple, "contract base form")
+    # 两侧对齐: 非空清单契约与本层逐字一致 (本层直接委托契约构造函数)
+    var units: str[]
+    add(units, "aarch64-unknown-linux-gnu@deadbeef")
+    add(units, "riscv64-unknown-linux-gnu@cafef00d")
+    assert(contract.CodegenPluginMissingError(triple, units) ==
+           pickup.CsgPluginPickupMissingError(triple, units),
+        "contract/pickup non-empty alignment")
+    # 空清单: 本层保留 S4-B 显式 installed=[] (契约基形无尾段, 差异留档)
+    assert(pickup.CsgPluginPickupMissingError(triple, noUnits) ==
+           "codegen_plugin_missing=" + triple + " installed=[]",
+        "pickup empty form")
+    # 覆盖谓词真值表 (B6 body 发射表 + riscv recipe 路径)
+    assert(contract.CodegenUnitCoversTriple(
+        contract.CodegenUnitA64, "arm64-apple-darwin"), "covers aarch64 darwin")
+    assert(contract.CodegenUnitCoversTriple(
+        contract.CodegenUnitA64, "aarch64-unknown-linux-gnu"), "covers aarch64 linux")
+    assert(contract.CodegenUnitCoversTriple(
+        contract.CodegenUnitX64, "x86_64-unknown-linux-gnu"), "covers x86_64")
+    assert(contract.CodegenUnitCoversTriple(
+        contract.CodegenUnitRv64, "riscv64-unknown-linux-gnu"), "covers riscv64")
+    assert(contract.CodegenUnitCoversTriple(
+        contract.CodegenUnitRv32, "riscv32-esp32s31-none-elf"), "covers esp32s31")
+    assert(contract.CodegenUnitCoversTriple(
+        contract.CodegenUnitWasm32, "wasm32-unknown-unknown"), "covers wasm32")
+    assert(!contract.CodegenUnitCoversTriple(
+        contract.CodegenUnitA64, "x86_64-unknown-linux-gnu"), "aarch64 not x86_64")
+    assert(!contract.CodegenUnitCoversTriple(
+        contract.CodegenUnitX64, "riscv64-unknown-linux-gnu"), "x86_64 not riscv64")
+    assert(!contract.CodegenUnitCoversTriple(
+        contract.CodegenUnitRv64, "riscv32-unknown-linux-gnu"), "riscv64 not riscv32")
+    assert(!contract.CodegenUnitCoversTriple(
+        contract.CodegenUnitInvalid, "arm64-apple-darwin"), "invalid covers nothing")
+    echo(base)
+    echo("PLUGIN_MISSING_MSG_CONTRACT_OK")
+    return 0
+
+fn main(argc: int32, argv: str*): int32 =
+    argc
+    argv
+    cmdline.CaptureCmdLine(argc, argv)
+    var mode = ""
+    if cmdline.ParamCount() >= 1:
+        mode = cmdline.ParamStr(1)
+    var root = ""
+    if cmdline.ParamCount() >= 2:
+        root = cmdline.ParamStr(2)
+    if mode == "" || mode == "unit":
+        return runUnit(root)
+    if mode == "installed-list":
+        return runInstalledList(root)
+    if mode == "corrupt-entry":
+        return runCorruptEntry(root)
+    if mode == "tamper-artifact":
+        return runTamperArtifact(root)
+    if mode == "tamper-receipt-cid":
+        return runTamperReceiptCid(root)
+    if mode == "tamper-receipt-quad":
+        return runTamperReceiptQuad(root)
+    if mode == "tamper-proof-local":
+        return runTamperProofLocal(root)
+    if mode == "store-gate-reject":
+        return runStoreGateReject(root)
+    if mode == "offline-miss":
+        return runOfflineMiss(root)
+    if mode == "offline-miss-empty":
+        return runOfflineMissEmpty(root)
+    if mode == "online-miss-stub":
+        return runOnlineMissStub(root)
+    if mode == "missing-msg-contract":
+        return runMissingMsgContract(root)
+    echo("PLUGIN_CACHE_UNKNOWN_MODE")
+    return 2

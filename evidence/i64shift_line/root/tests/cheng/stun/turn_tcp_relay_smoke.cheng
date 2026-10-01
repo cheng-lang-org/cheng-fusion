@@ -1,0 +1,391 @@
+# turn_tcp_relay_smoke: real end-to-end TURN-over-TCP relay (RFC 5766 section 7).
+#
+# One process hosts the cheng TCP TURN server (per-connection threads) on a
+# loopback ephemeral port. One TCP TURN client A and one raw UDP peer exercise
+# the full closed loop:
+#   1. A Allocate (401 challenge -> REST-auth retry) -> relayA
+#   2. A CreatePermission(peer=UDP peer) [authenticated]
+#   3. A SendIndication(peer, "hello from A")
+#      -> A's connection thread sendto peer (UDP)
+#      -> peer recvfrom verifies DATA + sender = relayA
+#   4. peer sendto relayA ("hello from peer")
+#      -> A's connection thread drains relayA -> Data Indication -> TCP frame
+#      -> A recvframe verifies DATA + peer = peer port
+#   5. A ChannelBind(peer, 0x4000) [authenticated]
+#   6. A ChannelData(0x4000, "via channel from A") -> peer recvfrom verifies
+#   7. peer sendto relayA ("via channel from peer")
+#      -> A's connection thread -> ChannelData(0x4000) -> A recvframe verifies
+# The TCP client<->server leg is real TCP (RFC 5766 section 7 framing); the
+# relay<->peer leg is real UDP (RFC 5766 section 7.2). The server runs
+# autonomously in a background accept-loop thread; each accepted connection is
+# served by its own dedicated connection thread.
+
+import std/system
+import std/result
+import std/rawbytes
+import std/atomic
+import std/thread
+import std/os as os
+import std/net/transports/tcp_syscall as tcp
+import std/net/transports/udp_syscall as udp
+import std/stun/protocol as stun
+import std/stun/turn_protocol as turn
+import std/stun/turn_auth as auth
+import std/stun/turn_relay as relay
+import std/stun/turn_tcp_transport as tr
+import std/stun/turn_tcp_server as tsrv
+
+const
+    realmStr = "example.org"
+    nonceStr = "bd8as92Kdf02Jd72vMaPwcBNds7i40tn"
+    restSecretStr = "coturn-static-secret"
+    timeoutMs = 5000
+    channelA = 0x4000
+
+var
+    g_server: tsrv.TurnTcpServer
+    txidCounter: int32
+
+fn nextTxid(seed: int32): rawbytes.Bytes =
+    txidCounter = txidCounter + 1
+    let out: rawbytes.Bytes = rawbytes.BytesAlloc(12)
+    var i: int32
+    for i in i..<12:
+        rawbytes.BytesSet(out, i, (txidCounter * 7 + seed + i) & 255)
+    return out
+
+fn turnTcpAcceptEntry(raw: ptr) =
+    let _ = tsrv.TurnTcpServerRun(g_server)
+
+fn clientSendFrame(fd: int32, msg: rawbytes.Bytes): int32 =
+    return tr.TurnTcpSendFrame(fd, msg)
+
+fn clientRecvFrame(fd: int32, buf: var rawbytes.Bytes, bufLen: var int32, out: var rawbytes.Bytes): int32 =
+    var tries: int32 = 0
+    while tries < 32:
+        tries = tries + 1
+        let ex: int32 = tr.TurnTcpFrameTryExtract(buf, bufLen, out)
+        if ex == 0:
+            return 0
+        if ex == 2:
+            return 3
+        let rc: int32 = os.fdWaitReadable(fd, timeoutMs)
+        if rc <= 0:
+            return 1
+        var h: tcp.TcpConnectionHandle
+        h.fd = fd
+        h.open = true
+        let recvRes = tcp.TcpRecvNonblocking(h, tr.TurnTcpRecvChunk())
+        if IsErr(recvRes):
+            continue
+        let data: rawbytes.Bytes = Value(recvRes)
+        if rawbytes.BytesLen(data) <= 0:
+            return 2
+        let arc: int32 = tr.TurnTcpFrameAppend(buf, bufLen, data)
+        if arc != 0:
+            return 3
+    return 1
+
+fn peerOpen(outFd: var int32, outPort: var int32): int32 =
+    return relay.TurnRelaySocketOpen(outFd, outPort)
+
+fn peerRecv(fd: int32, outData: var rawbytes.Bytes, outFromPort: var int32): int32 =
+    let ready: int32 = os.UdpFdWaitReadable(fd, timeoutMs)
+    if ready <= 0:
+        return 1
+    var recv: udp.UdpRecvResult
+    let recvRes = udp.UdpRecvFromNonblock(fd, 1500, recv)
+    if IsErr(recvRes):
+        return 1
+    outData = recv.data
+    outFromPort = recv.fromAddr.port
+    if rawbytes.BytesLen(outData) <= 0:
+        return 1
+    return 0
+
+fn peerSendTo(fd: int32, host: str, port: int32, data: rawbytes.Bytes): int32 =
+    var addr: udp.UdpSockAddr
+    let useLen: bool = os.udpPlatformUseLenFieldBridge() != 0
+    let addrRes = udp.UdpSockAddrFromHostPort(host, port, false, 2, useLen, addr)
+    if IsErr(addrRes):
+        return 1
+    let sendRes = udp.UdpSendTo(fd, data, addr)
+    if IsErr(sendRes):
+        return 2
+    return 0
+
+fn doAllocate(clientFd: int32, peerId: str, software: rawbytes.Bytes, buf: var rawbytes.Bytes, bufLen: var int32, outRelayPort: var int32): int32 =
+    let realmBytes: rawbytes.Bytes = rawbytes.BytesFromString(realmStr)
+    let nonceBytes: rawbytes.Bytes = rawbytes.BytesFromString(nonceStr)
+    let secret: rawbytes.Bytes = rawbytes.BytesFromString(restSecretStr)
+    let username: str = auth.TurnRestUsername(int64(1735689600), peerId)
+    let userBytes: rawbytes.Bytes = rawbytes.BytesFromString(username)
+    let key: rawbytes.Bytes = auth.TurnRestLongTermKey(username, realmStr, secret)
+    # 1. no-auth Allocate
+    let txid1: rawbytes.Bytes = nextTxid(1)
+    let req1: rawbytes.Bytes = turn.TurnEncodeAllocateRequestNoAuth(txid1, turn.TurnProtoUdp(), 600, false, software)
+    if clientSendFrame(clientFd, req1) != 0:
+        return 10
+    var resp1: rawbytes.Bytes
+    if clientRecvFrame(clientFd, buf, bufLen, resp1) != 0:
+        return 11
+    if !turn.TurnIsAllocateError(resp1):
+        return 12
+    # 2. auth Allocate
+    let txid2: rawbytes.Bytes = nextTxid(2)
+    let req2: rawbytes.Bytes = turn.TurnEncodeAllocateRequestAuth(txid2, turn.TurnProtoUdp(), 600, false, software, userBytes, realmBytes, nonceBytes, key)
+    if clientSendFrame(clientFd, req2) != 0:
+        return 13
+    var resp2: rawbytes.Bytes
+    if clientRecvFrame(clientFd, buf, bufLen, resp2) != 0:
+        return 14
+    if !turn.TurnIsAllocateSuccess(resp2):
+        return 15
+    if !auth.TurnVerifyMessageIntegrity(resp2, key):
+        return 16
+    let dec: turn.TurnAllocateResp = turn.TurnDecodeAllocateResponse(resp2, txid2)
+    if !dec.hasRelayed:
+        return 17
+    outRelayPort = dec.relayedPort
+    return 0
+
+fn doCreatePermission(clientFd: int32, peerId: str, peerPort: int32, buf: var rawbytes.Bytes, bufLen: var int32): int32 =
+    let realmBytes: rawbytes.Bytes = rawbytes.BytesFromString(realmStr)
+    let nonceBytes: rawbytes.Bytes = rawbytes.BytesFromString(nonceStr)
+    let secret: rawbytes.Bytes = rawbytes.BytesFromString(restSecretStr)
+    let username: str = auth.TurnRestUsername(int64(1735689600), peerId)
+    let userBytes: rawbytes.Bytes = rawbytes.BytesFromString(username)
+    let key: rawbytes.Bytes = auth.TurnRestLongTermKey(username, realmStr, secret)
+    let peerIp: rawbytes.Bytes = relay.TurnIpv4FromHost("127.0.0.1")
+    let txid: rawbytes.Bytes = nextTxid(3)
+    let req: rawbytes.Bytes = turn.TurnEncodeCreatePermissionRequestAuth(txid, peerIp, peerPort, userBytes, realmBytes, nonceBytes, key)
+    if clientSendFrame(clientFd, req) != 0:
+        return 1
+    var resp: rawbytes.Bytes
+    if clientRecvFrame(clientFd, buf, bufLen, resp) != 0:
+        return 2
+    if turn.TurnMessageType(resp) != 0x0108:
+        return 3
+    return 0
+
+fn doSendIndication(clientFd: int32, peerPort: int32, data: rawbytes.Bytes): int32 =
+    let peerIp: rawbytes.Bytes = relay.TurnIpv4FromHost("127.0.0.1")
+    let txid: rawbytes.Bytes = nextTxid(4)
+    let ind: rawbytes.Bytes = turn.TurnEncodeSendIndication(txid, peerIp, peerPort, data, false)
+    return clientSendFrame(clientFd, ind)
+
+fn doChannelBind(clientFd: int32, peerId: str, channel: int32, peerPort: int32, buf: var rawbytes.Bytes, bufLen: var int32): int32 =
+    let realmBytes: rawbytes.Bytes = rawbytes.BytesFromString(realmStr)
+    let nonceBytes: rawbytes.Bytes = rawbytes.BytesFromString(nonceStr)
+    let secret: rawbytes.Bytes = rawbytes.BytesFromString(restSecretStr)
+    let username: str = auth.TurnRestUsername(int64(1735689600), peerId)
+    let userBytes: rawbytes.Bytes = rawbytes.BytesFromString(username)
+    let key: rawbytes.Bytes = auth.TurnRestLongTermKey(username, realmStr, secret)
+    let peerIp: rawbytes.Bytes = relay.TurnIpv4FromHost("127.0.0.1")
+    let txid: rawbytes.Bytes = nextTxid(5)
+    # base = header + CHANNEL-NUMBER + XOR-PEER-ADDRESS (no MI/FP yet)
+    let base: rawbytes.Bytes = turn.TurnEncodeChannelBindRequest(txid, channel, peerIp, peerPort, rawbytes.EmptyBytes())
+    let withUser: rawbytes.Bytes = turn.TurnAppendUsername(base, userBytes)
+    let withRealm: rawbytes.Bytes = turn.TurnAppendRealm(withUser, realmBytes)
+    let withNonce: rawbytes.Bytes = turn.TurnAppendNonce(withRealm, nonceBytes)
+    let withMi: rawbytes.Bytes = stun.StunAppendMessageIntegrity(withNonce, key)
+    let finalReq: rawbytes.Bytes = stun.StunAppendFingerprint(withMi)
+    if clientSendFrame(clientFd, finalReq) != 0:
+        return 1
+    var resp: rawbytes.Bytes
+    if clientRecvFrame(clientFd, buf, bufLen, resp) != 0:
+        return 2
+    if turn.TurnMessageType(resp) != 0x0109:
+        return 3
+    return 0
+
+fn doChannelData(clientFd: int32, channel: int32, data: rawbytes.Bytes): int32 =
+    let cd: rawbytes.Bytes = tr.TurnEncodeChannelData(channel, data)
+    return clientSendFrame(clientFd, cd)
+
+fn main(): int32 =
+    let software: rawbytes.Bytes = rawbytes.BytesFromString("cheng-turn-stage2")
+    let realmBytes: rawbytes.Bytes = rawbytes.BytesFromString(realmStr)
+    let nonceBytes: rawbytes.Bytes = rawbytes.BytesFromString(nonceStr)
+    let secret: rawbytes.Bytes = rawbytes.BytesFromString(restSecretStr)
+    g_server = tsrv.TurnTcpServerNew("127.0.0.1", 0, software, realmBytes, nonceBytes, secret)
+    let bc: int32 = tsrv.TurnTcpServerBind(g_server)
+    if bc != 0:
+        echo(Fmt"turn_tcp_relay_smoke: server bind failed rc={bc}")
+        return 100
+    let listenPort: int32 = tsrv.TurnTcpServerBoundPort(g_server)
+    echo(Fmt"turn_tcp_relay_smoke: server listen 127.0.0.1:{listenPort}")
+    # accept loop in background thread
+    let acceptThread = thread.StartPtr(&turnTcpAcceptEntry, nil)
+    if acceptThread == nil:
+        echo("turn_tcp_relay_smoke: accept thread start failed")
+        return 101
+    # client A connect
+    let cres = tcp.TcpConnect4("127.0.0.1", listenPort)
+    if IsErr(cres):
+        echo("turn_tcp_relay_smoke: client connect failed")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 102
+    let clientConn: tcp.TcpConnectionHandle = Value(cres)
+    let clientFd: int32 = clientConn.fd
+    var cbuf: rawbytes.Bytes = rawbytes.BytesAlloc(tr.TurnTcpRecvBufCap())
+    var clen: int32 = 0
+    # 1. A allocate
+    var relayPortA: int32
+    let rcA: int32 = doAllocate(clientFd, "clientA", software, cbuf, clen, relayPortA)
+    if rcA != 0:
+        echo(Fmt"turn_tcp_relay_smoke: A allocate failed rc={rcA}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 200
+    echo(Fmt"turn_tcp_relay_smoke: A relayed 127.0.0.1:{relayPortA}")
+    # UDP peer
+    var peerFd: int32
+    var peerPort: int32
+    if peerOpen(peerFd, peerPort) != 0:
+        echo("turn_tcp_relay_smoke: peer open failed")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 201
+    echo(Fmt"turn_tcp_relay_smoke: peer 127.0.0.1:{peerPort}")
+    # 2. A CreatePermission(peer)
+    let rcP: int32 = doCreatePermission(clientFd, "clientA", peerPort, cbuf, clen)
+    if rcP != 0:
+        echo(Fmt"turn_tcp_relay_smoke: A createperm failed rc={rcP}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 202
+    # 3. A SendIndication(peer, "hello from A") -> peer recv
+    let dataA: rawbytes.Bytes = rawbytes.BytesFromString("hello from A")
+    let rcS: int32 = doSendIndication(clientFd, peerPort, dataA)
+    if rcS != 0:
+        echo(Fmt"turn_tcp_relay_smoke: A sendind failed rc={rcS}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 203
+    var peerData: rawbytes.Bytes
+    var peerFromPort: int32
+    let rcPR1: int32 = peerRecv(peerFd, peerData, peerFromPort)
+    if rcPR1 != 0:
+        echo(Fmt"turn_tcp_relay_smoke: peer recv failed rc={rcPR1}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 204
+    if rawbytes.BytesToString(peerData) != "hello from A":
+        echo(Fmt"turn_tcp_relay_smoke: peer got wrong data: {rawbytes.BytesToString(peerData)}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 205
+    if peerFromPort != relayPortA:
+        echo(Fmt"turn_tcp_relay_smoke: peer from port {peerFromPort} != relayPortA {relayPortA}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 206
+    echo("turn_tcp_relay_smoke: A->peer relay ok")
+    # 4. peer sendto relayA -> A recv DataIndication
+    let dataPeer: rawbytes.Bytes = rawbytes.BytesFromString("hello from peer")
+    let rcPS: int32 = peerSendTo(peerFd, "127.0.0.1", relayPortA, dataPeer)
+    if rcPS != 0:
+        echo(Fmt"turn_tcp_relay_smoke: peer sendto failed rc={rcPS}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 207
+    var indResp: rawbytes.Bytes
+    if clientRecvFrame(clientFd, cbuf, clen, indResp) != 0:
+        echo("turn_tcp_relay_smoke: A recv data ind failed")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 208
+    if !turn.TurnIsDataIndication(indResp):
+        echo(Fmt"turn_tcp_relay_smoke: A recv not data ind (type=0x{turn.TurnMessageType(indResp)})")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 209
+    let indTxid: rawbytes.Bytes = turn.TurnMessageTxid(indResp)
+    let indPeer: stun.StunXorMappedAddress = turn.TurnDecodeXorPeerAddress(indResp, indTxid)
+    let indData: rawbytes.Bytes = turn.TurnDecodeData(indResp)
+    if rawbytes.BytesToString(indData) != "hello from peer":
+        echo(Fmt"turn_tcp_relay_smoke: A got wrong ind data: {rawbytes.BytesToString(indData)}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 210
+    if indPeer.port != peerPort:
+        echo(Fmt"turn_tcp_relay_smoke: A ind peer port {indPeer.port} != peerPort {peerPort}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 211
+    echo("turn_tcp_relay_smoke: peer->A data indication ok")
+    # 5. A ChannelBind(peer, 0x4000)
+    let rcCB: int32 = doChannelBind(clientFd, "clientA", channelA, peerPort, cbuf, clen)
+    if rcCB != 0:
+        echo(Fmt"turn_tcp_relay_smoke: A channelbind failed rc={rcCB}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 212
+    echo("turn_tcp_relay_smoke: A channelbind ok")
+    # 6. A ChannelData(0x4000, "via channel from A") -> peer recv
+    let dataChA: rawbytes.Bytes = rawbytes.BytesFromString("via channel from A")
+    if doChannelData(clientFd, channelA, dataChA) != 0:
+        echo("turn_tcp_relay_smoke: A channeldata send failed")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 213
+    var peerChData: rawbytes.Bytes
+    var peerChFromPort: int32
+    if peerRecv(peerFd, peerChData, peerChFromPort) != 0:
+        echo("turn_tcp_relay_smoke: peer recv channeldata failed")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 214
+    if rawbytes.BytesToString(peerChData) != "via channel from A":
+        echo(Fmt"turn_tcp_relay_smoke: peer got wrong channeldata: {rawbytes.BytesToString(peerChData)}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 215
+    echo("turn_tcp_relay_smoke: A->peer channeldata ok")
+    # 7. peer sendto relayA -> A recv ChannelData(0x4000)
+    let dataChPeer: rawbytes.Bytes = rawbytes.BytesFromString("via channel from peer")
+    if peerSendTo(peerFd, "127.0.0.1", relayPortA, dataChPeer) != 0:
+        echo("turn_tcp_relay_smoke: peer sendto channeldata failed")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 216
+    var cdResp: rawbytes.Bytes
+    if clientRecvFrame(clientFd, cbuf, clen, cdResp) != 0:
+        echo("turn_tcp_relay_smoke: A recv channeldata failed")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 217
+    if !tr.TurnIsChannelData(cdResp):
+        echo(Fmt"turn_tcp_relay_smoke: A recv not channeldata (type=0x{turn.TurnMessageType(cdResp)})")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 218
+    var cdChannel: int32
+    var cdData: rawbytes.Bytes
+    if tr.TurnDecodeChannelData(cdResp, cdChannel, cdData) != 0:
+        echo("turn_tcp_relay_smoke: A channeldata decode failed")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 219
+    if cdChannel != channelA:
+        echo(Fmt"turn_tcp_relay_smoke: A channeldata channel {cdChannel} != {channelA}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 220
+    if rawbytes.BytesToString(cdData) != "via channel from peer":
+        echo(Fmt"turn_tcp_relay_smoke: A got wrong channeldata: {rawbytes.BytesToString(cdData)}")
+        atomic.StoreI32(g_server.stopFlag, 1)
+        let _ = thread.Join(acceptThread)
+        return 221
+    echo("turn_tcp_relay_smoke: peer->A channeldata ok")
+    # cleanup
+    let _ = os.TcpShutdownFd(clientFd, 2)
+    let _ = os.UdpCloseFd(clientFd)
+    let _ = os.UdpCloseFd(peerFd)
+    atomic.StoreI32(g_server.stopFlag, 1)
+    let _ = thread.Join(acceptThread)
+    let _ = os.UdpCloseFd(g_server.listenFd)
+    echo("turn_tcp_relay_smoke ok")
+    return 0

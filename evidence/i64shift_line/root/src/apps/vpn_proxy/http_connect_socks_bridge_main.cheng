@@ -1,0 +1,863 @@
+import std/cmdline as cmdline
+import std/rawbytes
+import std/rawmem_support
+import std/result
+import std/strutils as strutil
+import std/system
+import std/thread
+import cheng/apps/vpn_proxy/vpn_proxy_cli as cli
+import cheng/apps/vpn_proxy/vpn_proxy_listen as listen
+import cheng/apps/vpn_proxy/vpn_proxy_socks as socks
+import std/net/transports/tcp_syscall as tcp
+
+@importc("cheng_fd_wait_readable_bridge")
+fn BridgeFdWaitReadable(fd: int32, timeoutMs: int32): int32
+
+@importc("libc_write")
+fn BridgeLibcWrite(fd: int32, data: ptr, count: int64): int64
+
+@exportc("cheng_mobile_protect_callback_ready")
+fn BridgeMobileProtectCallbackReady(): int32 =
+    return 0
+
+@exportc("cheng_mobile_protect_fd")
+fn BridgeMobileProtectFd(fd: int32): int32 =
+    let _ = fd
+    return 1
+
+@exportc("cheng_mobile_tcp_connect4_protected_addr_bridge")
+fn BridgeMobileTcpConnect4ProtectedAddr(b0: int32,
+                                        b1: int32,
+                                        b2: int32,
+                                        b3: int32,
+                                        port: int32,
+                                        timeoutMs: int32): int32 =
+    let _b0 = b0
+    let _b1 = b1
+    let _b2 = b2
+    let _b3 = b3
+    let _port = port
+    let _timeoutMs = timeoutMs
+    return -38
+
+@exportc("cheng_mobile_local_proxy_stop_requested")
+fn BridgeMobileLocalProxyStopRequested(): int32 =
+    return 0
+
+type
+    BridgeTarget = socks.VpnProxyTarget
+
+    BridgeOptions =
+        listenAddress: str
+        socksAddress: str
+        acceptLimitEnabled: bool
+        acceptCount: int32
+
+    BridgeSession =
+        client: tcp.TcpConnectionHandle
+        upstream: tcp.TcpConnectionHandle
+        upstreamAddr: listen.VpnProxyListenAddress
+        header: Bytes
+        headerLen: int32
+        clientToUpstream: Bytes
+        upstreamToClient: Bytes
+        stage: int32
+        clientReadClosed: bool
+        upstreamReadClosed: bool
+        clientWriteClosed: bool
+        upstreamWriteClosed: bool
+        upstreamOpen: bool
+        open: bool
+
+const
+    BridgeMaxHeaderBytes = 8192
+    BridgeRelayChunkBytes = 65536
+    BridgeIdleWaitMs = 25
+    BridgeHeaderTimeoutMs = 8000
+    BridgeSocksHandshakeTimeoutMs = 8000
+    BridgeSessionStageHeader = 1
+    BridgeSessionStageRelay = 2
+    BridgeSocksVersion = 5
+    BridgeSocksAtypIpv4 = 1
+    BridgeSocksAtypDomain = 3
+    BridgeSocksAtypIpv6 = 4
+
+var
+    BridgeGlobalUpstreamAddr: listen.VpnProxyListenAddress
+
+fn BridgePrintLine(text: str) =
+    BridgeWriteLine(1, text)
+
+fn BridgePrintErr(text: str) =
+    BridgeWriteLine(2, text)
+
+fn BridgeWriteAllRaw(fd: int32, data: ptr, total: int32, label: str) =
+    if fd < 0:
+        panic("bridge write failed: invalid fd")
+    if total < 0:
+        panic("bridge write failed: negative length")
+    if total == 0:
+        return
+    if data == nil:
+        panic("bridge write failed: nil data")
+    var written: int32
+    while written < total:
+        let chunk: int64 = BridgeLibcWrite(fd, system.SystemPtrAdd(data, written), int64(total - written))
+        if chunk <= 0:
+            panic(label)
+        written = written + int32(chunk)
+
+fn BridgeWriteLine(fd: int32, text: str) =
+    BridgeWriteAllRaw(fd, system.StrDataPtr(text), text.len, "bridge write failed")
+    BridgeWriteAllRaw(fd, system.StrDataPtr("\n"), 1, "bridge newline write failed")
+
+fn BridgeBoolText(value: bool): str =
+    if value:
+        return "1"
+    return "0"
+
+fn BridgeUsage() =
+    BridgePrintLine("usage: http-connect-socks-bridge --listen HOST:PORT --socks HOST:PORT")
+    BridgePrintLine("flags: --accept-count N")
+
+fn BridgeBytesConcat(a: Bytes, b: Bytes): Bytes =
+    if BytesLen(a) <= 0:
+        return b
+    if BytesLen(b) <= 0:
+        return a
+    let out: Bytes = BytesAlloc(BytesLen(a) + BytesLen(b))
+    rawmem_support.RawmemCopy(out.data, a.data, BytesLen(a))
+    rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(out.data, BytesLen(a)),
+                              b.data,
+                              BytesLen(b))
+    return out
+
+fn BridgeBytesDropPrefix(data: Bytes, count: int32): Bytes =
+    if count <= 0:
+        return data
+    if count >= BytesLen(data):
+        return BytesAlloc(0)
+    return BytesSlice(data, count, BytesLen(data) - count)
+
+fn BridgeBytesRawGet(data: Bytes, idx: int32): int32 =
+    if data.data == nil || idx < 0 || idx >= BytesLen(data):
+        return 0
+    return BytesGet(data, idx)
+
+fn BridgeBytesRawSet(data: Bytes, idx: int32, value: int32) =
+    if data.data == nil || idx < 0 || idx >= BytesLen(data):
+        return
+    BytesSet(data, idx, value & 0xff)
+
+fn BridgeBytesToStringAt(data: Bytes, start: int32, count: int32): str =
+    if data.data == nil || start < 0 || count <= 0 || start + count > BytesLen(data):
+        return ""
+    return NewStringCopy(rawmem_support.RawmemPtrAdd(data.data, start), count)
+
+fn BridgeBytesMatchAsciiAt(data: Bytes, start: int32, text: str): bool =
+    if start < 0 || start + len(text) > BytesLen(data):
+        return false
+    for i in 0..<len(text):
+        let expected: int32 = int32(text[i])
+        if BridgeBytesRawGet(data, start + i) != expected:
+            return false
+    return true
+
+fn BridgeTcpReadExact(conn: var tcp.TcpConnectionHandle, count: int32): Result[Bytes] =
+    let out: Bytes = BytesAlloc(count)
+    var filled: int32
+    while filled < count:
+        let dstPtr: ptr = rawmem_support.RawmemPtrAdd(out.data, filled)
+        let readRes: Result[int32] = tcp.TcpRecvRaw(conn, dstPtr, count - filled)
+        if IsErr(readRes):
+            return Err[Bytes](ErrorText(readRes))
+        let got: int32 = Value(readRes)
+        if got <= 0:
+            return Err[Bytes]("http connect socks bridge: unexpected tcp eof")
+        filled = filled + got
+    return Ok[Bytes](out)
+
+fn BridgeTcpReadExactTimeout(conn: var tcp.TcpConnectionHandle,
+                             count: int32,
+                             timeoutMs: int32): Result[Bytes] =
+    let out: Bytes = BytesAlloc(count)
+    var filled: int32
+    while filled < count:
+        let ready: int32 = BridgeFdWaitReadable(conn.fd, timeoutMs)
+        if ready < 0:
+            return Err[Bytes]("http connect socks bridge: tcp wait readable failed")
+        if ready <= 0:
+            return Err[Bytes]("http connect socks bridge: tcp read timeout")
+        let dstPtr: ptr = rawmem_support.RawmemPtrAdd(out.data, filled)
+        let readRes: Result[int32] = tcp.TcpRecvRaw(conn, dstPtr, count - filled)
+        if IsErr(readRes):
+            return Err[Bytes](ErrorText(readRes))
+        let got: int32 = Value(readRes)
+        if got <= 0:
+            return Err[Bytes]("http connect socks bridge: unexpected tcp eof")
+        filled = filled + got
+    return Ok[Bytes](out)
+
+fn BridgeTcpWriteAll(conn: var tcp.TcpConnectionHandle, data: var Bytes): Result[int32] =
+    return tcp.TcpSendRaw(conn, data.data, BytesLen(data))
+
+fn BridgeReadHttpConnectHeader(conn: var tcp.TcpConnectionHandle,
+                               outLen: var int32): Result[Bytes] =
+    outLen = 0
+    let out: Bytes = BytesAlloc(BridgeMaxHeaderBytes)
+    if out.data == nil:
+        return Err[Bytes]("http connect socks bridge: header alloc failed")
+    while outLen < BridgeMaxHeaderBytes:
+        let oneRes: Result[Bytes] = BridgeTcpReadExactTimeout(conn, 1, BridgeHeaderTimeoutMs)
+        if IsErr(oneRes):
+            return Err[Bytes](ErrorText(oneRes))
+        BridgeBytesRawSet(out, outLen, BridgeBytesRawGet(Value(oneRes), 0))
+        outLen = outLen + 1
+        if outLen >= 4:
+            if BridgeBytesRawGet(out, outLen - 4) == 13 &&
+               BridgeBytesRawGet(out, outLen - 3) == 10 &&
+               BridgeBytesRawGet(out, outLen - 2) == 13 &&
+               BridgeBytesRawGet(out, outLen - 1) == 10:
+                return Ok[Bytes](out)
+    return Err[Bytes]("http connect socks bridge: CONNECT header too large")
+
+fn BridgeFindHttpHeaderEnd(header: Bytes, headerLen: int32): int32 =
+    if headerLen < 4:
+        return -1
+    if headerLen > BytesLen(header):
+        return -1
+    for i in 3..<headerLen:
+        if BridgeBytesRawGet(header, i - 3) == 13:
+            if BridgeBytesRawGet(header, i - 2) == 10:
+                if BridgeBytesRawGet(header, i - 1) == 13:
+                    if BridgeBytesRawGet(header, i) == 10:
+                        return i + 1
+    return -1
+
+fn BridgeParseConnectTarget(header: Bytes, headerLen: int32): Result[BridgeTarget] =
+    if headerLen <= 0 || headerLen > BytesLen(header):
+        return Err[BridgeTarget]("http connect socks bridge: invalid CONNECT header")
+    if !BridgeBytesMatchAsciiAt(header, 0, "CONNECT "):
+        return Err[BridgeTarget]("http connect socks bridge: CONNECT required")
+    var targetStart: int32 = 8
+    var targetEnd: int32 = -1
+    for i in targetStart..<headerLen:
+        if targetEnd < 0 && BridgeBytesRawGet(header, i) == 32:
+            targetEnd = i
+    if targetEnd <= targetStart:
+        return Err[BridgeTarget]("http connect socks bridge: target missing")
+    var hostStart: int32 = targetStart
+    var hostEnd: int32 = targetEnd
+    var portStart: int32 = -1
+    if BridgeBytesRawGet(header, hostStart) == int32('['):
+        var closeIdx: int32 = -1
+        for i in hostStart + 1..<targetEnd:
+            if closeIdx < 0 && BridgeBytesRawGet(header, i) == int32(']'):
+                closeIdx = i
+        if closeIdx <= hostStart || closeIdx + 1 >= targetEnd || BridgeBytesRawGet(header, closeIdx + 1) != int32(':'):
+            return Err[BridgeTarget]("http connect socks bridge: invalid ipv6 target")
+        hostStart = hostStart + 1
+        hostEnd = closeIdx
+        portStart = closeIdx + 2
+    else:
+        var colonIdx: int32 = -1
+        for i in targetStart..<targetEnd:
+            if BridgeBytesRawGet(header, i) == int32(':'):
+                colonIdx = i
+        if colonIdx <= targetStart || colonIdx + 1 >= targetEnd:
+            return Err[BridgeTarget]("http connect socks bridge: target port missing")
+        hostEnd = colonIdx
+        portStart = colonIdx + 1
+    let hostText: str = BridgeBytesToStringAt(header, hostStart, hostEnd - hostStart)
+    let portText: str = BridgeBytesToStringAt(header, portStart, targetEnd - portStart)
+    let portRes: Result[int32] = cli.VpnProxyParseInt32(portText)
+    if IsErr(portRes):
+        return Err[BridgeTarget](ErrorText(portRes))
+    var target: BridgeTarget
+    target.host = hostText
+    target.port = Value(portRes)
+    if len(target.host) <= 0 || target.port <= 0 || target.port > 65535:
+        return Err[BridgeTarget]("http connect socks bridge: invalid target")
+    return Ok[BridgeTarget](target)
+
+fn BridgeEncodeIpv4TargetWire(target: BridgeTarget,
+                              out: var Bytes): Result[bool] =
+    var octets: int32[]
+    var current: int32
+    var digits: int32
+    for i in 0..<len(target.host):
+        let ch: char = target.host[i]
+        if ch == '.':
+            if digits <= 0 || current < 0 || current > 255:
+                return Err[bool]("http connect socks bridge: invalid ipv4 target")
+            add(octets, current)
+            current = 0
+            digits = 0
+            continue
+        if ch < '0' || ch > '9':
+            return Err[bool]("http connect socks bridge: invalid ipv4 target")
+        current = current * 10 + (int32(ch) - int32('0'))
+        digits = digits + 1
+        if current > 255:
+            return Err[bool]("http connect socks bridge: invalid ipv4 target")
+    if digits <= 0 || current < 0 || current > 255:
+        return Err[bool]("http connect socks bridge: invalid ipv4 target")
+    add(octets, current)
+    if octets.len != 4:
+        return Err[bool]("http connect socks bridge: invalid ipv4 target")
+    out = BytesAlloc(1 + 4 + 2)
+    BridgeBytesRawSet(out, 0, BridgeSocksAtypIpv4)
+    BridgeBytesRawSet(out, 1, octets[0])
+    BridgeBytesRawSet(out, 2, octets[1])
+    BridgeBytesRawSet(out, 3, octets[2])
+    BridgeBytesRawSet(out, 4, octets[3])
+    BridgeBytesRawSet(out, 5, (target.port >> 8) & 0xff)
+    BridgeBytesRawSet(out, 6, target.port & 0xff)
+    return Ok[bool](true)
+
+fn BridgeEncodeDomainTargetWire(target: BridgeTarget,
+                                out: var Bytes): Result[bool] =
+    let hostBytes: Bytes = BytesFromString(target.host)
+    if BytesLen(hostBytes) <= 0 || BytesLen(hostBytes) > 255:
+        return Err[bool]("http connect socks bridge: invalid domain target")
+    out = BytesAlloc(1 + 1 + BytesLen(hostBytes) + 2)
+    BridgeBytesRawSet(out, 0, BridgeSocksAtypDomain)
+    BridgeBytesRawSet(out, 1, BytesLen(hostBytes))
+    for i in 0..<BytesLen(hostBytes):
+        BridgeBytesRawSet(out, 2 + i, BridgeBytesRawGet(hostBytes, i))
+    let portOffset: int32 = 2 + BytesLen(hostBytes)
+    BridgeBytesRawSet(out, portOffset, (target.port >> 8) & 0xff)
+    BridgeBytesRawSet(out, portOffset + 1, target.port & 0xff)
+    return Ok[bool](true)
+
+fn BridgeEncodeConnectTargetWire(target: BridgeTarget,
+                                 out: var Bytes): Result[bool] =
+    if len(target.host) <= 0 || target.port <= 0 || target.port > 65535:
+        return Err[bool]("http connect socks bridge: invalid target")
+    let ipv4Res: Result[bool] = BridgeEncodeIpv4TargetWire(target, out)
+    if IsOk(ipv4Res):
+        return ipv4Res
+    return BridgeEncodeDomainTargetWire(target, out)
+
+fn BridgeSocksConnect(upstream: listen.VpnProxyListenAddress,
+                      target: BridgeTarget,
+                      outConn: var tcp.TcpConnectionHandle): Result[bool] =
+    var connectRes: Result[tcp.TcpConnectionHandle]
+    if upstream.isV6:
+        connectRes = tcp.TcpConnect6Unprotected(upstream.host, upstream.port)
+    else:
+        connectRes = tcp.TcpConnect4Unprotected(upstream.host, upstream.port)
+    if IsErr(connectRes):
+        return Err[bool](ErrorText(connectRes))
+    outConn = Value(connectRes)
+    var methodWire: Bytes = BytesFromString("\x05\x01\x00")
+    let methodWriteRes: Result[int32] = BridgeTcpWriteAll(outConn, methodWire)
+    if IsErr(methodWriteRes):
+        tcp.TcpClose(outConn)
+        return Err[bool](ErrorText(methodWriteRes))
+    let methodReplyRes: Result[Bytes] = BridgeTcpReadExactTimeout(outConn,
+                                                                  2,
+                                                                  BridgeSocksHandshakeTimeoutMs)
+    if IsErr(methodReplyRes):
+        tcp.TcpClose(outConn)
+        return Err[bool](ErrorText(methodReplyRes))
+    let methodReply: Bytes = Value(methodReplyRes)
+    if BridgeBytesRawGet(methodReply, 0) != BridgeSocksVersion || BridgeBytesRawGet(methodReply, 1) != 0:
+        tcp.TcpClose(outConn)
+        return Err[bool]("http connect socks bridge: SOCKS5 no-auth negotiation failed")
+    var targetWire: Bytes
+    let targetWireRes: Result[bool] = BridgeEncodeConnectTargetWire(target, targetWire)
+    if IsErr(targetWireRes):
+        tcp.TcpClose(outConn)
+        return Err[bool](ErrorText(targetWireRes))
+    var requestHead: Bytes = BytesFromString("\x05\x01\x00")
+    var requestWire: Bytes = BridgeBytesConcat(requestHead, targetWire)
+    let requestWriteRes: Result[int32] = BridgeTcpWriteAll(outConn, requestWire)
+    if IsErr(requestWriteRes):
+        tcp.TcpClose(outConn)
+        return Err[bool](ErrorText(requestWriteRes))
+    let replyHeadRes: Result[Bytes] = BridgeTcpReadExactTimeout(outConn,
+                                                                4,
+                                                                BridgeSocksHandshakeTimeoutMs)
+    if IsErr(replyHeadRes):
+        tcp.TcpClose(outConn)
+        return Err[bool](ErrorText(replyHeadRes))
+    let replyHead: Bytes = Value(replyHeadRes)
+    if BridgeBytesRawGet(replyHead, 0) != BridgeSocksVersion || BridgeBytesRawGet(replyHead, 1) != 0:
+        tcp.TcpClose(outConn)
+        return Err[bool]("http connect socks bridge: SOCKS5 connect failed")
+    let atyp: int32 = BridgeBytesRawGet(replyHead, 3)
+    var tailLen: int32
+    if atyp == BridgeSocksAtypIpv4:
+        tailLen = 6
+    elif atyp == BridgeSocksAtypDomain:
+        let lenRes: Result[Bytes] = BridgeTcpReadExactTimeout(outConn,
+                                                              1,
+                                                              BridgeSocksHandshakeTimeoutMs)
+        if IsErr(lenRes):
+            tcp.TcpClose(outConn)
+            return Err[bool](ErrorText(lenRes))
+        tailLen = BridgeBytesRawGet(Value(lenRes), 0) + 2
+    elif atyp == BridgeSocksAtypIpv6:
+        tailLen = 18
+    else:
+        tcp.TcpClose(outConn)
+        return Err[bool]("http connect socks bridge: invalid SOCKS5 bind address type")
+    if tailLen > 0:
+        let tailRes: Result[Bytes] = BridgeTcpReadExactTimeout(outConn,
+                                                               tailLen,
+                                                               BridgeSocksHandshakeTimeoutMs)
+        if IsErr(tailRes):
+            tcp.TcpClose(outConn)
+            return Err[bool](ErrorText(tailRes))
+    return Ok[bool](true)
+
+fn BridgeCreateHeaderSession(client: var tcp.TcpConnectionHandle,
+                             upstream: listen.VpnProxyListenAddress,
+                             outSession: var BridgeSession): Result[bool] =
+    let clientNbRes: Result[bool] = tcp.TcpSetNonblocking(client, true)
+    if IsErr(clientNbRes):
+        return Err[bool](ErrorText(clientNbRes))
+    let header: Bytes = BytesAlloc(BridgeMaxHeaderBytes)
+    if header.data == nil:
+        return Err[bool]("http connect socks bridge: header alloc failed")
+    outSession.client = client
+    outSession.upstreamAddr = upstream
+    outSession.header = header
+    outSession.headerLen = 0
+    outSession.clientToUpstream = BytesAlloc(0)
+    outSession.upstreamToClient = BytesAlloc(0)
+    outSession.stage = BridgeSessionStageHeader
+    outSession.upstreamOpen = false
+    outSession.open = true
+    return Ok[bool](true)
+
+fn BridgeFailHeaderSession(session: var BridgeSession, wire: str, errorText: str): Result[bool] =
+    var failWire: Bytes = BytesFromString(wire)
+    let _ = BridgeTcpWriteAll(session.client, failWire)
+    BridgeCloseSession(session)
+    return Err[bool](errorText)
+
+fn BridgePromoteHeaderSession(session: var BridgeSession, headerEnd: int32): Result[bool] =
+    let targetRes: Result[BridgeTarget] = BridgeParseConnectTarget(session.header, headerEnd)
+    if IsErr(targetRes):
+        return BridgeFailHeaderSession(session,
+                                       "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
+                                       ErrorText(targetRes))
+    var upstreamConn: tcp.TcpConnectionHandle
+    let socksRes: Result[bool] = BridgeSocksConnect(session.upstreamAddr,
+                                                    Value(targetRes),
+                                                    upstreamConn)
+    if IsErr(socksRes):
+        return BridgeFailHeaderSession(session,
+                                       "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+                                       ErrorText(socksRes))
+    var okWire: Bytes = BytesFromString("HTTP/1.1 200 Connection Established\r\nProxy-Agent: Cheng app-scoped bridge\r\n\r\n")
+    let okRes: Result[int32] = BridgeTcpWriteAll(session.client, okWire)
+    if IsErr(okRes):
+        tcp.TcpClose(upstreamConn)
+        return Err[bool](ErrorText(okRes))
+    let upstreamNbRes: Result[bool] = tcp.TcpSetNonblocking(upstreamConn, true)
+    if IsErr(upstreamNbRes):
+        tcp.TcpClose(upstreamConn)
+        return Err[bool](ErrorText(upstreamNbRes))
+    let leftoverCount: int32 = session.headerLen - headerEnd
+    if leftoverCount > 0:
+        session.clientToUpstream = BytesSlice(session.header, headerEnd, leftoverCount)
+    session.headerLen = headerEnd
+    session.upstream = upstreamConn
+    session.upstreamOpen = true
+    session.stage = BridgeSessionStageRelay
+    return Ok[bool](true)
+
+fn BridgePumpHeaderSession(session: var BridgeSession): Result[bool] =
+    let ready: int32 = BridgeFdWaitReadable(session.client.fd, 0)
+    if ready < 0:
+        return Err[bool]("http connect socks bridge: client wait readable failed")
+    if ready <= 0:
+        return Ok[bool](false)
+    let remaining: int32 = BridgeMaxHeaderBytes - session.headerLen
+    if remaining <= 0:
+        return BridgeFailHeaderSession(session,
+                                       "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+                                       "http connect socks bridge: CONNECT header too large")
+    let buf: Bytes = BytesAlloc(remaining)
+    if buf.data == nil:
+        return Err[bool]("http connect socks bridge: header read alloc failed")
+    let readRes: Result[int32] = tcp.TcpRecvRawNonblocking(session.client, buf.data, BytesLen(buf))
+    if IsErr(readRes):
+        if ErrorText(readRes) == "tcp syscall: would block":
+            return Ok[bool](false)
+        return Err[bool](ErrorText(readRes))
+    let got: int32 = Value(readRes)
+    if got <= 0:
+        BridgeCloseSession(session)
+        return Ok[bool](true)
+    for i in 0..<got:
+        BridgeBytesRawSet(session.header,
+                          session.headerLen + i,
+                          BridgeBytesRawGet(buf, i))
+    session.headerLen = session.headerLen + got
+    let headerEnd: int32 = BridgeFindHttpHeaderEnd(session.header, session.headerLen)
+    if headerEnd > 0:
+        let promoteRes: Result[bool] = BridgePromoteHeaderSession(session, headerEnd)
+        if IsErr(promoteRes):
+            return Err[bool](ErrorText(promoteRes))
+        return Ok[bool](true)
+    if session.headerLen >= BridgeMaxHeaderBytes:
+        return BridgeFailHeaderSession(session,
+                                       "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+                                       "http connect socks bridge: CONNECT header too large")
+    return Ok[bool](true)
+
+fn BridgeInitSession(client: var tcp.TcpConnectionHandle,
+                     upstream: listen.VpnProxyListenAddress,
+                     outSession: var BridgeSession): Result[bool] =
+    var headerLen: int32
+    let headerRes: Result[Bytes] = BridgeReadHttpConnectHeader(client, headerLen)
+    if IsErr(headerRes):
+        var failWire: Bytes = BytesFromString("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+        let _ = BridgeTcpWriteAll(client, failWire)
+        return Err[bool](ErrorText(headerRes))
+    let targetRes: Result[BridgeTarget] = BridgeParseConnectTarget(Value(headerRes), headerLen)
+    if IsErr(targetRes):
+        var failWire: Bytes = BytesFromString("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+        let _ = BridgeTcpWriteAll(client, failWire)
+        return Err[bool](ErrorText(targetRes))
+    var upstreamConn: tcp.TcpConnectionHandle
+    let socksRes: Result[bool] = BridgeSocksConnect(upstream, Value(targetRes), upstreamConn)
+    if IsErr(socksRes):
+        var failWire: Bytes = BytesFromString("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        let _ = BridgeTcpWriteAll(client, failWire)
+        return Err[bool](ErrorText(socksRes))
+    var okWire: Bytes = BytesFromString("HTTP/1.1 200 Connection Established\r\nProxy-Agent: Cheng app-scoped bridge\r\n\r\n")
+    let okRes: Result[int32] = BridgeTcpWriteAll(client, okWire)
+    if IsErr(okRes):
+        tcp.TcpClose(upstreamConn)
+        return Err[bool](ErrorText(okRes))
+    let clientNbRes: Result[bool] = tcp.TcpSetNonblocking(client, true)
+    if IsErr(clientNbRes):
+        tcp.TcpClose(upstreamConn)
+        return Err[bool](ErrorText(clientNbRes))
+    let upstreamNbRes: Result[bool] = tcp.TcpSetNonblocking(upstreamConn, true)
+    if IsErr(upstreamNbRes):
+        tcp.TcpClose(upstreamConn)
+        return Err[bool](ErrorText(upstreamNbRes))
+    outSession.client = client
+    outSession.upstream = upstreamConn
+    outSession.clientToUpstream = BytesAlloc(0)
+    outSession.upstreamToClient = BytesAlloc(0)
+    outSession.stage = BridgeSessionStageRelay
+    outSession.upstreamOpen = true
+    outSession.open = true
+    return Ok[bool](true)
+
+fn BridgeCloseSession(session: var BridgeSession) =
+    if session.open:
+        tcp.TcpClose(session.client)
+        if session.upstreamOpen:
+            tcp.TcpClose(session.upstream)
+    session.open = false
+
+fn BridgeWorkerMain(raw: ptr) =
+    if raw == nil:
+        return
+    let encodedFd: uint64 = uint64(raw)
+    if encodedFd == uint64(0):
+        return
+    var client: tcp.TcpConnectionHandle
+    client.fd = int32(encodedFd) - 1
+    client.open = true
+    var upstreamAddr: listen.VpnProxyListenAddress
+    upstreamAddr.host = BridgeGlobalUpstreamAddr.host
+    upstreamAddr.port = BridgeGlobalUpstreamAddr.port
+    upstreamAddr.isV6 = BridgeGlobalUpstreamAddr.isV6
+    var session: BridgeSession
+    let initRes: Result[bool] = BridgeInitSession(client, upstreamAddr, session)
+    if IsErr(initRes):
+        BridgePrintErr(ErrorText(initRes))
+        tcp.TcpClose(client)
+        return
+    let relayRes: Result[bool] = BridgeRelaySession(session)
+    if IsErr(relayRes):
+        BridgePrintErr(ErrorText(relayRes))
+        BridgeCloseSession(session)
+
+fn BridgeStartDetachedWorker(client: var tcp.TcpConnectionHandle): Result[bool] =
+    if client.fd < 0:
+        return Err[bool]("http connect socks bridge: invalid client fd")
+    let worker = thread.StartPtr(&BridgeWorkerMain, ptr(uint64(client.fd + 1)))
+    if worker == nil:
+        return Err[bool]("http connect socks bridge: worker start failed")
+    if !thread.Detach(worker):
+        return Err[bool]("http connect socks bridge: worker detach failed")
+    return Ok[bool](true)
+
+fn BridgePumpOne(session: var BridgeSession): Result[bool] =
+    if !session.open:
+        return Ok[bool](false)
+    if session.stage == BridgeSessionStageHeader:
+        return BridgePumpHeaderSession(session)
+    if session.stage != BridgeSessionStageRelay:
+        BridgeCloseSession(session)
+        return Ok[bool](true)
+    var progressed: bool
+    if !session.clientReadClosed:
+        let ready: int32 = BridgeFdWaitReadable(session.client.fd, 0)
+        if ready < 0:
+            return Err[bool]("http connect socks bridge: client wait readable failed")
+        if ready > 0:
+            let buf: Bytes = BytesAlloc(BridgeRelayChunkBytes)
+            let readRes: Result[int32] = tcp.TcpRecvRawNonblocking(session.client, buf.data, BytesLen(buf))
+            if IsErr(readRes):
+                if ErrorText(readRes) != "tcp syscall: would block":
+                    return Err[bool](ErrorText(readRes))
+            else:
+                let got: int32 = Value(readRes)
+                if got <= 0:
+                    session.clientReadClosed = true
+                    progressed = true
+                else:
+                    session.clientToUpstream = BridgeBytesConcat(session.clientToUpstream, BytesSlice(buf, 0, got))
+                    progressed = true
+    if !session.upstreamReadClosed:
+        let ready: int32 = BridgeFdWaitReadable(session.upstream.fd, 0)
+        if ready < 0:
+            return Err[bool]("http connect socks bridge: upstream wait readable failed")
+        if ready > 0:
+            let buf: Bytes = BytesAlloc(BridgeRelayChunkBytes)
+            let readRes: Result[int32] = tcp.TcpRecvRawNonblocking(session.upstream, buf.data, BytesLen(buf))
+            if IsErr(readRes):
+                if ErrorText(readRes) != "tcp syscall: would block":
+                    return Err[bool](ErrorText(readRes))
+            else:
+                let got: int32 = Value(readRes)
+                if got <= 0:
+                    session.upstreamReadClosed = true
+                    progressed = true
+                else:
+                    session.upstreamToClient = BridgeBytesConcat(session.upstreamToClient, BytesSlice(buf, 0, got))
+                    progressed = true
+    if BytesLen(session.clientToUpstream) > 0:
+        let sendRes: Result[int32] = tcp.TcpSendRawNonblocking(session.upstream,
+                                                               session.clientToUpstream.data,
+                                                               BytesLen(session.clientToUpstream))
+        if IsErr(sendRes):
+            return Err[bool](ErrorText(sendRes))
+        let sent: int32 = Value(sendRes)
+        if sent > 0:
+            session.clientToUpstream = BridgeBytesDropPrefix(session.clientToUpstream, sent)
+            progressed = true
+    if BytesLen(session.upstreamToClient) > 0:
+        let sendRes: Result[int32] = tcp.TcpSendRawNonblocking(session.client,
+                                                               session.upstreamToClient.data,
+                                                               BytesLen(session.upstreamToClient))
+        if IsErr(sendRes):
+            return Err[bool](ErrorText(sendRes))
+        let sent: int32 = Value(sendRes)
+        if sent > 0:
+            session.upstreamToClient = BridgeBytesDropPrefix(session.upstreamToClient, sent)
+            progressed = true
+    if session.clientReadClosed && BytesLen(session.clientToUpstream) <= 0 && !session.upstreamWriteClosed:
+        let _ = tcp.TcpShutdownWrite(session.upstream)
+        session.upstreamWriteClosed = true
+        progressed = true
+    if session.upstreamReadClosed && BytesLen(session.upstreamToClient) <= 0 && !session.clientWriteClosed:
+        let _ = tcp.TcpShutdownWrite(session.client)
+        session.clientWriteClosed = true
+        progressed = true
+    if session.clientReadClosed:
+        if session.upstreamReadClosed:
+            if BytesLen(session.clientToUpstream) <= 0:
+                if BytesLen(session.upstreamToClient) <= 0:
+                    BridgeCloseSession(session)
+                    progressed = true
+    return Ok[bool](progressed)
+
+fn BridgeRelaySession(session: var BridgeSession): Result[bool] =
+    while session.open:
+        let pumpRes: Result[bool] = BridgePumpOne(session)
+        if IsErr(pumpRes):
+            return Err[bool](ErrorText(pumpRes))
+        if !Value(pumpRes):
+            if !session.clientReadClosed:
+                let clientReady: int32 = BridgeFdWaitReadable(session.client.fd, BridgeIdleWaitMs)
+                if clientReady < 0:
+                    return Err[bool]("http connect socks bridge: client wait readable failed")
+            elif !session.upstreamReadClosed:
+                let upstreamReady: int32 = BridgeFdWaitReadable(session.upstream.fd, BridgeIdleWaitMs)
+                if upstreamReady < 0:
+                    return Err[bool]("http connect socks bridge: upstream wait readable failed")
+    return Ok[bool](true)
+
+fn BridgePumpSessions(sessions: var BridgeSession[]): int32 =
+    var progressedCount: int32
+    var active: BridgeSession[]
+    for i in 0..<sessions.len:
+        var session: BridgeSession = sessions[i]
+        if session.open:
+            let pumpRes: Result[bool] = BridgePumpOne(session)
+            if IsErr(pumpRes):
+                BridgePrintErr(ErrorText(pumpRes))
+                BridgeCloseSession(session)
+            elif Value(pumpRes):
+                progressedCount = progressedCount + 1
+        if session.open:
+            add(active, session)
+    sessions = active
+    return progressedCount
+
+fn BridgeWaitAnySessionReadable(sessions: BridgeSession[], timeoutMs: int32) =
+    if sessions.len <= 0:
+        return
+    for i in 0..<sessions.len:
+        let session: BridgeSession = sessions[i]
+        if session.open:
+            if session.stage == BridgeSessionStageHeader:
+                let _ = BridgeFdWaitReadable(session.client.fd, timeoutMs)
+                return
+            if session.stage == BridgeSessionStageRelay:
+                if !session.clientReadClosed:
+                    let _ = BridgeFdWaitReadable(session.client.fd, timeoutMs)
+                    return
+                if !session.upstreamReadClosed:
+                    let _ = BridgeFdWaitReadable(session.upstream.fd, timeoutMs)
+                    return
+
+fn BridgeCanAccept(opts: BridgeOptions, served: int32): bool =
+    if !opts.acceptLimitEnabled:
+        return true
+    if served < opts.acceptCount:
+        return true
+    return false
+
+fn BridgeShouldRun(opts: BridgeOptions, served: int32, activeCount: int32): bool =
+    var keepRunning: bool
+    if BridgeCanAccept(opts, served):
+        keepRunning = true
+    if !keepRunning:
+        if activeCount > 0:
+            keepRunning = true
+    return keepRunning
+
+fn BridgeCollectArgsFrom(startIndex: int32, count: int32): str[] =
+    var out: str[]
+    if startIndex > count:
+        return out
+    for i in startIndex..count:
+        let arg: str = cmdline.ParamStr(i)
+        if len(arg) > 0:
+            add(out, arg)
+    return out
+
+fn BridgeOptionsFromArgs(args: str[]): BridgeOptions =
+    var out: BridgeOptions
+    out.listenAddress = cli.VpnProxyReadFlag(args, "--listen", "127.0.0.1:17897")
+    out.socksAddress = cli.VpnProxyReadFlag(args, "--socks", "127.0.0.1:10808")
+    let acceptRaw: str = cli.VpnProxyReadFlag(args, "--accept-count", "")
+    if len(acceptRaw) > 0:
+        let acceptRes: Result[int32] = cli.VpnProxyParseInt32(acceptRaw)
+        if IsErr(acceptRes):
+            out.acceptLimitEnabled = true
+            out.acceptCount = -1
+        elif Value(acceptRes) > 0:
+            out.acceptLimitEnabled = true
+            out.acceptCount = Value(acceptRes)
+    return out
+
+fn BridgeRun(opts: BridgeOptions): int32 =
+    if opts.acceptLimitEnabled:
+        if opts.acceptCount <= 0:
+            BridgePrintErr("http connect socks bridge: --accept-count must be positive")
+            return 1
+    let listenRes: Result[listen.VpnProxyListenAddress] = listen.VpnProxyParseListenAddress(opts.listenAddress)
+    if IsErr(listenRes):
+        BridgePrintErr(ErrorText(listenRes))
+        return 1
+    let upstreamRes: Result[listen.VpnProxyListenAddress] = listen.VpnProxyParseListenAddress(opts.socksAddress)
+    if IsErr(upstreamRes):
+        BridgePrintErr(ErrorText(upstreamRes))
+        return 1
+    let listenAddr: listen.VpnProxyListenAddress = Value(listenRes)
+    let upstreamAddr: listen.VpnProxyListenAddress = Value(upstreamRes)
+    BridgeGlobalUpstreamAddr = upstreamAddr
+    var listenTcpRes: Result[tcp.TcpListenerHandle]
+    if listenAddr.isV6:
+        listenTcpRes = tcp.TcpListen6(listenAddr.host, listenAddr.port)
+    else:
+        listenTcpRes = tcp.TcpListen4(listenAddr.host, listenAddr.port)
+    if IsErr(listenTcpRes):
+        BridgePrintErr(ErrorText(listenTcpRes))
+        return 1
+    var listener: tcp.TcpListenerHandle = Value(listenTcpRes)
+    let listenNbRes: Result[bool] = tcp.TcpListenerSetNonblocking(listener, true)
+    if IsErr(listenNbRes):
+        BridgePrintErr(ErrorText(listenNbRes))
+        tcp.TcpListenerClose(listener)
+        return 1
+    BridgePrintLine(strutil.Join(["http_connect_socks_bridge listening ",
+                                  listenAddr.host,
+                                  ":",
+                                  IntToStr(listener.addr.port)],
+                                 ""))
+    var acceptLimitText: str = "unlimited"
+    if opts.acceptLimitEnabled:
+        acceptLimitText = IntToStr(opts.acceptCount)
+    BridgePrintLine(strutil.Join(["http_connect_socks_bridge accept_limit=", acceptLimitText], ""))
+    var served: int32
+    var sessions: BridgeSession[]
+    var keepRunning: bool = BridgeShouldRun(opts, served, sessions.len)
+    while keepRunning:
+        let canAccept: bool = BridgeCanAccept(opts, served)
+        if canAccept:
+            var acceptWaitMs: int32
+            if sessions.len <= 0:
+                acceptWaitMs = BridgeIdleWaitMs
+            let readyRes: Result[bool] = tcp.TcpListenerWaitReadable(listener, acceptWaitMs)
+            if IsErr(readyRes):
+                BridgePrintErr(ErrorText(readyRes))
+                tcp.TcpListenerClose(listener)
+                return 1
+            if Value(readyRes):
+                var acceptedThisRound: bool
+                while !acceptedThisRound:
+                    var conn: tcp.TcpConnectionHandle
+                    if tcp.TcpAcceptInto(listener, conn):
+                        let workerRes: Result[bool] = BridgeStartDetachedWorker(conn)
+                        if IsErr(workerRes):
+                            BridgePrintErr(ErrorText(workerRes))
+                            tcp.TcpClose(conn)
+                        else:
+                            served = served + 1
+                        acceptedThisRound = true
+                    else:
+                        acceptedThisRound = true
+        let progressed: int32 = BridgePumpSessions(sessions)
+        if progressed <= 0 && sessions.len > 0:
+            BridgeWaitAnySessionReadable(sessions, BridgeIdleWaitMs)
+        keepRunning = BridgeShouldRun(opts, served, sessions.len)
+    BridgePrintLine(strutil.Join(["http_connect_socks_bridge exiting served=",
+                                  IntToStr(served),
+                                  " sessions=",
+                                  IntToStr(sessions.len),
+                                  " limit_enabled=",
+                                  BridgeBoolText(opts.acceptLimitEnabled)],
+                                 ""))
+    for i in 0..<sessions.len:
+        var session: BridgeSession = sessions[i]
+        BridgeCloseSession(session)
+    tcp.TcpListenerClose(listener)
+    return 0
+
+fn main(argc: int32, argv: str*): int32 =
+    argc
+    argv
+    cmdline.CaptureCmdLine(argc, argv)
+    let count: int32 = cmdline.ParamCount()
+    let args: str[] = BridgeCollectArgsFrom(1, count)
+    for i in 0..<args.len:
+        if args[i] == "-h" || args[i] == "--help":
+            BridgeUsage()
+            return 0
+    let opts: BridgeOptions = BridgeOptionsFromArgs(args)
+    return BridgeRun(opts)

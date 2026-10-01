@@ -35,6 +35,16 @@ import {
   parseUniqueCurrentJson,
 } from "./current_schema_json.ts";
 import {
+  buildChengGrammarObligationContract,
+} from "./cheng_semantic_pipeline_matrix_m9024.ts";
+import {
+  currentParserReceiptBindingAuthority,
+  tokenKindNamesFromParserSource,
+  validateDriverReceiptToolchainIdentityValue,
+  valueExprKindNamesFromParserSource,
+  type MapRow,
+} from "../tools/grammar_receipt_bind.ts";
+import {
   CHENG_CURRENT_SEMANTIC_INPUT_SPECS,
   currentGenerationExecutionRaw32,
   currentReleaseDomainCid,
@@ -103,6 +113,7 @@ const MANIFEST_KEYS = Object.freeze([
   "semanticSnapshotAudit",
   "semanticSnapshotBitmapReceipt",
   "semanticPublishedStdout",
+  "semanticSourceMembershipFocusedStdout",
   "semanticSourceClosure",
   "semanticPublishedObject",
   "semanticBinding",
@@ -124,6 +135,13 @@ const MANIFEST_KEYS = Object.freeze([
   "freshMcpRuntime",
   "freshMcpTypeArenaExecution",
   "tools",
+  "publisherReceiptRaw32",
+  "publisherManifestRaw32",
+  "runtimeFormalValidationRaw32",
+  "runtimeFormalPhysicalRaw32",
+  "runtimeFormalLogicalRaw32",
+  "runtimeFormalPathRoleRaw32",
+  "runtimeFormalSupportPathRoleRaw32",
   "releaseIdentityRaw32",
   "manifestRaw32",
 ] as const);
@@ -131,6 +149,8 @@ const ARTIFACT_ROLE_BASENAMES = Object.freeze({
   semanticSnapshotAudit: "semantic-snapshot-audit.json",
   semanticSnapshotBitmapReceipt: "semantic-snapshot-bitmap-receipt.json",
   semanticPublishedStdout: "published-candidate.stdout.txt",
+  semanticSourceMembershipFocusedStdout:
+    "source-membership-focused.stdout.txt",
   semanticSourceClosure: "published-source-closure.bin",
   semanticPublishedObject: "published-candidate.o",
   semanticBinding: "published-binding.bin",
@@ -147,6 +167,18 @@ const ARTIFACT_ROLE_BASENAMES = Object.freeze({
   freshMcpRuntime: "fresh-mcp-runtime-identity.json",
   freshMcpTypeArenaExecution: "fresh-mcp-type-arena-execution.json",
 } as const);
+const SEMANTIC_ARTIFACT_ROLES = Object.freeze([
+  "semanticSnapshotAudit",
+  "semanticSnapshotBitmapReceipt",
+  "semanticPublishedStdout",
+  "semanticSourceMembershipFocusedStdout",
+  "semanticSourceClosure",
+  "semanticPublishedObject",
+  "semanticBinding",
+  "semanticQueryProjection",
+  "semanticOpenDocumentUniverse",
+  "semanticSnapshotArtifact",
+] as const);
 const TARGET_ARTIFACT_SUFFIXES = Object.freeze({
   object: ".o",
   executable: ".exe",
@@ -165,20 +197,46 @@ const PUBLISHER_RECEIPT_KEYS = Object.freeze([
   "driver_role",
   "release_marker",
   "producer_root_fshex",
+  "publication_anchor_path_fshex",
+  "publication_anchor_status",
+  "publication_anchor_device",
+  "publication_anchor_inode",
+  "publication_anchor_mode",
+  "publication_anchor_uid",
+  "publication_anchor_gid",
   "artifact_manifest_path_fshex",
   "artifact_manifest_sha256",
   "artifact_manifest_device",
   "artifact_manifest_inode",
   "artifact_manifest_size",
   "artifact_manifest_mode",
+  "artifact_manifest_nlink",
+  "artifact_manifest_uid",
+  "artifact_manifest_gid",
   "artifact_manifest_mtime_ns",
   "artifact_manifest_ctime_ns",
+  "darwin_runtime_formal_validation_path_fshex",
+  "darwin_runtime_formal_validation_sha256",
+  "darwin_runtime_formal_validation_device",
+  "darwin_runtime_formal_validation_inode",
+  "darwin_runtime_formal_validation_size",
+  "darwin_runtime_formal_validation_mode",
+  "darwin_runtime_formal_validation_nlink",
+  "darwin_runtime_formal_validation_uid",
+  "darwin_runtime_formal_validation_gid",
+  "darwin_runtime_formal_validation_mtime_ns",
+  "darwin_runtime_formal_validation_ctime_ns",
+  "darwin_runtime_formal_process_count",
+  "darwin_runtime_formal_physical_sha256",
+  "darwin_runtime_formal_logical_sha256",
+  "darwin_runtime_formal_path_role_sha256",
+  "darwin_runtime_formal_support_path_role_sha256",
   "artifact_count",
   "directory_count",
   "contract_sha256",
   "binding_sha256",
   "completion_index_sha256",
-  "source_closure_sha256",
+  "source_closure_cid",
   "performance_source_sha256",
   "official_driver_sha256",
   "seven_stage_execution_raw32",
@@ -190,6 +248,29 @@ const PUBLISHER_RECEIPT_KEYS = Object.freeze([
   "fragment_snapshot_sha256",
   "performance_raw_sha256",
   "performance_verdict_sha256",
+  "performance_evidence_sha256",
+  "receipt_payload_sha256",
+] as const);
+const DARWIN_RUNTIME_FORMAL_RECEIPT_KEYS = Object.freeze([
+  "darwin_current_release_runtime_validation",
+  "driver_role",
+  "target",
+  "publish_root_fshex",
+  "runtime_output_root_fshex",
+  "runtime_validator_sha256",
+  "identity_manifest_sha256",
+  "formal_inputs_sha256",
+  "published_process_count",
+  "process_argv_raw32",
+  "process_env_raw32",
+  "process_guard_raw32",
+  "process_physical_sha256",
+  "process_logical_sha256",
+  "process_path_role_sha256",
+  "process_support_path_role_sha256",
+  "primary_receipt_sha256",
+  "backend2_receipt_sha256",
+  "exec_diff_receipt_sha256",
   "performance_evidence_sha256",
   "receipt_payload_sha256",
 ] as const);
@@ -335,6 +416,7 @@ interface CurrentReleaseManifest {
   readonly semanticSnapshotAudit: ArtifactPin;
   readonly semanticSnapshotBitmapReceipt: ArtifactPin;
   readonly semanticPublishedStdout: ArtifactPin;
+  readonly semanticSourceMembershipFocusedStdout: ArtifactPin;
   readonly semanticSourceClosure: ArtifactPin;
   readonly semanticPublishedObject: ArtifactPin;
   readonly semanticBinding: ArtifactPin;
@@ -356,6 +438,13 @@ interface CurrentReleaseManifest {
   readonly freshMcpRuntime: ArtifactPin;
   readonly freshMcpTypeArenaExecution: ArtifactPin;
   readonly tools: readonly ToolEvidence[];
+  readonly publisherReceiptRaw32: string;
+  readonly publisherManifestRaw32: string;
+  readonly runtimeFormalValidationRaw32: string;
+  readonly runtimeFormalPhysicalRaw32: string;
+  readonly runtimeFormalLogicalRaw32: string;
+  readonly runtimeFormalPathRoleRaw32: string;
+  readonly runtimeFormalSupportPathRoleRaw32: string;
   readonly releaseIdentityRaw32: string;
   readonly manifestRaw32: string;
 }
@@ -376,6 +465,11 @@ export interface CurrentReleaseManifestAssembly {
   readonly releaseIdentityRaw32: string;
   readonly publisherReceiptRaw32: string;
   readonly publisherManifestRaw32: string;
+  readonly runtimeFormalValidationRaw32: string;
+  readonly runtimeFormalPhysicalRaw32: string;
+  readonly runtimeFormalLogicalRaw32: string;
+  readonly runtimeFormalPathRoleRaw32: string;
+  readonly runtimeFormalSupportPathRoleRaw32: string;
   readonly publisherArtifactCount: number;
 }
 
@@ -385,10 +479,20 @@ export interface CurrentReleasePublisherArtifact {
   readonly bytesRaw32: string;
 }
 
+export interface CurrentReleaseSemanticPublisherArtifact
+  extends CurrentReleasePublisherArtifact {
+  readonly role: (typeof SEMANTIC_ARTIFACT_ROLES)[number];
+}
+
 export interface CurrentReleasePublisherEnvelope {
   readonly producerRoot: string;
   readonly receiptRaw32: string;
   readonly manifestRaw32: string;
+  readonly runtimeFormalValidationRaw32: string;
+  readonly runtimeFormalPhysicalRaw32: string;
+  readonly runtimeFormalLogicalRaw32: string;
+  readonly runtimeFormalPathRoleRaw32: string;
+  readonly runtimeFormalSupportPathRoleRaw32: string;
   readonly artifacts: readonly CurrentReleasePublisherArtifact[];
 }
 
@@ -476,6 +580,32 @@ function stableFile(pathRaw: string, label: string): StableFile {
   return { path, raw, raw32: sha256(raw), stat: after };
 }
 
+function stableExternalExecutable(
+  pathRaw: string,
+  label: string,
+): StableFile {
+  const path = resolve(pathRaw);
+  const before = lstatSync(path, {bigint: true});
+  if (before.isSymbolicLink() ||
+      !before.isFile() ||
+      before.nlink < 1n ||
+      before.size <= 0n ||
+      before.size > BigInt(Number.MAX_SAFE_INTEGER) ||
+      before.uid !== 0n ||
+      (before.mode & 0o022n) !== 0n ||
+      (before.mode & 0o111n) === 0n ||
+      realpathSync.native(path) !== path) {
+    throw new Error(`${label}_identity_invalid`);
+  }
+  const raw = readFileSync(path);
+  const after = lstatSync(path, {bigint: true});
+  if (!sameStat(before, after) ||
+      raw.length !== Number(before.size)) {
+    throw new Error(`${label}_drift`);
+  }
+  return {path, raw, raw32: sha256(raw), stat: after};
+}
+
 function stablePublisherFile(pathRaw: string, label: string): StableFile {
   const path = resolve(pathRaw);
   const before = lstatSync(path, { bigint: true });
@@ -526,6 +656,15 @@ function decodeFsHex(value: string | undefined, label: string): string {
     throw new Error(`${label}_fshex_noncanonical`);
   }
   return path;
+}
+
+function currentReleasePublisherAnchorPath(producerRoot: string): string {
+  const encodedName = Buffer.from(basename(producerRoot), "utf8").toString("hex");
+  const anchorName = `.cheng-current-publisher-${encodedName}-control`;
+  if (Buffer.byteLength(anchorName, "utf8") > 255) {
+    throw new Error("current_release_publisher_anchor_name_too_long");
+  }
+  return join(dirname(producerRoot), anchorName);
 }
 
 function parseCurrentReleaseKv(
@@ -690,6 +829,7 @@ function inspectPublisherEnvelope(
   for (const key of PUBLISHER_RECEIPT_KEYS) {
     if (
       key.endsWith("_sha256") ||
+      key.endsWith("_cid") ||
       key.endsWith("_raw32")
     ) {
       observedHash(
@@ -707,10 +847,58 @@ function inspectPublisherEnvelope(
     producerRoot !== resolve(producerRoot) ||
     rootStat.isSymbolicLink() ||
     !rootStat.isDirectory() ||
+    (rootStat.mode & 0o777n) !== 0o700n ||
+    rootStat.uid !== BigInt(process.getuid()) ||
+    rootStat.gid !== BigInt(process.getgid()) ||
     realpathSync.native(producerRoot) !== producerRoot ||
     publisherReceiptPath !== join(producerRoot, "publisher-receipt.kv")
   ) {
     throw new Error("current_release_publisher_root_invalid");
+  }
+  const anchorPath = decodeFsHex(
+    receipt.rows.get("publication_anchor_path_fshex"),
+    "current_release_publisher_anchor_path",
+  );
+  const anchorStat = lstatSync(anchorPath, { bigint: true });
+  if (
+    anchorPath !== currentReleasePublisherAnchorPath(producerRoot) ||
+    anchorPath !== resolve(anchorPath) ||
+    anchorStat.isSymbolicLink() ||
+    !anchorStat.isDirectory() ||
+    realpathSync.native(anchorPath) !== anchorPath ||
+    receipt.rows.get("publication_anchor_status") !== "EMPTY_RETAINED" ||
+    readdirSync(anchorPath).length !== 0 ||
+    anchorStat.dev !==
+      canonicalUintRaw(
+        receipt.rows.get("publication_anchor_device"),
+        "current_release_publisher_anchor_device",
+      ) ||
+    anchorStat.ino !==
+      canonicalUintRaw(
+        receipt.rows.get("publication_anchor_inode"),
+        "current_release_publisher_anchor_inode",
+      ) ||
+    anchorStat.mode !==
+      canonicalOctalRaw(
+        receipt.rows.get("publication_anchor_mode"),
+        "current_release_publisher_anchor_mode",
+      ) ||
+    anchorStat.uid !==
+      canonicalUintRaw(
+        receipt.rows.get("publication_anchor_uid"),
+        "current_release_publisher_anchor_uid",
+      ) ||
+    anchorStat.gid !==
+      canonicalUintRaw(
+        receipt.rows.get("publication_anchor_gid"),
+        "current_release_publisher_anchor_gid",
+      ) ||
+    (anchorStat.mode & 0o777n) !== 0o700n ||
+    anchorStat.uid !== BigInt(process.getuid()) ||
+    anchorStat.gid !== BigInt(process.getgid()) ||
+    anchorStat.dev !== rootStat.dev
+  ) {
+    throw new Error("current_release_publisher_anchor_identity_invalid");
   }
   const manifestPath = decodeFsHex(
     receipt.rows.get("artifact_manifest_path_fshex"),
@@ -748,6 +936,21 @@ function inspectPublisherEnvelope(
       canonicalOctalRaw(
         receipt.rows.get("artifact_manifest_mode"),
         "current_release_publisher_manifest_mode",
+      ) ||
+    manifestFile.stat.nlink !==
+      canonicalUintRaw(
+        receipt.rows.get("artifact_manifest_nlink"),
+        "current_release_publisher_manifest_nlink",
+      ) ||
+    manifestFile.stat.uid !==
+      canonicalUintRaw(
+        receipt.rows.get("artifact_manifest_uid"),
+        "current_release_publisher_manifest_uid",
+      ) ||
+    manifestFile.stat.gid !==
+      canonicalUintRaw(
+        receipt.rows.get("artifact_manifest_gid"),
+        "current_release_publisher_manifest_gid",
       ) ||
     manifestFile.stat.mtimeNs !==
       canonicalUintRaw(
@@ -816,6 +1019,8 @@ function inspectPublisherEnvelope(
       "inode",
       "mode",
       "nlink",
+      "uid",
+      "gid",
       "mtime_ns",
       "ctime_ns",
     ]) {
@@ -830,6 +1035,9 @@ function inspectPublisherEnvelope(
       "inode",
       "size",
       "mode",
+      "nlink",
+      "uid",
+      "gid",
       "mtime_ns",
       "ctime_ns",
     ]) {
@@ -882,6 +1090,16 @@ function inspectPublisherEnvelope(
         canonicalUintRaw(
           manifest.rows.get(`${prefix}nlink`),
           `current_release_publisher_directory_${index}_nlink`,
+        ) ||
+      stat.uid !==
+        canonicalUintRaw(
+          manifest.rows.get(`${prefix}uid`),
+          `current_release_publisher_directory_${index}_uid`,
+        ) ||
+      stat.gid !==
+        canonicalUintRaw(
+          manifest.rows.get(`${prefix}gid`),
+          `current_release_publisher_directory_${index}_gid`,
         ) ||
       stat.mtimeNs !==
         canonicalUintRaw(
@@ -954,6 +1172,21 @@ function inspectPublisherEnvelope(
           manifest.rows.get(`${prefix}mode`),
           `current_release_publisher_artifact_${index}_mode`,
         ) ||
+      file.stat.nlink !==
+        canonicalUintRaw(
+          manifest.rows.get(`${prefix}nlink`),
+          `current_release_publisher_artifact_${index}_nlink`,
+        ) ||
+      file.stat.uid !==
+        canonicalUintRaw(
+          manifest.rows.get(`${prefix}uid`),
+          `current_release_publisher_artifact_${index}_uid`,
+        ) ||
+      file.stat.gid !==
+        canonicalUintRaw(
+          manifest.rows.get(`${prefix}gid`),
+          `current_release_publisher_artifact_${index}_gid`,
+        ) ||
       file.stat.mtimeNs !==
         canonicalUintRaw(
           manifest.rows.get(`${prefix}mtime_ns`),
@@ -1002,11 +1235,151 @@ function inspectPublisherEnvelope(
       );
     }
   }
+  const runtimeFormalPath = decodeFsHex(
+    receipt.rows.get("darwin_runtime_formal_validation_path_fshex"),
+    "current_release_runtime_formal_path",
+  );
+  if (
+    runtimeFormalPath !==
+      join(producerRoot, "darwin-runtime-formal-validation.kv")
+  ) {
+    throw new Error("current_release_runtime_formal_location_invalid");
+  }
+  const runtimeFormalFile = stableFile(
+    runtimeFormalPath,
+    "current_release_runtime_formal_validation",
+  );
+  if (
+    byRelativePath.get("darwin-runtime-formal-validation.kv")
+      ?.bytesRaw32 !== runtimeFormalFile.raw32 ||
+    receipt.rows.get("darwin_runtime_formal_validation_sha256") !==
+      runtimeFormalFile.raw32 ||
+    runtimeFormalFile.stat.dev !==
+      canonicalUintRaw(
+        receipt.rows.get("darwin_runtime_formal_validation_device"),
+        "current_release_runtime_formal_device",
+      ) ||
+    runtimeFormalFile.stat.ino !==
+      canonicalUintRaw(
+        receipt.rows.get("darwin_runtime_formal_validation_inode"),
+        "current_release_runtime_formal_inode",
+      ) ||
+    runtimeFormalFile.stat.size !==
+      canonicalUintRaw(
+        receipt.rows.get("darwin_runtime_formal_validation_size"),
+        "current_release_runtime_formal_size",
+      ) ||
+    runtimeFormalFile.stat.mode !==
+      canonicalOctalRaw(
+        receipt.rows.get("darwin_runtime_formal_validation_mode"),
+        "current_release_runtime_formal_mode",
+      ) ||
+    runtimeFormalFile.stat.nlink !==
+      canonicalUintRaw(
+        receipt.rows.get("darwin_runtime_formal_validation_nlink"),
+        "current_release_runtime_formal_nlink",
+      ) ||
+    runtimeFormalFile.stat.uid !==
+      canonicalUintRaw(
+        receipt.rows.get("darwin_runtime_formal_validation_uid"),
+        "current_release_runtime_formal_uid",
+      ) ||
+    runtimeFormalFile.stat.gid !==
+      canonicalUintRaw(
+        receipt.rows.get("darwin_runtime_formal_validation_gid"),
+        "current_release_runtime_formal_gid",
+      ) ||
+    runtimeFormalFile.stat.mtimeNs !==
+      canonicalUintRaw(
+        receipt.rows.get("darwin_runtime_formal_validation_mtime_ns"),
+        "current_release_runtime_formal_mtime",
+      ) ||
+    runtimeFormalFile.stat.ctimeNs !==
+      canonicalUintRaw(
+        receipt.rows.get("darwin_runtime_formal_validation_ctime_ns"),
+        "current_release_runtime_formal_ctime",
+      )
+  ) {
+    throw new Error("current_release_runtime_formal_identity_drift");
+  }
+  const runtimeFormal = parseCurrentReleaseKv(
+    runtimeFormalFile,
+    "current_release_runtime_formal_validation",
+    "receipt_payload_sha256",
+  );
+  requireExactKvKeys(
+    runtimeFormal.rows,
+    DARWIN_RUNTIME_FORMAL_RECEIPT_KEYS,
+    "current_release_runtime_formal_validation",
+  );
+  if (
+    runtimeFormal.rows.get("darwin_current_release_runtime_validation") !==
+      "PASS" ||
+    runtimeFormal.rows.get("driver_role") !== "production" ||
+    runtimeFormal.rows.get("target") !== "arm64-apple-darwin" ||
+    decodeFsHex(
+      runtimeFormal.rows.get("publish_root_fshex"),
+      "current_release_runtime_formal_publish_root",
+    ) !== producerRoot ||
+    !decodeFsHex(
+      runtimeFormal.rows.get("runtime_output_root_fshex"),
+      "current_release_runtime_formal_output_root",
+    ).startsWith(`${producerRoot}/`) ||
+    canonicalUintRaw(
+      runtimeFormal.rows.get("published_process_count"),
+      "current_release_runtime_formal_process_count",
+    ) <= 0n ||
+    receipt.rows.get("darwin_runtime_formal_process_count") !==
+      runtimeFormal.rows.get("published_process_count")
+  ) {
+    throw new Error("current_release_runtime_formal_header_invalid");
+  }
+  for (const key of DARWIN_RUNTIME_FORMAL_RECEIPT_KEYS) {
+    if (key.endsWith("_sha256") || key.endsWith("_raw32")) {
+      observedHash(
+        runtimeFormal.rows.get(key),
+        `current_release_runtime_formal_${key}`,
+      );
+    }
+  }
+  for (const [receiptKey, runtimeKey] of [
+    [
+      "darwin_runtime_formal_physical_sha256",
+      "process_physical_sha256",
+    ],
+    [
+      "darwin_runtime_formal_logical_sha256",
+      "process_logical_sha256",
+    ],
+    [
+      "darwin_runtime_formal_path_role_sha256",
+      "process_path_role_sha256",
+    ],
+    [
+      "darwin_runtime_formal_support_path_role_sha256",
+      "process_support_path_role_sha256",
+    ],
+  ] as const) {
+    if (receipt.rows.get(receiptKey) !== runtimeFormal.rows.get(runtimeKey)) {
+      throw new Error(
+        `current_release_runtime_formal_authority_drift:${runtimeKey}`,
+      );
+    }
+  }
   return {
     envelope: Object.freeze({
       producerRoot,
       receiptRaw32: receiptFile.raw32,
       manifestRaw32: manifestFile.raw32,
+      runtimeFormalValidationRaw32: runtimeFormalFile.raw32,
+      runtimeFormalPhysicalRaw32:
+        runtimeFormal.rows.get("process_physical_sha256")!,
+      runtimeFormalLogicalRaw32:
+        runtimeFormal.rows.get("process_logical_sha256")!,
+      runtimeFormalPathRoleRaw32:
+        runtimeFormal.rows.get("process_path_role_sha256")!,
+      runtimeFormalSupportPathRoleRaw32:
+        runtimeFormal.rows.get("process_support_path_role_sha256")!,
       artifacts: Object.freeze(artifacts),
     }),
     receiptRows: receipt.rows,
@@ -1211,6 +1584,7 @@ export function pinCurrentParserHarnessClosure(
     [
       "schema",
       "status",
+      "officialCurrentBuild",
       "formalEbnfSha256",
       "formalSpec",
       "parser",
@@ -1218,6 +1592,7 @@ export function pinCurrentParserHarnessClosure(
       "driverEntry",
       "bootstrap",
       "harness",
+      "parserNodeMap",
       "dependencyClosure",
       "toolClosure",
       "buildCompiler",
@@ -1271,6 +1646,49 @@ export function pinCurrentParserHarnessClosure(
     assertExactCurrentObjectKeys(value, keys, label);
     return value as Record<string, unknown>;
   };
+  const officialCurrentBuild = pinObject(
+    manifest.officialCurrentBuild,
+    [
+      "bindingPath",
+      "bindingSha256",
+      "officialBuildReceiptPath",
+      "officialBuildReceiptSha256",
+      "sourceSnapshotManifestPath",
+      "sourceSnapshotManifestSha256",
+      "sourceSnapshotRoot",
+      "sourceSnapshotClosureSha256",
+      "officialDriverPath",
+      "officialDriverSha256",
+    ],
+    "current_release_harness_official_current_build",
+  );
+  for (const key of [
+    "bindingSha256",
+    "officialBuildReceiptSha256",
+    "sourceSnapshotManifestSha256",
+    "sourceSnapshotClosureSha256",
+    "officialDriverSha256",
+  ] as const) {
+    observedHash(
+      officialCurrentBuild[key],
+      `current_release_harness_official_current_build_${key}`,
+    );
+  }
+  for (const key of [
+    "bindingPath",
+    "officialBuildReceiptPath",
+    "sourceSnapshotManifestPath",
+    "sourceSnapshotRoot",
+    "officialDriverPath",
+  ] as const) {
+    if (typeof officialCurrentBuild[key] !== "string" ||
+        officialCurrentBuild[key] !==
+          resolve(String(officialCurrentBuild[key]))) {
+      throw new Error(
+        `current_release_harness_official_current_build_${key}_invalid`,
+      );
+    }
+  }
   for (const key of [
     "formalSpec",
     "parser",
@@ -1337,8 +1755,18 @@ export function pinCurrentParserHarnessClosure(
   };
   pinClosure(
     manifest.dependencyClosure,
-    CHENG_CURRENT_ROOT,
+    String(officialCurrentBuild.sourceSnapshotRoot),
     "current_release_harness_cheng_closure",
+  );
+  const parserNodeMap = pinObject(
+    manifest.parserNodeMap,
+    ["path", "sha256"],
+    "current_release_harness_parser_node_map",
+  );
+  pin(
+    parserNodeMap.path,
+    parserNodeMap.sha256,
+    "current_release_harness_parser_node_map",
   );
   pinClosure(
     manifest.toolClosure,
@@ -1350,10 +1778,29 @@ export function pinCurrentParserHarnessClosure(
     ["command", "executablePath", "executableSha256", "versionSha256"],
     "current_release_harness_build_compiler",
   );
-  pin(
+  if (typeof buildCompiler.executablePath !== "string") {
+    throw new Error(
+      "current_release_harness_build_compiler_path_invalid",
+    );
+  }
+  const buildCompilerFile = stableExternalExecutable(
     buildCompiler.executablePath,
-    buildCompiler.executableSha256,
     "current_release_harness_build_compiler",
+  );
+  if (buildCompilerFile.raw32 !==
+      observedHash(
+        buildCompiler.executableSha256,
+        "current_release_harness_build_compiler_bytes",
+      )) {
+    throw new Error(
+      "current_release_harness_build_compiler_pin_drift",
+    );
+  }
+  files.push(buildCompilerFile);
+  parts.push(
+    "current_release_harness_build_compiler",
+    buildCompilerFile.path,
+    buildCompilerFile.raw32,
   );
   observedHash(
     buildCompiler.versionSha256,
@@ -1383,6 +1830,9 @@ export function pinCurrentParserHarnessClosure(
         "driverRole",
         "driverSha256",
         "parserTraceRootSha256",
+        "parserBindingSha256",
+        "parserBindingRequiredResultCount",
+        "parserBindingHitCount",
       ],
     ],
   ] as const) {
@@ -1403,8 +1853,116 @@ export function pinCurrentParserHarnessClosure(
         row.byteLength,
         "inode" in row ? row.inode : undefined,
       );
+      if (collection === "receipts") {
+        observedHash(
+          row.parserTraceRootSha256,
+          `current_release_harness_receipts_${index}_trace`,
+        );
+        observedHash(
+          row.parserBindingSha256,
+          `current_release_harness_receipts_${index}_binding`,
+        );
+        if (!Number.isSafeInteger(
+              row.parserBindingRequiredResultCount) ||
+            Number(row.parserBindingRequiredResultCount) <= 0 ||
+            !Number.isSafeInteger(row.parserBindingHitCount) ||
+            Number(row.parserBindingHitCount) <= 0 ||
+            Number(row.parserBindingHitCount) >
+              Number(row.parserBindingRequiredResultCount)) {
+          throw new Error(
+            `current_release_harness_receipts_${index}_binding_count_invalid`,
+          );
+        }
+      }
     }
   }
+  if ((manifest.drivers as Record<string, any>[]).some(
+        (driver) =>
+          driver.sha256 !== officialCurrentBuild.officialDriverSha256)) {
+    throw new Error(
+      "current_release_harness_official_driver_identity_invalid",
+    );
+  }
+  const formalSpec = manifest.formalSpec as Record<string, unknown>;
+  const parser = manifest.parser as Record<string, unknown>;
+  if (typeof formalSpec.path !== "string" ||
+      typeof parser.path !== "string" ||
+      typeof parserNodeMap.path !== "string") {
+    throw new Error("current_release_harness_binding_path_invalid");
+  }
+  const formalSpecSource = readFileSync(formalSpec.path, "utf8");
+  const parserSource = readFileSync(parser.path, "utf8");
+  const nodeMapBytes = readFileSync(parserNodeMap.path);
+  const nodeMap = parseUniqueCurrentJson(
+    nodeMapBytes.toString("utf8"),
+    "ebnf_parser_node_map",
+  ) as {rows: readonly MapRow[]};
+  const grammar =
+    buildChengGrammarObligationContract(formalSpecSource);
+  if (observedHash(
+        manifest.formalEbnfSha256,
+        "current_release_harness_formal_ebnf",
+      ) !== grammar.ebnfSha256) {
+    throw new Error("current_release_harness_formal_ebnf_drift");
+  }
+  const mapRows = new Map(
+    nodeMap.rows.map((row) => [row.name, row]),
+  );
+  const tokenNames = tokenKindNamesFromParserSource(parserSource);
+  const valueKindNames =
+    valueExprKindNamesFromParserSource(parserSource);
+  for (const receipt of manifest.receipts as Record<string, any>[]) {
+    const source = (manifest.sources as Record<string, any>[])
+      .find((row) => row.path === receipt.sourcePath);
+    const driver = (manifest.drivers as Record<string, any>[])
+      .find((row) => row.role === receipt.driverRole);
+    if (source === undefined ||
+        driver === undefined ||
+        typeof receipt.path !== "string" ||
+        typeof source.path !== "string") {
+      throw new Error("current_release_harness_binding_source_invalid");
+    }
+    const receiptJsonText = readFileSync(receipt.path, "utf8");
+    const receiptValue = parseUniqueCurrentJson(
+      receiptJsonText,
+      "driver_parse_receipt",
+    ) as Record<string, any>;
+    validateDriverReceiptToolchainIdentityValue(receiptValue);
+    if (receiptValue.schema !== "cheng_driver_parse_receipt" ||
+        receiptValue.stage !== "parser" ||
+        receiptValue.sourcePath !== source.path ||
+        receiptValue.sourceSha256 !== source.sha256 ||
+        receiptValue.driverBytesSha256 !== driver.sha256 ||
+        receiptValue.toolchainManifest?.driverPath !== driver.path ||
+        receiptValue.parserTraceRootSha256 !==
+          receipt.parserTraceRootSha256) {
+      throw new Error("current_release_harness_receipt_identity_invalid");
+    }
+    const binding = currentParserReceiptBindingAuthority(
+      receiptJsonText,
+      readFileSync(source.path, "utf8"),
+      formalSpecSource,
+      grammar.obligations,
+      tokenNames,
+      mapRows,
+      String(parserNodeMap.sha256),
+      valueKindNames,
+    );
+    if (receipt.parserTraceRootSha256 !==
+          binding.parserTraceRootSha256 ||
+        receipt.parserBindingSha256 !== binding.bindingSha256 ||
+        receipt.parserBindingRequiredResultCount !==
+          binding.requiredResultCount ||
+        receipt.parserBindingHitCount !== binding.hitCount ||
+        binding.requiredResultCount !== grammar.requiredCount ||
+        binding.hitCount <= 0) {
+      throw new Error("current_release_harness_binding_invalid");
+    }
+  }
+  parts.push(
+    "current_release_harness_manifest",
+    sha256(canonicalJson(manifest)),
+  );
   const uniqueFiles = [
     ...new Map(files.map((file) => [file.path, file] as const)).values(),
   ];
@@ -1579,6 +2137,10 @@ function parseManifest(value: unknown): CurrentReleaseManifest {
       manifest.semanticPublishedStdout,
       "current_release_semantic_published_stdout",
     ),
+    semanticSourceMembershipFocusedStdout: parsePin(
+      manifest.semanticSourceMembershipFocusedStdout,
+      "current_release_semantic_source_membership_focused_stdout",
+    ),
     semanticSourceClosure: parsePin(
       manifest.semanticSourceClosure,
       "current_release_semantic_source_closure",
@@ -1645,6 +2207,34 @@ function parseManifest(value: unknown): CurrentReleaseManifest {
       "current_release_fresh_mcp_type_arena_execution",
     ),
     tools,
+    publisherReceiptRaw32: observedHash(
+      manifest.publisherReceiptRaw32,
+      "current_release_publisher_receipt",
+    ),
+    publisherManifestRaw32: observedHash(
+      manifest.publisherManifestRaw32,
+      "current_release_publisher_manifest",
+    ),
+    runtimeFormalValidationRaw32: observedHash(
+      manifest.runtimeFormalValidationRaw32,
+      "current_release_runtime_formal_validation",
+    ),
+    runtimeFormalPhysicalRaw32: observedHash(
+      manifest.runtimeFormalPhysicalRaw32,
+      "current_release_runtime_formal_physical",
+    ),
+    runtimeFormalLogicalRaw32: observedHash(
+      manifest.runtimeFormalLogicalRaw32,
+      "current_release_runtime_formal_logical",
+    ),
+    runtimeFormalPathRoleRaw32: observedHash(
+      manifest.runtimeFormalPathRoleRaw32,
+      "current_release_runtime_formal_path_role",
+    ),
+    runtimeFormalSupportPathRoleRaw32: observedHash(
+      manifest.runtimeFormalSupportPathRoleRaw32,
+      "current_release_runtime_formal_support_path_role",
+    ),
     releaseIdentityRaw32: observedHash(
       manifest.releaseIdentityRaw32,
       "current_release_identity",
@@ -1667,6 +2257,10 @@ function parseManifest(value: unknown): CurrentReleaseManifest {
     [
       out.semanticPublishedStdout,
       ARTIFACT_ROLE_BASENAMES.semanticPublishedStdout,
+    ],
+    [
+      out.semanticSourceMembershipFocusedStdout,
+      ARTIFACT_ROLE_BASENAMES.semanticSourceMembershipFocusedStdout,
     ],
     [
       out.semanticSourceClosure,
@@ -2298,12 +2892,14 @@ function compositeReleaseIdentity(
     semantic.closureReceiptCid,
     semantic.compilerInputReceiptCid,
     semantic.publishedReceiptCid,
+    semantic.sourceMembershipFocusedReceiptCid,
     semantic.queryProjectionCid,
     semantic.openDocumentUniverseCid,
     semantic.snapshotRaw32,
     manifest.semanticSnapshotAudit.bytesRaw32,
     manifest.semanticSnapshotBitmapReceipt.bytesRaw32,
     manifest.semanticPublishedStdout.bytesRaw32,
+    manifest.semanticSourceMembershipFocusedStdout.bytesRaw32,
     manifest.semanticSourceClosure.bytesRaw32,
     manifest.semanticPublishedObject.bytesRaw32,
     manifest.semanticBinding.bytesRaw32,
@@ -2329,6 +2925,13 @@ function compositeReleaseIdentity(
     freshMcpTypeArena.semanticRaw32,
     sha256(canonicalJson(manifest.targets)),
     sha256(canonicalJson(manifest.tools)),
+    manifest.publisherReceiptRaw32,
+    manifest.publisherManifestRaw32,
+    manifest.runtimeFormalValidationRaw32,
+    manifest.runtimeFormalPhysicalRaw32,
+    manifest.runtimeFormalLogicalRaw32,
+    manifest.runtimeFormalPathRoleRaw32,
+    manifest.runtimeFormalSupportPathRoleRaw32,
   ]);
 }
 
@@ -2364,6 +2967,51 @@ function requirePublisherArtifact(
     byteLength: artifact.byteLength,
     bytesRaw32: artifact.bytesRaw32,
   });
+}
+
+function requirePublisherRootArtifact(
+  envelope: CurrentReleasePublisherEnvelope,
+  expectedBasename: string,
+): ArtifactPin {
+  const artifact = requirePublisherArtifact(envelope, expectedBasename);
+  if (artifact.path !== join(envelope.producerRoot, expectedBasename)) {
+    throw new Error(
+      `current_release_publisher_artifact_role_path_invalid:${expectedBasename}`,
+    );
+  }
+  return artifact;
+}
+
+function bindCurrentReleaseSemanticPublisherArtifacts(
+  envelope: CurrentReleasePublisherEnvelope,
+): readonly CurrentReleaseSemanticPublisherArtifact[] {
+  const artifacts = SEMANTIC_ARTIFACT_ROLES.map((role) => {
+    const artifact = requirePublisherRootArtifact(
+      envelope,
+      ARTIFACT_ROLE_BASENAMES[role],
+    );
+    return Object.freeze({
+      role,
+      path: artifact.path,
+      byteLength: artifact.byteLength,
+      bytesRaw32: artifact.bytesRaw32,
+    });
+  });
+  if (
+    new Set(artifacts.map((artifact) => artifact.path)).size !==
+      SEMANTIC_ARTIFACT_ROLES.length
+  ) {
+    throw new Error("current_release_semantic_publisher_artifact_alias");
+  }
+  return Object.freeze(artifacts);
+}
+
+export function inspectCurrentReleaseSemanticPublisherArtifacts(
+  publisherReceiptPath: string,
+): readonly CurrentReleaseSemanticPublisherArtifact[] {
+  return bindCurrentReleaseSemanticPublisherArtifacts(
+    inspectPublisherEnvelope(publisherReceiptPath).envelope,
+  );
 }
 
 async function runCurrentReleasePublisherValidator(
@@ -2522,6 +3170,22 @@ export async function assembleCurrentReleaseManifest(
       publisher.envelope,
       ARTIFACT_ROLE_BASENAMES[key],
     );
+  const semanticArtifacts = new Map(
+    bindCurrentReleaseSemanticPublisherArtifacts(publisher.envelope).map(
+      (artifact) => [artifact.role, artifact] as const,
+    ),
+  );
+  const semanticPublished = (
+    role: (typeof SEMANTIC_ARTIFACT_ROLES)[number],
+  ): ArtifactPin => {
+    const artifact = semanticArtifacts.get(role);
+    if (artifact === undefined) {
+      throw new Error(
+        `current_release_semantic_publisher_artifact_missing:${role}`,
+      );
+    }
+    return artifact;
+  };
   const memoryReleaseManifest = published("memoryReleaseManifest");
   const memoryIdentity = extractCurrentMemoryReleaseIdentity(
     parseCurrentCanonicalJson(
@@ -2636,19 +3300,22 @@ export async function assembleCurrentReleaseManifest(
     parserHarnessManifest,
     executionPolicy,
     sevenStageManifest,
-    semanticSnapshotAudit: published("semanticSnapshotAudit"),
-    semanticSnapshotBitmapReceipt: published(
+    semanticSnapshotAudit: semanticPublished("semanticSnapshotAudit"),
+    semanticSnapshotBitmapReceipt: semanticPublished(
       "semanticSnapshotBitmapReceipt",
     ),
-    semanticPublishedStdout: published("semanticPublishedStdout"),
-    semanticSourceClosure: published("semanticSourceClosure"),
-    semanticPublishedObject: published("semanticPublishedObject"),
-    semanticBinding: published("semanticBinding"),
-    semanticQueryProjection: published("semanticQueryProjection"),
-    semanticOpenDocumentUniverse: published(
+    semanticPublishedStdout: semanticPublished("semanticPublishedStdout"),
+    semanticSourceMembershipFocusedStdout: semanticPublished(
+      "semanticSourceMembershipFocusedStdout",
+    ),
+    semanticSourceClosure: semanticPublished("semanticSourceClosure"),
+    semanticPublishedObject: semanticPublished("semanticPublishedObject"),
+    semanticBinding: semanticPublished("semanticBinding"),
+    semanticQueryProjection: semanticPublished("semanticQueryProjection"),
+    semanticOpenDocumentUniverse: semanticPublished(
       "semanticOpenDocumentUniverse",
     ),
-    semanticSnapshotArtifact: published("semanticSnapshotArtifact"),
+    semanticSnapshotArtifact: semanticPublished("semanticSnapshotArtifact"),
     memoryReleaseManifest,
     baselineDriver,
     driverSource,
@@ -2666,6 +3333,18 @@ export async function assembleCurrentReleaseManifest(
       "freshMcpTypeArenaExecution",
     ),
     tools: Object.freeze(tools),
+    publisherReceiptRaw32: publisher.envelope.receiptRaw32,
+    publisherManifestRaw32: publisher.envelope.manifestRaw32,
+    runtimeFormalValidationRaw32:
+      publisher.envelope.runtimeFormalValidationRaw32,
+    runtimeFormalPhysicalRaw32:
+      publisher.envelope.runtimeFormalPhysicalRaw32,
+    runtimeFormalLogicalRaw32:
+      publisher.envelope.runtimeFormalLogicalRaw32,
+    runtimeFormalPathRoleRaw32:
+      publisher.envelope.runtimeFormalPathRoleRaw32,
+    runtimeFormalSupportPathRoleRaw32:
+      publisher.envelope.runtimeFormalSupportPathRoleRaw32,
     releaseIdentityRaw32: sha256(
       "cheng.compiler.current_release_identity.unsealed",
     ),
@@ -2720,6 +3399,16 @@ export async function assembleCurrentReleaseManifest(
       releaseIdentityRaw32: finalManifest.releaseIdentityRaw32,
       publisherReceiptRaw32: publisher.envelope.receiptRaw32,
       publisherManifestRaw32: publisher.envelope.manifestRaw32,
+      runtimeFormalValidationRaw32:
+        publisher.envelope.runtimeFormalValidationRaw32,
+      runtimeFormalPhysicalRaw32:
+        publisher.envelope.runtimeFormalPhysicalRaw32,
+      runtimeFormalLogicalRaw32:
+        publisher.envelope.runtimeFormalLogicalRaw32,
+      runtimeFormalPathRoleRaw32:
+        publisher.envelope.runtimeFormalPathRoleRaw32,
+      runtimeFormalSupportPathRoleRaw32:
+        publisher.envelope.runtimeFormalSupportPathRoleRaw32,
       publisherArtifactCount: publisher.envelope.artifacts.length,
     });
   } finally {
@@ -2977,6 +3666,10 @@ async function auditCurrentReleaseGreenInternal(
         manifest.semanticPublishedStdout,
         "current_release_semantic_published_stdout",
       ),
+      sourceMembershipFocusedStdout: readPin(
+        manifest.semanticSourceMembershipFocusedStdout,
+        "current_release_semantic_source_membership_focused_stdout",
+      ),
       sourceClosure: readPin(
         manifest.semanticSourceClosure,
         "current_release_semantic_source_closure",
@@ -3025,6 +3718,8 @@ async function auditCurrentReleaseGreenInternal(
         })),
         sourceSnapshotRows: sourceSnapshot.rows,
         publishedStdoutRaw: semanticRawFiles.publishedStdout.raw,
+        sourceMembershipFocusedStdoutRaw:
+          semanticRawFiles.sourceMembershipFocusedStdout.raw,
         sourceClosureRaw: semanticRawFiles.sourceClosure.raw,
         publishedObjectRaw: semanticRawFiles.publishedObject.raw,
         bindingRaw: semanticRawFiles.binding.raw,

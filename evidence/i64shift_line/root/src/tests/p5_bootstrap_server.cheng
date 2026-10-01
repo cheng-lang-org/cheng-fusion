@@ -1,0 +1,151 @@
+# libp2p P5-S1 三进程门: bootstrap 发布方服务端 exe (设计案卷 §2d)。
+# 一个 bootstrap = 一条 AcceptTimed 循环, 统一分发 HEAD_REQ / WANT / REVOKE_REQ。
+#
+# 与 cas_head_source_server_smoke 的关键差异 (P5-S1 核心):
+#   head.headCid == manifest cid (【非】源 cid)。manifest = manifest-as-lock 行式 blob
+#   (modulePath=sourceCidHex), 其 sha256 == headCid = 整依赖集 Merkle 根。发布方:
+#     ① 读模块源文件 → ingest → sourceCid
+#     ② ManifestLockEncode({module=sourceCid}) → manifestBytes; ingest → manifestCid=headCid
+#     ③ ChannelHeadSign(headCid=manifestCid) → 存 head 库
+#   服务端同时持 head + manifest blob + 源 blob, 一进程应答 fresh node 的三类请求。
+#
+# mode (负路径造场; 全部验证在 fresh node 侧):
+#   positive    : 干净自签 head 存 channelId(pubA)。
+#   forge       : channelId 槽=pubA, 但 signerPubKey=pubB (自证不一致) → fresh 请求绑定/decode 拒。
+#   revoke-self : 干净 head + 对 signer 自身造自撤销记录 admit (自证 root 授权) → fresh 撤销并集拒。
+# 三 mode 均 ingest manifest+源 blob (内容寻址, 同 seed/内容 → 同 cid), 故 forge peer 仍可供
+# manifest/源 (fresh 落穿到诚实 peer 取 head 后, 按 cid 从任一 peer 拉 manifest/源均等价)。
+#
+# 用法: --port 0 --ready-path <f> --store-root <dir> --seed N --epoch E
+#       --module <modulePath> --source-file <path> [--mode positive|forge|revoke-self]
+#       [--forge-seed M] [--serve-count N] [--wait-ms W]
+
+import std/system
+import std/result
+import std/cmdline as cmdline
+import std/rawbytes as rawbytes
+import cheng/std/bytes_layout as layout
+import std/crypto/sha512 as sha512
+import std/crypto/ed25519/ref10 as ref10
+import std/os
+import cheng/libp2p/cas_store as cas
+import cheng/libp2p/protocols/cas_source/channel_head/head_codec as head
+import cheng/libp2p/protocols/cas_source/channel_head/head_store as headstore
+import cheng/libp2p/protocols/cas_source/channel_head/manifest_lock_codec as mlc
+import cheng/libp2p/protocols/cas_source/channel_head/authz_codec as authz
+import cheng/libp2p/protocols/cas_source/channel_head/authz_store as authzstore
+import cheng/libp2p/host/host_quic as hq
+import std/strutils as strutil
+
+# 手工造真 ed25519 keypair (照 channel_head_signing_smoke 已验证口径; keyPairFromSeed
+# conditional-let miscompile, 绕开)。
+fn deriveKeypair(seedv: int32, priv: var Bytes, pub: var Bytes) =
+    var seed = BytesAlloc(32)
+    for i in 0..<32:
+        BytesSet(seed, i, (seedv + i) & 255)
+    var digest = sha512.Sha512Digest(seed)
+    BytesSet(digest, 0, BytesGet(digest, 0) & 248)
+    BytesSet(digest, 31, (BytesGet(digest, 31) & 63) | 64)
+    var r: ref10.GeP3
+    ref10.geScalarMultBase(r, BytesSlice(digest, 0, 32))
+    pub = ref10.geP3ToBytes(r)
+    priv = BytesConcat(seed, pub)
+
+fn main(): int32 =
+    let port = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    let readyPath = cmdline.ReadFlagOrDefault("--ready-path", "")
+    let storeRoot = cmdline.ReadFlagOrDefault("--store-root", "")
+    let seedv = cmdline.ReadInt32FlagOrDefault("--seed", 7)
+    let epoch = int64(cmdline.ReadInt32FlagOrDefault("--epoch", 1))
+    let modulePath = cmdline.ReadFlagOrDefault("--module", "")
+    let sourceFile = cmdline.ReadFlagOrDefault("--source-file", "")
+    let mode = cmdline.ReadFlagOrDefault("--mode", "positive")
+    let forgeSeed = cmdline.ReadInt32FlagOrDefault("--forge-seed", 200)
+    let serveCount = cmdline.ReadInt32FlagOrDefault("--serve-count", 8)
+    let waitMs = cmdline.ReadInt32FlagOrDefault("--wait-ms", 4000)
+    assert(readyPath != "", " p5-server: --ready-path required")
+    assert(storeRoot != "", " p5-server: --store-root required")
+    assert(modulePath != "", " p5-server: --module required")
+    assert(sourceFile != "", " p5-server: --source-file required")
+
+    var privA: Bytes
+    var pubA: Bytes
+    deriveKeypair(seedv, privA, pubA)
+    assert(BytesLen(pubA) == 32, " p5-server: pubA 32B")
+    let channelId = head.ChannelIdForPubKey(pubA)
+    let channelIdHex = layout.FixedBytes32Hex(channelId)
+
+    # ① 模块源进 CAS → sourceCid (WANT serve 靠这份 blob 应答)。
+    var srcRes = os.ReadFileBytesResult(sourceFile)
+    assert(srcRes.ok, " p5-server: read source-file: " + Error(srcRes))
+    var srcBytes = srcRes.value
+    var srcIngest = cas.CasStoreIngestBytes(storeRoot, srcBytes)
+    assert(srcIngest.ok, " p5-server: ingest source: " + Error(srcIngest))
+    let sourceCidHex = srcIngest.value
+
+    # ② manifest-as-lock: {module = sourceCid} → 编码 → ingest → manifestCid = headCid。
+    var lock: mlc.ManifestLock
+    var entry: mlc.ManifestLockEntry
+    entry.modulePath = modulePath
+    entry.cidHex = sourceCidHex
+    add(lock.entries, entry)
+    var encRes = mlc.ManifestLockEncode(lock)
+    assert(encRes.ok, " p5-server: manifest encode: " + Error(encRes))
+    var manifestBytes = encRes.value
+    let headCid = mlc.ManifestLockCid(manifestBytes)
+    let headCidHex = layout.FixedBytes32Hex(headCid)
+    var manIngest = cas.CasStoreIngestBytes(storeRoot, manifestBytes)
+    assert(manIngest.ok, " p5-server: ingest manifest: " + Error(manIngest))
+    assert(manIngest.value == headCidHex, " p5-server: manifest cid != headCid (内容寻址不符)")
+
+    # ③ 真 ed25519 签 head (headCid == manifest cid)。
+    let genesis = head.ChannelHeadGenesisPrev()
+    var signRes = head.ChannelHeadSign(privA, epoch, headCid, genesis, pubA)
+    assert(signRes.ok, " p5-server: sign head: " + Error(signRes))
+    let recA = signRes.value
+
+    if mode == "positive":
+        var putRes = headstore.ChannelHeadStorePut(storeRoot, recA)
+        assert(putRes.ok, " p5-server: head store put: " + Error(putRes))
+    elif mode == "forge":
+        var privB: Bytes
+        var pubB: Bytes
+        deriveKeypair(forgeSeed, privB, pubB)
+        # channelId 槽仍是 pubA 的, 但 signerPubKey 换成 pubB (自证不一致); sig 用 keyB 真签。
+        var forgeRec = recA
+        forgeRec.signerPubKey = pubB
+        var forgeSignRes = head.ChannelHeadSign(privB, epoch, headCid, genesis, pubB)
+        assert(forgeSignRes.ok, " p5-server: forge keyB sign: " + Error(forgeSignRes))
+        forgeRec.sig = forgeSignRes.value.sig
+        var fEnc = head.ChannelHeadEncode(forgeRec)
+        assert(fEnc.ok, " p5-server: encode forge: " + Error(fEnc))
+        var putRes = headstore.ChannelHeadStorePutWire(storeRoot, channelIdHex, fEnc.value)
+        assert(putRes.ok, " p5-server: forge store put: " + Error(putRes))
+    elif mode == "revoke-self":
+        var putRes = headstore.ChannelHeadStorePut(storeRoot, recA)
+        assert(putRes.ok, " p5-server: head store put: " + Error(putRes))
+        # signer 自撤销 (A=channelId, B=signerPubKey, signer=pubA; 自证 root 授权)。
+        let pubAFixed = layout.FixedBytes32FromBytes(pubA).value
+        var revSign = authz.AuthzRecordSign(authz.AuthzTagRevoke, privA, channelId, pubAFixed, epoch, pubA)
+        assert(revSign.ok, " p5-server: revoke sign: " + Error(revSign))
+        var revAdmit = authzstore.AuthzRevocationAdmit(storeRoot, revSign.value)
+        assert(revAdmit.ok, " p5-server: revoke admit: " + Error(revAdmit))
+    else:
+        assert(false, " p5-server: unknown mode: " + mode)
+
+    echo(strutil.Join([" p5_bootstrap_server channel_id=", channelIdHex,
+                       " head_cid=", headCidHex,
+                       " source_cid=", sourceCidHex,
+                       " module=", modulePath,
+                       " mode=", mode], ""))
+
+    let serveRes = hq.Libp2pHostQuicServeCasUnified("127.0.0.1",
+                                                     port,
+                                                     "localhost",
+                                                     storeRoot,
+                                                     readyPath,
+                                                     serveCount,
+                                                     waitMs)
+    assert(serveRes.ok, " p5-server: serve: " + Error(serveRes))
+    echo(strutil.Join([" p5_bootstrap_server ok served=", IntToStr(serveRes.value)], ""))
+    return 0

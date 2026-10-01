@@ -1,0 +1,319 @@
+# Function task parallelism: work-stealing worker pool with join/barrier.
+#
+# Contract: BACKEND_JOBS=1 and BACKEND_JOBS=N must produce identical output hashes.
+# Workers are partitioned with pre-assigned contiguous function ranges.
+# Each worker pops tasks from the bottom of its own deque (LIFO, cache-friendly).
+# Idle workers steal tasks from the top of another worker's deque (FIFO).
+# Workers read frozen shared state, write only to their assigned result slots.
+# Synchronization via thread.StartPtr/Join (barrier, never yield-poll).
+# Main thread (worker 0) participates. After join, merge iterates in declaration order.
+
+import std/atomic
+import std/thread
+import cheng/core/ir/function_task as ftask
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/lang/typed_expr as texpr
+
+type
+    WorkStealingDeque =
+        tasks: int32[]
+        head: atomic.I32
+        tail: atomic.I32
+
+    WorkStealingWorkerContext = ref object
+        workerId: int32
+        workerCount: int32
+
+    WorkStealingPoolStats =
+        requestedJobs: int32
+        activeWorkerCount: int32
+        completedWorkerCount: int32
+        taskCount: int32
+
+# -- Module-level frozen shared state (read-only during parallel execution) --
+
+var
+    wsPoolPlan: lower.LoweringPlanStub
+    wsPoolSourceTexts: texpr.TypedExprSourceText[]
+    wsPoolLetCallReturnLiteralStart: int32
+    wsPoolResults: ftask.FunctionTaskResult[]
+    wsPoolFunctionCount: int32
+    wsPoolWorkerCount: int32
+
+# -- Module-level worker deques --
+
+var
+    wsPoolDeques: WorkStealingDeque[]
+    wsPoolDoneCount: atomic.I32
+
+# -- Module-level pool tracking for report --
+
+var
+    wsPoolLastRequestedJobs: int32
+    wsPoolLastActiveWorkerCount: int32
+    wsPoolLastCompletedWorkerCount: int32
+    wsPoolLastTaskCount: int32
+
+# =============================================================================
+# Shared state setup (call once before execution)
+# =============================================================================
+
+fn WorkStealingCloneTypedExprSourceTexts(items: var texpr.TypedExprSourceText[]): texpr.TypedExprSourceText[] =
+    var out: texpr.TypedExprSourceText[]
+    for i in 0..<items.len:
+        add(out, items[i])
+    return out
+
+fn WorkStealingSetSharedState(plan: var lower.LoweringPlanStub,
+                               sourceTexts: var texpr.TypedExprSourceText[],
+                               letCallReturnLiteralStart: int32) =
+    wsPoolPlan = plan
+    wsPoolSourceTexts = WorkStealingCloneTypedExprSourceTexts(sourceTexts)
+    wsPoolLetCallReturnLiteralStart = letCallReturnLiteralStart
+    wsPoolLastRequestedJobs = 1
+    wsPoolLastActiveWorkerCount = 0
+    wsPoolLastCompletedWorkerCount = 0
+    wsPoolLastTaskCount = 0
+
+# =============================================================================
+# Core body-IR execution (called by workers)
+# =============================================================================
+
+fn WorkStealingExecuteBodyIr(funcIndex: int32) =
+    var fnIr: lower.PrimaryObjectIrFunction
+    lower.LoweringBuildOneFunctionInto(wsPoolPlan,
+                                        wsPoolSourceTexts,
+                                        funcIndex,
+                                        wsPoolLetCallReturnLiteralStart,
+                                        fnIr)
+    wsPoolResults[funcIndex].funcIndex = funcIndex
+    wsPoolResults[funcIndex].outputKind = ftask.FunctionTaskResultKindBodyIr()
+    wsPoolResults[funcIndex].loweredFunction = fnIr
+    wsPoolResults[funcIndex].wordCount = fnIr.statementCount
+
+# =============================================================================
+# Lock-free deque operations
+# =============================================================================
+
+fn WorkStealingDequeNew(tasks: int32[]): WorkStealingDeque =
+    var d: WorkStealingDeque
+    d.tasks = tasks
+    d.head = atomic.NewI32(0)
+    d.tail = atomic.NewI32(tasks.len)
+    return d
+
+# Pop from bottom of own deque (LIFO). Called by owner worker only.
+fn WorkStealingPopBottom(workerId: int32): int32 =
+    let d = wsPoolDeques[workerId]
+    if d.tasks.len <= 0:
+        return -1
+    let t = atomic.LoadI32(d.tail) - 1
+    atomic.StoreI32(d.tail, t)
+    let h = atomic.LoadI32(d.head)
+    if h < t:
+        return d.tasks[t]
+    if h == t:
+        if atomic.CasI32(d.head, h, h + 1):
+            atomic.StoreI32(d.tail, h + 1)
+            return d.tasks[t]
+        atomic.StoreI32(d.tail, h + 1)
+        return -1
+    atomic.StoreI32(d.tail, h)
+    return -1
+
+# Steal from top of another worker's deque (FIFO). Retries on CAS contention.
+fn WorkStealingStealFrom(victimId: int32): int32 =
+    let d = wsPoolDeques[victimId]
+    if d.tasks.len <= 0:
+        return -1
+    while true:
+        let h = atomic.LoadI32(d.head)
+        let t = atomic.LoadI32(d.tail)
+        if h >= t:
+            return -1
+        if atomic.CasI32(d.head, h, h + 1):
+            return d.tasks[h]
+
+# =============================================================================
+# Results allocation
+# =============================================================================
+
+fn WorkStealingAllocateResults(functionCount: int32) =
+    wsPoolResults = []
+    for fi in 0..<functionCount:
+        add(wsPoolResults, ftask.FunctionTaskResultEmpty(fi))
+    wsPoolFunctionCount = functionCount
+
+# =============================================================================
+# Serial execution (BACKEND_JOBS=1 path)
+# =============================================================================
+
+fn WorkStealingExecuteSerial(functionCount: int32): ftask.FunctionTaskResult[] =
+    wsPoolLastRequestedJobs = 1
+    wsPoolLastActiveWorkerCount = 1
+    wsPoolLastCompletedWorkerCount = 1
+    wsPoolLastTaskCount = functionCount
+    WorkStealingAllocateResults(functionCount)
+    for fi in 0..<functionCount:
+        WorkStealingExecuteBodyIr(fi)
+    return wsPoolResults
+
+# =============================================================================
+# Initialize deques with contiguous partition
+# =============================================================================
+
+fn WorkStealingInitDeques(functionCount: int32,
+                           workerCount: int32) =
+    wsPoolDeques = []
+    for w in 0..<workerCount:
+        var tasks: int32[]
+        let start = (functionCount * w) / workerCount
+        let end = (functionCount * (w + 1)) / workerCount
+        for fi in start..<end:
+            add(tasks, fi)
+        add(wsPoolDeques, WorkStealingDequeNew(tasks))
+
+# =============================================================================
+# Worker thread entry point
+# =============================================================================
+
+fn WorkStealingWorkerEntry(raw: ptr) =
+    if raw == nil:
+        panic("function_task_ws_worker_ctx_nil")
+    let ctx: WorkStealingWorkerContext = WorkStealingWorkerContext(raw)
+    if ctx == nil:
+        panic("function_task_ws_worker_ctx_invalid")
+    let workerId = ctx.workerId
+    let workerCount = ctx.workerCount
+
+    # Process own deque first, then steal from others
+    var tasksDone = 0
+    while true:
+        let fi = WorkStealingPopBottom(workerId)
+        if fi >= 0:
+            WorkStealingExecuteBodyIr(fi)
+            tasksDone = tasksDone + 1
+        else:
+            # Steal from another worker
+            var stolen = false
+            var victimOffset = 1
+            while victimOffset < workerCount:
+                let victimId = (workerId + victimOffset) % workerCount
+                let stolenFi = WorkStealingStealFrom(victimId)
+                if stolenFi >= 0:
+                    WorkStealingExecuteBodyIr(stolenFi)
+                    tasksDone = tasksDone + 1
+                    stolen = true
+                    break
+                victimOffset = victimOffset + 1
+            if !stolen:
+                # All deques empty, done
+                break
+    let _ = atomic.AddI32(wsPoolDoneCount, 1)
+    memRelease(ctx)
+
+# =============================================================================
+# Parallel execution with work-stealing
+# =============================================================================
+
+fn WorkStealingExecuteParallel(functionCount: int32,
+                                jobCount: int32): ftask.FunctionTaskResult[] =
+    if functionCount <= 0:
+        wsPoolLastRequestedJobs = jobCount
+        wsPoolLastActiveWorkerCount = 0
+        wsPoolLastCompletedWorkerCount = 0
+        wsPoolLastTaskCount = 0
+        return []
+
+    var workerCount = jobCount
+    if workerCount > functionCount:
+        workerCount = functionCount
+    if workerCount <= 1:
+        return WorkStealingExecuteSerial(functionCount)
+
+    wsPoolLastRequestedJobs = jobCount
+    wsPoolLastActiveWorkerCount = workerCount
+    wsPoolLastTaskCount = functionCount
+
+    WorkStealingAllocateResults(functionCount)
+    WorkStealingInitDeques(functionCount, workerCount)
+    wsPoolDoneCount = atomic.NewI32(0)
+    if wsPoolDoneCount == nil:
+        panic("function_task_ws_done_atomic_alloc_failed")
+    wsPoolWorkerCount = workerCount
+
+    # Spawn worker threads (workers 1..N-1)
+    var workerThreads: thread.Thread[]
+    for w in 1..<workerCount:
+        let ctx = new(WorkStealingWorkerContext)
+        if ctx == nil:
+            for ti in 0..<workerThreads.len:
+                if !thread.JoinThread(workerThreads[ti]):
+                    panic("function_task_ws_join_failed_after_ctx_alloc")
+            panic("function_task_ws_worker_ctx_alloc_failed")
+        ctx.workerId = w
+        ctx.workerCount = workerCount
+        memRetain(ctx)
+        let t = thread.StartPtr(&WorkStealingWorkerEntry, ctx)
+        if t == nil:
+            memRelease(ctx)
+            for ti in 0..<workerThreads.len:
+                if !thread.JoinThread(workerThreads[ti]):
+                    panic("function_task_ws_join_failed_after_start")
+            panic("function_task_ws_worker_start_failed")
+        add(workerThreads, t)
+
+    # Main thread participates as worker 0
+    # Process own deque, then steal
+    while true:
+        let fi = WorkStealingPopBottom(0)
+        if fi >= 0:
+            WorkStealingExecuteBodyIr(fi)
+        else:
+            var stolen = false
+            var victimOffset = 1
+            while victimOffset < workerCount:
+                let stolenFi = WorkStealingStealFrom(victimOffset)
+                if stolenFi >= 0:
+                    WorkStealingExecuteBodyIr(stolenFi)
+                    stolen = true
+                    break
+                victimOffset = victimOffset + 1
+            if !stolen:
+                break
+
+    # Join all spawned workers (barrier synchronization)
+    for ti in 0..<workerThreads.len:
+        if !thread.JoinThread(workerThreads[ti]):
+            panic("function_task_ws_worker_join_failed")
+
+    wsPoolLastCompletedWorkerCount = atomic.LoadI32(wsPoolDoneCount) + 1
+    if wsPoolLastCompletedWorkerCount != workerCount:
+        panic("function_task_ws_worker_count_mismatch")
+    return wsPoolResults
+
+# =============================================================================
+# Auto dispatch: parallel if BACKEND_JOBS > 1 and more than 1 function
+# =============================================================================
+
+fn WorkStealingExecute(functionCount: int32,
+                        jobCount: int32): ftask.FunctionTaskResult[] =
+    if jobCount > 1 && functionCount > 1:
+        return WorkStealingExecuteParallel(functionCount, jobCount)
+    return WorkStealingExecuteSerial(functionCount)
+
+# =============================================================================
+# Report helpers
+# =============================================================================
+
+fn WorkStealingLastRequestedJobs(): int32 =
+    return wsPoolLastRequestedJobs
+
+fn WorkStealingLastActiveWorkerCount(): int32 =
+    return wsPoolLastActiveWorkerCount
+
+fn WorkStealingLastCompletedWorkerCount(): int32 =
+    return wsPoolLastCompletedWorkerCount
+
+fn WorkStealingLastTaskCount(): int32 =
+    return wsPoolLastTaskCount

@@ -1,0 +1,556 @@
+# libp2p P2 S4: cheng net push/pull CLI (正典 §11.6 P2 S4)。
+# 把 S2 (host_quic serve/fetch) + S3 (CAS admission) 构件包成用户命令:
+#   net_cas_cli push <file>  --store <dir> [--host <ip>] [--port <n>] --ready-file <path> [--serve-count <n>]
+#   net_cas_cli pull <cidHex> --from <host:port> --store <dir> [--module <path>]
+#
+# push = 读文件 → CasStoreIngestBytes (内容寻址得 cid) → 打印 cid → Libp2pHostQuicServeCasSource
+#        (真 bind, 写 ready-file 端口, serve N 请求后退出)。
+# pull = cidHex → 真 UDP dial Libp2pHostQuicFetchCasSource → CasAdmitFetchedBytes (双保险 cid
+#        自校验 + 进本地 store) → 从 store 读回 (再校验) 物化写出 → 可选 CasLockRecord → 打印物化路径。
+#
+# 架构约束 (S3-prep 定谳): cheng cold/stage3 不 lower 函数值调用, 故本 CLI 一律【命名函数直调】
+# (Libp2pHostQuicServeCasSource / Libp2pHostQuicFetchCasSource / CasAdmitFetchedBytes ...),
+# 绝不经 CasResolveDependencyPathWithFetch (其 fetcher(cidHex) 行是 driver-gated)。
+# 参数解析手写 (读 argv 循环, 无依赖框架)。
+# 生产纪律: 文件不存在 / cid 校验失败 / 缺块 = 硬错非零退出, 绝不静默兜底。
+
+import std/system
+import std/cmdline
+import std/os
+import std/rawbytes
+import std/strutils as strutil
+import std/strings
+import std/parseutils
+import cheng/std/bytes_layout as layout
+import cheng/libp2p/cas_store as cas
+import cheng/libp2p/protocols/cas_source/codec
+import cheng/libp2p/protocols/cas_source/channel_head/head_codec as head
+import cheng/libp2p/protocols/cas_source/channel_head/head_pin as headpin
+import cheng/libp2p/protocols/cas_source/channel_head/provider_set_codec as pset
+import cheng/libp2p/protocols/cas_source/channel_head/provider_snapshot_store as pstore
+import cheng/libp2p/cas_fetch_env as fetchenv
+import cheng/libp2p/host/host_quic as hq
+
+fn netCasPrintErr(msg: str) =
+    os.WriteLine(os.Get_stderr(), msg)
+
+fn netCasUsage(): str =
+    return strutil.Join([
+        "usage: net_cas_cli <push|pull|fetch-head> ...",
+        "  push <file>  --store <dir> [--host <ip>] [--port <n>] --ready-file <path> [--serve-count <n>]",
+        "  pull <cidHex> --from <host:port> --store <dir> [--module <path>]",
+        "  fetch-head <channelIdHex> --store <dir> [--bootstrap <host:port,...>] [--from <host:port>] [--keys <pubHex,...>] [--server-name <name>]",
+        "  snapshot-sign --store <dir> --priv-hex <128hex seed||pub> --entries <manifest> --epoch <n>",
+        "    (manifest 每行: <channelIdHex> <host:port>)",
+        "  snapshot-serve --store <dir> [--host <ip>] [--port <n>] --ready-file <path> [--serve-count <n>]",
+        "  snapshot-fetch <channelIdHex> --store <dir> --bootstrap <host:port,...> --keys <pubHex,...> [--server-name <name>]"], "\n")
+
+# 手写 argv 分类: 已知取值 flag 消耗其后一个 token 作为值 (故不被误当位置参数)。
+# 空格形 --key value 由本表识别; 内联形 --key=value / --key:value 由 StartsWith("--") 兜住。
+fn netCasFlagConsumesNext(a: str): bool =
+    if a == "--store":
+        return true
+    if a == "--host":
+        return true
+    if a == "--port":
+        return true
+    if a == "--ready-file":
+        return true
+    if a == "--serve-count":
+        return true
+    if a == "--from":
+        return true
+    if a == "--module":
+        return true
+    if a == "--bootstrap":
+        return true
+    if a == "--server-name":
+        return true
+    if a == "--priv-hex":
+        return true
+    if a == "--entries":
+        return true
+    if a == "--epoch":
+        return true
+    if a == "--keys":
+        return true
+    if a == "--wait-ms":
+        return true
+    return false
+
+# 第 index 个纯位置参数 (跳过 flag 及其值)。index 0 = 子命令, 1 = 文件/cidHex。
+fn netCasPositional(index: int32): str =
+    let count: int32 = cmdline.ParamCount()
+    var seen: int32 = 0
+    var skipNext: bool = false
+    for i in 1..count:
+        if skipNext:
+            skipNext = false
+            continue
+        let a: str = cmdline.ParamStr(i)
+        if netCasFlagConsumesNext(a):
+            skipNext = true
+            continue
+        if strutil.StartsWith(a, "--"):
+            continue
+        if seen == index:
+            return a
+        seen = seen + 1
+    return ""
+
+fn runNetCasPush(): int32 =
+    let filePath: str = netCasPositional(1)
+    let store: str = cmdline.ReadFlagOrDefault("--store", "")
+    let host: str = cmdline.ReadFlagOrDefault("--host", "127.0.0.1")
+    let port: int32 = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    let readyFile: str = cmdline.ReadFlagOrDefault("--ready-file", "")
+    let serveCount: int32 = cmdline.ReadInt32FlagOrDefault("--serve-count", 1)
+    if filePath == "":
+        netCasPrintErr("net push: 缺文件路径 (push <file> ...)")
+        return 2
+    if store == "":
+        netCasPrintErr("net push: --store <dir> 必填")
+        return 2
+    if readyFile == "":
+        netCasPrintErr("net push: --ready-file <path> 必填 (跨进程端口握手)")
+        return 2
+    if !os.FileExists(filePath):
+        netCasPrintErr("net push: 文件不存在 (硬错): " + filePath)
+        return 1
+    var readRes: Result[Bytes] = os.ReadFileBytesResult(filePath)
+    if IsErr(readRes):
+        netCasPrintErr("net push: 读文件失败: " + Error(readRes))
+        return 1
+    var bytes = Value(readRes)
+    var ingestRes: Result[str] = cas.CasStoreIngestBytes(store, bytes)
+    if IsErr(ingestRes):
+        netCasPrintErr("net push: ingest 失败: " + Error(ingestRes))
+        return 1
+    let cidHex: str = Value(ingestRes)
+    echo("net push: ingested cid=" + cidHex + " bytes=" + IntToStr(BytesLen(bytes)))
+    echo("net push: serving " + host + ":" + IntToStr(port) + " ready-file=" + readyFile + " serve-count=" + IntToStr(serveCount))
+    var serveRes: Result[int32] = hq.Libp2pHostQuicServeCasSource(host,
+                                                                   port,
+                                                                   "localhost",
+                                                                   store,
+                                                                   readyFile,
+                                                                   serveCount,
+                                                                   -1)
+    if IsErr(serveRes):
+        netCasPrintErr("net push: serve 失败: " + Error(serveRes))
+        return 1
+    echo("net push: served " + IntToStr(Value(serveRes)) + " request(s) ok")
+    return 0
+
+fn runNetCasPull(): int32 =
+    let cidHex: str = netCasPositional(1)
+    let fromArg: str = cmdline.ReadFlagOrDefault("--from", "")
+    let store: str = cmdline.ReadFlagOrDefault("--store", "")
+    let modulePath: str = cmdline.ReadFlagOrDefault("--module", "")
+    if cidHex == "":
+        netCasPrintErr("net pull: 缺 cidHex (pull <cidHex> ...)")
+        return 2
+    if fromArg == "":
+        netCasPrintErr("net pull: --from <host:port> 必填")
+        return 2
+    if store == "":
+        netCasPrintErr("net pull: --store <dir> 必填")
+        return 2
+    let parts = strutil.Split(fromArg, ':')
+    if parts.len != 2:
+        netCasPrintErr("net pull: --from 须为 host:port 形式: " + fromArg)
+        return 2
+    let host: str = parts[0]
+    var port: int32 = 0
+    if !cmdline.ParseInt32(parts[1], port):
+        netCasPrintErr("net pull: --from 端口非法: " + parts[1])
+        return 2
+    if port <= 0:
+        netCasPrintErr("net pull: --from 端口须 > 0: " + IntToStr(port))
+        return 2
+    var cidRes: Result[layout.FixedBytes32] = layout.FixedBytes32FromHex(cidHex)
+    if IsErr(cidRes):
+        netCasPrintErr("net pull: cidHex 非法: " + cidHex + " (" + Error(cidRes) + ")")
+        return 2
+    let cid = Value(cidRes)
+    var wantCids: layout.FixedBytes32[]
+    add(wantCids, cid)
+
+    var outBlocks: codec.CasSourceBlockEntry[]
+    var fetchRes: Result[int32] = hq.Libp2pHostQuicFetchCasSource(host,
+                                                                   port,
+                                                                   "localhost",
+                                                                   wantCids,
+                                                                   outBlocks)
+    if IsErr(fetchRes):
+        netCasPrintErr("net pull: fetch 失败: " + Error(fetchRes))
+        return 1
+    if Value(fetchRes) != 1 || outBlocks.len != 1:
+        netCasPrintErr("net pull: 期望恰好 1 块, 实得 " + IntToStr(outBlocks.len))
+        return 1
+    if !layout.FixedBytes32Equal(outBlocks[0].cid, cid):
+        netCasPrintErr("net pull: 返回块 cid 与请求不符 (内容寻址硬门)")
+        return 1
+
+    # 双保险 cid 自校验 + 进本地 store (fetch 侧已校一次, admit 再校一次, 拒收污染)。
+    var fetched: Bytes = outBlocks[0].data
+    var admitRes: Result[bool] = cas.CasAdmitFetchedBytes(store, cidHex, fetched)
+    if IsErr(admitRes):
+        netCasPrintErr("net pull: admission 失败 (cid 校验/ingest): " + Error(admitRes))
+        return 1
+
+    # 物化: 从 store 读回 (CasStoreGet 再校验) → 写物化路径。
+    var getRes: Result[Bytes] = cas.CasStoreGet(store, cidHex)
+    if IsErr(getRes):
+        netCasPrintErr("net pull: store 读回失败: " + Error(getRes))
+        return 1
+    var matBytes = Value(getRes)
+    os.MkdirAll(store + "/materialized", 493)
+    let matPath: str = cas.CasMaterializedPath(store, cidHex)
+    var wr: Result[bool] = os.WriteFileBytesResult(matPath, matBytes)
+    if IsErr(wr):
+        netCasPrintErr("net pull: 物化写出失败: " + Error(wr))
+        return 1
+
+    if modulePath != "":
+        var recRes: Result[bool] = cas.CasLockRecord(store, modulePath, cidHex)
+        if IsErr(recRes):
+            netCasPrintErr("net pull: lock 记录失败: " + Error(recRes))
+            return 1
+        echo("net pull: locked " + modulePath + " = " + cidHex)
+
+    echo("net pull: fetched cid=" + cidHex + " bytes=" + IntToStr(BytesLen(matBytes)))
+    echo("net pull: materialized -> " + matPath)
+    return 0
+
+# fetch-head peer 列表: --bootstrap 逗号/空白分隔优先; 空时回退 --from 单项。逐 token 丢空。
+fn netCasParsePeerList(bootstrapRaw: str, fromRaw: str): str[] =
+    let boot = strutil.Strip(bootstrapRaw)
+    if boot != "":
+        return strutil.SplitWhitespace(strutil.Replace(boot, ",", " "))
+    var out: str[]
+    let single = strutil.Strip(fromRaw)
+    if single != "":
+        add(out, single)
+    return out
+
+# head OR-liveness: 逐 peer FetchCasHead (自证 + ed25519 验签 + 请求绑定), 第一个通过者胜。恶意/
+# eclipse peer 伪造不出 head (channelId==sha256(signerPubKey) 自证 + 请求绑定拒他人 head), 只能扣留
+# (回 miss/错) → 跳下一个。全失败聚合各 peer 错因硬 Err。安全来自自证, 非 peer 数; 非多数投票。
+# ★ P5 收口边界 (2026-07-08 实测): 持久 pin 预检【不得】放进本环 —— 环内加 headpin.ChannelHeadPinCheck
+#   调用 (即使身体空转 return Ok) 触发 stage3 cold-hybrid 潜在 miscompile, 后续撤销腿 TLS x509 解析
+#   读到坏点 ("ecdsa: point ! on curve", 最小实验三证: 有调用必现/摘调用即愈/空身体仍现)。pin 预检
+#   移到调用方 runNetCasFetchHead (head 选定后, 撤销闸前), 语义代价 = 首个过网络三重验的 head 若被
+#   pin 拒则整个 fetch 硬拒 (不落穿下一 peer); 换钥/回滚拒本就该浮现, 非 liveness 兜底面。
+fn netCasFetchHeadOverPeers(peers: str[], serverName: str, channelId: layout.FixedBytes32, outRecord: var head.ChannelHeadRecord): Result[bool] =
+    var errs: str[]
+    for i in 0..<peers.len:
+        let peer = peers[i]
+        let parts = strutil.Split(peer, ':')
+        if parts.len != 2:
+            add(errs, strutil.Join(["peer 非 host:port: ", peer], ""))
+            continue
+        let host = strutil.Strip(parts[0])
+        var port: int32 = 0
+        if !cmdline.ParseInt32(strutil.Strip(parts[1]), port) || port <= 0:
+            add(errs, strutil.Join(["peer 端口非法: ", peer], ""))
+            continue
+        var rec: head.ChannelHeadRecord
+        let r = hq.Libp2pHostQuicFetchCasHead(host, port, serverName, channelId, rec)
+        if !IsErr(r):
+            outRecord = rec
+            return Ok[bool](true)
+        add(errs, strutil.Join(["peer=", peer, ": ", Error(r)], ""))
+    return Err[bool](strutil.Join(["cas fetch-head: 全部 ", IntToStr(peers.len),
+                                    " 个 peer 取 head 均失败 [", strutil.Join(errs, " | "), "]"], ""))
+
+# P5-S2 源侧接线: 把本次快照发现的 endpoint 并入 <store>/discovered_endpoints.txt (union 去重, 保留既有行)。
+# 该文件跨进程传给编译器的源/manifest 取物候选构造 (cas_fetch_subprocess.CasSubprocessDiscoveredPeers),
+# 让 fresh node 的源/manifest pull 与 head 同构地经快照扩宽 OR-liveness。★C1: 撤销 UNION 与 fetch-head
+# --bootstrap 恒用静态 CHENG_CAS_BOOTSTRAP 集, 绝不读此文件; 隔离由实参来源保证 (发现集只走此单向持久化)。
+# 写失败 = 硬报 stderr (真磁盘错) 但不改 fetch-head 判定 (head/撤销已定谳); 缺席退化成静态-only 源 pull。
+fn netCasPersistDiscoveredEndpoints(store: str, discovered: str[]) =
+    let path = store + "/discovered_endpoints.txt"
+    var existing: str[]
+    if os.FileExists(path):
+        let rr = os.ReadFileResult(path)
+        if !IsErr(rr):
+            let lines = strutil.Split(Value(rr), '\n')
+            for i in 0..<lines.len:
+                let ep = strutil.Strip(lines[i])
+                if ep != "":
+                    add(existing, ep)
+    for d in 0..<discovered.len:
+        var seen: bool = false
+        for e in 0..<existing.len:
+            if existing[e] == discovered[d]:
+                seen = true
+        if !seen:
+            add(existing, discovered[d])
+    let body = strutil.Join(existing, "\n")
+    var wrote: Result[bool] = os.WriteFileResult(path, body)
+    if IsErr(wrote):
+        netCasPrintErr("net fetch-head: 发现集持久化失败 (源侧候选扩宽, 非致命): " + Error(wrote))
+
+# fetch-head: channelId → head (OR-liveness) → 先取撤销闸 (撤销并集, 任一命中即硬拒) → 写 headCid。
+# head.headCid 是整依赖集 manifest 的 cid (Merkle 根)。写 <store>/heads/<channelHex>.headcid 供
+# 编译器侧子进程读回。生产纪律: 无 peer / channel 非法 / 无 head / 验签败 / 撤销命中 = 硬错非零退出。
+fn runNetCasFetchHead(): int32 =
+    let channelHex: str = netCasPositional(1)
+    let store: str = cmdline.ReadFlagOrDefault("--store", "")
+    let bootstrap: str = cmdline.ReadFlagOrDefault("--bootstrap", "")
+    let fromArg: str = cmdline.ReadFlagOrDefault("--from", "")
+    let keysArg: str = cmdline.ReadFlagOrDefault("--keys", "")
+    let serverName: str = cmdline.ReadFlagOrDefault("--server-name", "localhost")
+    if channelHex == "":
+        netCasPrintErr("net fetch-head: 缺 channelIdHex (fetch-head <channelIdHex> ...)")
+        return 2
+    if store == "":
+        netCasPrintErr("net fetch-head: --store <dir> 必填")
+        return 2
+    var cidRes: Result[layout.FixedBytes32] = layout.FixedBytes32FromHex(channelHex)
+    if IsErr(cidRes):
+        netCasPrintErr("net fetch-head: channelIdHex 非法: " + channelHex + " (" + Error(cidRes) + ")")
+        return 2
+    let channelId = Value(cidRes)
+    # ★ C1 (安全红线): staticPeers = consumer-pin 的静态 CHENG_CAS_BOOTSTRAP 集, 【只】它进撤销 UNION;
+    #   快照发现的 endpoint 只并入 head/源 liveness-OR (headPeers), 绝不碰 staticPeers/撤销 UNION。
+    let staticPeers = netCasParsePeerList(bootstrap, fromArg)
+    if staticPeers.len == 0:
+        netCasPrintErr("net fetch-head: 无 bootstrap peer (--bootstrap 列表或 --from 单项 必填)")
+        return 2
+    # ①-pre 发现层 (P5-S2, fail-open): 向 pinned 根 (--keys 或 CHENG_CAS_BOOTSTRAP_KEYS) 取签名快照,
+    #   验签 + 单调 epoch 过滤后, 把该 channelId 的 endpoint 并入 headPeers (只扩 head/源, 不扩撤销)。
+    var pinnedKeys: str[] = fetchenv.CasFetchEnvParsePeers(keysArg)
+    if pinnedKeys.len == 0:
+        pinnedKeys = fetchenv.CasFetchEnvSnapshotKeys()
+    var headPeers = staticPeers
+    var discoverRes: Result[str[]] = fetchenv.CasFetchEnvDiscoverEndpoints(store, serverName, staticPeers, pinnedKeys, channelId)
+    if IsErr(discoverRes):
+        netCasPrintErr("net fetch-head: 快照发现配置错 (硬拒): " + Error(discoverRes))
+        return 1
+    let discovered = Value(discoverRes)
+    for di in 0..<discovered.len:
+        add(headPeers, discovered[di])
+    if discovered.len > 0:
+        echo("net fetch-head: 快照发现 " + IntToStr(discovered.len) + " 个 endpoint 并入 head/源候选 (撤销 UNION 不受影响)")
+        # P5-S2 源侧接线: 把发现集持久化到 <store>/discovered_endpoints.txt, 供编译器进程的
+        # cas_fetch_subprocess.CasSubprocessDiscoveredPeers 读回, 扩宽源/manifest 取物 OR 候选 (与 head 同构)。
+        # ★C1: 此文件【只】喂源/manifest pull; 本命令的撤销 UNION 实参恒用 staticPeers (下方 :317), 与本文件零交集。
+        netCasPersistDiscoveredEndpoints(store, discovered)
+    # ① head OR-liveness (headPeers = 静态 ∪ 快照发现)
+    var record: head.ChannelHeadRecord
+    var headRes: Result[bool] = netCasFetchHeadOverPeers(headPeers, serverName, channelId, record)
+    if IsErr(headRes):
+        netCasPrintErr("net fetch-head: " + Error(headRes))
+        return 1
+    # ② 先取撤销闸 (撤销并集, safety UNION): head signer 被撤销 → 硬拒 (取不到撤销状态 fail-closed)。
+    #   ★ C1: 撤销 UNION 恒用 staticPeers (未被快照扩大), 防作恶根注入撤销-miss 票压制撤销。
+    var signerRes: Result[layout.FixedBytes32] = layout.FixedBytes32FromBytes(record.signerPubKey)
+    if IsErr(signerRes):
+        netCasPrintErr("net fetch-head: signerPubKey 非 32B (" + Error(signerRes) + ")")
+        return 1
+    let signerKey = Value(signerRes)
+    var revoked: bool = false
+    var revRes: Result[bool] = hq.Libp2pHostQuicFetchRevocationUnion(staticPeers, serverName, store, channelId, signerKey, revoked)
+    if IsErr(revRes):
+        netCasPrintErr("net fetch-head: 撤销并集查询失败 (fail-closed): " + Error(revRes))
+        return 1
+    if revoked:
+        netCasPrintErr("net fetch-head: signer 已被撤销 (撤销并集命中, 硬拒) channel=" + channelHex)
+        return 1
+    # ③ 持久 pin 裁决 + admit (P5 收口, 序照 P3 "撤销闸 → TofuAdmit" 先例): 换钥/跨会话 epoch 回滚/
+    #   同 epoch 分叉在此硬拒 (rc=1, pin 与 .headcid 零写); 首用即钉; epoch 前进原子重写; 幂等重取不动盘。
+    #   ★ 不放进 OR-liveness per-peer 环: 环内跨 dial 调 head_pin 触发 stage3 cold-hybrid miscompile
+    #   (撤销腿 TLS x509 读坏点, 见 netCasFetchHeadOverPeers 头注), 且 P3 先例本就是闸后 admit。
+    var pinAdmitRes: Result[bool] = headpin.ChannelHeadPinAdmit(store, record)
+    if IsErr(pinAdmitRes):
+        netCasPrintErr("net fetch-head: " + Error(pinAdmitRes))
+        return 1
+    # ④ 输出 headCid → <store>/heads/<channelHex>.headcid (内容缓存, 与 .pin 信任状态职责分离)
+    let headCidHex: str = layout.FixedBytes32Hex(record.headCid)
+    os.MkdirAll(store + "/heads", 493)
+    let headOut: str = store + "/heads/" + channelHex + ".headcid"
+    var wr: Result[bool] = os.WriteFileResult(headOut, headCidHex)
+    if IsErr(wr):
+        netCasPrintErr("net fetch-head: headCid 写出失败: " + Error(wr))
+        return 1
+    echo("net fetch-head: channel=" + channelHex + " headCid=" + headCidHex)
+    echo("net fetch-head: pin-file -> " + headpin.ChannelHeadPinPath(store, channelHex) + " epoch=" + strings.Int64ToStr(record.epoch))
+    echo("net fetch-head: headcid-file -> " + headOut)
+    return 0
+
+# 服务面清单解析: 每非空行 = "<channelIdHex> <host:port>" (空白分隔)。畸形行硬 Err (无兜底跳过)。
+fn netCasParseSnapshotEntries(manifestPath: str, outEntries: var pset.ProviderSetEntry[]): Result[bool] =
+    if !os.FileExists(manifestPath):
+        return Err[bool]("snapshot-sign: 服务面清单不存在: " + manifestPath)
+    var readRes: Result[str] = os.ReadFileResult(manifestPath)
+    if IsErr(readRes):
+        return Err[bool]("snapshot-sign: 读服务面清单失败: " + Error(readRes))
+    let lines = strutil.Split(Value(readRes), '\n')
+    for i in 0..<lines.len:
+        let line = strutil.Strip(lines[i])
+        if line == "":
+            continue
+        let toks = strutil.SplitWhitespace(line)
+        if toks.len != 2:
+            return Err[bool]("snapshot-sign: 清单行须为 '<channelIdHex> <host:port>': " + line)
+        let channelHex = strutil.Strip(toks[0])
+        let endpoint = strutil.Strip(toks[1])
+        var cidRes: Result[layout.FixedBytes32] = layout.FixedBytes32FromHex(channelHex)
+        if IsErr(cidRes):
+            return Err[bool]("snapshot-sign: channelIdHex 非法: " + channelHex + " (" + Error(cidRes) + ")")
+        let parts = strutil.Split(endpoint, ':')
+        if parts.len != 2:
+            return Err[bool]("snapshot-sign: endpoint 须为 host:port 形: " + endpoint)
+        var entry: pset.ProviderSetEntry
+        entry.channelId = Value(cidRes)
+        entry.endpoint = endpoint
+        add(outEntries, entry)
+    return Ok[bool](true)
+
+# snapshot-sign: 根私钥 + 服务面清单 → 0x50 签名 provider-set 快照 → 落 provider_snapshots/<signerHex>。
+# 生产纪律: 私钥/清单非法 / 签名/自检验签失败 / 落盘失败 = 硬错非零退出。
+fn runNetCasSnapshotSign(): int32 =
+    let store: str = cmdline.ReadFlagOrDefault("--store", "")
+    let privHex: str = cmdline.ReadFlagOrDefault("--priv-hex", "")
+    let entriesPath: str = cmdline.ReadFlagOrDefault("--entries", "")
+    let epochRaw: str = cmdline.ReadFlagOrDefault("--epoch", "")
+    if store == "":
+        netCasPrintErr("net snapshot-sign: --store <dir> 必填")
+        return 2
+    if privHex == "":
+        netCasPrintErr("net snapshot-sign: --priv-hex <128hex seed||pub> 必填")
+        return 2
+    if entriesPath == "":
+        netCasPrintErr("net snapshot-sign: --entries <manifest> 必填")
+        return 2
+    var epoch: int64 = 0
+    if parseutils.parseInt64(strutil.Strip(epochRaw), epoch) <= 0:
+        netCasPrintErr("net snapshot-sign: --epoch 非法整数: " + epochRaw)
+        return 2
+    if epoch <= int64(0):
+        netCasPrintErr("net snapshot-sign: --epoch 须 > 0 (0 为首见基线, 快照 epoch 从 1 起): " + strings.Int64ToStr(epoch))
+        return 2
+    var priv: Bytes = rawbytes.BytesFromHex(privHex)
+    if BytesLen(priv) != 64:
+        netCasPrintErr("net snapshot-sign: --priv-hex 须 64B (128 hex, seed||pub), 实得 " + IntToStr(BytesLen(priv)) + "B")
+        return 2
+    let signerPubKey: Bytes = BytesSlice(priv, 32, 32)
+    var entries: pset.ProviderSetEntry[]
+    var parseRes: Result[bool] = netCasParseSnapshotEntries(entriesPath, entries)
+    if IsErr(parseRes):
+        netCasPrintErr("net snapshot-sign: " + Error(parseRes))
+        return 1
+    if entries.len == 0:
+        netCasPrintErr("net snapshot-sign: 服务面清单为空 (无 entry 可签)")
+        return 1
+    var signRes: Result[pset.ProviderSetRecord] = pset.ProviderSetSign(priv, signerPubKey, epoch, entries)
+    if IsErr(signRes):
+        netCasPrintErr("net snapshot-sign: 签名失败: " + Error(signRes))
+        return 1
+    var rec = Value(signRes)
+    if !pset.ProviderSetVerify(rec):
+        netCasPrintErr("net snapshot-sign: 自检验签失败 (真 ed25519 sign→verify 不闭合)")
+        return 1
+    var encRes: Result[Bytes] = pset.ProviderSetEncode(rec)
+    if IsErr(encRes):
+        netCasPrintErr("net snapshot-sign: 编码失败: " + Error(encRes))
+        return 1
+    var wire = Value(encRes)
+    let signerHex: str = rawbytes.BytesToHex(signerPubKey)
+    var putRes: Result[bool] = pstore.ProviderSnapshotStorePutWire(store, signerHex, wire)
+    if IsErr(putRes):
+        netCasPrintErr("net snapshot-sign: 落盘失败: " + Error(putRes))
+        return 1
+    echo("net snapshot-sign: signer=" + signerHex + " epoch=" + strings.Int64ToStr(epoch) + " entries=" + IntToStr(entries.len) + " bytes=" + IntToStr(BytesLen(wire)))
+    echo("net snapshot-sign: stored -> " + pstore.ProviderSnapshotStorePath(store, signerHex))
+    return 0
+
+# snapshot-serve: 起统一 CAS 服务 (Libp2pHostQuicServeCasUnified), 应答 SNAPSHOT_REQ (0x25) 等动词。
+# store 须已含该根的快照 (先跑 snapshot-sign)。写 ready-file 端口, serve N 请求后退出。
+fn runNetCasSnapshotServe(): int32 =
+    let store: str = cmdline.ReadFlagOrDefault("--store", "")
+    let host: str = cmdline.ReadFlagOrDefault("--host", "127.0.0.1")
+    let port: int32 = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    let readyFile: str = cmdline.ReadFlagOrDefault("--ready-file", "")
+    let serveCount: int32 = cmdline.ReadInt32FlagOrDefault("--serve-count", 1)
+    let waitMs: int32 = cmdline.ReadInt32FlagOrDefault("--wait-ms", 20000)
+    if store == "":
+        netCasPrintErr("net snapshot-serve: --store <dir> 必填")
+        return 2
+    if readyFile == "":
+        netCasPrintErr("net snapshot-serve: --ready-file <path> 必填 (跨进程端口握手)")
+        return 2
+    echo("net snapshot-serve: serving " + host + ":" + IntToStr(port) + " store=" + store + " ready-file=" + readyFile + " serve-count=" + IntToStr(serveCount))
+    var serveRes: Result[int32] = hq.Libp2pHostQuicServeCasUnified(host,
+                                                                    port,
+                                                                    "localhost",
+                                                                    store,
+                                                                    readyFile,
+                                                                    serveCount,
+                                                                    waitMs)
+    if IsErr(serveRes):
+        netCasPrintErr("net snapshot-serve: serve 失败: " + Error(serveRes))
+        return 1
+    echo("net snapshot-serve: served " + IntToStr(Value(serveRes)) + " request(s) ok")
+    return 0
+
+# snapshot-fetch: fresh node 消费面冒烟。向 pinned 根 (--keys) 从静态 peer (--bootstrap) 取签名快照 →
+# 验签 + 请求绑定 + 单调 epoch admit → 打印【该 channelId 发现的 endpoint 集】。展示 P5-S2 消费闭环。
+# ★ C1: 本命令只产出发现集 (head/源候选), 不触撤销 UNION。
+fn runNetCasSnapshotFetch(): int32 =
+    let channelHex: str = netCasPositional(1)
+    let store: str = cmdline.ReadFlagOrDefault("--store", "")
+    let bootstrap: str = cmdline.ReadFlagOrDefault("--bootstrap", "")
+    let keysArg: str = cmdline.ReadFlagOrDefault("--keys", "")
+    let serverName: str = cmdline.ReadFlagOrDefault("--server-name", "localhost")
+    if channelHex == "":
+        netCasPrintErr("net snapshot-fetch: 缺 channelIdHex (snapshot-fetch <channelIdHex> ...)")
+        return 2
+    if store == "":
+        netCasPrintErr("net snapshot-fetch: --store <dir> 必填")
+        return 2
+    if bootstrap == "":
+        netCasPrintErr("net snapshot-fetch: --bootstrap <host:port,...> 必填")
+        return 2
+    if keysArg == "":
+        netCasPrintErr("net snapshot-fetch: --keys <pubHex,...> 必填 (pinned 根 pubkey)")
+        return 2
+    var cidRes: Result[layout.FixedBytes32] = layout.FixedBytes32FromHex(channelHex)
+    if IsErr(cidRes):
+        netCasPrintErr("net snapshot-fetch: channelIdHex 非法: " + channelHex + " (" + Error(cidRes) + ")")
+        return 2
+    let channelId = Value(cidRes)
+    let staticPeers = fetchenv.CasFetchEnvParsePeers(bootstrap)
+    let pinnedKeys = fetchenv.CasFetchEnvParsePeers(keysArg)
+    var discoverRes: Result[str[]] = fetchenv.CasFetchEnvDiscoverEndpoints(store, serverName, staticPeers, pinnedKeys, channelId)
+    if IsErr(discoverRes):
+        netCasPrintErr("net snapshot-fetch: 发现配置错 (硬拒): " + Error(discoverRes))
+        return 1
+    let discovered = Value(discoverRes)
+    echo("net snapshot-fetch: channel=" + channelHex + " pinned-keys=" + IntToStr(pinnedKeys.len) + " static-peers=" + IntToStr(staticPeers.len) + " discovered-endpoints=" + IntToStr(discovered.len))
+    for i in 0..<discovered.len:
+        echo("net snapshot-fetch: discovered-endpoint[" + IntToStr(i) + "]=" + discovered[i])
+    return 0
+
+fn main(): int32 =
+    let sub: str = netCasPositional(0)
+    if sub == "push":
+        return runNetCasPush()
+    if sub == "pull":
+        return runNetCasPull()
+    if sub == "fetch-head":
+        return runNetCasFetchHead()
+    if sub == "snapshot-sign":
+        return runNetCasSnapshotSign()
+    if sub == "snapshot-serve":
+        return runNetCasSnapshotServe()
+    if sub == "snapshot-fetch":
+        return runNetCasSnapshotFetch()
+    netCasPrintErr(netCasUsage())
+    if sub == "":
+        netCasPrintErr("net_cas_cli: 缺子命令 (push|pull|fetch-head|snapshot-sign|snapshot-serve|snapshot-fetch)")
+    else:
+        netCasPrintErr("net_cas_cli: 未知子命令: " + sub)
+    return 2

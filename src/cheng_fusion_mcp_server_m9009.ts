@@ -4,7 +4,7 @@
 // (./cheng_fusion_tool_registry.ts) instead of filtering the full claude-code
 // builtin tool registry (../artifact/builtin_tool_registry_m4623.ts) by name
 // prefix "cheng_". Behavior (tool list, order, schemas, dispatch) is unchanged.
-import {getChengFusionToolManifest, getChengFusionTools as getAllChengFusionTools, initChengFusionToolRegistryModule} from "./cheng_fusion_tool_registry.ts";
+import {getChengFusionToolManifest, loadAllChengFusionTools, resolveChengFusionTool} from "./cheng_fusion_tool_registry.ts";
 import {setChengProjectRootHints,withChengInvocationContext,zodToJsonSchema} from "./cheng_toolkit_m9000.ts";
 import {JSON_RPC_MAX_FRAME_BYTES,JsonRpcFrameDecoder} from "./json_rpc_frame_decoder.ts";
 import {randomBytes} from "node:crypto";
@@ -16,9 +16,22 @@ let mcpClientCanListRoots = false;
 let mcpRuntimeSessionIdentity = null;
 const chengMutatingTools = new Set(["cheng_csg_roundtrip", "cheng_profile_report", "cheng_exec_diff", "cheng_zc_census", "cheng_crash_triage", "cheng_corrupt_hunt", "cheng_shape_matrix", "cheng_ignition_chain", "cheng_residual_peel", "cheng_fixture_matrix", "cheng_regalloc_preflight", "cheng_semantic_snapshot_audit", "cheng_driver_frontier_probe"]);
 
-function getChengFusionTools() {
-  initChengFusionToolRegistryModule();
-  return getAllChengFusionTools();
+// tools/list 的四元组(name/description/schema/annotations)在一次进程生命周期内是静态的:
+// 注册表初始化即拒绝重复名,zod schema 与变更标注均不随请求变化。缓存避免每次 tools/list
+// 对全部 25 个工具重跑 zodToJsonSchema + 异步 description。
+const toolsListCache = new Map();
+
+async function buildToolListEntry(tool) {
+  const cached = toolsListCache.get(tool.name);
+  if (cached) return cached;
+  const entry = {
+    name: tool.name,
+    description: await describeTool(tool),
+    inputSchema: zodToJsonSchema(tool.inputSchema),
+    annotations: {readOnlyHint: !chengMutatingTools.has(tool.name)}
+  };
+  toolsListCache.set(tool.name, entry);
+  return entry;
 }
 
 async function describeTool(tool) {
@@ -160,7 +173,6 @@ async function handleMcpRequest(message, transportContext = {}) {
     }
     updateMcpClientCapabilities(message.params);
     updateMcpWorkspaceRoots(message.params);
-    initChengFusionToolRegistryModule();
     const requestedNonce = message.params?._meta?.chengFusionRuntimeNonce;
     const initializationNonce =
       typeof requestedNonce === "string" && /^[0-9a-f]{64}$/.test(requestedNonce)
@@ -183,12 +195,7 @@ async function handleMcpRequest(message, transportContext = {}) {
   }
   if (message.method === "ping") return {};
   if (message.method === "tools/list") {
-    const tools = await Promise.all(getChengFusionTools().map(async (tool) => ({
-      name: tool.name,
-      description: await describeTool(tool),
-      inputSchema: zodToJsonSchema(tool.inputSchema),
-      annotations: {readOnlyHint: !chengMutatingTools.has(tool.name)}
-    })));
+    const tools = await Promise.all((await loadAllChengFusionTools()).map(buildToolListEntry));
     return {tools};
   }
   if (message.method === "tools/call") {
@@ -199,7 +206,7 @@ async function handleMcpRequest(message, transportContext = {}) {
     if (sourceDrift) {
       return bindToolResponseToMcpRuntime({isError: true, content: [{type: "text", text: JSON.stringify(sourceDrift, null, 2)}]});
     }
-    const tool = getChengFusionTools().find((candidate) => candidate.name === name);
+    const tool = await resolveChengFusionTool(typeof name === "string" ? name : null);
     if (!tool) throw Object.assign(new Error(`Cheng fusion tool not found: ${name}`), {code: -32602});
     const rawArguments = message.params?.arguments === undefined ? {} : message.params.arguments;
     if (rawArguments === null || typeof rawArguments !== "object" || Array.isArray(rawArguments)) {
@@ -303,6 +310,14 @@ function writeToStreamWithBackpressure(stream, text) {
 async function startChengFusionMcpServer(stdin = process.stdin, stdout = process.stdout, stderr = process.stderr) {
   const maxQueuedClientMessages = 32;
   const maxQueuedClientBytes = JSON_RPC_MAX_FRAME_BYTES;
+  // 只读工具并发上限: 慢只读调用(如 lsp/driver 型)不再阻塞后续只读查询;
+  // 变更类工具永远单飞, 不受此值影响。
+  const maxConcurrentReadOnlyToolCalls = 4;
+  let activeReadOnlyToolCalls = 0;
+  // 在飞帧计数/字节: 消息一旦出队进入执行即记账于此。入队上限按「排队+在飞」总量判定,
+  // 否则并发出队会把洪泛从硬拒变成无界放行(P3 探针回归实证)。
+  let inFlightMessageCount = 0;
+  let inFlightFrameBytes = 0;
   const highWaterMessages = 8;
   const lowWaterMessages = 4;
   const highWaterBytes = 8 * 1024 * 1024;
@@ -311,7 +326,6 @@ async function startChengFusionMcpServer(stdin = process.stdin, stdout = process
   const pendingServerRequests = new Map();
   const queuedClientMessages = [];
   let queuedClientBytes = 0;
-  let processingClientMessage = false;
   let inputPaused = false;
   let inputEnded = false;
   let inputEndReason = "stdin ended";
@@ -384,14 +398,14 @@ async function startChengFusionMcpServer(stdin = process.stdin, stdout = process
 
   function maybeFinishAfterInputEnd() {
     if (!inputEnded || shuttingDown || gracefulDrainInFlight) return;
-    if (processingClientMessage || queuedClientMessages.length > 0 || pendingServerRequests.size > 0) return;
+    if (activeReadOnlyToolCalls > 0 || queuedClientMessages.length > 0 || pendingServerRequests.size > 0) return;
     gracefulDrainInFlight = true;
     const observedOutputTail = outputTail;
     observedOutputTail.then(() => {
       gracefulDrainInFlight = false;
       if (shuttingDown) return;
       if (
-        processingClientMessage
+        activeReadOnlyToolCalls > 0
         || queuedClientMessages.length > 0
         || pendingServerRequests.size > 0
         || outputTail !== observedOutputTail
@@ -477,18 +491,54 @@ async function startChengFusionMcpServer(stdin = process.stdin, stdout = process
     }
   }
 
-  async function pumpClientMessages() {
-    if (processingClientMessage || shuttingDown) return;
-    processingClientMessage = true;
+  function messageEligibleForConcurrentExecution(message) {
+    // 只并发"被注册表标注为只读的 tools/call"。写类工具、通知、initialize/list 与未知方法一律
+    // 走单队列严格按到达序执行 —— 变更语义绝不并发。
+    if (message?.method !== "tools/call") return false;
+    const name = message.params?.name;
+    if (typeof name !== "string" || chengMutatingTools.has(name)) return false;
+    return true;
+  }
+
+  let schedulingClientWork = false;
+  function scheduleClientWork() {
+    if (schedulingClientWork || shuttingDown) return;
+    schedulingClientWork = true;
     try {
-      while (!shuttingDown && queuedClientMessages.length > 0) {
-        const next = queuedClientMessages.shift();
-        queuedClientBytes -= next.frameBytes;
+      while (!shuttingDown && queuedClientMessages.length > 0 && activeReadOnlyToolCalls < maxConcurrentReadOnlyToolCalls) {
+        // 只取队首: 队首是可并发读则并发发射并继续; 队首是变更件/其它方法即停 —— 保序规则:
+        // 变更件的执行必须等所有先到者结束, 后到的读也不许越过已排队变更(防饿死变更与写后读竞态)。
+        if (!messageEligibleForConcurrentExecution(queuedClientMessages[0].message)) break;
+        const entry = queuedClientMessages.shift();
+        queuedClientBytes -= entry.frameBytes;
+        inFlightMessageCount++;
+        inFlightFrameBytes += entry.frameBytes;
+        activeReadOnlyToolCalls++;
         updateInputFlow();
-        await processClientMessage(next.message);
+        processClientMessage(entry.message).catch(() => {}).finally(() => {
+          activeReadOnlyToolCalls--;
+          inFlightMessageCount--;
+          inFlightFrameBytes -= entry.frameBytes;
+          scheduleClientWork();
+          maybeFinishAfterInputEnd();
+        });
+      }
+      if (!shuttingDown && queuedClientMessages.length > 0 && activeReadOnlyToolCalls === 0) {
+        // 严格串行路径: 队首必然是非并发件, 同步推进一条再由其 finally 续泵。
+        const entry = queuedClientMessages.shift();
+        queuedClientBytes -= entry.frameBytes;
+        inFlightMessageCount++;
+        inFlightFrameBytes += entry.frameBytes;
+        updateInputFlow();
+        void Promise.resolve(processClientMessage(entry.message)).catch(() => {}).finally(() => {
+          inFlightMessageCount--;
+          inFlightFrameBytes -= entry.frameBytes;
+          scheduleClientWork();
+          maybeFinishAfterInputEnd();
+        });
       }
     } finally {
-      processingClientMessage = false;
+      schedulingClientWork = false;
       updateInputFlow();
       maybeFinishAfterInputEnd();
     }
@@ -500,15 +550,16 @@ async function startChengFusionMcpServer(stdin = process.stdin, stdout = process
     const frameBytes = Number.isSafeInteger(frame.frameBytes) && frame.frameBytes >= 0
       ? frame.frameBytes
       : Buffer.byteLength(JSON.stringify(message), "utf8");
-    if (queuedClientMessages.length >= maxQueuedClientMessages || queuedClientBytes + frameBytes > maxQueuedClientBytes) {
+    if (
+      queuedClientMessages.length + inFlightMessageCount >= maxQueuedClientMessages
+      || queuedClientBytes + inFlightFrameBytes + frameBytes > maxQueuedClientBytes
+    ) {
       throw new Error(`MCP input request queue exceeded its bound (${maxQueuedClientMessages} messages / ${maxQueuedClientBytes} bytes)`);
     }
     queuedClientMessages.push({message, frameBytes});
     queuedClientBytes += frameBytes;
     updateInputFlow();
-    pumpClientMessages().catch((error) => {
-      fatalExit(error);
-    });
+    scheduleClientWork();
   }
 
   const onData = createMessageReader(enqueueClientMessage, (error) => {

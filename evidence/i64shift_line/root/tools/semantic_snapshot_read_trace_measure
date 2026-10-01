@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""Run one real workload under DTrace/strace and freeze its raw read evidence."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+from pathlib import Path
+import platform
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+_READ_TRACE_NAME = "semantic_snapshot_read_trace_parser"
+_READ_TRACE_PATH = Path(__file__).resolve().with_name(_READ_TRACE_NAME)
+_READ_TRACE_LOADER = importlib.machinery.SourceFileLoader(
+    _READ_TRACE_NAME, str(_READ_TRACE_PATH))
+_READ_TRACE_SPEC = importlib.util.spec_from_loader(
+    _READ_TRACE_NAME, _READ_TRACE_LOADER)
+if _READ_TRACE_SPEC is None:
+    raise RuntimeError("semantic snapshot read trace parser cannot be loaded")
+_READ_TRACE_MODULE = importlib.util.module_from_spec(_READ_TRACE_SPEC)
+sys.modules[_READ_TRACE_NAME] = _READ_TRACE_MODULE
+_READ_TRACE_LOADER.exec_module(_READ_TRACE_MODULE)
+
+from semantic_snapshot_read_trace_parser import (
+    DARWIN_DTRACE_PROGRAM,
+    DARWIN_METHOD,
+    LINUX_METHOD,
+    LINUX_TRACE_FILTER,
+    argv_digest,
+    canonical_json_bytes,
+    is_sha256,
+    parse_read_trace,
+    receipt_cid,
+    sha256_bytes,
+    trace_contract_sha256,
+)
+
+
+MISSING_EXIT = 3
+ERROR_EXIT = 4
+
+
+class CollectionError(RuntimeError):
+    pass
+
+
+def _stable_regular(path: Path, label: str) -> tuple[bytes, os.stat_result]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise CollectionError(f"{label} is not a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity_fields = ("st_dev", "st_ino", "st_mode", "st_size",
+                       "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field)
+           for field in identity_fields):
+        raise CollectionError(f"{label} changed while hashing")
+    path_after = path.stat(follow_symlinks=False)
+    if any(getattr(before, field) != getattr(path_after, field)
+           for field in identity_fields):
+        raise CollectionError(f"{label} path identity changed")
+    raw = b"".join(chunks)
+    if len(raw) != before.st_size:
+        raise CollectionError(f"{label} size changed while hashing")
+    return raw, before
+
+
+def _resolve_executable(value: str, label: str) -> Path:
+    resolved = value if "/" in value else (shutil.which(value) or "")
+    if not resolved:
+        raise FileNotFoundError(f"{label} executable is unavailable")
+    path = Path(resolved).resolve()
+    if not path.is_absolute():
+        raise CollectionError(f"{label} path is not absolute")
+    _stable_regular(path, label)
+    if not os.access(path, os.X_OK):
+        raise CollectionError(f"{label} is not executable")
+    return path
+
+
+def _exclusive_write(path: Path, raw: bytes) -> None:
+    if path.is_symlink() or path.exists():
+        raise CollectionError(f"output already exists: {path}")
+    parent = path.parent.resolve()
+    if not parent.is_dir() or stat.S_IMODE(parent.stat().st_mode) & 0o077:
+        raise CollectionError(f"output parent is not a private directory: {parent}")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                raise CollectionError("short output write")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _canonical_output(path: Path, label: str) -> Path:
+    absolute = path.absolute()
+    if not absolute.name or absolute.name in (".", ".."):
+        raise CollectionError(f"{label} basename is invalid")
+    absolute.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent = absolute.parent.resolve()
+    if not parent.is_dir() or stat.S_IMODE(parent.stat().st_mode) & 0o077:
+        raise CollectionError(f"{label} parent is not a private directory")
+    return parent / absolute.name
+
+
+def _status_receipt(args: argparse.Namespace, status: str, reason: str) -> bytes:
+    return canonical_json_bytes({
+        "schema": "cheng.semantic_snapshot.read_trace_collection_status",
+        "status": status,
+        "reason": reason,
+        "sample_index": args.sample_index,
+        "workload_kind": args.workload_kind,
+        "platform": platform.system().lower(),
+    })
+
+
+def _publish_failure(args: argparse.Namespace, status: str, reason: str) -> None:
+    try:
+        _exclusive_write(args.receipt_out, _status_receipt(args, status, reason))
+    except (CollectionError, OSError):
+        pass
+    print(f"semantic_snapshot_read_trace_status={status}", file=sys.stderr)
+    print(f"semantic_snapshot_read_trace_reason={reason}", file=sys.stderr)
+
+
+def _validate_identity_arguments(args: argparse.Namespace) -> None:
+    for field in ("trace_sha256", "source_manifest_sha256", "compiler_sha256",
+                  "toolchain_manifest_sha256"):
+        if not is_sha256(getattr(args, field)):
+            raise CollectionError(f"{field} is not SHA-256")
+    if args.sample_index < 0 or not args.workload_kind or \
+       "\x00" in args.workload_kind or not args.target or "\x00" in args.target:
+        raise CollectionError("sample or workload identity is invalid")
+    if args.raw_out.absolute() == args.receipt_out.absolute():
+        raise CollectionError("raw and receipt outputs must differ")
+
+
+def _linux_trace_argv(tool: Path, raw: Path,
+                      command: list[str]) -> list[str]:
+    return [str(tool), "-f", "-qq", "-e", LINUX_TRACE_FILTER,
+            "-e", "signal=none", "-o", str(raw), "--", *command]
+
+
+def _darwin_trace_argv(tool: Path, script: Path, raw: Path,
+                       command: list[str]) -> list[str]:
+    return [str(tool), "-q", "-s", str(script), "-o", str(raw),
+            "-c", shlex.join(command)]
+
+
+def _darwin_preflight(tool: Path, script: Path) -> bool:
+    script.write_text(DARWIN_DTRACE_PROGRAM, encoding="utf-8")
+    try:
+        completed = subprocess.run(
+            [str(tool), "-q", "-e", "-s", str(script), "-p", str(os.getpid())],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, timeout=10, check=False)
+    except subprocess.TimeoutExpired as exc:
+        if exc.stderr:
+            sys.stderr.buffer.write(exc.stderr)
+        return False
+    if completed.returncode != 0:
+        sys.stderr.buffer.write(completed.stderr)
+        return False
+    return True
+
+
+def _method_and_tool() -> tuple[str, Path]:
+    system = platform.system()
+    if system == "Darwin":
+        return DARWIN_METHOD, _resolve_executable("/usr/sbin/dtrace", "dtrace")
+    if system == "Linux":
+        return LINUX_METHOD, _resolve_executable("strace", "strace")
+    raise FileNotFoundError("DTrace/strace is unavailable on this platform")
+
+
+def collect(args: argparse.Namespace) -> int:
+    _validate_identity_arguments(args)
+    args.raw_out = _canonical_output(args.raw_out, "raw output")
+    args.receipt_out = _canonical_output(args.receipt_out, "receipt output")
+    if args.raw_out == args.receipt_out:
+        raise CollectionError("raw and receipt outputs must differ")
+    if args.raw_out.exists() or args.raw_out.is_symlink() or \
+       args.receipt_out.exists() or args.receipt_out.is_symlink():
+        raise CollectionError("measurement output path already exists")
+    command_path = _resolve_executable(args.command[0], "measured command")
+    command = [str(command_path), *args.command[1:]]
+    command_raw_before, command_stat_before = _stable_regular(
+        command_path, "measured command")
+    command_sha256 = sha256_bytes(command_raw_before)
+    command_argv_cid = argv_digest(command)
+    try:
+        method, trace_tool = _method_and_tool()
+    except FileNotFoundError as exc:
+        _publish_failure(args, "MISSING", str(exc))
+        return MISSING_EXIT
+    tool_raw_before, tool_stat_before = _stable_regular(trace_tool, "trace tool")
+    trace_tool_sha256 = sha256_bytes(tool_raw_before)
+
+    with tempfile.TemporaryDirectory(
+            prefix=".semantic-read-trace.", dir=args.raw_out.parent) as temporary:
+        temporary_root = Path(temporary)
+        os.chmod(temporary_root, 0o700)
+        raw_temporary = temporary_root / "raw.trace"
+        script_temporary = temporary_root / "read-trace.d"
+        if method == DARWIN_METHOD:
+            if not _darwin_preflight(trace_tool, script_temporary):
+                _publish_failure(args, "MISSING", "dtrace_permission_or_provider_unavailable")
+                return MISSING_EXIT
+            trace_argv = _darwin_trace_argv(
+                trace_tool, script_temporary, raw_temporary, command)
+        else:
+            trace_argv = _linux_trace_argv(trace_tool, raw_temporary, command)
+        completed = subprocess.run(
+            trace_argv, stdin=None, stdout=None, stderr=subprocess.PIPE, check=False)
+        if completed.stderr:
+            sys.stderr.buffer.write(completed.stderr)
+        if completed.returncode != 0:
+            diagnostic_lines = completed.stderr.lower().splitlines()
+            permission_failure = any(
+                line.startswith((b"dtrace:", b"strace:")) and any(
+                    token in line for token in (
+                        b"operation not permitted", b"permission denied",
+                        b"requires additional privileges", b"failed to initialize dtrace",
+                        b"ptrace"))
+                for line in diagnostic_lines)
+            status = "MISSING" if permission_failure else "RED"
+            _publish_failure(
+                args, status,
+                "trace_permission_unavailable" if permission_failure else
+                f"trace_or_workload_failed_rc_{completed.returncode}")
+            return MISSING_EXIT if permission_failure else ERROR_EXIT
+        if not raw_temporary.is_file() or raw_temporary.is_symlink():
+            raise CollectionError("trace tool did not create raw evidence")
+        raw_trace, raw_stat = _stable_regular(raw_temporary, "raw read trace")
+        if raw_stat.st_nlink != 1:
+            raise CollectionError("raw read trace is linked")
+        counts = parse_read_trace(raw_trace, method)
+
+        command_raw_after, command_stat_after = _stable_regular(
+            command_path, "measured command")
+        tool_raw_after, tool_stat_after = _stable_regular(trace_tool, "trace tool")
+        identity_fields = ("st_dev", "st_ino", "st_mode", "st_size",
+                           "st_mtime_ns", "st_ctime_ns")
+        if command_raw_after != command_raw_before or any(
+                getattr(command_stat_after, field) != getattr(command_stat_before, field)
+                for field in identity_fields):
+            raise CollectionError("measured command identity drifted")
+        if tool_raw_after != tool_raw_before or any(
+                getattr(tool_stat_after, field) != getattr(tool_stat_before, field)
+                for field in identity_fields):
+            raise CollectionError("trace tool identity drifted")
+
+        final_raw_path = args.raw_out.absolute()
+        receipt: dict[str, Any] = {
+            "schema": "cheng.semantic_snapshot.read_trace_evidence",
+            "status": "captured",
+            "method": method,
+            "sample_index": args.sample_index,
+            "workload_kind": args.workload_kind,
+            "trace_sha256": args.trace_sha256,
+            "source_manifest_sha256": args.source_manifest_sha256,
+            "compiler_sha256": args.compiler_sha256,
+            "toolchain_manifest_sha256": args.toolchain_manifest_sha256,
+            "target": args.target,
+            "command_path": str(command_path),
+            "command_sha256": command_sha256,
+            "command_argv": command,
+            "command_argv_cid": command_argv_cid,
+            "trace_tool_path": str(trace_tool),
+            "trace_tool_sha256": trace_tool_sha256,
+            "trace_tool_argv": trace_argv,
+            "trace_tool_argv_cid": argv_digest(trace_argv),
+            "trace_contract_sha256": trace_contract_sha256(method),
+            "raw_trace": {
+                "path": str(final_raw_path),
+                "sha256": sha256_bytes(raw_trace),
+            },
+            "raw_trace_bytes": len(raw_trace),
+            "read_syscalls": counts.read_syscalls,
+            "read_bytes": counts.read_bytes,
+            "trace_tool_return_code": completed.returncode,
+        }
+        receipt["measurement_receipt_cid"] = receipt_cid(receipt)
+        receipt_raw = canonical_json_bytes(receipt)
+        _exclusive_write(args.raw_out, raw_trace)
+        try:
+            _exclusive_write(args.receipt_out, receipt_raw)
+        except BaseException:
+            args.raw_out.unlink(missing_ok=True)
+            raise
+    print("semantic_snapshot_read_trace_status=GREEN")
+    print(f"semantic_snapshot_read_trace_method={method}")
+    print(f"measurement_receipt_cid={receipt['measurement_receipt_cid']}")
+    print(f"read_syscalls={counts.read_syscalls}")
+    print(f"read_bytes={counts.read_bytes}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--raw-out", type=Path, required=True)
+    parser.add_argument("--receipt-out", type=Path, required=True)
+    parser.add_argument("--sample-index", type=int, required=True)
+    parser.add_argument("--workload-kind", required=True)
+    parser.add_argument("--trace-sha256", required=True)
+    parser.add_argument("--source-manifest-sha256", required=True)
+    parser.add_argument("--compiler-sha256", required=True)
+    parser.add_argument("--toolchain-manifest-sha256", required=True)
+    parser.add_argument("--target", required=True)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if args.command and args.command[0] == "--":
+        args.command = args.command[1:]
+    if not args.command:
+        parser.error("measured command is required after --")
+    try:
+        return collect(args)
+    except (CollectionError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        _publish_failure(args, "RED", str(exc))
+        return ERROR_EXIT
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

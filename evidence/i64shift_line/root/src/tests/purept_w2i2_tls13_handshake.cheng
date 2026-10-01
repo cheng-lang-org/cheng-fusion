@@ -1,0 +1,615 @@
+# purept W2 i2: TLS 1.3 client/server handshake state machines.
+#
+# Sole judge: RFC 8448 section 3 (Simple 1-RTT Handshake) as the flow-level
+# vector (component-level 94/0 was proven by purept_w2i1; this driver replays
+# the same vector THROUGH the state machines), plus dual-end self handshakes
+# and precise-rejection negatives.
+#
+# Verdict sections:
+#   A  client machine replays RFC 8448 section 3 flow: vector inputs ->
+#      produced CH/Finished byte-exact, hs/ap secrets B8-B20 byte-exact
+#      (the vector's RSA CertificateVerify is genuinely verified: n/e are
+#      extracted from the vector certificate, PSS-SHA256 verified)
+#   B  server machine vector anchors on the RFC ClientHello
+#   C  >=3 dual-end self handshakes, different keys/randoms per round
+#   D  >=6 negatives, each rejected at an exact state with an exact code
+#   E  event-driven interface shape (feed one message -> one transition)
+#
+# Note on RFC 8448: the vector Certificate/CertificateVerify use the
+# draft-18-era forms (one-byte certificate_request_context length; CV
+# content order = 64 spaces || context || 0x00 || transcript hash), which
+# this driver replays via the client machine's cvContentStyle=2. All
+# self-handshake flights use the RFC 8446 final content order.
+
+import std/system
+import std/result
+import std/rawbytes
+import std/os
+import std/strings
+import std/buffer as bytebuffer
+import std/crypto/curve25519 as x25519
+import std/crypto/sha256
+import cheng/quic/pure/tls13_keyschedule as ks
+import cheng/quic/pure/tls13_transcript as tr
+import cheng/quic/pure/tls13_messages as msg
+import cheng/quic/pure/tls13_state_client as stc
+import cheng/quic/pure/tls13_state_server as sts
+
+var checksTotal: int32 = 0
+var checksFailed: int32 = 0
+
+fn hexValue(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + int32(c) - int32('a')
+    return -1
+
+fn hexDecode(text: str): Result[Bytes] =
+    if len(text) % 2 != 0:
+        return Err[Bytes]("hex: length must be even")
+    let out: Bytes = BytesAlloc(len(text) / 2)
+    var i: int32
+    while i < len(text):
+        let hi: int32 = hexValue(text[i])
+        let lo: int32 = hexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("hex: invalid digit")
+        BytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn hx(text: str): Bytes =
+    let r: Result[Bytes] = hexDecode(text)
+    if IsErr(r):
+        os.WriteLine(os.Get_stderr(), "driver hex constant invalid")
+        assert(false, "driver hex constant")
+    let v: Bytes = Value(r)
+    return v
+
+fn expectBytes(name: str, got: Bytes, want: Bytes) =
+    checksTotal = checksTotal + 1
+    if !BytesEqual(got, want):
+        checksFailed = checksFailed + 1
+        let gh: str = BytesToHex(got)
+        let wh: str = BytesToHex(want)
+        os.WriteLine(os.Get_stderr(), gh)
+        os.WriteLine(os.Get_stderr(), wh)
+        assert(false, name)
+    os.WriteLine(os.Get_stdout(), "PASS")
+    os.WriteLine(os.Get_stdout(), name)
+
+fn expectTrue(name: str, cond: bool) =
+    checksTotal = checksTotal + 1
+    if !cond:
+        checksFailed = checksFailed + 1
+        os.WriteLine(os.Get_stderr(), "FAIL")
+        os.WriteLine(os.Get_stderr(), name)
+        assert(false, name)
+    os.WriteLine(os.Get_stdout(), "PASS")
+    os.WriteLine(os.Get_stdout(), name)
+
+fn expectInt(name: str, got: int32, want: int32) =
+    checksTotal = checksTotal + 1
+    if got != want:
+        checksFailed = checksFailed + 1
+        let g: str = strings.Int64ToStr(got)
+        let w: str = strings.Int64ToStr(want)
+        os.WriteLine(os.Get_stderr(), g)
+        os.WriteLine(os.Get_stderr(), w)
+        assert(false, name)
+    os.WriteLine(os.Get_stdout(), "PASS")
+    os.WriteLine(os.Get_stdout(), name)
+
+fn strBytes(text: str): Bytes =
+    var b: bytebuffer.GrowByteBuffer = bytebuffer.NewByteBuffer()
+    var i: int32
+    while i < len(text):
+        bytebuffer.AppendByte(b, int32(text[i]))
+        i = i + 1
+    let view: Bytes = bytebuffer.ToBytes(b)
+    return msg.tls13OwnedBytes(view)
+
+fn seedOf(label: str, round: int32): Bytes =
+    let text: str = label + strings.Int64ToStr(round)
+    let raw: Bytes = strBytes(text)
+    return Sha256Digest(raw)
+
+fn flipAt(src: Bytes, pos: int32): Bytes =
+    let out: Bytes = BytesAlloc(BytesLen(src))
+    BytesCopyInto(out, 0, src)
+    let v: int32 = BytesGet(src, pos) + 1
+    BytesSet(out, pos, v - (v / 256) * 256)
+    return out
+
+fn flightMsgCount(flight: Bytes): int32 =
+    var off: int32 = 0
+    var n: int32 = 0
+    while off + 4 <= BytesLen(flight):
+        let l: int32 = BytesGet(flight, off + 1) * 65536 + BytesGet(flight, off + 2) * 256 + BytesGet(flight, off + 3)
+        off = off + 4 + l
+        n = n + 1
+    return n
+
+fn flightMsgAt(flight: Bytes, index: int32): Bytes =
+    var off: int32 = 0
+    var i: int32 = 0
+    while off + 4 <= BytesLen(flight):
+        let l: int32 = BytesGet(flight, off + 1) * 65536 + BytesGet(flight, off + 2) * 256 + BytesGet(flight, off + 3)
+        if i == index:
+            return BytesSlice(flight, off, 4 + l)
+        off = off + 4 + l
+        i = i + 1
+    return EmptyBytes()
+
+# ---------- RFC 8448 section 3 vectors ----------
+
+const
+    vClientPriv = "49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005"
+    vClientRandom = "cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7"
+    vServerPriv = "b1580eeadf6dd589b8ef4f2d5652578cc810e9980191ec8d058308cea216a21e"
+    vClientHello = "010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7000006130113031302010000910000000b0009000006736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001"
+    vServerHello = "020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"
+    vShared = "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d"
+    vHsSecret = "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"
+    vChsTraffic = "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"
+    vShsTraffic = "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"
+    vSrvHsKey = "3fce516009c21727d0f2e4e86ee403bc"
+    vSrvHsIv = "5d313eb2671276ee13000b30"
+    vCliHsKey = "dbfaa693d1762c5b666af5d950258d01"
+    vCliHsIv = "5bd3c71b836e0b76bb73265f"
+    vEncryptedExtensions = "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000"
+    vCertificate = "0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000"
+    vCertVerify = "0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3"
+    vSrvFinKey = "008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8"
+    vSrvFinishedData = "9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718"
+    vServerFinishedMsg = "140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718"
+    vCapTraffic = "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"
+    vSapTraffic = "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"
+    vExpMaster = "fe22f881176eda18eb8f44529e6792c50c9a3f89452f68d8ae311b4309d3cf50"
+    vSrvApKey = "9f02283b6c9c07efc26bb9f2ac92e356"
+    vSrvApIv = "cf782b88dd83549aadf1e984"
+    vCliApKey = "17422dda596ed5d9acd890e3c63f5051"
+    vCliApIv = "5b78923dee08579033e523d9"
+    vCliFinKey = "b80ad01015fb2f0bd65ff7d4da5d6bf83f84821d1f87fdc7d3c75b5a7b42d9c4"
+    vCliFinishedData = "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"
+    vClientFinishedMsg = "14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"
+    vResMaster = "7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c"
+    vResumption = "4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3"
+    # RFC 8032 section 7.1 TEST1/2/3 keypairs (deterministic ed25519 identities)
+    ed1Seed = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+    ed1Pub = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+    ed2Seed = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+    ed2Pub = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+    ed3Seed = "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7"
+    ed3Pub = "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"
+
+fn edSeedFor(round: int32): Bytes =
+    if round == 1:
+        return hx(ed1Seed)
+    if round == 2:
+        return hx(ed2Seed)
+    return hx(ed3Seed)
+
+fn edPubFor(round: int32): Bytes =
+    if round == 1:
+        return hx(ed1Pub)
+    if round == 2:
+        return hx(ed2Pub)
+    return hx(ed3Pub)
+
+# ---------- section B/C shared setup ----------
+
+fn selfPairUp(round: int32): Bytes =
+    let idx: str = strings.Int64ToStr(round)
+    let cliPriv: Bytes = seedOf("w2i2-cli-x25519-", round)
+    let srvPriv: Bytes = seedOf("w2i2-srv-x25519-", round)
+    let cliRandom: Bytes = seedOf("w2i2-cli-random-", round)
+    let srvRandom: Bytes = seedOf("w2i2-srv-random-", round)
+    let edSeed: Bytes = edSeedFor(round)
+    let edPub: Bytes = edPubFor(round)
+    let edPriv: Bytes = BytesConcat(edSeed, edPub)
+    stc.tls13CliConfigure(cliPriv, cliRandom, EmptyBytes(), "server." + idx, EmptyBytes(), 1)
+    sts.tls13SrvConfigure(srvPriv, srvRandom, edPriv, edPub, EmptyBytes(), 1)
+    let beginRes: Result[bool] = stc.tls13CliBegin()
+    if IsErr(beginRes):
+        return EmptyBytes()
+    let ch: Bytes = stc.tls13CliProducedOf()
+    let srvRes: Result[bool] = sts.tls13SrvFeed(ch)
+    if IsErr(srvRes):
+        return EmptyBytes()
+    return sts.tls13SrvProducedOf()
+
+fn runSelfRound(round: int32) =
+    let idx: str = strings.Int64ToStr(round)
+    let edPub: Bytes = edPubFor(round)
+    let flight: Bytes = selfPairUp(round)
+    expectTrue("C" + idx + ".pair_up", BytesLen(flight) > 0)
+    expectInt("C" + idx + ".flight_count", flightMsgCount(flight), 5)
+    let m1: Bytes = flightMsgAt(flight, 0)
+    let m2: Bytes = flightMsgAt(flight, 1)
+    let m3: Bytes = flightMsgAt(flight, 2)
+    let m4: Bytes = flightMsgAt(flight, 3)
+    let m5: Bytes = flightMsgAt(flight, 4)
+    let r1: Result[bool] = stc.tls13CliFeed(m1)
+    if IsErr(r1):
+        os.WriteLine(os.Get_stderr(), "C" + idx + " sh errtext:")
+        os.WriteLine(os.Get_stderr(), stc.tls13CliErrTextOf())
+    expectTrue("C" + idx + ".feed_sh", IsOk(r1))
+    let r2: Result[bool] = stc.tls13CliFeed(m2)
+    expectTrue("C" + idx + ".feed_ee", IsOk(r2))
+    let r3: Result[bool] = stc.tls13CliFeed(m3)
+    expectTrue("C" + idx + ".feed_cert", IsOk(r3))
+    let r4: Result[bool] = stc.tls13CliFeed(m4)
+    expectTrue("C" + idx + ".feed_cv", IsOk(r4))
+    let r5: Result[bool] = stc.tls13CliFeed(m5)
+    expectTrue("C" + idx + ".feed_sfin", IsOk(r5))
+    let cfin: Bytes = stc.tls13CliProducedOf()
+    expectInt("C" + idx + ".cfin_kind", BytesGet(cfin, 0), 20)
+    let r6: Result[bool] = sts.tls13SrvFeed(cfin)
+    expectTrue("C" + idx + ".feed_cfin", IsOk(r6))
+    expectInt("C" + idx + ".cli_complete", stc.tls13CliStateOf(), 6)
+    expectInt("C" + idx + ".srv_complete", sts.tls13SrvStateOf(), 2)
+    expectInt("C" + idx + ".cli_clean", stc.tls13CliErrCodeOf(), 0)
+    expectInt("C" + idx + ".srv_clean", sts.tls13SrvErrCodeOf(), 0)
+    let cshared_equal: Bytes = stc.tls13CliSharedOf()
+    let sshared_equal: Bytes = sts.tls13SrvSharedOf()
+    expectBytes("C" + idx + ".shared_equal", cshared_equal, sshared_equal)
+    let ccap_equal: Bytes = stc.tls13CliCapOf()
+    let scap_equal: Bytes = sts.tls13SrvCapOf()
+    expectBytes("C" + idx + ".cap_equal", ccap_equal, scap_equal)
+    let csap_equal: Bytes = stc.tls13CliSapOf()
+    let ssap_equal: Bytes = sts.tls13SrvSapOf()
+    expectBytes("C" + idx + ".sap_equal", csap_equal, ssap_equal)
+    let ccapkey_equal: Bytes = stc.tls13CliCapKeyOf()
+    let scapkey_equal: Bytes = sts.tls13SrvCapKeyOf()
+    expectBytes("C" + idx + ".capkey_equal", ccapkey_equal, scapkey_equal)
+    let ccapiv_equal: Bytes = stc.tls13CliCapIvOf()
+    let scapiv_equal: Bytes = sts.tls13SrvCapIvOf()
+    expectBytes("C" + idx + ".capiv_equal", ccapiv_equal, scapiv_equal)
+    let csapkey_equal: Bytes = stc.tls13CliSapKeyOf()
+    let ssapkey_equal: Bytes = sts.tls13SrvSapKeyOf()
+    expectBytes("C" + idx + ".sapkey_equal", csapkey_equal, ssapkey_equal)
+    let csapiv_equal: Bytes = stc.tls13CliSapIvOf()
+    let ssapiv_equal: Bytes = sts.tls13SrvSapIvOf()
+    expectBytes("C" + idx + ".sapiv_equal", csapiv_equal, ssapiv_equal)
+    let cresmaster_equal: Bytes = stc.tls13CliResMasterOf()
+    let sresmaster_equal: Bytes = sts.tls13SrvResMasterOf()
+    expectBytes("C" + idx + ".resmaster_equal", cresmaster_equal, sresmaster_equal)
+    expectBytes("C" + idx + ".transcript_equal", tr.tls13TranscriptHash0(), tr.tls13TranscriptHash1())
+    let ccert_binds_sig_key: Bytes = stc.tls13CliCertPubOf()
+    expectBytes("C" + idx + ".cert_binds_sig_key", ccert_binds_sig_key, edPub)
+
+# ---------- main ----------
+
+fn main(): int32 =
+    let chVec: Bytes = hx(vClientHello)
+    let shVec: Bytes = hx(vServerHello)
+    let eeVec: Bytes = hx(vEncryptedExtensions)
+    let certVec: Bytes = hx(vCertificate)
+    let cvVec: Bytes = hx(vCertVerify)
+    let sfinVec: Bytes = hx(vServerFinishedMsg)
+    let cfinVec: Bytes = hx(vClientFinishedMsg)
+
+    # ===== A. client machine replays the RFC 8448 section 3 flow =====
+    let cliPriv: Bytes = hx(vClientPriv)
+    let cliRandom: Bytes = hx(vClientRandom)
+    let cfg: int32 = stc.tls13CliConfigure(cliPriv, cliRandom, EmptyBytes(), "server", chVec, 2)
+    expectInt("A.configure", cfg, 0)
+    let beginRes: Result[bool] = stc.tls13CliBegin()
+    expectTrue("A.begin", IsOk(beginRes))
+    let chProduced: Bytes = stc.tls13CliProducedOf()
+    expectBytes("A.ch_byte_exact", chProduced, chVec)
+    let rSh: Result[bool] = stc.tls13CliFeed(shVec)
+    expectTrue("A.feed_sh", IsOk(rSh))
+    let aA_shared_B3_input: Bytes = stc.tls13CliSharedOf()
+    let aA_shared_B3_inputWant: Bytes = hx(vShared)
+    expectBytes("A.shared_B3_input", aA_shared_B3_input, aA_shared_B3_inputWant)
+    let aA_hs_secret_B3: Bytes = stc.tls13CliHsSecretOf()
+    let aA_hs_secret_B3Want: Bytes = hx(vHsSecret)
+    expectBytes("A.hs_secret_B3", aA_hs_secret_B3, aA_hs_secret_B3Want)
+    let aA_chs_traffic_B4: Bytes = stc.tls13CliChsTrafficOf()
+    let aA_chs_traffic_B4Want: Bytes = hx(vChsTraffic)
+    expectBytes("A.chs_traffic_B4", aA_chs_traffic_B4, aA_chs_traffic_B4Want)
+    let aA_shs_traffic_B5: Bytes = stc.tls13CliShsTrafficOf()
+    let aA_shs_traffic_B5Want: Bytes = hx(vShsTraffic)
+    expectBytes("A.shs_traffic_B5", aA_shs_traffic_B5, aA_shs_traffic_B5Want)
+    let aA_srv_hs_key_B8: Bytes = stc.tls13CliSapKeyOf()
+    let aA_srv_hs_key_B8Want: Bytes = hx(vSrvHsKey)
+    expectBytes("A.srv_hs_key_B8", aA_srv_hs_key_B8, aA_srv_hs_key_B8Want)
+    let aA_srv_hs_iv_B8: Bytes = stc.tls13CliSapIvOf()
+    let aA_srv_hs_iv_B8Want: Bytes = hx(vSrvHsIv)
+    expectBytes("A.srv_hs_iv_B8", aA_srv_hs_iv_B8, aA_srv_hs_iv_B8Want)
+    let aA_cli_hs_key_B9: Bytes = stc.tls13CliCapKeyOf()
+    let aA_cli_hs_key_B9Want: Bytes = hx(vCliHsKey)
+    expectBytes("A.cli_hs_key_B9", aA_cli_hs_key_B9, aA_cli_hs_key_B9Want)
+    let aA_cli_hs_iv_B9: Bytes = stc.tls13CliCapIvOf()
+    let aA_cli_hs_iv_B9Want: Bytes = hx(vCliHsIv)
+    expectBytes("A.cli_hs_iv_B9", aA_cli_hs_iv_B9, aA_cli_hs_iv_B9Want)
+    let aA_srv_fin_key_B10: Bytes = stc.tls13CliSrvFinKeyOf()
+    let aA_srv_fin_key_B10Want: Bytes = hx(vSrvFinKey)
+    expectBytes("A.srv_fin_key_B10", aA_srv_fin_key_B10, aA_srv_fin_key_B10Want)
+    let rEe: Result[bool] = stc.tls13CliFeed(eeVec)
+    expectTrue("A.feed_ee", IsOk(rEe))
+    let rCert: Result[bool] = stc.tls13CliFeed(certVec)
+    expectTrue("A.feed_cert", IsOk(rCert))
+    expectInt("A.cert_alg_rsa", stc.tls13CliCertAlgOf(), 2)
+    let rCv: Result[bool] = stc.tls13CliFeed(cvVec)
+    expectTrue("A.feed_cv_rsa_pss_verified", IsOk(rCv))
+    let rSfin: Result[bool] = stc.tls13CliFeed(sfinVec)
+    if IsErr(rSfin):
+        os.WriteLine(os.Get_stderr(), "sfin errtext:")
+        os.WriteLine(os.Get_stderr(), stc.tls13CliErrTextOf())
+    expectTrue("A.feed_sfin", IsOk(rSfin))
+    let aA_srv_fin_vd_B11: Bytes = stc.tls13CliSrvFinVdOf()
+    let aA_srv_fin_vd_B11Want: Bytes = hx(vSrvFinishedData)
+    expectBytes("A.srv_fin_vd_B11", aA_srv_fin_vd_B11, aA_srv_fin_vd_B11Want)
+    let cfinProduced: Bytes = stc.tls13CliProducedOf()
+    expectBytes("A.cfin_byte_exact", cfinProduced, cfinVec)
+    let aA_cli_fin_vd_B18: Bytes = stc.tls13CliCliFinVdOf()
+    let aA_cli_fin_vd_B18Want: Bytes = hx(vCliFinishedData)
+    expectBytes("A.cli_fin_vd_B18", aA_cli_fin_vd_B18, aA_cli_fin_vd_B18Want)
+    let aA_cli_fin_key_B17: Bytes = stc.tls13CliCliFinKeyOf()
+    let aA_cli_fin_key_B17Want: Bytes = hx(vCliFinKey)
+    expectBytes("A.cli_fin_key_B17", aA_cli_fin_key_B17, aA_cli_fin_key_B17Want)
+    let aA_cap_B12: Bytes = stc.tls13CliCapOf()
+    let aA_cap_B12Want: Bytes = hx(vCapTraffic)
+    expectBytes("A.cap_B12", aA_cap_B12, aA_cap_B12Want)
+    let aA_sap_B13: Bytes = stc.tls13CliSapOf()
+    let aA_sap_B13Want: Bytes = hx(vSapTraffic)
+    expectBytes("A.sap_B13", aA_sap_B13, aA_sap_B13Want)
+    let aA_exp_master_B14: Bytes = stc.tls13CliExpMasterOf()
+    let aA_exp_master_B14Want: Bytes = hx(vExpMaster)
+    expectBytes("A.exp_master_B14", aA_exp_master_B14, aA_exp_master_B14Want)
+    let aA_srv_ap_key_B15: Bytes = stc.tls13CliSapKeyOf()
+    let aA_srv_ap_key_B15Want: Bytes = hx(vSrvApKey)
+    expectBytes("A.srv_ap_key_B15", aA_srv_ap_key_B15, aA_srv_ap_key_B15Want)
+    let aA_srv_ap_iv_B15: Bytes = stc.tls13CliSapIvOf()
+    let aA_srv_ap_iv_B15Want: Bytes = hx(vSrvApIv)
+    expectBytes("A.srv_ap_iv_B15", aA_srv_ap_iv_B15, aA_srv_ap_iv_B15Want)
+    let aA_cli_ap_key_B16: Bytes = stc.tls13CliCapKeyOf()
+    let aA_cli_ap_key_B16Want: Bytes = hx(vCliApKey)
+    expectBytes("A.cli_ap_key_B16", aA_cli_ap_key_B16, aA_cli_ap_key_B16Want)
+    let aA_cli_ap_iv_B16: Bytes = stc.tls13CliCapIvOf()
+    let aA_cli_ap_iv_B16Want: Bytes = hx(vCliApIv)
+    expectBytes("A.cli_ap_iv_B16", aA_cli_ap_iv_B16, aA_cli_ap_iv_B16Want)
+    let aA_res_master_B19: Bytes = stc.tls13CliResMasterOf()
+    let aA_res_master_B19Want: Bytes = hx(vResMaster)
+    expectBytes("A.res_master_B19", aA_res_master_B19, aA_res_master_B19Want)
+    let resInput: Bytes = stc.tls13CliResMasterOf()
+    let resNonce: Bytes = hx("0000")
+    let resRes: Result[Bytes] = ks.tls13ResumptionSecret(resInput, resNonce)
+    expectTrue("A.resumption_B20.ok", IsOk(resRes))
+    let resVal: Bytes = Value(resRes)
+    let resWant: Bytes = hx(vResumption)
+    expectBytes("A.resumption_B20", resVal, resWant)
+    expectInt("A.cli_complete", stc.tls13CliStateOf(), 6)
+
+    # ===== B. server machine vector anchors on the RFC ClientHello =====
+    let srvPriv: Bytes = hx(vServerPriv)
+    let srvRandom: Bytes = hx("a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e26928")
+    let bEdSeed: Bytes = hx(ed1Seed)
+    let bEdPub: Bytes = hx(ed1Pub)
+    let bEdPriv: Bytes = BytesConcat(bEdSeed, bEdPub)
+    sts.tls13SrvConfigure(srvPriv, srvRandom, bEdPriv, bEdPub, EmptyBytes(), 1)
+    let bRes: Result[bool] = sts.tls13SrvFeed(chVec)
+    expectTrue("B.feed_ch", IsOk(bRes))
+    let bShared: Bytes = sts.tls13SrvSharedOf()
+    let bSharedWant: Bytes = hx(vShared)
+    expectBytes("B.shared_A2", bShared, bSharedWant)
+    let bHs: Bytes = sts.tls13SrvHsSecretOf()
+    let bHsWant: Bytes = hx(vHsSecret)
+    expectBytes("B.hs_secret_B3", bHs, bHsWant)
+    expectInt("B.expect_cfin", sts.tls13SrvStateOf(), 1)
+    let bFlight: Bytes = sts.tls13SrvProducedOf()
+    expectInt("B.flight_kind_sh", BytesGet(bFlight, 0), 2)
+
+    # ===== C. three dual-end self handshakes =====
+    runSelfRound(1)
+    runSelfRound(2)
+    runSelfRound(3)
+
+    # ===== D. negatives: precise rejection at exact state + code =====
+    # D1: EE payload byte flipped -> detected by the CV signature (state 4, code 9)
+    let d1Flight: Bytes = selfPairUp(1)
+    let d1M1: Bytes = flightMsgAt(d1Flight, 0)
+    let d1M2: Bytes = flightMsgAt(d1Flight, 1)
+    let d1M3: Bytes = flightMsgAt(d1Flight, 2)
+    let d1M4: Bytes = flightMsgAt(d1Flight, 3)
+    let d1M3: Bytes = flightMsgAt(d1Flight, 2)
+    let d1M4: Bytes = flightMsgAt(d1Flight, 3)
+    let d1EeBad: Bytes = flipAt(d1M2, BytesLen(d1M2) - 1)
+    let d1R1: Result[bool] = stc.tls13CliFeed(d1M1)
+    expectTrue("D1.sh_ok", IsOk(d1R1))
+    let d1R2: Result[bool] = stc.tls13CliFeed(d1EeBad)
+    expectTrue("D1.ee_decodes", IsOk(d1R2))
+    let d1R3: Result[bool] = stc.tls13CliFeed(d1M3)
+    expectTrue("D1.cert_ok", IsOk(d1R3))
+    let d1R4: Result[bool] = stc.tls13CliFeed(d1M4)
+    expectTrue("D1.rejected", IsErr(d1R4))
+    expectInt("D1.code", stc.tls13CliErrCodeOf(), 9)
+    expectInt("D1.state", stc.tls13CliStateOf(), 4)
+
+    # D2: CV signature byte flipped -> rejected at CV (state 4, code 9)
+    let d2Flight: Bytes = selfPairUp(1)
+    let d2M1: Bytes = flightMsgAt(d2Flight, 0)
+    let d2M2: Bytes = flightMsgAt(d2Flight, 1)
+    let d2M3: Bytes = flightMsgAt(d2Flight, 2)
+    let d2M4: Bytes = flightMsgAt(d2Flight, 3)
+    let d2CvBad: Bytes = flipAt(d2M4, 20)
+    let d2R1: Result[bool] = stc.tls13CliFeed(d2M1)
+    expectTrue("D2.sh_ok", IsOk(d2R1))
+    let d2R2: Result[bool] = stc.tls13CliFeed(d2M2)
+    expectTrue("D2.ee_ok", IsOk(d2R2))
+    let d2R3: Result[bool] = stc.tls13CliFeed(d2M3)
+    expectTrue("D2.cert_ok", IsOk(d2R3))
+    let d2R4: Result[bool] = stc.tls13CliFeed(d2CvBad)
+    expectTrue("D2.rejected", IsErr(d2R4))
+    expectInt("D2.code", stc.tls13CliErrCodeOf(), 9)
+    expectInt("D2.state", stc.tls13CliStateOf(), 4)
+
+    # D3: server Finished verify_data flipped -> rejected (state 5, code 10)
+    let d3Flight: Bytes = selfPairUp(1)
+    let d3M1: Bytes = flightMsgAt(d3Flight, 0)
+    let d3M2: Bytes = flightMsgAt(d3Flight, 1)
+    let d3M3: Bytes = flightMsgAt(d3Flight, 2)
+    let d3M4: Bytes = flightMsgAt(d3Flight, 3)
+    let d3M5: Bytes = flightMsgAt(d3Flight, 4)
+    let d3SfinBad: Bytes = flipAt(d3M5, 6)
+    let d3R1: Result[bool] = stc.tls13CliFeed(d3M1)
+    expectTrue("D3.sh_ok", IsOk(d3R1))
+    let d3R2: Result[bool] = stc.tls13CliFeed(d3M2)
+    expectTrue("D3.ee_ok", IsOk(d3R2))
+    let d3R3: Result[bool] = stc.tls13CliFeed(d3M3)
+    expectTrue("D3.cert_ok", IsOk(d3R3))
+    let d3R4: Result[bool] = stc.tls13CliFeed(d3M4)
+    expectTrue("D3.cv_ok", IsOk(d3R4))
+    let d3R5: Result[bool] = stc.tls13CliFeed(d3SfinBad)
+    expectTrue("D3.rejected", IsErr(d3R5))
+    expectInt("D3.code", stc.tls13CliErrCodeOf(), 10)
+    expectInt("D3.state", stc.tls13CliStateOf(), 5)
+
+    # D4: client Finished byte flipped -> server rejects (state 1, code 7)
+    let d4Flight: Bytes = selfPairUp(1)
+    let d4M1: Bytes = flightMsgAt(d4Flight, 0)
+    let d4M2: Bytes = flightMsgAt(d4Flight, 1)
+    let d4M3: Bytes = flightMsgAt(d4Flight, 2)
+    let d4M4: Bytes = flightMsgAt(d4Flight, 3)
+    let d4M5: Bytes = flightMsgAt(d4Flight, 4)
+    let d4R1: Result[bool] = stc.tls13CliFeed(d4M1)
+    expectTrue("D4.sh_ok", IsOk(d4R1))
+    let d4R2: Result[bool] = stc.tls13CliFeed(d4M2)
+    expectTrue("D4.ee_ok", IsOk(d4R2))
+    let d4R3: Result[bool] = stc.tls13CliFeed(d4M3)
+    expectTrue("D4.cert_ok", IsOk(d4R3))
+    let d4R4: Result[bool] = stc.tls13CliFeed(d4M4)
+    expectTrue("D4.cv_ok", IsOk(d4R4))
+    let d4R5: Result[bool] = stc.tls13CliFeed(d4M5)
+    expectTrue("D4.sfin_ok", IsOk(d4R5))
+    let d4Cfin: Bytes = stc.tls13CliProducedOf()
+    let d4CfinBad: Bytes = flipAt(d4Cfin, 6)
+    let d4R6: Result[bool] = sts.tls13SrvFeed(d4CfinBad)
+    expectTrue("D4.rejected", IsErr(d4R6))
+    expectInt("D4.code", sts.tls13SrvErrCodeOf(), 7)
+    expectInt("D4.state", sts.tls13SrvStateOf(), 1)
+
+    # D5: EE fed before SH -> rejected (state 1, code 1)
+    let d5Flight: Bytes = selfPairUp(1)
+    let d5M2: Bytes = flightMsgAt(d5Flight, 1)
+    let d5R: Result[bool] = stc.tls13CliFeed(d5M2)
+    expectTrue("D5.rejected", IsErr(d5R))
+    expectInt("D5.code", stc.tls13CliErrCodeOf(), 1)
+    expectInt("D5.state", stc.tls13CliStateOf(), 1)
+
+    # D6: CV fed at the Certificate slot -> rejected (state 3, code 1)
+    let d6Flight: Bytes = selfPairUp(1)
+    let d6M1: Bytes = flightMsgAt(d6Flight, 0)
+    let d6M2: Bytes = flightMsgAt(d6Flight, 1)
+    let d6M4: Bytes = flightMsgAt(d6Flight, 3)
+    let d6R1: Result[bool] = stc.tls13CliFeed(d6M1)
+    expectTrue("D6.sh_ok", IsOk(d6R1))
+    let d6R2: Result[bool] = stc.tls13CliFeed(d6M2)
+    expectTrue("D6.ee_ok", IsOk(d6R2))
+    let d6R3: Result[bool] = stc.tls13CliFeed(d6M4)
+    expectTrue("D6.rejected", IsErr(d6R3))
+    expectInt("D6.code", stc.tls13CliErrCodeOf(), 1)
+    expectInt("D6.state", stc.tls13CliStateOf(), 3)
+
+    # D7: SH cipher suite byte flipped -> rejected (state 1, code 3)
+    let d7Flight: Bytes = selfPairUp(1)
+    let d7ShBadMsg: Bytes = flightMsgAt(d7Flight, 0)
+    let d7ShBad: Bytes = flipAt(d7ShBadMsg, 39)
+    let d7R: Result[bool] = stc.tls13CliFeed(d7ShBad)
+    expectTrue("D7.rejected", IsErr(d7R))
+    expectInt("D7.code", stc.tls13CliErrCodeOf(), 3)
+    expectInt("D7.state", stc.tls13CliStateOf(), 1)
+
+    # D8: SH key share group flipped -> rejected (state 1, code 5)
+    let d8Flight: Bytes = selfPairUp(1)
+    let d8ShBadMsg: Bytes = flightMsgAt(d8Flight, 0)
+    let d8ShBad: Bytes = flipAt(d8ShBadMsg, 51)
+    let d8R: Result[bool] = stc.tls13CliFeed(d8ShBad)
+    expectTrue("D8.rejected", IsErr(d8R))
+    expectInt("D8.code", stc.tls13CliErrCodeOf(), 5)
+    expectInt("D8.state", stc.tls13CliStateOf(), 1)
+
+    # D9: SH supported version flipped -> rejected (state 1, code 4)
+    let d9Flight: Bytes = selfPairUp(1)
+    let d9ShBadMsg: Bytes = flightMsgAt(d9Flight, 0)
+    let d9ShBad: Bytes = flipAt(d9ShBadMsg, 45)
+    let d9R: Result[bool] = stc.tls13CliFeed(d9ShBad)
+    expectTrue("D9.rejected", IsErr(d9R))
+    expectInt("D9.code", stc.tls13CliErrCodeOf(), 4)
+    expectInt("D9.state", stc.tls13CliStateOf(), 1)
+
+    # D10: truncated server Finished -> rejected (state 5, code 2)
+    let d10Flight: Bytes = selfPairUp(1)
+    let d10M1: Bytes = flightMsgAt(d10Flight, 0)
+    let d10M2: Bytes = flightMsgAt(d10Flight, 1)
+    let d10M3: Bytes = flightMsgAt(d10Flight, 2)
+    let d10M4: Bytes = flightMsgAt(d10Flight, 3)
+    let d10M5: Bytes = flightMsgAt(d10Flight, 4)
+    let d10Trunc: Bytes = BytesSlice(d10M5, 0, BytesLen(d10M5) - 8)
+    let d10R1: Result[bool] = stc.tls13CliFeed(d10M1)
+    expectTrue("D10.sh_ok", IsOk(d10R1))
+    let d10R2: Result[bool] = stc.tls13CliFeed(d10M2)
+    expectTrue("D10.ee_ok", IsOk(d10R2))
+    let d10R3: Result[bool] = stc.tls13CliFeed(d10M3)
+    expectTrue("D10.cert_ok", IsOk(d10R3))
+    let d10R4: Result[bool] = stc.tls13CliFeed(d10M4)
+    expectTrue("D10.cv_ok", IsOk(d10R4))
+    let d10R5: Result[bool] = stc.tls13CliFeed(d10Trunc)
+    expectTrue("D10.rejected", IsErr(d10R5))
+    expectInt("D10.code", stc.tls13CliErrCodeOf(), 2)
+    expectInt("D10.state", stc.tls13CliStateOf(), 5)
+
+    # D11: ClientHello without a common suite -> server rejects (code 3)
+    let d11Priv: Bytes = seedOf("w2i2-cli-x25519-", 1)
+    let d11PubRes: Result[Bytes] = x25519.curve25519PublicFromPrivate(d11Priv)
+    expectTrue("D11.pub_ok", IsOk(d11PubRes))
+    let d11Pub: Bytes = Value(d11PubRes)
+    let d11Random32: Bytes = hx("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20")
+    let d11Ch: Bytes = stc.tls13CliBuildHello(d11Random32, EmptyBytes(), 0, "server", 1, 1, d11Pub, 772)
+    let d11SrvPriv: Bytes = seedOf("w2i2-srv-x25519-", 1)
+    let d11Random: Bytes = seedOf("w2i2-srv-random-", 1)
+    let d11Seed1: Bytes = edSeedFor(1)
+    let d11Pub1: Bytes = edPubFor(1)
+    let d11EdPriv: Bytes = BytesConcat(d11Seed1, d11Pub1)
+    sts.tls13SrvConfigure(d11SrvPriv, d11Random, d11EdPriv, d11Pub1, EmptyBytes(), 1)
+    let d11R: Result[bool] = sts.tls13SrvFeed(d11Ch)
+    expectTrue("D11.rejected", IsErr(d11R))
+    expectInt("D11.code", sts.tls13SrvErrCodeOf(), 3)
+    expectInt("D11.state", sts.tls13SrvStateOf(), 0)
+
+    # D12: ClientHello without any key share -> server rejects (code 4)
+    let d12Ch: Bytes = stc.tls13CliBuildHello(d11Random32, EmptyBytes(), 1, "server", 1, 1, EmptyBytes(), 772)
+    sts.tls13SrvConfigure(d11SrvPriv, d11Random, d11EdPriv, d11Pub1, EmptyBytes(), 1)
+    let d12R: Result[bool] = sts.tls13SrvFeed(d12Ch)
+    expectTrue("D12.rejected", IsErr(d12R))
+    expectInt("D12.code", sts.tls13SrvErrCodeOf(), 4)
+    expectInt("D12.state", sts.tls13SrvStateOf(), 0)
+
+    # D13: ClientHello without TLS 1.3 version -> server rejects (code 5)
+    let d13Ch: Bytes = stc.tls13CliBuildHello(d11Random32, EmptyBytes(), 1, "server", 1, 1, d11Pub, 0)
+    sts.tls13SrvConfigure(d11SrvPriv, d11Random, d11EdPriv, d11Pub1, EmptyBytes(), 1)
+    let d13R: Result[bool] = sts.tls13SrvFeed(d13Ch)
+    expectTrue("D13.rejected", IsErr(d13R))
+    expectInt("D13.code", sts.tls13SrvErrCodeOf(), 5)
+    expectInt("D13.state", sts.tls13SrvStateOf(), 0)
+
+    # ===== E. event-driven interface shape =====
+    let eFlight: Bytes = selfPairUp(2)
+    let eCh: Bytes = stc.tls13CliProducedOf()
+    expectInt("E.begin_produces_ch", BytesGet(eCh, 0), 1)
+    expectInt("E.one_message_per_feed", flightMsgCount(eFlight), 5)
+    let eM1: Bytes = flightMsgAt(eFlight, 0)
+    let eR1: Result[bool] = stc.tls13CliFeed(eM1)
+    expectTrue("E.feed_ok", IsOk(eR1))
+    let eR2: Result[bool] = stc.tls13CliFeed(eM1)
+    expectTrue("E.same_state_rejected", IsErr(eR2))
+    expectInt("E.same_state_code", stc.tls13CliErrCodeOf(), 1)
+
+    os.WriteLine(os.Get_stdout(), "RESULT all sections done")
+    if checksFailed != 0:
+        return 1
+    return 0

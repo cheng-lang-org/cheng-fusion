@@ -1,0 +1,1068 @@
+# MsQuic core connection implementation (no-pointer, in-process).
+
+import std/result
+import std/rawbytes
+import std/strutils as strutil
+import cheng/quic/core/common as qcommon
+import cheng/quic/core/flow_control_model
+import cheng/quic/core/packet_model
+import cheng/quic/core/quic_varint
+
+const
+    msQuicMaxQueuedFrames = 128
+    # Must hold every in-flight (sent, unacked) packet: the congestion window
+    # caps at 196608 bytes and a short data packet is ~1200 bytes, so up to ~164
+    # packets can be outstanding. A smaller cap evicts still-unacked packets from
+    # the retransmit list, so a lost packet beyond the cap is never recovered
+    # (silent tail loss → peer stalls mid-stream). 256 gives headroom over cwnd.
+    msQuicMaxSentPackets = 256
+    msQuicMaxAckRanges = 64
+    msQuicConnImplDefaultWindowPackets = 10
+    msQuicConnImplSlotCount = 2
+    msQuicConnImplQueuedFrameStoreCapacity = msQuicConnImplSlotCount * msQuicMaxQueuedFrames
+    msQuicConnImplSentPacketStoreCapacity = msQuicConnImplSlotCount * msQuicMaxSentPackets
+    msQuicConnImplFramePaddingCode: int64 = 0
+    msQuicConnImplFramePingCode: int64 = 1
+    msQuicConnImplFrameAckCode: int64 = 2
+    msQuicConnImplFrameDataCode: int64 = 14
+
+type
+    MsQuicAckRange =
+        first: int64
+        last: int64
+
+    MsQuicSentPacket =
+        active: int32
+        number: int64
+        sentAtMs: int64
+        data: rawbytes.Bytes
+        packetLength: int32
+        retries: int32
+
+    MsQuicRetransmitPacket =
+        number: int64
+        payload: rawbytes.Bytes
+
+    MsQuicConnImpl =
+        slot: int32
+        queuedFrameKinds: int64[msQuicMaxQueuedFrames]
+        queuedFrameStreamIds: int64[msQuicMaxQueuedFrames]
+        queuedFrameOffsets: int64[msQuicMaxQueuedFrames]
+        queuedFrameValues: int64[msQuicMaxQueuedFrames]
+        queuedFramePayloads: rawbytes.Bytes[msQuicMaxQueuedFrames]
+        sentPackets: MsQuicSentPacket[msQuicMaxSentPackets]
+
+    MsQuicConnImplStore =
+        flows: flow_control_model.MsQuicFlowControl[msQuicConnImplSlotCount]
+        maxPacketSizes: int32[msQuicConnImplSlotCount]
+        nextPacketNumbers: int64[msQuicConnImplSlotCount]
+        queuedCounts: int32[msQuicConnImplSlotCount]
+        queuedHeads: int32[msQuicConnImplSlotCount]
+        lastPacketMs: int64[msQuicConnImplSlotCount]
+        sentCounts: int32[msQuicConnImplSlotCount]
+        # Cached min(sentAtMs) across the active sent window, kept exact by every
+        # mutation site (append/compact/retransmit/force-retransmit). Lets the
+        # per-datagram retransmit-scan short-circuit in O(1) on the overwhelming
+        # common case (nothing is RTO-expired yet) instead of an O(window) SentAt
+        # scan on every single received packet — same shape as the earlier SACK
+        # high-water fix. Only consulted while sentCounts[slot] > 0.
+        sentMinAtMs: int64[msQuicConnImplSlotCount]
+        rtoMs: int64[msQuicConnImplSlotCount]
+        bytesInFlight: int64[msQuicConnImplSlotCount]
+        sendWindowBytes: int64[msQuicConnImplSlotCount]
+        totalAckedBytes: int64[msQuicConnImplSlotCount]
+        smoothedRttMs: int64[msQuicConnImplSlotCount]
+        minRttMs: int64[msQuicConnImplSlotCount]
+        rttVarMs: int64[msQuicConnImplSlotCount]
+        maxRttMs: int64[msQuicConnImplSlotCount]
+        sentPacketStore: MsQuicSentPacket[msQuicConnImplSentPacketStoreCapacity]
+
+var
+    msquicConnImplStore: MsQuicConnImplStore
+    msquicConnImplQueuedPayload0: rawbytes.Bytes
+    msquicConnImplQueuedPayload1: rawbytes.Bytes
+    msquicConnImplQueuedAckOnly0: bool
+    msquicConnImplQueuedAckOnly1: bool
+
+fn msquicConnImplQueuedPayloadAt(slot: int32): rawbytes.Bytes =
+    if slot == 0:
+        return msquicCloneBytes(msquicConnImplQueuedPayload0)
+    if slot == 1:
+        return msquicCloneBytes(msquicConnImplQueuedPayload1)
+    return emptyBytes()
+
+fn msquicConnImplSetQueuedPayload(slot: int32, data: rawbytes.Bytes) =
+    if slot == 0:
+        msquicConnImplQueuedPayload0 = data
+        return
+    if slot == 1:
+        msquicConnImplQueuedPayload1 = data
+        return
+
+fn msquicConnImplQueuedAckOnlyAt(slot: int32): bool =
+    if slot == 0:
+        return msquicConnImplQueuedAckOnly0
+    if slot == 1:
+        return msquicConnImplQueuedAckOnly1
+    return false
+
+fn msquicConnImplSetQueuedAckOnly(slot: int32, value: bool) =
+    if slot == 0:
+        msquicConnImplQueuedAckOnly0 = value
+        return
+    if slot == 1:
+        msquicConnImplQueuedAckOnly1 = value
+        return
+
+fn msquicConnImplClearQueuedPayload(slot: int32) =
+    var oldPayload: rawbytes.Bytes = msquicConnImplQueuedPayloadAt(slot)
+    if BytesLen(oldPayload) > 0:
+        rawbytes.BytesFree(oldPayload)
+    msquicConnImplSetQueuedPayload(slot, emptyBytes())
+    msquicConnImplSetQueuedAckOnly(slot, false)
+    msquicConnImplSetQueuedCount(slot, 0)
+    msquicConnImplSetQueuedHead(slot, 0)
+
+@borrows
+fn msquicConnImplAppendQueuedPayload(slot: int32, data: rawbytes.Bytes) =
+    let oldPayload: rawbytes.Bytes = msquicConnImplQueuedPayloadAt(slot)
+    let oldLen: int32 = BytesLen(oldPayload)
+    let addLen: int32 = BytesLen(data)
+    if addLen <= 0:
+        return
+    let out: rawbytes.Bytes = BytesAlloc(oldLen + addLen)
+    if oldLen > 0:
+        rawbytes.BytesCopyInto(out, 0, oldPayload)
+    rawbytes.BytesCopyInto(out, oldLen, data)
+    var oldFree: rawbytes.Bytes = oldPayload
+    if oldLen > 0:
+        rawbytes.BytesFree(oldFree)
+    msquicConnImplSetQueuedPayload(slot, out)
+
+fn msquicConnImplDefaultSendWindowBytes(): int64 =
+    return int64(1024 * 1024)
+
+fn msquicConnImplFlowAt(slot: int32): flow_control_model.MsQuicFlowControl =
+    return msquicConnImplStore.flows[slot]
+
+fn msquicConnImplStoreSetFlow(store: var MsQuicConnImplStore, slot: int32, flow: var flow_control_model.MsQuicFlowControl) =
+    store.flows[slot] = flow
+
+fn msquicConnImplSetFlow(slot: int32, flow: var flow_control_model.MsQuicFlowControl) =
+    msquicConnImplStoreSetFlow(msquicConnImplStore, slot, flow)
+
+fn msquicConnImplMaxPacketSizeAt(slot: int32): int32 =
+    return msquicConnImplStore.maxPacketSizes[slot]
+
+fn msquicConnImplStoreSetMaxPacketSize(store: var MsQuicConnImplStore, slot: int32, value: int32) =
+    store.maxPacketSizes[slot] = value
+
+fn msquicConnImplSetMaxPacketSize(slot: int32, value: int32) =
+    msquicConnImplStoreSetMaxPacketSize(msquicConnImplStore, slot, value)
+
+fn msquicConnImplNextPacketNumberAt(slot: int32): int64 =
+    return msquicConnImplStore.nextPacketNumbers[slot]
+
+fn msquicConnImplStoreSetNextPacketNumber(store: var MsQuicConnImplStore, slot: int32, value: int64) =
+    store.nextPacketNumbers[slot] = value
+
+fn msquicConnImplSetNextPacketNumber(slot: int32, value: int64) =
+    msquicConnImplStoreSetNextPacketNumber(msquicConnImplStore, slot, value)
+
+fn msquicConnImplQueuedCountAt(slot: int32): int32 =
+    return msquicConnImplStore.queuedCounts[slot]
+
+fn msquicConnImplStoreSetQueuedCount(store: var MsQuicConnImplStore, slot: int32, value: int32) =
+    store.queuedCounts[slot] = value
+
+fn msquicConnImplSetQueuedCount(slot: int32, value: int32) =
+    msquicConnImplStoreSetQueuedCount(msquicConnImplStore, slot, value)
+
+fn msquicConnImplQueuedHeadAt(slot: int32): int32 =
+    return msquicConnImplStore.queuedHeads[slot]
+
+fn msquicConnImplStoreSetQueuedHead(store: var MsQuicConnImplStore, slot: int32, value: int32) =
+    store.queuedHeads[slot] = value
+
+fn msquicConnImplSetQueuedHead(slot: int32, value: int32) =
+    msquicConnImplStoreSetQueuedHead(msquicConnImplStore, slot, value)
+
+fn msquicConnImplStoreSetLastPacketMs(store: var MsQuicConnImplStore, slot: int32, value: int64) =
+    store.lastPacketMs[slot] = value
+
+fn msquicConnImplSetLastPacketMs(slot: int32, value: int64) =
+    msquicConnImplStoreSetLastPacketMs(msquicConnImplStore, slot, value)
+
+fn msquicConnImplSentCountAt(slot: int32): int32 =
+    return msquicConnImplStore.sentCounts[slot]
+
+fn msquicConnImplStoreSetSentCount(store: var MsQuicConnImplStore, slot: int32, value: int32) =
+    store.sentCounts[slot] = value
+
+fn msquicConnImplSetSentCount(slot: int32, value: int32) =
+    msquicConnImplStoreSetSentCount(msquicConnImplStore, slot, value)
+
+fn msquicConnImplRtoMsAt(slot: int32): int64 =
+    return msquicConnImplStore.rtoMs[slot]
+
+fn msquicConnImplStoreSetRtoMs(store: var MsQuicConnImplStore, slot: int32, value: int64) =
+    store.rtoMs[slot] = value
+
+fn msquicConnImplSetRtoMs(slot: int32, value: int64) =
+    msquicConnImplStoreSetRtoMs(msquicConnImplStore, slot, value)
+
+fn msquicConnImplSentMinAtMsAt(slot: int32): int64 =
+    return msquicConnImplStore.sentMinAtMs[slot]
+
+fn msquicConnImplStoreSetSentMinAtMs(store: var MsQuicConnImplStore, slot: int32, value: int64) =
+    store.sentMinAtMs[slot] = value
+
+fn msquicConnImplSetSentMinAtMs(slot: int32, value: int64) =
+    msquicConnImplStoreSetSentMinAtMs(msquicConnImplStore, slot, value)
+
+# Exact recompute of the active window's minimum sentAtMs — O(sentCount), only
+# used on the rare paths (an actual retransmit fired, or the eviction-at-cap
+# shift ran) where the cache could otherwise go stale/wrong. Never called on
+# the steady-state per-datagram path.
+fn msquicConnImplRecomputeSentMinAtMs(impl: var MsQuicConnImpl) =
+    let slot: int32 = impl.slot
+    let n: int32 = msquicConnImplSentCountAt(slot)
+    if n <= 0:
+        return
+    var minMs: int64
+    var i: int32
+    for i in 0..<n:
+        let packet: MsQuicSentPacket = msquicConnImplSentAt(impl, i)
+        if i == 0 || packet.sentAtMs < minMs:
+            minMs = packet.sentAtMs
+    msquicConnImplSetSentMinAtMs(slot, minMs)
+
+fn msquicConnImplBytesInFlightAt(slot: int32): int64 =
+    return msquicConnImplStore.bytesInFlight[slot]
+
+fn msquicConnImplStoreSetBytesInFlight(store: var MsQuicConnImplStore, slot: int32, value: int64) =
+    store.bytesInFlight[slot] = value
+
+fn msquicConnImplSetBytesInFlight(slot: int32, value: int64) =
+    msquicConnImplStoreSetBytesInFlight(msquicConnImplStore, slot, value)
+
+fn msquicConnImplSendWindowBytesAt(slot: int32): int64 =
+    return msquicConnImplStore.sendWindowBytes[slot]
+
+fn msquicConnImplStoreSetSendWindowBytes(store: var MsQuicConnImplStore, slot: int32, value: int64) =
+    store.sendWindowBytes[slot] = value
+
+fn msquicConnImplSetSendWindowBytes(slot: int32, value: int64) =
+    msquicConnImplStoreSetSendWindowBytes(msquicConnImplStore, slot, value)
+
+fn msquicConnImplTotalAckedBytesAt(slot: int32): int64 =
+    return msquicConnImplStore.totalAckedBytes[slot]
+
+fn msquicConnImplStoreSetTotalAckedBytes(store: var MsQuicConnImplStore, slot: int32, value: int64) =
+    store.totalAckedBytes[slot] = value
+
+fn msquicConnImplSetTotalAckedBytes(slot: int32, value: int64) =
+    msquicConnImplStoreSetTotalAckedBytes(msquicConnImplStore, slot, value)
+
+fn msquicConnImplSmoothedRttMsAt(slot: int32): int64 =
+    return msquicConnImplStore.smoothedRttMs[slot]
+
+fn msquicConnImplStoreSetSmoothedRttMs(store: var MsQuicConnImplStore, slot: int32, value: int64) =
+    store.smoothedRttMs[slot] = value
+
+fn msquicConnImplSetSmoothedRttMs(slot: int32, value: int64) =
+    msquicConnImplStoreSetSmoothedRttMs(msquicConnImplStore, slot, value)
+
+fn msquicConnImplMinRttMsAt(slot: int32): int64 =
+    return msquicConnImplStore.minRttMs[slot]
+
+fn msquicConnImplStoreSetMinRttMs(store: var MsQuicConnImplStore, slot: int32, value: int64) =
+    store.minRttMs[slot] = value
+
+fn msquicConnImplSetMinRttMs(slot: int32, value: int64) =
+    msquicConnImplStoreSetMinRttMs(msquicConnImplStore, slot, value)
+
+fn msquicConnImplRttVarMsAt(slot: int32): int64 =
+    return msquicConnImplStore.rttVarMs[slot]
+
+fn msquicConnImplStoreSetRttVarMs(store: var MsQuicConnImplStore, slot: int32, value: int64) =
+    store.rttVarMs[slot] = value
+
+fn msquicConnImplSetRttVarMs(slot: int32, value: int64) =
+    msquicConnImplStoreSetRttVarMs(msquicConnImplStore, slot, value)
+
+fn msquicConnImplMaxRttMsAt(slot: int32): int64 =
+    return msquicConnImplStore.maxRttMs[slot]
+
+fn msquicConnImplStoreSetMaxRttMs(store: var MsQuicConnImplStore, slot: int32, value: int64) =
+    store.maxRttMs[slot] = value
+
+fn msquicConnImplSetMaxRttMs(slot: int32, value: int64) =
+    msquicConnImplStoreSetMaxRttMs(msquicConnImplStore, slot, value)
+
+fn msquicConnImplResetQueueStorage(impl: var MsQuicConnImpl) =
+    msquicConnImplClearQueuedPayload(impl.slot)
+
+# Sent-packet records live in the GLOBAL store (per-slot, flat-indexed), NOT in the
+# impl struct: Cheng passes a global array element (msquicNativeServerImpl[slot]) to a
+# `var` param BY VALUE, so writes to impl struct-array fields are lost on return. The
+# global store struct is passed by reference, so store writes persist. Scalars and
+# queued frames were already moved to the store for this reason; sentPackets had been
+# left as a struct field, which silently dropped every recorded sent packet → the peer
+# never matched acks → in-flight/cwnd froze at the initial flight → large transfers stalled.
+fn msquicConnImplSentStoreIdx(slot: int32, idx: int32): int32 =
+    return slot * msQuicMaxSentPackets + idx
+
+fn msquicConnImplSentPacketAtStore(slot: int32, idx: int32): MsQuicSentPacket =
+    return msquicConnImplStore.sentPacketStore[msquicConnImplSentStoreIdx(slot, idx)]
+
+fn msquicConnImplStoreSetSentPacket(store: var MsQuicConnImplStore, slot: int32, idx: int32, value: MsQuicSentPacket) =
+    store.sentPacketStore[slot * msQuicMaxSentPackets + idx] = value
+
+fn msquicConnImplSetSentPacketAtStore(slot: int32, idx: int32, value: MsQuicSentPacket) =
+    msquicConnImplStoreSetSentPacket(msquicConnImplStore, slot, idx, value)
+
+fn msquicConnImplResetSentStorage(impl: var MsQuicConnImpl) =
+    var i: int32
+    for i in i..<msQuicMaxSentPackets:
+        msquicConnImplSetSentPacketAtStore(impl.slot, i, MsQuicSentPacket(active: 0, number: 0, sentAtMs: 0, data: emptyBytes(), packetLength: 0, retries: 0))
+
+fn msquicConnImplSentAt(impl: var MsQuicConnImpl, idx: int32): MsQuicSentPacket =
+    return msquicConnImplSentPacketAtStore(impl.slot, idx)
+
+fn msquicConnImplCopySentPacket(dst: var MsQuicSentPacket, src: MsQuicSentPacket) =
+    dst.active = src.active
+    dst.number = src.number
+    dst.sentAtMs = src.sentAtMs
+    dst.data = src.data
+    dst.packetLength = src.packetLength
+    dst.retries = src.retries
+
+fn initMsQuicConnImpl(
+    impl: var MsQuicConnImpl,
+    slot: int32,
+    flow: var flow_control_model.MsQuicFlowControl,
+    maxPacketSize: int32,
+    initialWindowPackets: int32
+) =
+    let size: int32 = if maxPacketSize <= 0: 1200 else: maxPacketSize
+    let size64: int64 = int64(size)
+    let defaultWindowPackets32: int32 = msQuicConnImplDefaultWindowPackets
+    let defaultWindowPackets64: int64 = int64(defaultWindowPackets32)
+    var sendWindow: int64 = size64 * defaultWindowPackets64
+    if initialWindowPackets > 0:
+        let initialWindowPackets64: int64 = int64(initialWindowPackets)
+        sendWindow = size64 * initialWindowPackets64
+    if sendWindow <= 0:
+        sendWindow = msquicConnImplDefaultSendWindowBytes()
+    impl.slot = slot
+    msquicConnImplSetFlow(slot, flow)
+    msquicConnImplSetMaxPacketSize(slot, size)
+    msquicConnImplSetNextPacketNumber(slot, 1)
+    msquicConnImplSetQueuedCount(slot, 0)
+    msquicConnImplSetQueuedHead(slot, 0)
+    msquicConnImplSetLastPacketMs(slot, 0)
+    msquicConnImplSetSentCount(slot, 0)
+    msquicConnImplSetRtoMs(slot, 200)
+    msquicConnImplSetBytesInFlight(slot, 0)
+    msquicConnImplSetSendWindowBytes(slot, sendWindow)
+    msquicConnImplSetTotalAckedBytes(slot, 0)
+    msquicConnImplSetSmoothedRttMs(slot, 0)
+    msquicConnImplSetMinRttMs(slot, 0)
+    msquicConnImplSetRttVarMs(slot, 0)
+    msquicConnImplSetMaxRttMs(slot, 0)
+    msquicConnImplResetQueueStorage(impl)
+    msquicConnImplResetSentStorage(impl)
+
+fn msquicConnImplHasQueued(impl: var MsQuicConnImpl): bool =
+    return msquicConnImplQueuedCountAt(impl.slot) > 0
+
+fn msquicConnImplQueuedAckOnly(impl: var MsQuicConnImpl): bool =
+    if msquicConnImplQueuedCountAt(impl.slot) <= 0:
+        return false
+    return msquicConnImplQueuedAckOnlyAt(impl.slot)
+
+fn MsQuicConnImplCanSend(impl: var MsQuicConnImpl): bool =
+    let slot: int32 = impl.slot
+    if msquicConnImplSendWindowBytesAt(slot) <= 0:
+        return true
+    return msquicConnImplBytesInFlightAt(slot) < msquicConnImplSendWindowBytesAt(slot)
+
+fn msquicConnImplCanSend(impl: var MsQuicConnImpl): bool =
+    return MsQuicConnImplCanSend(impl)
+
+@borrows
+fn MsQuicConnImplSendAllowance(impl: MsQuicConnImpl): int64 =
+    let slot: int32 = impl.slot
+    if msquicConnImplSendWindowBytesAt(slot) <= 0:
+        return 2147483647
+    let remain: int64 = msquicConnImplSendWindowBytesAt(slot) - msquicConnImplBytesInFlightAt(slot)
+    if remain <= 0:
+        return 0
+    return remain
+
+@borrows
+fn msquicConnImplSendAllowance(impl: MsQuicConnImpl): int64 =
+    return MsQuicConnImplSendAllowance(impl)
+
+fn MsQuicConnImplFlushAllowed(impl: var MsQuicConnImpl): bool =
+    if MsQuicConnImplSendAllowance(impl) > 0:
+        return true
+    if msquicConnImplQueuedCountAt(impl.slot) <= 0:
+        return false
+    return msquicConnImplQueuedAckOnlyAt(impl.slot)
+
+fn msquicConnImplBytesInFlight(impl: var MsQuicConnImpl): int64 =
+    return msquicConnImplBytesInFlightAt(impl.slot)
+
+fn msquicConnImplUpdateMaxPacketSize(impl: var MsQuicConnImpl, nextSize: int32) =
+    let slot: int32 = impl.slot
+    if nextSize <= 0:
+        return
+    if msquicConnImplMaxPacketSizeAt(slot) == nextSize:
+        return
+    msquicConnImplSetMaxPacketSize(slot, nextSize)
+    if msquicConnImplSendWindowBytesAt(slot) <= 0:
+        return
+    let nextSize64: int64 = int64(nextSize)
+    let defaultWindowPackets32: int32 = msQuicConnImplDefaultWindowPackets
+    let defaultWindowPackets64: int64 = int64(defaultWindowPackets32)
+    msquicConnImplSetSendWindowBytes(slot, nextSize64 * defaultWindowPackets64)
+
+fn msquicConnImplUpdateMaxData(impl: var MsQuicConnImpl, maxData: int64) =
+    let slot: int32 = impl.slot
+    if maxData <= 0:
+        return
+    var flow: flow_control_model.MsQuicFlowControl = msquicConnImplFlowAt(slot)
+    if maxData > flow.maxData:
+        flow.maxData = maxData
+        flow.blocked = false
+        msquicConnImplSetFlow(slot, flow)
+
+fn msquicConnImplFlowMaxData(impl: var MsQuicConnImpl): int64 =
+    let flow: flow_control_model.MsQuicFlowControl = msquicConnImplFlowAt(impl.slot)
+    return flow.maxData
+
+fn msquicConnImplFlowMaxStreamData(impl: var MsQuicConnImpl): int64 =
+    let flow: flow_control_model.MsQuicFlowControl = msquicConnImplFlowAt(impl.slot)
+    return flow.maxStreamData
+
+fn msquicConnImplRaiseMaxStreamData(impl: var MsQuicConnImpl, maxData: int64) =
+    let slot: int32 = impl.slot
+    var flow: flow_control_model.MsQuicFlowControl = msquicConnImplFlowAt(slot)
+    if maxData > flow.maxStreamData:
+        flow.maxStreamData = maxData
+        msquicConnImplSetFlow(slot, flow)
+
+fn msquicConnImplQueueFrameParts(
+    impl: var MsQuicConnImpl,
+    kindCode: int64,
+    streamId: int64,
+    offset: int64,
+    value: int64,
+    data: rawbytes.Bytes
+): Result[bool] =
+    if msquicConnImplQueuedCountAt(impl.slot) >= msQuicMaxQueuedFrames:
+        return Err[bool]("msquic core: frame queue full")
+    var framePkt: packet_model.MsQuicPacket
+    packet_model.MsQuicPacketReset(framePkt, 0)
+    let addRes: Result[bool] = packet_model.MsQuicPacketAddFrameParts(framePkt, kindCode, streamId, offset, value, data)
+    if IsErr(addRes):
+        return Err[bool](strutil.Join([
+            ErrorText(addRes),
+            " kind=",
+            int64ToStr(kindCode),
+            " stream=",
+            int64ToStr(streamId),
+            " offset=",
+            int64ToStr(offset),
+            " value=",
+            int64ToStr(value)
+        ], ""))
+    let queuedBefore: int32 = msquicConnImplQueuedCountAt(impl.slot)
+    msquicConnImplAppendQueuedPayload(impl.slot, framePkt.payload)
+    let frameAckOnly: bool = kindCode == msQuicConnImplFrameAckCode || kindCode == msQuicConnImplFramePaddingCode
+    if queuedBefore <= 0:
+        msquicConnImplSetQueuedAckOnly(impl.slot, frameAckOnly)
+    elif ! frameAckOnly:
+        msquicConnImplSetQueuedAckOnly(impl.slot, false)
+    msquicConnImplSetQueuedCount(impl.slot, msquicConnImplQueuedCountAt(impl.slot) + 1)
+    return Ok[bool](true)
+
+fn msquicConnImplFrameBudget(impl: var MsQuicConnImpl): int32 =
+    let budget: int32 = msquicConnImplMaxPacketSizeAt(impl.slot) - 16
+    if budget <= 0:
+        return 0
+    return budget
+
+fn msquicConnImplMaxDataChunkLen(impl: var MsQuicConnImpl, streamId: int64, offset: int64): int32 =
+    let budget: int32 = msquicConnImplFrameBudget(impl)
+    if budget <= 0:
+        return 0
+    let dataFrameKind: int64 = msQuicConnImplFrameDataCode
+    var fixedLen: int32 = quicVarIntEncodedLen(dataFrameKind)
+    fixedLen = fixedLen + quicVarIntEncodedLen(streamId)
+    fixedLen = fixedLen + quicVarIntEncodedLen(offset)
+    fixedLen = fixedLen + quicVarIntEncodedLen(0)
+    if fixedLen <= 0:
+        return 0
+    let payloadLenStart = budget - fixedLen - 1
+    if payloadLenStart > 0:
+        for payloadLenOffset in 0..<payloadLenStart:
+            let payloadLen = payloadLenStart - payloadLenOffset
+            let dataLenLen: int32 = quicVarIntEncodedLen(int64(payloadLen))
+            if dataLenLen > 0 && fixedLen + dataLenLen + payloadLen <= budget:
+                return payloadLen
+    return 0
+
+fn msquicConnImplMaxQueuedDataLen(impl: var MsQuicConnImpl, streamId: int64, offset: int64): int32 =
+    let queueFree: int32 = msQuicMaxQueuedFrames - msquicConnImplQueuedCountAt(impl.slot)
+    if queueFree <= 0:
+        return 0
+    var total: int32
+    var nextOffset: int64 = offset
+    var i: int32
+    for i in i..<queueFree:
+        let chunkCap: int32 = msquicConnImplMaxDataChunkLen(impl, streamId, nextOffset)
+        if chunkCap <= 0:
+            break
+        total = total + chunkCap
+        nextOffset = nextOffset + int64(chunkCap)
+    return total
+
+fn msquicConnImplQueueData(
+    impl: var MsQuicConnImpl,
+    streamId: int64,
+    offset: int64,
+    data: rawbytes.Bytes
+): Result[bool] =
+    let count: int64 = int64(BytesLen(data))
+    if count <= 0:
+        return Ok[bool](false)
+    let slot: int32 = impl.slot
+    let queueFree: int32 = msQuicMaxQueuedFrames - msquicConnImplQueuedCountAt(slot)
+    if queueFree <= 0:
+        return Err[bool]("msquic core: frame queue full")
+    var framesNeeded: int32
+    var nextOffset: int64 = offset
+    var remainingForCount: int32 = BytesLen(data)
+    while remainingForCount > 0:
+        let chunkCap: int32 = msquicConnImplMaxDataChunkLen(impl, streamId, nextOffset)
+        if chunkCap <= 0:
+            return Err[bool]("msquic core: data frame budget <= 0")
+        let chunkLen: int32 = if remainingForCount < chunkCap: remainingForCount else: chunkCap
+        framesNeeded = framesNeeded + 1
+        if framesNeeded > queueFree:
+            return Err[bool]("msquic core: frame queue full")
+        nextOffset = nextOffset + int64(chunkLen)
+        remainingForCount = remainingForCount - chunkLen
+    var flow: flow_control_model.MsQuicFlowControl = msquicConnImplFlowAt(slot)
+    let fcRes: Result[bool] = msquicFlowControlConsumeConn(flow, count)
+    if IsErr(fcRes):
+        return Err[bool](ErrorText(fcRes))
+    msquicConnImplSetFlow(slot, flow)
+    flow = msquicConnImplFlowAt(slot)
+    let fsRes: Result[bool] = msquicFlowControlConsumeStream(flow, count)
+    if IsErr(fsRes):
+        return Err[bool](ErrorText(fsRes))
+    msquicConnImplSetFlow(slot, flow)
+    var queuedOffset: int64 = offset
+    var cursor: int32
+    var remaining: int32 = BytesLen(data)
+    while remaining > 0:
+        let chunkCap: int32 = msquicConnImplMaxDataChunkLen(impl, streamId, queuedOffset)
+        if chunkCap <= 0:
+            return Err[bool]("msquic core: data frame budget <= 0")
+        let chunkLen: int32 = if remaining < chunkCap: remaining else: chunkCap
+        let chunk: rawbytes.Bytes = BytesSlice(data, cursor, chunkLen)
+        let qRes: Result[bool] = msquicConnImplQueueFrameParts(impl, msQuicConnImplFrameDataCode, streamId, queuedOffset, 0, chunk)
+        if IsErr(qRes):
+            return Err[bool](ErrorText(qRes))
+        cursor = cursor + chunkLen
+        queuedOffset = queuedOffset + int64(chunkLen)
+        remaining = remaining - chunkLen
+    return Ok[bool](true)
+
+fn msquicConnImplQueuePing(impl: var MsQuicConnImpl): Result[bool] =
+    return msquicConnImplQueueFrameParts(impl, msQuicConnImplFramePingCode, 0, 0, 0, emptyBytes())
+
+fn msquicConnImplQueueAck(impl: var MsQuicConnImpl, number: int64): Result[bool] =
+    return msquicConnImplQueueFrameParts(impl, msQuicConnImplFrameAckCode, 0, 0, number, emptyBytes())
+
+# SACK wire payload for an ACK frame: a varint range_count followed by
+# range_count pairs of (first, last) varints. Ranges are independent inclusive
+# packet-number intervals (with gaps). value=largest stays on the frame for
+# legacy cumulative decode (range_count==0 ⇒ empty payload ⇒ [0,largest]).
+# The receiver (native_runtime) builds this payload from its recv bitmap and
+# queues an ACK frame via MsQuicConnImplQueueFrameParts.
+
+fn msquicConnImplNextPacketNumber(impl: var MsQuicConnImpl): int64 =
+    let slot: int32 = impl.slot
+    let num: int64 = msquicConnImplNextPacketNumberAt(slot)
+    msquicConnImplSetNextPacketNumber(slot, msquicConnImplNextPacketNumberAt(slot) + 1)
+    return num
+
+fn msquicConnImplBuildPacket(impl: var MsQuicConnImpl): Result[packet_model.MsQuicPacket] =
+    var out: packet_model.MsQuicPacket
+    let buildRes: Result[bool] = msquicConnImplBuildPacketInto(out, impl)
+    if IsErr(buildRes):
+        return Err[packet_model.MsQuicPacket](ErrorText(buildRes))
+    return Ok[packet_model.MsQuicPacket](out)
+
+fn msquicConnImplBuildPacketInto(out: var packet_model.MsQuicPacket, impl: var MsQuicConnImpl): Result[bool] =
+    let slot: int32 = impl.slot
+    if msquicConnImplQueuedCountAt(slot) <= 0:
+        return Err[bool]("msquic core: no frames queued")
+    let number: int64 = msquicConnImplNextPacketNumber(impl)
+    packet_model.MsQuicPacketReset(out, number)
+    let payload: rawbytes.Bytes = msquicConnImplQueuedPayloadAt(slot)
+    let payloadLen: int32 = BytesLen(payload)
+    if payloadLen <= 0:
+        return Err[bool]("msquic core: empty queued payload")
+    if payloadLen + 16 > msquicConnImplMaxPacketSizeAt(slot):
+        return Err[bool]("msquic packet: packet too small")
+    out.payload = BytesSlice(payload, 0, payloadLen)
+    out.framesCount = msquicConnImplQueuedCountAt(slot)
+    out.ackEliciting = ! msquicConnImplQueuedAckOnlyAt(slot)
+    msquicConnImplClearQueuedPayload(slot)
+    msquicConnImplSetLastPacketMs(slot, qcommon.msquicCoreNowMs())
+    return Ok[bool](true)
+
+fn msquicConnImplRecordSent(impl: var MsQuicConnImpl, pkt: var packet_model.MsQuicPacket, data: rawbytes.Bytes): Result[bool] =
+    let slot: int32 = impl.slot
+    if ! packet_model.MsQuicPacketAckEliciting(pkt):
+        return Ok[bool](false)
+    let size: int64 = int64(BytesLen(data))
+    if msquicConnImplSentCountAt(slot) >= msQuicMaxSentPackets:
+        let oldest: MsQuicSentPacket = msquicConnImplSentAt(impl, 0)
+        let oldestBytes: int64 = int64(BytesLen(oldest.data))
+        if oldestBytes > 0 && msquicConnImplBytesInFlightAt(slot) >= oldestBytes:
+            msquicConnImplSetBytesInFlight(slot, msquicConnImplBytesInFlightAt(slot) - oldestBytes)
+        for i in 1..<msquicConnImplSentCountAt(slot):
+            let dstIdx: int32 = i - 1
+            let srcIdx: int32 = i
+            let srcPacket: MsQuicSentPacket = msquicConnImplSentAt(impl, srcIdx)
+            msquicConnImplSetSentPacketAtStore(impl.slot, dstIdx, srcPacket)
+        msquicConnImplSetSentCount(slot, msquicConnImplSentCountAt(slot) - 1)
+
+    var rec: MsQuicSentPacket = MsQuicSentPacket(
+        active: 1,
+        number: pkt.number,
+        sentAtMs: qcommon.msquicCoreNowMs(),
+        data: data,
+        packetLength: int32(size),
+        retries: 0
+    )
+    let recIdx: int32 = msquicConnImplSentCountAt(slot)
+    msquicConnImplSetSentPacketAtStore(impl.slot, recIdx, rec)
+    msquicConnImplSetSentCount(slot, msquicConnImplSentCountAt(slot) + 1)
+    msquicConnImplSetBytesInFlight(slot, msquicConnImplBytesInFlightAt(slot) + size)
+    return Ok[bool](true)
+
+fn msquicConnImplRecordSentParts(impl: var MsQuicConnImpl,
+                                 packetNumber: int64,
+                                 ackEliciting: bool,
+                                 data: rawbytes.Bytes): Result[bool] =
+    let slot: int32 = impl.slot
+    if ! ackEliciting:
+        return Ok[bool](false)
+    let size: int64 = int64(BytesLen(data))
+    let wasEmpty: bool = msquicConnImplSentCountAt(slot) <= 0
+    if msquicConnImplSentCountAt(slot) >= msQuicMaxSentPackets:
+        let oldest: MsQuicSentPacket = msquicConnImplSentAt(impl, 0)
+        let oldestBytes: int64 = int64(BytesLen(oldest.data))
+        if oldestBytes > 0 && msquicConnImplBytesInFlightAt(slot) >= oldestBytes:
+            msquicConnImplSetBytesInFlight(slot, msquicConnImplBytesInFlightAt(slot) - oldestBytes)
+        for i in 1..<msquicConnImplSentCountAt(slot):
+            let dstIdx: int32 = i - 1
+            let srcIdx: int32 = i
+            let srcPacket: MsQuicSentPacket = msquicConnImplSentAt(impl, srcIdx)
+            msquicConnImplSetSentPacketAtStore(impl.slot, dstIdx, srcPacket)
+        msquicConnImplSetSentCount(slot, msquicConnImplSentCountAt(slot) - 1)
+        # The evicted slot may have held the cached minimum; the shift above is
+        # already O(window) (rare: only at the 256-packet cap), so an exact
+        # recompute here is free by comparison and keeps the cache correct.
+        msquicConnImplRecomputeSentMinAtMs(impl)
+
+    var rec: MsQuicSentPacket = MsQuicSentPacket(
+        active: 1,
+        number: packetNumber,
+        sentAtMs: qcommon.msquicCoreNowMs(),
+        data: data,
+        packetLength: int32(size),
+        retries: 0
+    )
+    let recIdx: int32 = msquicConnImplSentCountAt(slot)
+    msquicConnImplSetSentPacketAtStore(impl.slot, recIdx, rec)
+    msquicConnImplSetSentCount(slot, msquicConnImplSentCountAt(slot) + 1)
+    msquicConnImplSetBytesInFlight(slot, msquicConnImplBytesInFlightAt(slot) + size)
+    # A newly-appended packet is sent "now", never earlier than anything already
+    # outstanding, so it can only affect the cached minimum when the window was
+    # empty (this is then the sole entry, hence the new minimum).
+    if wasEmpty:
+        msquicConnImplSetSentMinAtMs(slot, rec.sentAtMs)
+    return Ok[bool](true)
+
+fn msquicConnImplAckRanges(
+    impl: var MsQuicConnImpl,
+    ranges: MsQuicAckRange[msQuicMaxAckRanges],
+    count: int32,
+    ackDelayMs: int64
+) =
+    let slot: int32 = impl.slot
+    if count <= 0:
+        return
+    var delayMs: int64 = ackDelayMs
+    if delayMs < 0:
+        delayMs = 0
+
+    var ackedBytes: int64
+    var latestAckedNumber: int64
+    var latestAckedSentAt: int64
+    var latestAckedRetries: int32
+
+    # Single pass over the dense [0, sentCount) window: mark-and-compact in one
+    # sweep instead of two full array scans (each element was being fetched via
+    # SentAt — a by-value MsQuicSentPacket struct copy including the wire-bytes
+    # handle — twice per ack: once to test/mark, once more to re-read for the
+    # compaction shift). Every acked entry is simply dropped (not carried to j);
+    # every surviving entry is compacted down to j exactly as the old two-pass
+    # version did, but each element is now read from the store at most once and
+    # written at most once. Behavior (which entries end up acked, the resulting
+    # dense array order/count, ackedBytes/RTT-sample inputs) is unchanged.
+    var i: int32
+    var j: int32
+    var survivorMinAtMs: int64
+    for i in 0..<msquicConnImplSentCountAt(slot):
+        let packet: MsQuicSentPacket = msquicConnImplSentAt(impl, i)
+        if packet.active == 0:
+            continue
+        let pktNum: int64 = packet.number
+        var acked: bool
+        var r: int32
+        for r in 0..<count:
+            let range: MsQuicAckRange = ranges[r]
+            if pktNum >= range.first && pktNum <= range.last:
+                acked = true
+                break
+        if acked:
+            let pktBytes: int64 = int64(BytesLen(packet.data))
+            ackedBytes = ackedBytes + pktBytes
+            if pktBytes > 0 && msquicConnImplBytesInFlightAt(slot) >= pktBytes:
+                msquicConnImplSetBytesInFlight(slot, msquicConnImplBytesInFlightAt(slot) - pktBytes)
+            if pktNum > latestAckedNumber:
+                latestAckedNumber = pktNum
+                latestAckedSentAt = packet.sentAtMs
+                latestAckedRetries = packet.retries
+        else:
+            if i != j:
+                msquicConnImplSetSentPacketAtStore(impl.slot, j, packet)
+            if j == 0 || packet.sentAtMs < survivorMinAtMs:
+                survivorMinAtMs = packet.sentAtMs
+            j = j + 1
+    msquicConnImplSetSentCount(slot, j)
+    if j > 0:
+        msquicConnImplSetSentMinAtMs(slot, survivorMinAtMs)
+
+    if ackedBytes <= 0:
+        return
+
+    let nowMs: int64 = qcommon.msquicCoreNowMs()
+    # Karn's algorithm: NEVER sample RTT from an ACK of a RETRANSMITTED packet — the ack
+    # could be for either the original or the retransmit, so the measured "RTT" is the RTO
+    # wait (~hundreds of ms to 1s), not the network RTT. Sampling it inflates srtt → inflates
+    # RTO → next loss waits even longer → spiral that collapses throughput on a lossy link
+    # (observed srtt spiking 8ms→1000ms). Skip the sample when the acked packet was resent.
+    if latestAckedNumber > 0 && latestAckedSentAt > 0 && nowMs >= latestAckedSentAt && latestAckedRetries == 0:
+        var sampleRtt: int64 = nowMs - latestAckedSentAt
+        if delayMs > 0 && sampleRtt > delayMs:
+            sampleRtt = sampleRtt - delayMs
+        elif delayMs > 0:
+            sampleRtt = 0
+        if msquicConnImplMinRttMsAt(slot) == 0 || sampleRtt < msquicConnImplMinRttMsAt(slot):
+            msquicConnImplSetMinRttMs(slot, sampleRtt)
+        if msquicConnImplMaxRttMsAt(slot) == 0 || sampleRtt > msquicConnImplMaxRttMsAt(slot):
+            msquicConnImplSetMaxRttMs(slot, sampleRtt)
+        if msquicConnImplSmoothedRttMsAt(slot) == 0:
+            msquicConnImplSetSmoothedRttMs(slot, sampleRtt)
+        else:
+            msquicConnImplSetSmoothedRttMs(slot, (msquicConnImplSmoothedRttMsAt(slot) * 7 + sampleRtt) / 8)
+        let smoothed: int64 = msquicConnImplSmoothedRttMsAt(slot)
+        let diff: int64 = if sampleRtt > smoothed: sampleRtt - smoothed else: smoothed - sampleRtt
+        if msquicConnImplRttVarMsAt(slot) == 0:
+            msquicConnImplSetRttVarMs(slot, diff)
+        else:
+            msquicConnImplSetRttVarMs(slot, (msquicConnImplRttVarMsAt(slot) * 3 + diff) / 4)
+
+    msquicConnImplSetTotalAckedBytes(slot, msquicConnImplTotalAckedBytesAt(slot) + ackedBytes)
+    # RFC9002 慢启动:拥塞窗随被 ACK 字节增长(初值 ~12KB 固定会让整 mp4 stop-and-go 太慢)。
+    # 封顶保守:过大 cwnd 无 pacing 会一次性灌爆接收端 UDP socket buffer→丢包→乱序重组超 64 槽
+    # →"chunk list full"→pipe closed(loopback 实测 1.25MB 撞此)。封顶 192KB ≈ 安全 BDP,既比
+    # 12KB 快一个量级又不撑爆 socket。真 WAN 的 cwnd 回退/pacing 是单独 follow-up。
+    let cwndNow: int64 = msquicConnImplSendWindowBytesAt(slot)
+    if cwndNow > 0:
+        var cwndNext: int64 = cwndNow + ackedBytes
+        let cwndCap: int64 = 1572864
+        if cwndNext > cwndCap:
+            cwndNext = cwndCap
+        msquicConnImplSetSendWindowBytes(slot, cwndNext)
+    if msquicConnImplSmoothedRttMsAt(slot) > 0:
+        let nextMs: int64 = msquicConnImplSmoothedRttMsAt(slot) + msquicConnImplRttVarMsAt(slot) * 4 + delayMs + 1
+        if nextMs > 1:
+            msquicConnImplSetRtoMs(slot, nextMs)
+
+fn msquicConnImplAck(impl: var MsQuicConnImpl, number: int64, ackDelayMs: int64) =
+    if number > 0:
+        var ranges: MsQuicAckRange[msQuicMaxAckRanges]
+        ranges[0] = MsQuicAckRange(first: 0, last: number)
+        msquicConnImplAckRanges(impl, ranges, 1, ackDelayMs)
+
+# Decode SACK ranges carried in an ACK frame payload and apply them. If the
+# payload is empty (legacy / handshake acks) fall back to cumulative [0,largest].
+fn msquicConnImplAckSack(impl: var MsQuicConnImpl, largest: int64, data: rawbytes.Bytes, ackDelayMs: int64) =
+    let dataLen: int32 = BytesLen(data)
+    if dataLen <= 0:
+        msquicConnImplAck(impl, largest, ackDelayMs)
+        return
+    let countRes: Result[quic_varint.QuicVarIntDecoded] = quicVarIntDecode(data, 0)
+    if IsErr(countRes):
+        msquicConnImplAck(impl, largest, ackDelayMs)
+        return
+    let countDec: quic_varint.QuicVarIntDecoded = Value(countRes)
+    var count: int32 = int32(countDec.value)
+    if count <= 0:
+        msquicConnImplAck(impl, largest, ackDelayMs)
+        return
+    if count > msQuicMaxAckRanges:
+        count = msQuicMaxAckRanges
+    var ranges: MsQuicAckRange[msQuicMaxAckRanges]
+    var cursor: int32 = countDec.next
+    var i: int32
+    var parsed: int32
+    for i in 0..<count:
+        let firstRes: Result[quic_varint.QuicVarIntDecoded] = quicVarIntDecode(data, cursor)
+        if IsErr(firstRes):
+            break
+        let firstDec: quic_varint.QuicVarIntDecoded = Value(firstRes)
+        let lastRes: Result[quic_varint.QuicVarIntDecoded] = quicVarIntDecode(data, firstDec.next)
+        if IsErr(lastRes):
+            break
+        let lastDec: quic_varint.QuicVarIntDecoded = Value(lastRes)
+        ranges[parsed] = MsQuicAckRange(first: firstDec.value, last: lastDec.value)
+        cursor = lastDec.next
+        parsed = parsed + 1
+    if parsed <= 0:
+        msquicConnImplAck(impl, largest, ackDelayMs)
+        return
+    msquicConnImplAckRanges(impl, ranges, parsed, ackDelayMs)
+
+fn MsQuicConnImplNextRetransmit(impl: var MsQuicConnImpl, nowMs: int64): MsQuicRetransmitPacket =
+    let slot: int32 = impl.slot
+    var i: int32
+    for i in i..<msquicConnImplSentCountAt(slot):
+        var packet: MsQuicSentPacket = msquicConnImplSentAt(impl, i)
+        if packet.active == 0:
+            continue
+        if nowMs - packet.sentAtMs < msquicConnImplRtoMsAt(slot):
+            continue
+
+        let size: int64 = int64(BytesLen(packet.data))
+        let newPn: int64 = msquicConnImplNextPacketNumber(impl)
+        packet.number = newPn
+        packet.sentAtMs = nowMs
+        packet.retries = packet.retries + 1
+        msquicConnImplSetSentPacketAtStore(impl.slot, i, packet)
+        if size > 0:
+            msquicConnImplSetRtoMs(slot, msquicConnImplRtoMsAt(slot) * 2)
+            if msquicConnImplRtoMsAt(slot) <= 0:
+                msquicConnImplSetRtoMs(slot, 200)
+        return MsQuicRetransmitPacket(number: newPn, payload: packet.data)
+
+    return MsQuicRetransmitPacket(number: 0, payload: emptyBytes())
+
+fn msquicConnImplNextRetransmit(impl: var MsQuicConnImpl, nowMs: int64): MsQuicRetransmitPacket =
+    return MsQuicConnImplNextRetransmit(impl, nowMs)
+
+fn MsQuicConnImplNextRetransmitInto(out: var MsQuicRetransmitPacket, impl: var MsQuicConnImpl, nowMs: int64): bool =
+    let slot: int32 = impl.slot
+    if msquicConnImplSentCountAt(slot) <= 0:
+        out.number = 0
+        out.payload = emptyBytes()
+        return false
+    # Every active entry's sentAtMs is >= the cached minimum, so if even the
+    # minimum hasn't reached this side's current RTO yet, none can be eligible
+    # for retransmit — skip the O(window) scan entirely. This runs on every
+    # received datagram (pump calls it per side per packet), and on a healthy
+    # link essentially nothing is ever RTO-expired, so this is the overwhelming
+    # common case.
+    if nowMs - msquicConnImplSentMinAtMsAt(slot) < msquicConnImplRtoMsAt(slot):
+        out.number = 0
+        out.payload = emptyBytes()
+        return false
+    var i: int32
+    for i in i..<msquicConnImplSentCountAt(slot):
+        var packet: MsQuicSentPacket = msquicConnImplSentAt(impl, i)
+        if packet.active == 0:
+            continue
+        if nowMs - packet.sentAtMs < msquicConnImplRtoMsAt(slot):
+            continue
+
+        let size: int64 = int64(BytesLen(packet.data))
+        let newPn: int64 = msquicConnImplNextPacketNumber(impl)
+        packet.number = newPn
+        packet.sentAtMs = nowMs
+        packet.retries = packet.retries + 1
+        msquicConnImplSetSentPacketAtStore(impl.slot, i, packet)
+        # This entry may have held the cached minimum and just moved to "now" —
+        # recompute exactly. Only reached on an actual retransmit (rare), so no
+        # regression versus the already-O(window) baseline of this branch.
+        msquicConnImplRecomputeSentMinAtMs(impl)
+        if size > 0:
+            msquicConnImplSetRtoMs(slot, msquicConnImplRtoMsAt(slot) * 2)
+            if msquicConnImplRtoMsAt(slot) <= 0:
+                msquicConnImplSetRtoMs(slot, 200)
+        out.number = newPn
+        out.payload = packet.data
+        return true
+    out.number = 0
+    out.payload = emptyBytes()
+    return false
+
+@borrows
+fn msquicConnImplRtoMs(impl: MsQuicConnImpl): int64 =
+    return msquicConnImplRtoMsAt(impl.slot)
+
+fn msquicConnImplForceRetransmit(impl: var MsQuicConnImpl, nowMs: int64) =
+    let slot: int32 = impl.slot
+    let rtoMs: int64 = msquicConnImplRtoMsAt(slot)
+    var i: int32
+    for i in i..<msquicConnImplSentCountAt(slot):
+        var packet: MsQuicSentPacket = msquicConnImplSentAt(impl, i)
+        packet.sentAtMs = nowMs - rtoMs - 1
+        msquicConnImplSetSentPacketAtStore(impl.slot, i, packet)
+    # Every active entry's sentAtMs just moved together; recompute the cached
+    # minimum from the actual (now-uniform) values instead of assuming it.
+    msquicConnImplRecomputeSentMinAtMs(impl)
+
+@borrows
+fn MsQuicConnImplHasQueued(impl: var MsQuicConnImpl): bool =
+    return msquicConnImplQueuedCountAt(impl.slot) > 0
+
+@borrows
+fn MsQuicConnImplQueuedAckOnly(impl: var MsQuicConnImpl): bool =
+    if msquicConnImplQueuedCountAt(impl.slot) <= 0:
+        return false
+    return msquicConnImplQueuedAckOnlyAt(impl.slot)
+
+fn MsQuicConnImplBytesInFlight(impl: var MsQuicConnImpl): int64 =
+    return msquicConnImplBytesInFlightAt(impl.slot)
+
+# Number of in-flight (sent, not-yet-acked) ack-eliciting packets. Used by the
+# close path to drain/retransmit before tearing down the connection.
+fn MsQuicConnImplSentCount(impl: var MsQuicConnImpl): int32 =
+    let slot: int32 = impl.slot
+    var active: int32
+    var i: int32
+    for i in 0..<msquicConnImplSentCountAt(slot):
+        let packet: MsQuicSentPacket = msquicConnImplSentAt(impl, i)
+        if packet.active != 0:
+            active = active + 1
+    return active
+
+fn MsQuicConnImplQueueFrameParts(
+    impl: var MsQuicConnImpl,
+    kindCode: int64,
+    streamId: int64,
+    offset: int64,
+    value: int64,
+    data: rawbytes.Bytes
+): Result[bool] =
+    return msquicConnImplQueueFrameParts(impl, kindCode, streamId, offset, value, data)
+
+fn MsQuicConnImplFrameBudget(impl: var MsQuicConnImpl): int32 =
+    let budget: int32 = msquicConnImplMaxPacketSizeAt(impl.slot) - 16
+    if budget <= 0:
+        return 0
+    return budget
+
+@borrows
+fn MsQuicConnImplFrameBudgetInto(impl: var MsQuicConnImpl, outBudget: var int32): bool =
+    let budget: int32 = msquicConnImplMaxPacketSizeAt(impl.slot) - 16
+    if budget <= 0:
+        outBudget = 0
+        return false
+    outBudget = budget
+    return true
+
+fn MsQuicConnImplBuildPacketInto(out: var packet_model.MsQuicPacket, impl: var MsQuicConnImpl): Result[bool] =
+    return msquicConnImplBuildPacketInto(out, impl)
+
+fn MsQuicConnImplBuildPacketPartsInto(impl: var MsQuicConnImpl,
+                                      outNumber: var int64,
+                                      outPayload: var rawbytes.Bytes,
+                                      outAckEliciting: var bool,
+                                      outFrameCount: var int32): Result[bool] =
+    var pkt: packet_model.MsQuicPacket
+    let buildRes: Result[bool] = msquicConnImplBuildPacketInto(pkt, impl)
+    if IsErr(buildRes):
+        return Err[bool](ErrorText(buildRes))
+    outNumber = pkt.number
+    outPayload = pkt.payload
+    outAckEliciting = pkt.ackEliciting
+    outFrameCount = pkt.framesCount
+    return Ok[bool](true)
+
+fn MsQuicConnImplRecordSent(impl: var MsQuicConnImpl, pkt: var packet_model.MsQuicPacket, data: rawbytes.Bytes): Result[bool] =
+    return msquicConnImplRecordSent(impl, pkt, data)
+
+fn MsQuicConnImplRecordSentParts(impl: var MsQuicConnImpl,
+                                 packetNumber: int64,
+                                 ackEliciting: bool,
+                                 data: rawbytes.Bytes): Result[bool] =
+    return msquicConnImplRecordSentParts(impl, packetNumber, ackEliciting, data)
+
+fn MsQuicConnImplAck(impl: var MsQuicConnImpl, number: int64, ackDelayMs: int64) =
+    msquicConnImplAck(impl, number, ackDelayMs)
+
+fn MsQuicConnImplAckSack(impl: var MsQuicConnImpl, largest: int64, data: rawbytes.Bytes, ackDelayMs: int64) =
+    msquicConnImplAckSack(impl, largest, data, ackDelayMs)
+
+fn MsQuicConnImplUpdateMaxData(impl: var MsQuicConnImpl, maxData: int64) =
+    msquicConnImplUpdateMaxData(impl, maxData)
+
+fn MsQuicConnImplRaiseMaxStreamData(impl: var MsQuicConnImpl, maxData: int64) =
+    msquicConnImplRaiseMaxStreamData(impl, maxData)
+
+fn MsQuicConnImplQueueAck(impl: var MsQuicConnImpl, number: int64): Result[bool] =
+    return msquicConnImplQueueAck(impl, number)
+
+fn MsQuicConnImplForceRetransmit(impl: var MsQuicConnImpl, nowMs: int64) =
+    msquicConnImplForceRetransmit(impl, nowMs)
+
+fn msquicConnImplCreditConn(impl: var MsQuicConnImpl, credit: int64) =
+    var flow: flow_control_model.MsQuicFlowControl = msquicConnImplFlowAt(impl.slot)
+    msquicFlowControlCreditConn(flow, credit)
+    msquicConnImplSetFlow(impl.slot, flow)
+
+fn msquicConnImplCreditStream(impl: var MsQuicConnImpl, credit: int64) =
+    var flow: flow_control_model.MsQuicFlowControl = msquicConnImplFlowAt(impl.slot)
+    msquicFlowControlCreditStream(flow, credit)
+    msquicConnImplSetFlow(impl.slot, flow)
+
+@borrows
+fn msquicConnImplBlocked(impl: MsQuicConnImpl): bool =
+    let flow: flow_control_model.MsQuicFlowControl = msquicConnImplFlowAt(impl.slot)
+    return msquicFlowControlBlocked(flow)
+
+@borrows
+fn msquicConnImplHasInFlight(impl: MsQuicConnImpl): bool =
+    return msquicConnImplSentCountAt(impl.slot) > 0
+
+@borrows
+fn msquicConnImplNextPtoAt(impl: MsQuicConnImpl, nowMs: int64): int64 =
+    let slot: int32 = impl.slot
+    if msquicConnImplSentCountAt(slot) <= 0:
+        return 0
+    if msquicConnImplRtoMsAt(slot) <= 0:
+        return 0
+    return nowMs + msquicConnImplRtoMsAt(slot)

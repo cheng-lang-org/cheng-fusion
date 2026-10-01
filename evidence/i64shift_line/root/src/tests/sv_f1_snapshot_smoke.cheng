@@ -1,0 +1,248 @@
+import std/strings
+import std/os
+import std/rawbytes
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/game/csg/schema
+import cheng/game/csg/execution
+import cheng/game/world3d
+import cheng/game/csg/ball_servo_rigid
+import cheng/game/assets/semantic_video/snapshot_codec
+import cheng/game/assets/semantic_video/snapshot_block
+import cheng/game/assets/semantic_video/reader
+import cheng/game/assets/semantic_video/validator
+import cheng/game/assets/semantic_video/writer
+import cheng/game/csg/csgworld
+
+# F1 S2 recovery A/B smoke (in-process):
+#   1. pass-through: run the deterministic ballbalance episode 4000 ticks,
+#      record World3dCid after every tick, capture state_payload encodes at
+#      ticks 1200/2400/3600 on the way; baseline cids dumped for CLI diff.
+#   2. recovery points: for each capture tick, rebuild the world, replay the
+#      shared drive to the tick, assert the replay CID equals the pass-through
+#      CID, decode the payload over the replayed state, assert the decoded
+#      CID too, then continue to tick 4000 and assert the CID tick-by-tick
+#      against the pass-through run (>=1000 tick window per point).
+#   3. S1 gates: block validator PASS; asv-gen0/asv-gen1 coexist with the
+#      revision link; block rebuild byte-identical; decode->re-encode
+#      byte-identical.
+#   4. corruption: a flipped magic byte must fail SvSnapDecode; a flipped
+#      payload data byte must be rejected at the resource CID binding.
+
+const
+    SvF1TotalTicks: int32 = 5000
+    SvF1CkptCount: int32 = 3
+
+type
+    SvF1Direct =
+        ok: bool
+        factsCid: str
+        cids: str[]
+        ticks: int64[]
+        lengths: int32[]
+        allPayloads: rawbytes.Bytes
+        resCids: str[]
+
+@borrows
+fn SvF1FailText(e: str): str =
+    return strings.CloneStr(e)
+
+@borrows
+fn SvF1DirectRun(): SvF1Direct =
+    var out: SvF1Direct
+    var facts: schema.CsgWorldFacts
+    let embedded: str = csgworld.CsgWorldLoad("artifacts/csg_world_video/csgworld/ballbalance.csgworld", facts)
+    if embedded.len == 0:
+        return out
+    var factsCid: str = Fmt"{schema.CsgWorldFactsCid(facts)}"
+    if factsCid != embedded:
+        return out
+    out.factsCid = strings.CloneStr(factsCid)
+    var drive = snapshot_block.SvSnapDriveStartFromFacts(facts)
+    if !drive.ok:
+        return out
+    setLen(out.ticks, SvF1CkptCount)
+    out.ticks[0] = int64(1200)
+    out.ticks[1] = int64(2400)
+    out.ticks[2] = int64(3600)
+    add(out.cids, strings.CloneStr(world3d.World3dCid(drive.st.w)))
+    var servo: ball_servo_rigid.BallServoRigidState
+    var buf = layout.ByteBufInit(8192)
+    var targetIdx: int32 = 0
+    var t: int32 = 1
+    while t <= SvF1TotalTicks:
+        if !snapshot_block.SvSnapDriveTick(drive.st, facts):
+            layout.ByteBufFree(buf)
+            return out
+        add(out.cids, strings.CloneStr(world3d.World3dCid(drive.st.w)))
+        if targetIdx < SvF1CkptCount && int64(t) == out.ticks[targetIdx]:
+            var sw = world3d.World3dClone(drive.st.w)
+            var ss = execution.CsgExecutionSnapshot(drive.st)
+            var encoded = snapshot_codec.SvSnapEncode(sw, ss, servo)
+            if !encoded.ok:
+                layout.ByteBufFree(buf)
+                return out
+            layout.ByteBufAppendBytes(buf, encoded.bytes)
+            add(out.lengths, rawbytes.BytesLen(encoded.bytes))
+            add(out.resCids, strings.CloneStr(snapshot_block.SvSnapResourceCid(encoded.bytes)))
+            rawbytes.BytesFree(encoded.bytes)
+            targetIdx = targetIdx + 1
+        t = t + 1
+    out.allPayloads = layout.ByteBufToBytes(buf)
+    layout.ByteBufFree(buf)
+    out.ok = true
+    return out
+
+# One recovery point: replay -> decode overwrite -> continue to 5000 with
+# tick-by-tick CID A/B against the pass-through run.
+@borrows
+fn SvF1RestoreCheck(direct: SvF1Direct, targetIdx: int32) =
+    let ckptTick: int64 = direct.ticks[targetIdx]
+    var offset: int32 = 0
+    for i in 0..<targetIdx:
+        offset = offset + direct.lengths[i]
+    var facts: schema.CsgWorldFacts
+    let loadedAt: str = csgworld.CsgWorldLoad("artifacts/csg_world_video/csgworld/ballbalance.csgworld", facts)
+    assert(loadedAt.len > 0, " fixture csgworld loads")
+    var drive = snapshot_block.SvSnapDriveStartFromFacts(facts)
+    assert(drive.ok, " restore drive ok")
+    assert(drive.factsCid == direct.factsCid, " facts cid reproducible")
+    while drive.st.w.tick < ckptTick:
+        assert(snapshot_block.SvSnapDriveTick(drive.st, facts), " fast-forward accepted")
+    var replayCid: str = world3d.World3dCid(drive.st.w)
+    assert(replayCid == direct.cids[int32(ckptTick)], " replay determinism at ckpt")
+    var view = rawbytes.BytesSliceView(direct.allPayloads, offset, direct.lengths[targetIdx])
+    var restored = snapshot_codec.SvSnapDecode(view)
+    assert(restored.ok, SvF1FailText(restored.error))
+    var decodedCid: str = world3d.World3dCid(restored.st.w)
+    assert(decodedCid == direct.cids[int32(ckptTick)], " decoded world cid equals pass-through")
+    assert(restored.st.w.tick == ckptTick, " payload tick bound")
+    assert(restored.st.stepCount == ckptTick, " payload stepCount bound")
+    # decode -> re-encode must reproduce the exact payload bytes
+    var reencoded = snapshot_codec.SvSnapEncode(restored.st.w, restored.st, restored.servo)
+    assert(reencoded.ok, " re-encode ok")
+    assert(snapshot_block.SvSnapBytesEqual(reencoded.bytes, view), " decode re-encode byte-identical")
+    rawbytes.BytesFree(reencoded.bytes)
+    # overwrite and continue: every tick's CID must match the pass-through
+    var t: int64 = ckptTick
+    while t < int64(SvF1TotalTicks):
+        assert(snapshot_block.SvSnapDriveTick(restored.st, facts), " continuation accepted")
+        t = t + 1
+        var contCid: str = world3d.World3dCid(restored.st.w)
+        assert(contCid == direct.cids[int32(t)], " continuation cid A/B at tick " + strings.Int64ToStr(t))
+    echo(" restore ck-" + strings.Int64ToStr(ckptTick) + " window=" + strings.Int64ToStr(int64(SvF1TotalTicks) - ckptTick) + " ticks all match")
+
+# S1 gates over a freshly built block (built twice for byte determinism).
+@borrows
+fn SvF1BlockGates(direct: SvF1Direct) =
+    os.MkdirAll(".scratch/f1", 493)
+    var builtA = snapshot_block.SvSnapshotBlockBuild(direct.factsCid, direct.ticks,
+        direct.lengths, direct.allPayloads, ".scratch/f1/smoke_a.svblock")
+    assert(builtA.ok, SvF1FailText(builtA.error))
+    assert(builtA.factCount == 10, " block record count 10")
+    var blockALoad = os.ReadFileBytesResult(".scratch/f1/smoke_a.svblock")
+    assert(!result.IsErr(blockALoad), " read block a")
+    var blockA = result.Value(blockALoad)
+    var validation = validator.SvValidate(blockA)
+    assert(validation.ok, SvF1FailText(validation.error))
+    var decoded = reader.SvReaderDecode(blockA)
+    assert(decoded.ok, SvF1FailText(decoded.error))
+    var parsed = reader.SvParseRecords(decoded.lines)
+    assert(parsed.ok, SvF1FailText(parsed.error))
+    let records = parsed.records
+    assert(records.manifests.len == 1, " manifest 1")
+    assert(records.entities.len == 1, " entity 1")
+    assert(records.observations.len == 1, " observation 1")
+    assert(records.assertions.len == 2, " assertions 2")
+    assert(records.snapshots.len == SvF1CkptCount, " snapshots 3")
+    assert(records.dependencies.len == 1, " dependency 1")
+    assert(records.revisions.len == 1, " revision 1")
+    # S1 revision gate: superseded and current assertions coexist in-block
+    var has0: bool = false
+    var has1: bool = false
+    for i in 0..<records.assertions.len:
+        if records.assertions[i].uid == "asv-gen0":
+            has0 = true
+            assert(records.assertions[i].rev == 0, " gen0 rev 0")
+        if records.assertions[i].uid == "asv-gen1":
+            has1 = true
+            assert(records.assertions[i].rev == 1, " gen1 rev 1")
+    assert(has0 && has1, " asv-gen0/asv-gen1 coexist")
+    assert(records.revisions[0].supersedes == "asv-gen0", " revision supersedes gen0")
+    assert(records.revisions[0].targetUid == "asv-gen1", " revision targets gen1")
+    assert(records.revisions[0].oldRev == 0 && records.revisions[0].newRev == 1, " revision revs")
+    # manifest bindings
+    let mrec = records.manifests[0]
+    assert(mrec.entrySnapshot == "ck-1200", " entrySnapshot main ckpt")
+    assert(mrec.caps.len == 2, " caps 2")
+    assert(mrec.caps[0] == "common_core" && mrec.caps[1] == "world_execution", " caps content")
+    assert(mrec.resCid.len == SvF1CkptCount, " resCid 3")
+    var offset: int32 = 0
+    for i in 0..<SvF1CkptCount:
+        assert(mrec.resType[i] == "state_payload", " resType state_payload")
+        assert(mrec.resCid[i] == direct.resCids[i], " resCid binding")
+        # CSGC packing may reorder lines; find the snapshot record by ckpt id
+        var wantCkpt: str = snapshot_block.SvSnapCkptId(direct.ticks[i])
+        var si: int32 = 0 - 1
+        for j in 0..<records.snapshots.len:
+            if records.snapshots[j].ckpt == wantCkpt:
+                si = j
+        assert(si >= 0, " snapshot record found for ckpt")
+        var view = rawbytes.BytesSliceView(direct.allPayloads, offset, direct.lengths[i])
+        assert(snapshot_block.SvSnapResourceCid(view) == records.snapshots[si].worldCid, " snapshot worldCid binding")
+        assert(records.snapshots[si].deps.len == 1 && records.snapshots[si].deps[0] == direct.factsCid, " snapshot dep binds facts")
+        offset = offset + direct.lengths[i]
+    # rebuild determinism: same inputs -> byte-identical block
+    var builtB = snapshot_block.SvSnapshotBlockBuild(direct.factsCid, direct.ticks,
+        direct.lengths, direct.allPayloads, ".scratch/f1/smoke_b.svblock")
+    assert(builtB.ok, SvF1FailText(builtB.error))
+    var blockBLoad = os.ReadFileBytesResult(".scratch/f1/smoke_b.svblock")
+    assert(!result.IsErr(blockBLoad), " read block b")
+    var blockB = result.Value(blockBLoad)
+    assert(rawbytes.BytesEqual(blockA, blockB), " block rebuild byte-identical")
+    echo(" s1 gates: validator pass, revision coexists, rebuild deterministic")
+
+# corruption rejection: structural flip (magic) fails decode; data flip is
+# rejected at the resource CID binding.
+@borrows
+fn SvF1CorruptionGates(direct: SvF1Direct) =
+    var offset: int32 = direct.lengths[0] + direct.lengths[1]
+    # (a) magic byte flip -> structured decode error
+    var corruptMagic = rawbytes.BytesSlice(direct.allPayloads, offset, direct.lengths[2])
+    rawbytes.BytesSet(corruptMagic, 2, (rawbytes.BytesGet(corruptMagic, 2) + 1) & 255)
+    var decodedMagic = snapshot_codec.SvSnapDecode(corruptMagic)
+    assert(!decodedMagic.ok, " flipped magic rejected by decode")
+    echo(" corruption: magic flip rejected (" + decodedMagic.error + ")")
+    rawbytes.BytesFree(corruptMagic)
+    # (b) payload data flip -> resource CID binding must reject
+    var corruptData = rawbytes.BytesSlice(direct.allPayloads, offset, direct.lengths[2])
+    var mid: int32 = direct.lengths[2] / 2
+    rawbytes.BytesSet(corruptData, mid, (rawbytes.BytesGet(corruptData, mid) + 1) & 255)
+    var badCid: str = snapshot_block.SvSnapResourceCid(corruptData)
+    assert(badCid != direct.resCids[2], " flipped payload rejected at resource cid")
+    echo(" corruption: data flip rejected at resource cid binding")
+    rawbytes.BytesFree(corruptData)
+
+fn main(): int32 =
+    var direct = SvF1DirectRun()
+    if !direct.ok:
+        echo(" sv_f1_snapshot_smoke FAIL: pass-through run")
+        return 1
+    os.MkdirAll(".scratch/f1", 493)
+    var blbuf = layout.ByteBufInit(4096)
+    for bt in 0..<direct.cids.len:
+        var row: str = "tick=" + strings.Int64ToStr(int64(bt)) + " cid=" + direct.cids[bt] + "\n"
+        for bi in 0..<row.len:
+            layout.ByteBufAppendByte(blbuf, row[bi])
+    var baselineBytes = layout.ByteBufToBytes(blbuf)
+    layout.ByteBufFree(blbuf)
+    os.WriteFile(".scratch/f1/passthrough_cids.txt", rawbytes.BytesToString(baselineBytes))
+    rawbytes.BytesFree(baselineBytes)
+    echo(" pass-through 5000 ticks recorded, 3 payloads encoded, baseline dumped")
+    SvF1RestoreCheck(direct, 0)
+    SvF1RestoreCheck(direct, 1)
+    SvF1RestoreCheck(direct, 2)
+    SvF1BlockGates(direct)
+    SvF1CorruptionGates(direct)
+    echo(" sv_f1_snapshot_smoke ok")
+    return 0

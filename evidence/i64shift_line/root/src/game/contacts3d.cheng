@@ -1,0 +1,631 @@
+# Contact resolution (solver-decision §3): sphere-vs-plane, sphere-vs-AABB(face),
+# dynamic-sphere-vs-dynamic-sphere and dynamic-sphere-vs-static-sphere
+# single-sided contacts. Supported combinations only —
+# anything else is a hard failure upstream. Restitution e=0. Coulomb friction
+# is enforced at the position level (PBD friction cone): the step's tangential
+# displacement is clamped against the bound mu * penetration depth, so the
+# Verlet-PBD velocity rebuild in Physics3dStep inherits the friction instead
+# of overwriting a velocity-level scale.
+# Ground plane: z=0, normal +Z, lives outside the wall list as an
+# always-present analytic plane (world3d has no global fields to spare).
+import cheng/game/world3d
+import cheng/game/csg/numerics
+import std/math as m
+
+const
+    Contacts3dGroundFriction = 0.6
+    Contacts3dBodyFriction = 0.6
+
+# self-collision (body-body pairs) default OFF: climb/journey semantics
+# require hand-overlapping-rope-node (grasp) and body-near-rope contact to
+# stay non-colliding. Worlds that want it set this before stepping.
+var contacts3dSelfCollisionOn: int32 = 0
+
+fn contacts3dSelfCollisionSet(on: int32) =
+    contacts3dSelfCollisionOn = on
+
+fn Contacts3dSelfCollisionSet(on: int32) =
+    contacts3dSelfCollisionSet(on)
+
+# --- Rider-load report channel (capsule-vs-BallRigid contacts) ---
+#
+# M-a wiring: the load-aware rolling resistance in physics3d samples the
+# ball's ground-normal load, but the riding pressure of a machine duck
+# standing on the ball enters the dynamics only through this module's
+# position-level PBD capsule-ball contact, which writes velocities and
+# positions and never bodyFz - so the carried-load gate never opened in
+# the standing-duck scene (excess stayed identically zero). This channel
+# reports, per ball body slot, the equivalent DOWNWARD force (newtons)
+# of the normal contact impulses the ball received this tick, so
+# physics3d adds it to m*g in its load sample.
+#
+# Module-level report state, deliberately NOT world state: it never
+# enters the CID preimage, empty scenes read exact zero, and worlds
+# without capsule-ball contacts keep their bit-exact trajectories.
+#
+# Conversion (engine tick frozen at 240 Hz, the same dt the Verlet
+# rebuild uses to turn contact position repairs into stored velocity):
+#   - velocity-level normal impulse jn (free-capsule branch): F = jn/dt
+#   - position-level repair lam (mass-weighted): the ball's displacement
+#     share lam*invMass[b] becomes velocity lam*invMass[b]/dt in the
+#     rebuild, i.e. the impulse m_b*lam*invMass[b]/dt = lam/dt, i.e. the
+#     force lam/dt^2
+# Only the vertical component enters, sign-folded so a rider pressing
+# the ball DOWN adds load while a capsule supporting the ball from
+# below subtracts: contribution = F * (0 - n_z). Cleared at the top of
+# Contacts3dResolveAll (the single per-tick entry), accumulated during
+# Contacts3dResolveCapsuleBalls, read after Physics3dStep returns.
+const
+    Contacts3dTickInvDt = 240.0
+
+var contacts3dBallLoadFz: float64[]
+var contacts3dBallLoadCap: int32 = 0
+
+fn contacts3dBallLoadClear(count: int32) =
+    # grow-only: entries at and below count are zeroed every tick; stale
+    # entries beyond count from a previous larger world are never read
+    if count > contacts3dBallLoadCap:
+        setLen(contacts3dBallLoadFz, count)
+        contacts3dBallLoadCap = count
+    var i: int32 = 0
+    while i < count:
+        contacts3dBallLoadFz[i] = 0.0
+        i = i + 1
+
+fn contacts3dBallLoadAdd(slot: int32, fz: float64) =
+    if slot < 0:
+        return
+    if slot >= contacts3dBallLoadCap:
+        return
+    contacts3dBallLoadFz[slot] = contacts3dBallLoadFz[slot] + fz
+
+# Per-ball equivalent rider load (newtons, positive = pressed toward the
+# ground) accumulated by this tick's capsule-ball contacts; exact zero
+# before the first step and in worlds without capsule-ball contacts.
+fn Contacts3dBallLoadRead(ballSlot: int32): float64 =
+    if ballSlot < 0:
+        return 0.0
+    if ballSlot >= contacts3dBallLoadCap:
+        return 0.0
+    return contacts3dBallLoadFz[ballSlot]
+
+# pairs joined by any constraint (grasp, joint, winch) must never be
+# resolved as contacts: overlap there IS the connection semantics
+@borrows
+fn Contacts3dConstraintLinked(w: World3d, i: int32, j: int32): bool =
+    var k: int32 = 0
+    while k < w.conCount:
+        let a: int32 = w.conA[k]
+        let b: int32 = w.conB[k]
+        let forward: bool = a == i and b == j
+        let reverse: bool = a == j and b == i
+        if forward:
+            return true
+        if reverse:
+            return true
+        k = k + 1
+    return false
+
+type
+    Contacts3dStats =
+        contactCount: int32
+        maxPenetrationM: float64
+        supported: bool
+
+@borrows
+fn contacts3dResolvePenetration(w: var World3d,
+                                slot: int32,
+                                nx: float64,
+                                ny: float64,
+                                nz: float64,
+                                penetration: float64,
+                                friction: float64,
+                                prevPx: float64[],
+                                prevPy: float64[],
+                                prevPz: float64[]): bool =
+    # push out along the normal
+    w.bodyPx[slot] = w.bodyPx[slot] + nx * penetration
+    w.bodyPy[slot] = w.bodyPy[slot] + ny * penetration
+    w.bodyPz[slot] = w.bodyPz[slot] + nz * penetration
+    # kill inward normal velocity (e = 0)
+    let vn = w.bodyVx[slot] * nx + w.bodyVy[slot] * ny + w.bodyVz[slot] * nz
+    if vn < 0.0:
+        w.bodyVx[slot] = w.bodyVx[slot] - vn * nx
+        w.bodyVy[slot] = w.bodyVy[slot] - vn * ny
+        w.bodyVz[slot] = w.bodyVz[slot] - vn * nz
+    # Coulomb friction, position level: the tangential component of this
+    # step's displacement (current position minus pre-step position) is
+    # clamped against the friction cone bound mu * penetration. Inside the
+    # cone the contact sticks (displacement removed); outside, exactly the
+    # bound is removed along the slide direction, never reversed, so the
+    # velocity rebuild decelerates tangential motion without overshoot.
+    let dx = w.bodyPx[slot] - prevPx[slot]
+    let dy = w.bodyPy[slot] - prevPy[slot]
+    let dz = w.bodyPz[slot] - prevPz[slot]
+    let dn = dx * nx + dy * ny + dz * nz
+    let tx = dx - dn * nx
+    let ty = dy - dn * ny
+    let tz = dz - dn * nz
+    let tMag = numerics.CsgSqrt(tx * tx + ty * ty + tz * tz)
+    let bound = friction * penetration
+    if tMag > bound:
+        let s = bound / tMag
+        w.bodyPx[slot] = w.bodyPx[slot] - tx * s
+        w.bodyPy[slot] = w.bodyPy[slot] - ty * s
+        w.bodyPz[slot] = w.bodyPz[slot] - tz * s
+    else:
+        w.bodyPx[slot] = w.bodyPx[slot] - tx
+        w.bodyPy[slot] = w.bodyPy[slot] - ty
+        w.bodyPz[slot] = w.bodyPz[slot] - tz
+    return true
+
+# Dynamic sphere pair: separation is split by inverse mass (0.5/0.5 at
+# equal mass), e = 0 kills the approaching relative normal velocity, and
+# the same position-level Coulomb cone clamps this step's RELATIVE
+# tangential displacement (mine minus yours) against mu * penetration,
+# split by the same weights — the pair form of contacts3dResolvePenetration.
+@borrows
+fn contacts3dResolvePair(w: var World3d,
+                         i: int32,
+                         j: int32,
+                         nx: float64,
+                         ny: float64,
+                         nz: float64,
+                         penetration: float64,
+                         friction: float64,
+                         prevPx: float64[],
+                         prevPy: float64[],
+                         prevPz: float64[]): bool =
+    let wSum = w.bodyInvMass[i] + w.bodyInvMass[j]
+    let wi = w.bodyInvMass[i] / wSum
+    let wj = w.bodyInvMass[j] / wSum
+    # push apart along the center line (n points from i to j)
+    w.bodyPx[i] = w.bodyPx[i] - nx * penetration * wi
+    w.bodyPy[i] = w.bodyPy[i] - ny * penetration * wi
+    w.bodyPz[i] = w.bodyPz[i] - nz * penetration * wi
+    w.bodyPx[j] = w.bodyPx[j] + nx * penetration * wj
+    w.bodyPy[j] = w.bodyPy[j] + ny * penetration * wj
+    w.bodyPz[j] = w.bodyPz[j] + nz * penetration * wj
+    # kill the approaching relative normal velocity (e = 0)
+    let vn = (w.bodyVx[i] - w.bodyVx[j]) * nx + (w.bodyVy[i] - w.bodyVy[j]) * ny + (w.bodyVz[i] - w.bodyVz[j]) * nz
+    if vn > 0.0:
+        w.bodyVx[i] = w.bodyVx[i] - vn * wi * nx
+        w.bodyVy[i] = w.bodyVy[i] - vn * wi * ny
+        w.bodyVz[i] = w.bodyVz[i] - vn * wi * nz
+        w.bodyVx[j] = w.bodyVx[j] + vn * wj * nx
+        w.bodyVy[j] = w.bodyVy[j] + vn * wj * ny
+        w.bodyVz[j] = w.bodyVz[j] + vn * wj * nz
+    # Coulomb cone on the relative step displacement
+    let dx = (w.bodyPx[i] - prevPx[i]) - (w.bodyPx[j] - prevPx[j])
+    let dy = (w.bodyPy[i] - prevPy[i]) - (w.bodyPy[j] - prevPy[j])
+    let dz = (w.bodyPz[i] - prevPz[i]) - (w.bodyPz[j] - prevPz[j])
+    let dn = dx * nx + dy * ny + dz * nz
+    let tx = dx - dn * nx
+    let ty = dy - dn * ny
+    let tz = dz - dn * nz
+    let tMag = numerics.CsgSqrt(tx * tx + ty * ty + tz * tz)
+    let bound = friction * penetration
+    if tMag > bound:
+        let s = bound / tMag
+        w.bodyPx[i] = w.bodyPx[i] - tx * s * wi
+        w.bodyPy[i] = w.bodyPy[i] - ty * s * wi
+        w.bodyPz[i] = w.bodyPz[i] - tz * s * wi
+        w.bodyPx[j] = w.bodyPx[j] + tx * s * wj
+        w.bodyPy[j] = w.bodyPy[j] + ty * s * wj
+        w.bodyPz[j] = w.bodyPz[j] + tz * s * wj
+    else:
+        w.bodyPx[i] = w.bodyPx[i] - tx * wi
+        w.bodyPy[i] = w.bodyPy[i] - ty * wi
+        w.bodyPz[i] = w.bodyPz[i] - tz * wi
+        w.bodyPx[j] = w.bodyPx[j] + tx * wj
+        w.bodyPy[j] = w.bodyPy[j] + ty * wj
+        w.bodyPz[j] = w.bodyPz[j] + tz * wj
+    return true
+
+@borrows
+fn Contacts3dResolveGround(w: var World3d,
+                           stats: var Contacts3dStats,
+                           prevPx: float64[],
+                           prevPy: float64[],
+                           prevPz: float64[]) =
+    var i: int32 = 0
+    while i < w.count:
+        if w.bodyInvMass[i] > 0.0:
+            let r = w.bodyRadius[i]
+            # capsules are handled by physics3dCapsuleGroundPushout (the
+            # lift-accounted lowest-point pushout) + the velocity-level
+            # ground contact; a second position-level pushout here would
+            # double the Verlet-rebuilt rebound velocity (pogo pump)
+            if w.bodyCapsuleHalf[i] <= 0.0:
+                let penetration = r - w.bodyPz[i]
+                if penetration > 0.0:
+                    let _ok = contacts3dResolvePenetration(w, i, 0.0, 0.0, 1.0, penetration, Contacts3dGroundFriction, prevPx, prevPy, prevPz)
+                    stats.contactCount = stats.contactCount + 1
+                    if penetration > stats.maxPenetrationM:
+                        stats.maxPenetrationM = penetration
+        i = i + 1
+
+@borrows
+fn Contacts3dResolveWalls(w: var World3d,
+                          stats: var Contacts3dStats,
+                          prevPx: float64[],
+                          prevPy: float64[],
+                          prevPz: float64[]) =
+    var wi: int32 = 0
+    while wi < w.wallCount:
+        let friction = w.wallFriction[wi]
+        # face planes of the AABB with outward normals (supported combo:
+        # sphere vs AABB face). Face reachability is clamped to the face
+        # rectangle extents so edges/corners are not treated as faces.
+        var i: int32 = 0
+        while i < w.count:
+            if w.bodyInvMass[i] > 0.0:
+                let px = w.bodyPx[i]
+                let py = w.bodyPy[i]
+                let pz = w.bodyPz[i]
+                let rx = px - w.wallCx[wi]
+                let ry = py - w.wallCy[wi]
+                let rz = pz - w.wallCz[wi]
+                let ax = m.absFloat(rx)
+                let ay = m.absFloat(ry)
+                let az = m.absFloat(rz)
+                let hx = w.wallHx[wi]
+                let hy = w.wallHy[wi]
+                let hz = w.wallHz[wi]
+                let r = w.bodyRadius[i]
+                # signed distance beyond each face pair
+                let dxFace = ax - hx
+                let dyFace = ay - hy
+                let dzFace = az - hz
+                # inside the slab of the other two axes?
+                if dyFace < 0.0 && dzFace < 0.0 && dxFace < r:
+                    var nrm: float64 = 1.0
+                    if rx < 0.0:
+                        nrm = -1.0
+                    let penetration = r - dxFace
+                    if penetration > 0.0:
+                        let _ok = contacts3dResolvePenetration(w, i, nrm, 0.0, 0.0, penetration, friction, prevPx, prevPy, prevPz)
+                        stats.contactCount = stats.contactCount + 1
+                        if penetration > stats.maxPenetrationM:
+                            stats.maxPenetrationM = penetration
+                if dxFace < 0.0 && dzFace < 0.0 && dyFace < r:
+                    var nrm: float64 = 1.0
+                    if ry < 0.0:
+                        nrm = -1.0
+                    let penetration = r - dyFace
+                    if penetration > 0.0:
+                        let _ok = contacts3dResolvePenetration(w, i, 0.0, nrm, 0.0, penetration, friction, prevPx, prevPy, prevPz)
+                        stats.contactCount = stats.contactCount + 1
+                        if penetration > stats.maxPenetrationM:
+                            stats.maxPenetrationM = penetration
+                if dxFace < 0.0 && dyFace < 0.0 && dzFace < r:
+                    var nrm: float64 = 1.0
+                    if rz < 0.0:
+                        nrm = -1.0
+                    let penetration = r - dzFace
+                    if penetration > 0.0:
+                        let _ok = contacts3dResolvePenetration(w, i, 0.0, 0.0, nrm, penetration, friction, prevPx, prevPy, prevPz)
+                        stats.contactCount = stats.contactCount + 1
+                        if penetration > stats.maxPenetrationM:
+                            stats.maxPenetrationM = penetration
+            i = i + 1
+        wi = wi + 1
+
+# prevP* are the exact pre-step positions saved by Physics3dStep before
+# integration; friction clamps the displacement accumulated across
+# integration and constraint projection in one bound.
+
+# Dynamic sphere pairs (i < j, both invMass > 0): humanoid self collision
+# (hands/feet/body must not interpenetrate). Fires only when the center
+# distance is below the radius sum, so sparse scenes never enter the branch.
+@borrows
+fn Contacts3dResolveBodyPairs(w: var World3d,
+                              stats: var Contacts3dStats,
+                              prevPx: float64[],
+                              prevPy: float64[],
+                              prevPz: float64[]) =
+    if contacts3dSelfCollisionOn != 1:
+        return
+    var i: int32 = 0
+    while i < w.count:
+        if w.bodyInvMass[i] > 0.0:
+            var j: int32 = i + 1
+            while j < w.count:
+                if w.bodyInvMass[j] > 0.0:
+                    let dx = w.bodyPx[j] - w.bodyPx[i]
+                    let dy = w.bodyPy[j] - w.bodyPy[i]
+                    let dz = w.bodyPz[j] - w.bodyPz[i]
+                    let rSum = w.bodyRadius[i] + w.bodyRadius[j]
+                    let d2 = dx * dx + dy * dy + dz * dz
+                    if d2 < rSum * rSum:
+                        if !Contacts3dConstraintLinked(w, i, j):
+                            let dist = numerics.CsgSqrt(d2)
+                            if dist > 0.0:
+                                let inv = 1.0 / dist
+                                let penetration = rSum - dist
+                                let _ok = contacts3dResolvePair(w, i, j, dx * inv, dy * inv, dz * inv, penetration, Contacts3dBodyFriction, prevPx, prevPy, prevPz)
+                                stats.contactCount = stats.contactCount + 1
+                                if penetration > stats.maxPenetrationM:
+                                    stats.maxPenetrationM = penetration
+                j = j + 1
+        i = i + 1
+
+# Dynamic sphere vs static body: a World3dBodyStatic body is an
+# infinite-mass sphere obstacle (its bodyRadius carries the radius
+# semantics); only the dynamic side moves and the friction cone is the
+# single-body form. World3dBodyAnchor tethers are control points held one
+# plant length from their part by design and are not obstacles.
+@borrows
+fn Contacts3dResolveStaticBodies(w: var World3d,
+                                 stats: var Contacts3dStats,
+                                 prevPx: float64[],
+                                 prevPy: float64[],
+                                 prevPz: float64[]) =
+    var s: int32 = 0
+    while s < w.count:
+        if w.bodyKind[s] == world3d.World3dBodyStatic:
+            var i: int32 = 0
+            while i < w.count:
+                if w.bodyInvMass[i] > 0.0:
+                    let dx = w.bodyPx[i] - w.bodyPx[s]
+                    let dy = w.bodyPy[i] - w.bodyPy[s]
+                    let dz = w.bodyPz[i] - w.bodyPz[s]
+                    let rSum = w.bodyRadius[i] + w.bodyRadius[s]
+                    let d2 = dx * dx + dy * dy + dz * dz
+                    if d2 < rSum * rSum:
+                        let dist = numerics.CsgSqrt(d2)
+                        if dist > 0.0:
+                            let inv = 1.0 / dist
+                            let penetration = rSum - dist
+                            let _ok = contacts3dResolvePenetration(w, i, dx * inv, dy * inv, dz * inv, penetration, Contacts3dBodyFriction, prevPx, prevPy, prevPz)
+                            stats.contactCount = stats.contactCount + 1
+                            if penetration > stats.maxPenetrationM:
+                                stats.maxPenetrationM = penetration
+                i = i + 1
+        s = s + 1
+
+# Capsule line segment vs dynamic ball rigid. The pair path above
+# approximates every body by its center sphere, which crushes a capsule
+# link's segment geometry (half length + radius under the body quaternion)
+# into the center point — a machine-duck foot plate would touch a ball at
+# the wrong place with the wrong lever arm. This pass measures the exact
+# segment-sphere distance (closest point on the capsule axis segment),
+# triggers below the radius sum, and resolves with the G1 endpoint-contact
+# formula (physics3dCapsuleEndContact shape) in its position-level PBD
+# form: the generalized effective mass along the normal
+#   k = invMc + invMb + cvec . I^-1 cvec,   cvec = rc x n
+# (rc the contact point's lever arm on the capsule axis, I^-1 the
+# symmetric-top inverse about the capsule axis) splits the penetration
+#   lam = penetration / k
+# into inverse-mass translation shares on both bodies, plus — for FREE
+# capsules only — the G1 angular response: the contact-point lever arm
+# enters the angular channel as the velocity impulse
+#   jn = -vn / k,  Delta omega = jn * I^-1 cvec
+# on the real relative approach velocity. A constraint-HELD capsule takes
+# translation + friction only: its support couple belongs to the
+# constraint stage (the same ownership split physics3dCapsuleGroundContact
+# derives for the held-bias case — a per-tick angular kick on a held light
+# capsule is re-delivered against the constraints every tick and ratchets
+# omega / teleports the pose through Ixx^-1 ~ 1e5, the exact M5a foot
+# explosion class). The velocity-level form is deliberately NOT used for
+# the translation channel: this pass runs before the Verlet rebuild, which
+# overwrites the linear share every tick while omega accumulates.
+# Friction is the same position-level Coulomb cone as the pair path.
+# The pass only fires when a CapsuleRigid and a BallRigid coexist, so
+# scenes without the combination never enter the branch (existing world
+# CIDs untouched). Pairs joined by a constraint are skipped like the
+# sphere pair path.
+@borrows
+fn contacts3dResolveCapsuleBall(w: var World3d,
+                                c: int32,
+                                b: int32,
+                                held: bool,
+                                nx: float64,
+                                ny: float64,
+                                nz: float64,
+                                penetration: float64,
+                                ccx: float64,
+                                ccy: float64,
+                                ccz: float64,
+                                prevPx: float64[],
+                                prevPy: float64[],
+                                prevPz: float64[]): bool =
+    # contact lever arm rc (closest point on the capsule axis, from the
+    # capsule center of mass) and the world capsule axis
+    let rcx = ccx - w.bodyPx[c]
+    let rcy = ccy - w.bodyPy[c]
+    let rcz = ccz - w.bodyPz[c]
+    let ax = 2.0 * (w.bodyQuatX[c] * w.bodyQuatZ[c] + w.bodyQuatW[c] * w.bodyQuatY[c])
+    let ay = 2.0 * (w.bodyQuatY[c] * w.bodyQuatZ[c] - w.bodyQuatW[c] * w.bodyQuatX[c])
+    let az = 1.0 - 2.0 * (w.bodyQuatX[c] * w.bodyQuatX[c] + w.bodyQuatY[c] * w.bodyQuatY[c])
+    # cvec = rc x n; symmetric-top inverse inertia I^-1 cvec
+    # (I^-1 v = v_perp / It + (a.v) a / Ia, body-frame diagonal moments)
+    let cvx = rcy * nz - rcz * ny
+    let cvy = rcz * nx - rcx * nz
+    let cvz = rcx * ny - rcy * nx
+    let par = cvx * ax + cvy * ay + cvz * az
+    let iix = (cvx - par * ax) / w.bodyIxx[c] + par * ax / w.bodyIzz[c]
+    let iiy = (cvy - par * ay) / w.bodyIxx[c] + par * ay / w.bodyIzz[c]
+    let iiz = (cvz - par * az) / w.bodyIxx[c] + par * az / w.bodyIzz[c]
+    let kAng = iix * cvx + iiy * cvy + iiz * cvz
+    let k = w.bodyInvMass[c] + w.bodyInvMass[b] + kAng
+    if k > 0.0:
+        var loadFz: float64 = 0.0
+        # free-capsule angular response first: G1 impulse on the real
+        # relative contact-point approach velocity (ball vs capsule
+        # surface v + omega x rc), so a genuinely struck free capsule
+        # tumbles instead of sliding through
+        if !held:
+            let uRelN = (w.bodyVx[b] - w.bodyVx[c] - (w.bodyAngVy[c] * rcz - w.bodyAngVz[c] * rcy)) * nx + (w.bodyVy[b] - w.bodyVy[c] - (w.bodyAngVz[c] * rcx - w.bodyAngVx[c] * rcz)) * ny + (w.bodyVz[b] - w.bodyVz[c] - (w.bodyAngVx[c] * rcy - w.bodyAngVy[c] * rcx)) * nz
+            if uRelN < 0.0:
+                let jn = (0.0 - uRelN) / k
+                w.bodyVx[c] = w.bodyVx[c] - jn * nx * w.bodyInvMass[c]
+                w.bodyVy[c] = w.bodyVy[c] - jn * ny * w.bodyInvMass[c]
+                w.bodyVz[c] = w.bodyVz[c] - jn * nz * w.bodyInvMass[c]
+                w.bodyVx[b] = w.bodyVx[b] + jn * nx * w.bodyInvMass[b]
+                w.bodyVy[b] = w.bodyVy[b] + jn * ny * w.bodyInvMass[b]
+                w.bodyVz[b] = w.bodyVz[b] + jn * nz * w.bodyInvMass[b]
+                # torque of the impulse on the capsule: rc x (jn n) = jn cvec
+                w.bodyAngVx[c] = w.bodyAngVx[c] + jn * iix
+                w.bodyAngVy[c] = w.bodyAngVy[c] + jn * iiy
+                w.bodyAngVz[c] = w.bodyAngVz[c] + jn * iiz
+                loadFz = loadFz + jn * Contacts3dTickInvDt
+        let lam = penetration / k
+        # translation shares
+        w.bodyPx[c] = w.bodyPx[c] - lam * w.bodyInvMass[c] * nx
+        w.bodyPy[c] = w.bodyPy[c] - lam * w.bodyInvMass[c] * ny
+        w.bodyPz[c] = w.bodyPz[c] - lam * w.bodyInvMass[c] * nz
+        w.bodyPx[b] = w.bodyPx[b] + lam * w.bodyInvMass[b] * nx
+        w.bodyPy[b] = w.bodyPy[b] + lam * w.bodyInvMass[b] * ny
+        w.bodyPz[b] = w.bodyPz[b] + lam * w.bodyInvMass[b] * nz
+        # Coulomb cone on the relative step displacement (pair form,
+        # inverse-mass translation shares). The relative slip here is
+        # (b - c) - the REVERSE order of contacts3dResolvePair's (i - j) -
+        # so the clamp that damps the slip pushes the BALL back along its
+        # slip and the CAPSULE forward; the flipped signs would anti-damp
+        # (pump free energy into a rolling ball under a static rider).
+        let wSum = w.bodyInvMass[c] + w.bodyInvMass[b]
+        let wc = w.bodyInvMass[c] / wSum
+        let wb = w.bodyInvMass[b] / wSum
+        let dx = (w.bodyPx[b] - prevPx[b]) - (w.bodyPx[c] - prevPx[c])
+        let dy = (w.bodyPy[b] - prevPy[b]) - (w.bodyPy[c] - prevPy[c])
+        let dz = (w.bodyPz[b] - prevPz[b]) - (w.bodyPz[c] - prevPz[c])
+        let dn = dx * nx + dy * ny + dz * nz
+        let tx = dx - dn * nx
+        let ty = dy - dn * ny
+        let tz = dz - dn * nz
+        let tMag = numerics.CsgSqrt(tx * tx + ty * ty + tz * tz)
+        let bound = Contacts3dBodyFriction * penetration
+        if tMag > bound:
+            let s = bound / tMag
+            w.bodyPx[c] = w.bodyPx[c] + tx * s * wc
+            w.bodyPy[c] = w.bodyPy[c] + ty * s * wc
+            w.bodyPz[c] = w.bodyPz[c] + tz * s * wc
+            w.bodyPx[b] = w.bodyPx[b] - tx * s * wb
+            w.bodyPy[b] = w.bodyPy[b] - ty * s * wb
+            w.bodyPz[b] = w.bodyPz[b] - tz * s * wb
+        else:
+            w.bodyPx[c] = w.bodyPx[c] + tx * wc
+            w.bodyPy[c] = w.bodyPy[c] + ty * wc
+            w.bodyPz[c] = w.bodyPz[c] + tz * wc
+            w.bodyPx[b] = w.bodyPx[b] - tx * wb
+            w.bodyPy[b] = w.bodyPy[b] - ty * wb
+            w.bodyPz[b] = w.bodyPz[b] - tz * wb
+        # rider-load report: position repair lam (mass-weighted) becomes
+        # velocity lam*invMass[b]/dt in the Verlet rebuild = the impulse
+        # lam/dt on the ball = the force lam/dt^2; sign-folded by the
+        # normal's z so only groundward pressure adds load
+        loadFz = loadFz + lam * Contacts3dTickInvDt * Contacts3dTickInvDt
+        contacts3dBallLoadAdd(b, loadFz * (0.0 - nz))
+    return true
+
+@borrows
+fn Contacts3dResolveCapsuleBalls(w: var World3d,
+                                 stats: var Contacts3dStats,
+                                 prevPx: float64[],
+                                 prevPy: float64[],
+                                 prevPz: float64[]) =
+    var c: int32 = 0
+    while c < w.count:
+        if w.bodyKind[c] == world3d.World3dBodyCapsuleRigid:
+            if w.bodyInvMass[c] > 0.0:
+                # held/free ownership split (same predicate shape as the
+                # G1 ground contact's bias handling): a capsule joined by
+                # any active constraint has its support couple owned by
+                # the constraint stage and takes translation + friction
+                # only here
+                var held: bool = false
+                var hci: int32 = 0
+                while hci < w.conCount:
+                    if w.conActive[hci] == 1:
+                        if w.conA[hci] == c:
+                            held = true
+                        if w.conB[hci] == c:
+                            held = true
+                    hci = hci + 1
+                let h = w.bodyCapsuleHalf[c]
+                let ax = 2.0 * (w.bodyQuatX[c] * w.bodyQuatZ[c] + w.bodyQuatW[c] * w.bodyQuatY[c])
+                let ay = 2.0 * (w.bodyQuatY[c] * w.bodyQuatZ[c] - w.bodyQuatW[c] * w.bodyQuatX[c])
+                let az = 1.0 - 2.0 * (w.bodyQuatX[c] * w.bodyQuatX[c] + w.bodyQuatY[c] * w.bodyQuatY[c])
+                # segment endpoints = hemisphere centers
+                let ax1 = w.bodyPx[c] + h * ax
+                let ay1 = w.bodyPy[c] + h * ay
+                let az1 = w.bodyPz[c] + h * az
+                let ax2 = w.bodyPx[c] - h * ax
+                let ay2 = w.bodyPy[c] - h * ay
+                let az2 = w.bodyPz[c] - h * az
+                let abx = ax2 - ax1
+                let aby = ay2 - ay1
+                let abz = az2 - az1
+                let abLen2 = abx * abx + aby * aby + abz * abz
+                var b: int32 = 0
+                while b < w.count:
+                    if w.bodyKind[b] == world3d.World3dBodyBallRigid:
+                        if w.bodyInvMass[b] > 0.0:
+                            if !Contacts3dConstraintLinked(w, c, b):
+                                # closest point on the segment to the
+                                # ball center
+                                var t: float64 = 0.0
+                                if abLen2 > 0.0:
+                                    t = ((w.bodyPx[b] - ax1) * abx + (w.bodyPy[b] - ay1) * aby + (w.bodyPz[b] - az1) * abz) / abLen2
+                                    if t < 0.0:
+                                        t = 0.0
+                                    if t > 1.0:
+                                        t = 1.0
+                                let ccx = ax1 + t * abx
+                                let ccy = ay1 + t * aby
+                                let ccz = az1 + t * abz
+                                let dxx = w.bodyPx[b] - ccx
+                                let dyy = w.bodyPy[b] - ccy
+                                let dzz = w.bodyPz[b] - ccz
+                                let rSum = w.bodyRadius[c] + w.bodyRadius[b]
+                                let d2 = dxx * dxx + dyy * dyy + dzz * dzz
+                                if d2 < rSum * rSum:
+                                    let dist = numerics.CsgSqrt(d2)
+                                    var nx = dxx
+                                    var ny = dyy
+                                    var nz = dzz
+                                    if dist > 0.000000001:
+                                        let inv = 1.0 / dist
+                                        nx = dxx * inv
+                                        ny = dyy * inv
+                                        nz = dzz * inv
+                                    else:
+                                        # ball center on the segment axis:
+                                        # any unit normal perpendicular to
+                                        # the axis keeps the contact total
+                                        let perp2 = ax * ax + ay * ay
+                                        if perp2 > 0.000000000001:
+                                            let pinv = 1.0 / numerics.CsgSqrt(perp2)
+                                            nx = ay * pinv
+                                            ny = (0.0 - ax) * pinv
+                                            nz = 0.0
+                                        else:
+                                            nx = 1.0
+                                            ny = 0.0
+                                            nz = 0.0
+                                    let penetration = rSum - dist
+                                    let _ok = contacts3dResolveCapsuleBall(w, c, b, held, nx, ny, nz, penetration, ccx, ccy, ccz, prevPx, prevPy, prevPz)
+                                    stats.contactCount = stats.contactCount + 1
+                                    if penetration > stats.maxPenetrationM:
+                                        stats.maxPenetrationM = penetration
+                    b = b + 1
+        c = c + 1
+
+@borrows
+fn Contacts3dResolveAll(w: var World3d,
+                        prevPx: float64[],
+                        prevPy: float64[],
+                        prevPz: float64[]): Contacts3dStats =
+    var stats: Contacts3dStats
+    stats.contactCount = 0
+    stats.maxPenetrationM = 0.0
+    stats.supported = true
+    # new tick: the per-ball rider-load report starts from zero
+    contacts3dBallLoadClear(w.count)
+    Contacts3dResolveGround(w, stats, prevPx, prevPy, prevPz)
+    Contacts3dResolveWalls(w, stats, prevPx, prevPy, prevPz)
+    Contacts3dResolveBodyPairs(w, stats, prevPx, prevPy, prevPz)
+    Contacts3dResolveStaticBodies(w, stats, prevPx, prevPy, prevPz)
+    Contacts3dResolveCapsuleBalls(w, stats, prevPx, prevPy, prevPz)
+    return stats

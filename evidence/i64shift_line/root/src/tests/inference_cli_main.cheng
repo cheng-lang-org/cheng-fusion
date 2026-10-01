@@ -1,0 +1,165 @@
+import std/result
+import std/strings
+import std/strutils as strutil
+import std/cmdline
+import cheng/inference/kernel as infer
+import cheng/inference/model_graph as mg
+import cheng/inference/weight_store as ws
+import cheng/inference/weight_binding as wb
+import cheng/inference/distributed_engine as engine
+
+# Milestone A slice 5: minimal CLI inference entry point.
+#
+# Scope of this slice: the CLI skeleton + greedy autoregressive loop + EOS
+# stop + golden-token regression, wired end to end through the *real*
+# GLM-5.2 DSA-MLA-MTP audit executor (no mocks, no fallback path). The model
+# and weights are the same deterministic tiny fixture already exercised by
+# src/tests/distributed_inference_engine_smoke.cheng
+# (mg.ModelGraphBuildTinyGlm52DsaMlaMtpFixture); the prompt is a fixed
+# int32 token id array because the tiny fixture's 8-token vocabulary is not
+# the real Qwen2.5 tokenizer's vocabulary space and mixing them would be
+# semantically meaningless. Real-model text-in/text-out (real safetensors
+# weights + a dense-transformer op dispatcher) is out of scope for this
+# slice; see docs/op-lane-queue-2026-07-09.md milestone A slice 6.
+
+type
+    Glm52CliFixture =
+        graph: mg.ModelGraph
+        bindings: wb.WeightBindingSet
+        store: ws.WeightTensorStore
+
+fn cliMakeTensor(shape: int32[], scale: int32, data: int32[]): infer.TensorQ =
+    var out: infer.TensorQ
+    let res = infer.TensorFromDataFill(out, shape, scale, data)
+    assert(IsOk(res), " inference cli: tensor build")
+    return out
+
+# Deterministic synthetic weight values (not random, not a trained model) --
+# same generator shape as buildWeightFixture/makeWeightTensor in
+# distributed_inference_engine_smoke.cheng, so reruns and rebuilds always
+# produce the exact same fixture and the same golden output below.
+fn cliMakeWeightTensor(weight: mg.ModelWeightShard, ordinal: int32): infer.TensorQ =
+    let countRes = mg.ModelGraphTensorElementCount(weight.shape)
+    assert(IsOk(countRes), " inference cli: weight tensor shape")
+    let elemCount = int32(Value(countRes))
+    assert(elemCount > 0, " inference cli: weight tensor element count")
+    var data: int32[]
+    for i in 0..<elemCount:
+        add(data, 100 + ordinal * 10 + i)
+    return cliMakeTensor(weight.shape, 1000, data)
+
+fn cliBuildTinyGlm52Fixture(modelCid: str): Glm52CliFixture =
+    let graph = mg.ModelGraphBuildTinyGlm52DsaMlaMtpFixture(modelCid)
+    assert(IsOk(mg.ModelGraphValidate(graph)), " inference cli: glm52 fixture graph valid")
+    var payloads: ws.WeightTensorPayload[]
+    var bindings: wb.WeightShardBinding[]
+    for i in 0..<graph.weights.len:
+        var peerId = "peer:a"
+        if i % 2 == 1:
+            peerId = "peer:b"
+        let tensor = cliMakeWeightTensor(graph.weights[i], i)
+        let payloadRes = ws.WeightTensorPayloadBuild(
+            graph.weights[i].modelCid,
+            graph.weights[i].tensorName,
+            graph.weights[i].shardCid,
+            graph.weights[i].dtype,
+            graph.weights[i].            quantScheme,
+            strings.CloneStr(peerId),
+            tensor
+        )
+        assert(IsOk(payloadRes), " inference cli: weight payload")
+        let payload = Value(payloadRes)
+        let payloadHashValue = payload.payloadHash
+        add(payloads, payload)
+        add(bindings, wb.WeightShardBinding(
+            modelCid: graph.weights[i].modelCid,
+            tensorName: graph.weights[i].tensorName,
+            shardCid: graph.weights[i].shardCid,
+            dtype: graph.weights[i].dtype,
+            quantScheme: graph.weights[i].quantScheme,
+            sizeBytes: graph.weights[i].sizeBytes,
+            peerId: peerId,
+            payloadHash: payloadHashValue
+        ))
+    let set = wb.WeightBindingBuildSet(graph.modelCid, bindings)
+    var hashes: int64[]
+    for i in 0..<payloads.len:
+        add(hashes, payloads[i].payloadHash)
+    let store = ws.WeightTensorStoreBuild(graph.modelCid, payloads)
+    let boundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(graph, hashes)
+    assert(IsOk(boundGraphRes), " inference cli: bind weight anchors")
+    let boundGraph = Value(boundGraphRes)
+    assert(IsOk(wb.WeightBindingValidate(set, boundGraph)), " inference cli: weight bindings")
+    assert(IsOk(ws.WeightTensorValidateStore(store, set, boundGraph)), " inference cli: weight store")
+    return Glm52CliFixture(graph: boundGraph, bindings: set, store: store)
+
+@borrows
+fn cliTokenIdsToString(tokenIds: infer.TensorQ): str =
+    var parts: str[]
+    for i in 0..<tokenIds.data.len:
+        add(parts, strings.IntToStr(tokenIds.data[i]))
+    return strutil.Join(parts, ",")
+
+fn main(): int32 =
+    let maxNewTokens = cmdline.ReadInt32FlagOrDefault("--max-new-tokens", 4)
+    let eosTokenId = cmdline.ReadInt32FlagOrDefault("--eos", -1)
+    if maxNewTokens <= 0:
+        echo("error: --max-new-tokens must be positive")
+        return 2
+
+    let fixture = cliBuildTinyGlm52Fixture("cid:model:inference-cli-glm52-tiny")
+    let promptTokenIds = cliMakeTensor([2], 1, [1, 2])
+    # Every generate step re-audits the full sequence (no persisted kv cache,
+    # see DistributedGenerateGreedyHfGlm52DsaMlaMtpAuditTokens), so the MoE
+    # router capacity must cover the longest sequence the loop will reach.
+    let expertCapacity = promptTokenIds.shape[0] + maxNewTokens
+    let promptTokenIdsForEos = infer.TensorClone(promptTokenIds)
+
+    let generateRes = engine.DistributedGenerateGreedyHfGlm52DsaMlaMtpAuditTokens(
+        fixture.graph,
+        fixture.bindings,
+        fixture.store,
+        promptTokenIds,
+        maxNewTokens,
+        expertCapacity,
+        eosTokenId
+    )
+    if IsErr(generateRes):
+        echo(Error(generateRes))
+        return 1
+    let outputTokenIds = Value(generateRes)
+    echo(strutil.Join(["inference_cli tokens: ", cliTokenIdsToString(outputTokenIds)], ""))
+
+    if maxNewTokens == 4 && eosTokenId == -1:
+        # Golden token sequence for the fixed tiny-fixture prompt [1, 2] with
+        # maxNewTokens=4, expertCapacity=6, eosTokenId disabled. Captured
+        # from a real run of this exact fixture/executor (see evidence in
+        # the slice 5 patch notes) and pinned here as a regression.
+        assert(outputTokenIds.shape.len == 1 && outputTokenIds.shape[0] == 6,
+               " inference cli: golden token count")
+        assert(outputTokenIds.data[0] == 1 && outputTokenIds.data[1] == 2,
+               " inference cli: golden prompt echo")
+        assert(outputTokenIds.data[2] == 7 && outputTokenIds.data[3] == 7 &&
+               outputTokenIds.data[4] == 7 && outputTokenIds.data[5] == 7,
+               " inference cli: golden generated tokens")
+
+        # EOS stop check derived from the same golden run: stopping on the
+        # first generated token must halt the loop immediately after it.
+        let eosGenerateRes = engine.DistributedGenerateGreedyHfGlm52DsaMlaMtpAuditTokens(
+            fixture.graph,
+            fixture.bindings,
+            fixture.store,
+            promptTokenIdsForEos,
+            maxNewTokens,
+            expertCapacity,
+            outputTokenIds.data[2]
+        )
+        assert(IsOk(eosGenerateRes), " inference cli: eos generate")
+        let eosOut = Value(eosGenerateRes)
+        assert(eosOut.shape.len == 1 && eosOut.shape[0] == 3 &&
+               eosOut.data[0] == 1 && eosOut.data[1] == 2 &&
+               eosOut.data[2] == outputTokenIds.data[2],
+               " inference cli: eos early stop")
+
+    echo(" inference_cli_main ok")
+    return 0

@@ -1,0 +1,255 @@
+# WebTransport MoQ segment-stream relay (browser-facing 秒发秒开 server).
+#
+# Exposes ONE WebTransport/HTTP3 endpoint (real h3 SETTINGS preamble + Extended
+# CONNECT + bidi data streams) that a PWA player's browser WebTransport API can
+# dial directly (ALPN "h3", serverCertificateHashes pinning). Each bidi stream
+# carries ONE moq segment-stream request: the browser writes the WT_STREAM
+# signal (varint 0x41 + sessionId) then the standard length-prefixed request
+# frame; this server reads the request, dials the upstream publisher as a
+# native-QUIC moq client, replays the exact request, and writes the response
+# bytes RAW back on the same stream (same unframed reply convention as
+# Libp2pMoqSegmentStreamServerWriteRange), then FINs the stream.
+#
+# v1 scope: fixed upstream, no announce registry, no auth (same as
+# src/tests/media_moq_relay_main.cheng's raw-QUIC sibling).
+
+import std/result
+import std/system
+import std/strings
+import std/rawbytes
+import std/os as os
+import std/strutils as strutil
+import std/cmdline as cmdline
+import std/tls/x509 as x509
+import std/tls/x509_issue as x509issue
+import cheng/quic/connection as qconn
+import cheng/quic/multiaddress as qaddr
+import cheng/quic/msquictransport_native as qtransport
+import cheng/quic/tls/policy as qpolicy
+import cheng/libp2p/transports/quic_transport as quic_transport
+import cheng/libp2p/transports/webtransport_wire as wtwire
+import cheng/libp2p/transports/webtransport_h3_session as wth3
+import cheng/libp2p/protocols/media/moq_segment_stream as moqstream
+
+const
+    wtMoqAcceptWaitMs = 20000
+    wtMoqBidiWaitAttempts = 500
+    wtMoqBidiWaitPollMs = 10
+    wtMoqMaxBidiPerSession = 64
+
+fn wtMoqRelayLog(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn wtMoqBuildServerPolicy(sanHost: str, validityDays: int32): Result[qpolicy.MsQuicTlsPolicy] =
+    let issuedRes: Result[x509issue.X509IssuedCert] = x509issue.X509IssueSelfSignedLeaf(strings.CloneStr(sanHost), validityDays)
+    if IsErr(issuedRes):
+        return Err[qpolicy.MsQuicTlsPolicy]("cert issue: " + ErrorText(issuedRes))
+    let cert: x509issue.X509IssuedCert = Value(issuedRes)
+    var policy: qpolicy.MsQuicTlsPolicy
+    policy.serverName = sanHost
+    policy.allowInsecure = false
+    policy.certChainCount = 1
+    policy.certChain0 = rawbytes.BytesSlice(cert.der, 0, rawbytes.BytesLen(cert.der))
+    policy.certPrivateKey = rawbytes.BytesSlice(cert.privateKeyRaw, 0, rawbytes.BytesLen(cert.privateKeyRaw))
+    policy.certLeafKeyKind = x509.X509KeyEcdsaP256
+    policy.trustRootsCount = 1
+    policy.trustRoot0 = rawbytes.BytesSlice(cert.der, 0, rawbytes.BytesLen(cert.der))
+    let alpnRes: Result[bool] = qpolicy.msquicTlsPolicyAddAlpn(policy, "h3")
+    if IsErr(alpnRes):
+        return Err[qpolicy.MsQuicTlsPolicy]("alpn: " + ErrorText(alpnRes))
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_CERTHASH=" + BytesToHex(cert.certHash))
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_CERTDER_HEX=" + BytesToHex(cert.der))
+    return Ok[qpolicy.MsQuicTlsPolicy](policy)
+
+# One moq request on one established WT bidi stream: read request frame, fetch
+# the exact range upstream, write the reply bytes RAW, FIN the stream.
+fn wtMoqServeBidi(listener: var qtransport.MsQuicTransport,
+                  dataConn: var qconn.Connection,
+                  upstreamHost: str,
+                  upstreamPort: int32): int32 =
+    let requestRes = moqstream.Libp2pMoqSegmentStreamServerReadRequest(dataConn)
+    if IsErr(requestRes):
+        wtMoqRelayLog(" wt_moq_relay: read request: " + ErrorText(requestRes))
+        return 11
+    let request = Value(requestRes)
+    let readChunk: int32 = request.readChunkBytes
+    let segKey: str = strings.CloneStr(request.segmentKey)
+    let reqOff: int32 = request.offsetBytes
+    let reqLen: int32 = request.lengthBytes
+    var upClient = qtransport.InitMsQuicTransport()
+    var upConn: qconn.Connection
+    let dialHost: str = strings.CloneStr(upstreamHost)
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(upClient, upConn,
+                                                                  dialHost, upstreamPort, "localhost")
+    if IsErr(dialRes):
+        wtMoqRelayLog(" wt_moq_relay: upstream dial: " + ErrorText(dialRes))
+        qtransport.Stop(upClient)
+        return 3
+    upConn = qconn.ConnDeriveStream(upConn, 4, 4)
+    let negRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(upClient, upConn)
+    if IsErr(negRes):
+        wtMoqRelayLog(" wt_moq_relay: upstream negotiate: " + ErrorText(negRes))
+        qconn.ConnClose(upConn)
+        qtransport.Stop(upClient)
+        return 4
+    let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(upClient, upConn)
+    if IsErr(ackRes):
+        wtMoqRelayLog(" wt_moq_relay: upstream ack: " + ErrorText(ackRes))
+        qconn.ConnClose(upConn)
+        qtransport.Stop(upClient)
+        return 5
+    var reader: moqstream.Libp2pMoqSegmentStreamReader
+    let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(upConn), request)
+    if IsErr(openRes):
+        wtMoqRelayLog(" wt_moq_relay: upstream open: " + ErrorText(openRes))
+        qconn.ConnClose(upConn)
+        qtransport.Stop(upClient)
+        return 6
+    # Buffer the whole upstream reply, then serve it with the publisher's exact
+    # write path before tearing the upstream client down (the client session's
+    # recycle resets the process-global listener datapath id the server-side
+    # send path reads -- see media_moq_relay_main.cheng).
+    var fetched = rawbytes.EmptyBytes()
+    while !reader.closed:
+        let chunkRes = moqstream.Libp2pMoqSegmentStreamRead(reader, readChunk)
+        if IsErr(chunkRes):
+            wtMoqRelayLog(" wt_moq_relay: upstream read: " + ErrorText(chunkRes))
+            moqstream.Libp2pMoqSegmentStreamClose(reader)
+            qtransport.Stop(upClient)
+            return 7
+        let chunk = Value(chunkRes)
+        if rawbytes.BytesLen(chunk) <= 0:
+            break
+        fetched = moqstream.Libp2pMoqSegmentStreamAppendBytes(fetched, chunk)
+    let fetchedLen: int32 = rawbytes.BytesLen(fetched)
+    let writeRes = moqstream.Libp2pMoqSegmentStreamServerWriteRange(dataConn, fetched, 0, fetchedLen, readChunk)
+    if IsErr(writeRes):
+        wtMoqRelayLog(" wt_moq_relay: requester write: " + ErrorText(writeRes))
+        moqstream.Libp2pMoqSegmentStreamClose(reader)
+        qtransport.Stop(upClient)
+        return 8
+    let shutdownRes = qconn.connShutdownWrite(dataConn)
+    if IsErr(shutdownRes):
+        wtMoqRelayLog(" wt_moq_relay: requester shutdown: " + ErrorText(shutdownRes))
+        moqstream.Libp2pMoqSegmentStreamClose(reader)
+        qtransport.Stop(upClient)
+        return 9
+    moqstream.Libp2pMoqSegmentStreamClose(reader)
+    qtransport.Stop(upClient)
+    wtMoqRelayLog(strutil.Join([" wt_moq_relay: forwarded=", IntToStr(fetchedLen),
+                                " segment=", share(segKey),
+                                " off=", IntToStr(reqOff),
+                                " len=", IntToStr(reqLen)], ""))
+    return 0
+
+fn wtMoqServeOneSession(listener: var qtransport.MsQuicTransport,
+                        expectedPath: str,
+                        upstreamHost: str,
+                        upstreamPort: int32,
+                        withH3SettingsPreamble: bool): int32 =
+    let acceptRes: Result[qconn.Connection] = qtransport.AcceptTimed(listener, wtMoqAcceptWaitMs)
+    if IsErr(acceptRes):
+        wtMoqRelayLog(" wt_moq_relay: accept: " + ErrorText(acceptRes))
+        return 5
+    var base: qconn.Connection = Value(acceptRes)
+    let handleRes: Result[bool] = wth3.Wth3ServerHandleConnection(listener, base, expectedPath, withH3SettingsPreamble)
+    if IsErr(handleRes):
+        wtMoqRelayLog(" wt_moq_relay: session rejected: " + ErrorText(handleRes))
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_SESSION_REJECTED=" + ErrorText(handleRes))
+        qconn.ConnClose(base)
+        return 6
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_SESSION_ESTABLISHED=1")
+    # One WT session serves many bidi streams (poster + esindex + asset ranges
+    # all ride one session); keep serving until the peer stops opening streams.
+    var bidiCount: int32
+    while bidiCount < wtMoqMaxBidiPerSession:
+        let bidiRes: Result[int64] = wth3.Wth3AwaitBidiStream(listener, base, int64(4), wtMoqBidiWaitAttempts, wtMoqBidiWaitPollMs)
+        if IsErr(bidiRes):
+            break
+        let streamId: int64 = Value(bidiRes)
+        var dataConn: qconn.Connection = qconn.ConnDeriveStream(base, streamId, streamId)
+        let sigRes: Result[int64] = wtwire.Wth3ReadVarint(listener, dataConn)
+        if IsErr(sigRes):
+            wtMoqRelayLog(" wt_moq_relay: read WT_STREAM signal: " + ErrorText(sigRes))
+            qconn.ConnClose(base)
+            return 8
+        let sessionIdRes: Result[int64] = wtwire.Wth3ReadVarint(listener, dataConn)
+        if IsErr(sessionIdRes):
+            wtMoqRelayLog(" wt_moq_relay: read WT_STREAM session id: " + ErrorText(sessionIdRes))
+            qconn.ConnClose(base)
+            return 8
+        let serveCode: int32 = wtMoqServeBidi(listener, dataConn, strings.CloneStr(upstreamHost), upstreamPort)
+        bidiCount = bidiCount + 1
+        if serveCode != 0:
+            wtMoqRelayLog(strutil.Join([" wt_moq_relay: bidi serve failed code=", IntToStr(serveCode)], ""))
+            qconn.ConnClose(base)
+            return serveCode
+    qconn.ConnClose(base)
+    return 0
+
+fn main(): int32 =
+    let port: int32 = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    var sanHostRaw: str
+    let hasSanHost: bool = cmdline.ReadFirstFlagValue("--san-host", sanHostRaw)
+    let sanHost: str = if hasSanHost: sanHostRaw else: "127.0.0.1"
+    var listenIpRaw: str
+    let hasListenIp: bool = cmdline.ReadFirstFlagValue("--listen-ip", listenIpRaw)
+    let listenIp: str = if hasListenIp: listenIpRaw else: "127.0.0.1"
+    let validityDays: int32 = cmdline.ReadInt32FlagOrDefault("--cert-days", 1)
+    if validityDays <= 0 || validityDays > 14:
+        wtMoqRelayLog(" wt_moq_relay: --cert-days must be in 1..14")
+        return 2
+    var pathRaw: str
+    let hasPath: bool = cmdline.ReadFirstFlagValue("--path", pathRaw)
+    let expectedPath: str = if hasPath: pathRaw else: "/wt"
+    var upstreamHostRaw: str
+    let hasUpstream: bool = cmdline.ReadFirstFlagValue("--upstream-host", upstreamHostRaw)
+    if !hasUpstream:
+        wtMoqRelayLog(" wt_moq_relay: missing --upstream-host")
+        return 2
+    let upstreamPort: int32 = cmdline.ReadInt32FlagOrDefault("--upstream-port", 0)
+    if upstreamPort <= 0:
+        wtMoqRelayLog(" wt_moq_relay: missing --upstream-port")
+        return 2
+    let maxSessions: int32 = cmdline.ReadInt32FlagOrDefault("--max-sessions", 4)
+    # The real h3 SETTINGS preamble is ON by default: a browser's WebTransport
+    # client requires it (SETTINGS_ENABLE_CONNECT_PROTOCOL + H3_DATAGRAM +
+    # SETTINGS_WEBTRANSPORT_MAX_SESSIONS). --no-h3-settings-preamble restores
+    # the legacy non-standard wire for the old cheng-only probes.
+    let withH3SettingsPreamble: bool = !cmdline.HasFlag("--no-h3-settings-preamble")
+    var readyPathRaw: str
+    let hasReady: bool = cmdline.ReadFirstFlagValue("--ready-path", readyPathRaw)
+    let readyPath: str = if hasReady: readyPathRaw else: ""
+
+    let policyRes: Result[qpolicy.MsQuicTlsPolicy] = wtMoqBuildServerPolicy(strings.CloneStr(sanHost), validityDays)
+    if IsErr(policyRes):
+        wtMoqRelayLog(" wt_moq_relay: " + ErrorText(policyRes))
+        return 3
+    let policy: qpolicy.MsQuicTlsPolicy = Value(policyRes)
+    var listener = qtransport.InitMsQuicTransport()
+    let tlsRes: Result[bool] = qtransport.setMsQuicTransportTlsPolicy(listener, policy)
+    if IsErr(tlsRes):
+        wtMoqRelayLog(" wt_moq_relay: tls policy: " + ErrorText(tlsRes))
+        return 4
+    let addrText = "/ip4/" + strings.CloneStr(listenIp) + "/udp/" + IntToStr(port) + "/quic-v1"
+    let addrData = BytesSlice(BytesFromString(addrText), 0, len(addrText))
+    var addr: qaddr.MultiAddress
+    addr.raw = addrText
+    addr.data = addrData
+    qtransport.start(listener, addr)
+    if !listener.running:
+        wtMoqRelayLog(" wt_moq_relay: listener start: " + listener.lastError)
+        return 4
+    let boundPort: int32 = quic_transport.Libp2pQuicBoundPort(listener.listenAddr)
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_READY port=" + IntToStr(boundPort) + " san_host=" + strings.CloneStr(sanHost) + " path=" + strings.CloneStr(expectedPath))
+    if len(readyPath) > 0:
+        if !quic_transport.Libp2pQuicWriteReadyPort(readyPath, boundPort):
+            wtMoqRelayLog(" wt_moq_relay: ready path write failed")
+            return 4
+    var served: int32
+    var lastRc: int32
+    while served < maxSessions:
+        lastRc = wtMoqServeOneSession(listener, strings.CloneStr(expectedPath), strings.CloneStr(upstreamHostRaw), upstreamPort, withH3SettingsPreamble)
+        served = served + 1
+    qtransport.Stop(listener)
+    return lastRc

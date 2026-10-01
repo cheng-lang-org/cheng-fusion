@@ -1,0 +1,697 @@
+# Muxer abstraction(mplex + yamux framing, synchronous).
+
+import cheng/libp2p/utils/result
+import cheng/libp2p/utils/bytes
+import cheng/libp2p/utils/strings
+import cheng/libp2p/utils/varint
+import cheng/libp2p/stream/connection
+import cheng/libp2p/stream/connection as streamconn
+import cheng/libp2p/stream/bufferstream
+import cheng/libp2p/resourcemanager
+import cheng/libp2p/multiaddress
+import cheng/libp2p/muxers/yamux/yamux as yamuxmod
+import std/seqs
+const
+    maxMuxers = 64
+    maxMuxerStreams = 64
+    maxStreamQueue = 64
+    maxFramePayload = 1048576
+    muxerReadChunk = 4096
+    muxerKindAuto = -1
+    muxerKindMplex = 0
+    muxerKindYamux = 1
+    mplexCodec = "/mplex/6.7.0"
+    mplexNew = 0
+    mplexMsgIn = 1
+    mplexMsgOut = 2
+    mplexCloseIn = 3
+    mplexCloseOut = 4
+    mplexResetIn = 5
+    mplexResetOut = 6
+
+type
+    Stream =
+        kind: int32
+        muxerId: int32
+        streamId: int32
+        initiatorLocal: bool
+
+    StreamState =
+        id: int32
+        initiatorLocal: bool
+        active: bool
+        closedLocal: bool
+        closedRemote: bool
+        reset: bool
+        reserved: bool
+        buffer: BufferStream
+
+    StreamQueue =
+        count: int32
+        head: int32
+        tail: int32
+        items: int32[maxStreamQueue]
+
+    MuxerState =
+        active: bool
+        conn: streamconn.Connection
+        open: bool
+        nextId: int32
+        initiator: bool
+        rxBuffer: Bytes
+        streams: StreamState[]
+        inbound: StreamQueue
+
+    Muxer =
+        kind: int32
+        id: int32
+
+var
+    muxerCount: int32
+    muxerStates: MuxerState[]
+
+fn muxerEnsureStateTableInit() =
+    if len(muxerStates) < maxMuxers:
+        setLen(muxerStates, maxMuxers)
+
+fn muxerKind(m: Muxer): int32 =
+    m.kind
+
+fn muxerProtocol(kind: int32): Result[str] =
+    if kind == muxerKindMplex:
+        return Ok[str](mplexCodec)
+    if kind == muxerKindYamux:
+        return Ok[str](yamuxmod.YamuxCodec)
+    return Err[str]("muxer: unknown kind")
+
+fn muxerKindFromProtocol(proto: str): Result[int32] =
+    if (proto == mplexCodec):
+        return Ok[int32](muxerKindMplex)
+    if (proto == yamuxmod.YamuxCodec):
+        return Ok[int32](muxerKindYamux)
+    return Err[int32]("muxer: unknown protocol")
+
+@borrows
+fn toYamuxMuxer(m: Muxer): yamuxmod.YamuxMuxer =
+    yamuxmod.YamuxMuxer(id: m.id)
+
+@borrows
+fn toYamuxStream(s: Stream): yamuxmod.YamuxStream =
+    yamuxmod.YamuxStream(muxerId: s.muxerId, streamId: s.streamId, initiatorLocal: s.initiatorLocal)
+
+fn fromYamuxStream(s: yamuxmod.YamuxStream): Stream =
+    Stream(kind: muxerKindYamux, muxerId: s.muxerId, streamId: s.streamId, initiatorLocal: s.initiatorLocal)
+
+fn muxerResetStreams(state: var MuxerState) =
+    for i in 0..<maxMuxerStreams:
+        if state.streams[i].reserved:
+            releaseStream(muxerStreamResourceDir(state.streams[i].initiatorLocal))
+            state.streams[i].reserved = false
+        bufferstream.resetBufferStream(state.streams[i].buffer)
+        state.streams[i].active = false
+        state.streams[i].closedLocal = false
+        state.streams[i].closedRemote = false
+        state.streams[i].reset = false
+        state.streams[i].reserved = false
+        state.streams[i].id = 0
+        state.streams[i].initiatorLocal = false
+
+fn initMuxerStreamQueue(): StreamQueue =
+    StreamQueue(count: 0, head: 0, tail: 0)
+
+fn muxerStreamQueueIsEmpty(q: var StreamQueue): bool =
+    q.count <= 0
+
+fn muxerStreamQueueIsFull(q: var StreamQueue): bool =
+    q.count >= maxStreamQueue
+
+fn muxerEnqueueStreamId(q: var StreamQueue, streamId: int32): Result[bool] =
+    if muxerStreamQueueIsFull(q):
+        return Err[bool]("muxer: stream queue full")
+    q.items[q.tail] = streamId
+    q.tail = (q.tail + 1) % maxStreamQueue
+    q.count = q.count + 1
+    return Ok[bool](true)
+
+fn muxerDequeueStreamId(q: var StreamQueue): Result[int32] =
+    if muxerStreamQueueIsEmpty(q):
+        return Err[int32]("muxer: stream queue empty")
+    let streamId: int32 = q.items[q.head]
+    q.head = (q.head + 1) % maxStreamQueue
+    q.count = q.count - 1
+    return Ok[int32](streamId)
+
+fn initMuxerStreamStateInto(state: var MuxerState, idx: int32, streamId: int32, initiatorLocal: bool) =
+    state.streams[idx].id = streamId
+    state.streams[idx].initiatorLocal = initiatorLocal
+    state.streams[idx].active = true
+    state.streams[idx].closedLocal = false
+    state.streams[idx].closedRemote = false
+    state.streams[idx].reset = false
+    state.streams[idx].reserved = false
+    bufferstream.resetBufferStream(state.streams[idx].buffer)
+
+fn muxerStateActive(state: var MuxerState): bool =
+    return state.active
+
+fn muxerStateValid(id: int32): bool =
+    muxerEnsureStateTableInit()
+    if id < 0 || id >= muxerCount:
+        return false
+    return muxerStateActive(muxerStates[id])
+
+fn muxerStreamResourceDir(initiatorLocal: bool): int32 =
+    if initiatorLocal:
+        return resourceDirOutbound
+    return resourceDirInbound
+
+fn streamBufferWrite(state: var MuxerState, idx: int32, data: Bytes): Result[int32] =
+    if idx < 0 || idx >= maxMuxerStreams:
+        return Err[int32]("muxer: invalid stream")
+    return bufferstream.write(state.streams[idx].buffer, data)
+
+fn streamBufferRead(state: var MuxerState, idx: int32, count: int32): Result[Bytes] =
+    if idx < 0 || idx >= maxMuxerStreams:
+        return Err[Bytes]("muxer: invalid stream")
+    return bufferstream.read(state.streams[idx].buffer, count)
+
+fn muxerStateSlotReusable(state: var MuxerState): bool =
+    return !state.active || !state.open
+
+fn muxerReinitState(state: var MuxerState, conn: streamconn.Connection) =
+    muxerEnsureStreamSlots(state)
+    state.active = true
+    state.conn = conn
+    state.open = true
+    state.nextId = 1
+    state.initiator = ConnectionDirection(conn) == streamconn.Outbound
+    state.rxBuffer = EmptyBytes()
+    state.inbound = initMuxerStreamQueue()
+    muxerResetStreams(state)
+
+fn muxerAllocMuxerState(conn: streamconn.Connection): int32 =
+    muxerEnsureStateTableInit()
+    for i in 0..<muxerCount:
+        if muxerStateSlotReusable(muxerStates[i]):
+            muxerReinitState(muxerStates[i], conn)
+            return i
+    if muxerCount >= maxMuxers:
+        return -1
+    let idx: int32 = muxerCount
+    muxerCount = muxerCount + 1
+    muxerReinitState(muxerStates[idx], conn)
+    return idx
+
+fn muxerInitMuxerState(m: var MuxerState) =
+    m.nextId = 1
+
+fn muxerEnsureStreamSlots(state: var MuxerState) =
+    if len(state.streams) < maxMuxerStreams:
+        setLen(state.streams, maxMuxerStreams)
+
+fn muxerClearStreamState(state: var MuxerState, idx: int32) =
+    if idx < 0 || idx >= maxMuxerStreams:
+        return
+    if state.streams[idx].reserved:
+        releaseStream(muxerStreamResourceDir(state.streams[idx].initiatorLocal))
+        state.streams[idx].reserved = false
+    bufferstream.resetBufferStream(state.streams[idx].buffer)
+    state.streams[idx].active = false
+    state.streams[idx].closedLocal = false
+    state.streams[idx].closedRemote = false
+    state.streams[idx].reset = false
+    state.streams[idx].id = 0
+    state.streams[idx].initiatorLocal = false
+
+fn muxerMaybeFinalizeStream(state: var MuxerState, idx: int32) =
+    if idx < 0 || idx >= maxMuxerStreams:
+        return
+    if ! state.streams[idx].active:
+        return
+    if state.streams[idx].reset:
+        muxerClearStreamState(state, idx)
+        return
+    if state.streams[idx].closedLocal && state.streams[idx].closedRemote:
+        if bufferstream.available(state.streams[idx].buffer) <= 0:
+            muxerClearStreamState(state, idx)
+
+fn newMuxer(conn: streamconn.Connection): Muxer =
+    var conn2: streamconn.Connection = conn
+    setConnectionAccounting(conn2, false)
+    let id: int32 = muxerAllocMuxerState(conn2)
+    if id >= 0:
+        muxerInitMuxerState(muxerStates[id])
+    return Muxer(kind: muxerKindMplex, id: id)
+
+fn newMuxerWithKind(conn: streamconn.Connection, kind: int32): Result[Muxer] =
+    if kind == muxerKindYamux:
+        var conn2: streamconn.Connection = conn
+        setConnectionAccounting(conn2, false)
+        let yRes: Result[yamuxmod.YamuxMuxer] = yamuxmod.NewYamuxMuxer(conn2)
+        if IsErr(yRes):
+            return Err[Muxer](Error(yRes))
+        let y: yamuxmod.YamuxMuxer = Value(yRes)
+        return Ok[Muxer](Muxer(kind: muxerKindYamux, id: y.id))
+    if kind == muxerKindMplex:
+        let m: Muxer = newMuxer(conn)
+        if m.id < 0:
+            return Err[Muxer]("muxer: table full")
+        return Ok[Muxer](m)
+    return Err[Muxer]("muxer: unknown kind")
+
+fn muxerIsOpenInState(state: var MuxerState): bool =
+    if !state.open:
+        return false
+    return connIsOpen(state.conn)
+
+fn isOpen(m: Muxer): bool =
+    if m.kind == muxerKindYamux:
+        return yamuxmod.YamuxIsOpen(toYamuxMuxer(m))
+    if ! muxerStateValid(m.id):
+        return false
+    return muxerIsOpenInState(muxerStates[m.id])
+
+fn MuxerIsOpen(m: Muxer): bool =
+    return isOpen(m)
+
+fn emptyMultiAddress(): multiaddress.MultiAddress =
+    multiaddress.MultiAddress(raw: "", data: EmptyBytes())
+
+fn muxerStateConn(state: var MuxerState): streamconn.Connection =
+    return state.conn
+
+fn muxerConnection(m: var Muxer): streamconn.Connection =
+    if m.kind == muxerKindYamux:
+        return yamuxmod.YamuxConnection(toYamuxMuxer(m))
+    if ! muxerStateValid(m.id):
+        var conn: streamconn.Connection
+        connClose(conn)
+        return conn
+    return muxerStateConn(muxerStates[m.id])
+
+fn muxerFindStreamIndex(state: var MuxerState, streamId: int32, initiatorLocal: bool): int32 =
+    for i in 0..<maxMuxerStreams:
+        if state.streams[i].active && state.streams[i].id == streamId && state.streams[i].initiatorLocal == initiatorLocal:
+            return i
+    return -1
+
+fn muxerAllocStream(state: var MuxerState, streamId: int32, initiatorLocal: bool): Result[int32] =
+    let existing: int32 = muxerFindStreamIndex(state, streamId, initiatorLocal)
+    if existing >= 0:
+        return Ok[int32](existing)
+    for i in 0..<maxMuxerStreams:
+        if ! state.streams[i].active:
+            initMuxerStreamStateInto(state, i, streamId, initiatorLocal)
+            return Ok[int32](i)
+    return Err[int32]("muxer: stream table full")
+
+fn encodeMplexFrame(streamId: int32, msgType: int32, payload: Bytes): Bytes =
+    let header: int64 = (int64(streamId) << 3) + int64(msgType)
+    let headerBytes: Bytes = encodeUVarint(header)
+    let lenBytes: Bytes = encodeUVarint(int64(BytesLen(payload)))
+    let head: Bytes = BytesConcat(headerBytes, lenBytes)
+    return BytesConcat(head, payload)
+
+@borrows
+fn decodeVarintPartial(data: Bytes, offset: int32, value: var int64, next: var int32): int32 =
+    if offset < 0:
+        return 2
+    var mul: int64 = 1
+    var result: int64
+    for i in offset..<BytesLen(data):
+        let b: int32 = BytesGet(data, i)
+        let low: int32 = b % 128
+        result = result + (int64(low) * mul)
+        if b < 128:
+            value = result
+            next = i + 1
+            return 0
+        mul = mul * 128
+        if mul <= 0:
+            return 2
+    return 1
+
+@borrows
+fn dropFront(data: Bytes, count: int32): Bytes =
+    let total: int32 = BytesLen(data)
+    var skip: int32 = count
+    if skip < 0:
+        skip = 0
+    if skip >= total:
+        return EmptyBytes()
+    let n: int32 = total - skip
+    let out: Bytes = BytesAlloc(n)
+    BytesCopyRangeInto(out, 0, data, skip, n)
+    return out
+
+fn handleFrame(state: var MuxerState, streamId: int32, msgType: int32, payload: Bytes): Result[bool] =
+    if msgType == mplexNew:
+        let existing: int32 = muxerFindStreamIndex(state, streamId, false)
+        let idxRes: Result[int32] = muxerAllocStream(state, streamId, false)
+        if IsErr(idxRes):
+            return Err[bool](Error(idxRes))
+        if existing < 0:
+            let enqRes: Result[bool] = muxerEnqueueStreamId(state.inbound, streamId)
+            if IsErr(enqRes):
+                return Err[bool](Error(enqRes))
+        return Ok[bool](true)
+    let initiatorLocal: bool = (msgType % 2) == 1
+    let idx: int32 = muxerFindStreamIndex(state, streamId, initiatorLocal)
+    if idx < 0:
+        return Ok[bool](true)
+    if msgType == mplexMsgIn || msgType == mplexMsgOut:
+        if state.streams[idx].reset || state.streams[idx].closedRemote:
+            return Ok[bool](true)
+        if state.streams[idx].active:
+            let writeRes: Result[int32] = streamBufferWrite(state, idx, payload)
+            if IsErr(writeRes):
+                return Err[bool](Error(writeRes))
+        return Ok[bool](true)
+    if msgType == mplexCloseIn || msgType == mplexCloseOut:
+        state.streams[idx].closedRemote = true
+        muxerMaybeFinalizeStream(state, idx)
+        return Ok[bool](true)
+    if msgType == mplexResetIn || msgType == mplexResetOut:
+        state.streams[idx].reset = true
+        state.streams[idx].closedRemote = true
+        bufferstream.resetBufferStream(state.streams[idx].buffer)
+        muxerMaybeFinalizeStream(state, idx)
+        return Ok[bool](true)
+    return Err[bool]("muxer: unknown message type")
+
+fn pumpMplexIncoming(state: var MuxerState): Result[int32] =
+    let readRes: Result[Bytes] = connRead(state.conn, muxerReadChunk)
+    if IsErr(readRes):
+        return Err[int32](Error(readRes))
+    let chunk: Bytes = Value(readRes)
+    if BytesLen(chunk) > 0:
+        state.rxBuffer = BytesConcat(state.rxBuffer, chunk)
+    var idx: int32
+    var frames: int32
+    while true:
+        let frameStart: int32 = idx
+        var header64: int64
+        var nextIdx: int32
+        let stRes: int32 = decodeVarintPartial(state.rxBuffer, idx, header64, nextIdx)
+        if stRes == 1:
+            break
+        if stRes == 2:
+            return Err[int32]("muxer: bad header varint")
+        idx = nextIdx
+        if header64 < 0:
+            return Err[int32]("muxer: invalid header")
+        let msgType64: int64 = header64 % 8
+        if msgType64 < 0 || msgType64 > mplexResetOut:
+            return Err[int32]("muxer: invalid message type")
+        let streamId64: int64 = header64 / 8
+        if streamId64 > 2147483647:
+            return Err[int32]("muxer: stream id too large")
+        var len64: int64
+        let lenRes: int32 = decodeVarintPartial(state.rxBuffer, idx, len64, nextIdx)
+        if lenRes == 1:
+            idx = frameStart
+            break
+        if lenRes == 2:
+            return Err[int32]("muxer: bad length varint")
+        idx = nextIdx
+        if len64 < 0 || len64 > maxFramePayload:
+            return Err[int32]("muxer: frame too large")
+        let length: int32 = int32(len64)
+        if idx + length > BytesLen(state.rxBuffer):
+            idx = frameStart
+            break
+        var payload: Bytes
+        if length > 0:
+            payload = BytesAlloc(length)
+            BytesCopyRangeInto(payload, 0, state.rxBuffer, idx, length)
+        idx = idx + length
+        let handleRes: Result[bool] = handleFrame(state, int32(streamId64), int32(msgType64), payload)
+        if IsErr(handleRes):
+            return Err[int32](Error(handleRes))
+        frames = frames + 1
+    if idx > 0:
+        state.rxBuffer = dropFront(state.rxBuffer, idx)
+    return Ok[int32](frames)
+
+fn muxerSetStreamReserved(state: var MuxerState, idx: int32, reserved: bool) =
+    state.streams[idx].reserved = reserved
+
+fn openStreamInState(state: var MuxerState, muxerId: int32): Result[Stream] =
+    if !state.open:
+        return Err[Stream]("muxer: closed")
+    let streamId: int32 = state.nextId
+    state.nextId = state.nextId + 1
+    var reserved: bool
+    if resourceEnabled():
+        let reserveRes: Result[bool] = reserveStream(muxerStreamResourceDir(true))
+        if IsErr(reserveRes):
+            return Err[Stream](Error(reserveRes))
+        reserved = true
+    let idxRes: Result[int32] = muxerAllocStream(state, streamId, true)
+    if IsErr(idxRes):
+        if reserved:
+            releaseStream(muxerStreamResourceDir(true))
+        return Err[Stream](Error(idxRes))
+    let idx: int32 = Value(idxRes)
+    muxerSetStreamReserved(state, idx, reserved)
+    let frame: Bytes = encodeMplexFrame(streamId, mplexNew, EmptyBytes())
+    let writeRes: Result[int32] = connWrite(state.conn, frame)
+    if IsErr(writeRes):
+        if reserved:
+            releaseStream(muxerStreamResourceDir(true))
+        muxerClearStreamState(state, idx)
+        return Err[Stream](Error(writeRes))
+    return Ok[Stream](Stream(kind: muxerKindMplex, muxerId: muxerId, streamId: streamId, initiatorLocal: true))
+
+fn openStream(m: var Muxer): Result[Stream] =
+    if m.kind == muxerKindYamux:
+        var ym: yamuxmod.YamuxMuxer = toYamuxMuxer(m)
+        let yRes: Result[yamuxmod.YamuxStream] = yamuxmod.YamuxOpenStream(ym)
+        if IsErr(yRes):
+            return Err[Stream](Error(yRes))
+        return Ok[Stream](fromYamuxStream(Value(yRes)))
+    if ! muxerStateValid(m.id):
+        return Err[Stream]("muxer: invalid")
+    return openStreamInState(muxerStates[m.id], m.id)
+
+fn acceptStreamInState(state: var MuxerState, muxerId: int32): Result[Stream] =
+    if !state.open:
+        return Err[Stream]("muxer: closed")
+    if muxerStreamQueueIsEmpty(state.inbound):
+        let pumpRes: Result[int32] = pumpMplexIncoming(state)
+        if IsErr(pumpRes):
+            return Err[Stream](Error(pumpRes))
+    if muxerStreamQueueIsEmpty(state.inbound):
+        return Err[Stream]("muxer: no incoming streams")
+    let idRes: Result[int32] = muxerDequeueStreamId(state.inbound)
+    if IsErr(idRes):
+        return Err[Stream](Error(idRes))
+    let streamId: int32 = Value(idRes)
+    let idx: int32 = muxerFindStreamIndex(state, streamId, false)
+    if idx < 0:
+        return Err[Stream]("muxer: unknown incoming stream")
+    var reserved: bool
+    if resourceEnabled():
+        let reserveRes: Result[bool] = reserveStream(muxerStreamResourceDir(false))
+        if IsErr(reserveRes):
+            muxerResetStreamInState(state, streamId, false)
+            return Err[Stream](Error(reserveRes))
+        reserved = true
+    muxerSetStreamReserved(state, idx, reserved)
+    return Ok[Stream](Stream(kind: muxerKindMplex, muxerId: muxerId, streamId: streamId, initiatorLocal: false))
+
+fn acceptStream(m: var Muxer): Result[Stream] =
+    if m.kind == muxerKindYamux:
+        var ym: yamuxmod.YamuxMuxer = toYamuxMuxer(m)
+        let yRes: Result[yamuxmod.YamuxStream] = yamuxmod.YamuxAcceptStream(ym)
+        if IsErr(yRes):
+            return Err[Stream](Error(yRes))
+        return Ok[Stream](fromYamuxStream(Value(yRes)))
+    let muxerId: int32 = m.id
+    if ! muxerStateValid(muxerId):
+        return Err[Stream]("muxer: invalid")
+    return acceptStreamInState(muxerStates[muxerId], muxerId)
+
+fn muxerWriteInState(state: var MuxerState, streamId: int32, initiatorLocal: bool, data: Bytes): Result[int32] =
+    if !state.open:
+        return Err[int32]("stream: closed")
+    let idx: int32 = muxerFindStreamIndex(state, streamId, initiatorLocal)
+    if idx < 0:
+        return Err[int32]("stream: unknown")
+    if state.streams[idx].reset || state.streams[idx].closedLocal:
+        return Err[int32]("stream: closed")
+    let msgType: int32 = if initiatorLocal: mplexMsgOut else: mplexMsgIn
+    let total: int32 = BytesLen(data)
+    var offset: int32
+    if total <= 0:
+        let frame: Bytes = encodeMplexFrame(streamId, msgType, EmptyBytes())
+        let writeRes: Result[int32] = connWrite(state.conn, frame)
+        if IsErr(writeRes):
+            return Err[int32](Error(writeRes))
+        return Ok[int32](0)
+    while offset < total: # cheng-syntax-policy: allow-counting-while
+        let remaining: int32 = total - offset
+        let chunkSize: int32 = if remaining > maxFramePayload: maxFramePayload else: remaining
+        let chunk: Bytes = BytesSlice(data, offset, chunkSize)
+        let frame: Bytes = encodeMplexFrame(streamId, msgType, chunk)
+        let writeRes: Result[int32] = connWrite(state.conn, frame)
+        if IsErr(writeRes):
+            return Err[int32](Error(writeRes))
+        offset = offset + chunkSize
+    if offset > 0:
+        let bwRes: Result[bool] = resourceRecordOutboundBytes(int64(offset))
+        if IsErr(bwRes):
+            return Err[int32](Error(bwRes))
+    return Ok[int32](total)
+
+fn write(s: var Stream, data: Bytes): Result[int32] =
+    if s.kind == muxerKindYamux:
+        var ys: yamuxmod.YamuxStream = toYamuxStream(s)
+        return yamuxmod.YamuxWrite(ys, data)
+    if ! muxerStateValid(s.muxerId):
+        return Err[int32]("stream: invalid muxer")
+    return muxerWriteInState(muxerStates[s.muxerId], s.streamId, s.initiatorLocal, data)
+
+fn streamWrite(s: var Stream, data: Bytes): Result[int32] =
+    if s.kind == muxerKindYamux:
+        var ys: yamuxmod.YamuxStream = toYamuxStream(s)
+        return yamuxmod.YamuxWrite(ys, data)
+    if ! muxerStateValid(s.muxerId):
+        return Err[int32]("stream: invalid muxer")
+    return muxerWriteInState(muxerStates[s.muxerId], s.streamId, s.initiatorLocal, data)
+
+fn muxerReadInState(state: var MuxerState, streamId: int32, initiatorLocal: bool, count: int32): Result[Bytes] =
+    let idx: int32 = muxerFindStreamIndex(state, streamId, initiatorLocal)
+    if idx < 0:
+        return Err[Bytes]("stream: unknown")
+    if bufferstream.available(state.streams[idx].buffer) <= 0:
+        let pumpRes: Result[int32] = pumpMplexIncoming(state)
+        if IsErr(pumpRes):
+            return Err[Bytes](Error(pumpRes))
+    if bufferstream.available(state.streams[idx].buffer) <= 0:
+        if state.streams[idx].reset || state.streams[idx].closedRemote:
+            muxerMaybeFinalizeStream(state, idx)
+            return Err[Bytes]("stream: closed")
+        return Ok[Bytes](EmptyBytes())
+    let outRes: Result[Bytes] = streamBufferRead(state, idx, count)
+    if IsErr(outRes):
+        return outRes
+    var payload: Bytes = Value(outRes)
+    let readLen: int32 = BytesLen(payload)
+    if readLen > 0:
+        let bwRes: Result[bool] = resourceRecordInboundBytes(int64(readLen))
+        if IsErr(bwRes):
+            return Err[Bytes](Error(bwRes))
+    muxerMaybeFinalizeStream(state, idx)
+    return Ok[Bytes](payload)
+
+fn read(s: var Stream, count: int32): Result[Bytes] =
+    if s.kind == muxerKindYamux:
+        var ys: yamuxmod.YamuxStream = toYamuxStream(s)
+        return yamuxmod.YamuxRead(ys, count)
+    if ! muxerStateValid(s.muxerId):
+        return Err[Bytes]("stream: invalid muxer")
+    return muxerReadInState(muxerStates[s.muxerId], s.streamId, s.initiatorLocal, count)
+
+fn streamRead(s: var Stream, count: int32): Result[Bytes] =
+    if s.kind == muxerKindYamux:
+        var ys: yamuxmod.YamuxStream = toYamuxStream(s)
+        return yamuxmod.YamuxRead(ys, count)
+    if ! muxerStateValid(s.muxerId):
+        return Err[Bytes]("stream: invalid muxer")
+    return muxerReadInState(muxerStates[s.muxerId], s.streamId, s.initiatorLocal, count)
+
+fn muxerStreamIsOpenInState(state: var MuxerState, streamId: int32, initiatorLocal: bool): bool =
+    if !state.open:
+        return false
+    let idx: int32 = muxerFindStreamIndex(state, streamId, initiatorLocal)
+    if idx < 0:
+        return false
+    if ! state.streams[idx].active || state.streams[idx].reset:
+        return false
+    return ! (state.streams[idx].closedLocal && state.streams[idx].closedRemote)
+
+fn streamIsOpen(s: Stream): bool =
+    if s.kind == muxerKindYamux:
+        return yamuxmod.YamuxStreamIsOpen(toYamuxStream(s))
+    if ! muxerStateValid(s.muxerId):
+        return false
+    return muxerStreamIsOpenInState(muxerStates[s.muxerId], s.streamId, s.initiatorLocal)
+
+fn muxerCloseStreamInState(state: var MuxerState, streamId: int32, initiatorLocal: bool): Result[bool] =
+    muxerEnsureStreamSlots(state)
+    if !state.open:
+        return Err[bool]("stream: closed")
+    let idx: int32 = muxerFindStreamIndex(state, streamId, initiatorLocal)
+    if idx < 0:
+        return Err[bool]("stream: unknown")
+    if state.streams[idx].closedLocal:
+        return Ok[bool](true)
+    state.streams[idx].closedLocal = true
+    let msgType: int32 = if initiatorLocal: mplexCloseOut else: mplexCloseIn
+    let frame: Bytes = encodeMplexFrame(streamId, msgType, EmptyBytes())
+    let writeRes: Result[int32] = connWrite(state.conn, frame)
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    if state.streams[idx].reserved:
+        let relRes: Result[bool] = releaseStream(muxerStreamResourceDir(initiatorLocal))
+        if IsErr(relRes):
+            return Err[bool](Error(relRes))
+        state.streams[idx].reserved = false
+    muxerMaybeFinalizeStream(state, idx)
+    return Ok[bool](true)
+
+fn closeStream(s: var Stream): Result[bool] =
+    if s.kind == muxerKindYamux:
+        var ys: yamuxmod.YamuxStream = toYamuxStream(s)
+        return yamuxmod.YamuxCloseStream(ys)
+    if ! muxerStateValid(s.muxerId):
+        return Err[bool]("stream: invalid muxer")
+    muxerEnsureStateTableInit()
+    return muxerCloseStreamInState(muxerStates[s.muxerId], s.streamId, s.initiatorLocal)
+
+fn muxerResetStreamInState(state: var MuxerState, streamId: int32, initiatorLocal: bool): Result[bool] =
+    if !state.open:
+        return Err[bool]("stream: closed")
+    let idx: int32 = muxerFindStreamIndex(state, streamId, initiatorLocal)
+    if idx < 0:
+        return Err[bool]("stream: unknown")
+    state.streams[idx].reset = true
+    state.streams[idx].closedLocal = true
+    let msgType: int32 = if initiatorLocal: mplexResetOut else: mplexResetIn
+    let frame: Bytes = encodeMplexFrame(streamId, msgType, EmptyBytes())
+    let writeRes: Result[int32] = connWrite(state.conn, frame)
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    bufferstream.resetBufferStream(state.streams[idx].buffer)
+    if state.streams[idx].reserved:
+        let relRes: Result[bool] = releaseStream(muxerStreamResourceDir(initiatorLocal))
+        if IsErr(relRes):
+            return Err[bool](Error(relRes))
+        state.streams[idx].reserved = false
+    muxerMaybeFinalizeStream(state, idx)
+    return Ok[bool](true)
+
+fn resetStream(s: var Stream): Result[bool] =
+    if s.kind == muxerKindYamux:
+        var ys: yamuxmod.YamuxStream = toYamuxStream(s)
+        return yamuxmod.YamuxResetStream(ys)
+    if ! muxerStateValid(s.muxerId):
+        return Err[bool]("stream: invalid muxer")
+    return muxerResetStreamInState(muxerStates[s.muxerId], s.streamId, s.initiatorLocal)
+
+fn closeMuxerInState(state: var MuxerState) =
+    state.open = false
+    connClose(state.conn)
+    muxerResetStreams(state)
+    state.inbound = initMuxerStreamQueue()
+    state.rxBuffer = EmptyBytes()
+
+fn closeMuxer(m: var Muxer) =
+    if m.kind == muxerKindYamux:
+        var ym: yamuxmod.YamuxMuxer = toYamuxMuxer(m)
+        yamuxmod.YamuxClose(ym)
+        return
+    if ! muxerStateValid(m.id):
+        return
+    closeMuxerInState(muxerStates[m.id])

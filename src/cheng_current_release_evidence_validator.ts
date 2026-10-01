@@ -15,8 +15,13 @@ export const CHENG_CURRENT_DRIVER_GENERATION_ENVIRONMENT_SCHEMA =
 
 export const CHENG_CURRENT_SEMANTIC_INPUT_SPECS = Object.freeze([
   ["cheng-package.toml", "project_manifest"],
+  ["docs/cheng-formal-spec.md", "formal_language_spec"],
   ["src/core/tooling/semantic_snapshot.cheng", "core_source"],
   ["src/core/tooling/semantic_snapshot_production.cheng", "production_source"],
+  [
+    "src/core/tooling/semantic_snapshot_incremental_plan.cheng",
+    "incremental_plan_source",
+  ],
   [
     "src/core/tooling/compiler_snapshot_builder.cheng",
     "snapshot_builder_source",
@@ -46,12 +51,20 @@ export const CHENG_CURRENT_SEMANTIC_INPUT_SPECS = Object.freeze([
     "production_smoke_source",
   ],
   [
+    "src/tests/semantic_snapshot_candidate_job_smoke.cheng",
+    "candidate_job_smoke_source",
+  ],
+  [
+    "src/tests/semantic_snapshot_source_membership_event_smoke.cheng",
+    "source_membership_smoke_source",
+  ],
+  [
     "src/tests/semantic_snapshot_rejection_smoke.cheng",
     "rejection_smoke_source",
   ],
   [
     "src/tests/lsp_multifile_exact_snapshot_acceptance_smoke.cheng",
-    "lsp_version_isolation_smoke_source",
+    "lsp_multifile_smoke_source",
   ],
   ["tools/semantic_snapshot_core_gate.sh", "core_gate_source"],
   [
@@ -62,6 +75,14 @@ export const CHENG_CURRENT_SEMANTIC_INPUT_SPECS = Object.freeze([
   [
     "tools/lsp_multifile_exact_snapshot_acceptance_gate.sh",
     "published_candidate_gate_source",
+  ],
+  [
+    "tools/lsp_candidate_job_scheduler_contract.py",
+    "candidate_scheduler_contract_source",
+  ],
+  [
+    "tools/semantic_snapshot_source_membership_event_gate.sh",
+    "source_membership_gate_source",
   ],
   ["tools/beat_c_process_group_guard.sh", "process_tree_guard"],
   ["artifacts/bootstrap/cheng.stage3", "compiler"],
@@ -76,6 +97,70 @@ export const CHENG_CURRENT_SEMANTIC_INPUT_SPECS = Object.freeze([
   ["bootstrap/cold_parser.c", "cold_compiler_include"],
   ["bootstrap/host_runtime.c", "cold_compiler_include"],
   ["bootstrap/cold_types.h", "cold_compiler_include"],
+] as const);
+
+const SOURCE_MEMBERSHIP_FOCUSED_INPUT_SPECS = Object.freeze([
+  ["cheng-package.toml", "project_manifest"],
+  ["src/core/tooling/semantic_snapshot.cheng", "core_source"],
+  ["src/core/tooling/semantic_snapshot_production.cheng", "production_source"],
+  [
+    "src/core/tooling/semantic_snapshot_query_projection.cheng",
+    "query_projection_source",
+  ],
+  [
+    "src/core/tooling/compiler_snapshot_builder.cheng",
+    "snapshot_builder_source",
+  ],
+  [
+    "src/core/tooling/semantic_snapshot_incremental_plan.cheng",
+    "incremental_plan_source",
+  ],
+  ["src/core/tooling/lsp_server.cheng", "lsp_producer_source"],
+  [
+    "src/tests/semantic_snapshot_source_membership_event_smoke.cheng",
+    "source_membership_smoke_source",
+  ],
+  [
+    "src/tests/semantic_snapshot_candidate_job_smoke.cheng",
+    "candidate_job_smoke_source",
+  ],
+  [
+    "src/tests/lsp_multifile_exact_snapshot_acceptance_smoke.cheng",
+    "lsp_multifile_smoke_source",
+  ],
+  [
+    "tools/lsp_candidate_job_scheduler_contract.py",
+    "candidate_scheduler_contract_source",
+  ],
+  ["bootstrap/cheng_cold.c", "cold_compiler_source"],
+  ["tools/beat_c_process_group_guard.sh", "process_tree_guard"],
+  [
+    "tools/semantic_snapshot_source_membership_event_gate.sh",
+    "source_membership_gate_source",
+  ],
+] as const);
+
+const SOURCE_MEMBERSHIP_MUTATION_IDS = Object.freeze([
+  "binding_stable_row",
+  "cancelled_completion_receipt_mismatch",
+  "completion_receipt_mismatch",
+  "duplicate_active",
+  "duplicate_add",
+  "duplicate_remove",
+  "late_completion_receipt_mismatch",
+  "lsp_current_event_receipt_publisher",
+  "lsp_current_event_receipt_query",
+  "lsp_duplicate_delete",
+  "lsp_entry_delete",
+  "lsp_stale_rename",
+  "missing_active",
+  "presence_state",
+  "remove_unknown",
+  "rename_peer",
+  "rename_target_present",
+  "reordered_active",
+  "tombstone_inclusion",
+  "wrong_active_cid",
 ] as const);
 
 const STRUCTURAL_CHECKS = Object.freeze([
@@ -138,11 +223,13 @@ const PUBLISHED_ROUTING_FRAGMENTS = Object.freeze([
   'SOURCE_CLOSURE_AFTER_RUNTIME_CID="$(source_closure_cid source-closure-after-runtime)"',
   "lsp_multifile_exact_snapshot_acceptance_gate_status=pass",
   "compiler_source_sha256=%s",
+  "formal_spec_sha256=%s",
   "lsp_module_sha256=%s",
   "query_projection_module_sha256=%s",
   "compiler_csg_module_sha256=%s",
   "source_closure_cid=%s",
   "object_sha256=%s",
+  "snapshot_payload=[0-9a-f]{64}",
   "^lsp_multifile_exact_snapshot_acceptance_status=pass published=1 ",
 ] as const);
 
@@ -163,6 +250,7 @@ export interface CurrentSemanticSnapshotRawEvidence {
   readonly inputArtifacts: readonly CurrentSemanticInputArtifact[];
   readonly sourceSnapshotRows: readonly CurrentSemanticSourceSnapshotRow[];
   readonly publishedStdoutRaw: Buffer;
+  readonly sourceMembershipFocusedStdoutRaw: Buffer;
   readonly sourceClosureRaw: Buffer;
   readonly publishedObjectRaw: Buffer;
   readonly bindingRaw: Buffer;
@@ -183,6 +271,7 @@ export interface CurrentSemanticSnapshotValidation {
   readonly closureReceiptCid: string;
   readonly compilerInputReceiptCid: string;
   readonly publishedReceiptCid: string;
+  readonly sourceMembershipFocusedReceiptCid: string;
   readonly queryProjectionCid: string;
   readonly openDocumentUniverseCid: string;
   readonly snapshotRaw32: string;
@@ -348,6 +437,158 @@ function semanticInputs(
   return out;
 }
 
+function validateSourceMembershipFocusedReceipt(
+  raw: Buffer,
+  inputs: ReadonlyMap<string, CurrentSemanticInputArtifact>,
+  sourceSetCid: string,
+): string {
+  const label = "current_release_source_membership_focused";
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(raw);
+  if (!text.endsWith("\n") || text.includes("\r") || text.includes("\0")) {
+    throw new Error(`${label}_wire_invalid`);
+  }
+  const lines = text.slice(0, -1).split("\n");
+  const inputStart = 6;
+  const mutationStart =
+    inputStart + SOURCE_MEMBERSHIP_FOCUSED_INPUT_SPECS.length;
+  const terminalStart =
+    mutationStart + SOURCE_MEMBERSHIP_MUTATION_IDS.length;
+  if (
+    lines.length !== terminalStart + 3 ||
+    lines[0] !==
+      "semantic_snapshot_source_membership_event_gate_schema=cheng.semantic_snapshot.source_membership_event_gate" ||
+    lines[1] !==
+      "semantic_snapshot_source_membership_event_gate_status=passed" ||
+    lines[2] !==
+      `semantic_snapshot_source_membership_event_gate_mutations=${SOURCE_MEMBERSHIP_MUTATION_IDS.length}` ||
+    lines[3] !==
+      `semantic_snapshot_source_membership_event_gate_unique_mutation_cids=${SOURCE_MEMBERSHIP_MUTATION_IDS.length}` ||
+    lines[5] !==
+      `semantic_snapshot_source_membership_event_gate_input_count=${SOURCE_MEMBERSHIP_FOCUSED_INPUT_SPECS.length}`
+  ) {
+    throw new Error(`${label}_terminal_schema_invalid`);
+  }
+  const closureMatch =
+    /^semantic_snapshot_source_membership_event_gate_source_closure_cid=([0-9a-f]{64})$/.exec(
+      lines[4]!,
+    );
+  if (closureMatch === null) {
+    throw new Error(`${label}_closure_header_invalid`);
+  }
+  const inputLines: string[] = [];
+  for (
+    let index = 0;
+    index < SOURCE_MEMBERSHIP_FOCUSED_INPUT_SPECS.length;
+    index += 1
+  ) {
+    const line = lines[inputStart + index]!;
+    const match =
+      /^input role=([a-z][a-z0-9_]*) path=([A-Za-z0-9_.\/-]+) bytes=([1-9][0-9]*) sha256=([0-9a-f]{64})$/.exec(
+        line,
+      );
+    const [expectedPath, expectedRole] =
+      SOURCE_MEMBERSHIP_FOCUSED_INPUT_SPECS[index]!;
+    const artifact = inputs.get(expectedPath);
+    if (
+      match === null ||
+      match[1] !== expectedRole ||
+      match[2] !== expectedPath ||
+      artifact === undefined ||
+      artifact.role !== expectedRole ||
+      Number(match[3]) !== artifact.raw.length ||
+      match[4] !== sha256(artifact.raw)
+    ) {
+      throw new Error(`${label}_input_${index}_drift`);
+    }
+    inputLines.push(line);
+  }
+  const focusedClosureRaw = Buffer.from(`${inputLines.join("\n")}\n`, "utf8");
+  if (sha256(focusedClosureRaw) !== closureMatch[1]) {
+    throw new Error(`${label}_closure_cid_drift`);
+  }
+
+  const observedMutationCids = new Set<string>();
+  const mutationLines: string[] = [];
+  for (
+    let index = 0;
+    index < SOURCE_MEMBERSHIP_MUTATION_IDS.length;
+    index += 1
+  ) {
+    const line = lines[mutationStart + index]!;
+    const match =
+      /^semantic_snapshot_source_membership_mutation id=([a-z0-9_]+) cid=([0-9a-f]{64}) bytes=([^ \t]+)$/.exec(
+        line,
+      );
+    if (
+      match === null ||
+      match[1] !== SOURCE_MEMBERSHIP_MUTATION_IDS[index] ||
+      sha256(Buffer.from(match[3]!, "utf8")) !== match[2] ||
+      observedMutationCids.has(match[2]!)
+    ) {
+      throw new Error(`${label}_mutation_${index}_invalid`);
+    }
+    observedMutationCids.add(match[2]!);
+    mutationLines.push(line);
+  }
+  if (
+    lines[terminalStart] !==
+      "semantic_snapshot_source_membership_event_smoke: ok" ||
+    lines[terminalStart + 1] !==
+      "semantic_snapshot_candidate_job_smoke: ok cancelled=1 late=1 duplicate=1"
+  ) {
+    throw new Error(`${label}_smoke_terminal_invalid`);
+  }
+  const lspTerminal =
+    /^lsp_source_membership_event_status=pass rename_source_version=([1-9][0-9]*) delete_source_version=([1-9][0-9]*) stable_rows=([1-9][0-9]*) active_rows=([1-9][0-9]*) published=1$/.exec(
+      lines[terminalStart + 2]!,
+    );
+  if (
+    lspTerminal === null ||
+    Number(lspTerminal[2]) !== Number(lspTerminal[1]) + 1 ||
+    Number(lspTerminal[3]) < 4 ||
+    Number(lspTerminal[4]) !== 2
+  ) {
+    throw new Error(`${label}_lsp_terminal_invalid`);
+  }
+  return currentReleaseDomainCid(
+    "cheng.semantic_snapshot.source_membership_focused_receipt",
+    [
+      sourceSetCid,
+      sha256(raw),
+      closureMatch[1]!,
+      ...inputLines,
+      ...mutationLines,
+      lines[terminalStart]!,
+      lines[terminalStart + 1]!,
+      lines[terminalStart + 2]!,
+    ],
+  );
+}
+
+export function validateCurrentSourceMembershipFocusedEvidence(
+  raw: Buffer,
+  inputArtifacts: readonly CurrentSemanticInputArtifact[],
+  sourceSetCid: string,
+): string {
+  observedHash(
+    sourceSetCid,
+    "current_release_source_membership_focused_source_set",
+  );
+  const inputs = new Map<string, CurrentSemanticInputArtifact>();
+  for (const artifact of inputArtifacts) {
+    if (
+      inputs.has(artifact.relativePath) ||
+      artifact.raw.length <= 0
+    ) {
+      throw new Error(
+        "current_release_source_membership_focused_input_set_invalid",
+      );
+    }
+    inputs.set(artifact.relativePath, artifact);
+  }
+  return validateSourceMembershipFocusedReceipt(raw, inputs, sourceSetCid);
+}
+
 function recomputeCompilerInputReceipt(
   inputs: ReadonlyMap<string, CurrentSemanticInputArtifact>,
   compilerInputAudit: unknown,
@@ -448,6 +689,171 @@ function validatePublishedRouting(gateRaw: Buffer, guardRaw32: string): string {
   );
 }
 
+export interface CurrentPublishedCandidateExecutionAuthority {
+  readonly sourceSetCid: string;
+  readonly sourceVersion: number;
+  readonly documentCount: number;
+  readonly openDocumentCount: number;
+  readonly compilerSha256: string;
+  readonly formalSpecSha256: string;
+  readonly sourceClosureCid: string;
+  readonly objectSha256: string;
+  readonly bindingReceiptCid: string;
+  readonly queryProjectionCid: string;
+  readonly openDocumentUniverseCid: string;
+  readonly snapshotPayloadCid: string;
+  readonly stdoutSha256: string;
+  readonly routingReceiptCid: string;
+}
+
+export function currentPublishedCandidateReceiptBindingCid(
+  receiptCid: string,
+): string {
+  return currentReleaseDomainCid(
+    "cheng.semantic_snapshot.published_candidate_receipt_presence",
+    [
+      "published_candidate_receipt_present_valid",
+      observedHash(
+        receiptCid, "current_release_published_candidate_receipt"),
+    ],
+  );
+}
+
+export function validateCurrentPublishedCandidateExecutionReceipt(
+  publishedValue: unknown,
+  authority: CurrentPublishedCandidateExecutionAuthority,
+): string {
+  assertExactCurrentObjectKeys(
+    publishedValue,
+    [
+      "schema",
+      "status",
+      "executionBound",
+      "sourceSetCid",
+      "sourceVersion",
+      "documentCount",
+      "openDocumentCount",
+      "compilerSha256",
+      "formalSpecSha256",
+      "sourceClosureCid",
+      "objectSha256",
+      "bindingReceiptCid",
+      "queryProjectionCid",
+      "openDocumentUniverseCid",
+      "snapshotPayloadCid",
+      "stdoutSha256",
+      "runtimeReceiptCid",
+      "routingReceiptCid",
+      "receiptCid",
+    ],
+    "current_release_published_candidate",
+  );
+  const sourceSetCid = observedHash(
+    authority.sourceSetCid, "current_release_published_source_set");
+  const compilerSha256 = observedHash(
+    authority.compilerSha256, "current_release_published_compiler");
+  const formalSpecSha256 = observedHash(
+    authority.formalSpecSha256, "current_release_published_formal_spec");
+  const sourceClosureCid = observedHash(
+    authority.sourceClosureCid, "current_release_published_source_closure");
+  const objectSha256 = observedHash(
+    authority.objectSha256, "current_release_published_object");
+  const bindingReceiptCid = observedHash(
+    authority.bindingReceiptCid, "current_release_published_binding");
+  const queryProjectionCid = observedHash(
+    authority.queryProjectionCid, "current_release_published_query");
+  const openDocumentUniverseCid = observedHash(
+    authority.openDocumentUniverseCid,
+    "current_release_published_open_document_universe");
+  const snapshotPayloadCid = observedHash(
+    authority.snapshotPayloadCid, "current_release_published_snapshot_payload");
+  const stdoutSha256 = observedHash(
+    authority.stdoutSha256, "current_release_published_stdout");
+  const routingReceiptCid = observedHash(
+    authority.routingReceiptCid, "current_release_published_routing");
+  if (
+    !Number.isSafeInteger(authority.sourceVersion) ||
+    authority.sourceVersion <= 1 ||
+    !Number.isSafeInteger(authority.documentCount) ||
+    authority.documentCount < 2 ||
+    !Number.isSafeInteger(authority.openDocumentCount) ||
+    authority.openDocumentCount < 2 ||
+    authority.openDocumentCount > authority.documentCount ||
+    new Set([
+      bindingReceiptCid,
+      queryProjectionCid,
+      openDocumentUniverseCid,
+      snapshotPayloadCid,
+    ]).size !== 4
+  ) {
+    throw new Error("current_release_published_identity_invalid");
+  }
+  const runtimeReceiptCid = currentReleaseDomainCid(
+    "cheng.semantic_snapshot.published_candidate_receipt",
+    [
+      sourceSetCid,
+      stdoutSha256,
+      compilerSha256,
+      formalSpecSha256,
+      sourceClosureCid,
+      objectSha256,
+      String(authority.sourceVersion),
+      String(authority.documentCount),
+      String(authority.openDocumentCount),
+      bindingReceiptCid,
+      queryProjectionCid,
+      openDocumentUniverseCid,
+      snapshotPayloadCid,
+    ],
+  );
+  const publishedReceiptCid = currentReleaseDomainCid(
+    "cheng.semantic_snapshot.published_candidate_execution_receipt",
+    [
+      sourceSetCid,
+      runtimeReceiptCid,
+      routingReceiptCid,
+      String(authority.sourceVersion),
+      String(authority.documentCount),
+      String(authority.openDocumentCount),
+      compilerSha256,
+      formalSpecSha256,
+      sourceClosureCid,
+      objectSha256,
+      bindingReceiptCid,
+      queryProjectionCid,
+      openDocumentUniverseCid,
+      snapshotPayloadCid,
+      stdoutSha256,
+    ],
+  );
+  const published = publishedValue as Record<string, unknown>;
+  if (
+    published.schema !==
+      "cheng.semantic_snapshot.published_candidate_receipt" ||
+    published.status !== "pass" ||
+    published.executionBound !== true ||
+    published.sourceSetCid !== sourceSetCid ||
+    published.sourceVersion !== authority.sourceVersion ||
+    published.documentCount !== authority.documentCount ||
+    published.openDocumentCount !== authority.openDocumentCount ||
+    published.compilerSha256 !== compilerSha256 ||
+    published.formalSpecSha256 !== formalSpecSha256 ||
+    published.sourceClosureCid !== sourceClosureCid ||
+    published.objectSha256 !== objectSha256 ||
+    published.bindingReceiptCid !== bindingReceiptCid ||
+    published.queryProjectionCid !== queryProjectionCid ||
+    published.openDocumentUniverseCid !== openDocumentUniverseCid ||
+    published.snapshotPayloadCid !== snapshotPayloadCid ||
+    published.stdoutSha256 !== stdoutSha256 ||
+    published.runtimeReceiptCid !== runtimeReceiptCid ||
+    published.routingReceiptCid !== routingReceiptCid ||
+    published.receiptCid !== publishedReceiptCid
+  ) {
+    throw new Error("current_release_published_candidate_cid_drift");
+  }
+  return publishedReceiptCid;
+}
+
 export function validateCurrentSemanticSnapshotEvidence(
   auditValue: unknown,
   bitmapValue: unknown,
@@ -490,6 +896,12 @@ export function validateCurrentSemanticSnapshotEvidence(
   if (audit.sourceSetCid !== sourceSetCid) {
     throw new Error("current_release_semantic_source_set_cid_drift");
   }
+  const sourceMembershipFocusedReceiptCid =
+    validateSourceMembershipFocusedReceipt(
+      evidence.sourceMembershipFocusedStdoutRaw,
+      inputs,
+      sourceSetCid,
+    );
 
   assertExactCurrentObjectKeys(
     audit.structuralAudit,
@@ -517,29 +929,6 @@ export function validateCurrentSemanticSnapshotEvidence(
     throw new Error("current_release_structural_audit_cid_drift");
   }
 
-  assertExactCurrentObjectKeys(
-    audit.publishedCandidateReceipt,
-    [
-      "schema",
-      "status",
-      "executionBound",
-      "sourceVersion",
-      "documentCount",
-      "openDocumentCount",
-      "compilerSha256",
-      "sourceClosureCid",
-      "objectSha256",
-      "bindingReceiptCid",
-      "queryProjectionCid",
-      "openDocumentUniverseCid",
-      "stdoutSha256",
-      "runtimeReceiptCid",
-      "routingReceiptCid",
-      "receiptCid",
-    ],
-    "current_release_published_candidate",
-  );
-  const published = audit.publishedCandidateReceipt as Record<string, unknown>;
   const stdout = parseKeyValueReceipt(
     evidence.publishedStdoutRaw,
     "current_release_published_stdout",
@@ -550,6 +939,7 @@ export function validateCurrentSemanticSnapshotEvidence(
     "gate_sha256",
     "compiler_sha256",
     "compiler_source_sha256",
+    "formal_spec_sha256",
     "lsp_module_sha256",
     "query_projection_module_sha256",
     "compiler_csg_module_sha256",
@@ -575,6 +965,7 @@ export function validateCurrentSemanticSnapshotEvidence(
     ],
     ["gate_sha256", "tools/lsp_multifile_exact_snapshot_acceptance_gate.sh"],
     ["compiler_source_sha256", "bootstrap/cheng_cold.c"],
+    ["formal_spec_sha256", "docs/cheng-formal-spec.md"],
     ["lsp_module_sha256", "src/core/tooling/lsp_server.cheng"],
     [
       "query_projection_module_sha256",
@@ -590,7 +981,7 @@ export function validateCurrentSemanticSnapshotEvidence(
     }
   }
   const runtime =
-    /^pass published=1 source_version=([1-9][0-9]*) documents=([1-9][0-9]*) open_documents=([1-9][0-9]*) binding_receipt=([0-9a-f]{64}) query_projection=([0-9a-f]{64}) open_document_universe=([0-9a-f]{64})$/.exec(
+    /^pass published=1 source_version=([1-9][0-9]*) documents=([1-9][0-9]*) open_documents=([1-9][0-9]*) binding_receipt=([0-9a-f]{64}) query_projection=([0-9a-f]{64}) open_document_universe=([0-9a-f]{64}) snapshot_payload=([0-9a-f]{64})$/.exec(
       requireRow(
         stdout,
         "lsp_multifile_exact_snapshot_acceptance_status",
@@ -606,9 +997,15 @@ export function validateCurrentSemanticSnapshotEvidence(
   const bindingReceiptCid = runtime[4]!;
   const queryProjectionCid = runtime[5]!;
   const openDocumentUniverseCid = runtime[6]!;
+  const snapshotPayloadCid = runtime[7]!;
   const compilerSha256 = requireRow(
     stdout,
     "compiler_sha256",
+    "current_release_published_stdout",
+  );
+  const formalSpecSha256 = requireRow(
+    stdout,
+    "formal_spec_sha256",
     "current_release_published_stdout",
   );
   const sourceClosureCid = requireRow(
@@ -631,6 +1028,7 @@ export function validateCurrentSemanticSnapshotEvidence(
       openDocumentUniverseCid,
       evidence.openDocumentUniverseRaw,
     ],
+    ["snapshot_payload", snapshotPayloadCid, evidence.snapshotRaw],
   ] as const) {
     observedHash(actual, `current_release_published_${label}`);
     if (raw.length <= 0 || sha256(raw) !== actual) {
@@ -647,57 +1045,42 @@ export function validateCurrentSemanticSnapshotEvidence(
     openDocumentCount > documentCount ||
     compilerSha256 !==
       sha256(inputs.get("artifacts/bootstrap/cheng.stage3")!.raw) ||
-    new Set([bindingReceiptCid, queryProjectionCid, openDocumentUniverseCid])
-      .size !== 3
+    formalSpecSha256 !==
+      sha256(inputs.get("docs/cheng-formal-spec.md")!.raw) ||
+    new Set([
+      bindingReceiptCid,
+      queryProjectionCid,
+      openDocumentUniverseCid,
+      snapshotPayloadCid,
+    ]).size !== 4
   ) {
     throw new Error("current_release_published_identity_invalid");
   }
   const stdoutRaw32 = sha256(evidence.publishedStdoutRaw);
-  const runtimeReceiptCid = currentReleaseDomainCid(
-    "cheng.semantic_snapshot.published_candidate_receipt",
-    [
-      sourceSetCid,
-      stdoutRaw32,
-      compilerSha256,
-      sourceClosureCid,
-      objectSha256,
-      String(sourceVersion),
-      String(documentCount),
-      String(openDocumentCount),
-      bindingReceiptCid,
-      queryProjectionCid,
-      openDocumentUniverseCid,
-    ],
-  );
   const routingReceiptCid = validatePublishedRouting(
     inputs.get("tools/lsp_multifile_exact_snapshot_acceptance_gate.sh")!.raw,
     sha256(inputs.get("tools/beat_c_process_group_guard.sh")!.raw),
   );
-  const publishedReceiptCid = currentReleaseDomainCid(
-    "cheng.semantic_snapshot.published_candidate_execution_receipt",
-    [sourceSetCid, runtimeReceiptCid, routingReceiptCid],
-  );
-  if (
-    published.schema !==
-      "cheng.semantic_snapshot.published_candidate_receipt" ||
-    published.status !== "pass" ||
-    published.executionBound !== true ||
-    published.sourceVersion !== sourceVersion ||
-    published.documentCount !== documentCount ||
-    published.openDocumentCount !== openDocumentCount ||
-    published.compilerSha256 !== compilerSha256 ||
-    published.sourceClosureCid !== sourceClosureCid ||
-    published.objectSha256 !== objectSha256 ||
-    published.bindingReceiptCid !== bindingReceiptCid ||
-    published.queryProjectionCid !== queryProjectionCid ||
-    published.openDocumentUniverseCid !== openDocumentUniverseCid ||
-    published.stdoutSha256 !== stdoutRaw32 ||
-    published.runtimeReceiptCid !== runtimeReceiptCid ||
-    published.routingReceiptCid !== routingReceiptCid ||
-    published.receiptCid !== publishedReceiptCid
-  ) {
-    throw new Error("current_release_published_candidate_cid_drift");
-  }
+  const publishedReceiptCid =
+    validateCurrentPublishedCandidateExecutionReceipt(
+      audit.publishedCandidateReceipt,
+      {
+        sourceSetCid,
+        sourceVersion,
+        documentCount,
+        openDocumentCount,
+        compilerSha256,
+        formalSpecSha256,
+        sourceClosureCid,
+        objectSha256,
+        bindingReceiptCid,
+        queryProjectionCid,
+        openDocumentUniverseCid,
+        snapshotPayloadCid,
+        stdoutSha256: stdoutRaw32,
+        routingReceiptCid,
+      },
+    );
 
   assertExactCurrentObjectKeys(
     audit.productionClosureAudit,
@@ -737,11 +1120,13 @@ export function validateCurrentSemanticSnapshotEvidence(
     "src/core/backend/direct_object_emit.cheng",
     "src/core/backend/macho_object_writer.cheng",
   ];
+  const publishedReceiptBindingCid =
+    currentPublishedCandidateReceiptBindingCid(publishedReceiptCid);
   const closureReceiptCid = currentReleaseDomainCid(
     "cheng.semantic_snapshot.production_closure_audit",
     [
       ...closureSourcePaths.map((path) => sha256(inputs.get(path)!.raw)),
-      publishedReceiptCid,
+      publishedReceiptBindingCid,
       ...CLOSURE_OBSERVATION_KEYS.flatMap((key) => [
         key,
         closure.observations[key] ? "1" : "0",
@@ -761,7 +1146,7 @@ export function validateCurrentSemanticSnapshotEvidence(
     structuralReceiptCid,
     closureReceiptCid,
     compilerInputReceiptCid,
-    publishedReceiptCid,
+    publishedReceiptBindingCid,
   ]);
   if (audit.auditCid !== auditCid) {
     throw new Error("current_release_semantic_audit_cid_drift");
@@ -819,6 +1204,7 @@ export function validateCurrentSemanticSnapshotEvidence(
     closureReceiptCid,
     compilerInputReceiptCid,
     publishedReceiptCid,
+    sourceMembershipFocusedReceiptCid,
     queryProjectionCid,
     openDocumentUniverseCid,
     snapshotRaw32: sha256(evidence.snapshotRaw),

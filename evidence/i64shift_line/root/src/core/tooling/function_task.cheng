@@ -1,0 +1,262 @@
+# Function task parallelism: round-robin partition worker pool with join/barrier.
+#
+# Contract: BACKEND_JOBS=1 and BACKEND_JOBS=N must produce identical output hashes.
+# Workers read frozen shared state (module-level vars set before execution).
+# Each worker writes only to its pre-assigned task-local slot in the results array
+# (partitioned by round-robin on function index). No mutex contention.
+# Merge is implicit: results are already in declaration order by function index.
+# Uses thread.StartPtr/Join for barrier synchronization (never yield-poll).
+
+import std/strings
+import std/thread
+import cheng/core/ir/function_task as ftask
+import cheng/core/backend/lowering_plan as lower
+import cheng/core/lang/typed_expr as texpr
+
+type
+    RoundRobinWorkerContext = ref object
+        workerId: int32
+        workerCount: int32
+
+    RoundRobinPoolStats =
+        requestedJobs: int32
+        activeWorkerCount: int32
+        completedWorkerCount: int32
+        taskCount: int32
+
+    RoundRobinDeterminismResult =
+        ok: bool
+        serialHash: str
+        parallelHash: str
+        jobCount: int32
+        taskCount: int32
+
+# -- Module-level frozen shared state (read-only during parallel execution) --
+
+var
+    roundRobinPoolPlan: lower.LoweringPlanStub
+    roundRobinPoolSourceTexts: texpr.TypedExprSourceText[]
+    roundRobinPoolLetCallReturnLiteralStart: int32
+    roundRobinPoolResults: ftask.FunctionTaskResult[]
+    roundRobinPoolFunctionCount: int32
+
+# -- Module-level pool tracking for report --
+
+var
+    roundRobinPoolLastRequestedJobs: int32
+    roundRobinPoolLastActiveWorkerCount: int32
+    roundRobinPoolLastCompletedWorkerCount: int32
+    roundRobinPoolLastTaskCount: int32
+
+# -- Determinism state --
+
+var
+    roundRobinDeterminismSerialHash: str
+    roundRobinDeterminismSet: bool
+
+# =============================================================================
+# Shared state setup (call once before execution)
+# =============================================================================
+
+fn RoundRobinSetSharedState(plan: var lower.LoweringPlanStub,
+                             sourceTexts: var texpr.TypedExprSourceText[],
+                             letCallReturnLiteralStart: int32) =
+    roundRobinPoolPlan = plan
+    roundRobinPoolSourceTexts = lower.LoweringCloneTypedExprSourceTexts(sourceTexts)
+    roundRobinPoolLetCallReturnLiteralStart = letCallReturnLiteralStart
+    roundRobinPoolLastRequestedJobs = 1
+    roundRobinPoolLastActiveWorkerCount = 0
+    roundRobinPoolLastCompletedWorkerCount = 0
+    roundRobinPoolLastTaskCount = 0
+    roundRobinDeterminismSerialHash = ""
+    roundRobinDeterminismSet = false
+
+# =============================================================================
+# Core body-IR execution (called by workers)
+# =============================================================================
+
+fn RoundRobinExecuteBodyIr(funcIndex: int32) =
+    var fnIr: lower.PrimaryObjectIrFunction
+    lower.LoweringBuildOneFunctionInto(roundRobinPoolPlan,
+                                        roundRobinPoolSourceTexts,
+                                        funcIndex,
+                                        roundRobinPoolLetCallReturnLiteralStart,
+                                        fnIr)
+    roundRobinPoolResults[funcIndex].funcIndex = funcIndex
+    roundRobinPoolResults[funcIndex].outputKind = ftask.FunctionTaskResultKindBodyIr()
+    roundRobinPoolResults[funcIndex].loweredFunction = fnIr
+    roundRobinPoolResults[funcIndex].wordCount = fnIr.statementCount
+
+# =============================================================================
+# Worker thread entry point (signature: fn(ptr) as required by thread.StartPtr)
+# =============================================================================
+
+fn RoundRobinWorkerEntry(ctx: RoundRobinWorkerContext) =
+    if ctx == nil:
+        return
+    let workerId = ctx.workerId
+    let workerCount = ctx.workerCount
+    let functionCount = roundRobinPoolFunctionCount
+    var fi = workerId
+    while fi < functionCount:
+        RoundRobinExecuteBodyIr(fi)
+        fi = fi + workerCount
+    memRelease(ctx)
+
+# =============================================================================
+# Results allocation
+# =============================================================================
+
+fn RoundRobinAllocateResults(functionCount: int32) =
+    roundRobinPoolResults = []
+    for fi in 0..<functionCount:
+        add(roundRobinPoolResults, ftask.FunctionTaskResultEmpty(fi))
+    roundRobinPoolFunctionCount = functionCount
+
+# =============================================================================
+# Serial execution (BACKEND_JOBS=1 path)
+# =============================================================================
+
+fn RoundRobinExecuteSerial(functionCount: int32): ftask.FunctionTaskResult[] =
+    roundRobinPoolLastRequestedJobs = 1
+    roundRobinPoolLastActiveWorkerCount = 1
+    roundRobinPoolLastCompletedWorkerCount = 1
+    roundRobinPoolLastTaskCount = functionCount
+    RoundRobinAllocateResults(functionCount)
+    for fi in 0..<functionCount:
+        RoundRobinExecuteBodyIr(fi)
+    return roundRobinPoolResults
+
+# =============================================================================
+# Parallel execution with round-robin partition
+# Main thread (worker 0) participates. Workers 1..N-1 are spawned.
+# Synchronization via thread.Join (barrier, never yield-poll).
+# =============================================================================
+
+fn RoundRobinExecuteParallel(functionCount: int32,
+                              jobCount: int32): ftask.FunctionTaskResult[] =
+    if functionCount <= 0:
+        roundRobinPoolLastRequestedJobs = jobCount
+        roundRobinPoolLastActiveWorkerCount = 0
+        roundRobinPoolLastCompletedWorkerCount = 0
+        roundRobinPoolLastTaskCount = 0
+        return []
+
+    var workerCount = jobCount
+    if workerCount > functionCount:
+        workerCount = functionCount
+    if workerCount <= 1:
+        return RoundRobinExecuteSerial(functionCount)
+
+    roundRobinPoolLastRequestedJobs = jobCount
+    roundRobinPoolLastActiveWorkerCount = workerCount
+    roundRobinPoolLastTaskCount = functionCount
+
+    RoundRobinAllocateResults(functionCount)
+
+    # Spawn worker threads (workers 1..N-1)
+    # Each worker gets a RoundRobinWorkerContext with its workerId.
+    var workerThreads: thread.Thread[]
+    for w in 1..<workerCount:
+        let ctx = new(RoundRobinWorkerContext)
+        if ctx == nil:
+            for ti in 0..<workerThreads.len:
+                let _ = thread.JoinThread(workerThreads[ti])
+            panic("function_task_round_robin_worker_ctx_alloc_failed")
+        ctx.workerId = w
+        ctx.workerCount = workerCount
+        memRetain(ctx)
+        let t = thread.StartPtr(&RoundRobinWorkerEntry, ctx)
+        if t == nil:
+            memRelease(ctx)
+            for ti in 0..<workerThreads.len:
+                let _ = thread.JoinThread(workerThreads[ti])
+            panic("function_task_round_robin_worker_start_failed")
+        add(workerThreads, t)
+
+    # Main thread participates as worker 0
+    var fi = 0
+    while fi < functionCount:
+        RoundRobinExecuteBodyIr(fi)
+        fi = fi + workerCount
+
+    # Join all spawned workers (barrier synchronization)
+    for ti in 0..<workerThreads.len:
+        let _ = thread.JoinThread(workerThreads[ti])
+
+    roundRobinPoolLastCompletedWorkerCount = workerCount
+    return roundRobinPoolResults
+
+# =============================================================================
+# Auto dispatch: parallel if BACKEND_JOBS > 1 and more than 1 function
+# =============================================================================
+
+fn RoundRobinExecute(functionCount: int32,
+                      jobCount: int32): ftask.FunctionTaskResult[] =
+    if jobCount > 1 && functionCount > 1:
+        return RoundRobinExecuteParallel(functionCount, jobCount)
+    return RoundRobinExecuteSerial(functionCount)
+
+# =============================================================================
+# Report helpers
+# =============================================================================
+
+fn RoundRobinLastRequestedJobs(): int32 =
+    return roundRobinPoolLastRequestedJobs
+
+fn RoundRobinLastActiveWorkerCount(): int32 =
+    return roundRobinPoolLastActiveWorkerCount
+
+fn RoundRobinLastCompletedWorkerCount(): int32 =
+    return roundRobinPoolLastCompletedWorkerCount
+
+fn RoundRobinLastTaskCount(): int32 =
+    return roundRobinPoolLastTaskCount
+
+# =============================================================================
+# Determinism: compute hash of result array for comparison
+# =============================================================================
+
+fn RoundRobinComputeResultsHash(results: ftask.FunctionTaskResult[]): str =
+    var buf = ""
+    for ri in 0..<results.len:
+        let r = results[ri]
+        buf = Fmt"{buf}{r.funcIndex}"
+        buf = Fmt"{buf}{r.wordCount}"
+        buf = Fmt"{buf}{r.outputKind}"
+    return strings.Sha256(buf)
+
+fn RoundRobinSetDeterminismBaseline(baselineHash: str) =
+    roundRobinDeterminismSerialHash = baselineHash
+    roundRobinDeterminismSet = true
+
+fn RoundRobinVerifyDeterminism(parallelHash: str): bool =
+    if !roundRobinDeterminismSet || len(roundRobinDeterminismSerialHash) <= 0:
+        return true
+    return parallelHash == roundRobinDeterminismSerialHash
+
+fn RoundRobinDeterminismReportForSerial(results: ftask.FunctionTaskResult[]): RoundRobinDeterminismResult =
+    var result: RoundRobinDeterminismResult
+    result.ok = true
+    result.jobCount = 1
+    result.taskCount = results.len
+    result.serialHash = RoundRobinComputeResultsHash(results)
+    result.parallelHash = result.serialHash
+    return result
+
+fn RoundRobinDeterminismReportForParallel(serialResults: ftask.FunctionTaskResult[],
+                                           parallelResults: ftask.FunctionTaskResult[],
+                                           jobCount: int32): RoundRobinDeterminismResult =
+    var result: RoundRobinDeterminismResult
+    result.jobCount = jobCount
+    result.taskCount = serialResults.len
+    result.serialHash = RoundRobinComputeResultsHash(serialResults)
+    result.parallelHash = RoundRobinComputeResultsHash(parallelResults)
+    result.ok = result.serialHash == result.parallelHash
+    return result
+
+fn RoundRobinDeterminismBaselineReady(): bool =
+    return roundRobinDeterminismSet && len(roundRobinDeterminismSerialHash) > 0
+
+fn RoundRobinDeterminismBaselineHash(): str =
+    return roundRobinDeterminismSerialHash

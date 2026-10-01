@@ -1,0 +1,896 @@
+import std/os
+import std/os_host_process as hostos
+import std/rawbytes
+import std/result
+import std/strings
+import std/strutils as strutil
+import std/net/transports/tcp_syscall as tcp
+import cheng/core/tooling/path as chengpath
+import cheng/apps/vpn_proxy/vpn_proxy_cli as cli
+import cheng/apps/vpn_proxy/vpn_proxy_config as config
+import cheng/apps/vpn_proxy/gui/vpn_proxy_gui_listener as guilistener
+
+@importc("cheng_monotime_ns")
+fn VpnGuiMonoTimeNsBridge(): int64
+
+type
+    VpnProxyGuiFieldId = enum
+        VpnGuiFieldConfigPath
+        VpnGuiFieldListen
+        VpnGuiFieldCertDer
+        VpnGuiFieldKeyPk8Der
+        VpnGuiFieldTrustRootDer
+        VpnGuiFieldExitName
+        VpnGuiFieldExitHost
+        VpnGuiFieldExitPort
+        VpnGuiFieldServerName
+        VpnGuiFieldAuthority
+        VpnGuiFieldAuth
+        VpnGuiFieldCcRx
+
+    VpnProxyGuiProc =
+        running: bool
+        pid: int64
+        readFd: int32
+        exitCode: int32
+        stopRequested: bool
+        stopRequestedAtMs: int64
+
+    VpnProxyGuiState =
+        rootDir: str
+        title: str
+        runtimeToolPath: str
+        defaultConfigPath: str
+        fields: str[]
+        noticeText: str
+        errorText: str
+        statusText: str
+        logText: str
+        logVersion: int32
+        proc: VpnProxyGuiProc
+        quitRequested: bool
+
+var VpnGuiGlobalState: VpnProxyGuiState
+
+const
+    VpnGuiFieldCount = 12
+    VpnGuiSigTerm = 15
+    VpnGuiSigKill = 9
+    VpnGuiStopGraceMs = 1500
+    VpnGuiMaxLogChars = 16000
+    VpnGuiHttpMaxChars = 65536
+    VpnGuiListenHost = "127.0.0.1"
+    VpnGuiWebPort = 18443
+    VpnGuiWaitMs = 200
+
+fn VpnGuiPrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn VpnGuiMonoNowMs(): int64 =
+    return VpnGuiMonoTimeNsBridge() / 1000000
+
+fn VpnGuiFieldLabel(id: VpnProxyGuiFieldId): str =
+    if id == VpnGuiFieldConfigPath:
+        return "CONFIG PATH"
+    if id == VpnGuiFieldListen:
+        return "SOCKS LISTEN"
+    if id == VpnGuiFieldCertDer:
+        return "CLIENT CERT"
+    if id == VpnGuiFieldKeyPk8Der:
+        return "CLIENT KEY"
+    if id == VpnGuiFieldTrustRootDer:
+        return "TRUST ROOT"
+    if id == VpnGuiFieldExitName:
+        return "EXIT NAME"
+    if id == VpnGuiFieldExitHost:
+        return "EXIT HOST"
+    if id == VpnGuiFieldExitPort:
+        return "EXIT PORT"
+    if id == VpnGuiFieldServerName:
+        return "SERVER NAME"
+    if id == VpnGuiFieldAuthority:
+        return "AUTHORITY"
+    if id == VpnGuiFieldAuth:
+        return "AUTH TOKEN"
+    return "CC RX"
+
+fn VpnGuiDefaultRuntimeToolPath(rootDir: str): str =
+    return chengpath.PathAbsolute(rootDir, "artifacts/backend_driver_tools/vpn_proxy_runtime_tool/vpn_proxy_runtime_tool")
+
+fn VpnGuiDefaultConfigPath(rootDir: str): str =
+    let preferred: str = chengpath.PathAbsolute(rootDir, "artifacts/hysteria2_deploy/local.json")
+    if chengpath.PathFileExists(preferred):
+        return preferred
+    return chengpath.PathAbsolute(rootDir, "artifacts/hysteria2_gui/local.json")
+
+fn VpnGuiAppendLog(state: var VpnProxyGuiState,
+                     textRaw: str) =
+    let text: str = textRaw
+    if len(text) <= 0:
+        return
+    state.logText = strutil.Join([state.logText, text], "")
+    let total: int32 = len(state.logText)
+    if total > VpnGuiMaxLogChars:
+        state.logText = chengpath.TextSlice(state.logText, total - VpnGuiMaxLogChars, VpnGuiMaxLogChars)
+    state.logVersion = state.logVersion + 1
+
+fn VpnGuiOwnText(raw: str): str =
+    return strutil.Strip(raw)
+
+fn VpnGuiJsonQuote(raw: str): str =
+    var out: str = "\""
+    for i in 0..<len(raw):
+        let ch = raw[i]
+        if ch == '\\':
+            out = strutil.Join([out, "\\\\"], "")
+        elif ch == '"':
+            out = strutil.Join([out, "\\\""], "")
+        elif ch == '\n':
+            out = strutil.Join([out, "\\n"], "")
+        elif ch == '\r':
+            out = strutil.Join([out, "\\r"], "")
+        elif ch == '\t':
+            out = strutil.Join([out, "\\t"], "")
+        else:
+            out = strutil.Join([out, strings.CharToStr(ch)], "")
+    out = strutil.Join([out, "\""], "")
+    return out
+
+fn VpnGuiParseInt32Field(raw: str): Result[int32] =
+    return cli.VpnProxyParseInt32(raw)
+
+fn VpnGuiFieldsEnsureLen(fields: var str[]) =
+    if fields.len >= VpnGuiFieldCount:
+        return
+    let missing: int32 = VpnGuiFieldCount - fields.len
+    for i in 0..<missing:
+        add(fields, "")
+
+fn VpnGuiFieldGet(state: VpnProxyGuiState,
+                    id: VpnProxyGuiFieldId): str =
+    let idx: int32 = int32(id)
+    if idx < 0 || idx >= state.fields.len:
+        return ""
+    return state.fields[idx]
+
+fn VpnGuiFieldSet(state: var VpnProxyGuiState,
+                    id: VpnProxyGuiFieldId,
+                    value: str) =
+    VpnGuiFieldsEnsureLen(state.fields)
+    let idx: int32 = int32(id)
+    if idx < 0 || idx >= state.fields.len:
+        return
+    state.fields[idx] = value
+
+fn VpnGuiDefaultFieldValues(rootDir: str,
+                              configPath: str): str[] =
+    var out: str[]
+    VpnGuiFieldsEnsureLen(out)
+    out[int32(VpnGuiFieldConfigPath)] = configPath
+    out[int32(VpnGuiFieldListen)] = "127.0.0.1:1086"
+    rootDir
+    out[int32(VpnGuiFieldCertDer)] = "certs/client.der"
+    out[int32(VpnGuiFieldKeyPk8Der)] = "certs/client.key.pk8.der"
+    out[int32(VpnGuiFieldTrustRootDer)] = "certs/ca.der"
+    out[int32(VpnGuiFieldExitName)] = "v64"
+    out[int32(VpnGuiFieldExitHost)] = "64.176.84.12"
+    out[int32(VpnGuiFieldExitPort)] = "7443"
+    out[int32(VpnGuiFieldServerName)] = "server.cheng-quic.internal"
+    out[int32(VpnGuiFieldAuthority)] = "cheng-quic.internal"
+    out[int32(VpnGuiFieldAuth)] = ""
+    out[int32(VpnGuiFieldCcRx)] = "65535"
+    return out
+
+fn VpnGuiApplyLoadedConfig(state: var VpnProxyGuiState,
+                             cfg: config.VpnProxyConfig) =
+    VpnGuiFieldSet(state, VpnGuiFieldConfigPath, cfg.configPath)
+    VpnGuiFieldSet(state, VpnGuiFieldListen, cfg.client.listen)
+    VpnGuiFieldSet(state, VpnGuiFieldCertDer, cfg.client.certDer)
+    VpnGuiFieldSet(state, VpnGuiFieldKeyPk8Der, cfg.client.keyPk8Der)
+    VpnGuiFieldSet(state, VpnGuiFieldTrustRootDer, cfg.client.trustRootDer)
+    if cfg.exits.len > 0:
+        let exitCfg: config.VpnProxyExitConfig = cfg.exits[0]
+        VpnGuiFieldSet(state, VpnGuiFieldExitName, exitCfg.name)
+        VpnGuiFieldSet(state, VpnGuiFieldExitHost, exitCfg.host)
+        VpnGuiFieldSet(state, VpnGuiFieldExitPort, IntToStr(exitCfg.port))
+        VpnGuiFieldSet(state, VpnGuiFieldServerName, exitCfg.serverName)
+        VpnGuiFieldSet(state, VpnGuiFieldAuthority, exitCfg.authority)
+        VpnGuiFieldSet(state, VpnGuiFieldAuth, exitCfg.auth)
+        VpnGuiFieldSet(state, VpnGuiFieldCcRx, IntToStr(exitCfg.ccRx))
+
+fn VpnGuiLoadConfigIntoState(state: var VpnProxyGuiState): bool =
+    let configPath: str = VpnGuiFieldGet(state, VpnGuiFieldConfigPath)
+    if !chengpath.PathFileExists(configPath):
+        state.noticeText = "new config"
+        state.errorText = ""
+        return false
+    let loadRes: Result[config.VpnProxyConfig] = config.VpnProxyLoadConfig(configPath)
+    if IsErr(loadRes):
+        state.errorText = ErrorText(loadRes)
+        state.noticeText = ""
+        return false
+    VpnGuiApplyLoadedConfig(state, Value(loadRes))
+    state.noticeText = "loaded"
+    state.errorText = ""
+    return true
+
+fn VpnGuiStateInit(rootDir: str,
+                     runtimeToolPathRaw: str,
+                     configPathRaw: str): VpnProxyGuiState =
+    var out: VpnProxyGuiState
+    out.rootDir = rootDir
+    out.title = "Cheng VPN GUI"
+    if len(runtimeToolPathRaw) > 0:
+        out.runtimeToolPath = chengpath.PathAbsolute(rootDir, runtimeToolPathRaw)
+    else:
+        out.runtimeToolPath = VpnGuiDefaultRuntimeToolPath(rootDir)
+    if len(configPathRaw) > 0:
+        out.defaultConfigPath = chengpath.PathAbsolute(rootDir, configPathRaw)
+    else:
+        out.defaultConfigPath = VpnGuiDefaultConfigPath(rootDir)
+    out.fields = VpnGuiDefaultFieldValues(rootDir, out.defaultConfigPath)
+    out.noticeText = "edit fields, save config, start local proxy"
+    out.errorText = ""
+    out.statusText = "idle"
+    out.logText = ""
+    out.logVersion = 0
+    out.proc.running = false
+    out.proc.pid = int64(-1)
+    out.proc.readFd = -1
+    out.proc.exitCode = -1
+    out.proc.stopRequested = false
+    out.proc.stopRequestedAtMs = int64(0)
+    out.quitRequested = false
+    let _ = VpnGuiLoadConfigIntoState(out)
+    return out
+
+fn VpnGuiInitGlobalState(rootDir: str,
+                           runtimeToolPathRaw: str,
+                           configPathRaw: str) =
+    VpnGuiGlobalState.rootDir = rootDir
+    VpnGuiGlobalState.title = "Cheng VPN GUI"
+    if len(runtimeToolPathRaw) > 0:
+        VpnGuiGlobalState.runtimeToolPath = chengpath.PathAbsolute(rootDir, runtimeToolPathRaw)
+    else:
+        VpnGuiGlobalState.runtimeToolPath = VpnGuiDefaultRuntimeToolPath(rootDir)
+    if len(configPathRaw) > 0:
+        VpnGuiGlobalState.defaultConfigPath = chengpath.PathAbsolute(rootDir, configPathRaw)
+    else:
+        VpnGuiGlobalState.defaultConfigPath = VpnGuiDefaultConfigPath(rootDir)
+    VpnGuiGlobalState.fields = VpnGuiDefaultFieldValues(rootDir, VpnGuiGlobalState.defaultConfigPath)
+    VpnGuiGlobalState.noticeText = "edit fields, save config, start local proxy"
+    VpnGuiGlobalState.errorText = ""
+    VpnGuiGlobalState.statusText = "idle"
+    VpnGuiGlobalState.logText = ""
+    VpnGuiGlobalState.logVersion = 0
+    VpnGuiGlobalState.proc.running = false
+    VpnGuiGlobalState.proc.pid = int64(-1)
+    VpnGuiGlobalState.proc.readFd = -1
+    VpnGuiGlobalState.proc.exitCode = -1
+    VpnGuiGlobalState.proc.stopRequested = false
+    VpnGuiGlobalState.proc.stopRequestedAtMs = int64(0)
+    VpnGuiGlobalState.quitRequested = false
+    let _ = VpnGuiLoadConfigIntoState(VpnGuiGlobalState)
+
+fn VpnProxyGuiBuildConfigText(state: VpnProxyGuiState): Result[str] =
+    let portRes: Result[int32] = VpnGuiParseInt32Field(VpnGuiFieldGet(state, VpnGuiFieldExitPort))
+    if IsErr(portRes):
+        return Err[str]("vpn gui: invalid exit port")
+    let ccRxRes: Result[int32] = VpnGuiParseInt32Field(VpnGuiFieldGet(state, VpnGuiFieldCcRx))
+    if IsErr(ccRxRes):
+        return Err[str]("vpn gui: invalid cc_rx")
+    let listen: str = VpnGuiOwnText(VpnGuiFieldGet(state, VpnGuiFieldListen))
+    let certDer: str = VpnGuiOwnText(VpnGuiFieldGet(state, VpnGuiFieldCertDer))
+    let keyPk8Der: str = VpnGuiOwnText(VpnGuiFieldGet(state, VpnGuiFieldKeyPk8Der))
+    let trustRootDer: str = VpnGuiOwnText(VpnGuiFieldGet(state, VpnGuiFieldTrustRootDer))
+    let exitName: str = VpnGuiOwnText(VpnGuiFieldGet(state, VpnGuiFieldExitName))
+    let exitHost: str = VpnGuiOwnText(VpnGuiFieldGet(state, VpnGuiFieldExitHost))
+    let serverName: str = VpnGuiOwnText(VpnGuiFieldGet(state, VpnGuiFieldServerName))
+    if len(listen) <= 0 || len(certDer) <= 0 || len(keyPk8Der) <= 0 || len(trustRootDer) <= 0:
+        return Err[str]("vpn gui: client fields must be non-empty")
+    if len(exitName) <= 0 || len(exitHost) <= 0 || len(serverName) <= 0:
+        return Err[str]("vpn gui: exit fields must be non-empty")
+    var text: str = "{\n"
+    text = strutil.Join([text, "  \"client\": {\n"], "")
+    text = strutil.Join([text, "    \"listen\": ", VpnGuiJsonQuote(listen), ",\n"], "")
+    text = strutil.Join([text, "    \"cert_der\": ", VpnGuiJsonQuote(certDer), ",\n"], "")
+    text = strutil.Join([text, "    \"key_pk8_der\": ", VpnGuiJsonQuote(keyPk8Der), ",\n"], "")
+    text = strutil.Join([text, "    \"trust_root_der\": ", VpnGuiJsonQuote(trustRootDer), "\n"], "")
+    text = strutil.Join([text, "  },\n"], "")
+    text = strutil.Join([text, "  \"exits\": [\n"], "")
+    text = strutil.Join([text, "    {\n"], "")
+    text = strutil.Join([text, "      \"name\": ", VpnGuiJsonQuote(exitName), ",\n"], "")
+    text = strutil.Join([text, "      \"host\": ", VpnGuiJsonQuote(exitHost), ",\n"], "")
+    text = strutil.Join([text, "      \"port\": ", IntToStr(Value(portRes)), ",\n"], "")
+    text = strutil.Join([text, "      \"server_name\": ", VpnGuiJsonQuote(serverName), ",\n"], "")
+    text = strutil.Join([text, "      \"authority\": ", VpnGuiJsonQuote(VpnGuiFieldGet(state, VpnGuiFieldAuthority)), ",\n"], "")
+    text = strutil.Join([text, "      \"auth\": ", VpnGuiJsonQuote(VpnGuiFieldGet(state, VpnGuiFieldAuth)), ",\n"], "")
+    text = strutil.Join([text, "      \"cc_rx\": ", IntToStr(Value(ccRxRes)), "\n"], "")
+    text = strutil.Join([text, "    }\n"], "")
+    text = strutil.Join([text, "  ]\n"], "")
+    text = strutil.Join([text, "}\n"], "")
+    let parseRes: Result[config.VpnProxyConfig] = config.VpnProxyParseConfigTextForTest(text)
+    if IsErr(parseRes):
+        return Err[str](ErrorText(parseRes))
+    return Ok[str](text)
+
+fn VpnProxyGuiSaveConfig(state: var VpnProxyGuiState): bool =
+    let configPath: str = VpnGuiFieldGet(state, VpnGuiFieldConfigPath)
+    if len(configPath) <= 0:
+        state.errorText = "vpn gui: config path is empty"
+        state.noticeText = ""
+        return false
+    let buildRes: Result[str] = VpnProxyGuiBuildConfigText(state)
+    if IsErr(buildRes):
+        state.errorText = ErrorText(buildRes)
+        state.noticeText = ""
+        return false
+    if !chengpath.WriteTextFile("", configPath, Value(buildRes)):
+        state.errorText = "vpn gui: failed to write config"
+        state.noticeText = ""
+        return false
+    state.noticeText = "saved"
+    state.errorText = ""
+    return true
+
+fn VpnGuiProcReset(state: var VpnProxyGuiState) =
+    if state.proc.readFd >= 0:
+        hostos.PtyClose(state.proc.readFd)
+    state.proc.running = false
+    state.proc.pid = int64(-1)
+    state.proc.readFd = -1
+    state.proc.stopRequested = false
+    state.proc.stopRequestedAtMs = int64(0)
+
+fn VpnGuiProcPoll(state: var VpnProxyGuiState) =
+    if !state.proc.running:
+        return
+    if state.proc.readFd >= 0:
+        let readRes: os.TextReadResult = hostos.FdReadWait(state.proc.readFd, 65536, 0)
+        if len(readRes.text) > 0:
+            VpnGuiAppendLog(state, readRes.text)
+        if readRes.eof:
+            hostos.PtyClose(state.proc.readFd)
+            state.proc.readFd = -1
+    let waitRes: os.PtyWaitResult = hostos.PtyWait(state.proc.pid)
+    if waitRes.waitStatus == 1:
+        let exitCode: int32 = waitRes.exitCode
+        VpnGuiProcReset(state)
+        state.proc.exitCode = exitCode
+        state.statusText = strutil.Join(["process exited rc=", IntToStr(exitCode)], "")
+        state.noticeText = state.statusText
+        state.errorText = ""
+        return
+    if state.proc.stopRequested:
+        let nowMs: int64 = VpnGuiMonoNowMs()
+        if nowMs - state.proc.stopRequestedAtMs >= int64(VpnGuiStopGraceMs):
+            let _ = hostos.ProcessSignal(state.proc.pid, VpnGuiSigKill)
+            state.proc.stopRequestedAtMs = nowMs + int64(86400000)
+
+fn VpnProxyGuiStartLocal(state: var VpnProxyGuiState): bool =
+    if state.proc.running:
+        state.noticeText = "proxy already running"
+        state.errorText = ""
+        return true
+    if !VpnProxyGuiSaveConfig(state):
+        return false
+    if !chengpath.FileExistsNonEmpty(state.rootDir, state.runtimeToolPath):
+        state.errorText = "vpn gui: runtime tool missing"
+        state.noticeText = ""
+        return false
+    let spawnRes: os.ExecFilePipeSpawnResult = hostos.ExecFilePipeSpawn(state.runtimeToolPath,
+                                                                        ["local", "--config", VpnGuiFieldGet(state, VpnGuiFieldConfigPath)],
+                                                                        [],
+                                                                        state.rootDir)
+    if !spawnRes.ok || spawnRes.pid <= 0 || spawnRes.readFd < 0:
+        state.errorText = "vpn gui: failed to spawn local runtime"
+        state.noticeText = ""
+        return false
+    if spawnRes.writeFd >= 0:
+        hostos.PtyClose(spawnRes.writeFd)
+    state.proc.running = true
+    state.proc.pid = spawnRes.pid
+    state.proc.readFd = spawnRes.readFd
+    state.proc.exitCode = -1
+    state.proc.stopRequested = false
+    state.proc.stopRequestedAtMs = int64(0)
+    state.statusText = strutil.Join(["running pid=", IntToStr(int32(spawnRes.pid))], "")
+    state.noticeText = state.statusText
+    state.errorText = ""
+    return true
+
+fn VpnProxyGuiStopLocal(state: var VpnProxyGuiState): bool =
+    if !state.proc.running || state.proc.pid <= 0:
+        state.noticeText = "proxy already stopped"
+        state.errorText = ""
+        return true
+    let ok: bool = hostos.ProcessSignal(state.proc.pid, VpnGuiSigTerm)
+    state.proc.stopRequested = true
+    state.proc.stopRequestedAtMs = VpnGuiMonoNowMs()
+    if ok:
+        state.noticeText = "stop requested"
+        state.errorText = ""
+    else:
+        state.errorText = "vpn gui: stop signal failed"
+        state.noticeText = ""
+    return ok
+
+fn VpnProxyGuiReload(state: var VpnProxyGuiState): bool =
+    let ok: bool = VpnGuiLoadConfigIntoState(state)
+    if ok:
+        state.statusText = "config reloaded"
+    return ok
+
+fn VpnProxyGuiStateForTest(rootDir: str,
+                             runtimeToolPathRaw: str,
+                             configPathRaw: str): VpnProxyGuiState =
+    return VpnGuiStateInit(rootDir, runtimeToolPathRaw, configPathRaw)
+
+fn VpnGuiHtmlEscape(raw: str): str =
+    var out = ""
+    for i in 0..<len(raw):
+        let ch = raw[i]
+        if ch == '&':
+            out = strutil.Join([out, "&amp;"], "")
+        elif ch == '<':
+            out = strutil.Join([out, "&lt;"], "")
+        elif ch == '>':
+            out = strutil.Join([out, "&gt;"], "")
+        elif ch == '"':
+            out = strutil.Join([out, "&quot;"], "")
+        elif ch == '\'':
+            out = strutil.Join([out, "&#39;"], "")
+        else:
+            out = strutil.Join([out, strings.CharToStr(ch)], "")
+    return out
+
+fn VpnGuiFindChar(text: str,
+                    want: char,
+                    startAt: int32): int32 =
+    var i: int32 = startAt
+    if i < 0:
+        i = 0
+    for i in i..<len(text):
+        if text[i] == want:
+            return i
+    return -1
+
+fn VpnGuiFindSub(text: str,
+                   sub: str): int32 =
+    if len(sub) <= 0:
+        return 0
+    if len(text) < len(sub):
+        return -1
+    for i in 0..<(len(text) - len(sub) + 1):
+        var matched = true
+        for j in 0..<len(sub):
+            if text[i + j] != sub[j]:
+                matched = false
+                break
+        if matched:
+            return i
+    return -1
+
+fn VpnGuiHexValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn VpnGuiUrlDecode(raw: str): str =
+    var out = ""
+    var i: int32
+    let rawLen: int32 = len(raw)
+    while i < rawLen:
+        let ch = raw[i]
+        if ch == '+':
+            out = strutil.Join([out, " "], "")
+            i = i + 1
+        elif ch == '%' && i + 2 < rawLen:
+            let hi: int32 = VpnGuiHexValue(raw[i + 1])
+            let lo: int32 = VpnGuiHexValue(raw[i + 2])
+            if hi >= 0 && lo >= 0:
+                out = strutil.Join([out, strings.CharToStr(char(hi * 16 + lo))], "")
+                i = i + 3
+            else:
+                out = strutil.Join([out, strings.CharToStr(ch)], "")
+                i = i + 1
+        else:
+            out = strutil.Join([out, strings.CharToStr(ch)], "")
+            i = i + 1
+    return out
+
+fn VpnGuiApplyQueryField(state: var VpnProxyGuiState,
+                           key: str,
+                           value: str) =
+    if key == "config_path":
+        VpnGuiFieldSet(state, VpnGuiFieldConfigPath, value)
+        return
+    if key == "listen":
+        VpnGuiFieldSet(state, VpnGuiFieldListen, value)
+        return
+    if key == "cert_der":
+        VpnGuiFieldSet(state, VpnGuiFieldCertDer, value)
+        return
+    if key == "key_pk8_der":
+        VpnGuiFieldSet(state, VpnGuiFieldKeyPk8Der, value)
+        return
+    if key == "trust_root_der":
+        VpnGuiFieldSet(state, VpnGuiFieldTrustRootDer, value)
+        return
+    if key == "exit_name":
+        VpnGuiFieldSet(state, VpnGuiFieldExitName, value)
+        return
+    if key == "exit_host":
+        VpnGuiFieldSet(state, VpnGuiFieldExitHost, value)
+        return
+    if key == "exit_port":
+        VpnGuiFieldSet(state, VpnGuiFieldExitPort, value)
+        return
+    if key == "server_name":
+        VpnGuiFieldSet(state, VpnGuiFieldServerName, value)
+        return
+    if key == "authority":
+        VpnGuiFieldSet(state, VpnGuiFieldAuthority, value)
+        return
+    if key == "auth":
+        VpnGuiFieldSet(state, VpnGuiFieldAuth, value)
+        return
+    if key == "cc_rx":
+        VpnGuiFieldSet(state, VpnGuiFieldCcRx, value)
+
+fn VpnGuiApplyQueryString(state: var VpnProxyGuiState,
+                            query: str) =
+    if len(query) <= 0:
+        return
+    let pairs: str[] = strutil.Split(query, '&')
+    for i in 0..<pairs.len:
+        let item: str = pairs[i]
+        if len(item) <= 0:
+            continue
+        let eq: int32 = VpnGuiFindChar(item, '=', 0)
+        var keyRaw = item
+        var valueRaw = ""
+        if eq >= 0:
+            keyRaw = strings.SliceBytes(item, 0, eq)
+            valueRaw = strings.SliceBytes(item, eq + 1, len(item) - (eq + 1))
+        let key: str = VpnGuiUrlDecode(keyRaw)
+        let value: str = VpnGuiUrlDecode(valueRaw)
+        VpnGuiApplyQueryField(state, key, value)
+
+fn VpnGuiStatusBadgeClass(state: VpnProxyGuiState): str =
+    if state.proc.running:
+        return "ok"
+    if len(state.errorText) > 0:
+        return "err"
+    return "idle"
+
+fn VpnGuiProcessSummary(state: VpnProxyGuiState): str =
+    if state.proc.running:
+        return strutil.Join(["running pid=", IntToStr(int32(state.proc.pid))], "")
+    if state.proc.exitCode >= 0:
+        return strutil.Join(["stopped rc=", IntToStr(state.proc.exitCode)], "")
+    return "stopped"
+
+fn VpnProxyGuiStatusJsonForTest(state: VpnProxyGuiState,
+                                  port: int32,
+                                  url: str): str =
+    var out = "{"
+    out = strutil.Join([out, "\"running\":"], "")
+    if state.proc.running:
+        out = strutil.Join([out, "true"], "")
+    else:
+        out = strutil.Join([out, "false"], "")
+    out = strutil.Join([out, ",\"pid\":", IntToStr(int32(state.proc.pid))], "")
+    out = strutil.Join([out, ",\"listen_url\":", VpnGuiJsonQuote(url)], "")
+    out = strutil.Join([out, ",\"web_port\":", IntToStr(port)], "")
+    out = strutil.Join([out, ",\"config_path\":", VpnGuiJsonQuote(VpnGuiFieldGet(state, VpnGuiFieldConfigPath))], "")
+    out = strutil.Join([out, ",\"socks_listen\":", VpnGuiJsonQuote(VpnGuiFieldGet(state, VpnGuiFieldListen))], "")
+    out = strutil.Join([out, ",\"status\":", VpnGuiJsonQuote(VpnGuiProcessSummary(state))], "")
+    out = strutil.Join([out, ",\"notice\":", VpnGuiJsonQuote(state.noticeText)], "")
+    out = strutil.Join([out, ",\"error\":", VpnGuiJsonQuote(state.errorText)], "")
+    out = strutil.Join([out, "}"], "")
+    return out
+
+fn VpnGuiAppendInput(out: var str,
+                       label: str,
+                       name: str,
+                       value: str,
+                       hint: str = "") =
+    out = strutil.Join([out, "<label class='field'>"], "")
+    out = strutil.Join([out, "<span>", VpnGuiHtmlEscape(label), "</span>"], "")
+    out = strutil.Join([out, "<input name='", VpnGuiHtmlEscape(name), "' value=\"", VpnGuiHtmlEscape(value), "\""], "")
+    if len(hint) > 0:
+        out = strutil.Join([out, " placeholder=\"", VpnGuiHtmlEscape(hint), "\""], "")
+    out = strutil.Join([out, " />"], "")
+    out = strutil.Join([out, "</label>"], "")
+
+fn VpnProxyGuiHtmlForTest(state: VpnProxyGuiState,
+                            port: int32,
+                            url: str): str =
+    var out: str
+    out = strutil.Join([out, "<!doctype html><html><head><meta charset='utf-8'>"], "")
+    if state.proc.running:
+        out = strutil.Join([out, "<meta http-equiv='refresh' content='2'>"], "")
+    out = strutil.Join([out, "<title>Cheng VPN GUI</title>"], "")
+    out = strutil.Join([out, "<style>"], "")
+    out = strutil.Join([out, "body{margin:0;background:linear-gradient(180deg,#eef5ff,#f8fbff);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'SF Pro Display','PingFang SC',sans-serif;color:#122033;}"], "")
+    out = strutil.Join([out, ".shell{max-width:1080px;margin:0 auto;padding:28px 20px 36px;}"], "")
+    out = strutil.Join([out, ".hero,.card{background:rgba(255,255,255,0.92);backdrop-filter:blur(10px);border:1px solid rgba(18,32,51,0.08);border-radius:20px;box-shadow:0 18px 50px rgba(23,55,94,0.08);}"], "")
+    out = strutil.Join([out, ".hero{padding:24px 24px 18px;margin-bottom:18px;}"], "")
+    out = strutil.Join([out, "h1{margin:0;font-size:28px;letter-spacing:-0.03em;}"], "")
+    out = strutil.Join([out, ".sub{margin:10px 0 0;color:#58718d;font-size:14px;}"], "")
+    out = strutil.Join([out, ".badges{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px;}"], "")
+    out = strutil.Join([out, ".badge{display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;font-size:13px;font-weight:600;}"], "")
+    out = strutil.Join([out, ".badge.ok{background:#e8fff2;color:#0e6b3b;}"], "")
+    out = strutil.Join([out, ".badge.err{background:#fff1f1;color:#9f2330;}"], "")
+    out = strutil.Join([out, ".badge.idle{background:#eef3f8;color:#39516d;}"], "")
+    out = strutil.Join([out, ".grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;}"], "")
+    out = strutil.Join([out, ".card{padding:20px;}"], "")
+    out = strutil.Join([out, ".field{display:flex;flex-direction:column;gap:8px;margin-bottom:12px;}"], "")
+    out = strutil.Join([out, ".field span{font-size:12px;font-weight:700;color:#4b6480;letter-spacing:0.05em;}"], "")
+    out = strutil.Join([out, ".field input{height:42px;border:1px solid #d5e1ee;border-radius:12px;padding:0 14px;font-size:14px;background:#fbfdff;color:#102133;}"], "")
+    out = strutil.Join([out, ".row{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px;}"], "")
+    out = strutil.Join([out, "button{height:42px;padding:0 16px;border:none;border-radius:12px;background:#0f6fff;color:white;font-weight:700;cursor:pointer;}"], "")
+    out = strutil.Join([out, "button.secondary{background:#16324f;}"], "")
+    out = strutil.Join([out, "button.ghost{background:#e9f1f9;color:#15314f;}"], "")
+    out = strutil.Join([out, ".meta{font-size:13px;color:#5a738f;line-height:1.6;}"], "")
+    out = strutil.Join([out, ".meta code{padding:2px 6px;border-radius:8px;background:#edf3fa;color:#19324b;}"], "")
+    out = strutil.Join([out, "pre{margin:0;min-height:240px;max-height:420px;overflow:auto;padding:16px;border-radius:16px;background:#0d1723;color:#d7e5f6;font-size:12px;line-height:1.55;}"], "")
+    out = strutil.Join([out, "@media(max-width:900px){.grid{grid-template-columns:1fr;}.shell{padding:16px 14px 24px;}}"], "")
+    out = strutil.Join([out, "</style></head><body><div class='shell'>"], "")
+    out = strutil.Join([out, "<section class='hero'>"], "")
+    out = strutil.Join([out, "<h1>Cheng VPN GUI</h1>"], "")
+    out = strutil.Join([out, "<p class='sub'>纯 Cheng 本地 Web 控制台。配置、启动、停止和日志都走现有 vpn_proxy 核心。</p>"], "")
+    out = strutil.Join([out, "<div class='badges'>"], "")
+    out = strutil.Join([out, "<span class='badge ", VpnGuiStatusBadgeClass(state), "'>", VpnGuiHtmlEscape(VpnGuiProcessSummary(state)), "</span>"], "")
+    out = strutil.Join([out, "<span class='badge idle'>web ", VpnGuiHtmlEscape(url), "</span>"], "")
+    out = strutil.Join([out, "<span class='badge idle'>socks ", VpnGuiHtmlEscape(VpnGuiFieldGet(state, VpnGuiFieldListen)), "</span>"], "")
+    out = strutil.Join([out, "</div></section>"], "")
+    out = strutil.Join([out, "<div class='grid'>"], "")
+    out = strutil.Join([out, "<section class='card'>"], "")
+    out = strutil.Join([out, "<form method='get' action='/save'>"], "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldConfigPath), "config_path", VpnGuiFieldGet(state, VpnGuiFieldConfigPath), "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldListen), "listen", VpnGuiFieldGet(state, VpnGuiFieldListen), "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldCertDer), "cert_der", VpnGuiFieldGet(state, VpnGuiFieldCertDer), "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldKeyPk8Der), "key_pk8_der", VpnGuiFieldGet(state, VpnGuiFieldKeyPk8Der), "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldTrustRootDer), "trust_root_der", VpnGuiFieldGet(state, VpnGuiFieldTrustRootDer), "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldExitName), "exit_name", VpnGuiFieldGet(state, VpnGuiFieldExitName), "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldExitHost), "exit_host", VpnGuiFieldGet(state, VpnGuiFieldExitHost), "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldExitPort), "exit_port", VpnGuiFieldGet(state, VpnGuiFieldExitPort), "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldServerName), "server_name", VpnGuiFieldGet(state, VpnGuiFieldServerName), "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldAuthority), "authority", VpnGuiFieldGet(state, VpnGuiFieldAuthority), "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldAuth), "auth", VpnGuiFieldGet(state, VpnGuiFieldAuth), "")
+    VpnGuiAppendInput(out, VpnGuiFieldLabel(VpnGuiFieldCcRx), "cc_rx", VpnGuiFieldGet(state, VpnGuiFieldCcRx), "")
+    out = strutil.Join([out, "<div class='row'>"], "")
+    out = strutil.Join([out, "<button type='submit' formaction='/save'>保存配置</button>"], "")
+    out = strutil.Join([out, "<button type='submit' formaction='/start' class='secondary'>保存并启动</button>"], "")
+    out = strutil.Join([out, "</div></form>"], "")
+    out = strutil.Join([out, "</section>"], "")
+    out = strutil.Join([out, "<section class='card'>"], "")
+    out = strutil.Join([out, "<div class='meta'>"], "")
+    out = strutil.Join([out, "<p><strong>运行时：</strong> <code>", VpnGuiHtmlEscape(state.runtimeToolPath), "</code></p>"], "")
+    out = strutil.Join([out, "<p><strong>状态：</strong> ", VpnGuiHtmlEscape(state.statusText), "</p>"], "")
+    out = strutil.Join([out, "<p><strong>提示：</strong> ", VpnGuiHtmlEscape(state.noticeText), "</p>"], "")
+    out = strutil.Join([out, "<p><strong>错误：</strong> ", VpnGuiHtmlEscape(state.errorText), "</p>"], "")
+    out = strutil.Join([out, "<p><a href='/status.json'>status.json</a></p>"], "")
+    out = strutil.Join([out, "</div>"], "")
+    out = strutil.Join([out, "<div class='row'>"], "")
+    out = strutil.Join([out, "<form method='get' action='/reload'><button class='ghost' type='submit'>从文件重载</button></form>"], "")
+    out = strutil.Join([out, "<form method='get' action='/stop'><button class='ghost' type='submit'>停止本地代理</button></form>"], "")
+    out = strutil.Join([out, "<form method='get' action='/quit'><button class='ghost' type='submit'>退出界面</button></form>"], "")
+    out = strutil.Join([out, "</div>"], "")
+    out = strutil.Join([out, "<div style='margin-top:18px'><pre>", VpnGuiHtmlEscape(state.logText), "</pre></div>"], "")
+    out = strutil.Join([out, "</section>"], "")
+    out = strutil.Join([out, "</div></div></body></html>"], "")
+    port
+    return out
+
+fn VpnGuiReadHttpRequest(conn: var tcp.TcpConnectionHandle): Result[str] =
+    var requestText = ""
+    for _ in 0..<32:
+        let readRes: Result[Bytes] = tcp.TcpRecv(conn, 4096)
+        if IsErr(readRes):
+            return Err[str](ErrorText(readRes))
+        let chunk: Bytes = Value(readRes)
+        if BytesLen(chunk) <= 0:
+            break
+        requestText = strutil.Join([requestText, BytesToString(chunk)], "")
+        if len(requestText) > VpnGuiHttpMaxChars:
+            return Err[str]("vpn gui: http request too large")
+        if VpnGuiFindSub(requestText, "\r\n\r\n") >= 0:
+            return Ok[str](requestText)
+    return Err[str]("vpn gui: incomplete http request")
+
+fn VpnGuiParseRequestLine(requestText: str,
+                            outMethod: var str,
+                            outTarget: var str): bool =
+    let lineEnd: int32 = VpnGuiFindSub(requestText, "\r\n")
+    if lineEnd <= 0:
+        return false
+    let line: str = strings.SliceBytes(requestText, 0, lineEnd)
+    let firstSpace: int32 = VpnGuiFindChar(line, char(32), 0)
+    if firstSpace <= 0:
+        return false
+    let secondSpace: int32 = VpnGuiFindChar(line, char(32), firstSpace + 1)
+    if secondSpace <= firstSpace + 1:
+        outMethod = strutil.Strip(strings.SliceBytes(line, 0, firstSpace))
+        outTarget = strutil.Strip(strings.SliceBytes(line, firstSpace + 1, len(line) - (firstSpace + 1)))
+        return len(outMethod) > 0 && len(outTarget) > 0
+    outMethod = strutil.Strip(strings.SliceBytes(line, 0, firstSpace))
+    outTarget = strutil.Strip(strings.SliceBytes(line, firstSpace + 1, secondSpace - (firstSpace + 1)))
+    return len(outMethod) > 0 && len(outTarget) > 0
+
+fn VpnGuiSplitTarget(target: str,
+                       outPath: var str,
+                       outQuery: var str) =
+    let q: int32 = VpnGuiFindChar(target, '?', 0)
+    if q < 0:
+        outPath = target
+        outQuery = ""
+        return
+    outPath = strings.SliceBytes(target, 0, q)
+    outQuery = strings.SliceBytes(target, q + 1, len(target) - (q + 1))
+
+fn VpnGuiSendHttp(conn: var tcp.TcpConnectionHandle,
+                    statusLine: str,
+                    contentType: str,
+                    body: str) =
+    var response = strutil.Join(["HTTP/1.1 ", statusLine, "\r\n"], "")
+    response = strutil.Join([response, "Content-Type: ", contentType, "\r\n"], "")
+    response = strutil.Join([response, "Cache-Control: no-store\r\n"], "")
+    response = strutil.Join([response, "Content-Length: ", IntToStr(len(body)), "\r\n"], "")
+    response = strutil.Join([response, "Connection: close\r\n\r\n"], "")
+    response = strutil.Join([response, body], "")
+    let _ = tcp.TcpSend(conn, BytesFromString(response))
+
+fn VpnGuiSendRedirect(conn: var tcp.TcpConnectionHandle,
+                        location: str) =
+    let body = strutil.Join(["<html><body>redirecting to <a href=\"", VpnGuiHtmlEscape(location), "\">", VpnGuiHtmlEscape(location), "</a></body></html>"], "")
+    var response = "HTTP/1.1 303 See Other\r\n"
+    response = strutil.Join([response, "Location: ", location, "\r\n"], "")
+    response = strutil.Join([response, "Cache-Control: no-store\r\n"], "")
+    response = strutil.Join([response, "Content-Type: text/html; charset=utf-8\r\n"], "")
+    response = strutil.Join([response, "Content-Length: ", IntToStr(len(body)), "\r\n"], "")
+    response = strutil.Join([response, "Connection: close\r\n\r\n"], "")
+    response = strutil.Join([response, body], "")
+    let _ = tcp.TcpSend(conn, BytesFromString(response))
+
+fn VpnGuiHandleHttp(state: var VpnProxyGuiState,
+                      conn: var tcp.TcpConnectionHandle,
+                      port: int32,
+                      url: str) =
+    let requestRes: Result[str] = VpnGuiReadHttpRequest(conn)
+    if IsErr(requestRes):
+        VpnGuiSendHttp(conn, "400 Bad Request", "text/plain; charset=utf-8", strutil.Join([ErrorText(requestRes), "\n"], ""))
+        return
+    var method = ""
+    var target = ""
+    if !VpnGuiParseRequestLine(Value(requestRes), method, target):
+        VpnGuiSendHttp(conn, "400 Bad Request", "text/plain; charset=utf-8", "vpn gui: invalid request line\n")
+        return
+    if method != "GET":
+        VpnGuiSendHttp(conn, "405 Method Not Allowed", "text/plain; charset=utf-8", "vpn gui: GET only\n")
+        return
+    var path = ""
+    var query = ""
+    VpnGuiSplitTarget(target, path, query)
+    if path == "/save":
+        VpnGuiApplyQueryString(state, query)
+        let _ = VpnProxyGuiSaveConfig(state)
+        VpnGuiSendRedirect(conn, "/")
+        return
+    if path == "/start":
+        VpnGuiApplyQueryString(state, query)
+        let _ = VpnProxyGuiStartLocal(state)
+        VpnGuiSendRedirect(conn, "/")
+        return
+    if path == "/stop":
+        let _ = VpnProxyGuiStopLocal(state)
+        VpnGuiSendRedirect(conn, "/")
+        return
+    if path == "/reload":
+        let _ = VpnProxyGuiReload(state)
+        VpnGuiSendRedirect(conn, "/")
+        return
+    if path == "/quit":
+        state.quitRequested = true
+        let body = "<html><body><h1>Cheng VPN GUI closed</h1><p>Local proxy process keeps its current state.</p></body></html>"
+        VpnGuiSendHttp(conn, "200 OK", "text/html; charset=utf-8", body)
+        return
+    if path == "/status.json":
+        let body = VpnProxyGuiStatusJsonForTest(state, port, url)
+        VpnGuiSendHttp(conn, "200 OK", "application/json; charset=utf-8", body)
+        return
+    let body = VpnProxyGuiHtmlForTest(state, port, url)
+    VpnGuiSendHttp(conn, "200 OK", "text/html; charset=utf-8", body)
+
+fn VpnGuiTryOpenBrowser(rootDir: str,
+                          url: str) =
+    let macOpen: str = "/usr/bin/open"
+    if chengpath.PathFileExists(macOpen):
+        let _ = hostos.ExecFileStatus(macOpen, [url], [], rootDir, 5)
+        return
+    let linuxOpen: str = "/usr/bin/xdg-open"
+    if chengpath.PathFileExists(linuxOpen):
+        let _ = hostos.ExecFileStatus(linuxOpen, [url], [], rootDir, 5)
+
+fn VpnGuiServeReadyOnce(listener: tcp.TcpListenerHandle,
+                          port: int32,
+                          url: str): Result[bool] =
+    var conn: tcp.TcpConnectionHandle
+    if !tcp.TcpAcceptInto(listener, conn):
+        return Ok[bool](false)
+    VpnGuiHandleHttp(VpnGuiGlobalState, conn, port, url)
+    tcp.TcpClose(conn)
+    return Ok[bool](true)
+
+fn VpnGuiPollGlobal() =
+    VpnGuiProcPoll(VpnGuiGlobalState)
+
+fn VpnGuiHandleGlobalHttp(conn: var tcp.TcpConnectionHandle,
+                            port: int32,
+                            url: str) =
+    VpnGuiHandleHttp(VpnGuiGlobalState, conn, port, url)
+
+fn VpnGuiGlobalQuitRequested(): bool =
+    return VpnGuiGlobalState.quitRequested
+
+fn VpnGuiSetGlobalErrorText(text: str) =
+    VpnGuiGlobalState.errorText = text
+
+fn VpnGuiGlobalErrorText(): str =
+    return VpnGuiGlobalState.errorText
+
+fn VpnGuiGlobalProcRunning(): bool =
+    return VpnGuiGlobalState.proc.running
+
+fn VpnGuiGlobalProcPid(): int64 =
+    return VpnGuiGlobalState.proc.pid
+
+fn VpnProxyGuiRun(rootDir: str,
+                    runtimeToolPathRaw: str,
+                    configPathRaw: str): int32 =
+    let listenFd: int32 = guilistener.VpnProxyGuiOpenListenerFd(VpnGuiListenHost, VpnGuiWebPort)
+    if listenFd < 0:
+        VpnGuiPrintLine("vpn gui: listen failed")
+        return 1
+    var listener: tcp.TcpListenerHandle
+    listener.fd = listenFd
+    listener.addr.host = VpnGuiListenHost
+    listener.addr.port = VpnGuiWebPort
+    let nonblockingRes: Result[bool] = tcp.TcpListenerSetNonblocking(listener, true)
+    if IsErr(nonblockingRes):
+        let errText: str = ErrorText(nonblockingRes)
+        tcp.TcpListenerClose(listener)
+        VpnGuiPrintLine(errText)
+        return 1
+    let port: int32 = if listener.addr.port > 0: listener.addr.port else: VpnGuiWebPort
+    let url: str = strutil.Join(["http://", VpnGuiListenHost, ":", IntToStr(port), "/"], "")
+    VpnGuiInitGlobalState(rootDir, runtimeToolPathRaw, configPathRaw)
+    VpnGuiPrintLine(strutil.Join(["vpn gui: open ", url], ""))
+    VpnGuiTryOpenBrowser(rootDir, url)
+    var exitCode: int32
+    while !VpnGuiGlobalState.quitRequested:
+        VpnGuiProcPoll(VpnGuiGlobalState)
+        let readyRes: Result[bool] = tcp.TcpListenerWaitReadable(listener, VpnGuiWaitMs)
+        if IsErr(readyRes):
+            VpnGuiGlobalState.errorText = ErrorText(readyRes)
+            exitCode = 1
+            break
+        if !Value(readyRes):
+            continue
+        let serveRes: Result[bool] = VpnGuiServeReadyOnce(listener, port, url)
+        if IsErr(serveRes):
+            VpnGuiGlobalState.errorText = ErrorText(serveRes)
+            exitCode = 1
+            break
+    tcp.TcpListenerClose(listener)
+    if exitCode != 0 && len(VpnGuiGlobalState.errorText) > 0:
+        VpnGuiPrintLine(VpnGuiGlobalState.errorText)
+    if VpnGuiGlobalState.proc.running:
+        VpnGuiPrintLine(strutil.Join(["vpn gui: ui closed, local proxy still running pid=", IntToStr(int32(VpnGuiGlobalState.proc.pid))], ""))
+    return exitCode

@@ -1,0 +1,1764 @@
+import std/result
+import std/system
+import std/rawbytes
+import std/strings as strings
+import std/strutils as strutil
+import std/times as times
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
+import cheng/chain/consensus as consensus
+import cheng/chain/lsmr_types as lt
+import cheng/oracle/oracle_types as oracle_types
+import cheng/apps/chain_node/cheng_node_identity as identity
+import cheng/apps/chain_node/cheng_node_index as cindex
+import cheng/apps/chain_node/cheng_node_object as cobject
+import cheng/apps/chain_node/cheng_node_ledger as ledger
+import cheng/apps/chain_node/cheng_node_actor as actor
+import cheng/apps/chain_node/cheng_node_transport as ctransport
+import cheng/apps/chain_node/cheng_node_domains as cdomain
+import cheng/apps/chain_node/chain_node as chain
+import cheng/oracle/oracle_bft_state_machine as oracle_bft
+import cheng/DiLoCo/core/diloco as diloco
+import cheng/DiLoCo/train/outer_merge as diloco_outer
+import cheng/core/tooling/compiler_csg as ccsg
+import cheng/core/tooling/compiler_world as cworld
+import cheng/apps/vpn_proxy/vpn_proxy_config as vpncfg
+import cheng/apps/vpn_proxy/vpn_proxy_routing as vpnrouting
+import cheng/libp2p/core/types as libtypes
+import cheng/libp2p/core/peer_id
+import cheng/libp2p/host/host as libhost
+import cheng/libp2p/transports/tailnet_transport as tsnet
+import cheng/moq/moq_fountain as moq
+import cheng/apps/unimaker/unimaker_edge_types as evotypes
+import cheng/evomap/unimaker_evomap_protocol as evo
+
+const
+    ChengNodeDidBundleAssetId: int32 = 930001
+    ChengNodeDidOperatorAnchorAssetId: int32 = 930002
+    ChengNodeDidOperatorAnchorAccountId: int32 = 1
+
+type
+    ChengNode =
+        version: int32
+        identity: identity.ChengNodeIdentity
+        indices: cindex.ChengNodeIndexRegistry
+        objects: cobject.ChengNodeObjectStore
+        ledger: ledger.ChengNodeLedger
+        actors: actor.ChengNodeActorBus
+        chainState: chain.ChainNode
+        transport: ctransport.ChengNodeTransportState
+        vpn: ctransport.ChengNodeVpnState
+        oracle: cdomain.ChengNodeOracleDomain
+        diloco: cdomain.ChengNodeDilocoDomain
+        evomap: cdomain.ChengNodeEvoMapDomain
+
+fn ChengNodeAppendText(buf: var layout.ByteBuf, text: str) =
+    lt.AppendU32BE(buf, len(text))
+    for i in 0..<len(text):
+        layout.ByteBufAppendByte(buf, int32(text[i]) & 255)
+
+fn ChengNodeBufCid(buf: var layout.ByteBuf): layout.FixedBytes32 =
+    let data = layout.ByteBufToBytes(buf)
+    return hash256.Sha256Fixed(layout.ByteSpanFromBytes(data))
+
+@borrows
+fn ChengNodeHashTextCid(tag: str, text: str): layout.FixedBytes32 =
+    var buf = layout.ByteBufInit(128)
+    ChengNodeAppendText(buf, strings.CloneStr(tag))
+    ChengNodeAppendText(buf, strings.CloneStr(text))
+    return ChengNodeBufCid(buf)
+
+@borrows
+fn ChengNodeSyntheticSnapshotCid(event: ledger.ChengNodeEventRecord,
+                                   nextSnapshotVersion: int32): layout.FixedBytes32 =
+    var buf = layout.ByteBufInit(192)
+    ChengNodeAppendText(buf, "cheng_node.snapshot")
+    lt.AppendU32BE(buf, nextSnapshotVersion)
+    ChengNodeAppendText(buf, strings.CloneStr(event.objectKind))
+    ChengNodeAppendText(buf, strings.CloneStr(event.indexGroup))
+    ChengNodeAppendText(buf, strings.CloneStr(event.lookupKind))
+    ChengNodeAppendText(buf, strings.CloneStr(event.keyText))
+    lt.AppendU32BE(buf, event.seq)
+    lt.AppendFixed32(buf, event.payloadCid)
+    lt.AppendFixed32(buf, event.eventCid)
+    return ChengNodeBufCid(buf)
+
+@borrows
+fn ChengNodeDispatchForEvent(node: var ChengNode,
+                               actorName: str,
+                               event: ledger.ChengNodeEventRecord) =
+    let topic = Fmt"{event.indexGroup}/{event.lookupKind}"
+    let ledgerDispatchRes = actor.ChengNodeActorBusDispatch(node.actors,
+                                                              "event_ledger",
+                                                              strings.CloneStr(topic),
+                                                              event.seq)
+    if IsErr(ledgerDispatchRes):
+        let ledgerErr = Error(ledgerDispatchRes)
+        Panic(ledgerErr)
+    if event.indexGroup == "discovery" && actorName != "transport_discovery":
+        let transportDispatchRes = actor.ChengNodeActorBusDispatch(node.actors,
+                                                                     "transport_discovery",
+                                                                     strings.CloneStr(topic),
+                                                                     event.seq)
+        if IsErr(transportDispatchRes):
+            let transportErr = Error(transportDispatchRes)
+            Panic(transportErr)
+    let actorDispatchRes = actor.ChengNodeActorBusDispatch(node.actors,
+                                                             strings.CloneStr(actorName),
+                                                             topic,
+                                                             event.seq)
+    if IsErr(actorDispatchRes):
+        let actorErr = Error(actorDispatchRes)
+        Panic(actorErr)
+
+@borrows
+fn ChengNodeRegisterObjectText(node: var ChengNode,
+                                 payloadCid: layout.FixedBytes32,
+                                 objectKind: str,
+                                 objectText: str): Result[bool] =
+    if layout.FixedBytes32Equal(payloadCid, layout.FixedBytes32()):
+        return Err[bool]("cheng_node: zero payload cid")
+    return cobject.ChengNodeObjectStorePut(node.objects,
+                                           payloadCid,
+                                           strings.CloneStr(objectKind),
+                                           strings.CloneStr(objectText))
+
+fn ChengNodeAnchorIndexedCid(node: var ChengNode,
+                               actorName: str,
+                               indexGroup: str,
+                               lookupKind: str,
+                               keyText: str,
+                               objectKind: str,
+                               payloadCid: layout.FixedBytes32): Result[ledger.ChengNodeProofBundle] =
+    let eventRes = ledger.ChengNodeLedgerAppend(node.ledger,
+                                                  strings.CloneStr(actorName),
+                                                  strings.CloneStr(objectKind),
+                                                  strings.CloneStr(indexGroup),
+                                                  strings.CloneStr(lookupKind),
+                                                  strings.CloneStr(keyText),
+                                                  payloadCid)
+    if IsErr(eventRes):
+        return Err[ledger.ChengNodeProofBundle](Error(eventRes))
+    let event = Value(eventRes)
+    ChengNodeDispatchForEvent(node, actorName, event)
+    let snapshotVersion = node.ledger.manifest.snapshotVersion + 1
+    let snapshotCid = ChengNodeSyntheticSnapshotCid(event, snapshotVersion)
+    let snapshotRes = ledger.ChengNodeLedgerSealSnapshot(node.ledger, snapshotVersion, snapshotCid)
+    if IsErr(snapshotRes):
+        return Err[ledger.ChengNodeProofBundle](Error(snapshotRes))
+    let proofRes = ledger.ChengNodeLedgerBuildProof(node.ledger,
+                                                      strings.CloneStr(indexGroup),
+                                                      strings.CloneStr(lookupKind),
+                                                      strings.CloneStr(keyText),
+                                                      payloadCid,
+                                                      event.eventCid)
+    if IsErr(proofRes):
+        return Err[ledger.ChengNodeProofBundle](Error(proofRes))
+    let proof = Value(proofRes)
+    let upsertRes = cindex.ChengNodeIndexUpsert(node.indices,
+                                                  strings.CloneStr(indexGroup),
+                                                  strings.CloneStr(lookupKind),
+                                                  strings.CloneStr(keyText),
+                                                  payloadCid,
+                                                  event.seq,
+                                                  proof.proofCid)
+    if IsErr(upsertRes):
+        return Err[ledger.ChengNodeProofBundle](Error(upsertRes))
+    let snapshotHeadKey = layout.FixedBytes32Hex(node.ledger.manifest.headCid)
+    let snapshotHeadUpsertRes = cindex.ChengNodeIndexUpsert(node.indices,
+                                                              "snapshot",
+                                                              "head",
+                                                              snapshotHeadKey,
+                                                              snapshotCid,
+                                                              event.seq,
+                                                              proof.proofCid)
+    if IsErr(snapshotHeadUpsertRes):
+        return Err[ledger.ChengNodeProofBundle](Error(snapshotHeadUpsertRes))
+    let snapshotVersionKey = IntToStr(snapshotVersion)
+    let snapshotVersionUpsertRes = cindex.ChengNodeIndexUpsert(node.indices,
+                                                                 "snapshot",
+                                                                 "version",
+                                                                 snapshotVersionKey,
+                                                                 snapshotCid,
+                                                                 event.seq,
+                                                                 proof.proofCid)
+    if IsErr(snapshotVersionUpsertRes):
+        return Err[ledger.ChengNodeProofBundle](Error(snapshotVersionUpsertRes))
+    return Ok[ledger.ChengNodeProofBundle](proof)
+
+@borrows
+fn ChengNodePayloadFromText(objectKind: str,
+                              objectText: str): layout.FixedBytes32 =
+    return ChengNodeHashTextCid(objectKind, objectText)
+
+@borrows
+fn ChengNodeLineValue(text: str,
+                        key: str): str =
+    let prefix = strutil.Join([strings.CloneStr(key), "="], "")
+    var lineStart: int32
+    let n = strings.Len(text)
+    while lineStart < n:
+        var lineEnd: int32 = lineStart
+        while lineEnd < n:
+            if text[lineEnd] == '\n':
+                break
+            lineEnd = lineEnd + 1
+        let lineLen = lineEnd - lineStart
+        if lineLen >= strings.Len(prefix):
+            let line = strings.SliceBytes(text, lineStart, lineLen)
+            if strings.SliceBytes(line, 0, strings.Len(prefix)) == prefix:
+                return strings.CloneStr(strings.SliceBytes(line, strings.Len(prefix), strings.Len(line) - strings.Len(prefix)))
+        lineStart = lineEnd + 1
+    return ""
+
+fn ChengNodeBalanceObjectText(assetId: int32,
+                                accountId: int32,
+                                balance: int64,
+                                headCid: layout.FixedBytes32): str =
+    var out = ""
+    out = strutil.Join([out, "version=1\n"], "")
+    out = strutil.Join([out, "asset_id=", IntToStr(assetId), "\n"], "")
+    out = strutil.Join([out, "account_id=", IntToStr(accountId), "\n"], "")
+    out = strutil.Join([out, "balance=", int64ToStr(balance), "\n"], "")
+    out = strutil.Join([out, "head_cid=", layout.FixedBytes32Hex(headCid)], "")
+    return out
+
+fn ChengNodeBalanceValueFromText(text: str): int64 =
+    let balanceText = ChengNodeLineValue(text, "balance")
+    if len(balanceText) <= 0:
+        return int64(0)
+    return int64(parseInt(balanceText))
+
+fn ChengNodeMaxInt32(left: int32,
+                       right: int32): int32 =
+    if left >= right:
+        return left
+    return right
+
+fn ChengNodeChunkCount(payloadLen: int32): int32 =
+    if payloadLen <= 28:
+        return 1
+    return 1 + ((payloadLen - 28 + 31) / 32)
+
+fn ChengNodeChunksToPayload(chunks: layout.FixedBytes32[]): Result[Bytes] =
+    if chunks.len <= 0:
+        return Err[Bytes]("cheng_node: missing chunks")
+    let head = layout.FixedBytes32ToBytes(chunks[0])
+    let payloadLen = int32(
+        int64(BytesGet(head, 0) & 255) * int64(16777216) +
+        int64(BytesGet(head, 1) & 255) * int64(65536) +
+        int64(BytesGet(head, 2) & 255) * int64(256) +
+        int64(BytesGet(head, 3) & 255)
+    )
+    if payloadLen < 0:
+        return Err[Bytes]("cheng_node: invalid chunk length")
+    let wantChunkCount = ChengNodeChunkCount(payloadLen)
+    if wantChunkCount != chunks.len:
+        return Err[Bytes]("cheng_node: chunk count mismatch")
+    let out = BytesAlloc(payloadLen)
+    var copied = 0
+    var headPos = 4
+    while headPos < 32 && copied < payloadLen:
+        BytesSet(out, copied, BytesGet(head, headPos))
+        copied = copied + 1
+        headPos = headPos + 1
+    for i in 1..<chunks.len:
+        let chunkBytes = layout.FixedBytes32ToBytes(chunks[i])
+        var j = 0
+        while j < 32 && copied < payloadLen:
+            BytesSet(out, copied, BytesGet(chunkBytes, j))
+            copied = copied + 1
+            j = j + 1
+    if copied != payloadLen:
+        return Err[Bytes]("cheng_node: payload size mismatch")
+    return Ok[Bytes](out)
+
+fn ChengNodeLoadChunkedText(node: var chain.ChainNode,
+                              assetId: int32,
+                              accountId: int32,
+                              seqId: int32): Result[str] =
+    var maxOrdinal = 0
+    for i in 0..<node.events.len:
+        let event = node.events[i]
+        if event.kind != consensus.ConsensusKindMint:
+            continue
+        if event.assetId != assetId:
+            continue
+        if event.toAccount != accountId:
+            continue
+        if event.fromAccount != seqId:
+            continue
+        let ordinal = int32(event.amount)
+        if int64(ordinal) != event.amount:
+            return Err[str]("cheng_node: chunk ordinal overflow")
+        if ordinal > maxOrdinal:
+            maxOrdinal = ordinal
+    if maxOrdinal <= 0:
+        return Err[str]("cheng_node: chunk seq missing")
+    var chunks: layout.FixedBytes32[]
+    chunks = []
+    var ordinal = 1
+    for ordinal in 1..maxOrdinal:
+
+        var foundCount = 0
+        var chunk = layout.FixedBytes32()
+        for i in 0..<node.events.len:
+            let event = node.events[i]
+            if event.kind != consensus.ConsensusKindMint:
+                continue
+            if event.assetId != assetId:
+                continue
+            if event.toAccount != accountId:
+                continue
+            if event.fromAccount != seqId:
+                continue
+            if event.amount != int64(ordinal):
+                continue
+            foundCount = foundCount + 1
+            chunk = event.fromParentCid
+        if foundCount != 1:
+            return Err[str]("cheng_node: chunk multiplicity mismatch")
+        add(chunks, chunk)
+
+    let payloadRes = ChengNodeChunksToPayload(chunks)
+    if IsErr(payloadRes):
+        return Err[str](Error(payloadRes))
+    return Ok[str](BytesToString(Value(payloadRes)))
+
+@borrows
+fn ChengNodeCompilerBuildReceiptText(receiptKey: str,
+                                       receiptCid: layout.FixedBytes32): str =
+    let receiptCidHex: str = layout.FixedBytes32Hex(receiptCid)
+    return Fmt"version=1\nreceipt_key={receiptKey}\nreceipt_cid={receiptCidHex}"
+
+@borrows
+fn ChengNodeCompilerTargetReceiptText(receiptKey: str,
+                                        receipt: ccsg.CompileReceipt): str =
+    let receiptCidHex: str = layout.FixedBytes32Hex(receipt.receiptCid)
+    let worldHeadCidHex: str = layout.FixedBytes32Hex(receipt.worldHeadCid)
+    return Fmt"version=1\ntarget={receipt.targetTriple}\nreceipt_key={receiptKey}\nreceipt_cid={receiptCidHex}\nworld_head_cid={worldHeadCidHex}\nbootstrap_stage={receipt.bootstrapStage}"
+
+fn ChengNodeMoqBuildText(build: moq.MoqFountainBuildResult): str =
+    var out = ""
+    out = strutil.Join([out, "version=1\n"], "")
+    out = strutil.Join([out, "owner_peer_id=", build.ownerPeerId, "\n"], "")
+    out = strutil.Join([out, "mime_type=", build.mimeType, "\n"], "")
+    out = strutil.Join([out, "bundle_cid=", build.bundleCid, "\n"], "")
+    out = strutil.Join([out, "blob_cid=", build.blobCid, "\n"], "")
+    out = strutil.Join([out, "catalog_key=", build.catalogKey, "\n"], "")
+    out = strutil.Join([out, "blob_byte_len=", IntToStr(build.blobByteLen), "\n"], "")
+    out = strutil.Join([out, "object_target_bytes=", IntToStr(build.objectTargetBytes), "\n"], "")
+    out = strutil.Join([out, "source_block_bytes=", IntToStr(build.sourceBlockBytes), "\n"], "")
+    out = strutil.Join([out, "object_count=", IntToStr(build.objectCount)], "")
+    return out
+
+@borrows
+fn ChengNodeDiscoveryObjectKind(lookupKind: str): str =
+    if lookupKind == "topic":
+        return "discovery_topic"
+    if lookupKind == "capability":
+        return "discovery_capability"
+    return "discovery_peer"
+
+fn ChengNodeApplyRuntimeObject(node: var ChengNode,
+                                 objectKind: str,
+                                 keyText: str,
+                                 payloadCid: layout.FixedBytes32): Result[bool] =
+    let objectRes = cobject.ChengNodeObjectStoreGet(node.objects, payloadCid)
+    if IsErr(objectRes):
+        return Err[bool](Error(objectRes))
+    let objectText = Value(objectRes).text
+    if objectKind == "discovery_peer" ||
+       objectKind == "discovery_topic" ||
+       objectKind == "discovery_capability":
+        let applyRes = ctransport.ChengNodeTransportApplyDiscoveryText(node.transport, objectText)
+        if IsErr(applyRes):
+            return Err[bool](Error(applyRes))
+        var lookupKind = "peer"
+        if objectKind == "discovery_topic":
+            lookupKind = "topic"
+        elif objectKind == "discovery_capability":
+            lookupKind = "capability"
+        let publishRes = ctransport.ChengNodeTransportPublishDiscovery(node.transport,
+                                                                         lookupKind,
+                                                                         keyText,
+                                                                         objectText,
+                                                                         payloadCid,
+                                                                         node.ledger.manifest.headSeq,
+                                                                         node.ledger.manifest.snapshotVersion)
+        if IsErr(publishRes):
+            return Err[bool](Error(publishRes))
+        return Ok[bool](true)
+    if objectKind == "vpn_peer_session":
+        return ctransport.ChengNodeVpnApplyPeerText(node.vpn, objectText)
+    if objectKind == "vpn_overlay_route":
+        return ctransport.ChengNodeVpnApplyOverlayRouteText(node.vpn, objectText)
+    if objectKind == "vpn_exit_route":
+        return ctransport.ChengNodeVpnApplyExitRouteText(node.vpn, objectText)
+    if objectKind == "oracle_machine_state":
+        return cdomain.ChengNodeOracleApplyMachineText(node.oracle, objectText)
+    if objectKind == "oracle_pair_state":
+        return cdomain.ChengNodeOracleApplyPairText(node.oracle, objectText)
+    if objectKind == "diloco_job_state":
+        return cdomain.ChengNodeDilocoApplyJobText(node.diloco, objectText)
+    if objectKind == "diloco_cohort_state":
+        return cdomain.ChengNodeDilocoApplyCohortText(node.diloco, objectText)
+    if objectKind == "diloco_lease_state":
+        return cdomain.ChengNodeDilocoApplyLeaseText(node.diloco, objectText)
+    if objectKind == "evomap_agent_hello":
+        return cdomain.ChengNodeEvoMapApplyAgentText(node.evomap, objectText)
+    if objectKind == "evomap_task":
+        return cdomain.ChengNodeEvoMapApplyTaskText(node.evomap, objectText)
+    if objectKind == "evomap_capsule":
+        return cdomain.ChengNodeEvoMapApplyCapsuleText(node.evomap, objectText)
+    return Ok[bool](false)
+
+fn ChengNodeAnnounceDiscoveryText(node: var ChengNode,
+                                    lookupKind: str,
+                                    keyText: str,
+                                    objectText: str): Result[bool] =
+    let objectKind = ChengNodeDiscoveryObjectKind(lookupKind)
+    let upsertRes = ChengNodeUpsertIndexedText(node,
+                                                 "transport_discovery",
+                                                 "discovery",
+                                                 strings.CloneStr(lookupKind),
+                                                 strings.CloneStr(keyText),
+                                                 strings.CloneStr(objectKind),
+                                                 strings.CloneStr(objectText))
+    if IsErr(upsertRes):
+        return Err[bool](Error(upsertRes))
+    let payloadCid = ChengNodePayloadFromText(objectKind, objectText)
+    let applyRes = ctransport.ChengNodeTransportApplyDiscoveryText(node.transport, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    let publishRes = ctransport.ChengNodeTransportPublishDiscovery(node.transport,
+                                                                     lookupKind,
+                                                                     keyText,
+                                                                     objectText,
+                                                                     payloadCid,
+                                                                     node.ledger.manifest.headSeq,
+                                                                     node.ledger.manifest.snapshotVersion)
+    if IsErr(publishRes):
+        return Err[bool](Error(publishRes))
+    return Ok[bool](Value(upsertRes))
+
+fn ChengNodeInit(rootSeed: str): Result[ChengNode] =
+    let identityRes = identity.ChengNodeIdentityDerive(strings.CloneStr(rootSeed))
+    if IsErr(identityRes):
+        return Err[ChengNode](Error(identityRes))
+    var out: ChengNode
+    out.version = 1
+    out.identity = Value(identityRes)
+    cindex.ChengNodeIndexRegistryInitInPlace(out.indices)
+    cobject.ChengNodeObjectStoreInitInPlace(out.objects)
+    out.ledger = ledger.ChengNodeLedgerInit()
+    actor.ChengNodeActorBusInitInPlace(out.actors)
+    let chainInitRes = chain.ChainNodeInitInto(out.chainState,
+                                                 "cheng_node.chain",
+                                                 rootSeed)
+    if IsErr(chainInitRes):
+        return Err[ChengNode](Error(chainInitRes))
+    out.transport = ctransport.ChengNodeTransportStateInit(layout.FixedBytes32Hex(out.identity.libp2pKey))
+    out.vpn = ctransport.ChengNodeVpnStateInit(layout.FixedBytes32Hex(out.identity.vpnKey),
+                                                 ctransport.ChengNodeTransportPeerIdText(out.transport))
+    out.oracle = cdomain.ChengNodeOracleDomainInit()
+    out.diloco = cdomain.ChengNodeDilocoDomainInit()
+    out.evomap = cdomain.ChengNodeEvoMapDomainInit()
+    return Ok[ChengNode](out)
+
+fn ChengNodeAnchorIndexedObject(node: var ChengNode,
+                                  actorName: str,
+                                  indexGroup: str,
+                                  lookupKind: str,
+                                  keyText: str,
+                                  objectKind: str,
+                                  payloadCid: layout.FixedBytes32): Result[ledger.ChengNodeProofBundle] =
+    return ChengNodeAnchorIndexedCid(node,
+                                       actorName,
+                                       indexGroup,
+                                       lookupKind,
+                                       keyText,
+                                       objectKind,
+                                       payloadCid)
+
+fn ChengNodeAnchorIndexedText(node: var ChengNode,
+                                actorName: str,
+                                indexGroup: str,
+                                lookupKind: str,
+                                keyText: str,
+                                objectKind: str,
+                                objectText: str): Result[ledger.ChengNodeProofBundle] =
+    let payloadCid = ChengNodePayloadFromText(objectKind, objectText)
+    let storeRes = ChengNodeRegisterObjectText(node, payloadCid, objectKind, objectText)
+    if IsErr(storeRes):
+        return Err[ledger.ChengNodeProofBundle](Error(storeRes))
+    return ChengNodeAnchorIndexedCid(node,
+                                       actorName,
+                                       indexGroup,
+                                       lookupKind,
+                                       keyText,
+                                       objectKind,
+                                       payloadCid)
+
+fn ChengNodeUpsertIndexedText(node: var ChengNode,
+                                actorName: str,
+                                indexGroup: str,
+                                lookupKind: str,
+                                keyText: str,
+                                objectKind: str,
+                                objectText: str): Result[bool] =
+    let payloadCid = ChengNodePayloadFromText(objectKind, objectText)
+    let storeRes = ChengNodeRegisterObjectText(node, payloadCid, objectKind, objectText)
+    if IsErr(storeRes):
+        return Err[bool](Error(storeRes))
+    let currentRes = cindex.ChengNodeIndexGet(node.indices, indexGroup, lookupKind, keyText)
+    if IsOk(currentRes):
+        let current = Value(currentRes)
+        if layout.FixedBytes32Equal(current.valueCid, payloadCid):
+            return Ok[bool](false)
+    let proofRes = ChengNodeAnchorIndexedCid(node,
+                                               actorName,
+                                               indexGroup,
+                                               lookupKind,
+                                               keyText,
+                                               objectKind,
+                                               payloadCid)
+    if IsErr(proofRes):
+        return Err[bool](Error(proofRes))
+    return Ok[bool](true)
+
+fn ChengNodeTombstoneIndexedObject(node: var ChengNode,
+                                     actorName: str,
+                                     indexGroup: str,
+                                     lookupKind: str,
+                                     keyText: str): Result[ledger.ChengNodeProofBundle] =
+    let zeroCid = layout.FixedBytes32()
+    let eventRes = ledger.ChengNodeLedgerAppend(node.ledger,
+                                                  actorName,
+                                                  "index_tombstone",
+                                                  indexGroup,
+                                                  lookupKind,
+                                                  keyText,
+                                                  zeroCid)
+    if IsErr(eventRes):
+        return Err[ledger.ChengNodeProofBundle](Error(eventRes))
+    let event = Value(eventRes)
+    ChengNodeDispatchForEvent(node, actorName, event)
+    let snapshotVersion = node.ledger.manifest.snapshotVersion + 1
+    let snapshotCid = ChengNodeSyntheticSnapshotCid(event, snapshotVersion)
+    let snapshotRes = ledger.ChengNodeLedgerSealSnapshot(node.ledger, snapshotVersion, snapshotCid)
+    if IsErr(snapshotRes):
+        return Err[ledger.ChengNodeProofBundle](Error(snapshotRes))
+    let proofRes = ledger.ChengNodeLedgerBuildProof(node.ledger,
+                                                      indexGroup,
+                                                      lookupKind,
+                                                      keyText,
+                                                      zeroCid,
+                                                      event.eventCid)
+    if IsErr(proofRes):
+        return Err[ledger.ChengNodeProofBundle](Error(proofRes))
+    let proof = Value(proofRes)
+    let removeRes = cindex.ChengNodeIndexRemove(node.indices,
+                                                  indexGroup,
+                                                  lookupKind,
+                                                  keyText,
+                                                  event.seq,
+                                                  proof.proofCid)
+    if IsErr(removeRes):
+        return Err[ledger.ChengNodeProofBundle](Error(removeRes))
+    let snapshotHeadKey = layout.FixedBytes32Hex(node.ledger.manifest.headCid)
+    let snapshotHeadUpsertRes = cindex.ChengNodeIndexUpsert(node.indices,
+                                                              "snapshot",
+                                                              "head",
+                                                              snapshotHeadKey,
+                                                              snapshotCid,
+                                                              event.seq,
+                                                              proof.proofCid)
+    if IsErr(snapshotHeadUpsertRes):
+        return Err[ledger.ChengNodeProofBundle](Error(snapshotHeadUpsertRes))
+    let snapshotVersionUpsertRes = cindex.ChengNodeIndexUpsert(node.indices,
+                                                                 "snapshot",
+                                                                 "version",
+                                                                 IntToStr(snapshotVersion),
+                                                                 snapshotCid,
+                                                                 event.seq,
+                                                                 proof.proofCid)
+    if IsErr(snapshotVersionUpsertRes):
+        return Err[ledger.ChengNodeProofBundle](Error(snapshotVersionUpsertRes))
+    return Ok[ledger.ChengNodeProofBundle](proof)
+
+fn ChengNodeRefreshBalanceKey(node: var ChengNode,
+                                assetId: int32,
+                                accountId: int32): Result[bool] =
+    let balanceRes = chain.ChainNodeBalance(node.chainState, assetId, accountId)
+    if IsErr(balanceRes):
+        return Err[bool](Error(balanceRes))
+    let balance = Value(balanceRes)
+    let headCid = chain.ChainNodeAccountHeadFromNode(node.chainState, assetId, accountId)
+    let balanceKey = cindex.ChengNodeBalanceKey(assetId, accountId)
+    let objectText = ChengNodeBalanceObjectText(assetId, accountId, balance, headCid)
+    return ChengNodeUpsertIndexedText(node,
+                                        "chain",
+                                        "balance",
+                                        "asset_account",
+                                        balanceKey,
+                                        "balance_cell",
+                                        objectText)
+
+fn ChengNodeChainMint(node: var ChengNode,
+                        assetId: int32,
+                        accountId: int32,
+                        amount: int64): Result[bool] =
+    let mintRes = chain.ChainNodeMint(node.chainState, assetId, accountId, amount)
+    if IsErr(mintRes):
+        return Err[bool](Error(mintRes))
+    return ChengNodeRefreshBalanceKey(node, assetId, accountId)
+
+fn ChengNodeChainTransfer(node: var ChengNode,
+                            assetId: int32,
+                            fromAccount: int32,
+                            toAccount: int32,
+                            amount: int64): Result[bool] =
+    let transferRes = chain.ChainNodeTransfer(node.chainState,
+                                                assetId,
+                                                fromAccount,
+                                                toAccount,
+                                                amount)
+    if IsErr(transferRes):
+        return Err[bool](Error(transferRes))
+    let fromRefreshRes = ChengNodeRefreshBalanceKey(node, assetId, fromAccount)
+    if IsErr(fromRefreshRes):
+        return Err[bool](Error(fromRefreshRes))
+    let toRefreshRes = ChengNodeRefreshBalanceKey(node, assetId, toAccount)
+    if IsErr(toRefreshRes):
+        return Err[bool](Error(toRefreshRes))
+    return Ok[bool](true)
+
+fn ChengNodeSyncDidIndexes(node: var ChengNode): Result[bool] =
+    var changed = false
+    var didAccountIds: int32[]
+    didAccountIds = []
+    var didMaxSeqs: int32[]
+    didMaxSeqs = []
+    for i in 0..<node.chainState.events.len:
+        let event = node.chainState.events[i]
+        if event.kind != consensus.ConsensusKindMint:
+            continue
+        if event.assetId != ChengNodeDidBundleAssetId:
+            continue
+        var slot = -1
+        for j in 0..<didAccountIds.len:
+            if didAccountIds[j] == event.toAccount:
+                slot = j
+                break
+        if slot < 0:
+            add(didAccountIds, event.toAccount)
+            add(didMaxSeqs, event.fromAccount)
+            continue
+        didMaxSeqs[slot] = ChengNodeMaxInt32(didMaxSeqs[slot], event.fromAccount)
+    for i in 0..<didAccountIds.len:
+        let textRes = ChengNodeLoadChunkedText(node.chainState,
+                                                 ChengNodeDidBundleAssetId,
+                                                 didAccountIds[i],
+                                                 didMaxSeqs[i])
+        if IsErr(textRes):
+            return Err[bool](Error(textRes))
+        let objectText = Value(textRes)
+        let didText = ChengNodeLineValue(objectText, "did")
+        if len(didText) <= 0:
+            return Err[bool]("cheng_node: did bundle missing did")
+        let upsertRes = ChengNodeUpsertIndexedText(node,
+                                                     "did",
+                                                     "did",
+                                                     "subject",
+                                                     didText,
+                                                     "did_bundle",
+                                                     objectText)
+        if IsErr(upsertRes):
+            return Err[bool](Error(upsertRes))
+        if Value(upsertRes):
+            changed = true
+    var maxAnchorSeq = 0
+    for i in 0..<node.chainState.events.len:
+        let event = node.chainState.events[i]
+        if event.kind != consensus.ConsensusKindMint:
+            continue
+        if event.assetId != ChengNodeDidOperatorAnchorAssetId:
+            continue
+        if event.toAccount != ChengNodeDidOperatorAnchorAccountId:
+            continue
+        if event.fromAccount > maxAnchorSeq:
+            maxAnchorSeq = event.fromAccount
+    for anchorSeq in 1..maxAnchorSeq:
+        let textRes = ChengNodeLoadChunkedText(node.chainState,
+                                                 ChengNodeDidOperatorAnchorAssetId,
+                                                 ChengNodeDidOperatorAnchorAccountId,
+                                                 anchorSeq)
+        if IsErr(textRes):
+            return Err[bool](Error(textRes))
+        let objectText = Value(textRes)
+        let keyText = ChengNodeLineValue(objectText, "operator_id")
+        if len(keyText) <= 0:
+            return Err[bool]("cheng_node: operator anchor missing operator_id")
+        let upsertRes = ChengNodeUpsertIndexedText(node,
+                                                     "did",
+                                                     "did_operator",
+                                                     "operator",
+                                                     keyText,
+                                                     "did_operator_anchor",
+                                                     objectText)
+        if IsErr(upsertRes):
+            return Err[bool](Error(upsertRes))
+        if Value(upsertRes):
+            changed = true
+    return Ok[bool](changed)
+
+fn ChengNodeImportChainSnapshot(node: var ChengNode,
+                                  snapshot: chain.ChainNodeServeSnapshot): Result[bool] =
+    let replayRes = chain.ChainNodeReplayFromSnapshotInto(node.chainState,
+                                                            snapshot.nodeId,
+                                                            snapshot.address,
+                                                            snapshot)
+    if IsErr(replayRes):
+        return Err[bool](Error(replayRes))
+    var changed = false
+    for i in 0..<node.chainState.index.accountAssetIds.len:
+        let assetId = node.chainState.index.accountAssetIds[i]
+        let accountId = node.chainState.index.accountIds[i]
+        let refreshRes = ChengNodeRefreshBalanceKey(node, assetId, accountId)
+        if IsErr(refreshRes):
+            return Err[bool](Error(refreshRes))
+        if Value(refreshRes):
+            changed = true
+    let didRes = ChengNodeSyncDidIndexes(node)
+    if IsErr(didRes):
+        return Err[bool](Error(didRes))
+    if Value(didRes):
+        changed = true
+    return Ok[bool](changed)
+
+fn ChengNodeImportOracleState(node: var ChengNode,
+                                machine: oracle_bft.OracleBftStateMachine): Result[bool] =
+    node.oracle.machine = machine
+    return ChengNodeOracleSyncIndexes(node)
+
+@borrows
+fn ChengNodeReplayStoredEvent(node: var ChengNode,
+                                actorName: str,
+                                objectKind: str,
+                                indexGroup: str,
+                                lookupKind: str,
+                                keyText: str,
+                                payloadCid: layout.FixedBytes32): Result[bool] =
+    if objectKind == "index_tombstone":
+        let zeroCid = layout.FixedBytes32()
+        let eventRes = ledger.ChengNodeLedgerAppend(node.ledger,
+                                                      strings.CloneStr(actorName),
+                                                      "index_tombstone",
+                                                      strings.CloneStr(indexGroup),
+                                                      strings.CloneStr(lookupKind),
+                                                      strings.CloneStr(keyText),
+                                                      zeroCid)
+        if IsErr(eventRes):
+            return Err[bool](Error(eventRes))
+        let event = Value(eventRes)
+        let snapshotVersion = node.ledger.manifest.snapshotVersion + 1
+        let snapshotCid = ChengNodeSyntheticSnapshotCid(event, snapshotVersion)
+        let snapshotRes = ledger.ChengNodeLedgerSealSnapshot(node.ledger, snapshotVersion, snapshotCid)
+        if IsErr(snapshotRes):
+            return Err[bool](Error(snapshotRes))
+        let proofRes = ledger.ChengNodeLedgerBuildProof(node.ledger,
+                                                          strings.CloneStr(indexGroup),
+                                                          strings.CloneStr(lookupKind),
+                                                          strings.CloneStr(keyText),
+                                                          zeroCid,
+                                                          event.eventCid)
+        if IsErr(proofRes):
+            return Err[bool](Error(proofRes))
+        let proof = Value(proofRes)
+        let removeRes = cindex.ChengNodeIndexRemove(node.indices,
+                                                      strings.CloneStr(indexGroup),
+                                                      strings.CloneStr(lookupKind),
+                                                      strings.CloneStr(keyText),
+                                                      event.seq,
+                                                      proof.proofCid)
+        if IsErr(removeRes):
+            return Err[bool](Error(removeRes))
+        let snapshotHeadKey = layout.FixedBytes32Hex(node.ledger.manifest.headCid)
+        let snapshotHeadUpsertRes = cindex.ChengNodeIndexUpsert(node.indices,
+                                                                  "snapshot",
+                                                                  "head",
+                                                                  snapshotHeadKey,
+                                                                  snapshotCid,
+                                                                  event.seq,
+                                                                  proof.proofCid)
+        if IsErr(snapshotHeadUpsertRes):
+            return Err[bool](Error(snapshotHeadUpsertRes))
+        let snapshotVersionUpsertRes = cindex.ChengNodeIndexUpsert(node.indices,
+                                                                     "snapshot",
+                                                                     "version",
+                                                                     IntToStr(snapshotVersion),
+                                                                     snapshotCid,
+                                                                     event.seq,
+                                                                     proof.proofCid)
+        if IsErr(snapshotVersionUpsertRes):
+            return Err[bool](Error(snapshotVersionUpsertRes))
+        return Ok[bool](true)
+    let eventRes = ledger.ChengNodeLedgerAppend(node.ledger,
+                                                  actorName,
+                                                  objectKind,
+                                                  indexGroup,
+                                                  lookupKind,
+                                                  keyText,
+                                                  payloadCid)
+    if IsErr(eventRes):
+        return Err[bool](Error(eventRes))
+    let event = Value(eventRes)
+    let snapshotVersion = node.ledger.manifest.snapshotVersion + 1
+    let snapshotCid = ChengNodeSyntheticSnapshotCid(event, snapshotVersion)
+    let snapshotRes = ledger.ChengNodeLedgerSealSnapshot(node.ledger, snapshotVersion, snapshotCid)
+    if IsErr(snapshotRes):
+        return Err[bool](Error(snapshotRes))
+    let proofRes = ledger.ChengNodeLedgerBuildProof(node.ledger,
+                                                      indexGroup,
+                                                      lookupKind,
+                                                      keyText,
+                                                      payloadCid,
+                                                      event.eventCid)
+    if IsErr(proofRes):
+        return Err[bool](Error(proofRes))
+    let proof = Value(proofRes)
+    let upsertRes = cindex.ChengNodeIndexUpsert(node.indices,
+                                                  indexGroup,
+                                                  lookupKind,
+                                                  keyText,
+                                                  payloadCid,
+                                                  event.seq,
+                                                  proof.proofCid)
+    if IsErr(upsertRes):
+        return Err[bool](Error(upsertRes))
+    let snapshotHeadKey = layout.FixedBytes32Hex(node.ledger.manifest.headCid)
+    let snapshotHeadUpsertRes = cindex.ChengNodeIndexUpsert(node.indices,
+                                                              "snapshot",
+                                                              "head",
+                                                              snapshotHeadKey,
+                                                              snapshotCid,
+                                                              event.seq,
+                                                              proof.proofCid)
+    if IsErr(snapshotHeadUpsertRes):
+        return Err[bool](Error(snapshotHeadUpsertRes))
+    let snapshotVersionUpsertRes = cindex.ChengNodeIndexUpsert(node.indices,
+                                                                 "snapshot",
+                                                                 "version",
+                                                                 IntToStr(snapshotVersion),
+                                                                 snapshotCid,
+                                                                 event.seq,
+                                                                 proof.proofCid)
+    if IsErr(snapshotVersionUpsertRes):
+        return Err[bool](Error(snapshotVersionUpsertRes))
+    let runtimeRes = ChengNodeApplyRuntimeObject(node, strings.CloneStr(objectKind), strings.CloneStr(keyText), payloadCid)
+    if IsErr(runtimeRes):
+        return Err[bool](Error(runtimeRes))
+    return Ok[bool](true)
+
+@borrows
+fn ChengNodeLocalPeerIdText(node: ChengNode): str =
+    return ctransport.ChengNodeTransportPeerIdText(node.transport)
+
+fn ChengNodeLibp2pSurfaceText(node: ChengNode): str =
+    return ctransport.ChengNodeTransportSurfaceText(node.transport)
+
+fn ChengNodeAnnounceDiscovery(node: var ChengNode,
+                                lookupKind: str,
+                                keyText: str,
+                                transportKind: str,
+                                hostText: str,
+                                port: int32,
+                                networkDomain: str,
+                                visibility: str,
+                                priority: int32): Result[bool] =
+    let addrRes = ctransport.ChengNodeTransportListenAddr(transportKind,
+                                                            hostText,
+                                                            port,
+                                                            networkDomain,
+                                                            visibility,
+                                                            priority)
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    let objectText = ctransport.ChengNodeTransportDiscoveryObjectText(lookupKind,
+                                                                        keyText,
+                                                                        ctransport.ChengNodeTransportPeerIdText(node.transport),
+                                                                        Value(addrRes))
+    return ChengNodeAnnounceDiscoveryText(node, lookupKind, keyText, objectText)
+
+fn ChengNodeAnnouncePeer(node: var ChengNode,
+                           transportKind: str,
+                           hostText: str,
+                           port: int32): Result[bool] =
+    var networkDomain = "public"
+    if transportKind == "webrtc":
+        networkDomain = "browser-webrtc"
+    return ChengNodeAnnounceDiscovery(node,
+                                        "peer",
+                                        ctransport.ChengNodeTransportPeerIdText(node.transport),
+                                        transportKind,
+                                        hostText,
+                                        port,
+                                        networkDomain,
+                                        "public",
+                                        100)
+
+fn ChengNodeSyncDiscoveryFromRemote(node: var ChengNode,
+                                      remote: var ChengNode,
+                                      lookupKind: str,
+                                      keyText: str): Result[bool] =
+    var objectText = ""
+    let syncRes = ctransport.ChengNodeTransportSyncDiscoveryText(node.transport,
+                                                                   remote.transport,
+                                                                   lookupKind,
+                                                                   keyText,
+                                                                   objectText)
+    if IsErr(syncRes):
+        return Err[bool](Error(syncRes))
+    return ChengNodeAnnounceDiscoveryText(node, lookupKind, keyText, objectText)
+
+fn ChengNodeStreamText(node: var ChengNode,
+                         remote: var ChengNode,
+                         protocolText: str): Result[str] =
+    if protocolText == "identify":
+        return ctransport.ChengNodeTransportIdentifyText(node.transport, remote.transport)
+    let protocolRes = ctransport.ChengNodeTransportProtocolId(protocolText)
+    if IsErr(protocolRes):
+        return Err[str](Error(protocolRes))
+    if remote.transport.host.listenAddrs.len <= 0:
+        return Err[str]("cheng_node: remote transport has no listen addr")
+    let remoteAddr = remote.transport.host.listenAddrs[0]
+    let dialRes = libhost.Libp2pDial(node.transport.host,
+                                       remote.transport.host.selfPeerId,
+                                       remoteAddr,
+                                       2)
+    if IsErr(dialRes):
+        return Err[str](Error(dialRes))
+    let streamRes = libhost.Libp2pOpenStream(node.transport.host,
+                                               remote.transport.host.selfPeerId,
+                                               Value(protocolRes))
+    if IsErr(streamRes):
+        return Err[str](Error(streamRes))
+    var out = ""
+    out = strutil.Join([out, "peer_id=", ctransport.ChengNodeTransportPeerIdText(remote.transport), "\n"], "")
+    out = strutil.Join([out, "transport=", libtypes.Libp2pTransportText(remoteAddr.transport), "\n"], "")
+    out = strutil.Join([out, "protocol=", protocolText, "\n"], "")
+    out = strutil.Join([out, "stream_id=", IntToStr(Value(streamRes)), "\n"], "")
+    out = strutil.Join([out, "open_stream_count=", IntToStr(node.transport.host.openStreamPeers.len)], "")
+    return Ok[str](out)
+
+fn ChengNodeVpnUpsertPeer(node: var ChengNode,
+                            session: tsnet.Libp2pTailnetPeerSession): Result[bool] =
+    let objectText = ctransport.ChengNodeVpnPeerObjectText(session)
+    let applyRes = ctransport.ChengNodeVpnApplyPeerText(node.vpn, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return ChengNodeUpsertIndexedText(node,
+                                        "vpn",
+                                        "vpn_peer",
+                                        "peer",
+                                        session.peerId,
+                                        "vpn_peer_session",
+                                        objectText)
+
+fn ChengNodeVpnUpsertOverlayRoute(node: var ChengNode,
+                                    routeKey: str,
+                                    rawAddr: libtypes.Libp2pMultiaddr): Result[bool] =
+    let listenRes = tsnet.Libp2pTailnetListen(node.vpn.overlay, rawAddr)
+    if IsErr(listenRes):
+        return Err[bool](Error(listenRes))
+    let objectText = ctransport.ChengNodeVpnOverlayRouteObjectText(routeKey,
+                                                                     ctransport.ChengNodeTransportPeerIdText(node.transport),
+                                                                     rawAddr,
+                                                                     Value(listenRes))
+    let applyRes = ctransport.ChengNodeVpnApplyOverlayRouteText(node.vpn, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return ChengNodeUpsertIndexedText(node,
+                                        "vpn",
+                                        "vpn_route",
+                                        "route",
+                                        routeKey,
+                                        "vpn_overlay_route",
+                                        objectText)
+
+fn ChengNodeVpnUpsertExitRoute(node: var ChengNode,
+                                 routeKey: str,
+                                 cfg: vpncfg.VpnProxyExitConfig): Result[bool] =
+    var exits = vpnrouting.VpnProxyInitExitStates([cfg])
+    if exits.len <= 0:
+        return Err[bool]("cheng_node: exit state init failed")
+    let objectText = ctransport.ChengNodeVpnExitRouteObjectText(routeKey, cfg, exits[0])
+    let applyRes = ctransport.ChengNodeVpnApplyExitRouteText(node.vpn, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return ChengNodeUpsertIndexedText(node,
+                                        "vpn",
+                                        "vpn_route",
+                                        "route",
+                                        routeKey,
+                                        "vpn_exit_route",
+                                        objectText)
+
+fn ChengNodeVpnStatusReportText(node: ChengNode): str =
+    return ctransport.ChengNodeVpnStatusText(node.vpn)
+
+fn ChengNodeOracleSyncIndexes(node: var ChengNode): Result[bool] =
+    if !node.oracle.machine.hasFinalized:
+        return Ok[bool](false)
+    var changed = false
+    let machineText = cdomain.ChengNodeOracleMachineStateText(node.oracle)
+    let machineUpsertRes = ChengNodeUpsertIndexedText(node,
+                                                        "oracle",
+                                                        "oracle",
+                                                        "pair",
+                                                        "__machine__",
+                                                        "oracle_machine_state",
+                                                        machineText)
+    if IsErr(machineUpsertRes):
+        return Err[bool](Error(machineUpsertRes))
+    if Value(machineUpsertRes):
+        changed = true
+    for pairId in 1..oracle_types.OraclePairCount:
+        let pairKey = cdomain.ChengNodeOraclePairKeyFromPairId(pairId)
+        if len(pairKey) <= 0:
+            return Err[bool]("cheng_node oracle: pair key missing")
+        let pairTextRes = cdomain.ChengNodeOraclePairStateText(node.oracle, pairId)
+        if IsErr(pairTextRes):
+            return Err[bool](Error(pairTextRes))
+        let pairUpsertRes = ChengNodeUpsertIndexedText(node,
+                                                         "oracle",
+                                                         "oracle",
+                                                         "pair",
+                                                         pairKey,
+                                                         "oracle_pair_state",
+                                                         Value(pairTextRes))
+        if IsErr(pairUpsertRes):
+            return Err[bool](Error(pairUpsertRes))
+        if Value(pairUpsertRes):
+            changed = true
+    return Ok[bool](changed)
+
+fn ChengNodeOracleSubmitFixtureRound(node: var ChengNode,
+                                       roundId: int64): Result[bool] =
+    let finalizeRes = cdomain.ChengNodeOracleFinalizeFixtureRound(node.oracle, roundId)
+    if IsErr(finalizeRes):
+        return Err[bool](Error(finalizeRes))
+    return ChengNodeOracleSyncIndexes(node)
+
+@borrows
+fn ChengNodeOracleQueryText(node: ChengNode,
+                              pairText: str,
+                              withDelta: bool): Result[str] =
+    var pairId = 0
+    var pairKey = ""
+    let resolveRes = cdomain.ChengNodeOracleResolvePair(pairText, pairId, pairKey)
+    if IsErr(resolveRes):
+        return Err[str](Error(resolveRes))
+    let queryRes = ChengNodeKeyedQueryText(node,
+                                             "oracle",
+                                             "pair",
+                                             pairKey,
+                                             withDelta)
+    if IsErr(queryRes):
+        return Err[str](Error(queryRes))
+    var out = ""
+    let entryRes = cindex.ChengNodeIndexGet(node.indices, "oracle", "pair", pairKey)
+    if IsOk(entryRes):
+        let objectRes = cobject.ChengNodeObjectStoreGet(node.objects, Value(entryRes).valueCid)
+        if IsOk(objectRes):
+            let objectText = Value(objectRes).text
+            out = strutil.Join([out, "pair_id=", IntToStr(pairId), "\n"], "")
+            out = strutil.Join([out, "pair_key=", pairKey, "\n"], "")
+            out = strutil.Join([out, "round_id=", ChengNodeLineValue(objectText, "latest_round_id"), "\n"], "")
+            out = strutil.Join([out, "price_e8=", ChengNodeLineValue(objectText, "latest_price_e8"), "\n"], "")
+            out = strutil.Join([out, "reporter_count=", ChengNodeLineValue(objectText, "reporter_count"), "\n"], "")
+            out = strutil.Join([out, "height=", ChengNodeLineValue(objectText, "height"), "\n"], "")
+            out = strutil.Join([out, "app_hash=", ChengNodeLineValue(objectText, "app_hash"), "\n\n"], "")
+    out = strutil.Join([out, Value(queryRes)], "")
+    return Ok[str](out)
+
+fn ChengNodeDilocoArtifactRef(jobBundleCid: layout.FixedBytes32,
+                                tag: str): Result[diloco.DiLoCoArtifactRef] =
+    var out = diloco.DiLoCoArtifactRef()
+    let payloadText = strutil.Join(["cheng_node.diloco.artifact|", strings.CloneStr(tag)], "")
+    let refRes = diloco.DiLoCoArtifactRefFromBytesFill(out,
+                                                         jobBundleCid,
+                                                         BytesFromString(payloadText),
+                                                         256,
+                                                         tag)
+    if IsErr(refRes):
+        return Err[diloco.DiLoCoArtifactRef](Error(refRes))
+    return Ok[diloco.DiLoCoArtifactRef](out)
+
+fn ChengNodeDilocoLeaseKey(jobKey: str,
+                             peerText: str): str =
+    return strutil.Join([jobKey, "/", peerText], "")
+
+fn ChengNodeDilocoSyncJobText(node: var ChengNode,
+                                jobKey: str,
+                                jobBundleCid: layout.FixedBytes32): Result[bool] =
+    let jobTextRes = cdomain.ChengNodeDilocoJobStateText(node.diloco,
+                                                           strings.CloneStr(jobKey),
+                                                           jobBundleCid)
+    if IsErr(jobTextRes):
+        return Err[bool](Error(jobTextRes))
+    return ChengNodeUpsertIndexedText(node,
+                                        "diloco",
+                                        "diloco_job",
+                                        "job",
+                                        jobKey,
+                                        "diloco_job_state",
+                                        Value(jobTextRes))
+
+fn ChengNodeDilocoSyncCohortText(node: var ChengNode,
+                                   jobKey: str,
+                                   jobBundleCid: layout.FixedBytes32): Result[bool] =
+    let cohortPos = diloco.DiLoCoCohortPos(node.diloco.state, jobBundleCid)
+    if cohortPos < 0:
+        return Err[bool]("cheng_node diloco: cohort missing")
+    let cohortText = cdomain.ChengNodeDilocoCohortStateText(strings.CloneStr(jobKey),
+                                                              node.diloco.state.cohorts[cohortPos])
+    return ChengNodeUpsertIndexedText(node,
+                                        "diloco",
+                                        "diloco_cohort",
+                                        "cohort",
+                                        jobKey,
+                                        "diloco_cohort_state",
+                                        cohortText)
+
+fn ChengNodeDilocoSyncLeaseText(node: var ChengNode,
+                                  jobKey: str,
+                                  lease: diloco.DiLoCoLease): Result[bool] =
+    let peerText = peer_id.Libp2pPeerIdText(lease.peerId)
+    let leaseKey = ChengNodeDilocoLeaseKey(strings.CloneStr(jobKey), peerText)
+    let leaseText = cdomain.ChengNodeDilocoLeaseStateText(jobKey, strings.CloneStr(leaseKey), lease)
+    return ChengNodeUpsertIndexedText(node,
+                                        "diloco",
+                                        "diloco_lease",
+                                        "lease",
+                                        leaseKey,
+                                        "diloco_lease_state",
+                                        leaseText)
+
+fn ChengNodeDilocoSyncAllLeases(node: var ChengNode,
+                                  jobKey: str,
+                                  jobBundleCid: layout.FixedBytes32): Result[bool] =
+    var changed = false
+    for i in 0..<node.diloco.state.leases.len:
+        let lease = node.diloco.state.leases[i]
+        if !layout.FixedBytes32Equal(lease.jobBundleCid, jobBundleCid):
+            continue
+        let leaseSyncRes = ChengNodeDilocoSyncLeaseText(node, strings.CloneStr(jobKey), lease)
+        if IsErr(leaseSyncRes):
+            return Err[bool](Error(leaseSyncRes))
+        if Value(leaseSyncRes):
+            changed = true
+    return Ok[bool](changed)
+
+fn ChengNodeDilocoOpenJob(node: var ChengNode,
+                            jobKey: str,
+                            requestedWorkerCount: int32,
+                            innerStepBudget: int32,
+                            outerStepTimeoutSeconds: int32,
+                            genesisModelPayload: rawbytes.Bytes,
+                            genesisOptimizerPayload: rawbytes.Bytes): Result[bool] =
+    if len(jobKey) <= 0:
+        return Err[bool]("cheng_node diloco: job key missing")
+    let jobBundleCid = cdomain.ChengNodeDilocoJobBundleCid(jobKey)
+    var modelRef = diloco.DiLoCoArtifactRef()
+    let modelPutRes = cdomain.ChengNodeDilocoPutPayloadFill(node.diloco,
+                                                              modelRef,
+                                                              jobBundleCid,
+                                                              genesisModelPayload)
+    if IsErr(modelPutRes):
+        return Err[bool](Error(modelPutRes))
+    var optimizerRef = diloco.DiLoCoArtifactRef()
+    let optimizerPutRes = cdomain.ChengNodeDilocoPutPayloadFill(node.diloco,
+                                                                  optimizerRef,
+                                                                  jobBundleCid,
+                                                                  genesisOptimizerPayload)
+    if IsErr(optimizerPutRes):
+        return Err[bool](Error(optimizerPutRes))
+    var job = diloco.DiLoCoJob()
+    var version = diloco.DiLoCoGlobalVersion()
+    let openRes = diloco.DiLoCoOpenJobFill(job,
+                                             version,
+                                             node.diloco.state,
+                                             jobBundleCid,
+                                             requestedWorkerCount,
+                                             innerStepBudget,
+                                             outerStepTimeoutSeconds,
+                                             modelRef,
+                                             optimizerRef)
+    if IsErr(openRes):
+        return Err[bool](Error(openRes))
+    return ChengNodeDilocoSyncJobText(node, jobKey, jobBundleCid)
+
+fn ChengNodeDilocoJoinCohort(node: var ChengNode,
+                               jobKey: str,
+                               peerSeed: str): Result[bool] =
+    let jobBundleCid = cdomain.ChengNodeDilocoJobBundleCid(jobKey)
+    let peerId = cdomain.ChengNodeDilocoPeerIdFromSeed(peerSeed)
+    var cohort = diloco.DiLoCoCohort()
+    let joinRes = diloco.DiLoCoJoinCohortFill(cohort,
+                                                node.diloco.state,
+                                                jobBundleCid,
+                                                peerId)
+    if IsErr(joinRes):
+        return Err[bool](Error(joinRes))
+    let cohortSyncRes = ChengNodeDilocoSyncCohortText(node, strings.CloneStr(jobKey), jobBundleCid)
+    if IsErr(cohortSyncRes):
+        return Err[bool](Error(cohortSyncRes))
+    let jobSyncRes = ChengNodeDilocoSyncJobText(node, strings.CloneStr(jobKey), jobBundleCid)
+    if IsErr(jobSyncRes):
+        return Err[bool](Error(jobSyncRes))
+    return Ok[bool](Value(cohortSyncRes) || Value(jobSyncRes))
+
+fn ChengNodeDilocoFetchLease(node: var ChengNode,
+                               jobKey: str,
+                               peerSeed: str): Result[bool] =
+    let jobBundleCid = cdomain.ChengNodeDilocoJobBundleCid(jobKey)
+    let peerId = cdomain.ChengNodeDilocoPeerIdFromSeed(peerSeed)
+    var lease = diloco.DiLoCoLease()
+    let leaseRes = diloco.DiLoCoFetchLeaseFill(lease,
+                                                 node.diloco.state,
+                                                 jobBundleCid,
+                                                 peerId)
+    if IsErr(leaseRes):
+        return Err[bool](Error(leaseRes))
+    return ChengNodeDilocoSyncLeaseText(node, jobKey, lease)
+
+fn ChengNodeDilocoReportBarrier(node: var ChengNode,
+                                  jobKey: str,
+                                  peerSeed: str): Result[bool] =
+    let jobBundleCid = cdomain.ChengNodeDilocoJobBundleCid(jobKey)
+    let peerId = cdomain.ChengNodeDilocoPeerIdFromSeed(peerSeed)
+    var barrier = diloco.DiLoCoBarrier()
+    let barrierRes = diloco.DiLoCoReportInnerStepDoneFill(barrier,
+                                                            node.diloco.state,
+                                                            jobBundleCid,
+                                                            peerId)
+    if IsErr(barrierRes):
+        return Err[bool](Error(barrierRes))
+    return ChengNodeDilocoSyncJobText(node, jobKey, jobBundleCid)
+
+fn ChengNodeDilocoSubmitOuterDelta(node: var ChengNode,
+                                     jobKey: str,
+                                     peerSeed: str,
+                                     sampleCount: int32,
+                                     tokenCount: int32,
+                                     innerStepCount: int32,
+                                     weightNumerator: int32,
+                                     weightDenominator: int32,
+                                     modelDeltaPayload: rawbytes.Bytes,
+                                     optimizerDeltaPayload: rawbytes.Bytes): Result[bool] =
+    let jobBundleCid = cdomain.ChengNodeDilocoJobBundleCid(jobKey)
+    let jobPos = diloco.DiLoCoJobPos(node.diloco.state, jobBundleCid)
+    if jobPos < 0:
+        return Err[bool]("cheng_node diloco: job missing")
+    let job = node.diloco.state.jobs[jobPos]
+    let peerId = cdomain.ChengNodeDilocoPeerIdFromSeed(peerSeed)
+    var modelRef = diloco.DiLoCoArtifactRef()
+    let modelPutRes = cdomain.ChengNodeDilocoPutPayloadFill(node.diloco,
+                                                              modelRef,
+                                                              jobBundleCid,
+                                                              modelDeltaPayload)
+    if IsErr(modelPutRes):
+        return Err[bool](Error(modelPutRes))
+    var optimizerRef = diloco.DiLoCoArtifactRef()
+    let optimizerPutRes = cdomain.ChengNodeDilocoPutPayloadFill(node.diloco,
+                                                                  optimizerRef,
+                                                                  jobBundleCid,
+                                                                  optimizerDeltaPayload)
+    if IsErr(optimizerPutRes):
+        return Err[bool](Error(optimizerPutRes))
+    var delta = diloco.DiLoCoOuterDelta()
+    let deltaRes = diloco.DiLoCoSubmitOuterDeltaFill(delta,
+                                                       node.diloco.state,
+                                                       jobBundleCid,
+                                                       job.currentGlobalVersionCid,
+                                                       job.currentOuterStep,
+                                                       peerId,
+                                                       modelRef,
+                                                       optimizerRef,
+                                                       sampleCount,
+                                                       tokenCount,
+                                                       innerStepCount,
+                                                       weightNumerator,
+                                                       weightDenominator)
+    if IsErr(deltaRes):
+        return Err[bool](Error(deltaRes))
+    return ChengNodeDilocoSyncJobText(node, jobKey, jobBundleCid)
+
+fn ChengNodeDilocoPublishMerge(node: var ChengNode,
+                                 jobKey: str,
+                                 leaderSeed: str): Result[bool] =
+    let jobBundleCid = cdomain.ChengNodeDilocoJobBundleCid(jobKey)
+    let jobPos = diloco.DiLoCoJobPos(node.diloco.state, jobBundleCid)
+    if jobPos < 0:
+        return Err[bool]("cheng_node diloco: job missing")
+    if !node.diloco.artifactStoreReady:
+        return Err[bool]("cheng_node diloco: artifact store not attached")
+    let leaderPeerId = cdomain.ChengNodeDilocoPeerIdFromSeed(leaderSeed)
+    var commit = diloco.DiLoCoMergeCommit()
+    var version = diloco.DiLoCoGlobalVersion()
+    let mergeRes = diloco_outer.DiLoCoOuterMergeAndPublishFill(commit,
+                                                                 version,
+                                                                 node.diloco.artifactStore,
+                                                                 node.diloco.state,
+                                                                 jobBundleCid,
+                                                                 leaderPeerId,
+                                                                 256)
+    if IsErr(mergeRes):
+        return Err[bool](Error(mergeRes))
+    let jobSyncRes = ChengNodeDilocoSyncJobText(node, strings.CloneStr(jobKey), jobBundleCid)
+    if IsErr(jobSyncRes):
+        return Err[bool](Error(jobSyncRes))
+    let leaseSyncRes = ChengNodeDilocoSyncAllLeases(node, jobKey, jobBundleCid)
+    if IsErr(leaseSyncRes):
+        return Err[bool](Error(leaseSyncRes))
+    return Ok[bool](Value(jobSyncRes) || Value(leaseSyncRes))
+
+@borrows
+fn ChengNodeDilocoStatusText(node: ChengNode,
+                               jobKey: str): Result[str] =
+    return cdomain.ChengNodeDilocoStatusReportText(node.diloco, jobKey)
+
+fn ChengNodeEvoMapNextSequence(node: ChengNode): int32 =
+    var out = 1
+    for i in 0..<node.evomap.capsules.len:
+        if node.evomap.capsules[i].sequence >= out:
+            out = node.evomap.capsules[i].sequence + 1
+    return out
+
+@borrows
+fn ChengNodeEvoMapIdentity(node: ChengNode,
+                             didText: str,
+                             peerText: str,
+                             deviceLabel: str): evotypes.AgentIdentity =
+    var out = evotypes.AgentIdentity()
+    out.didText = strings.CloneStr(didText)
+    out.peerIdText = strings.CloneStr(peerText)
+    out.deviceLabel = strings.CloneStr(deviceLabel)
+    let keyHex = layout.FixedBytes32Hex(node.identity.evomapKey)
+    out.signatureCid = evotypes.UnimakerHashText("cheng.cheng_node.evomap.signature",
+                                                   [keyHex,
+                                                    strings.CloneStr(out.didText),
+                                                    strings.CloneStr(out.peerIdText),
+                                                    strings.CloneStr(out.deviceLabel)])
+    out.identityCid = evotypes.UnimakerHashText("cheng.unimaker.identity",
+                                                  [strings.CloneStr(out.didText),
+                                                   strings.CloneStr(out.peerIdText),
+                                                   strings.CloneStr(out.deviceLabel),
+                                                   layout.FixedBytes32Hex(out.signatureCid)])
+    return out
+
+@borrows
+fn ChengNodeEvoMapResolveGene(capsuleKind: str,
+                                capability: str,
+                                strategy: str,
+                                condition: str): Result[evotypes.EvoGene] =
+    let capabilitySet = len(capability) > 0
+    let strategySet = len(strategy) > 0
+    let conditionSet = len(condition) > 0
+    if capabilitySet || strategySet || conditionSet:
+        if !capabilitySet || !strategySet || !conditionSet:
+            return Err[evotypes.EvoGene]("cheng_node evomap: incomplete gene fields")
+        return Ok[evotypes.EvoGene](evotypes.UnimakerGeneMake(capability,
+                                                                  strategy,
+                                                                  condition))
+    let defaults = evotypes.UnimakerDefaultGenes()
+    if defaults.len <= 0:
+        return Err[evotypes.EvoGene]("cheng_node evomap: default gene missing")
+    for i in 0..<defaults.len:
+        if defaults[i].capability == "event_ingest":
+            return Ok[evotypes.EvoGene](evotypes.EvoGene(
+                capability: strings.CloneStr(defaults[i].capability),
+                strategy: strings.CloneStr(defaults[i].strategy),
+                condition: strings.CloneStr(defaults[i].condition),
+                geneCid: defaults[i].geneCid))
+    return Ok[evotypes.EvoGene](evotypes.EvoGene(
+        capability: strings.CloneStr(defaults[0].capability),
+        strategy: strings.CloneStr(defaults[0].strategy),
+        condition: strings.CloneStr(defaults[0].condition),
+        geneCid: defaults[0].geneCid))
+
+fn ChengNodeEvoMapUpsertAgent(node: var ChengNode,
+                                didText: str,
+                                peerText: str,
+                                deviceLabel: str): Result[bool] =
+    if len(didText) <= 0 || len(peerText) <= 0 || len(deviceLabel) <= 0:
+        return Err[bool]("cheng_node evomap: identity fields missing")
+    var hello = evo.EvoMapA2AHello()
+    hello.version = evotypes.UnimakerProtocolVersion
+    hello.identity = ChengNodeEvoMapIdentity(node, didText, peerText, deviceLabel)
+    hello.cursor = evotypes.UnimakerCursorMake(node.evomap.capsules.len,
+                                                 evotypes.UnimakerGraphHeadCid(node.evomap.capsules))
+    hello.genes = evotypes.UnimakerDefaultGenes()
+    let objectText = cdomain.ChengNodeEvoMapAgentText(hello)
+    let applyRes = cdomain.ChengNodeEvoMapApplyAgentText(node.evomap, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return ChengNodeUpsertIndexedText(node,
+                                        "evomap",
+                                        "evomap",
+                                        "agent",
+                                        peerText,
+                                        "evomap_agent_hello",
+                                        objectText)
+
+fn ChengNodeEvoMapAnchorTask(node: var ChengNode,
+                               requesterPeerIdText: str,
+                               taskId: str,
+                               promptText: str,
+                               keywords: str[],
+                               contextCapsuleCids: layout.FixedBytes32[]): Result[bool] =
+    if len(requesterPeerIdText) <= 0 || len(taskId) <= 0 || len(promptText) <= 0:
+        return Err[bool]("cheng_node evomap: task fields missing")
+    var taskValue = evo.EvoMapA2ATask()
+    taskValue.version = evotypes.UnimakerProtocolVersion
+    taskValue.requesterPeerIdText = requesterPeerIdText
+    taskValue.task.taskId = strings.CloneStr(taskId)
+    taskValue.task.promptText = promptText
+    taskValue.task.keywords = keywords
+    taskValue.contextCapsuleCids = contextCapsuleCids
+    let objectText = cdomain.ChengNodeEvoMapTaskText(taskValue)
+    let applyRes = cdomain.ChengNodeEvoMapApplyTaskText(node.evomap, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return ChengNodeUpsertIndexedText(node,
+                                        "evomap",
+                                        "evomap",
+                                        "task",
+                                        taskId,
+                                        "evomap_task",
+                                        objectText)
+
+fn ChengNodeEvoMapAnchorCapsule(node: var ChengNode,
+                                  didText: str,
+                                  peerText: str,
+                                  deviceLabel: str,
+                                  capsuleKind: str,
+                                  taskId: str,
+                                  contentText: str,
+                                  keywords: str[],
+                                  parentCids: layout.FixedBytes32[],
+                                  relationKind: str,
+                                  createdAtEpochSeconds: int64,
+                                  geneCapability: str,
+                                  geneStrategy: str,
+                                  geneCondition: str): Result[bool] =
+    if len(didText) <= 0 || len(peerText) <= 0 || len(deviceLabel) <= 0:
+        return Err[bool]("cheng_node evomap: capsule identity missing")
+    if len(taskId) <= 0 || len(contentText) <= 0:
+        return Err[bool]("cheng_node evomap: capsule fields missing")
+    if !evotypes.UnimakerCapsuleKindValid(capsuleKind):
+        return Err[bool]("cheng_node evomap: invalid capsule kind")
+    let relationText = len(relationKind) > 0 ? relationKind : evotypes.UnimakerEdgeKindCausedBy
+    if !evotypes.UnimakerEdgeKindValid(relationText):
+        return Err[bool]("cheng_node evomap: invalid relation kind")
+    let geneRes = ChengNodeEvoMapResolveGene(capsuleKind,
+                                               geneCapability,
+                                               geneStrategy,
+                                               geneCondition)
+    if IsErr(geneRes):
+        return Err[bool](Error(geneRes))
+    let identityValue = ChengNodeEvoMapIdentity(node, didText, peerText, deviceLabel)
+    let createdAt = createdAtEpochSeconds > int64(0) ? createdAtEpochSeconds : times.EpochTimeSeconds()
+    let eventValue = evotypes.UnimakerEventMake(capsuleKind,
+                                                  taskId,
+                                                  contentText,
+                                                  keywords,
+                                                  parentCids,
+                                                  relationText,
+                                                  createdAt)
+    let capsule = evotypes.UnimakerCapsuleMake(ChengNodeEvoMapNextSequence(node),
+                                                 identityValue,
+                                                 eventValue,
+                                                 Value(geneRes))
+    let objectText = cdomain.ChengNodeEvoMapCapsuleText(capsule)
+    let applyRes = cdomain.ChengNodeEvoMapApplyCapsuleText(node.evomap, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return ChengNodeUpsertIndexedText(node,
+                                        "evomap",
+                                        "evomap",
+                                        "capsule",
+                                        layout.FixedBytes32Hex(capsule.capsuleCid),
+                                        "evomap_capsule",
+                                        objectText)
+
+@borrows
+fn ChengNodeEvoMapStatusText(node: ChengNode): str =
+    return cdomain.ChengNodeEvoMapStatusReportText(node.evomap)
+
+fn ChengNodeAnchorCompilerPackage(node: var ChengNode,
+                                    snapshot: cworld.CompilerPackageSnapshot): Result[ledger.ChengNodeProofBundle] =
+    return ChengNodeAnchorIndexedText(node,
+                                        "compiler",
+                                        "compiler",
+                                        "package",
+                                        snapshot.packageId,
+                                        "compiler_package_snapshot",
+                                        cworld.CompilerPackageSnapshotReport(snapshot))
+
+fn ChengNodeAnchorCompilerWorldHead(node: var ChengNode,
+                                      head: cworld.CompilerWorldHead): Result[ledger.ChengNodeProofBundle] =
+    return ChengNodeAnchorIndexedText(node,
+                                        "compiler",
+                                        "compiler",
+                                        "world_head",
+                                        layout.FixedBytes32Hex(head.headCid),
+                                        "compiler_world_head",
+                                        cworld.CompilerWorldHeadReport(head))
+
+@borrows
+fn ChengNodeAnchorCompilerBuildReceipt(node: var ChengNode,
+                                         receiptKey: str,
+                                         receiptCid: layout.FixedBytes32): Result[ledger.ChengNodeProofBundle] =
+    return ChengNodeAnchorIndexedText(node,
+                                        "compiler",
+                                        "compiler",
+                                        "build_receipt",
+                                        strings.CloneStr(receiptKey),
+                                        "compiler_build_receipt",
+                                        ChengNodeCompilerBuildReceiptText(receiptKey, receiptCid))
+
+@borrows
+fn ChengNodeAnchorCompilerBuildReceiptReport(node: var ChengNode,
+                                               receiptKey: str,
+                                               receipt: ccsg.CompileReceipt): Result[ledger.ChengNodeProofBundle] =
+    let targetProofRes = ChengNodeAnchorIndexedText(node,
+                                                      "compiler",
+                                                      "compiler",
+                                                      "target",
+                                                      strings.CloneStr(receipt.targetTriple),
+                                                      "compiler_target_receipt",
+                                                      ChengNodeCompilerTargetReceiptText(receiptKey, receipt))
+    if IsErr(targetProofRes):
+        return Err[ledger.ChengNodeProofBundle](Error(targetProofRes))
+    return ChengNodeAnchorCompilerBuildReceipt(node,
+                                                 receiptKey,
+                                                 receipt.receiptCid)
+
+fn ChengNodeBundleCidFromMoqBuild(build: moq.MoqFountainBuildResult): layout.FixedBytes32 =
+    let bundleCidRes = layout.FixedBytes32FromHex(build.bundleCid)
+    if IsOk(bundleCidRes):
+        return Value(bundleCidRes)
+    return ChengNodeHashTextCid("content.moq_fountain.bundle", build.bundleCid)
+
+fn ChengNodeAnchorMoqBuild(node: var ChengNode,
+                             build: moq.MoqFountainBuildResult): Result[ledger.ChengNodeProofBundle] =
+    let buildText = ChengNodeMoqBuildText(build)
+    let capabilityProofRes = ChengNodeAnchorIndexedText(node,
+                                                          "content_moq_fountain",
+                                                          "discovery",
+                                                          "capability",
+                                                          "content.moq_fountain",
+                                                          "moq_fountain_capability",
+                                                          buildText)
+    if IsErr(capabilityProofRes):
+        return Err[ledger.ChengNodeProofBundle](Error(capabilityProofRes))
+    return ChengNodeAnchorIndexedText(node,
+                                        "content_moq_fountain",
+                                        "discovery",
+                                        "topic",
+                                        build.catalogKey,
+                                        "moq_fountain_catalog",
+                                        buildText)
+
+@borrows
+fn ChengNodeRequiredIndexCount(node: ChengNode): int32 =
+    return cindex.ChengNodeIndexRequiredGroupCount(node.indices)
+
+@borrows
+fn ChengNodeCapabilityActorCount(node: ChengNode): int32 =
+    return actor.ChengNodeActorCount(node.actors)
+
+@borrows
+fn ChengNodeActiveIndexCount(node: ChengNode,
+                               groupName: str): int32 =
+    var count = 0
+    for i in 0..<node.indices.entries.len:
+        let entry = node.indices.entries[i]
+        if entry.active && entry.groupName == groupName:
+            count = count + 1
+    return count
+
+@borrows
+fn ChengNodeProofBundleByCid(node: ChengNode,
+                               proofCid: layout.FixedBytes32): Result[ledger.ChengNodeProofBundle] =
+    for i in 0..<node.ledger.proofs.len:
+        let proof = node.ledger.proofs[i]
+        if layout.FixedBytes32Equal(proof.proofCid, proofCid):
+            return Ok[ledger.ChengNodeProofBundle](ledger.ChengNodeProofBundle(
+                version: proof.version,
+                indexGroup: strings.CloneStr(proof.indexGroup),
+                lookupKind: strings.CloneStr(proof.lookupKind),
+                keyText: strings.CloneStr(proof.keyText),
+                valueCid: proof.valueCid,
+                eventCid: proof.eventCid,
+                manifestHeadCid: proof.manifestHeadCid,
+                snapshotVersion: proof.snapshotVersion,
+                snapshotCid: proof.snapshotCid,
+                proofCid: proof.proofCid))
+    return Err[ledger.ChengNodeProofBundle]("cheng_node: proof not found")
+
+@borrows
+fn ChengNodeSnapshotSegmentByVersion(node: ChengNode,
+                                       snapshotVersion: int32): Result[ledger.ChengNodeSnapshotSegment] =
+    for i in 0..<node.ledger.segments.len:
+        let segment = node.ledger.segments[i]
+        if segment.snapshotVersion == snapshotVersion:
+            return Ok[ledger.ChengNodeSnapshotSegment](ledger.ChengNodeSnapshotSegment(
+                snapshotVersion: segment.snapshotVersion,
+                startSeq: segment.startSeq,
+                endSeq: segment.endSeq,
+                snapshotCid: segment.snapshotCid,
+                segmentCid: segment.segmentCid))
+    return Err[ledger.ChengNodeSnapshotSegment]("cheng_node: snapshot segment not found")
+
+fn ChengNodeHeadManifestText(node: ChengNode): str =
+    var out = ""
+    out = strutil.Join([out, "version=", IntToStr(node.ledger.manifest.version), "\n"], "")
+    out = strutil.Join([out, "head_seq=", IntToStr(node.ledger.manifest.headSeq), "\n"], "")
+    out = strutil.Join([out, "head_event_cid=", layout.FixedBytes32Hex(node.ledger.manifest.headEventCid), "\n"], "")
+    out = strutil.Join([out, "snapshot_version=", IntToStr(node.ledger.manifest.snapshotVersion), "\n"], "")
+    out = strutil.Join([out, "snapshot_cid=", layout.FixedBytes32Hex(node.ledger.manifest.snapshotCid), "\n"], "")
+    out = strutil.Join([out, "manifest_head_cid=", layout.FixedBytes32Hex(node.ledger.manifest.headCid)], "")
+    return out
+
+@borrows
+fn ChengNodeKeyedQueryText(node: ChengNode,
+                             indexGroup: str,
+                             lookupKind: str,
+                             keyText: str,
+                             withDelta: bool): Result[str] =
+    var out = ""
+    let manifestHeadCidHex: str = layout.FixedBytes32Hex(node.ledger.manifest.headCid)
+    let keyTextHex: str = BytesToHex(BytesFromString(strings.CloneStr(keyText)))
+    out = Fmt"{out}manifest_head_cid={manifestHeadCidHex}\n"
+    out = Fmt"{out}index_group={indexGroup}\n"
+    out = Fmt"{out}lookup_kind={lookupKind}\n"
+    out = Fmt"{out}key_text_hex={keyTextHex}\n"
+    let entryRes = cindex.ChengNodeIndexGet(node.indices, indexGroup, lookupKind, keyText)
+    if IsErr(entryRes):
+        out = Fmt"{out}found=0\n"
+        if withDelta:
+            out = Fmt"{out}delta_count=0\n"
+        return Ok[str](out)
+    let entry = Value(entryRes)
+    let proofRes = ChengNodeProofBundleByCid(node, entry.proofCid)
+    if IsErr(proofRes):
+        return Err[str](Error(proofRes))
+    let proof = Value(proofRes)
+    let eventSeqText: str = IntToStr(entry.eventSeq)
+    let valueCidHex: str = layout.FixedBytes32Hex(entry.valueCid)
+    let proofCidHex: str = layout.FixedBytes32Hex(entry.proofCid)
+    let eventCidHex: str = layout.FixedBytes32Hex(proof.eventCid)
+    let snapshotVersionText: str = IntToStr(proof.snapshotVersion)
+    let snapshotCidHex: str = layout.FixedBytes32Hex(proof.snapshotCid)
+    out = Fmt"{out}found=1\n"
+    out = Fmt"{out}event_seq={eventSeqText}\n"
+    out = Fmt"{out}value_cid={valueCidHex}\n"
+    out = Fmt"{out}proof_cid={proofCidHex}\n"
+    out = Fmt"{out}event_cid={eventCidHex}\n"
+    out = Fmt"{out}snapshot_version={snapshotVersionText}\n"
+    out = Fmt"{out}snapshot_cid={snapshotCidHex}\n"
+    let objectRes = cobject.ChengNodeObjectStoreGet(node.objects, entry.valueCid)
+    if IsOk(objectRes):
+        let objectEntry = Value(objectRes)
+        let payloadTextHex: str = BytesToHex(BytesFromString(objectEntry.text))
+        out = Fmt"{out}payload_present=1\n"
+        out = Fmt"{out}payload_kind={objectEntry.objectKind}\n"
+        out = Fmt"{out}payload_text_hex={payloadTextHex}\n"
+    else:
+        out = Fmt"{out}payload_present=0\n"
+    if withDelta:
+        let segmentRes = ChengNodeSnapshotSegmentByVersion(node, proof.snapshotVersion)
+        if IsErr(segmentRes):
+            return Err[str](Error(segmentRes))
+        let segment = Value(segmentRes)
+        let segmentSnapshotVersionText: str = IntToStr(segment.snapshotVersion)
+        let segmentStartSeqText: str = IntToStr(segment.startSeq)
+        let segmentEndSeqText: str = IntToStr(segment.endSeq)
+        let segmentCidHex: str = layout.FixedBytes32Hex(segment.segmentCid)
+        out = Fmt"{out}delta_count=1\n"
+        out = Fmt"{out}delta.segment_snapshot_version={segmentSnapshotVersionText}\n"
+        out = Fmt"{out}delta.segment_start_seq={segmentStartSeqText}\n"
+        out = Fmt"{out}delta.segment_end_seq={segmentEndSeqText}\n"
+        out = Fmt"{out}delta.segment_cid={segmentCidHex}\n"
+    return Ok[str](out)
+
+@borrows
+fn ChengNodeBalanceQueryText(node: ChengNode,
+                               assetId: int32,
+                               accountId: int32,
+                               withDelta: bool): Result[str] =
+    let keyText = cindex.ChengNodeBalanceKey(assetId, accountId)
+    let queryRes = ChengNodeKeyedQueryText(node,
+                                             "balance",
+                                             "asset_account",
+                                             keyText,
+                                             withDelta)
+    if IsErr(queryRes):
+        return Err[str](Error(queryRes))
+    var out = ""
+    out = strutil.Join([out, "asset_id=", IntToStr(assetId), "\n"], "")
+    out = strutil.Join([out, "account_id=", IntToStr(accountId), "\n"], "")
+    let entryRes = cindex.ChengNodeIndexGet(node.indices, "balance", "asset_account", keyText)
+    if IsErr(entryRes):
+        out = strutil.Join([out, "balance=0\n"], "")
+        out = strutil.Join([out, Value(queryRes)], "")
+        return Ok[str](out)
+    let entry = Value(entryRes)
+    let objectRes = cobject.ChengNodeObjectStoreGet(node.objects, entry.valueCid)
+    if IsErr(objectRes):
+        return Err[str](Error(objectRes))
+    let balance = ChengNodeBalanceValueFromText(Value(objectRes).text)
+    out = strutil.Join([out, "balance=", int64ToStr(balance), "\n"], "")
+    out = strutil.Join([out, Value(queryRes)], "")
+    return Ok[str](out)
+
+fn ChengNodeRequiredSurfaceText(node: ChengNode): str =
+    var out = ""
+    let requiredIndexesText: str = IntToStr(node.indices.specs.len)
+    out = Fmt"{out}required_indexes={requiredIndexesText}\n"
+    for i in 0..<node.indices.specs.len:
+        let indexText: str = IntToStr(i)
+        out = Fmt"{out}index.{indexText}={node.indices.specs[i].groupName}\n"
+    let actorsText: str = IntToStr(node.actors.actors.len)
+    out = Fmt"{out}actors={actorsText}\n"
+    for i in 0..<node.actors.actors.len:
+        let actorIndexText: str = IntToStr(i)
+        out = Fmt"{out}actor.{actorIndexText}={node.actors.actors[i].name}\n"
+    return out
+
+fn ChengNodeBootstrapSummaryText(node: ChengNode): str =
+    let rootIdHex: str = layout.FixedBytes32Hex(node.identity.rootId)
+    let requiredIndexCountText: str = IntToStr(ChengNodeRequiredIndexCount(node))
+    let actorCountText: str = IntToStr(ChengNodeCapabilityActorCount(node))
+    let objectCountText: str = IntToStr(cobject.ChengNodeObjectCount(node.objects))
+    let balanceCountText: str = IntToStr(ChengNodeActiveIndexCount(node, "balance"))
+    let didCountText: str = IntToStr(ChengNodeActiveIndexCount(node, "did"))
+    let didOperatorCountText: str = IntToStr(ChengNodeActiveIndexCount(node, "did_operator"))
+    let discoveryCountText: str = IntToStr(ChengNodeActiveIndexCount(node, "discovery"))
+    let oracleCountText: str = IntToStr(ChengNodeActiveIndexCount(node, "oracle"))
+    let dilocoJobCountText: str = IntToStr(ChengNodeActiveIndexCount(node, "diloco_job"))
+    let dilocoCohortCountText: str = IntToStr(ChengNodeActiveIndexCount(node, "diloco_cohort"))
+    let dilocoLeaseCountText: str = IntToStr(ChengNodeActiveIndexCount(node, "diloco_lease"))
+    let evomapCountText: str = IntToStr(ChengNodeActiveIndexCount(node, "evomap"))
+    let vpnPeerCountText: str = IntToStr(ChengNodeActiveIndexCount(node, "vpn_peer"))
+    let vpnRouteCountText: str = IntToStr(ChengNodeActiveIndexCount(node, "vpn_route"))
+    let manifestHeadSeqText: str = IntToStr(node.ledger.manifest.headSeq)
+    let manifestHeadCidHex: str = layout.FixedBytes32Hex(node.ledger.manifest.headCid)
+    let chainTipEventCidHex: str = layout.FixedBytes32Hex(node.chainState.tipEventCid)
+    let chainEventCountText: str = IntToStr(node.chainState.events.len)
+    let transportPeerIdText: str = ctransport.ChengNodeTransportPeerIdText(node.transport)
+    return Fmt"root_id={rootIdHex}\nrequired_index_count={requiredIndexCountText}\nactor_count={actorCountText}\nobject_count={objectCountText}\nbalance_index_count={balanceCountText}\ndid_index_count={didCountText}\ndid_operator_index_count={didOperatorCountText}\ndiscovery_index_count={discoveryCountText}\noracle_index_count={oracleCountText}\ndiloco_job_index_count={dilocoJobCountText}\ndiloco_cohort_index_count={dilocoCohortCountText}\ndiloco_lease_index_count={dilocoLeaseCountText}\nevomap_index_count={evomapCountText}\nvpn_peer_index_count={vpnPeerCountText}\nvpn_route_index_count={vpnRouteCountText}\nmanifest_head_seq={manifestHeadSeqText}\nmanifest_head_cid={manifestHeadCidHex}\nchain_tip_event_cid={chainTipEventCidHex}\nchain_event_count={chainEventCountText}\ntransport_peer_id={transportPeerIdText}"

@@ -1,0 +1,1487 @@
+# backend2_assemble — greenfield 后端跨函数合并点 (纲领 §② backend2_assemble)。
+# 唯一消费跨函数偏移的地方: 前缀和布局 + reloc 纯加法 rebase + 填 PrimaryObjectPlan,
+# 使下游 DirectObjectEmit / macho writer 原封不动消费。fragment 全部函数基址相对
+# (fn-base-rel), 此处加 functionWordOffset rebase 成绝对字偏移。
+#
+# 契约来自实测 pobj 参考 plan 形态 (single_line_body):
+#   symbolNames/functionBodyKinds/functionWordOffsets/functionWordCounts/itemIds 五者等长;
+#   符号 Darwin mangle (_前缀); itemId = 100000+i; entryFunctionSymbol 仅从
+#   exact entry function-row 的 UTF-8 符号 payload 物化；
+#   reloc: (srcItemId, absWordOffset, mangledTarget); functionBodyKinds=statement_sequence。
+
+import cheng/core/backend/primary_object_plan as pobj
+import cheng/core/backend/codegen_contract as contract
+import cheng/core/backend/regalloc_production_artifacts as regart
+import cheng/core/backend/regalloc_production_emitter as regprod
+import cheng/core/backend/codegen_rv_isa_units as rvenc
+import cheng/core/analysis/managed_lvalue_replace as managedreplace
+import cheng/core/backend/system_link_plan as slplan
+import cheng/core/backend/target_matrix as tmat
+import cheng/core/tooling/compiler_request as creq
+import cheng/core/tooling/compiler_toolchain_encoder_authority_import as encauthority
+import cheng/core/lang/typed_expr as texpr
+import cheng/core/backend2/backend2_types as b2t
+import cheng/core/backend2/backend2_cid as b2cid
+import cheng/core/backend2/backend2_frag_codec as b2fc
+import cheng/core/backend2/backend2_fragment_lifecycle as b2life
+import cheng/core/backend2/backend2_assembler_lifecycle as b2temps
+import cheng/core/ir/core_types as coreir
+import cheng/core/ir/body_ir_lifecycle as bodylifecycle
+import cheng/std/bytes_layout as layout
+import std/rawbytes
+import std/os
+import std/result
+import std/strings
+import std/strutils as strutil
+
+type
+    Backend2AssemblerFailureKind = enum
+        Backend2AssemblerFailureNone
+        Backend2AssemblerFailureFragmentKeyMissing
+        Backend2AssemblerFailureFragmentContentMissing
+        Backend2AssemblerFailureFragmentContentMismatch
+        Backend2AssemblerFailureBodyIrPayloadMissing
+        Backend2AssemblerFailureBodyIrTypeArenaMismatch
+        Backend2AssemblerFailureBodyIrTrailingBytes
+        Backend2AssemblerFailureBodyIrRoundTripMismatch
+        Backend2AssemblerFailureCallTargetMissing
+        Backend2AssemblerFailureDataTargetMissing
+        Backend2AssemblerFailureFunctionAddressTargetInvalid
+        Backend2AssemblerFailureResolvedDataTargetMissing
+
+@borrows
+fn backend2CanonicalTextIndex(items: var str[], value: str): int32 =
+    for index in 0..<items.len:
+        if items[index] == value:
+            return index
+    return -1
+
+# O(1) exact function-row projection consumer.  The returned handle owns its
+# retain while the assembler lifecycle remains the sole owner of the SoA
+# column. Definitions, calls, funcaddr and entry all pass through this helper.
+@borrows
+fn Backend2FunctionSymbolAtRowExact(
+        allSymbolNames: var str[],
+        functionRow: int32): str =
+    if functionRow < 0 ||
+       functionRow >= allSymbolNames.len ||
+       allSymbolNames[functionRow] == "":
+        panic("backend2 canonical function symbol row invalid")
+    return share(allSymbolNames[functionRow])
+
+fn backend2CanonicalLegacyMachineFieldsEmpty(
+        frag: var b2t.FunctionFragment): bool =
+    return frag.wordCount == 0 && frag.words.len == 0 &&
+           frag.relocWordOffsets.len == 0 &&
+           frag.relocTargetSymbols.len == 0 && frag.refSymbols.len == 0 &&
+           frag.dataRelocFnRelWordOffsets.len == 0 &&
+           frag.dataRelocTargetLabels.len == 0
+
+fn backend2CanonicalFragmentIdentityFailure(
+        frag: var b2t.FunctionFragment):
+        Backend2AssemblerFailureKind =
+    if frag.funcEmitCid == "":
+        return Backend2AssemblerFailureFragmentKeyMissing
+    if frag.contentCid == "":
+        return Backend2AssemblerFailureFragmentContentMissing
+    var recomputed = b2cid.Backend2ContentCidOfFragment(frag)
+    let contentExact = recomputed == frag.contentCid
+    os.ReleaseStr(recomputed)
+    if !contentExact:
+        return Backend2AssemblerFailureFragmentContentMismatch
+    return Backend2AssemblerFailureNone
+
+fn backend2CanonicalBodyIrInto(
+        frag: var b2t.FunctionFragment,
+        expectedTypeArenaArtifactCid:
+            layout.FixedBytes32,
+        bodyIROut: var coreir.BodyIR,
+        bodyDecodedOut: var bool,
+        failureCodeOut:
+            var Backend2AssemblerFailureKind): bool =
+    bodyDecodedOut = false
+    failureCodeOut = Backend2AssemblerFailureNone
+    if frag.bodyIrPayload == "":
+        failureCodeOut = Backend2AssemblerFailureBodyIrPayloadMissing
+        return false
+    # BytesFromString is a borrowed zero-copy view over frag.bodyIrPayload's
+    # own buffer; freeing it would free memory the fragment still owns.
+    let encoded = rawbytes.BytesFromString(frag.bodyIrPayload)
+    if !b2fc.Backend2BodyIrEncodedTypeArenaArtifactMatches(
+           encoded, expectedTypeArenaArtifactCid):
+        failureCodeOut =
+            Backend2AssemblerFailureBodyIrTypeArenaMismatch
+        return false
+    var cursor: int32
+    bodyIROut = b2fc.Backend2BodyIrDecodeExpectedTypeArenaArtifact(
+        encoded,
+        cursor,
+        expectedTypeArenaArtifactCid)
+    bodyDecodedOut = true
+    if cursor != encoded.len:
+        failureCodeOut = Backend2AssemblerFailureBodyIrTrailingBytes
+        return false
+    # Decode is a production boundary, not a trusted in-memory assignment.
+    # Re-encode and compare the complete payload so an asymmetric codec cannot
+    # silently change the allocator ingress.
+    var reencoded = b2fc.Backend2BodyIrEncode(bodyIROut)
+    let roundTripExact = rawbytes.BytesEqual(encoded, reencoded)
+    rawbytes.BytesFree(reencoded)
+    if !roundTripExact:
+        failureCodeOut =
+            Backend2AssemblerFailureBodyIrRoundTripMismatch
+        return false
+    return true
+
+@borrows
+fn backend2CanonicalResolvedCallTargetsInto(
+        bodyIR: var coreir.BodyIR,
+        targetTriple: str,
+        typedFunctionSymbolRows: var int32[],
+        allSymbolNames: var str[],
+        out: var str[],
+        failureCodeOut:
+            var Backend2AssemblerFailureKind): bool =
+    failureCodeOut = Backend2AssemblerFailureNone
+    setLen(out, 0)
+    if bodyIR.callTargetDomainKinds.len != bodyIR.callSequence.len ||
+       bodyIR.callTargetRows.len != bodyIR.callSequence.len ||
+       bodyIR.callTargetInterfaceCids.len != bodyIR.callSequence.len:
+        failureCodeOut = Backend2AssemblerFailureCallTargetMissing
+        return false
+    for callIndex in 0..<bodyIR.callSequence.len:
+        let domain = bodyIR.callTargetDomainKinds[callIndex]
+        let targetRow = bodyIR.callTargetRows[callIndex]
+        if !coreir.BodyIRCallTargetIdentityValid(domain, targetRow) ||
+           !coreir.BodyIRTypeArenaArtifactCidValid(
+               bodyIR.callTargetInterfaceCids[callIndex]):
+            failureCodeOut =
+                Backend2AssemblerFailureCallTargetMissing
+            return false
+        if domain == coreir.BodyCallTargetDomainFunctionTag:
+            if targetRow < 0 ||
+               targetRow >= typedFunctionSymbolRows.len:
+                failureCodeOut =
+                    Backend2AssemblerFailureCallTargetMissing
+                return false
+            let symbolRow = typedFunctionSymbolRows[targetRow]
+            if symbolRow < 0 || symbolRow >= allSymbolNames.len ||
+               len(allSymbolNames[symbolRow]) <= 0:
+                failureCodeOut =
+                    Backend2AssemblerFailureCallTargetMissing
+                return false
+            add(out, Backend2FunctionSymbolAtRowExact(
+                allSymbolNames, symbolRow))
+            continue
+        if bodyIR.callSequence[callIndex].targetSymbol == "":
+            failureCodeOut =
+                Backend2AssemblerFailureCallTargetMissing
+            return false
+        add(out, pobj.PrimaryTargetSymbolName(
+            targetTriple,
+            bodyIR.callSequence[callIndex].targetSymbol))
+    return true
+
+@borrows
+fn backend2CanonicalResolvedDataTargetsInto(
+        bodyIR: var coreir.BodyIR,
+        targetTriple: str,
+        allSymbolNames: var str[],
+        out: var str[],
+        failureCodeOut:
+            var Backend2AssemblerFailureKind): bool =
+    failureCodeOut = Backend2AssemblerFailureNone
+    for slotIndex in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[slotIndex]
+        if slot.placeKind == coreir.BodyPlaceGlobalAddressTag:
+            if slot.name == "":
+                failureCodeOut =
+                    Backend2AssemblerFailureDataTargetMissing
+                return false
+            let functionIndex = pobj.PrimaryBodyIrFunctionAddressSlotIndex(slot.name)
+            if functionIndex >= 0:
+                if functionIndex >= allSymbolNames.len ||
+                   allSymbolNames[functionIndex] == "":
+                    failureCodeOut =
+                        Backend2AssemblerFailureFunctionAddressTargetInvalid
+                    return false
+            elif pobj.PrimaryGlobalDataLabel(
+                     targetTriple, slot.name) == "":
+                failureCodeOut =
+                    Backend2AssemblerFailureResolvedDataTargetMissing
+                return false
+    for slotIndex in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[slotIndex]
+        if slot.placeKind == coreir.BodyPlaceGlobalAddressTag:
+            let functionIndex =
+                pobj.PrimaryBodyIrFunctionAddressSlotIndex(slot.name)
+            if functionIndex >= 0:
+                add(out, Backend2FunctionSymbolAtRowExact(
+                    allSymbolNames, functionIndex))
+            else:
+                let targetSymbol =
+                    pobj.PrimaryGlobalDataLabel(targetTriple, slot.name)
+                add(out, targetSymbol)
+        else:
+            add(out, "")
+    return true
+
+fn backend2CanonicalCStringPayloadExact(
+        frag: var b2t.FunctionFragment,
+        bodyIR: var coreir.BodyIR): bool =
+    var expectedLabels: str[]
+    var expectedPayloadTexts: str[]
+    var expectedRawBytes: int32[]
+    var expectedRawByteCounts: int32[]
+    pobj.PrimaryBodyIrAppendCStringDataLabels(
+        bodyIR, frag.functionSymbol, expectedLabels,
+        expectedPayloadTexts, expectedRawBytes, expectedRawByteCounts)
+    if expectedLabels.len != frag.cstringDataLabels.len ||
+       expectedRawByteCounts.len != frag.cstringPayloadRawByteCounts.len ||
+       expectedRawBytes.len != frag.cstringPayloadRawBytes.len ||
+       bodyIR.cstringLiterals.len != frag.cstringLiterals.len:
+        return false
+    for literalIndex in 0..<bodyIR.cstringLiterals.len:
+        # backend2 owns the final symbol spelling; a prebound label would make
+        # the emitter reloc and the fragment data object two authorities.
+        if bodyIR.cstringLiterals[literalIndex].dataLabel != "" ||
+           bodyIR.cstringLiterals[literalIndex].text !=
+               frag.cstringLiterals[literalIndex] ||
+           expectedLabels[literalIndex] !=
+               frag.cstringDataLabels[literalIndex] ||
+           expectedRawByteCounts[literalIndex] !=
+               frag.cstringPayloadRawByteCounts[literalIndex]:
+            return false
+    for byteIndex in 0..<expectedRawBytes.len:
+        if expectedRawBytes[byteIndex] !=
+           frag.cstringPayloadRawBytes[byteIndex]:
+            return false
+    return true
+
+@borrows
+fn backend2CanonicalGlobalRowsExact(
+        frag: var b2t.FunctionFragment,
+        bodyIR: var coreir.BodyIR,
+        targetTriple: str): bool =
+    var rowIndex: int32
+    for slotIndex in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[slotIndex]
+        if slot.placeKind != coreir.BodyPlaceGlobalAddressTag ||
+           pobj.PrimaryBodyIrFunctionAddressSlotIndex(slot.name) >= 0:
+            continue
+        if rowIndex >= frag.globalDataLabelsRaw.len || slot.name == "" ||
+           frag.globalDataPayloadTexts[rowIndex] == "" ||
+           frag.globalDataPayloadByteCounts[rowIndex] != 0 ||
+           pobj.PrimaryTargetSymbolName(
+               targetTriple, frag.globalDataLabelsRaw[rowIndex]) !=
+               pobj.PrimaryGlobalDataLabel(targetTriple, slot.name):
+            return false
+        rowIndex = rowIndex + 1
+    return rowIndex == frag.globalDataLabelsRaw.len
+
+fn backend2CanonicalGlobalSlotNameAt(
+        bodyIR: var coreir.BodyIR,
+        rowOrdinal: int32): str =
+    var rowIndex: int32
+    for slotIndex in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[slotIndex]
+        if slot.placeKind != coreir.BodyPlaceGlobalAddressTag ||
+           pobj.PrimaryBodyIrFunctionAddressSlotIndex(slot.name) >= 0:
+            continue
+        if rowIndex == rowOrdinal:
+            return slot.name
+        rowIndex = rowIndex + 1
+    return ""
+
+fn backend2AppendCanonicalRelocs(plan: var pobj.PrimaryObjectPlan,
+                                 bodyIR: var coreir.BodyIR,
+                                 emission: var regprod.RegallocProductionFunctionEmission,
+                                 itemId: int32,
+                                 functionWordOffset: int32,
+                                 resolvedCallTargets: var str[],
+                                 resolvedDataTargets: var str[],
+                                 resolvedCStringTargets: var str[]): bool =
+    var pageOpen = false
+    var pageWordIndex: int32 = -1
+    var pageOpIndex: int32 = -1
+    var pageSubIndex: int32 = -1
+    var pageRelocIndex: int32 = -1
+    var callSeen: bool[]
+    for _ in 0..<bodyIR.callSequence.len:
+        add(callSeen, false)
+    var nextDataSubIndex: int32[]
+    for _ in 0..<bodyIR.ops.len:
+        add(nextDataSubIndex, 0)
+    for relocIndex in 0..<emission.recipes.functionRelocs.len:
+        let reloc = emission.recipes.functionRelocs[relocIndex]
+        if pageOpen && reloc.kind != contract.RegallocA64RelocPageOff12:
+            return false
+        if reloc.kind == contract.RegallocA64RelocCall26 ||
+           reloc.kind == contract.RegallocMachineRelocPcRel32 ||
+           reloc.kind == contract.RegallocMachineRelocRiscvCall:
+            if reloc.wordIndex < 0 ||
+               reloc.wordIndex >= emission.recipes.functionWords.len ||
+               reloc.byteOffset < 0 ||
+               reloc.byteOffset >
+                   emission.recipes.functionWords.len * 4 - 4 ||
+               reloc.callOrdinal < 0 || reloc.callOrdinal >= bodyIR.callSequence.len ||
+               reloc.callOrdinal >= bodyIR.callTargetDomainKinds.len ||
+               reloc.callOrdinal >= bodyIR.callTargetRows.len ||
+               reloc.callOrdinal >= bodyIR.callTargetInterfaceCids.len ||
+               reloc.callOrdinal >= resolvedCallTargets.len || reloc.opIndex < 0 ||
+               reloc.opIndex >= bodyIR.ops.len || reloc.subIndex >= 0 ||
+               callSeen[reloc.callOrdinal] ||
+               reloc.wordIndex > 2147483647 - functionWordOffset ||
+               reloc.targetDomain !=
+                   bodyIR.callTargetDomainKinds[reloc.callOrdinal] ||
+               reloc.targetRow !=
+                   bodyIR.callTargetRows[reloc.callOrdinal] ||
+               !layout.FixedBytes32Equal(
+                   reloc.targetInterfaceCid,
+                   bodyIR.callTargetInterfaceCids[reloc.callOrdinal]) ||
+               reloc.targetSymbol != resolvedCallTargets[reloc.callOrdinal] ||
+               bodyIR.callSequence[reloc.callOrdinal].targetSymbol ==
+                   "cheng_call_ptr_i32_raw" ||
+               bodyIR.callSequence[reloc.callOrdinal].targetSymbol ==
+                   "cheng_call_ptr_void_raw":
+                return false
+            if reloc.kind == contract.RegallocMachineRelocRiscvCall &&
+               (!regart.RegallocProductionTargetIsRiscv(
+                    emission.targetTriple) ||
+                reloc.wordIndex >=
+                    emission.recipes.functionWords.len - 1):
+                return false
+            if reloc.kind == contract.RegallocA64RelocCall26 &&
+               !regart.RegallocProductionTargetIsA64(
+                    emission.targetTriple):
+                return false
+            callSeen[reloc.callOrdinal] = true
+            add(plan.relocSourceItemIds, itemId)
+            var exactRelocOffset =
+                functionWordOffset + reloc.wordIndex
+            if reloc.kind ==
+                   contract.RegallocMachineRelocPcRel32:
+                exactRelocOffset =
+                    functionWordOffset * 4 + reloc.byteOffset
+            add(plan.relocWordOffsets, exactRelocOffset)
+            add(plan.relocTargetSymbols, share(reloc.targetSymbol))
+        elif reloc.kind == contract.RegallocA64RelocPage21:
+            if reloc.wordIndex < 0 || reloc.wordIndex >=
+                   emission.recipes.functionWords.len - 1 ||
+               reloc.callOrdinal >= 0 || reloc.opIndex < 0 ||
+               reloc.opIndex >= bodyIR.ops.len || reloc.subIndex < 0 ||
+               reloc.subIndex != nextDataSubIndex[reloc.opIndex] ||
+               reloc.wordIndex > 2147483647 - functionWordOffset ||
+               reloc.targetSymbol == "" ||
+               (backend2CanonicalTextIndex(
+                    resolvedDataTargets, reloc.targetSymbol) < 0 &&
+                backend2CanonicalTextIndex(
+                    resolvedCStringTargets, reloc.targetSymbol) < 0):
+                return false
+            pageOpen = true
+            pageWordIndex = reloc.wordIndex
+            pageOpIndex = reloc.opIndex
+            pageSubIndex = reloc.subIndex
+            pageRelocIndex = relocIndex
+        elif reloc.kind == contract.RegallocA64RelocPageOff12:
+            if !pageOpen || pageRelocIndex < 0 ||
+               pageRelocIndex >= emission.recipes.functionRelocs.len ||
+               reloc.callOrdinal >= 0 ||
+               reloc.wordIndex != pageWordIndex + 1 ||
+               reloc.opIndex != pageOpIndex || reloc.subIndex != pageSubIndex ||
+               reloc.targetSymbol !=
+                   emission.recipes.functionRelocs[
+                       pageRelocIndex].targetSymbol:
+                return false
+            add(plan.dataRelocSourceItemIds, itemId)
+            add(plan.dataRelocWordOffsets, functionWordOffset + pageWordIndex)
+            add(plan.dataRelocTargetSymbols,
+                share(emission.recipes.functionRelocs[
+                    pageRelocIndex].targetSymbol))
+            nextDataSubIndex[pageOpIndex] =
+                nextDataSubIndex[pageOpIndex] + 1
+            pageOpen = false
+            pageWordIndex = -1
+            pageOpIndex = -1
+            pageSubIndex = -1
+            pageRelocIndex = -1
+        else:
+            return false
+    if pageOpen:
+        return false
+    for callIndex in 0..<callSeen.len:
+        let target = bodyIR.callSequence[callIndex].targetSymbol
+        # These two canonical intrinsics lower to BLR and intentionally have
+        # no symbol relocation. Every other call-sequence row must publish one
+        # and only one Call26 receipt.
+        let indirect = target == "cheng_call_ptr_i32_raw" ||
+                       target == "cheng_call_ptr_void_raw"
+        if !indirect && !callSeen[callIndex]:
+            return false
+    return true
+
+fn backend2CanonicalEvidenceCountExact(
+        plan: var pobj.PrimaryObjectPlan,
+        expected: int32): bool =
+    let debugCount = plan.regallocDebugFragmentOpIds.len
+    return expected >= 0 &&
+        plan.regallocFrozenSnapshotSinglePayloads.len == expected &&
+        plan.regallocEmissionLedgerSinglePayloads.len == expected &&
+        plan.regallocFunctionSymbols.len == expected &&
+        plan.regallocFunctionIrIndexes.len == expected &&
+        plan.regallocFunctionKinds.len == expected &&
+        plan.regallocFunctionBodyIrSha256s.len == expected &&
+        plan.regallocFunctionSymbolByteStarts.len == expected &&
+        plan.regallocFunctionSymbolByteLengths.len == expected &&
+        plan.regallocFunctionSymbolBytesSha256s.len == expected &&
+        plan.regallocFunctionPlanSha256s.len == expected &&
+        plan.regallocFunctionActionSemanticRootSha256s.len == expected &&
+        plan.regallocFunctionActionLedgerRootSha256s.len == expected &&
+        plan.regallocFunctionMachineFragmentRootSha256s.len == expected &&
+        plan.regallocFunctionAbiIngressRootSha256s.len == expected &&
+        plan.regallocFunctionDebugProvenanceBound.len == expected &&
+        plan.regallocFunctionDebugFunctionIds.len == expected &&
+        plan.regallocFunctionDebugProvenanceSha256s.len == expected &&
+        plan.regallocFunctionDebugMachineFragmentRootSha256s.len == expected &&
+        plan.regallocFunctionDebugFragmentStarts.len == expected &&
+        plan.regallocFunctionDebugFragmentCounts.len == expected &&
+        plan.regallocFunctionActionCounts.len == expected &&
+        plan.regallocFunctionExactCalleeMasks.len == expected &&
+        plan.regallocFunctionRegisterAssignmentCounts.len == expected &&
+        plan.regallocFunctionSpillActionCounts.len == expected &&
+        plan.regallocFunctionReloadActionCounts.len == expected &&
+        plan.regallocFunctionCallClobberActionCounts.len == expected &&
+        plan.regallocFunctionEdgeParallelCopyActionCounts.len == expected &&
+        plan.regallocFunctionParallelCopyCycleBreakActionCounts.len == expected &&
+        plan.regallocFunctionCriticalEdgeActionCounts.len == expected &&
+        plan.regallocFunctionSretExclusionCounts.len == expected &&
+        plan.regallocFunctionAddressEscapeMemoryActionCounts.len == expected &&
+        plan.regallocFunctionOutgoingStackArgActionCounts.len == expected &&
+        plan.regallocDebugFragmentFunctionIndexes.len == debugCount &&
+        plan.regallocDebugFragmentSyntheticKinds.len == debugCount &&
+        plan.regallocDebugFragmentSiteKinds.len == debugCount &&
+        plan.regallocDebugFragmentSiteIndexes.len == debugCount &&
+        plan.regallocDebugFragmentMachineOwnerKinds.len == debugCount &&
+        plan.regallocDebugFragmentMachineOwnerOrdinals.len == debugCount &&
+        plan.regallocDebugFragmentActionConsumerOrdinals.len == debugCount &&
+        plan.regallocDebugFragmentTextByteStarts.len == debugCount &&
+        plan.regallocDebugFragmentByteLengths.len == debugCount &&
+        plan.regallocDebugFragmentBytesSha256s.len == debugCount
+
+fn backend2RecordBodyIrLifecycleReceipt(
+        plan: var pobj.PrimaryObjectPlan,
+        receipt: bodylifecycle.BodyIrFunctionLifecycleReceipt) =
+    if receipt.allocated != int64(1) ||
+       receipt.released != int64(1) ||
+       receipt.live != int64(0) ||
+       receipt.allocatedBytes != receipt.releasedBytes ||
+       receipt.liveBytes != int64(0) ||
+       receipt.retained != receipt.borrowReturnCount ||
+       receipt.retained < int64(0) ||
+       receipt.retained > int64(1) ||
+       (receipt.outcome ==
+            bodylifecycle.BodyIrFunctionOutcomeEmitSuccess &&
+        receipt.retained != int64(1)) ||
+       receipt.ownerTransferCount != int64(1) ||
+       receipt.bodyPhysicalFreeCount !=
+           int64(receipt.physicalBufferCount) ||
+       !receipt.payloadReleased ||
+       !receipt.ledgerStorageReleased ||
+       !receipt.phaseArenaStorageReleased ||
+       receipt.phaseArenaReleasedBufferCount <= 0 ||
+       receipt.phaseArenaReleasedBytes <= int64(0):
+        panic("backend2 body ir lifecycle: unbalanced terminal receipt")
+    plan.bodyIrLifecycleFunctionCount =
+        plan.bodyIrLifecycleFunctionCount + 1
+    plan.bodyIrLifecycleAllocated =
+        plan.bodyIrLifecycleAllocated + receipt.allocated
+    plan.bodyIrLifecycleReleased =
+        plan.bodyIrLifecycleReleased + receipt.released
+    plan.bodyIrLifecycleLive =
+        plan.bodyIrLifecycleLive + receipt.live
+    plan.bodyIrLifecycleAllocatedBytes =
+        plan.bodyIrLifecycleAllocatedBytes + receipt.allocatedBytes
+    plan.bodyIrLifecycleReleasedBytes =
+        plan.bodyIrLifecycleReleasedBytes + receipt.releasedBytes
+    plan.bodyIrLifecycleLiveBytes =
+        plan.bodyIrLifecycleLiveBytes + receipt.liveBytes
+    plan.bodyIrLifecycleOwnerTransferCount =
+        plan.bodyIrLifecycleOwnerTransferCount +
+            receipt.ownerTransferCount
+    plan.bodyIrLifecyclePhysicalBufferCount =
+        plan.bodyIrLifecyclePhysicalBufferCount +
+            int64(receipt.physicalBufferCount)
+    plan.bodyIrLifecyclePhysicalFreeCount =
+        plan.bodyIrLifecyclePhysicalFreeCount +
+            receipt.bodyPhysicalFreeCount
+    plan.bodyIrLifecycleLedgerStorageReleasedSequenceCount =
+        plan.bodyIrLifecycleLedgerStorageReleasedSequenceCount +
+            int64(receipt.ledgerStorageReleasedSequenceCount)
+    plan.bodyIrLifecycleLedgerStorageReleasedBufferCount =
+        plan.bodyIrLifecycleLedgerStorageReleasedBufferCount +
+            int64(receipt.ledgerStorageReleasedBufferCount)
+    plan.bodyIrLifecycleLedgerStorageReleasedBytes =
+        plan.bodyIrLifecycleLedgerStorageReleasedBytes +
+            receipt.ledgerStorageReleasedBytes
+    plan.bodyIrLifecycleAllClosed =
+        plan.bodyIrLifecycleAllClosed &&
+        receipt.payloadReleased &&
+        receipt.ledgerStorageReleased &&
+        receipt.phaseArenaStorageReleased
+
+fn backend2RecordFragmentLifecycleReceipt(
+        plan: var pobj.PrimaryObjectPlan,
+        receipt: var b2life.Backend2FragmentReleaseReceipt) =
+    if !receipt.payloadStorageReleased ||
+       !receipt.auxiliaryStorageReleased ||
+       !receipt.ledgerStorageReleased ||
+       receipt.allocated != receipt.released ||
+       receipt.live != int64(0) ||
+       receipt.allocatedBytes != receipt.releasedBytes ||
+       receipt.liveBytes != int64(0):
+        panic("backend2 fragment lifecycle: unbalanced terminal receipt")
+    plan.backend2FragmentOwnerToken = receipt.ownerToken
+    plan.backend2FragmentFunctionRowCount =
+        receipt.functionRowCount
+    plan.backend2FragmentBuiltFunctionCount =
+        receipt.builtFunctionCount
+    plan.backend2FragmentAllocated = receipt.allocated
+    plan.backend2FragmentReleased = receipt.released
+    plan.backend2FragmentLive = receipt.live
+    plan.backend2FragmentAllocatedBytes =
+        receipt.allocatedBytes
+    plan.backend2FragmentReleasedBytes =
+        receipt.releasedBytes
+    plan.backend2FragmentLiveBytes = receipt.liveBytes
+    plan.backend2FragmentOwnerTransferCount =
+        receipt.ownerTransferCount
+    plan.backend2FragmentPhysicalFreeCount =
+        receipt.releasedBufferCount
+    plan.backend2FragmentManagedStringReleaseCount =
+        receipt.releasedManagedStringValueCount
+    plan.backend2FragmentManagedStringReleasedBytes =
+        receipt.releasedManagedStringBytes
+    plan.backend2FragmentPayloadReleased =
+        receipt.payloadStorageReleased
+    plan.backend2FragmentLedgerStorageReleased =
+        receipt.ledgerStorageReleased
+    plan.backend2FragmentReleaseReceiptConsumed = true
+
+fn backend2RecordAssemblerTempLifecycleReceipt(
+        plan: var pobj.PrimaryObjectPlan,
+        receipt: b2temps.Backend2AssemblerTempReleaseReceipt) =
+    if plan.backend2AssemblerTempReceiptReady ||
+       receipt.allocated != receipt.released ||
+       receipt.live != int64(0) ||
+       receipt.allocatedBytes != receipt.releasedBytes ||
+       receipt.liveBytes != int64(0) ||
+       receipt.physicalBufferCount !=
+           int64(receipt.releasedPhysicalBufferCount) ||
+       receipt.physicalBytes != receipt.releasedPhysicalBytes ||
+       !receipt.rowStorageReleased ||
+       !receipt.aggregateStorageReleased ||
+       !receipt.allSymbolStorageReleased ||
+       !receipt.workerStorageReleased ||
+       !receipt.workerEndpointsClosedAndReaped ||
+       !receipt.ledgerStorageReleased ||
+       receipt.ledgerStorageReleasedSequenceCount != 6 ||
+       receipt.ledgerStorageReleasedBufferCount <= 0 ||
+       receipt.ledgerStorageReleasedBytes <= int64(0):
+        panic("backend2 assembler temp lifecycle: invalid terminal receipt")
+    plan.backend2AssemblerTempReceiptReady = true
+    plan.backend2AssemblerTempOutcome = receipt.outcome
+    plan.backend2AssemblerTempCompletedFunctionCount =
+        receipt.completedFunctionCount
+    plan.backend2AssemblerTempFailedFunctionCount =
+        receipt.failedFunctionCount
+    plan.backend2AssemblerTempAllocated = receipt.allocated
+    plan.backend2AssemblerTempReleased = receipt.released
+    plan.backend2AssemblerTempLive = receipt.live
+    plan.backend2AssemblerTempAllocatedBytes =
+        receipt.allocatedBytes
+    plan.backend2AssemblerTempReleasedBytes =
+        receipt.releasedBytes
+    plan.backend2AssemblerTempLiveBytes = receipt.liveBytes
+    plan.backend2AssemblerTempOwnerTransferCount =
+        receipt.ownerTransferCount
+    plan.backend2AssemblerTempPhysicalBufferCount =
+        receipt.physicalBufferCount
+    plan.backend2AssemblerTempPhysicalBytes =
+        receipt.physicalBytes
+    plan.backend2AssemblerTempPhysicalFreeCount =
+        int64(receipt.releasedPhysicalBufferCount)
+    plan.backend2AssemblerTempPhysicalFreedBytes =
+        receipt.releasedPhysicalBytes
+    plan.backend2AssemblerTempRowStorageReleased =
+        receipt.rowStorageReleased
+    plan.backend2AssemblerTempAggregateStorageReleased =
+        receipt.aggregateStorageReleased
+    plan.backend2AssemblerTempAllSymbolStorageReleased =
+        receipt.allSymbolStorageReleased
+    plan.backend2AssemblerTempWorkerStorageReleased =
+        receipt.workerStorageReleased
+    plan.backend2AssemblerTempWorkerEndpointsClosedAndReaped =
+        receipt.workerEndpointsClosedAndReaped
+    plan.backend2AssemblerTempLedgerStorageReleased =
+        receipt.ledgerStorageReleased
+    plan.backend2AssemblerTempLedgerStorageReleasedSequenceCount =
+        int64(receipt.ledgerStorageReleasedSequenceCount)
+    plan.backend2AssemblerTempLedgerStorageReleasedBufferCount =
+        int64(receipt.ledgerStorageReleasedBufferCount)
+    plan.backend2AssemblerTempLedgerStorageReleasedBytes =
+        receipt.ledgerStorageReleasedBytes
+
+fn backend2FinalizeFragments(
+        fragments: var b2t.FunctionFragment[],
+        fragmentBuilt: var bool[],
+        functionIrIndexes: var int32[],
+        lifecycle: var b2life.Backend2FragmentLifecycle,
+        outcome: int32,
+        plan: var pobj.PrimaryObjectPlan) =
+    var receipt: b2life.Backend2FragmentReleaseReceipt
+    var releaseErr: str
+    if !b2life.Backend2FragmentLifecycleFinalizeStrictInto(
+           lifecycle,
+           fragments,
+           fragmentBuilt,
+           functionIrIndexes,
+           outcome,
+           receipt,
+           releaseErr):
+        panic(releaseErr)
+    backend2RecordFragmentLifecycleReceipt(plan, receipt)
+
+fn backend2AbortAssembler(
+        fragments: var b2t.FunctionFragment[],
+        fragmentBuilt: var bool[],
+        functionIrIndexes: var int32[],
+        lifecycle: var b2life.Backend2FragmentLifecycle,
+        tempLifecycle:
+            var b2temps.Backend2AssemblerTempLifecycle,
+        plan: var pobj.PrimaryObjectPlan,
+        message: str) =
+    var tempReceipt: b2temps.Backend2AssemblerTempReleaseReceipt
+    var tempReleaseErr: str
+    if !b2temps.Backend2AssemblerTempLifecycleFinalizeStrictInto(
+           tempLifecycle,
+           b2temps.Backend2AssemblerTempOutcomeFailure,
+           tempReceipt,
+           tempReleaseErr):
+        panic(tempReleaseErr)
+    backend2RecordAssemblerTempLifecycleReceipt(plan, tempReceipt)
+    backend2FinalizeFragments(
+        fragments,
+        fragmentBuilt,
+        functionIrIndexes,
+        lifecycle,
+        b2life.Backend2FragmentOutcomeAssemblerFailure,
+        plan)
+    panic(message)
+
+fn backend2AbortAssemblerWithBodyIr(
+        fragments: var b2t.FunctionFragment[],
+        fragmentBuilt: var bool[],
+        functionIrIndexes: var int32[],
+        lifecycle: var b2life.Backend2FragmentLifecycle,
+        tempLifecycle:
+            var b2temps.Backend2AssemblerTempLifecycle,
+        bodyIrLifecycle:
+            var bodylifecycle.BodyIrFunctionLifecycle,
+        bodyIR: var coreir.BodyIR,
+        plan: var pobj.PrimaryObjectPlan,
+        message: str) =
+    var bodyReceipt: bodylifecycle.BodyIrFunctionLifecycleReceipt
+    bodylifecycle.BodyIrFunctionLifecycleRelease(
+        bodyIrLifecycle,
+        bodyIR,
+        bodylifecycle.BodyIrFunctionOutcomeEmitFailure,
+        bodyReceipt)
+    backend2RecordBodyIrLifecycleReceipt(plan, bodyReceipt)
+    backend2AbortAssembler(
+        fragments,
+        fragmentBuilt,
+        functionIrIndexes,
+        lifecycle,
+        tempLifecycle,
+        plan,
+        message)
+
+fn Backend2FinalizeNoLowerableFragmentsInto(
+        fragments: var b2t.FunctionFragment[],
+        fragmentBuilt: var bool[],
+        functionIrIndexes: var int32[],
+        lifecycle: var b2life.Backend2FragmentLifecycle,
+        plan: var pobj.PrimaryObjectPlan) =
+    backend2FinalizeFragments(
+        fragments,
+        fragmentBuilt,
+        functionIrIndexes,
+        lifecycle,
+        b2life.Backend2FragmentOutcomeNoLowerable,
+        plan)
+
+fn Backend2FinalizeWorkerFailureFragmentsInto(
+        fragments: var b2t.FunctionFragment[],
+        fragmentBuilt: var bool[],
+        functionIrIndexes: var int32[],
+        lifecycle: var b2life.Backend2FragmentLifecycle,
+        plan: var pobj.PrimaryObjectPlan) =
+    backend2FinalizeFragments(
+        fragments,
+        fragmentBuilt,
+        functionIrIndexes,
+        lifecycle,
+        b2life.Backend2FragmentOutcomeWorkerFailure,
+        plan)
+
+# allSymbolNames: 全量函数符号表 (N 索引域, 含 importc 占位), 供 funcaddr data reloc 解析
+# __cheng_function_address#N → allSymbolNames[N] (已 mangled)。Tier-1/3 (无 funcaddr marker) 传空亦正确。
+fn Backend2AssembleInto(fragments: var b2t.FunctionFragment[],
+                        fragmentBuilt: var bool[],
+                        functionIrIndexes: var int32[],
+                        functionTypedIrIndexes: var int32[],
+                        functionNameIds: var int32[],
+                        functionNames: var str[],
+                        functionSymbolRoles: var int32[],
+                        functionNameInternPoolDomainCid:
+                            layout.FixedBytes32,
+                        functionNameIdentityReceiptCid:
+                            layout.FixedBytes32,
+                        entryFunctionIrIndex: int32,
+                        assemblerTemps:
+                            var b2temps.Backend2AssemblerTempLifecycle,
+                        linkPlan: var slplan.SystemLinkPlanStub,
+                        expectedTypeArenaArtifactCid:
+                            layout.FixedBytes32,
+                        fragmentLifecycle:
+                            var b2life.Backend2FragmentLifecycle,
+                        plan: var pobj.PrimaryObjectPlan) =
+    let triple = linkPlan.targetTriple
+    if !assemblerTemps.allSymbolsMovedToAssembler:
+        backend2AbortAssembler(
+            fragments,
+            fragmentBuilt,
+            functionIrIndexes,
+            fragmentLifecycle,
+            assemblerTemps,
+            plan,
+            "backend2 assembler lifecycle: all symbols not transferred")
+    if !regart.RegallocProductionTargetUsesCanonicalRegalloc(triple):
+        backend2AbortAssembler(
+            fragments,
+            fragmentBuilt,
+            functionIrIndexes,
+            fragmentLifecycle,
+            assemblerTemps,
+            plan,
+            "backend2 canonical regalloc target unsupported")
+    var encoderSourceRow: int32 = -1
+    var encoderRuntimeAuthorityCid: layout.FixedBytes32
+    if tmat.TargetIsRiscvCodegen(triple):
+        var encoderAuthorityRes =
+            encauthority.CompilerToolchainEncoderRuntimeAuthorityImportCurrent()
+        # Driver-context default correction (2026-08-29 runtime walls, same
+        # family as primary_object_plan): the process vector cannot name a
+        # receipted binary inside combined kernel/plugin drivers (ambient argv
+        # is not propagated into the fixture-compile context).  Anchor on the
+        # workspace's official published compiler authority; the full import
+        # validation chain and every rejection are unchanged, so a workspace
+        # with a missing or drifted authority still fails closed here.
+        if IsErr(encoderAuthorityRes):
+            # Spec migration: a managed field read yields a borrow view, so the
+            # let local is borrowed; a borrowed actual cannot bind a non-var
+            # non-@borrows formal (default move).  Clone into an owned value.
+            let workspaceRootForAuthority: str = strings.CloneStr(
+                linkPlan.packageRoot)
+            encoderAuthorityRes =
+                encauthority.CompilerToolchainEncoderRuntimeAuthorityImportForWorkspace(
+                    workspaceRootForAuthority)
+        if IsErr(encoderAuthorityRes):
+            backend2AbortAssembler(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                plan,
+                Fmt"backend2 encoder runtime authority import failed{Error(encoderAuthorityRes)}")
+        let encoderAuthority = Value(encoderAuthorityRes)
+        if encoderAuthority.canonicalRow < 0 ||
+           layout.FixedBytes32Equal(
+               encoderAuthority.runtimeAuthorityCid,
+               layout.FixedBytes32()):
+            backend2AbortAssembler(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                plan,
+                "backend2 encoder runtime authority invalid")
+        encoderSourceRow = encoderAuthority.canonicalRow
+        encoderRuntimeAuthorityCid =
+            layout.FixedBytes32Copy(
+                encoderAuthority.runtimeAuthorityCid)
+        var emitXlen = 64
+        if tmat.TargetIsRv32(triple):
+            emitXlen = rvenc.RvIsaEsp32S31Xlen()
+        if !rvenc.RvIsaXlenOk(emitXlen):
+            backend2AbortAssembler(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                plan,
+                "backend2 riscv encoder xlen invalid")
+    plan.targetTriple = triple
+    plan.objectFormat = tmat.TargetPrimaryObjectFormat(triple)
+    plan.actualBackendKind = "backend2"
+    if linkPlan.emitKind == creq.EmitObj:
+        plan.outputPath = linkPlan.outputPath
+    else:
+        plan.outputPath = Fmt"{linkPlan.outputPath}.primary.o"
+    plan.entryPath = linkPlan.entryPath
+    if fragments.len != fragmentBuilt.len ||
+       functionIrIndexes.len != fragments.len ||
+       functionSymbolRoles.len != functionTypedIrIndexes.len ||
+       layout.FixedBytes32Equal(
+           functionNameInternPoolDomainCid,
+           layout.FixedBytes32()) ||
+       layout.FixedBytes32Equal(
+           functionNameIdentityReceiptCid,
+           layout.FixedBytes32()):
+        backend2AbortAssembler(
+            fragments,
+            fragmentBuilt,
+            functionIrIndexes,
+            fragmentLifecycle,
+            assemblerTemps,
+            plan,
+            "backend2 canonical function identity shape invalid")
+    var typedFunctionSymbolRows: int32[]
+    for _ in 0..<functionTypedIrIndexes.len:
+        add(typedFunctionSymbolRows, -1)
+    if assemblerTemps.allSymbolNames.len !=
+           functionTypedIrIndexes.len:
+        backend2AbortAssembler(
+            fragments,
+            fragmentBuilt,
+            functionIrIndexes,
+            fragmentLifecycle,
+            assemblerTemps,
+            plan,
+            "backend2 canonical symbol projection shape invalid")
+    for functionRow in 0..<functionTypedIrIndexes.len:
+        let typedFunctionIndex =
+            functionTypedIrIndexes[functionRow]
+        if typedFunctionIndex < 0 ||
+           typedFunctionIndex >= typedFunctionSymbolRows.len ||
+           typedFunctionSymbolRows[typedFunctionIndex] != -1 ||
+           (functionSymbolRoles[functionRow] !=
+                pobj.PrimaryObjectSymbolRoleTypedName &&
+            functionSymbolRoles[functionRow] !=
+                pobj.PrimaryObjectSymbolRoleExplicitExport &&
+            functionSymbolRoles[functionRow] !=
+                pobj.PrimaryObjectSymbolRoleSourceEntry) ||
+           len(assemblerTemps.allSymbolNames[functionRow]) <= 0:
+            backend2AbortAssembler(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                plan,
+                "backend2 canonical typed symbol projection invalid")
+        typedFunctionSymbolRows[typedFunctionIndex] = functionRow
+    plan.symbolNameInternPoolDomainCid =
+        layout.FixedBytes32Copy(
+            functionNameInternPoolDomainCid)
+    plan.symbolLoweringIdentityReceiptCid =
+        layout.FixedBytes32Copy(
+            functionNameIdentityReceiptCid)
+    plan.entrySymbol = ""
+    plan.entryFunctionSymbol = ""
+    var entryFunctionRow: int32 = -1
+    if entryFunctionIrIndex >= 0:
+        for row in 0..<functionIrIndexes.len:
+            if functionIrIndexes[row] == entryFunctionIrIndex:
+                if entryFunctionRow >= 0:
+                    backend2AbortAssembler(
+                        fragments,
+                        fragmentBuilt,
+                        functionIrIndexes,
+                        fragmentLifecycle,
+                        assemblerTemps,
+                        plan,
+                        "backend2 canonical entry identity duplicate")
+                entryFunctionRow = row
+        if entryFunctionRow < 0 ||
+           !fragmentBuilt[entryFunctionRow] ||
+           fragments[entryFunctionRow].functionSymbol == "":
+            backend2AbortAssembler(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                plan,
+                "backend2 canonical entry identity missing")
+        plan.entrySymbol = share(
+            fragments[entryFunctionRow].functionSymbol)
+        let entrySymbolRow = functionIrIndexes[entryFunctionRow]
+        if entrySymbolRow < 0 ||
+           entrySymbolRow >= assemblerTemps.allSymbolNames.len:
+            backend2AbortAssembler(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                plan,
+                "backend2 canonical entry symbol row invalid")
+        plan.entryFunctionSymbol = Backend2FunctionSymbolAtRowExact(
+            assemblerTemps.allSymbolNames, entrySymbolRow)
+    var builtFunctionCount: int32
+    for row in 0..<fragmentBuilt.len:
+        if fragmentBuilt[row]:
+            builtFunctionCount = builtFunctionCount + 1
+    plan.reachableFunctionCount = builtFunctionCount
+    if plan.bodyIrLifecycleFunctionCount != 0 ||
+       plan.bodyIrLifecycleAllocated != int64(0) ||
+       plan.bodyIrLifecycleReleased != int64(0) ||
+       plan.bodyIrLifecycleLive != int64(0) ||
+       plan.bodyIrLifecycleAllocatedBytes != int64(0) ||
+       plan.bodyIrLifecycleReleasedBytes != int64(0) ||
+       plan.bodyIrLifecycleLiveBytes != int64(0) ||
+       plan.bodyIrLifecycleOwnerTransferCount != int64(0) ||
+       plan.bodyIrLifecyclePhysicalBufferCount != int64(0) ||
+       plan.bodyIrLifecyclePhysicalFreeCount != int64(0) ||
+       plan.bodyIrLifecycleLedgerStorageReleasedSequenceCount != int64(0) ||
+       plan.bodyIrLifecycleLedgerStorageReleasedBufferCount != int64(0) ||
+       plan.bodyIrLifecycleLedgerStorageReleasedBytes != int64(0) ||
+       plan.backend2AssemblerTempReceiptReady ||
+       plan.bodyIrLifecycleAllClosed:
+        backend2AbortAssembler(
+            fragments,
+            fragmentBuilt,
+            functionIrIndexes,
+            fragmentLifecycle,
+            assemblerTemps,
+            plan,
+            "backend2 body ir lifecycle: assemble requires empty receipt")
+    plan.bodyIrLifecycleAllClosed = true
+    pobj.PrimaryObjectPlanRegallocFunctionIndexInit(
+        plan, builtFunctionCount)
+    var offset: int32
+    var builtOrdinal: int32
+    var entryFunctionPublished: bool
+    for i in 0..<fragments.len:
+        if !fragmentBuilt[i]:
+            continue
+        b2temps.Backend2AssemblerTempLifecycleBeginRow(
+            assemblerTemps, i)
+        if functionIrIndexes[i] < 0 ||
+           functionIrIndexes[i] >= functionTypedIrIndexes.len ||
+           functionIrIndexes[i] >= functionNameIds.len ||
+           functionIrIndexes[i] >= functionNames.len ||
+           functionTypedIrIndexes[functionIrIndexes[i]] < 0 ||
+           functionNameIds[functionIrIndexes[i]] < 0 ||
+           functionNames[functionIrIndexes[i]] !=
+               fragments[i].functionSymbol ||
+           fragments[i].functionSymbol == "" ||
+           fragments[i].globalDataLabelsRaw.len !=
+               fragments[i].globalDataPayloadTexts.len ||
+           fragments[i].globalDataLabelsRaw.len !=
+               fragments[i].globalDataPayloadByteCounts.len ||
+           fragments[i].cstringDataLabels.len !=
+               fragments[i].cstringPayloadRawByteCounts.len ||
+           !backend2CanonicalLegacyMachineFieldsEmpty(fragments[i]):
+            backend2AbortAssembler(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                plan,
+                "backend2 canonical fragment structure invalid")
+        let fragmentIdentityFailure =
+            backend2CanonicalFragmentIdentityFailure(fragments[i])
+        if fragmentIdentityFailure !=
+               Backend2AssemblerFailureNone:
+            backend2AbortAssembler(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                plan,
+                Fmt"backend2 canonical fragment identity failure code={fragmentIdentityFailure}")
+        var bodyIR: coreir.BodyIR
+        var bodyIrDecoded: bool
+        var bodyIrDecodeFailure: Backend2AssemblerFailureKind
+        if !backend2CanonicalBodyIrInto(
+               fragments[i],
+               expectedTypeArenaArtifactCid,
+               bodyIR,
+               bodyIrDecoded,
+               bodyIrDecodeFailure):
+            if bodyIrDecoded:
+                var failedBodyIrLifecycle: bodylifecycle.BodyIrFunctionLifecycle
+                bodylifecycle.BodyIrFunctionLifecycleBegin(
+                    failedBodyIrLifecycle,
+                    bodyIR,
+                    functionIrIndexes[i])
+                bodylifecycle.BodyIrFunctionLifecycleMoveToEmitter(
+                    failedBodyIrLifecycle)
+                backend2AbortAssemblerWithBodyIr(
+                    fragments,
+                    fragmentBuilt,
+                    functionIrIndexes,
+                    fragmentLifecycle,
+                    assemblerTemps,
+                    failedBodyIrLifecycle,
+                    bodyIR,
+                    plan,
+                    Fmt"backend2 canonical BodyIR decode failure code={bodyIrDecodeFailure}")
+            backend2AbortAssembler(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                plan,
+                Fmt"backend2 canonical BodyIR admission failure code={bodyIrDecodeFailure}")
+        var bodyIrLifecycle: bodylifecycle.BodyIrFunctionLifecycle
+        var bodyIrLifecycleReceipt: bodylifecycle.BodyIrFunctionLifecycleReceipt
+        bodylifecycle.BodyIrFunctionLifecycleBegin(
+            bodyIrLifecycle, bodyIR, functionIrIndexes[i])
+        bodylifecycle.BodyIrFunctionLifecycleMoveToEmitter(
+            bodyIrLifecycle)
+        if !backend2CanonicalCStringPayloadExact(fragments[i], bodyIR) ||
+           !backend2CanonicalGlobalRowsExact(fragments[i], bodyIR, triple):
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                "backend2 canonical fragment data payload mismatch")
+        let symbolRow = functionIrIndexes[i]
+        if symbolRow < 0 ||
+           symbolRow >= assemblerTemps.allSymbolNames.len:
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                "backend2 canonical definition symbol row invalid")
+        let symbol = Backend2FunctionSymbolAtRowExact(
+            assemblerTemps.allSymbolNames, symbolRow)
+        if i == entryFunctionRow:
+            if symbol != plan.entryFunctionSymbol:
+                backend2AbortAssemblerWithBodyIr(
+                    fragments,
+                    fragmentBuilt,
+                    functionIrIndexes,
+                    fragmentLifecycle,
+                    assemblerTemps,
+                    bodyIrLifecycle,
+                    bodyIR,
+                    plan,
+                    "backend2 canonical entry symbol materialization drift")
+            entryFunctionPublished = true
+        if regart.RegallocProductionFunctionIndexCheck(
+               plan.regallocFunctionIndex,
+               functionIrIndexes[i],
+               regart.RegallocProductionFunctionKindNormal,
+               Fmt"{symbol}") !=
+               regart.RegallocProductionFunctionIndexAppendOk ||
+           backend2CanonicalTextIndex(
+               assemblerTemps.seenDataLabels, Fmt"{symbol}") >= 0:
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                "backend2 canonical duplicate/colliding function symbol")
+        b2temps.Backend2AssemblerTempAppendSeenFunctionSymbol(
+            assemblerTemps, symbol)
+        if builtOrdinal > 2147383647:
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                "backend2 canonical item id overflow")
+        let itemId = 100000 + builtOrdinal
+        if offset < 0 || offset > 536870911:
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                "backend2 canonical regalloc symbol offset overflow")
+        var resolvedTargetFailure: Backend2AssemblerFailureKind
+        if !backend2CanonicalResolvedCallTargetsInto(
+               bodyIR,
+               triple,
+               typedFunctionSymbolRows,
+               assemblerTemps.allSymbolNames,
+               assemblerTemps.resolvedCallTargets,
+               resolvedTargetFailure):
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                Fmt"backend2 canonical call target failure code={resolvedTargetFailure}")
+        if !backend2CanonicalResolvedDataTargetsInto(
+               bodyIR,
+               triple,
+               assemblerTemps.allSymbolNames,
+               assemblerTemps.resolvedDataTargets,
+               resolvedTargetFailure):
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                Fmt"backend2 canonical data target failure code={resolvedTargetFailure}")
+        for ci in 0..<fragments[i].cstringDataLabels.len:
+            add(assemblerTemps.resolvedCStringTargets,
+                pobj.PrimaryTargetSymbolName(triple,
+                                             fragments[i].cstringDataLabels[ci]))
+        b2temps.Backend2AssemblerTempLifecycleBindResolved(
+            assemblerTemps)
+        let managedReplaceReceipt =
+            managedreplace.ManagedLvalueReplaceProductionVerify(
+                bodyIR)
+        if !managedReplaceReceipt.valid:
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                "backend2 managed lvalue replace admission failed")
+        bodylifecycle.BodyIrFunctionLifecycleBorrowForRegalloc(
+            bodyIrLifecycle)
+        assemblerTemps.emission =
+            regprod.RegallocProductionEmitFunctionWithEncoderAuthority(
+            triple, bodyIR, Fmt"{symbol}", offset * 4,
+            assemblerTemps.resolvedCallTargets,
+            assemblerTemps.resolvedDataTargets,
+            functionIrIndexes[i],
+            regart.RegallocProductionFunctionKindNormal,
+            encoderSourceRow,
+            encoderRuntimeAuthorityCid)
+        bodylifecycle.BodyIrFunctionLifecycleReturnRegallocBorrow(
+            bodyIrLifecycle)
+        b2temps.Backend2AssemblerTempLifecycleAttachEmission(
+            assemblerTemps)
+        if !assemblerTemps.emission.valid ||
+           assemblerTemps.emission.targetTriple != triple ||
+           assemblerTemps.emission.recipeOrigin !=
+               regart.RegallocProductionRecipeOriginBodyIrAdapter ||
+           !regprod.RegallocProductionEmissionPublishedPayloadExact(
+               assemblerTemps.emission):
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                Fmt"backend2 canonical regalloc production emit failed symbol={symbol} code={assemblerTemps.emission.errorCode} plan_code={assemblerTemps.emission.plan.errorCode} detail={assemblerTemps.emission.errorDetail}")
+        if assemblerTemps.emission.recipes.functionWords.len >
+               536870911 - offset:
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                "backend2 canonical regalloc symbol extent overflow")
+        if assemblerTemps.emission.receipt.symbolName != symbol ||
+           assemblerTemps.emission.receipt.symbolByteStart != offset * 4 ||
+           assemblerTemps.emission.receipt.symbolByteLength !=
+               assemblerTemps.emission.recipes.functionWords.len * 4:
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                "backend2 canonical regalloc symbol receipt mismatch")
+        add(plan.symbolNames, Fmt"{symbol}")
+        add(plan.symbolTypedFunctionIndexes,
+            functionTypedIrIndexes[functionIrIndexes[i]])
+        add(plan.symbolNameIds,
+            functionNameIds[functionIrIndexes[i]])
+        add(plan.symbolRoles,
+            functionSymbolRoles[functionIrIndexes[i]])
+        add(plan.functionBodyKinds, texpr.BodyKindStatementSequence)
+        add(plan.functionIrIndexes, functionIrIndexes[i])
+        add(plan.functionWordOffsets, offset)
+        add(plan.functionWordCounts,
+            assemblerTemps.emission.recipes.functionWords.len)
+        add(plan.itemIds, itemId)
+        for wordIndex in 0..<
+                assemblerTemps.emission.recipes.functionWords.len:
+            add(plan.instructionWords,
+                assemblerTemps.emission.recipes.functionWords[wordIndex])
+        if !backend2AppendCanonicalRelocs(plan,
+                                          bodyIR,
+                                          assemblerTemps.emission,
+                                          itemId,
+                                          offset,
+                                          assemblerTemps.resolvedCallTargets,
+                                          assemblerTemps.resolvedDataTargets,
+                                          assemblerTemps.resolvedCStringTargets):
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                "backend2 canonical regalloc relocation receipt mismatch")
+        if !pobj.PrimaryObjectPlanRecordRegallocProductionEvidence(plan,
+                                                                    bodyIR,
+                                                                    assemblerTemps.emission,
+                                                                    functionIrIndexes[i],
+                                                                    regart.RegallocProductionFunctionKindNormal):
+            backend2AbortAssemblerWithBodyIr(
+                fragments,
+                fragmentBuilt,
+                functionIrIndexes,
+                fragmentLifecycle,
+                assemblerTemps,
+                bodyIrLifecycle,
+                bodyIR,
+                plan,
+                "backend2 canonical regalloc evidence publication failed")
+        # global-reloc slice: global __data 标签 (raw -> mangle; payload text = zero:N/hex:<u32le>)。
+        # 插在 cstring 标签块之前 => 每 fragment 先 global 后 cstring (byte-identity, 镜像老侧 pipeline
+        # AppendGlobalDataLabels→AppendCStringDataLabels 顺序)。global payload 走 text (byteCount 恒 0,
+        # 不进 dataPayloadRawBytes 扁平流), 由 direct_object_emit else 臂按 zero:/hex: 消费。
+        for gi in 0..<fragments[i].globalDataLabelsRaw.len:
+            let giLabel = fragments[i].globalDataLabelsRaw[gi]
+            let giPayload = fragments[i].globalDataPayloadTexts[gi]
+            let giByteCount = fragments[i].globalDataPayloadByteCounts[gi]
+            let finalLabel = pobj.PrimaryTargetSymbolName(triple, giLabel)
+            let slotName = backend2CanonicalGlobalSlotNameAt(bodyIR, gi)
+            let seenIndex = backend2CanonicalTextIndex(
+                assemblerTemps.seenGlobalLabels, Fmt"{finalLabel}")
+            if seenIndex >= 0:
+                if assemblerTemps.seenGlobalSlotNames[seenIndex] !=
+                       slotName ||
+                   assemblerTemps.seenGlobalPayloadTexts[seenIndex] !=
+                       giPayload ||
+                   assemblerTemps.seenGlobalPayloadByteCounts[seenIndex] !=
+                       giByteCount:
+                    backend2AbortAssemblerWithBodyIr(
+                        fragments,
+                        fragmentBuilt,
+                        functionIrIndexes,
+                        fragmentLifecycle,
+                        assemblerTemps,
+                        bodyIrLifecycle,
+                        bodyIR,
+                        plan,
+                        "backend2 canonical global label collision")
+                continue
+            if backend2CanonicalTextIndex(
+                   assemblerTemps.seenFunctionSymbols,
+                   Fmt"{finalLabel}") >= 0 ||
+               backend2CanonicalTextIndex(
+                   assemblerTemps.seenDataLabels,
+                   Fmt"{finalLabel}") >= 0:
+                backend2AbortAssemblerWithBodyIr(
+                    fragments,
+                    fragmentBuilt,
+                    functionIrIndexes,
+                    fragmentLifecycle,
+                    assemblerTemps,
+                    bodyIrLifecycle,
+                    bodyIR,
+                    plan,
+                    "backend2 canonical global symbol collision")
+            b2temps.Backend2AssemblerTempAppendSeenGlobalLabel(
+                assemblerTemps, finalLabel)
+            b2temps.Backend2AssemblerTempAppendSeenDataLabel(
+                assemblerTemps, finalLabel)
+            b2temps.Backend2AssemblerTempAppendSeenGlobalSlotName(
+                assemblerTemps, slotName)
+            b2temps.Backend2AssemblerTempAppendSeenGlobalPayloadText(
+                assemblerTemps, giPayload)
+            b2temps.Backend2AssemblerTempAppendSeenGlobalPayloadByteCount(
+                assemblerTemps, giByteCount)
+            add(plan.dataLabels, Fmt"{finalLabel}")
+            add(plan.dataPayloadTexts, Fmt"{giPayload}")
+            add(plan.dataPayloadRawByteCounts, giByteCount)
+        # slice-2B: cstring __data 标签 + 载荷 (raw label -> mangle; 载荷字节流扁平拼接)。
+        # dataLabels/dataPayloadTexts/dataPayloadRawByteCounts 三者按标签并行; dataPayloadRawBytes
+        # 是扁平流, 由 byteCounts 分段 (与 pobj PrimaryBodyIrAppendCStringDataLabels 契约同形)。
+        for ci in 0..<fragments[i].cstringDataLabels.len:
+            let finalLabel =
+                assemblerTemps.resolvedCStringTargets[ci]
+            if backend2CanonicalTextIndex(
+                   assemblerTemps.seenFunctionSymbols,
+                   Fmt"{finalLabel}") >= 0 ||
+               backend2CanonicalTextIndex(
+                   assemblerTemps.seenDataLabels,
+                   Fmt"{finalLabel}") >= 0:
+                backend2AbortAssemblerWithBodyIr(
+                    fragments,
+                    fragmentBuilt,
+                    functionIrIndexes,
+                    fragmentLifecycle,
+                    assemblerTemps,
+                    bodyIrLifecycle,
+                    bodyIR,
+                    plan,
+                    "backend2 canonical cstring symbol collision")
+            b2temps.Backend2AssemblerTempAppendSeenDataLabel(
+                assemblerTemps, finalLabel)
+            add(plan.dataLabels, Fmt"{finalLabel}")
+            add(plan.dataPayloadTexts, "-")
+            add(plan.dataPayloadRawByteCounts,
+                fragments[i].cstringPayloadRawByteCounts[ci])
+        for bidx in 0..<fragments[i].cstringPayloadRawBytes.len:
+            add(plan.dataPayloadRawBytes,
+                fragments[i].cstringPayloadRawBytes[bidx])
+        offset = offset +
+            assemblerTemps.emission.recipes.functionWords.len
+        builtOrdinal = builtOrdinal + 1
+        b2temps.Backend2AssemblerTempLifecycleMoveToPublisher(
+            assemblerTemps)
+        b2temps.Backend2AssemblerTempLifecycleReleaseRow(
+            assemblerTemps, true)
+        bodylifecycle.BodyIrFunctionLifecycleRelease(
+            bodyIrLifecycle,
+            bodyIR,
+            bodylifecycle.BodyIrFunctionOutcomeEmitSuccess,
+            bodyIrLifecycleReceipt)
+        backend2RecordBodyIrLifecycleReceipt(
+            plan, bodyIrLifecycleReceipt)
+    if plan.bodyIrLifecycleFunctionCount != builtFunctionCount ||
+       plan.bodyIrLifecycleAllocated != int64(builtFunctionCount) ||
+       plan.bodyIrLifecycleReleased != int64(builtFunctionCount) ||
+       plan.bodyIrLifecycleLive != int64(0) ||
+       plan.bodyIrLifecycleAllocatedBytes !=
+           plan.bodyIrLifecycleReleasedBytes ||
+       plan.bodyIrLifecycleLiveBytes != int64(0) ||
+       plan.bodyIrLifecycleOwnerTransferCount !=
+           int64(builtFunctionCount) ||
+       plan.bodyIrLifecyclePhysicalBufferCount !=
+           plan.bodyIrLifecyclePhysicalFreeCount ||
+       !plan.bodyIrLifecycleAllClosed:
+        backend2AbortAssembler(
+            fragments,
+            fragmentBuilt,
+            functionIrIndexes,
+            fragmentLifecycle,
+            assemblerTemps,
+            plan,
+            "backend2 body ir lifecycle: assemble stream is unbalanced")
+    if !backend2CanonicalEvidenceCountExact(plan, builtFunctionCount):
+        backend2AbortAssembler(
+            fragments,
+            fragmentBuilt,
+            functionIrIndexes,
+            fragmentLifecycle,
+            assemblerTemps,
+            plan,
+            "backend2 canonical regalloc evidence count mismatch")
+    if plan.symbolTypedFunctionIndexes.len != builtFunctionCount ||
+       plan.symbolNameIds.len != builtFunctionCount ||
+       plan.symbolRoles.len != builtFunctionCount:
+        backend2AbortAssembler(
+            fragments,
+            fragmentBuilt,
+            functionIrIndexes,
+            fragmentLifecycle,
+            assemblerTemps,
+            plan,
+            "backend2 canonical symbol identity publication incomplete")
+    plan.symbolIdentityReceiptCid =
+        pobj.PrimaryObjectPlanSymbolIdentityReceiptCid(plan)
+    if layout.FixedBytes32Equal(
+           plan.symbolIdentityReceiptCid,
+           layout.FixedBytes32()):
+        backend2AbortAssembler(
+            fragments,
+            fragmentBuilt,
+            functionIrIndexes,
+            fragmentLifecycle,
+            assemblerTemps,
+            plan,
+            "backend2 canonical symbol identity receipt missing")
+    if entryFunctionRow >= 0 && !entryFunctionPublished:
+        backend2AbortAssembler(
+            fragments,
+            fragmentBuilt,
+            functionIrIndexes,
+            fragmentLifecycle,
+            assemblerTemps,
+            plan,
+            "backend2 canonical entry row not published")
+    var assemblerTempReceipt: b2temps.Backend2AssemblerTempReleaseReceipt
+    var assemblerTempReleaseErr: str
+    if !b2temps.Backend2AssemblerTempLifecycleFinalizeStrictInto(
+           assemblerTemps,
+           b2temps.Backend2AssemblerTempOutcomeSuccess,
+           assemblerTempReceipt,
+           assemblerTempReleaseErr):
+        panic(assemblerTempReleaseErr)
+    backend2RecordAssemblerTempLifecycleReceipt(
+        plan, assemblerTempReceipt)
+    backend2FinalizeFragments(
+        fragments,
+        fragmentBuilt,
+        functionIrIndexes,
+        fragmentLifecycle,
+        b2life.Backend2FragmentOutcomeAssembled,
+        plan)

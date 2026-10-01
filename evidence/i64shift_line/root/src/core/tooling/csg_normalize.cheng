@@ -1,0 +1,570 @@
+# csg_normalize.cheng
+#
+# Per-def semantic-cid normalization pass (libp2p 正典 §11.6 P1 首片).
+#
+# 目标: 消掉 CompilerCsgCanonicalGraphCid 的三处“位置性”敏感通道, 使同一逻辑图在
+# 源中 def 重排后得到相同 normalized cid。三处位置性通道 (compiler_csg.cheng):
+#   ① CompilerCsgHashNode ownerNodeId(:1615)  —— 对父节点位置整数的引用
+#   ② CompilerCsgHashEdge fromNodeId/toNodeId  —— 两端点是位置整数
+#   ③ CompilerCsgCanonicalGraphCid             —— 按插入序遍历 nodeId/edgeId
+# 本 pass 用内容寻址 (content-cid) 替掉全部三处: 节点 owner 引用改代入 owner 的
+# normalized cid; 边端点改代入两端 def 的 normalized cid; 顶层用排序 multiset 替插入序。
+#
+# 这是一个纯只读后处理: 只读 compiler_csg 的 CompilerCsgNode/CompilerCsgEdge
+# 数据与 nodeKind/edgeKind 常量。节点 schema 的 semantic identity 字段必须与本层
+# local/content 编码同步，禁止从 factText 反解析身份。
+#
+# 依赖方向 (核实): 节点内容唯一的 node->node 引用是 ownerNodeId, 指向父节点, 以 package
+# 为根构成严格树 => 全单点 SCC。module Imports 边可成环, 但只进边 cid, 不进节点 payload,
+# 故不造成内容环。因此本图今日对每个节点都产单点 component。仍实现通用 Tarjan (迭代显式
+# 栈避栈溢), 使 pass 在未来引入 symbol->symbol 内容引用成环时仍正确; 环内用 component-local
+# canonical 序号解环。
+#
+# 诚实边界 (α 等价): 本 cid 层只 hash nodes/edges; symbol 节点 factText = 函数名，
+# overload 身份另由 semanticSource/参数/返回类型参与 hash；声明行只属于 raw evidence，
+# 永不进入 normalized hash。签名不完整仅在同源同名唯一时成立，线性 validation 拒绝
+# 任何歧义。函数体与局部变量名仍不进入本层。
+# 故本层对“局部变量改名”本就不敏感 (名字根本不入 hash)。真正被本 pass 修掉的敏感度 =
+# def 重排 (位置通道三处)。改 symbolText/factText 本就该变 cid (真语义变更, 非 α)。
+# 若日后把函数体折进 def-cid, 那时 α(体内局部名) 才成为敏感度; 当前层无此增量可留。
+
+import std/system
+import std/os
+import std/strings
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
+import cheng/core/tooling/compiler_csg as ccsg
+
+type
+    CsgNormOwnerGraph =
+        succStart: int32[]
+        succList: int32[]
+
+    CsgNormComponentSet =
+        compNodes: int32[]
+        compStart: int32[]
+
+# ---- domain-separated 字节编码器 (复刻 compiler_csg :1582-1598, 换 domain 头隔离 cid 空间) ----
+
+fn csgNormAppendU32BE(buf: var layout.ByteBuf, value: int64) =
+    layout.ByteBufAppendByte(buf, (value >> 24) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 16) & 255)
+    layout.ByteBufAppendByte(buf, (value >> 8) & 255)
+    layout.ByteBufAppendByte(buf, value & 255)
+
+@borrows
+fn csgNormAppendFixed32(buf: var layout.ByteBuf,
+                        value: layout.FixedBytes32) =
+    layout.ByteBufAppendFixed32(buf, value)
+
+@borrows
+fn csgNormAppendText(buf: var layout.ByteBuf, text: str) =
+    csgNormAppendU32BE(buf, text.len)
+    for i in 0..<text.len:
+        layout.ByteBufAppendByte(buf, text[i])
+
+fn csgNormBufCid(buf: var layout.ByteBuf): layout.FixedBytes32 =
+    let cid = hash256.Sha256Fixed(layout.ByteBufView(buf))
+    layout.ByteBufFree(buf)
+    return cid
+
+# ---- FixedBytes32 全序 (逐字节, 复刻 lsmr_types.cheng:195 范式) ----
+
+@borrows
+fn CsgNormFixedBytes32Less(a: layout.FixedBytes32,
+                            b: layout.FixedBytes32): bool =
+    for i in 0..<layout.FixedBytes32Size:
+        if a.data[i] != b.data[i]:
+            return a.data[i] < b.data[i]
+    return false
+
+# ---- kind 合法性 (未知硬错, 不静默跳过) ----
+
+fn csgNormNodeKindKnown(k: int32): bool =
+    return k == ccsg.CompilerCsgNodeKindPackage ||
+           k == ccsg.CompilerCsgNodeKindModule ||
+           k == ccsg.CompilerCsgNodeKindSymbol ||
+           k == ccsg.CompilerCsgNodeKindLayout ||
+           k == ccsg.CompilerCsgNodeKindEffect ||
+           k == ccsg.CompilerCsgNodeKindCapability
+
+fn csgNormEdgeKindKnown(k: int32): bool =
+    return k == ccsg.CompilerCsgEdgeKindContains ||
+           k == ccsg.CompilerCsgEdgeKindImports ||
+           k == ccsg.CompilerCsgEdgeKindHasLayout ||
+           k == ccsg.CompilerCsgEdgeKindHasEffect ||
+           k == ccsg.CompilerCsgEdgeKindHasCapability
+
+# ---- 位置无关局部指纹: 15 语义字段, 不含 raw 声明行与 owner/邻居引用 ----
+
+@borrows
+fn CsgNormLocalFingerprint(
+        node: ccsg.CompilerCsgNode): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.ByteBufInit(256)
+    csgNormAppendText(buf, "cheng.compiler.csg.node.localfp")
+    csgNormAppendU32BE(buf, node.nodeKind)
+    csgNormAppendText(buf, node.modulePath)
+    csgNormAppendText(buf, node.symbolText)
+    csgNormAppendText(buf, node.factText)
+    csgNormAppendText(buf, node.semanticSource)
+    csgNormAppendU32BE(buf, node.semanticSignatureComplete)
+    if node.semanticSignatureComplete != 0:
+        csgNormAppendText(buf, node.semanticParamTypeJoin)
+        csgNormAppendText(buf, node.semanticReturnType)
+    csgNormAppendU32BE(buf, node.resultLayoutKind)
+    csgNormAppendU32BE(buf, node.effectKind)
+    csgNormAppendU32BE(buf, node.capabilityKind)
+    csgNormAppendU32BE(buf, node.callConv)
+    csgNormAppendU32BE(buf, node.entryFlag)
+    csgNormAppendU32BE(buf, node.exportedFlag)
+    csgNormAppendText(buf, node.exportSymbolName)
+    return csgNormBufCid(buf)
+
+# ---- 节点 normalized 内容 cid: 15 语义字段 + owner 引用替成 owner 的 ncid ----
+# owner==0 (package 根) => 无 owner (root 标记 0); 否则标记 1 + owner ncid。
+
+@borrows
+fn csgNormHashNodeContent(node: ccsg.CompilerCsgNode,
+                          hasOwner: bool,
+                          ownerNcid: layout.FixedBytes32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.ByteBufInit(256)
+    csgNormAppendText(buf, "cheng.compiler.csg.node.normalized")
+    csgNormAppendU32BE(buf, node.nodeKind)
+    csgNormAppendText(buf, node.modulePath)
+    csgNormAppendText(buf, node.symbolText)
+    csgNormAppendText(buf, node.factText)
+    csgNormAppendText(buf, node.semanticSource)
+    csgNormAppendU32BE(buf, node.semanticSignatureComplete)
+    if node.semanticSignatureComplete != 0:
+        csgNormAppendText(buf, node.semanticParamTypeJoin)
+        csgNormAppendText(buf, node.semanticReturnType)
+    csgNormAppendU32BE(buf, node.resultLayoutKind)
+    csgNormAppendU32BE(buf, node.effectKind)
+    csgNormAppendU32BE(buf, node.capabilityKind)
+    csgNormAppendU32BE(buf, node.callConv)
+    csgNormAppendU32BE(buf, node.entryFlag)
+    csgNormAppendU32BE(buf, node.exportedFlag)
+    csgNormAppendText(buf, node.exportSymbolName)
+    if hasOwner:
+        csgNormAppendU32BE(buf, 1)
+        csgNormAppendFixed32(buf, ownerNcid)
+    else:
+        csgNormAppendU32BE(buf, 0)
+    return csgNormBufCid(buf)
+
+# ---- 边 normalized 内容 cid: edgeKind + 两端 def 的 ncid 替掉位置端点 ----
+
+@borrows
+fn csgNormHashEdgeContent(edgeKind: int32,
+                          fromNcid: layout.FixedBytes32,
+                          toNcid: layout.FixedBytes32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.ByteBufInit(128)
+    csgNormAppendText(buf, "cheng.compiler.csg.edge.normalized")
+    csgNormAppendU32BE(buf, edgeKind)
+    csgNormAppendFixed32(buf, fromNcid)
+    csgNormAppendFixed32(buf, toNcid)
+    return csgNormBufCid(buf)
+
+# ---- nodeId -> 数组下标映射 (nodeId 由 AddNode 分配为 len+1, 但不假设该不变式) ----
+
+@borrows
+fn CsgNormBuildIdxByNodeId(
+        nodes: ccsg.CompilerCsgNode[]): int32[] =
+    let n = nodes.len
+    var maxId: int32
+    for i in 0..<n:
+        let nid = nodes[i].nodeId
+        if nid < 1:
+            panic("csg_normalize: node has invalid nodeId (< 1)")
+        if nid > maxId:
+            maxId = nid
+    var idx: int32[]
+    setLen(idx, maxId + 1)
+    for i in 0..<(maxId + 1):
+        idx[i] = -1
+    for i in 0..<n:
+        let nid = nodes[i].nodeId
+        if idx[nid] != -1:
+            panic("csg_normalize: duplicate nodeId")
+        idx[nid] = i
+    return idx
+
+# ---- owner 依赖图 (CSR): 顶点=节点下标, 边 u->v = u 的 ncid 需要 v(=owner) 的 ncid ----
+
+@borrows
+fn CsgNormBuildOwnerSucc(nodes: ccsg.CompilerCsgNode[],
+                         idxByNodeId: int32[]): CsgNormOwnerGraph =
+    let n = nodes.len
+    var outDeg: int32[]
+    setLen(outDeg, n)
+    for i in 0..<n:
+        if nodes[i].ownerNodeId != 0:
+            outDeg[i] = 1
+        else:
+            outDeg[i] = 0
+    var succStart: int32[]
+    setLen(succStart, n + 1)
+    succStart[0] = 0
+    for i in 0..<n:
+        succStart[i + 1] = succStart[i] + outDeg[i]
+    var succList: int32[]
+    setLen(succList, succStart[n])
+    for i in 0..<n:
+        if nodes[i].ownerNodeId != 0:
+            let owner = nodes[i].ownerNodeId
+            if owner < 1 || owner >= idxByNodeId.len:
+                panic("csg_normalize: dangling owner (nodeId out of range)")
+            let oi = idxByNodeId[owner]
+            if oi < 0:
+                panic("csg_normalize: dangling owner (missing node)")
+            succList[succStart[i]] = oi
+    var g: CsgNormOwnerGraph
+    g.succStart = succStart
+    g.succList = succList
+    return g
+
+# ---- 迭代 Tarjan SCC (显式 DFS 栈避栈溢); component 产出顺序 = 依赖拓扑逆序(被引者先出) ----
+
+fn CsgNormTarjanComponents(g: CsgNormOwnerGraph, n: int32): CsgNormComponentSet =
+    var indexOf: int32[]
+    var lowlink: int32[]
+    var onStack: bool[]
+    setLen(indexOf, n)
+    setLen(lowlink, n)
+    setLen(onStack, n)
+    for i in 0..<n:
+        indexOf[i] = -1
+        lowlink[i] = 0
+        onStack[i] = false
+    var nextIndex: int32
+
+    var tstack: int32[]
+    var workV: int32[]
+    var workCursor: int32[]
+    setLen(workV, n)
+    setLen(workCursor, n)
+    var workTop: int32
+
+    var compNodes: int32[]
+    var compStart: int32[]
+    add(compStart, 0)
+
+    for start in 0..<n:
+        if indexOf[start] != -1:
+            continue
+        workV[workTop] = start
+        workCursor[workTop] = 0
+        workTop = workTop + 1
+        while workTop > 0:
+            let v = workV[workTop - 1]
+            if indexOf[v] == -1:
+                indexOf[v] = nextIndex
+                lowlink[v] = nextIndex
+                nextIndex = nextIndex + 1
+                add(tstack, v)
+                onStack[v] = true
+            var progressed = false
+            var ci = workCursor[workTop - 1]
+            let base = g.succStart[v]
+            let deg = g.succStart[v + 1] - base
+            while ci < deg:
+                let w = g.succList[base + ci]
+                ci = ci + 1
+                if indexOf[w] == -1:
+                    workCursor[workTop - 1] = ci
+                    workV[workTop] = w
+                    workCursor[workTop] = 0
+                    workTop = workTop + 1
+                    progressed = true
+                    break
+                else:
+                    if onStack[w]:
+                        if indexOf[w] < lowlink[v]:
+                            lowlink[v] = indexOf[w]
+            if progressed:
+                continue
+            workCursor[workTop - 1] = ci
+            if lowlink[v] == indexOf[v]:
+                var done = false
+                while !done:
+                    let w = tstack[tstack.len - 1]
+                    setLen(tstack, tstack.len - 1)
+                    onStack[w] = false
+                    add(compNodes, w)
+                    if w == v:
+                        done = true
+                add(compStart, compNodes.len)
+            workTop = workTop - 1
+            if workTop > 0:
+                let parent = workV[workTop - 1]
+                if lowlink[v] < lowlink[parent]:
+                    lowlink[parent] = lowlink[v]
+
+    var out: CsgNormComponentSet
+    out.compNodes = compNodes
+    out.compStart = compStart
+    return out
+
+# ---- 按 component 序算每个节点的 normalized cid ----
+# 单点 component: H(15 语义字段, owner ncid | ROOT)。
+# 多点 component (未来内容成环时): component-local canonical 序号解环。
+
+@borrows
+fn CsgNormComputeNodeCids(nodes: ccsg.CompilerCsgNode[],
+                          idxByNodeId: int32[],
+                          comps: CsgNormComponentSet): layout.FixedBytes32[] =
+    let n = nodes.len
+    var out: layout.FixedBytes32[]
+    var computed: bool[]
+    setLen(out, n)
+    setLen(computed, n)
+    for i in 0..<n:
+        computed[i] = false
+
+    let numComps = comps.compStart.len - 1
+    for c in 0..<numComps:
+        if c % 256 == 0:
+            os.ProcessResourceGuardCheck()
+        let cstart = comps.compStart[c]
+        let cend = comps.compStart[c + 1]
+        let size = cend - cstart
+        if size == 1:
+            let vi = comps.compNodes[cstart]
+            if !csgNormNodeKindKnown(nodes[vi].nodeKind):
+                panic("csg_normalize: unknown nodeKind " + strings.IntToStr(nodes[vi].nodeKind))
+            var hasOwner = false
+            var ownerNcid = layout.FixedBytes32()
+            if nodes[vi].ownerNodeId != 0:
+                let oi = idxByNodeId[nodes[vi].ownerNodeId]
+                if oi < 0 || !computed[oi]:
+                    panic("csg_normalize: owner ncid not ready (self-loop or bug)")
+                hasOwner = true
+                ownerNcid = out[oi]
+            out[vi] = csgNormHashNodeContent(nodes[vi], hasOwner, ownerNcid)
+            computed[vi] = true
+        else:
+            # 多点 SCC (owner 图为函数式图, 只有纯环才会出现; 本 CSG 数据模型永不触发,
+            # 但通用引擎必须正确处理未来 symbol->symbol 内容环)。
+            var members: int32[]
+            for k in cstart..<cend:
+                let mi = comps.compNodes[k]
+                if !csgNormNodeKindKnown(nodes[mi].nodeKind):
+                    panic("csg_normalize: unknown nodeKind (component) " + strings.IntToStr(nodes[mi].nodeKind))
+                add(members, mi)
+            # 位置无关局部指纹
+            var fps: layout.FixedBytes32[]
+            for k in 0..<members.len:
+                add(fps, CsgNormLocalFingerprint(nodes[members[k]]))
+            # 按 localFp 升序排 members 的下标排列 order (稳定插入排序)
+            var order: int32[]
+            for k in 0..<members.len:
+                add(order, k)
+            for a in 1..<order.len:
+                let cur = order[a]
+                var b = a - 1
+                while b >= 0:
+                    if !CsgNormFixedBytes32Less(fps[cur], fps[order[b]]):
+                        break
+                    order[b + 1] = order[b]
+                    b = b - 1
+                order[b + 1] = cur
+            # component ncid = H(排序后 [localFp + 每顶点 owner 引用(内=local idx / 外=已算 ncid / root)])
+            var cbuf: layout.ByteBuf = layout.ByteBufInit(256)
+            csgNormAppendText(cbuf, "cheng.compiler.csg.component.normalized")
+            csgNormAppendU32BE(cbuf, members.len)
+            for p in 0..<order.len:
+                let mpos = order[p]
+                let mi = members[mpos]
+                csgNormAppendFixed32(cbuf, fps[mpos])
+                if nodes[mi].ownerNodeId == 0:
+                    csgNormAppendU32BE(cbuf, 0)
+                else:
+                    let oi = idxByNodeId[nodes[mi].ownerNodeId]
+                    var localIdx: int32 = -1
+                    for q in 0..<order.len:
+                        if members[order[q]] == oi:
+                            localIdx = q
+                            break
+                    if localIdx >= 0:
+                        csgNormAppendU32BE(cbuf, 1)
+                        csgNormAppendU32BE(cbuf, localIdx)
+                    else:
+                        if oi < 0 || !computed[oi]:
+                            panic("csg_normalize: external owner not ready in component")
+                        csgNormAppendU32BE(cbuf, 2)
+                        csgNormAppendFixed32(cbuf, out[oi])
+            let componentNcid = csgNormBufCid(cbuf)
+            # 每顶点 ncid = H(component ncid, 自身 local idx)
+            for p in 0..<order.len:
+                let mi = members[order[p]]
+                var mbuf: layout.ByteBuf = layout.ByteBufInit(64)
+                csgNormAppendText(mbuf, "cheng.compiler.csg.component.member.normalized")
+                csgNormAppendFixed32(mbuf, componentNcid)
+                csgNormAppendU32BE(mbuf, p)
+                out[mi] = csgNormBufCid(mbuf)
+                computed[mi] = true
+
+    return out
+
+# ---- 顶点 ncid 查表 (边端点), 越界/缺失即硬错 ----
+
+@borrows
+@borrow_result
+fn csgNormLookupNcid(nodeId: int32,
+                     nodeCids: layout.FixedBytes32[],
+                     idxByNodeId: int32[]): layout.FixedBytes32 =
+    if nodeId < 1 || nodeId >= idxByNodeId.len:
+        panic("csg_normalize: edge endpoint nodeId out of range")
+    let oi = idxByNodeId[nodeId]
+    if oi < 0:
+        panic("csg_normalize: edge endpoint references missing node")
+    return nodeCids[oi]
+
+@borrows
+fn CsgNormComputeEdgeCids(edges: ccsg.CompilerCsgEdge[],
+                          nodeCids: layout.FixedBytes32[],
+                          idxByNodeId: int32[]): layout.FixedBytes32[] =
+    var out: layout.FixedBytes32[]
+    for i in 0..<edges.len:
+        if i % 256 == 0:
+            os.ProcessResourceGuardCheck()
+        if !csgNormEdgeKindKnown(edges[i].edgeKind):
+            panic("csg_normalize: unknown edgeKind " + strings.IntToStr(edges[i].edgeKind))
+        let fromNcid = csgNormLookupNcid(edges[i].fromNodeId, nodeCids, idxByNodeId)
+        let toNcid = csgNormLookupNcid(edges[i].toNodeId, nodeCids, idxByNodeId)
+        add(out, csgNormHashEdgeContent(edges[i].edgeKind, fromNcid, toNcid))
+    return out
+
+# ---- symbol semantic identity 线性唯一性验证 ----
+
+@borrows
+fn csgNormCountSymbolsRec(nodes: ccsg.CompilerCsgNode[],
+                           nodeIndex: int32,
+                           symbolCount: var int32) =
+    var cursor = nodeIndex
+    while true:
+        if cursor >= nodes.len:
+            return
+        if cursor % 4096 == 0:
+            os.ProcessResourceGuardCheck()
+        if nodes[cursor].nodeKind == ccsg.CompilerCsgNodeKindSymbol:
+            symbolCount = symbolCount + 1
+        cursor = cursor + 1
+
+@borrows
+fn csgNormValidateSemanticIdentityRec(
+        nodes: ccsg.CompilerCsgNode[],
+        index: var ccsg.CompilerCsgSemanticIdentityIndex,
+        nodeIndex: int32,
+        err: var str): bool =
+    var cursor = nodeIndex
+    while true:
+        if cursor >= nodes.len:
+            err = ""
+            return true
+        if cursor % 4096 == 0:
+            os.ProcessResourceGuardCheck()
+        if nodes[cursor].nodeKind != ccsg.CompilerCsgNodeKindSymbol:
+            cursor = cursor + 1
+            continue
+        var source = strings.CloneStr(nodes[cursor].semanticSource)
+        if source == "":
+            source = strings.CloneStr(nodes[cursor].modulePath)
+        var factText = strings.CloneStr(nodes[cursor].factText)
+        var paramJoin = strings.CloneStr(nodes[cursor].semanticParamTypeJoin)
+        var returnType = strings.CloneStr(nodes[cursor].semanticReturnType)
+        let signatureComplete = nodes[cursor].semanticSignatureComplete
+        let nodeId = nodes[cursor].nodeId
+        if !ccsg.CompilerCsgSemanticIdentityIndexInsert(index,
+                                                        source,
+                                                        factText,
+                                                        paramJoin,
+                                                        returnType,
+                                                        signatureComplete,
+                                                        err):
+            let prevErr = strings.CloneStr(err)
+            err = Fmt" csg_normalize: semantic identity invalid node={nodeId}:{prevErr}"
+            return false
+        cursor = cursor + 1
+
+@borrows
+fn CsgNormValidateSemanticIdentity(nodes: ccsg.CompilerCsgNode[],
+                                    err: var str): bool =
+    var symbolCount: int32
+    csgNormCountSymbolsRec(nodes, 0, symbolCount)
+    var index = ccsg.CompilerCsgSemanticIdentityIndexInit(symbolCount)
+    if !csgNormValidateSemanticIdentityRec(nodes, index, 0, err):
+        ccsg.CompilerCsgSemanticIdentityIndexRelease(index)
+        return false
+    var ledgerErr: str
+    if !ccsg.CompilerCsgSemanticIdentityIndexValidateLedger(index, ledgerErr):
+        err = Fmt" csg_normalize: semantic identity ledger invalid:{ledgerErr}"
+        ccsg.CompilerCsgSemanticIdentityIndexRelease(index)
+        return false
+    ccsg.CompilerCsgSemanticIdentityIndexRelease(index)
+    err = ""
+    return true
+
+# ---- 公开: 每个节点的 normalized cid 表 (按节点下标) ----
+
+@borrows
+fn CsgNormNodeCids(
+        nodes: ccsg.CompilerCsgNode[]): layout.FixedBytes32[] =
+    var identityErr: str
+    if !CsgNormValidateSemanticIdentity(nodes, identityErr):
+        panic(identityErr)
+    let idx = CsgNormBuildIdxByNodeId(nodes)
+    let g = CsgNormBuildOwnerSucc(nodes, idx)
+    let comps = CsgNormTarjanComponents(g, nodes.len)
+    return CsgNormComputeNodeCids(nodes, idx, comps)
+
+# ---- FixedBytes32 数组升序排序 (插入排序), 用于构造顺序无关 multiset ----
+
+fn csgNormSortFixed(arr: var layout.FixedBytes32[]) =
+    for i in 1..<arr.len:
+        let cur = arr[i]
+        var j = i - 1
+        while j >= 0:
+            if !CsgNormFixedBytes32Less(cur, arr[j]):
+                break
+            arr[j + 1] = arr[j]
+            j = j - 1
+        arr[j + 1] = cur
+
+# ---- 顶层 normalized graph cid: 排序 multiset 替插入序 ----
+# H(domain, packageId, n, sorted node-ncid multiset, m, sorted edge-ncid multiset)。
+# multiset 保留重复 (重载函数可产出相同节点内容 -> 相同 ncid, set 去重会漏多重度)。
+
+@borrows
+fn CsgNormalizedGraphCid(packageId: str,
+                         nodes: ccsg.CompilerCsgNode[],
+                         edges: ccsg.CompilerCsgEdge[]): layout.FixedBytes32 =
+    var identityErr: str
+    if !CsgNormValidateSemanticIdentity(nodes, identityErr):
+        panic(identityErr)
+    let idx = CsgNormBuildIdxByNodeId(nodes)
+    let g = CsgNormBuildOwnerSucc(nodes, idx)
+    let comps = CsgNormTarjanComponents(g, nodes.len)
+    let nodeCids = CsgNormComputeNodeCids(nodes, idx, comps)
+    let edgeCids = CsgNormComputeEdgeCids(edges, nodeCids, idx)
+
+    var sortedNodes: layout.FixedBytes32[]
+    for i in 0..<nodeCids.len:
+        add(sortedNodes, nodeCids[i])
+    csgNormSortFixed(sortedNodes)
+
+    var sortedEdges: layout.FixedBytes32[]
+    for i in 0..<edgeCids.len:
+        add(sortedEdges, edgeCids[i])
+    csgNormSortFixed(sortedEdges)
+
+    var buf: layout.ByteBuf = layout.ByteBufInit(512)
+    csgNormAppendText(buf, "cheng.compiler.csg.canonical_graph.normalized")
+    csgNormAppendText(buf, packageId)
+    csgNormAppendU32BE(buf, sortedNodes.len)
+    for i in 0..<sortedNodes.len:
+        csgNormAppendFixed32(buf, sortedNodes[i])
+    csgNormAppendU32BE(buf, sortedEdges.len)
+    for i in 0..<sortedEdges.len:
+        csgNormAppendFixed32(buf, sortedEdges[i])
+    return csgNormBufCid(buf)

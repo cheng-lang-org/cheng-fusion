@@ -1,0 +1,507 @@
+# QUIC packet protection (RFC 9001): header protection application/removal
+# (Section 5.4), AEAD payload protection (Section 5.3), and the packet-number
+# reconstruction entry (RFC 9000, Appendix A.3 via frames_header).
+#
+# Layering over the W3a plaintext-format modules:
+#   - frames_header supplies the plaintext header forms, the packet-number
+#     field offset (QuicHeader.pnOff is independent of the protected PN-length
+#     bits for both header forms) and QuicPnDecode;
+#   - this module takes the header-protection mask from the 16 ciphertext
+#     bytes at pnOff (the sample), unmasks byte0 (long headers 0x0f-relevant
+#     bits, short headers 0x1f) and the PN field, reconstructs the full packet
+#     number, and runs AES-128-GCM with nonce = iv xor (64-bit pn).
+#
+# Header protection ciphers:
+#   - AES suite (production): mask = AES-ECB(hp, sample), single block via
+#     std/crypto/aes.aesEncryptBlockInto (the module's only single-block exit;
+#     no additional backend opening was needed).
+#   - ChaCha suite (RFC 9001 Appendix A.5 shape): mask = ChaCha20 block
+#     (counter 0, zero nonce) bytes 4..20, via std/crypto/chacha20poly1305.
+#
+# Error codes (negative return / rec.errCode):
+#   -1  truncated packet or field              -2  not a QUIC packet
+#   -4  parameter out of range                 -5  structural violation
+#   -6  Retry packet (integrity is out of scope here, see QuicRetryIntegrityVerify)
+#   -10 AEAD authentication failed (bad tag / corrupted mask / wrong keys)
+#   -11 payload below the one-frame minimum
+#   -12 packet too short to carry the 16-byte protection sample
+#   -13 header protection mask computation failed
+#   -60 Retry integrity intentionally not wired (campaign scope: format layer)
+#
+# Version Negotiation has no protection: the frames_header VN parser is the
+# complete format layer (version list view + count).
+
+import std/result as result
+import std/rawbytes
+import std/crypto/aes as quicaes
+import std/crypto/aesgcm as quicgcm
+import std/crypto/chacha20poly1305 as quicchacha
+import cheng/quic/pure/frames_varint as quicvarint
+import cheng/quic/pure/frames_header as quichdr
+import cheng/quic/pure/packet_keys as qkeys
+
+# AES-ECB single-block header protection mask (Section 5.4.1, AES suites).
+@borrows
+fn QuicHpMaskAes(hpKey: Bytes, sample: Bytes): Result[Bytes] =
+    if BytesLen(hpKey) != 16 && BytesLen(hpKey) != 32:
+        return Err[Bytes]("quic hp: AES header protection needs a 16/32-byte key")
+    if BytesLen(sample) < 16:
+        return Err[Bytes]("quic hp: sample too short")
+    var rk: quicaes.AesRoundKeys
+    let kr: Result[bool] = quicaes.aesKeyExpandInto(rk, hpKey)
+    if result.IsErr(kr):
+        return Err[Bytes](result.ErrorText(kr))
+    let block: Bytes = BytesSlice(sample, 0, 16)
+    var out: Bytes = EmptyBytes()
+    let er: Result[bool] = quicaes.aesEncryptBlockInto(out, rk.rounds, rk.data, block)
+    if result.IsErr(er):
+        return Err[Bytes](result.ErrorText(er))
+    return Ok[Bytes](out)
+
+# ChaCha20 header protection mask (Section 5.4.4): counter = sample[0..4]
+# (little-endian), nonce = sample[4..16], mask = ChaCha20 block bytes 0..16
+# (invoking ChaCha20 to protect 5 zero bytes takes the raw keystream).
+@borrows
+fn QuicHpMaskChacha(hpKey: Bytes, sample: Bytes): Result[Bytes] =
+    if BytesLen(hpKey) != 32:
+        return Err[Bytes]("quic hp: ChaCha header protection needs a 32-byte key")
+    if BytesLen(sample) < 16:
+        return Err[Bytes]("quic hp: sample too short")
+    let counter: int32 = (BytesGet(sample, 0) & 255) | ((BytesGet(sample, 1) & 255) << 8) |
+        ((BytesGet(sample, 2) & 255) << 16) | ((BytesGet(sample, 3) & 255) << 24)
+    let nonce: Bytes = BytesSlice(sample, 4, 12)
+    let blk: Bytes = quicchacha.Chacha20Block(hpKey, counter, nonce)
+    return Ok[Bytes](BytesSlice(blk, 0, 16))
+
+# Owned-in/owned-out AES-128-GCM output: ciphertext buffer (encrypted in
+# place) plus the authentication tag.
+type QuicAeadCipherTag =
+    cipher: Bytes
+    tag: Bytes
+
+# ---- exact AES-GCM over verified single-block primitives ----
+#
+# The std aesGcmEncryptRaw/aesGcmDecryptRaw CTR kernel takes a 4-block
+# hardware-group shortcut for AES-128 (rounds == 10) that produces wrong
+# keystream from the second 64-byte group onward on the current --emit:exe
+# driver (verified against a reference AES-GCM: bytes 0..63 correct, byte 64+
+# divergent; sub-64-byte payloads and every tail handled by the T-table path
+# are exact). std/crypto files are outside this campaign's write scope, so
+# the QUIC AEAD here composes GCM from the pieces that ARE verified: the
+# single-block AES-ECB exit (same one the header protection mask uses) and
+# the std GHASH table kernel. Single-block CTR is slower than the bulk path;
+# that gap belongs to the M5 performance slice, not to correctness.
+
+type QuicGcmCtx =
+    rounds: int32
+    roundKeys: Bytes
+    hHi: uint64
+    hLo: uint64
+
+@borrows
+fn quicGcmInit(ctx: var QuicGcmCtx, key: Bytes): Result[bool] =
+    var rk: quicaes.AesRoundKeys
+    let kr: Result[bool] = quicaes.aesKeyExpandInto(rk, key)
+    if result.IsErr(kr):
+        return Err[bool](result.ErrorText(kr))
+    var zero: Bytes = BytesAlloc(16)
+    var h: Bytes = EmptyBytes()
+    let hr: Result[bool] = quicaes.aesEncryptBlockInto(h, rk.rounds, rk.data, zero)
+    if result.IsErr(hr):
+        return Err[bool](result.ErrorText(hr))
+    ctx.rounds = rk.rounds
+    ctx.roundKeys = BytesTake(rk.data)
+    ctx.hHi = quicgcm.gcmLoadBE64(h, 0)
+    ctx.hLo = quicgcm.gcmLoadBE64(h, 8)
+    return Ok[bool](true)
+
+# GHASH over (aad, data) into a 16-byte S block.
+@borrows
+fn quicGhash(hHi: uint64, hLo: uint64, aad: Bytes, data: Bytes): Bytes =
+    let out: Bytes = BytesAlloc(16)
+    quicgcm.ghashInto(out, hHi, hLo, aad, data)
+    return out
+
+# AES-ECB single block through the reuse buffer (one reusable block + tables).
+@borrows
+fn quicAesBlock(blk: Bytes, rounds: int32, roundKeys: Bytes, sbox: Bytes, mul2: Bytes, mul3: Bytes) =
+    quicaes.aesEncryptBlockReuse(blk, rounds, roundKeys, sbox, mul2, mul3)
+
+# CTR keystream XOR in place: counter blocks are inc32^k(j0), k = 1, 2, ...
+@borrows
+fn quicGcmCtrXor(rounds: int32, roundKeys: Bytes, j0: Bytes, data: Bytes, sbox: Bytes, mul2: Bytes, mul3: Bytes): Result[bool] =
+    let ctr: Bytes = BytesSlice(j0, 0, 16)
+    let blk: Bytes = BytesSlice(j0, 0, 16)
+    let len: int32 = BytesLen(data)
+    var off: int32
+    while off < len:
+        # inc32: increment the last 4 bytes mod 2^32 BEFORE each block.
+        let b0: int32 = BytesGet(ctr, 12) & 255
+        let b1: int32 = BytesGet(ctr, 13) & 255
+        let b2: int32 = BytesGet(ctr, 14) & 255
+        let b3: int32 = BytesGet(ctr, 15) & 255
+        let w0: int64 = (int64(b0) << 24) | (int64(b1) << 16) | (int64(b2) << 8) | int64(b3)
+        let w: int64 = (w0 + 1) & int64(0xFFFFFFFF)
+        BytesSet(ctr, 12, int32((w >> 24) & 255))
+        BytesSet(ctr, 13, int32((w >> 16) & 255))
+        BytesSet(ctr, 14, int32((w >> 8) & 255))
+        BytesSet(ctr, 15, int32(w & 255))
+        BytesCopyInto(blk, 0, ctr)
+        quicAesBlock(blk, rounds, roundKeys, sbox, mul2, mul3)
+        var i: int32
+        while i < 16:
+            if off + i >= len:
+                break
+            BytesSet(data, off + i, BytesGet(data, off + i) ^ BytesGet(blk, i))
+            i = i + 1
+        off = off + 16
+    return Ok[bool](true)
+
+# Owned-in/owned-out AES-128-GCM encrypt: takes a fresh owned plaintext
+# buffer (consumed in place, std re-pass shape), returns the ciphertext (same
+# storage, encrypted) and the tag so callers extract with single BytesTakes.
+@borrows
+fn quicAeadEncryptOwned(key: Bytes, nonce: Bytes, aad: Bytes,
+                        plainOwned: Bytes): Result[QuicAeadCipherTag] =
+    var ctx: QuicGcmCtx
+    let initRes: Result[bool] = quicGcmInit(ctx, key)
+    if result.IsErr(initRes):
+        return Err[QuicAeadCipherTag](result.ErrorText(initRes))
+    # j0 = nonce || 0x00000001 (GCM spec); tag = ECB(j0) ^ GHASH(aad, cipher)
+    let j0: Bytes = BytesAlloc(16)
+    BytesCopyInto(j0, 0, BytesSliceView(nonce, 0, 12))
+    BytesSet(j0, 12, 0)
+    BytesSet(j0, 13, 0)
+    BytesSet(j0, 14, 0)
+    BytesSet(j0, 15, 1)
+    let sBox: Bytes = quicaes.aesBuildSbox()
+    let mul2: Bytes = quicaes.aesBuildMulTable(2)
+    let mul3: Bytes = quicaes.aesBuildMulTable(3)
+    let ctrRes: Result[bool] = quicGcmCtrXor(ctx.rounds, ctx.roundKeys, j0, plainOwned, sBox, mul2, mul3)
+    if result.IsErr(ctrRes):
+        return Err[QuicAeadCipherTag](result.ErrorText(ctrRes))
+    let s: Bytes = quicGhash(ctx.hHi, ctx.hLo, aad, plainOwned)
+    let e: Bytes = BytesSlice(j0, 0, 16)
+    quicAesBlock(e, ctx.rounds, ctx.roundKeys, sBox, mul2, mul3)
+    let tag: Bytes = BytesAlloc(16)
+    var ti: int32
+    while ti < 16:
+        BytesSet(tag, ti, BytesGet(e, ti) ^ BytesGet(s, ti))
+        ti = ti + 1
+    var out: QuicAeadCipherTag
+    out.cipher = plainOwned
+    out.tag = tag
+    return Ok[QuicAeadCipherTag](out)
+
+# Owned-in/owned-out AES-128-GCM decrypt: takes a fresh owned ciphertext
+# buffer (consumed in place, std re-pass shape), returns the decrypted bytes
+# as the Err/Ok payload so callers extract with a single BytesTake.
+@borrows
+fn quicAeadDecryptOwned(key: Bytes, nonce: Bytes, tag: Bytes,
+                        cipherOwned: Bytes, aad: Bytes): Result[Bytes] =
+    var ctx: QuicGcmCtx
+    let initRes: Result[bool] = quicGcmInit(ctx, key)
+    if result.IsErr(initRes):
+        return Err[Bytes](result.ErrorText(initRes))
+    let j0: Bytes = BytesAlloc(16)
+    BytesCopyInto(j0, 0, BytesSliceView(nonce, 0, 12))
+    BytesSet(j0, 12, 0)
+    BytesSet(j0, 13, 0)
+    BytesSet(j0, 14, 0)
+    BytesSet(j0, 15, 1)
+    let sBox: Bytes = quicaes.aesBuildSbox()
+    let mul2: Bytes = quicaes.aesBuildMulTable(2)
+    let mul3: Bytes = quicaes.aesBuildMulTable(3)
+    let s: Bytes = quicGhash(ctx.hHi, ctx.hLo, aad, cipherOwned)
+    let e: Bytes = BytesSlice(j0, 0, 16)
+    quicAesBlock(e, ctx.rounds, ctx.roundKeys, sBox, mul2, mul3)
+    let expect: Bytes = BytesAlloc(16)
+    var ti: int32
+    while ti < 16:
+        BytesSet(expect, ti, BytesGet(e, ti) ^ BytesGet(s, ti))
+        ti = ti + 1
+    if !quicgcm.tagEqual(expect, tag):
+        return Err[Bytes]("quic aead: tag mismatch")
+    let ctrRes: Result[bool] = quicGcmCtrXor(ctx.rounds, ctx.roundKeys, j0, cipherOwned, sBox, mul2, mul3)
+    if result.IsErr(ctrRes):
+        return Err[Bytes](result.ErrorText(ctrRes))
+    return Ok[Bytes](cipherOwned)
+
+# Result of QuicPacketUnprotect for one packet.
+type QuicUnprotectRecord =
+    ok: bool
+    errCode: int32
+    fullPn: int64       # reconstructed packet number (RFC 9000 Appendix A.3)
+    pnLen: int32        # unprotected PN length (1..4)
+    byte0: int32        # unprotected first octet (form/type bits readable)
+    headerLen: int32    # AAD length: pnOff + pnLen
+    payloadLen: int32   # plaintext frames length
+    plain: Bytes        # owned plaintext frames buffer (payloadLen bytes)
+
+fn QuicUnprotectRecordZero(): QuicUnprotectRecord =
+    var out: QuicUnprotectRecord
+    out.ok = false
+    out.errCode = 0
+    out.fullPn = 0
+    out.pnLen = 0
+    out.byte0 = 0
+    out.headerLen = 0
+    out.payloadLen = 0
+    out.plain = EmptyBytes()
+    return out
+
+# Read the pnLen-byte big-endian packet number at off (caller range-checked).
+@borrows
+fn quicPnReadAt(buf: Bytes, off: int32, pnLen: int32): int64 =
+    var v: int64
+    var i: int32
+    while i < pnLen:
+        v = (v << 8) | int64(BytesGet(buf, off + i) & 255)
+        i = i + 1
+    return v
+
+# Protect one assembled packet (RFC 9001, Sections 5.3 + 5.4).
+#
+# `unprotected` is the full plaintext packet: header bytes, the truncated
+# packet number at pnOff (pnLen bytes, big-endian), and at least one frame
+# byte of plaintext payload. The caller assembles long and short headers with
+# the frames_header append helpers; this routine is header-form agnostic.
+# Returns the wire packet: AEAD ciphertext || tag, with byte0 and the PN
+# field masked by the header protection mask sampled from the ciphertext.
+@borrows
+fn QuicPacketProtect(keys: qkeys.QuicPacketKeys, unprotected: Bytes,
+                     pnOff: int32, pnLen: int32, fullPn: int64): Result[Bytes] =
+    if pnLen < 1 || pnLen > 4:
+        return Err[Bytes]("quic protect: pn length out of range")
+    if pnOff < 0 || pnOff + pnLen > unprotected.len:
+        return Err[Bytes]("quic protect: pn field out of bounds")
+    let plainLen: int32 = unprotected.len - pnOff - pnLen
+    # RFC 9001, Section 5.4.2: the sample lives at pn_offset+4..+16, so the
+    # encoded pn plus the ciphertext must cover the region to that offset
+    # (pn_len + payload >= 4); Section 12.4 requires at least one frame anyway.
+    if pnLen + plainLen < 4:
+        return Err[Bytes]("quic protect: payload below the sample minimum")
+    # The nonce uses the FULL packet number (Section 5.3); the header field
+    # carries only the truncated encoding, so the caller supplies the value.
+    let nonce: Bytes = qkeys.QuicPacketNonce(keys.iv, fullPn)
+
+    # Ownership shape: the AEAD works on its own owned buffers via
+    # quicAeadEncryptOwned (cipher + tag come back through the Result); the
+    # wire packet is then assembled and masked with plain scalar writes.
+    var headerBuf: Bytes = BytesSlice(unprotected, 0, pnOff + pnLen)
+    var plainBuf: Bytes = BytesAlloc(plainLen)
+    BytesCopyInto(plainBuf, 0, BytesSliceView(unprotected, pnOff + pnLen, plainLen))
+    var encRes: Result[QuicAeadCipherTag] = quicAeadEncryptOwned(keys.key, nonce, headerBuf, plainBuf)
+    if result.IsErr(encRes):
+        return Err[Bytes](result.ErrorText(encRes))
+    let cipher: Bytes = BytesTake(encRes.value.cipher)
+    let tag: Bytes = BytesTake(encRes.value.tag)
+
+    let total: int32 = pnOff + pnLen + plainLen + 16
+    var out: Bytes = BytesAlloc(total)
+    BytesCopyInto(out, 0, headerBuf)
+    BytesCopyInto(out, pnOff + pnLen, cipher)
+    BytesCopyInto(out, pnOff + pnLen + plainLen, tag)
+
+    # RFC 9001, Section 5.4.2: sample_offset = pn_offset + 4 (the Packet
+    # Number field is assumed to be 4 bytes for sampling).
+    let sample: Bytes = BytesSliceView(out, pnOff + 4, 16)
+    var maskRes: Result[Bytes] = QuicHpMaskAes(keys.hp, sample)
+    if result.IsErr(maskRes):
+        return Err[Bytes](result.ErrorText(maskRes))
+    let mask: Bytes = BytesTake(maskRes.value)
+    var bits: int32 = 0x0f
+    if (BytesGet(out, 0) & 0x80) == 0:
+        bits = 0x1f
+    BytesSet(out, 0, BytesGet(out, 0) ^ (BytesGet(mask, 0) & bits))
+    var i: int32
+    while i < pnLen:
+        BytesSet(out, pnOff + i, BytesGet(out, pnOff + i) ^ BytesGet(mask, 1 + i))
+        i = i + 1
+    return Ok[Bytes](out)
+
+# Remove header protection and AEAD (RFC 9001, Sections 5.4 + 5.3) from one
+# packet. `dcidLen` is only used for short (1-RTT) headers — the negotiated
+# Destination Connection ID length; long headers parse their own CID fields.
+# `largestPn` is the largest successfully processed packet number in this
+# packet number space (-1 before any packet). On success returns 0 and fills
+# rec (plain is a fresh owned buffer); any nonzero return leaves rec.ok=false.
+@borrows
+fn QuicPacketUnprotect(keys: qkeys.QuicPacketKeys, packet: Bytes,
+                       dcidLen: int32, largestPn: int64,
+                       rec: var QuicUnprotectRecord): int32 =
+    # Ownership note: QuicUnprotectRecord carries a managed field (plain), so
+    # the record is filled strictly field-by-field — never record-assigned.
+    # On a nonzero return only rec.errCode is meaningful.
+    if packet.len < 1:
+        rec.errCode = -1
+        return -1
+    let byte0Raw: int32 = BytesGet(packet, 0) & 255
+    var pnOff: int32 = -1
+    var isLong: bool = (byte0Raw & 0x80) != 0
+    var lengthField: int64 = -1
+    if isLong:
+        var h: quichdr.QuicHeader = quichdr.QuicHeaderZero()
+        let r: int32 = quichdr.QuicHeaderParse(packet, h)
+        if r == -6:
+            # Retry: token+tag split is done; integrity verification is the
+            # explicitly deferred surface (see QuicRetryIntegrityVerify).
+            rec.errCode = -6
+            return -6
+        if r < 0:
+            rec.errCode = r
+            return r
+        pnOff = h.pnOff
+        lengthField = h.length
+    else:
+        var h: quichdr.QuicHeader = quichdr.QuicHeaderZero()
+        let r: int32 = quichdr.QuicShortHeaderParse(packet, dcidLen, h)
+        if r < 0:
+            rec.errCode = r
+            return r
+        pnOff = h.pnOff
+    if pnOff < 0 || pnOff + 4 + 16 > packet.len:
+        rec.errCode = -12
+        return -12
+
+    let sample: Bytes = BytesSliceView(packet, pnOff + 4, 16)
+    var maskRes: Result[Bytes] = QuicHpMaskAes(keys.hp, sample)
+    if result.IsErr(maskRes):
+        rec.errCode = -13
+        return -13
+    let mask: Bytes = BytesTake(maskRes.value)
+    var bits: int32 = 0x0f
+    if !isLong:
+        bits = 0x1f
+    let byte0Plain: int32 = byte0Raw ^ (BytesGet(mask, 0) & bits)
+    let pnLen: int32 = (byte0Plain & 0x03) + 1
+    if pnOff + pnLen > packet.len:
+        rec.errCode = -1
+        return -1
+    # Unmask byte0 and the PN field first (RFC 9001, Section 5.4 RFC-ordered
+    # removal): the truncated packet number feeds Appendix A.3 reconstruction.
+    let headerLen: int32 = pnOff + pnLen
+    var aad: Bytes = BytesAlloc(headerLen)
+    BytesCopyInto(aad, 0, BytesSliceView(packet, 0, pnOff))
+    BytesSet(aad, 0, byte0Plain)
+    var um: int32
+    while um < pnLen:
+        BytesSet(aad, pnOff + um, BytesGet(packet, pnOff + um) ^ BytesGet(mask, 1 + um))
+        um = um + 1
+    let truncated: int64 = quicPnReadAt(aad, pnOff, pnLen)
+    let fullPn: int64 = quichdr.QuicPnDecode(largestPn, truncated, pnLen * 8)
+
+    # Ciphertext extent: long headers carry a Length field (PN + frames +
+    # tag); short headers run to the end of the buffer/view.
+    var ctLen: int32 = packet.len - pnOff - pnLen - 16
+    if isLong:
+        if lengthField < int64(pnLen) + 16:
+            rec.errCode = -5
+            return -5
+        let total: int64 = int64(pnOff) + lengthField
+        if total > int64(packet.len):
+            rec.errCode = -1
+            return -1
+        ctLen = int32(lengthField) - pnLen - 16
+    if ctLen < 1 || pnLen + ctLen < 4:
+        # Below the one-frame minimum, or too short for the sampling rule
+        # (sample at pn_offset+4 must lie inside pn+ciphertext+tag).
+        rec.errCode = -11
+        return -11
+
+    # Unprotected header (AAD): the buffer built above, with byte0 and PN
+    # already unmasked.
+    let nonce: Bytes = qkeys.QuicPacketNonce(keys.iv, fullPn)
+    var plainBuf: Bytes = BytesAlloc(ctLen)
+    BytesCopyInto(plainBuf, 0, BytesSliceView(packet, pnOff + pnLen, ctLen))
+    let tag: Bytes = BytesSliceView(packet, pnOff + pnLen + ctLen, 16)
+    var decRes: Result[Bytes] = quicAeadDecryptOwned(keys.key, nonce, tag, plainBuf, aad)
+    if result.IsErr(decRes):
+        rec.errCode = -10
+        return -10
+    rec.ok = true
+    rec.errCode = 0
+    rec.fullPn = fullPn
+    rec.pnLen = pnLen
+    rec.byte0 = byte0Plain
+    rec.headerLen = headerLen
+    rec.payloadLen = ctLen
+    rec.plain = BytesTake(decRes.value)
+    return 0
+
+# Retry wire-form parse (RFC 9000, Section 17.2.5): long header with NO
+# Source Connection ID — byte0, version, DCID Length, DCID, Retry Token,
+# 16-byte Integrity Tag. frames_header's generic long-header parse does not
+# split Retry fields (it reports the distinct -6); this is the format-layer
+# completion. Integrity verification stays the deferred surface below.
+type QuicRetryParsed =
+    ok: bool
+    errCode: int32
+    version: int64
+    dcidOff: int32
+    dcidLen: int32
+    tokenOff: int32
+    tokenLen: int32
+    tagOff: int32        # == packet.len - 16 on success
+
+fn QuicRetryParsedZero(): QuicRetryParsed =
+    var out: QuicRetryParsed
+    out.ok = false
+    out.errCode = 0
+    out.version = 0
+    out.dcidOff = -1
+    out.dcidLen = 0
+    out.tokenOff = -1
+    out.tokenLen = 0
+    out.tagOff = -1
+    return out
+
+@borrows
+fn QuicRetryParse(packet: Bytes, out: var QuicRetryParsed): int32 =
+    var cand: QuicRetryParsed = QuicRetryParsedZero()
+    if packet.len < 1 + 4 + 1 + 16:
+        cand.errCode = -1
+        out = cand
+        return -1
+    let byte0: int32 = BytesGet(packet, 0) & 255
+    if (byte0 & 0x80) == 0 || (byte0 & 0x40) == 0:
+        cand.errCode = -2
+        out = cand
+        return -2
+    if ((byte0 >> 4) & 0x03) != 3:
+        cand.errCode = -5
+        out = cand
+        return -5
+    cand.version = quichdr.QuicHeaderVersionAt(packet, 1)
+    let dcil: int32 = BytesGet(packet, 5) & 255
+    if dcil > 20:
+        cand.errCode = -4
+        out = cand
+        return -4
+    if 6 + dcil + 16 > packet.len:
+        cand.errCode = -1
+        out = cand
+        return -1
+    cand.ok = true
+    cand.version = quichdr.QuicHeaderVersionAt(packet, 1)
+    cand.dcidOff = 6
+    cand.dcidLen = dcil
+    cand.tokenOff = 6 + dcil
+    cand.tokenLen = packet.len - 16 - cand.tokenOff
+    cand.tagOff = packet.len - 16
+    out = cand
+    return 0
+
+# Retry packet integrity (RFC 9001, Section 5.7) — INTERFACE PLACEHOLDER.
+#
+# Campaign scope for W3b is the format layer: frames_header already splits
+# the Retry token and the 16-byte integrity tag (parse return -6), and the
+# RFC 9001 Appendix A.4 wire form is asserted in the W3b vector driver. The
+# full construction (retry salt HKDF, pseudo-packet with the original DCID,
+# AES-128-GCM verify/emit) is wired with the cross-line integration slice;
+# until then callers get the distinct code -60, never a silent pass.
+@borrows
+fn QuicRetryIntegrityVerify(packet: Bytes): int32 =
+    if packet.len < 1:
+        return -1
+    return -60

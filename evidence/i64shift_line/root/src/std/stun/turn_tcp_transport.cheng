@@ -1,0 +1,147 @@
+# TURN over TCP transport (RFC 5766 section 7).
+#
+# Framing: every STUN/ChannelData message on a TURN-over-TCP connection is
+# preceded by a 4-byte big-endian length prefix giving the size of the
+# message that follows (the prefix itself is NOT counted). recv must handle
+# fragmentation (one message split across TCP segments) and coalescing
+# (multiple messages in one segment): an accumulating buffer + try-extract
+# loop.
+#
+# ChannelData (RFC 5766 section 2.5): a non-STUN message with a 4-byte header
+# (channel number 0x4000-0x7FFF as 2B BE + 2B BE data length) followed by the
+# application data. Over TCP it carries the same 4B length prefix as every
+# other message. ChannelData carries no MESSAGE-INTEGRITY / FINGERPRINT.
+#
+# Every routine is a small single-purpose function to keep BodyIR/CFG small.
+
+import std/rawbytes
+import std/system
+import std/result
+import std/net/transports/tcp_syscall as tcp
+import std/stun/protocol as stun
+
+const
+    turnTcpFrameHeaderLen = 4
+    turnTcpMaxFrame = 65535
+    turnTcpRecvBufCap = 70000
+    turnTcpRecvChunk = 4096
+
+# --- frame length prefix codec ---
+
+fn TurnTcpSetU32BE(buf: Bytes, offset: int32, value: int32) =
+    BytesSet(buf, offset, (value >> 24) & 255)
+    BytesSet(buf, offset + 1, (value >> 16) & 255)
+    BytesSet(buf, offset + 2, (value >> 8) & 255)
+    BytesSet(buf, offset + 3, value & 255)
+
+@borrows
+fn TurnTcpU32BE(buf: Bytes, offset: int32): int32 =
+    let b0: int32 = int32(BytesGet(buf, offset))
+    let b1: int32 = int32(BytesGet(buf, offset + 1))
+    let b2: int32 = int32(BytesGet(buf, offset + 2))
+    let b3: int32 = int32(BytesGet(buf, offset + 3))
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+# --- frame encode / send ---
+
+fn TurnTcpEncodeFrame(msg: Bytes): Bytes =
+    let msgLen: int32 = BytesLen(msg)
+    let out: Bytes = BytesAlloc(turnTcpFrameHeaderLen + msgLen)
+    TurnTcpSetU32BE(out, 0, msgLen)
+    if msgLen > 0:
+        BytesCopyInto(out, turnTcpFrameHeaderLen, msg)
+    return out
+
+# Send one framed message on a connected TCP fd. A fresh TcpConnectionHandle is
+# built locally from the fd (TcpSend only touches fd + open), so no
+# Bytes-bearing handle is passed across a function boundary (cheng ORC: passing
+# a struct with Bytes fields by value can free the addr early).
+fn TurnTcpSendFrame(fd: int32, msg: Bytes): int32 =
+    if fd < 0:
+        return 1
+    let frame: Bytes = TurnTcpEncodeFrame(msg)
+    var h: tcp.TcpConnectionHandle
+    h.fd = fd
+    h.open = true
+    let sendRes = tcp.TcpSend(h, frame)
+    if IsErr(sendRes):
+        return 2
+    return 0
+
+# --- frame receive buffer (fragmentation + coalescing) ---
+
+# Append `chunk` into the accumulating buffer at `bufLen`, advancing `bufLen`.
+# Returns 0 on success, 1 if the chunk would overflow the buffer capacity.
+fn TurnTcpFrameAppend(buf: var Bytes, bufLen: var int32, chunk: Bytes): int32 =
+    let chunkLen: int32 = BytesLen(chunk)
+    if chunkLen <= 0:
+        return 0
+    if bufLen + chunkLen > BytesLen(buf):
+        return 1
+    BytesCopyInto(buf, bufLen, chunk)
+    bufLen = bufLen + chunkLen
+    return 0
+
+# Shift the leftover bytes (after `consumed`) to the front of the buffer and
+# shrink `bufLen` accordingly. Used after a full frame has been extracted.
+fn TurnTcpFrameShift(buf: var Bytes, bufLen: var int32, consumed: int32) =
+    let remaining: int32 = bufLen - consumed
+    if remaining <= 0:
+        bufLen = 0
+        return
+    let tail: Bytes = BytesSlice(buf, consumed, remaining)
+    BytesCopyInto(buf, 0, tail)
+    bufLen = remaining
+
+# Try to extract one complete frame from the accumulating buffer.
+# Returns 0 on success (out = message bytes, buffer shifted), 1 if more bytes
+# are needed, 2 on a malformed/oversized length prefix.
+fn TurnTcpFrameTryExtract(buf: var Bytes, bufLen: var int32, out: var Bytes): int32 =
+    if bufLen < turnTcpFrameHeaderLen:
+        return 1
+    let msgLen: int32 = TurnTcpU32BE(buf, 0)
+    if msgLen < 0 || msgLen > turnTcpMaxFrame:
+        return 2
+    if bufLen < turnTcpFrameHeaderLen + msgLen:
+        return 1
+    out = BytesSlice(buf, turnTcpFrameHeaderLen, msgLen)
+    TurnTcpFrameShift(buf, bufLen, turnTcpFrameHeaderLen + msgLen)
+    return 0
+
+# --- ChannelData message codec (RFC 5766 section 2.5) ---
+
+fn TurnEncodeChannelData(channel: int32, data: Bytes): Bytes =
+    let dataLen: int32 = BytesLen(data)
+    let out: Bytes = BytesAlloc(4 + dataLen)
+    stun.StunSetU16BE(out, 0, channel)
+    stun.StunSetU16BE(out, 2, dataLen)
+    if dataLen > 0:
+        BytesCopyInto(out, 4, data)
+    return out
+
+fn TurnDecodeChannelData(msg: Bytes, outChannel: var int32, outData: var Bytes): int32 =
+    let n: int32 = BytesLen(msg)
+    if n < 4:
+        return 1
+    outChannel = stun.StunU16BE(msg, 0)
+    let dataLen: int32 = stun.StunU16BE(msg, 2)
+    if dataLen < 0 || 4 + dataLen > n:
+        return 2
+    outData = BytesSlice(msg, 4, dataLen)
+    return 0
+
+# A message is ChannelData iff its first 2 bytes are a channel number in the
+# 0x4000-0x7FFF range (RFC 5766 section 2.5). STUN message types never collide
+# with this range (STUN types are < 0x0FFF before the class bits, and the
+# channel range is distinguished by the high bit pattern).
+fn TurnIsChannelData(msg: Bytes): bool =
+    if BytesLen(msg) < 4:
+        return false
+    let channel: int32 = stun.StunU16BE(msg, 0)
+    return channel >= 0x4000 && channel <= 0x7FFF
+
+fn TurnTcpRecvBufCap(): int32 =
+    return turnTcpRecvBufCap
+
+fn TurnTcpRecvChunk(): int32 =
+    return turnTcpRecvChunk

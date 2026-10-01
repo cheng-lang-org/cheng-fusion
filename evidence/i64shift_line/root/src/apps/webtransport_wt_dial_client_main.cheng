@@ -1,0 +1,148 @@
+# Standalone real WebTransport/QUIC dial client -- a SEPARATE OS process
+# from webtransport_wt_listener_main.cheng, communicating only over real
+# loopback UDP sockets (no in-process pipe shortcut, no shared state).
+#
+# Takes the server's presented leaf certificate DER (--certder-hex, out of
+# band -- exactly what a WebTransport app supplies to a browser's
+# `serverCertificateHashes` option) plus the expected SHA-256 fingerprint
+# (--certhash). Verifies certhash == SHA-256(certder) FIRST and refuses to
+# even dial on a mismatch (explicit, loud failure, no fallback) -- then pins
+# that exact DER as the sole trust root, dials, negotiates ALPN "h3", runs
+# the real HTTP/3 SETTINGS + Extended CONNECT handshake, opens one
+# bidirectional WebTransport data stream, writes --payload, and verifies the
+# server echoes the exact same bytes back.
+
+import std/result
+import std/system
+import std/os
+import std/rawbytes
+import std/strutils as strutil
+import std/cmdline as cmdline
+import std/tls/x509_issue as x509issue
+import cheng/quic/connection as qconn
+import cheng/quic/multiaddress as qaddr
+import cheng/quic/msquictransport_native as qtransport
+import cheng/quic/tls/policy as qpolicy
+import cheng/quic/tls/handshake13 as handshake13
+import cheng/libp2p/transports/quic_transport as quic_transport
+import cheng/libp2p/transports/webtransport_common as wtcommon
+import cheng/libp2p/transports/webtransport_wire as wtwire
+import cheng/libp2p/transports/webtransport_h3_session as wth3
+
+const
+    wtDialBidiStreamId: int64 = 4
+    wtDialEchoMaxBytes = 65536
+    wtDialEchoFirstByteWaitMs = 5000
+    wtDialEchoQuietGapMs = 200
+
+fn wtDialLog(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn main(): int32 =
+    let port: int32 = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    if port <= 0:
+        wtDialLog("wt_dial_client: missing --port")
+        return 2
+    var certHashHexRaw: str
+    let hasCertHash: bool = cmdline.ReadFirstFlagValue("--certhash", certHashHexRaw)
+    var certDerHexRaw: str
+    let hasCertDer: bool = cmdline.ReadFirstFlagValue("--certder-hex", certDerHexRaw)
+    if !hasCertHash || !hasCertDer:
+        wtDialLog("wt_dial_client: missing --certhash/--certder-hex")
+        return 2
+    var sanHostRaw: str
+    let hasSanHost: bool = cmdline.ReadFirstFlagValue("--san-host", sanHostRaw)
+    let sanHost: str = if hasSanHost: sanHostRaw else: "127.0.0.1"
+    var pathRaw: str
+    let hasPath: bool = cmdline.ReadFirstFlagValue("--path", pathRaw)
+    let path: str = if hasPath: pathRaw else: "/wt"
+    var payloadRaw: str
+    let hasPayload: bool = cmdline.ReadFirstFlagValue("--payload", payloadRaw)
+    let payloadText: str = if hasPayload: payloadRaw else: "hello-from-wt-dial-client"
+    # Off by default: see webtransport_h3_session.cheng's VERIFIED TRANSPORT
+    # GAP note -- turning this on makes the handshake fail encoding the
+    # preamble's own SETTINGS frame, the F07 hard flaw's still-open
+    # same-file const sub-case in quic_varint.cheng, unrelated to this file
+    # (bounded, explicit failure, not a hang). Pass --h3-settings-preamble
+    # to reproduce that.
+    let withH3SettingsPreamble: bool = cmdline.HasFlag("--h3-settings-preamble")
+
+    # --- certhash pinning gate: explicit, loud failure on mismatch, no dial attempted ---
+    let certDer: Bytes = BytesFromHex(certDerHexRaw)
+    let expectedHash: Bytes = BytesFromHex(certHashHexRaw)
+    let actualHash: Bytes = x509issue.X509CertHash(certDer)
+    if ! BytesEqual(actualHash, expectedHash):
+        os.WriteLine(os.Get_stdout(), "WT_DIAL_CERTHASH_MISMATCH expected=" + certHashHexRaw + " actual=" + BytesToHex(actualHash))
+        return 6
+    os.WriteLine(os.Get_stdout(), "WT_DIAL_CERTHASH_OK=" + BytesToHex(actualHash))
+
+    var policy: qpolicy.MsQuicTlsPolicy
+    policy.serverName = sanHost
+    policy.allowInsecure = false
+    policy.trustRootsCount = 1
+    policy.trustRoot0 = certDer
+    let alpnRes: Result[bool] = qpolicy.msquicTlsPolicyAddAlpn(policy, "h3")
+    if IsErr(alpnRes):
+        wtDialLog("wt_dial_client: alpn: " + ErrorText(alpnRes))
+        return 3
+
+    var client = qtransport.InitMsQuicTransport()
+    let tlsRes: Result[bool] = qtransport.setMsQuicTransportTlsPolicy(client, policy)
+    if IsErr(tlsRes):
+        wtDialLog("wt_dial_client: tls policy: " + ErrorText(tlsRes))
+        return 3
+    handshake13.msquicTls13ResetClientDefault(true)
+    let addrText = "/ip4/127.0.0.1/udp/" + IntToStr(port) + "/quic-v1"
+    let addrData = BytesSlice(BytesFromString(addrText), 0, len(addrText))
+    var addr: qaddr.MultiAddress
+    addr.raw = addrText
+    addr.data = addrData
+    let dialRes: Result[qconn.Connection] = qtransport.dial(client, addr)
+    if IsErr(dialRes):
+        wtDialLog("wt_dial_client: dial: " + ErrorText(dialRes))
+        return 4
+    var base: qconn.Connection = Value(dialRes)
+
+    let negotiated: str = handshake13.msquicTls13ClientNegotiatedAlpn()
+    if negotiated != "h3":
+        wtDialLog("wt_dial_client: alpn negotiation failed, got=" + negotiated)
+        qconn.ConnClose(base)
+        return 5
+    os.WriteLine(os.Get_stdout(), "WT_DIAL_ALPN=" + negotiated)
+
+    let authority: str = sanHost + ":" + IntToStr(port)
+    let handshakeRes: Result[bool] = wth3.Wth3ClientHandshake(client, base, authority, path, withH3SettingsPreamble)
+    if IsErr(handshakeRes):
+        os.WriteLine(os.Get_stdout(), "WT_DIAL_SESSION_REJECTED=" + ErrorText(handshakeRes))
+        qconn.ConnClose(base)
+        return 7
+    os.WriteLine(os.Get_stdout(), "WT_DIAL_SESSION_ESTABLISHED=1")
+
+    var dataConn: qconn.Connection = qconn.ConnDeriveStream(base, wtDialBidiStreamId, wtDialBidiStreamId)
+    let sigRes: Result[Bytes] = wtcommon.WebtransportEncodeBidiStreamSignal(0)
+    if IsErr(sigRes):
+        wtDialLog("wt_dial_client: encode WT_STREAM signal: " + ErrorText(sigRes))
+        qconn.ConnClose(base)
+        return 8
+    let payload: Bytes = BytesFromString(payloadText)
+    let outBytes: Bytes = BytesConcat(Value(sigRes), payload)
+    let writeRes: Result[bool] = quic_transport.Libp2pQuicWriteExact(client, dataConn, outBytes)
+    if IsErr(writeRes):
+        wtDialLog("wt_dial_client: write bidi signal+payload: " + ErrorText(writeRes))
+        qconn.ConnClose(base)
+        return 8
+    os.WriteLine(os.Get_stdout(), "WT_DIAL_SENT_BYTES=" + IntToStr(BytesLen(payload)))
+
+    let echoRes: Result[Bytes] = wtwire.Wth3ReadAvailable(client, dataConn, wtDialEchoMaxBytes, wtDialEchoFirstByteWaitMs, wtDialEchoQuietGapMs)
+    if IsErr(echoRes):
+        wtDialLog("wt_dial_client: read echo: " + ErrorText(echoRes))
+        qconn.ConnClose(base)
+        return 9
+    let echoed: Bytes = Value(echoRes)
+    if ! BytesEqual(echoed, payload):
+        os.WriteLine(os.Get_stdout(), "WT_DIAL_ECHO_MISMATCH sent_hex=" + BytesToHex(payload) + " got_hex=" + BytesToHex(echoed))
+        qconn.ConnClose(base)
+        return 10
+    os.WriteLine(os.Get_stdout(), "WT_DIAL_ECHO_OK bytes=" + IntToStr(BytesLen(echoed)))
+    qconn.ConnClose(base)
+    return 0

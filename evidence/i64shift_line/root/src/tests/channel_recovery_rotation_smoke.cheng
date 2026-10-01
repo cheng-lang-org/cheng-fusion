@@ -1,0 +1,162 @@
+# libp2p P3 收尾片: recovery 钥绑定 + rotation redirect 闭环 (TOFU T5-T10, 正典 §11.6 P3)。
+# exe run 非 census: 断言失败即 abort 非零。crypto 断言 DEFAULT-ON (无 env 逃生)。
+#
+# 核心裁决: rotation 不是 "同 channelId 换钥" (换钥硬拒在单 channelId 内保持绝对), 而是 recovery 钥
+# 签名的 oldChannelId→newChannelId redirect; newChannelId 下 head 仍是 v1 自证。tofu.cheng 零改动。
+#
+# 正路径: 根钥声明 recovery 钥 (bind) → recovery 钥签 rotation → follow(old)==new → new 继承同一
+#   recoveryKeyHash → 链式二次 rotation → 恢复钥授权撤销 (recoveryAuth 路径, 撤根钥)。
+# 负路径矩阵 (每条独立 rejectReason):
+#   - recovery-bind: sig 篡改拒 / 非根钥声明拒 / 不可变 (换 recovery hash) 拒 / 幂等 (同 hash) 过
+#   - rotation: T7 非 recovery 钥签拒 / T6 无 pin 拒 / epoch 回退拒
+
+import std/system
+import std/result
+import std/rawbytes as rawbytes
+import cheng/std/bytes_layout as layout
+import std/crypto/sha512 as sha512
+import std/crypto/ed25519/ref10 as ref10
+import std/os as os
+import cheng/libp2p/protocols/cas_source/channel_head/head_codec as head
+import cheng/libp2p/protocols/cas_source/channel_head/authz_codec as authz
+import cheng/libp2p/protocols/cas_source/channel_head/authz_store as store
+
+fn deriveKeypair(seedv: int32, priv: var Bytes, pub: var Bytes) =
+    var seed = BytesAlloc(32)
+    for i in 0..<32:
+        BytesSet(seed, i, (seedv + i) & 255)
+    var digest = sha512.Sha512Digest(seed)
+    BytesSet(digest, 0, BytesGet(digest, 0) & 248)
+    BytesSet(digest, 31, (BytesGet(digest, 31) & 63) | 64)
+    var r: ref10.GeP3
+    ref10.geScalarMultBase(r, BytesSlice(digest, 0, 32))
+    pub = ref10.geP3ToBytes(r)
+    priv = BytesConcat(seed, pub)
+
+fn rmIf(path: str) =
+    if os.FileExists(path):
+        let _rm = os.RemoveFile(path)
+
+fn main(): int32 =
+    let base = os.GetEnvDefault("TMPDIR", "/tmp") + "/cheng_channel_recovery_rotation_p3"
+    let storeRoot = base + "/store"
+    os.MkdirAll(storeRoot, 493)
+    # 确定性起点: 清 recovery/rotation 库
+    rmIf(store.AuthzRecoveryPath(storeRoot))
+    rmIf(store.AuthzRotationPath(storeRoot))
+
+    var rootPriv: Bytes
+    var rootPub: Bytes
+    deriveKeypair(41, rootPriv, rootPub)
+    let oldChannelId = head.ChannelIdForPubKey(rootPub)
+    let oldHex = layout.FixedBytes32Hex(oldChannelId)
+
+    var recoveryPriv: Bytes
+    var recoveryPub: Bytes
+    deriveKeypair(77, recoveryPriv, recoveryPub)
+    let recoveryKeyHash = head.ChannelIdForPubKey(recoveryPub)   # = sha256(recoveryPub)
+
+    var newPriv: Bytes
+    var newPub: Bytes
+    deriveKeypair(123, newPriv, newPub)
+    let newChannelId = head.ChannelIdForPubKey(newPub)
+    let newHex = layout.FixedBytes32Hex(newChannelId)
+
+    # ---- 正: recovery 绑定 (根钥声明 recovery 钥) ----
+    var bindSign = authz.AuthzRecordSign(authz.AuthzTagRecoveryBind, rootPriv, oldChannelId, recoveryKeyHash, int64(1), rootPub)
+    assert(!IsErr(bindSign), " recovery-bind sign: " + Error(bindSign))
+    var bindRec = Value(bindSign)
+    var bindVerify = authz.RecoveryBindVerify(bindRec)
+    assert(!IsErr(bindVerify), " RecoveryBindVerify: " + Error(bindVerify))
+    assert(layout.FixedBytes32Equal(Value(bindVerify), recoveryKeyHash), " RecoveryBindVerify 返回 recoveryKeyHash")
+    var bindAdmit = store.AuthzRecoveryBindAdmit(storeRoot, bindRec)
+    assert(!IsErr(bindAdmit), " recovery-bind admit: " + Error(bindAdmit))
+    let pin = store.AuthzRecoveryPinLookup(storeRoot, oldHex)
+    assert(pin.found, " recovery pin 已钉")
+    assert(layout.FixedBytes32Equal(pin.recoveryKeyHash, recoveryKeyHash), " recovery pin hash 精确")
+
+    # ---- 正: 幂等 (同 hash 二次绑无副作用) ----
+    var bindAgain = store.AuthzRecoveryBindAdmit(storeRoot, bindRec)
+    assert(!IsErr(bindAgain), " recovery-bind 幂等 (同 hash 二次绑)")
+
+    # ---- 负: recovery-bind 换 hash → 不可变拒 ----
+    var altHash = head.ChannelIdForPubKey(newPub)   # 不同 hash
+    var bindAlt = authz.AuthzRecordSign(authz.AuthzTagRecoveryBind, rootPriv, oldChannelId, altHash, int64(2), rootPub)
+    assert(!IsErr(bindAlt), " alt recovery-bind sign")
+    var bindAltAdmit = store.AuthzRecoveryBindAdmit(storeRoot, Value(bindAlt))
+    assert(IsErr(bindAltAdmit), " 负: recovery 换 hash → 不可变拒")
+
+    # ---- 负: recovery-bind sig 篡改拒 ----
+    var bindTamper = authz.AuthzRecordClone(bindRec)
+    var ts = BytesAlloc(64)
+    for i in 0..<64:
+        BytesSet(ts, i, BytesGet(bindRec.sig, i))
+    BytesSet(ts, 0, (BytesGet(ts, 0) ^ 0x01) & 255)
+    bindTamper.sig = ts
+    assert(IsErr(authz.RecoveryBindVerify(bindTamper)), " 负: recovery-bind sig 篡改拒")
+
+    # ---- 负: 非根钥声明 recovery (A != sha256(signer)) 拒 ----
+    var otherPriv: Bytes
+    var otherPub: Bytes
+    deriveKeypair(200, otherPriv, otherPub)
+    var bindNonRoot = authz.AuthzRecordSign(authz.AuthzTagRecoveryBind, otherPriv, oldChannelId, recoveryKeyHash, int64(1), otherPub)
+    assert(!IsErr(bindNonRoot), " non-root recovery-bind sign (sig 合法)")
+    var nonRootVerify = authz.RecoveryBindVerify(Value(bindNonRoot))
+    assert(IsErr(nonRootVerify), " 负: 非根钥声明 recovery 拒")
+    assert(Error(nonRootVerify) == "recovery-bind: 只有根钥能声明 recovery 钥", " 负: 非根钥 rejectReason 精确")
+
+    # ---- 负: T7 rotation 非 recovery 钥签拒 (在成功 rotation 前, oldChannelId 已 pin) ----
+    var rotBadSign = authz.AuthzRecordSign(authz.AuthzTagRotate, otherPriv, oldChannelId, newChannelId, int64(1), otherPub)
+    assert(!IsErr(rotBadSign), " T7 rotation sign (sig 合法但非 recovery 钥)")
+    var rotBadAdmit = store.AuthzRotationAdmit(storeRoot, Value(rotBadSign))
+    assert(IsErr(rotBadAdmit), " 负: T7 非 recovery 钥 rotation 拒")
+    assert(Error(rotBadAdmit) == "rotate: rotation 授权拒 (非 recovery 钥)", " 负: T7 rejectReason 精确")
+
+    # ---- 负: T6 无 recovery pin 的 channel rotate 拒 ----
+    let unpinnedChannel = head.ChannelIdForPubKey(otherPub)   # 从未 pin
+    var rotUnpinned = authz.AuthzRecordSign(authz.AuthzTagRotate, recoveryPriv, unpinnedChannel, newChannelId, int64(1), recoveryPub)
+    assert(!IsErr(rotUnpinned), " T6 rotation sign")
+    var rotUnpinnedAdmit = store.AuthzRotationAdmit(storeRoot, Value(rotUnpinned))
+    assert(IsErr(rotUnpinnedAdmit), " 负: T6 无 pin channel rotate 拒")
+
+    # ---- 正: T5 rotation (recovery 钥签 old→new) ----
+    var rotSign = authz.AuthzRecordSign(authz.AuthzTagRotate, recoveryPriv, oldChannelId, newChannelId, int64(5), recoveryPub)
+    assert(!IsErr(rotSign), " rotation sign: " + Error(rotSign))
+    var rotAdmit = store.AuthzRotationAdmit(storeRoot, Value(rotSign))
+    assert(!IsErr(rotAdmit), " rotation admit: " + Error(rotAdmit))
+    let followed = store.AuthzRotationFollow(storeRoot, oldChannelId)
+    assert(layout.FixedBytes32Equal(followed, newChannelId), " follow(old) == new (redirect)")
+    # new 继承同一 recoveryKeyHash
+    let newPin = store.AuthzRecoveryPinLookup(storeRoot, newHex)
+    assert(newPin.found, " new 继承 recovery pin")
+    assert(layout.FixedBytes32Equal(newPin.recoveryKeyHash, recoveryKeyHash), " new 继承同一 recoveryKeyHash")
+
+    # ---- 负: rotation epoch 回退拒 (重放 epoch<=已存5) ----
+    var rotReplay = authz.AuthzRecordSign(authz.AuthzTagRotate, recoveryPriv, oldChannelId, newChannelId, int64(5), recoveryPub)
+    assert(!IsErr(rotReplay), " rotation replay sign")
+    var rotReplayAdmit = store.AuthzRotationAdmit(storeRoot, Value(rotReplay))
+    assert(IsErr(rotReplayAdmit), " 负: rotation epoch 回退拒 (重放)")
+
+    # ---- 正: 链式二次 rotation (new → new2, 同一 recovery 钥) ----
+    var new2Priv: Bytes
+    var new2Pub: Bytes
+    deriveKeypair(211, new2Priv, new2Pub)
+    let new2ChannelId = head.ChannelIdForPubKey(new2Pub)
+    var rot2Sign = authz.AuthzRecordSign(authz.AuthzTagRotate, recoveryPriv, newChannelId, new2ChannelId, int64(9), recoveryPub)
+    assert(!IsErr(rot2Sign), " 二次 rotation sign")
+    var rot2Admit = store.AuthzRotationAdmit(storeRoot, Value(rot2Sign))
+    assert(!IsErr(rot2Admit), " 二次 rotation admit (同 recovery 钥): " + Error(rot2Admit))
+    let followed2 = store.AuthzRotationFollow(storeRoot, oldChannelId)
+    assert(layout.FixedBytes32Equal(followed2, new2ChannelId), " follow(old) 沿链跟到 new2 (多跳)")
+
+    # ---- 正: recovery 钥授权撤销 (recoveryAuth 路径, 撤根钥) ----
+    let revTargetHex = rawbytes.BytesToHex(rootPub)
+    rmIf(store.AuthzRevocationPath(storeRoot, oldHex, revTargetHex))
+    var recRevoke = authz.AuthzRecordSign(authz.AuthzTagRevoke, recoveryPriv, oldChannelId, layout.FixedBytes32FromBytes(rootPub).value, int64(1), recoveryPub)
+    assert(!IsErr(recRevoke), " recovery 撤根钥 sign")
+    var recRevokeAdmit = store.AuthzRevocationAdmit(storeRoot, Value(recRevoke))
+    assert(!IsErr(recRevokeAdmit), " recovery 授权撤销 admit (recoveryAuth 路径): " + Error(recRevokeAdmit))
+    assert(store.AuthzRevocationExists(storeRoot, oldChannelId, rootPub), " recovery 撤销后: 撤销集有根钥")
+
+    echo(" channel_recovery_rotation_smoke ok")
+    return 0

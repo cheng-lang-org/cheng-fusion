@@ -1,0 +1,1067 @@
+# cdp_client.cheng
+# Pure Cheng Chrome DevTools Protocol client.
+# Stack: TCP socket → HTTP GET → WebSocket upgrade → CDP JSON-RPC → response
+# Uses Darwin provider socket exports (@importc libc_*).
+# No V8/Node.js/Puppeteer dependency.
+
+import std/strings
+import std/rawmem_support as rm
+import std/os
+
+# ============================================================
+# Darwin provider socket exports
+# ============================================================
+
+@importc("libc_socket")
+fn socketCreate(domain: int32, typ: int32, protocol: int32): int32
+
+@importc("libc_connect")
+fn socketConnect(fd: int32, addr: ptr, len: int32): int32
+
+@importc("libc_write")
+fn socketWrite(fd: int32, buf: ptr, count: int32): int32
+
+@importc("libc_read")
+fn socketRead(fd: int32, buf: ptr, count: int32): int32
+
+@importc("libc_shutdown")
+fn socketShutdown(fd: int32, how: int32): int32
+
+@importc("libc_close")
+fn socketClose(fd: int32): int32
+
+@importc("cheng_errno")
+fn sysErrno(): int32
+
+@abi_internal
+@importc("cheng_strerror")
+fn sysStrerror(err: int32): str
+
+@importc("cheng_epoch_time_seconds")
+fn epochSeconds(): int32
+
+@importc("malloc")
+fn rawMalloc(size: int64): ptr
+
+@importc("free")
+fn rawFree(p: ptr)
+
+# ============================================================
+# Constants
+# ============================================================
+
+const
+    AF_INET: int32 = 2
+    SOCK_STREAM: int32 = 1
+    IPPROTO_TCP: int32 = 6
+    SHUT_RDWR: int32 = 2
+    EAGAIN: int32 = 35
+    CdpIoChunkBytes: int32 = 4096
+    CdpMaxHttpResponseBytes: int32 = 1048576
+    CdpMaxHttpHeaderBytes: int32 = 65536
+    CdpMaxWebSocketPayloadBytes: int32 = 8388608
+
+# ============================================================
+# Types
+# ============================================================
+
+type
+    CdpConnection =
+        fd: int32
+        host: str
+        port: int32
+        alive: bool
+
+    CdpJsonFieldRead =
+        found: bool
+        value: str
+
+# ============================================================
+# Byte buffer helpers (using malloc + RawmemWriteI8)
+# ============================================================
+
+fn mallocBuf(size: int32): ptr =
+    if size <= 0:
+        return ptr(0)
+    return rawMalloc(int64(size))
+
+
+fn freeBuf(p: ptr) =
+    rawFree(p)
+
+
+fn bufWriteByte(p: ptr, offset: int32, value: int32) =
+    rm.RawmemWriteI8(p, offset, int8(value))
+
+
+fn bufWriteInt16BE(p: ptr, offset: int32, value: int32) =
+    bufWriteByte(p, offset, (value >> 8) & 0xff)
+    bufWriteByte(p, offset + 1, value & 0xff)
+
+
+fn bufReadByte(p: ptr, offset: int32): int32 =
+    # Use charToStr for a heap-allocated mutable 1-byte string
+    var carrier: str = charToStr(' ')
+    var dst = rm.RawmemAsVoid(carrier)
+    rm.RawmemCopy(dst, rm.RawmemPtrAdd(p, offset), 1)
+    return int32(carrier[0])
+
+
+# String search helper (no IndexOf in stdlib)
+@borrows
+fn strFind(haystack: str, needle: str): int32 =
+    if len(needle) == 0:
+        return 0
+    if len(haystack) < len(needle):
+        return -1
+    var i: int32
+    while i + len(needle) <= len(haystack):
+        var isMatch: bool
+        isMatch = true
+        var j: int32
+        while j < len(needle) && isMatch:
+            if haystack[i + j] != needle[j]:
+                isMatch = false
+            j = j + 1
+        if isMatch:
+            return i
+        i = i + 1
+    return -1
+
+# ============================================================
+# TCP connection
+# ============================================================
+
+fn cdpTcpConnect(port: int32): CdpConnection =
+    var conn = CdpConnection()
+    conn.fd = -1
+    conn.alive = false
+    conn.host = "127.0.0.1"
+    conn.port = port
+    if port <= 0 || port > 65535:
+        return conn
+
+    let fd = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    if fd < 0:
+        return conn
+
+    # Build sockaddr_in: 16 bytes
+    # sin_len(1) + sin_family(1) + sin_port(2) + sin_addr(4) + sin_zero(8)
+    var addr = mallocBuf(16)
+    if addr == ptr(0):
+        let _ = socketShutdown(fd, SHUT_RDWR)
+        let _close = socketClose(fd)
+        return conn
+
+    bufWriteByte(addr, 0, 16)     # sin_len
+    bufWriteByte(addr, 1, AF_INET)  # sin_family
+    bufWriteInt16BE(addr, 2, port)  # sin_port (big-endian)
+    # sin_addr: 127.0.0.1 = 0x7f000001
+    bufWriteByte(addr, 4, 127)
+    bufWriteByte(addr, 5, 0)
+    bufWriteByte(addr, 6, 0)
+    bufWriteByte(addr, 7, 1)
+    # sin_zero: 8 zero bytes
+    var i: int32
+    i = 8
+    while i < 16:
+        bufWriteByte(addr, i, 0)
+        i = i + 1
+
+    let ret = socketConnect(fd, addr, 16)
+    freeBuf(addr)
+
+    if ret < 0:
+        let _ = socketShutdown(fd, SHUT_RDWR)
+        let _close = socketClose(fd)
+        return conn
+
+    conn.fd = fd
+    conn.alive = true
+    return conn
+
+
+fn cdpDisconnect(conn: var CdpConnection) =
+    if conn.alive && conn.fd >= 0:
+        let _ = socketShutdown(conn.fd, SHUT_RDWR)
+        let _close = socketClose(conn.fd)
+    conn.alive = false
+    conn.fd = -1
+
+
+fn cdpIsAlive(conn: var CdpConnection): bool =
+    return conn.alive && conn.fd >= 0
+
+
+# ============================================================
+# Raw send/recv
+# ============================================================
+
+fn cdpSendString(conn: var CdpConnection, text: str): bool =
+    if !cdpIsAlive(conn):
+        return false
+    let raw = rm.RawmemAsVoid(text)
+    let total = len(text)
+    var sent: int32
+    while sent < total:
+        let chunk = socketWrite(conn.fd, rm.RawmemPtrAdd(raw, int32(sent)), total - sent)
+        if chunk <= 0:
+            return false
+        sent = sent + chunk
+    return true
+
+
+fn cdpBufferToString(buf: ptr, count: int32): str =
+    if count <= 0:
+        return ""
+    var chunk: str
+    var i: int32
+    while i < count:
+        chunk = ConcatStr(chunk, charToStr(char(bufReadByte(buf, i))))
+        i = i + 1
+    return chunk
+
+
+fn cdpReadChunk(conn: var CdpConnection, maxBytes: int32, outChunk: var str): bool =
+    outChunk = ""
+    if maxBytes <= 0:
+        return false
+    var buf = mallocBuf(maxBytes)
+    if buf == ptr(0):
+        return false
+    let n = socketRead(conn.fd, buf, maxBytes)
+    if n <= 0:
+        freeBuf(buf)
+        return false
+    outChunk = cdpBufferToString(buf, int32(n))
+    freeBuf(buf)
+    return true
+
+
+fn cdpReadExact(conn: var CdpConnection, byteCount: int32, outText: var str): bool =
+    outText = ""
+    if byteCount < 0:
+        return false
+    if byteCount == 0:
+        return true
+    var remaining: int32 = byteCount
+    while remaining > 0:
+        var want: int32 = CdpIoChunkBytes
+        if remaining < want:
+            want = remaining
+        var chunk: str
+        if !cdpReadChunk(conn, want, chunk):
+            return false
+        if chunk.len <= 0 || chunk.len > remaining:
+            return false
+        outText = ConcatStr(outText, chunk)
+        remaining = remaining - chunk.len
+    return true
+
+
+fn cdpHttpHeaderEndPos(response: str): int32 =
+    var pos: int32
+    while pos + 3 < len(response):
+        if response[pos] == '\r' && response[pos+1] == '\n' &&
+           response[pos+2] == '\r' && response[pos+3] == '\n':
+            return pos
+        pos = pos + 1
+    return -1
+
+
+fn cdpRecvHttpUntilClosed(conn: var CdpConnection): str =
+    var response: str
+    var keepReading: bool = true
+    while keepReading:
+        var chunk: str
+        if cdpReadChunk(conn, CdpIoChunkBytes, chunk):
+            response = ConcatStr(response, chunk)
+            if response.len > CdpMaxHttpResponseBytes:
+                return ""
+        else:
+            keepReading = false
+    return response
+
+
+fn cdpRecvHttpHeader(conn: var CdpConnection): str =
+    var response: str
+    var keepReading: bool = true
+    while keepReading:
+        var chunk: str
+        if !cdpReadChunk(conn, CdpIoChunkBytes, chunk):
+            return ""
+        response = ConcatStr(response, chunk)
+        if response.len > CdpMaxHttpHeaderBytes:
+            return ""
+        if cdpHttpHeaderEndPos(response) >= 0:
+            keepReading = false
+    return response
+
+
+# ============================================================
+# HTTP GET
+# ============================================================
+
+fn cdpHttpGet(conn: var CdpConnection, path: str): str =
+    # Use sequential ConcatStr to avoid multi-element inline array literal
+    var req: str
+    req = ConcatStr("GET ", path)
+    req = ConcatStr(req, " HTTP/1.1\r\n")
+    req = ConcatStr(req, "Host: ")
+    req = ConcatStr(req, conn.host)
+    req = ConcatStr(req, "\r\n")
+    req = ConcatStr(req, "Connection: close\r\n")
+    req = ConcatStr(req, "Accept: application/json\r\n")
+    req = ConcatStr(req, "\r\n")
+
+    if !cdpSendString(conn, req):
+        return ""
+    return cdpRecvHttpUntilClosed(conn)
+
+
+fn cdpHttpPostJson(conn: var CdpConnection, path: str, body: str): str =
+    var req: str
+    req = ConcatStr("POST ", path)
+    req = ConcatStr(req, " HTTP/1.1\r\n")
+    req = ConcatStr(req, "Host: ")
+    req = ConcatStr(req, conn.host)
+    req = ConcatStr(req, "\r\n")
+    req = ConcatStr(req, "Connection: close\r\n")
+    req = ConcatStr(req, "Accept: application/json\r\n")
+    req = ConcatStr(req, "Content-Type: application/json\r\n")
+    req = ConcatStr(req, "Content-Length: ")
+    req = ConcatStr(req, strings.IntToStr(len(body)))
+    req = ConcatStr(req, "\r\n")
+    req = ConcatStr(req, "\r\n")
+    req = ConcatStr(req, body)
+
+    if !cdpSendString(conn, req):
+        return ""
+    return cdpRecvHttpUntilClosed(conn)
+
+
+fn cdpHttpPostJsonLocal(port: int32, path: str, body: str): str =
+    var conn = cdpTcpConnect(port)
+    if !cdpIsAlive(conn):
+        return ""
+    let response = cdpHttpPostJson(conn, path, body)
+    cdpDisconnect(conn)
+    return httpBody(response)
+
+
+# ============================================================
+# HTTP response: extract body (everything after \r\n\r\n)
+# ============================================================
+
+fn httpBody(response: str): str =
+    let pos = cdpHttpHeaderEndPos(response)
+    if pos >= 0:
+        return sliceBytes(response, pos + 4, len(response) - pos - 4)
+    return ""
+
+
+fn cdpHttpStatusCode(response: str): int32 =
+    if response.len < 12:
+        return 0
+    if response[0] != 'H' || response[1] != 'T' || response[2] != 'T' || response[3] != 'P':
+        return 0
+    var i: int32
+    while i < response.len && response[i] != ' ':
+        i = i + 1
+    if i + 4 > response.len:
+        return 0
+    var code: int32
+    if !cdpParsePort(response, i + 1, i + 4, code):
+        return 0
+    return code
+
+
+# ============================================================
+# CDP page discovery: GET /json
+# ============================================================
+
+fn cdpDiscoverPages(conn: var CdpConnection): str =
+    return httpBody(cdpHttpGet(conn, "/json"))
+
+
+# ============================================================
+# Extract WebSocket URL from JSON page list
+# ============================================================
+
+fn cdpExtractFirstWsUrl(json: str): str =
+    var key = "\"webSocketDebuggerUrl\""
+    var pos = strFind(json, key)
+    if pos < 0:
+        return ""
+    var start = pos + len(key)
+    while start < len(json) && (json[start] == ' ' || json[start] == '\n' || json[start] == '\r' || json[start] == '\t'):
+        start = start + 1
+    if start >= len(json) || json[start] != ':':
+        return ""
+    start = start + 1
+    while start < len(json) && (json[start] == ' ' || json[start] == '\n' || json[start] == '\r' || json[start] == '\t'):
+        start = start + 1
+    if start >= len(json) || json[start] != '"':
+        return ""
+    start = start + 1
+    var endPos = start
+    while endPos < len(json):
+        if json[endPos] == '\\':
+            return ""
+        if json[endPos] == '"':
+            break
+        endPos = endPos + 1
+    if endPos <= start:
+        return ""
+    return sliceBytes(json, start, endPos - start)
+
+
+fn cdpAsciiDigit(ch: char): bool =
+    return ch >= '0' && ch <= '9'
+
+
+@borrows
+fn cdpParsePort(text: str, start: int32, stop: int32, outPort: var int32): bool =
+    if start < 0 || stop <= start || stop > len(text):
+        return false
+    var value: int32
+    var i: int32 = start
+    while i < stop:
+        if !cdpAsciiDigit(text[i]):
+            return false
+        value = value * 10 + (int32(text[i]) - int32('0'))
+        if value <= 0 || value > 65535:
+            return false
+        i = i + 1
+    outPort = value
+    return true
+
+
+@borrows
+fn cdpWsUrlIsLocalHost(wsUrl: str, hostStart: int32, hostEnd: int32): bool =
+    let hostLen = hostEnd - hostStart
+    if hostLen <= 0:
+        return false
+    let host = sliceBytes(wsUrl, hostStart, hostLen)
+    if host == "127.0.0.1":
+        return true
+    if host == "localhost":
+        return true
+    return false
+
+
+fn cdpWsUrlLocalPort(wsUrl: str, outPort: var int32): bool =
+    # Only local debug endpoints are accepted for automation sessions.
+    if len(wsUrl) < 6:
+        return false
+    if wsUrl[0] != 'w' || wsUrl[1] != 's' || wsUrl[2] != ':' || wsUrl[3] != '/' || wsUrl[4] != '/':
+        return false
+    var hostStart: int32 = 5
+    var colonPos: int32 = -1
+    var slashPos: int32 = -1
+    var i: int32 = hostStart
+    while i < len(wsUrl):
+        if wsUrl[i] == ':' && colonPos < 0:
+            colonPos = i
+        elif wsUrl[i] == '/':
+            slashPos = i
+            break
+        i = i + 1
+    if colonPos <= hostStart || slashPos <= colonPos + 1:
+        return false
+    if !cdpWsUrlIsLocalHost(wsUrl, hostStart, colonPos):
+        return false
+    return cdpParsePort(wsUrl, colonPos + 1, slashPos, outPort)
+
+
+# ============================================================
+# WebSocket upgrade handshake
+# ============================================================
+
+fn wsGenerateKey(): str =
+    var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    var out: str
+    let t = epochSeconds()
+    var i: int32
+    i = 0
+    while i < 16:
+        var idx = int32((t >> (i * 2)) & 0x3f)
+        if idx >= 64:
+            idx = idx % 64
+        out = ConcatStr(out, charToStr(chars[idx]))
+        i = i + 1
+    return out
+
+
+fn cdpWebSocketUpgrade(conn: var CdpConnection, wsUrl: str): bool =
+    # wsUrl: ws://host:port/path
+    if len(wsUrl) < 5:
+        return false
+    if wsUrl[0] != 'w':
+        return false
+    if wsUrl[1] != 's':
+        return false
+    if wsUrl[2] != ':':
+        return false
+    if wsUrl[3] != '/':
+        return false
+    if wsUrl[4] != '/':
+        return false
+    var rest = sliceBytes(wsUrl, 5, len(wsUrl) - 5)
+
+    # Split host and path
+    var slashPos = strFind(rest, "/")
+    if slashPos < 0:
+        return false
+    var hostPart = sliceBytes(rest, 0, slashPos)
+    var pathPart = sliceBytes(rest, slashPos, len(rest) - slashPos)
+
+    var wsKey = wsGenerateKey()
+
+    # Build upgrade request with sequential ConcatStr
+    var upgradeReq: str
+    upgradeReq = ConcatStr("GET ", pathPart)
+    upgradeReq = ConcatStr(upgradeReq, " HTTP/1.1\r\n")
+    upgradeReq = ConcatStr(upgradeReq, "Host: ")
+    upgradeReq = ConcatStr(upgradeReq, hostPart)
+    upgradeReq = ConcatStr(upgradeReq, "\r\n")
+    upgradeReq = ConcatStr(upgradeReq, "Upgrade: websocket\r\n")
+    upgradeReq = ConcatStr(upgradeReq, "Connection: Upgrade\r\n")
+    upgradeReq = ConcatStr(upgradeReq, "Sec-WebSocket-Key: ")
+    upgradeReq = ConcatStr(upgradeReq, wsKey)
+    upgradeReq = ConcatStr(upgradeReq, "\r\n")
+    upgradeReq = ConcatStr(upgradeReq, "Sec-WebSocket-Version: 13\r\n")
+    upgradeReq = ConcatStr(upgradeReq, "\r\n")
+
+    if !cdpSendString(conn, upgradeReq):
+        return false
+
+    var response = cdpRecvHttpHeader(conn)
+    if len(response) == 0:
+        return false
+    if cdpHttpStatusCode(response) != 101:
+        return false
+    return true
+
+
+# ============================================================
+# WebSocket frame send/recv (RFC 6455)
+# ============================================================
+
+fn wsBuildTextFrame(text: str): str =
+    var out: str
+    var payloadLen = len(text)
+    if payloadLen >= 65536:
+        return ""
+
+    # byte 0: FIN + text opcode = 0x81
+    out = ConcatStr(out, charToStr(char(0x81)))
+
+    # byte 1+: MASK + length
+    if payloadLen < 126:
+        out = ConcatStr(out, charToStr(char(0x80 | payloadLen)))
+    else:
+        if payloadLen < 65536:
+            out = ConcatStr(out, charToStr(char(0x80 | 126)))
+            out = ConcatStr(out, charToStr(char((payloadLen >> 8) & 0xff)))
+            out = ConcatStr(out, charToStr(char(payloadLen & 0xff)))
+
+    # Masking key (4 bytes)
+    let t = epochSeconds()
+    var m0 = int32(t & 0xff) ^ 0x12
+    var m1 = int32((t >> 8) & 0xff) ^ 0x34
+    var m2 = int32((t >> 16) & 0xff) ^ 0x56
+    var m3 = int32((t >> 24) & 0xff) ^ 0x78
+    out = ConcatStr(out, charToStr(char(m0)))
+    out = ConcatStr(out, charToStr(char(m1)))
+    out = ConcatStr(out, charToStr(char(m2)))
+    out = ConcatStr(out, charToStr(char(m3)))
+
+    # Masked payload
+    var i: int32
+    while i < payloadLen:
+        var b = int32(text[i])
+        var rem = i & 3
+        if rem == 0:
+            b = b ^ m0
+        else:
+            if rem == 1:
+                b = b ^ m1
+            else:
+                if rem == 2:
+                    b = b ^ m2
+                else:
+                    b = b ^ m3
+        out = ConcatStr(out, charToStr(char(b)))
+        i = i + 1
+
+    return out
+
+
+fn wsSendText(conn: var CdpConnection, text: str): bool =
+    var frame = wsBuildTextFrame(text)
+    if frame.len <= 0:
+        return false
+    return cdpSendString(conn, frame)
+
+
+fn wsPayloadLengthFromU64Bytes(raw: str, outLen: var int32): bool =
+    if raw.len != 8:
+        return false
+    var value: int64
+    var i: int32
+    while i < 8:
+        value = (value << 8) | int64(int32(raw[i]) & 0xff)
+        if value > int64(CdpMaxWebSocketPayloadBytes):
+            return false
+        i = i + 1
+    outLen = int32(value)
+    return true
+
+
+fn wsUnmaskPayload(payload: str, maskKey: str): str =
+    if maskKey.len != 4:
+        return ""
+    var out: str
+    var i: int32
+    while i < payload.len:
+        let keyByte = int32(maskKey[i & 3]) & 0xff
+        let value = (int32(payload[i]) & 0xff) ^ keyByte
+        out = ConcatStr(out, charToStr(char(value)))
+        i = i + 1
+    return out
+
+
+fn wsRecvFrame(conn: var CdpConnection, timeoutSeconds: int32, outPayload: var str, outOpcode: var int32): bool =
+    timeoutSeconds
+    var header: str
+    if !cdpReadExact(conn, 2, header):
+        return false
+    outOpcode = int32(header[0]) & 0x0f
+    let masked = (int32(header[1]) & 0x80) != 0
+    var payloadLen = int32(header[1]) & 0x7f
+    if payloadLen == 126:
+        var ext: str
+        if !cdpReadExact(conn, 2, ext):
+            return false
+        payloadLen = ((int32(ext[0]) & 0xff) << 8) | (int32(ext[1]) & 0xff)
+    elif payloadLen == 127:
+        var ext64: str
+        if !cdpReadExact(conn, 8, ext64):
+            return false
+        if !wsPayloadLengthFromU64Bytes(ext64, payloadLen):
+            return false
+    if payloadLen < 0 || payloadLen > CdpMaxWebSocketPayloadBytes:
+        return false
+    var maskKey: str
+    if masked:
+        if !cdpReadExact(conn, 4, maskKey):
+            return false
+    var payload: str
+    if !cdpReadExact(conn, payloadLen, payload):
+        return false
+    if masked:
+        outPayload = wsUnmaskPayload(payload, maskKey)
+    else:
+        outPayload = payload
+    return true
+
+
+# ============================================================
+# CDP JSON-RPC message builder
+# ============================================================
+
+var nextCdpId: int32 = 1
+
+fn cdpBuildRequestWithId(method: str, paramsJson: str, outId: var int32): str =
+    var id = nextCdpId
+    nextCdpId = nextCdpId + 1
+    outId = id
+    var idStr = strings.IntToStr(id)
+    var req: str
+    req = ConcatStr("{\"id\":", idStr)
+    req = ConcatStr(req, ",\"method\":\"")
+    req = ConcatStr(req, method)
+    req = ConcatStr(req, "\"")
+    if len(paramsJson) > 0:
+        req = ConcatStr(req, ",\"params\":")
+        req = ConcatStr(req, paramsJson)
+    req = ConcatStr(req, "}")
+    return req
+
+
+fn cdpBuildRequest(method: str, paramsJson: str): str =
+    var id: int32
+    return cdpBuildRequestWithId(method, paramsJson, id)
+
+
+# ============================================================
+# CDP command send/receive
+# ============================================================
+
+@borrows
+fn cdpRawJsonEqualsInt32(raw: str, value: int32): bool =
+    return raw == strings.IntToStr(value)
+
+
+fn cdpSendCommand(conn: var CdpConnection, method: str, paramsJson: str, outResponse: var str): bool =
+    var requestId: int32
+    var req = cdpBuildRequestWithId(method, paramsJson, requestId)
+    if !wsSendText(conn, req):
+        return false
+
+    var attempt: int32
+    while attempt < 40:
+        var payload: str
+        var opcode: int32
+        if !wsRecvFrame(conn, 30, payload, opcode):
+            return false
+        if opcode == 1:
+            let idRead = cdpJsonTopRawField(payload, "id")
+            if idRead.found && cdpRawJsonEqualsInt32(strings.CloneStr(idRead.value), requestId):
+                outResponse = payload
+                return true
+        attempt = attempt + 1
+    return false
+
+
+# ============================================================
+# High-level CDP operations
+# ============================================================
+
+fn cdpGetDocument(conn: var CdpConnection, outJson: var str): bool =
+    return cdpSendCommand(conn, "DOM.getDocument",
+        "{\"depth\":-1,\"pierce\":true}", outJson)
+
+
+fn cdpPageEnable(conn: var CdpConnection): bool =
+    var responseJson: str
+    return cdpSendCommand(conn, "Page.enable", "", responseJson)
+
+
+fn cdpRuntimeEnable(conn: var CdpConnection): bool =
+    var responseJson: str
+    return cdpSendCommand(conn, "Runtime.enable", "", responseJson)
+
+
+fn cdpGetComputedStyle(conn: var CdpConnection, nodeId: int32, outJson: var str): bool =
+    var params: str
+    params = ConcatStr("{\"nodeId\":", strings.IntToStr(nodeId))
+    params = ConcatStr(params, "}")
+    return cdpSendCommand(conn, "CSS.getComputedStyleForNode", params, outJson)
+
+
+fn cdpGetBoxModel(conn: var CdpConnection, nodeId: int32, outJson: var str): bool =
+    var params: str
+    params = ConcatStr("{\"nodeId\":", strings.IntToStr(nodeId))
+    params = ConcatStr(params, "}")
+    return cdpSendCommand(conn, "DOM.getBoxModel", params, outJson)
+
+
+fn cdpJsonEscapeString(value: str): str =
+    var escaped: str
+    var i: int32
+    while i < len(value):
+        let c = value[i]
+        if c == '"':
+            escaped = ConcatStr(escaped, "\\\"")
+        elif c == '\\':
+            escaped = ConcatStr(escaped, "\\\\")
+        elif c == '\n':
+            escaped = ConcatStr(escaped, "\\n")
+        elif c == '\r':
+            escaped = ConcatStr(escaped, "\\r")
+        elif c == '\t':
+            escaped = ConcatStr(escaped, "\\t")
+        else:
+            escaped = ConcatStr(escaped, charToStr(c))
+        i = i + 1
+    return escaped
+
+
+fn cdpNavigate(conn: var CdpConnection, url: str, outJson: var str): bool =
+    var params: str
+    params = ConcatStr("{\"url\":\"", cdpJsonEscapeString(url))
+    params = ConcatStr(params, "\"}")
+    return cdpSendCommand(conn, "Page.navigate", params, outJson)
+
+
+fn cdpEvaluateJs(conn: var CdpConnection, expression: str, outJson: var str): bool =
+    var params: str
+    params = ConcatStr("{\"expression\":\"", cdpJsonEscapeString(expression))
+    params = ConcatStr(params, "\",\"returnByValue\":true}")
+    return cdpSendCommand(conn, "Runtime.evaluate", params, outJson)
+
+
+fn cdpJsonFieldMissing(): CdpJsonFieldRead =
+    var out: CdpJsonFieldRead
+    return out
+
+
+# Takes an owned value (call site clones the slice view out): a plain formal
+# cannot bind a borrow view, and a var formal cannot bind an rvalue view.
+fn cdpJsonFieldFound(value: str): CdpJsonFieldRead =
+    var out: CdpJsonFieldRead
+    out.found = true
+    out.value = value
+    return out
+
+
+fn cdpJsonFieldIsWs(ch: char): bool =
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'
+
+
+# text is scanned read-only; var formals (implicit borrow) keep the owned
+# formal of cdpJsonTopRawField live across the scanner calls instead of
+# consuming it on a plain move formal.
+fn cdpJsonFieldSkipWs(text: var str, pos: int32): int32 =
+    var i: int32 = pos
+    while i < text.len && cdpJsonFieldIsWs(text[i]):
+        i = i + 1
+    return i
+
+
+fn cdpJsonFieldSkipString(text: var str, quotePos: int32): int32 =
+    if quotePos < 0 || quotePos >= text.len || text[quotePos] != '"':
+        return -1
+    var i: int32 = quotePos + 1
+    while i < text.len:
+        if text[i] == '\\':
+            i = i + 2
+        elif text[i] == '"':
+            return i + 1
+        else:
+            i = i + 1
+    return -1
+
+
+fn cdpJsonFieldKeyMatches(text: var str, quotePos: int32, afterQuote: int32,
+                          key: var str): bool =
+    let size: int32 = afterQuote - quotePos - 2
+    if size != key.len:
+        return false
+    var i: int32
+    while i < size:
+        if text[quotePos + 1 + i] != key[i]:
+            return false
+        i = i + 1
+    return true
+
+
+fn cdpJsonFieldSkipValue(text: var str, start: int32): int32 =
+    var i: int32 = cdpJsonFieldSkipWs(text, start)
+    if i >= text.len:
+        return i
+    if text[i] == '"':
+        let stringEnd = cdpJsonFieldSkipString(text, i)
+        if stringEnd < 0:
+            return text.len
+        return stringEnd
+    if text[i] != '{' && text[i] != '[':
+        while i < text.len && text[i] != ',' && text[i] != '}' && text[i] != ']':
+            i = i + 1
+        return i
+    var depth: int32
+    while i < text.len:
+        if text[i] == '"':
+            let stringEnd = cdpJsonFieldSkipString(text, i)
+            if stringEnd < 0:
+                return text.len
+            i = stringEnd
+        elif text[i] == '{' || text[i] == '[':
+            depth = depth + 1
+            i = i + 1
+        elif text[i] == '}' || text[i] == ']':
+            depth = depth - 1
+            i = i + 1
+            if depth <= 0:
+                return i
+        else:
+            i = i + 1
+    return i
+
+
+fn cdpJsonTopRawField(text: str, key: str): CdpJsonFieldRead =
+    var i: int32 = cdpJsonFieldSkipWs(text, 0)
+    if i >= text.len || text[i] != '{':
+        return cdpJsonFieldMissing()
+    i = i + 1
+    while i < text.len:
+        i = cdpJsonFieldSkipWs(text, i)
+        if i >= text.len || text[i] == '}':
+            return cdpJsonFieldMissing()
+        if text[i] == ',':
+            i = i + 1
+            continue
+        if text[i] != '"':
+            return cdpJsonFieldMissing()
+        let keyEnd = cdpJsonFieldSkipString(text, i)
+        if keyEnd < 0:
+            return cdpJsonFieldMissing()
+        let matched = cdpJsonFieldKeyMatches(text, i, keyEnd, key)
+        var valueStart: int32 = cdpJsonFieldSkipWs(text, keyEnd)
+        if valueStart >= text.len || text[valueStart] != ':':
+            return cdpJsonFieldMissing()
+        valueStart = cdpJsonFieldSkipWs(text, valueStart + 1)
+        let valueEnd = cdpJsonFieldSkipValue(text, valueStart)
+        if matched:
+            if valueEnd <= valueStart:
+                return cdpJsonFieldMissing()
+            let matchedValue: str = strings.CloneStr(
+                sliceBytes(text, valueStart, valueEnd - valueStart))
+            return cdpJsonFieldFound(matchedValue)
+        i = valueEnd
+    return cdpJsonFieldMissing()
+
+
+fn cdpJsonDecodeStringRaw(raw: str, outValue: var str): bool =
+    if raw.len < 2:
+        return false
+    if raw[0] != '"' || raw[raw.len - 1] != '"':
+        return false
+    var out: str
+    var segmentStart: int32 = 1
+    var i: int32 = 1
+    let closeQuote: int32 = raw.len - 1
+    while i < closeQuote:
+        if raw[i] == '\\':
+            if i + 1 >= closeQuote:
+                return false
+            if i > segmentStart:
+                out = ConcatStr(out, sliceBytes(raw, segmentStart, i - segmentStart))
+            if raw[i + 1] == '"':
+                out = ConcatStr(out, "\"")
+            elif raw[i + 1] == '\\':
+                out = ConcatStr(out, "\\")
+            elif raw[i + 1] == 'n':
+                out = ConcatStr(out, "\n")
+            elif raw[i + 1] == 'r':
+                out = ConcatStr(out, "\r")
+            elif raw[i + 1] == 't':
+                out = ConcatStr(out, "\t")
+            else:
+                return false
+            i = i + 2
+            segmentStart = i
+        else:
+            i = i + 1
+    if closeQuote > segmentStart:
+        out = ConcatStr(out, sliceBytes(raw, segmentStart, closeQuote - segmentStart))
+    outValue = out
+    return true
+
+
+fn cdpRuntimeEvaluateStringValue(responseJson: str, outValue: var str): bool =
+    let outerResult = cdpJsonTopRawField(responseJson, "result")
+    if !outerResult.found:
+        return false
+    # Spec migration: a managed field read yields a borrow view, and a borrowed
+    # actual cannot bind a non-var non-@borrows formal. Clone each field-read
+    # source into an owned value (borrows-invalid-sweep strFind precedent).
+    let innerResult = cdpJsonTopRawField(strings.CloneStr(outerResult.value), "result")
+    if !innerResult.found:
+        return false
+    let valueRaw = cdpJsonTopRawField(strings.CloneStr(innerResult.value), "value")
+    if !valueRaw.found:
+        return false
+    return cdpJsonDecodeStringRaw(strings.CloneStr(valueRaw.value), outValue)
+
+
+# ============================================================
+# One-shot: connect → discover → upgrade → get DOM
+# ============================================================
+
+fn cdpFetchDocumentFromChrome(outJson: var str): bool =
+    return cdpFetchDocumentFromDebugPort(9222, outJson)
+
+
+fn cdpFetchDocumentFromDebugPort(port: int32, outJson: var str): bool =
+    # Step 1: Connect and discover pages via HTTP
+    var conn = cdpTcpConnect(port)
+    if !cdpIsAlive(conn):
+        return false
+
+    var pagesJson = cdpDiscoverPages(conn)
+    if len(pagesJson) == 0:
+        cdpDisconnect(conn)
+        return false
+
+    var wsUrl = cdpExtractFirstWsUrl(pagesJson)
+    if len(wsUrl) == 0:
+        cdpDisconnect(conn)
+        return false
+
+    cdpDisconnect(conn)
+
+    # Step 2: New connection for WebSocket
+    var wsConn = cdpConnectWsUrl(wsUrl)
+    if !cdpIsAlive(wsConn):
+        return false
+
+    # Step 3: Get document
+    var ok = cdpGetDocument(wsConn, outJson)
+    cdpDisconnect(wsConn)
+    return ok
+
+
+fn cdpFetchDocumentFromWsUrl(wsUrl: str, outJson: var str): bool =
+    var wsConn = cdpConnectWsUrl(wsUrl)
+    if !cdpIsAlive(wsConn):
+        return false
+    var ok = cdpGetDocument(wsConn, outJson)
+    cdpDisconnect(wsConn)
+    return ok
+
+
+fn cdpConnectWsUrl(wsUrl: str): CdpConnection =
+    var empty: CdpConnection
+    empty.fd = -1
+    var port: int32
+    if !cdpWsUrlLocalPort(wsUrl, port):
+        return empty
+
+    var wsConn = cdpTcpConnect(port)
+    if !cdpIsAlive(wsConn):
+        return empty
+
+    if !cdpWebSocketUpgrade(wsConn, wsUrl):
+        cdpDisconnect(wsConn)
+        return empty
+    return wsConn
+
+
+fn cdpNavigateAndEvaluateJsFromWsUrl(wsUrl: str,
+                                     url: str,
+                                     waitMs: int32,
+                                     expression: str,
+                                     outEvaluateJson: var str): bool =
+    var wsConn = cdpConnectWsUrl(wsUrl)
+    if !cdpIsAlive(wsConn):
+        return false
+    if !cdpPageEnable(wsConn):
+        cdpDisconnect(wsConn)
+        return false
+    if !cdpRuntimeEnable(wsConn):
+        cdpDisconnect(wsConn)
+        return false
+    var navJson: str
+    if url.len > 0:
+        if !cdpNavigate(wsConn, url, navJson):
+            cdpDisconnect(wsConn)
+            return false
+        if waitMs > 0:
+            os.SleepMs(waitMs)
+    let ok = cdpEvaluateJs(wsConn, expression, outEvaluateJson)
+    cdpDisconnect(wsConn)
+    return ok
+
+
+fn cdpNavigateAndEvaluateStringFromWsUrl(wsUrl: str,
+                                         url: str,
+                                         waitMs: int32,
+                                         expression: str,
+                                         outValue: var str): bool =
+    var evaluateJson: str
+    if !cdpNavigateAndEvaluateJsFromWsUrl(wsUrl, url, waitMs, expression, evaluateJson):
+        return false
+    return cdpRuntimeEvaluateStringValue(evaluateJson, outValue)

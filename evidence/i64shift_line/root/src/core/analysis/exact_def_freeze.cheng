@@ -1,0 +1,2891 @@
+# exact_def_freeze — ExactDef 批 2: 点活性 walker + consume 边 + read-edge
+# 验证器 (docs/cheng-exact-def-rewrite-design.md §4 批 2; 算法照
+# docs/cheng-exact-def-batch2-walker-spec.md 伪代码级规格移植, C 行号证据
+# 逐条锚定在注释中)。
+#
+# 职责:
+#   1. 支配缓存自建 (idom/pre/post + 前驱 CSR; DefinitionCfg 只给可达不给
+#      支配 — 规格 §6, C 48866-49292 同构移植, 无 pending 边/无 SWITCH)。
+#   2. query-relevant 切片 (逆 BFS 裁 [flow_entry,flow_end), 哨兵 1 同阈值)。
+#   3. 点活性主循环 (C 54949-55841): 状态机 UNDEFINED/LIVE/CONSUMED/
+#      RELEASED 按位掩码, join=按位或; 容量哨兵 2 同阈值 5B+1。
+#   4. consume 谓词四通道单源 (C 52694-53136):
+#      ①source 列 — Cheng 载体 = BodyOp.sourceDefinitionRow (lowering /
+#        cleanup 物化的不可变权威, 域 BodyDefinitionDomainBodyOpTag);
+#        C 豁免序①-⑧⑩-⑭全部 C-op-kind 载体 (NOP/MV/SEQ_STR_ADD/
+#        COPY_COMPOSITE/PAYLOAD_LOAD/FIELD_REF/ARRAY_*) 在 Cheng 19 值 op
+#        域无对应行 → 真空; ⑨def 借用豁免→false, ⑮默认真 保留;
+#      ②call-arg CSR — 侧车 argDefOpRows/argOwnerships, MOVE 才消费
+#        (derive 批 2 臂填 lowering call 行, 同步扩列填物化 call 行);
+#      ③CFG_MERGE op_b — Cheng 无 CFG_MERGE 行 (批 4 前置), 真空 false;
+#      ④frozen var-out NOP origin — Cheng 无 NOP/MV 行, 真空 false。
+#      四枚举位点 (names_candidate / walker 步进 / summary 审计 /
+#      first-consume 语义) 同源单遍: 谓词与引用枚举共享同一实现; consumer
+#      索引/first-consume/sparse/defer 性能缓存不移植 (规格 §6)。
+#   5. consume-edge 审计 (C 69563-69758 条件与字段序逐字对齐): PLAIN 两
+#      容忍臂中 EXACT_PLAIN_SCOPE_END 与静态 str PLAIN storage 在 Cheng
+#      无载体 (str→STR storage) → 真空 false; 单消费者支配快道不移植
+#      (cyclic 恒 true 等效禁用), 全量 dataflow 唯一权威, 语义不变。
+#   6. reissue 四循环 (cold_parser.c:26838-27024) Cheng 归宿: 四循环全部
+#      NOP/MV/CALL 钉载体, 基板无对应行 → 真空; [reissuefail] 判词保留 —
+#      任何 MEMORY_VERSION place 定义在 Cheng 无证书权威可证 → 判词 +
+#      false (严格方向, 无放宽)。
+#   7. read-edge seal 后单遍完成 + 终校验 (cold_parser.c:21525-21676 /
+#      21447-21518; 解析期七处不移植, 设计 §5-7)。Cheng 侧车仅 readA 一列
+#      (批 1 schema 冻结), b/c/dst 读边无存储载体: 完成只落 a 列,
+#      use-after-consume 扫描覆盖 a+b 读的活性语义。C 四条当代性旁路
+#      (version_chain/cert/self_merge/sole_mv) 全 MV/CFG_MERGE 载体 →
+#      真空; Cheng 直读车道 = 定义当代性 (is_current_at_consumer, 含
+#      reaches 门, 缺陷修复 1 同标准)。自边两形真空: Cheng 参数定义 op
+#      直接定义入参槽, 无 raw ABI 载体槽/CFG_MERGE 双臂。
+#   8. use-after-consume: 托管 storage (STR/SEQUENCE/OBJECT) 定义的读点
+#      活性查询, 非纯 LIVE → `use of consumed managed value`。
+#
+# 判词纪律 (设计 §3.5/§6): 文本逐字保留 C (含 cheng_cold: 前缀与字段序);
+# 基板替换仅两处 (批 1 先例): %.*s 函数名 → controlFunctionRow int32;
+# 解析期 expression/loc 段无载体 → 空串。verdict = stderr 单行 + 返 false
+# (query is unreachable / 三条 exact consume dataflow / 审计两条 /
+# use-of-consumed / read-edge 族); diag-gated (exact point liveness
+# failed / redefines live 两条) 经 limits.diagPointLiveness 开关;
+# 容量哨兵与 read-edge die 链 = stderr 单行 + 进程退出 (C die 语义)。
+#
+# exact_frozen 门: seal 后恒 frozen 自然消解 (规格 §6)。
+# 身份纪律: 一切跨节点身份 int32 行 (op 行/槽行/函数行), 零文本零名字键。
+
+import std/strformat
+import std/os
+import cheng/core/ir/core_types as coreir
+import cheng/core/ir/body_ir_exact_def as exactdef
+import cheng/core/lang/typed_expr_type_arena as typearena
+
+const
+    # 状态位 (cheng_cold.c:54632-54637 逐值对齐); join=按位或 (54828)。
+    ExactDefFreezeStateUndefinedTag = 1
+    ExactDefFreezeStateLiveTag = 2
+    ExactDefFreezeStateConsumedTag = 4
+    ExactDefFreezeStateReleasedTag = 8
+    # C 容量阈值 (55006): (INT32_MAX-1)/5。
+    ExactDefFreezeWorkQueueBlockCapC = 429496729
+    # C read operand 枚举 (cold_parser.c:21-24): DST0/A1/B2/C3。
+    exactDefFreezeReadOperandA = 1
+    exactDefFreezeReadOperandB = 2
+
+type
+    # 验证旋钮。生产 = ExactDefFreezeProductionLimits (C 同阈值);
+    # 夹具用小常量触发两条容量哨兵 (同一代码路径, 阈值注入是测试缝,
+    # 非运行时启发式)。
+    ExactDefFreezeLimits =
+        workQueueBlockCap: int32      # 哨兵 2 阈值 (C: (INT32_MAX-1)/5)
+        reverseQueueCap: int32        # 哨兵 1 阈值, -1 = blockCount (C 同)
+        mutexQueueCap: int32          # 互斥消费者对 BFS 阈值, -1 = blockCount
+        diagPointLiveness: bool       # C diag-gated 判词开关
+
+    # 支配缓存 (C ColdDominatorCache 18474-18506 的 Cheng 工作区形;
+    # 无 built_generation — 每次验证对 frozen BodyIR 一次性构建)。
+    ExactDefFreezeDominators =
+        blockCount: int32
+        edgeCount: int32
+        idom: int32[]
+        preorder: int32[]
+        postorder: int32[]
+        predOffsets: int32[]          # CSR, blockCount+1 行
+        predecessors: int32[]
+        reachable: bool[]
+
+    # 数据流工作区 (C ColdExactDataflowWorkspace 54646-54795 同构;
+    # u8 状态列以 int32 携带, 值域 0..15)。
+    ExactDefFreezeWorkspace =
+        entryStates: int32[]
+        exitStates: int32[]
+        flowQueued: bool[]
+        queryRelevant: int32[]
+        flowQueue: int32[]            # 容量 5*blockCount+1
+        opBlockIds: int32[]           # 派生 owner (非权威, 由 blocks 构建)
+
+    # 消费者摘要 (C ColdExactConsumerSummary 同构, 四枚举位点同源单遍产出)。
+    ExactDefFreezeConsumerSummary =
+        count: int32
+        first: int32
+        second: int32
+        last: int32
+        terminalCount: int32
+
+fn ExactDefFreezeProductionLimits(): ExactDefFreezeLimits =
+    var limits: ExactDefFreezeLimits
+    limits.workQueueBlockCap = ExactDefFreezeWorkQueueBlockCapC
+    limits.reverseQueueCap = -1
+    limits.mutexQueueCap = -1
+    limits.diagPointLiveness = false
+    return limits
+
+# ---- verdict / die 基座 ----
+
+@borrows
+fn exactDefFreezeVerdictEmit(line: str) =
+    os.WriteLine(os.Get_stderr(), line)
+    os.C_fflush(os.Get_stderr())
+
+# C die 语义 (cheng_cold.c:296): stderr 单行确定 + 进程退出, 不返。
+@borrows
+fn exactDefFreezeDie(line: str) =
+    os.WriteLine(os.Get_stderr(), line)
+    os.C_fflush(os.Get_stderr())
+    os.os_exit_bridge(2)
+
+@borrows
+fn exactDefFreezeOpOperandOrInvalid(op: coreir.BodyOp,
+                                    ordinal: int32): int32 =
+    if ordinal < 0 || ordinal >= op.operands.len:
+        return -1
+    return op.operands[ordinal]
+
+# 谓词 source 列读取: Cheng 权威 = BodyOp.sourceDefinitionRow
+# (域 BodyOp 才是一致物理定义边; 其他域/-1 不算 source 列命名)。
+@borrows
+fn exactDefFreezeOpSourceDefRow(op: coreir.BodyOp): int32 =
+    if op.sourceDefinitionDomain ==
+           coreir.BodyDefinitionDomainBodyOpTag:
+        return op.sourceDefinitionRow
+    return -1
+
+# ---- 支配缓存构建 (C 48866-49292 同构; 边集=每块 term 的后继 CSR,
+#      无 pending 边; 不可达块 idom=-1 preorder=-1) ----
+
+fn exactDefFreezeDominatorDie(text: str) =
+    # 结构性 die (C 48881-49262 族): 非夹具判词, 文本保留 C 形。
+    exactDefFreezeDie(text)
+
+fn ExactDefFreezeDominatorsBuild(
+        bodyIR: var coreir.BodyIR): ExactDefFreezeDominators =
+    var dom: ExactDefFreezeDominators
+    let blockCount = bodyIR.blocks.len
+    dom.blockCount = blockCount
+    if blockCount <= 0:
+        return dom
+    if !bodyIR.controlFlowSealed:
+        panic("exact def freeze: dominators require sealed control flow")
+    if bodyIR.termSuccessorStarts.len != bodyIR.terms.len ||
+       bodyIR.termSuccessorCounts.len != bodyIR.terms.len:
+        exactDefFreezeDominatorDie(
+            "BodyIR dominator graph exceeds exact index range")
+    # 边集: 每块 term 的后继 CSR 切片。
+    var edgeFrom: int32[]
+    var edgeTo: int32[]
+    for block in 0..<blockCount:
+        let termIndex = bodyIR.blocks[block].termIndex
+        if termIndex < 0:
+            continue
+        if termIndex >= bodyIR.terms.len:
+            exactDefFreezeDominatorDie(
+                "BodyIR dominator graph exceeds exact index range")
+        let start = bodyIR.termSuccessorStarts[termIndex]
+        let count = bodyIR.termSuccessorCounts[termIndex]
+        if start < 0 || count < 0 ||
+           start > bodyIR.successorBlockIds.len - count:
+            exactDefFreezeDominatorDie(
+                "BodyIR dominator graph exceeds exact index range")
+        for edge in start..<start + count:
+            let successor = bodyIR.successorBlockIds[edge]
+            if successor < 0 || successor >= blockCount:
+                exactDefFreezeDominatorDie(
+                    "BodyIR dominator graph exceeds exact index range")
+            add(edgeFrom, block)
+            add(edgeTo, successor)
+    let edgeCount = edgeTo.len
+    dom.edgeCount = edgeCount
+    # 前驱 CSR。
+    setLen(dom.predOffsets, blockCount + 1)
+    for edge in 0..<edgeCount:
+        dom.predOffsets[edgeTo[edge] + 1] =
+            dom.predOffsets[edgeTo[edge] + 1] + 1
+    for block in 0..<blockCount:
+        dom.predOffsets[block + 1] =
+            dom.predOffsets[block + 1] + dom.predOffsets[block]
+    if dom.predOffsets[blockCount] != edgeCount:
+        exactDefFreezeDominatorDie(
+            "BodyIR dominator workspace shape mismatch")
+    var predCursor: int32[]
+    setLen(predCursor, blockCount)
+    setLen(dom.predecessors, edgeCount)
+    for edge in 0..<edgeCount:
+        let successor = edgeTo[edge]
+        dom.predecessors[dom.predOffsets[successor] +
+                         predCursor[successor]] = edgeFrom[edge]
+        predCursor[successor] = predCursor[successor] + 1
+    # RPO DFS (迭代, 显式栈; C 49051 栈溢出 die 对应容量哨兵外结构)。
+    var visited: bool[]
+    setLen(visited, blockCount)
+    var postorder: int32[]
+    var stackBlock: int32[]
+    var stackEdge: int32[]
+    add(stackBlock, 0)
+    add(stackEdge, 0)
+    while stackBlock.len > 0:
+        let top = stackBlock.len - 1
+        let block = stackBlock[top]
+        if !visited[block]:
+            visited[block] = true
+        var advanced = false
+        let termIndex = bodyIR.blocks[block].termIndex
+        if termIndex >= 0:
+            let start = bodyIR.termSuccessorStarts[termIndex]
+            let count = bodyIR.termSuccessorCounts[termIndex]
+            var edgeOrdinal = stackEdge[top]
+            while edgeOrdinal < count:
+                let successor =
+                    bodyIR.successorBlockIds[start + edgeOrdinal]
+                edgeOrdinal = edgeOrdinal + 1
+                if !visited[successor]:
+                    advanced = true
+                    break
+            stackEdge[top] = edgeOrdinal
+            if advanced:
+                add(stackBlock,
+                    bodyIR.successorBlockIds[start + edgeOrdinal - 1])
+                add(stackEdge, 0)
+                continue
+        add(postorder, block)
+        setLen(stackBlock, top)
+        setLen(stackEdge, top)
+    let orderCount = postorder.len
+    dom.reachable = visited
+    # rpoNumber: RPO 序位置 (entry=0 在 RPO 首)。
+    var rpoNumber: int32[]
+    setLen(rpoNumber, blockCount)
+    for position in 0..<blockCount:
+        rpoNumber[position] = -1
+    for position in 0..<orderCount:
+        rpoNumber[postorder[orderCount - 1 - position]] = position
+    # Cooper 不动点 idom (C 49052-49100; pass_limit=RPO^2+1 超了 die)。
+    setLen(dom.idom, blockCount)
+    for block in 0..<blockCount:
+        dom.idom[block] = -1
+    dom.idom[0] = 0
+    let passLimit = orderCount * orderCount + 1
+    var pass: int32
+    var changed = true
+    while changed:
+        pass = pass + 1
+        if pass > passLimit:
+            exactDefFreezeDominatorDie(
+                "BodyIR dominator fixed point did not converge")
+        changed = false
+        for rpoIndex in 0..<orderCount:
+            let block = postorder[orderCount - 1 - rpoIndex]
+            if block == 0:
+                continue
+            var newIdom: int32 = -1
+            for edge in dom.predOffsets[block]..<dom.predOffsets[block + 1]:
+                let pred = dom.predecessors[edge]
+                if !visited[pred]:
+                    continue
+                # Cooper 规则: 未编号前驱 (idom<0, 回边/前向边) 本轮
+                # 不参与 — 首个已编号前驱做种子, 其余做交集。
+                if pred != 0 && dom.idom[pred] < 0:
+                    continue
+                if newIdom < 0:
+                    newIdom = pred
+                else:
+                    var finger1 = pred
+                    var finger2 = newIdom
+                    while finger1 != finger2:
+                        while rpoNumber[finger1] > rpoNumber[finger2]:
+                            finger1 = dom.idom[finger1]
+                            if finger1 < 0:
+                                exactDefFreezeDominatorDie(
+                                    "BodyIR dominator predecessor intersection failed")
+                        while rpoNumber[finger2] > rpoNumber[finger1]:
+                            finger2 = dom.idom[finger2]
+                            if finger2 < 0:
+                                exactDefFreezeDominatorDie(
+                                    "BodyIR dominator predecessor intersection failed")
+                    newIdom = finger1
+            if newIdom >= 0 && dom.idom[block] != newIdom:
+                dom.idom[block] = newIdom
+                changed = true
+    # 支配树 pre/post (迭代 DFS; clock != 2*order_count die)。
+    setLen(dom.preorder, blockCount)
+    setLen(dom.postorder, blockCount)
+    for block in 0..<blockCount:
+        dom.preorder[block] = -1
+        dom.postorder[block] = -1
+    var treeStack: int32[]
+    var clock: int32
+    add(treeStack, 0)
+    while treeStack.len > 0:
+        let top = treeStack.len - 1
+        let block = treeStack[top]
+        if dom.preorder[block] < 0:
+            dom.preorder[block] = clock
+            clock = clock + 1
+            # 子块压栈 (idom==block 的可达块, 逆 RPO 序保持先序确定)。
+            var childRpo = orderCount
+            while childRpo > 0:
+                childRpo = childRpo - 1
+                let child = postorder[orderCount - 1 - childRpo]
+                if child != 0 && dom.idom[child] == block:
+                    add(treeStack, child)
+        else:
+            dom.postorder[block] = clock
+            clock = clock + 1
+            setLen(treeStack, top)
+    if clock != 2 * orderCount:
+        exactDefFreezeDominatorDie(
+            "BodyIR dominator tree interval mismatch")
+    return dom
+
+# block_dominates (C 49203-49211): pre/post 区间包含, 双方 preorder>=0。
+@borrows
+fn exactDefFreezeBlockDominates(dom: ExactDefFreezeDominators,
+                                dominatorBlock: int32,
+                                block: int32): bool =
+    if dominatorBlock < 0 || dominatorBlock >= dom.blockCount ||
+       block < 0 || block >= dom.blockCount:
+        return false
+    if dom.preorder[dominatorBlock] < 0 || dom.preorder[block] < 0:
+        return false
+    return dom.preorder[dominatorBlock] <= dom.preorder[block] &&
+           dom.postorder[block] <= dom.postorder[dominatorBlock]
+
+# op_dominates_predecessor (C 51611-51631; 无 cur_open_block —
+# seal 后块 op 区间恒完整)。
+@borrows
+fn exactDefFreezeOpDominatesPredecessor(
+        bodyIR: coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        opBlockIds: int32[],
+        definition: int32,
+        predecessor: int32): bool =
+    let defBlock = opBlockIds[definition]
+    if defBlock < 0 || predecessor < 0 || predecessor >= dom.blockCount:
+        return false
+    if defBlock == predecessor:
+        let start = bodyIR.blocks[predecessor].opStart
+        let opEnd = start + bodyIR.blocks[predecessor].opCount
+        return definition >= start && definition < opEnd
+    return exactDefFreezeBlockDominates(dom, defBlock, predecessor)
+
+# reaches (C 51633-51657 逐条): 双块未知→def<consumer; 单块未知→false;
+# 同块→def<consumer; 跨块→block_dominates。
+@borrows
+fn exactDefFreezeReaches(bodyIR: coreir.BodyIR,
+                         dom: ExactDefFreezeDominators,
+                         opBlockIds: int32[],
+                         definition: int32,
+                         consumer: int32): bool =
+    if definition < 0 || definition >= bodyIR.ops.len ||
+       consumer < 0 || consumer >= bodyIR.ops.len ||
+       definition == consumer:
+        return false
+    let defBlock = opBlockIds[definition]
+    let consumerBlock = opBlockIds[consumer]
+    if defBlock < 0 && consumerBlock < 0:
+        return definition < consumer
+    if defBlock < 0 || consumerBlock < 0:
+        return false
+    if defBlock == consumerBlock:
+        return definition < consumer
+    return exactDefFreezeBlockDominates(dom, defBlock, consumerBlock)
+
+# is_current_at_predecessor (C 51739-51826): 沿 idom 链逐块扫
+# [start,end) (defBlock 起点 def+1, pred 块截到 boundaryOp), 凡
+# valueDefSlot==slot[def] 且 place!=INVALID 的 candidate 即 false。
+@borrows
+fn exactDefFreezeIsCurrentAtPredecessor(
+        bodyIR: coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        opBlockIds: int32[],
+        definition: int32,
+        predecessor: int32,
+        boundaryOp: int32): bool =
+    let slot = bodyIR.ops[definition].valueDefSlot
+    let defBlock = opBlockIds[definition]
+    if !exactDefFreezeOpDominatesPredecessor(
+           bodyIR, dom, opBlockIds, definition, predecessor):
+        return false
+    if boundaryOp >= 0 && opBlockIds[boundaryOp] == predecessor &&
+       defBlock == predecessor && definition >= boundaryOp:
+        return false
+    var cursor = predecessor
+    while cursor >= 0:
+        let start = bodyIR.blocks[cursor].opStart
+        var scanEnd = start + bodyIR.blocks[cursor].opCount
+        var scanStart = start
+        if cursor == defBlock:
+            scanStart = definition + 1
+        if cursor == predecessor && boundaryOp >= 0 &&
+           opBlockIds[boundaryOp] == predecessor:
+            scanEnd = boundaryOp
+        var op = scanStart
+        while op < scanEnd:
+            if bodyIR.ops[op].valueDefSlot == slot &&
+               bodyIR.exactDef.opPlaceKinds[op] !=
+                   exactdef.BodyIrExactDefPlaceInvalidTag:
+                return false
+            op = op + 1
+        if cursor == defBlock:
+            return true
+        cursor = dom.idom[cursor]
+    return false
+
+# is_current_at_consumer (C 60339-60349)。
+@borrows
+fn exactDefFreezeIsCurrentAtConsumer(
+        bodyIR: coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        opBlockIds: int32[],
+        definition: int32,
+        consumer: int32): bool =
+    let consumerBlock = opBlockIds[consumer]
+    return consumerBlock >= 0 &&
+           exactDefFreezeReaches(
+               bodyIR, dom, opBlockIds, definition, consumer) &&
+           exactDefFreezeIsCurrentAtPredecessor(
+               bodyIR, dom, opBlockIds, definition, consumerBlock,
+               consumer)
+
+# ---- consume 谓词 (C 52694-53136) 与同源引用枚举 ----
+
+# 通道② CSR 引用探测: op 是 CALL (operands[0]=callSequence 行) 且某
+# arg 行的 argDefOpRows==def → 该 arg ownership。
+# 返回 argOwnerships 行值, 无引用返 -1。
+@borrows
+fn exactDefFreezeCallArgReference(bodyIR: coreir.BodyIR,
+                                  def: int32,
+                                  consumer: int32): int32 =
+    let op = bodyIR.ops[consumer]
+    if op.kind != coreir.BodyOpCallTag || op.operands.len != 1:
+        return -1
+    let callRow = op.operands[0]
+    if callRow < 0 || callRow >= bodyIR.callSequence.len:
+        return -1
+    let start = bodyIR.exactDef.callArgStarts[callRow]
+    let count = bodyIR.exactDef.callArgCounts[callRow]
+    if start < 0 || count < 0 ||
+       start > bodyIR.exactDef.argDefOpRows.len - count:
+        return -1
+    for row in start..<start + count:
+        if bodyIR.exactDef.argDefOpRows[row] == def:
+            return bodyIR.exactDef.argOwnerships[row]
+    return -1
+
+# wall81: consumer CALL 的 managedStoreKind 身份列 (operands[0] 是
+# callSequence 行); 仅 SNAPSHOT_RETAIN/CLONE 返回其 tag, 其余 -1。
+# 全仓只有 cleanup_cfg exit-return snapshot 物化落这两个 tag
+# (cleanup_cfg:11353-11357), 且 :758-761 runtime intrinsic authority
+# 契约把 tag 绑定为该形状的精确身份 — 无启发式。
+@borrows
+fn exactDefFreezeCallSnapshotReadKind(bodyIR: coreir.BodyIR,
+                                      consumer: int32): int32 =
+    let op = bodyIR.ops[consumer]
+    if op.kind != coreir.BodyOpCallTag || op.operands.len != 1:
+        return -1
+    let callRow = op.operands[0]
+    if callRow < 0 || callRow >= bodyIR.callSequence.len:
+        return -1
+    let kind = bodyIR.callSequence[callRow].managedStoreKind
+    if kind == Int32(coreir.ManagedStoreSnapshotRetainTag) ||
+       kind == Int32(coreir.ManagedStoreSnapshotCloneTag):
+        return kind
+    return -1
+
+# wall86: 上谓词的同源出口 (纯转发, 零逻辑新增)。identity 主审
+# TEMPORARY 臂的 source 通道缺口 (cold_nested row=32 墙) 的修法
+# 必须复用本谓词 — wall81 freeze 侧读语义豁免与 identity 侧豁免
+# 共享同一身份列实现, 禁止第二份逐字拷贝。授权面注记: 本出口落
+# exact_def_freeze (wall86 授权面); exact_def_identity 的通道接入
+# hunk 由 identity 主审授权线落 (w85 活动文件, wall86 线停手移交)。
+@borrows
+fn ExactDefFreezeCallSnapshotReadKind(bodyIR: coreir.BodyIR,
+                                      consumer: int32): int32 =
+    return exactDefFreezeCallSnapshotReadKind(bodyIR, consumer)
+
+# 通道③ CFG_MERGE 第二输入 (C op_b 列, 53129-53135) 的 Cheng 空间回收
+# (批 4): consumer 是 CFG_MERGE place 的 CopyLocal (merge 行), 其 staging
+# 槽 = operands[0]; staging 槽在 consumer 之前的定义行恰有两条边拷贝
+# (双输入), def 是其中非第一输入 (非结构 source 列) 者即第二输入。
+# C 的 op_b==def 判定在 Cheng 无 op_b 列, 以此空间不变量等价回收
+# (配对合法性由批 4 merge 校验器全字段证明, 见 exact_def_merge)。
+@borrows
+fn exactDefFreezeMergeSecondInputRow(bodyIR: coreir.BodyIR,
+                                     consumer: int32): int32 =
+    if consumer < 0 || consumer >= bodyIR.ops.len:
+        return -1
+    let op = bodyIR.ops[consumer]
+    if bodyIR.exactDef.opPlaceKinds[consumer] !=
+           exactdef.BodyIrExactDefPlaceCfgMergeTag ||
+       op.kind != coreir.BodyOpCopyLocalTag || op.operands.len != 1:
+        return -1
+    let staging = op.operands[0]
+    if staging < 0 || staging >= bodyIR.localSlots.len:
+        return -1
+    let firstInput = exactDefFreezeOpSourceDefRow(op)
+    var second: int32 = -1
+    for candidate in 0..<consumer:
+        let candidateOp = bodyIR.ops[candidate]
+        if candidateOp.valueDefSlot != staging || candidate == firstInput:
+            continue
+        if candidateOp.kind != coreir.BodyOpCopyLocalTag ||
+           candidateOp.valueDefOwnership == coreir.OwnInvalid:
+            continue
+        if second >= 0:
+            return -1
+        second = candidate
+    return second
+
+# names_definition_candidate (C 20922-20958) 的 Cheng 同源形:
+# source 列 | CSR 引用 (任意 ownership) | merge 第二输入 (批 4) |
+# frozen-origin (真空)。
+@borrows
+fn exactDefFreezeOpNamesDefinitionCandidate(bodyIR: coreir.BodyIR,
+                                            def: int32,
+                                            consumer: int32): bool =
+    if def < 0 || def >= bodyIR.ops.len ||
+       consumer < 0 || consumer >= bodyIR.ops.len:
+        return false
+    if exactDefFreezeOpSourceDefRow(bodyIR.ops[consumer]) == def:
+        return true
+    if exactDefFreezeCallArgReference(bodyIR, def, consumer) >= 0:
+        return true
+    if exactDefFreezeMergeSecondInputRow(bodyIR, consumer) == def:
+        return true
+    return false
+
+# 谓词本体。通道序: source 列 → CSR → frozen-origin(真空) →
+# merge 第二输入 (批 4)。
+@borrows
+fn exactDefFreezeOpConsumesDefinition(bodyIR: coreir.BodyIR,
+                                      def: int32,
+                                      consumer: int32): bool =
+    if def < 0 || def >= bodyIR.ops.len ||
+       consumer < 0 || consumer >= bodyIR.ops.len:
+        return false
+    # 通道①: source 列 (C 52694-53057)。
+    if exactDefFreezeOpSourceDefRow(bodyIR.ops[consumer]) == def:
+        # 豁免⑨: def own 借用 → false (C 52960-52975; 借用定义不被
+        # source 边消费)。C 豁免①-⑧⑩-⑭的 op-kind 载体 Cheng 无对应
+        # 行, 真空不移植。
+        let defOwnership = bodyIR.ops[def].valueDefOwnership
+        if defOwnership == coreir.OwnBorrowShared ||
+           defOwnership == coreir.OwnBorrowUnique:
+            return false
+        # wall81 豁免: exit-return snapshot call 的 source 边是
+        # retain/clone 读依赖, 非 move — cleanup 物化契约
+        # (cleanup_cfg:11333 owned return source already consumed)
+        # 要求 source 在 snapshot 时未消费, 物化后源仍由 drop unit
+        # 消费 (cleanup_cfg:12532) — 版本不结束。恒真通道①会把
+        # snapshot+drop 判为同一定义的串联双消费, dataflow invalid
+        # (cold_nested owned-return 形状)。身份列 SNAPSHOT_RETAIN/
+        # CLONE 全仓仅 cleanup_cfg 物化并经 runtime intrinsic
+        # authority 契约校验, 精确无启发式。
+        if exactDefFreezeCallSnapshotReadKind(bodyIR, consumer) >= 0:
+            return false
+        # ⑮默认真。
+        return true
+    # 通道②: CSR (C 53058-53089; CALL_COMPOSITE 对应 Cheng
+    # BodyOpCallTag)。首个命名 def 的 arg 行, MOVE 才消费。
+    let argOwnership = exactDefFreezeCallArgReference(bodyIR, def, consumer)
+    if argOwnership >= 0:
+        return argOwnership == Int32(coreir.OwnMove)
+    # 通道④ frozen var-out NOP origin (C 53105-53128): NOP/MV/CALL 钉
+    # 载体 Cheng 无 → 真空 false。
+    # 通道③ CFG_MERGE 第二输入 (C 53129-53135, 批 4 落地): 借用定义
+    # 不被 merge 边消费 (豁免⑨同规则), owned 输入消费。
+    if exactDefFreezeMergeSecondInputRow(bodyIR, consumer) == def:
+        let defOwnership = bodyIR.ops[def].valueDefOwnership
+        if defOwnership == coreir.OwnBorrowShared ||
+           defOwnership == coreir.OwnBorrowUnique:
+            return false
+        return true
+    return false
+
+# owned_slot_overwrite (C 54854-54880): 双 MOVE + 同槽 +
+# def place∈{STACK_LOCAL,CFG_MERGE} + op place==STACK_LOCAL +
+# 双 producer 行 == body 函数行。
+@borrows
+fn exactDefFreezeOwnedSlotOverwriteConsumes(bodyIR: coreir.BodyIR,
+                                            def: int32,
+                                            op: int32): bool =
+    if def < 0 || def >= bodyIR.ops.len ||
+       op <= def || op >= bodyIR.ops.len:
+        return false
+    if bodyIR.ops[def].valueDefOwnership != coreir.OwnMove ||
+       bodyIR.ops[op].valueDefOwnership != coreir.OwnMove:
+        return false
+    let slot = bodyIR.ops[def].valueDefSlot
+    if slot < 0 || slot >= bodyIR.localSlots.len ||
+       bodyIR.ops[op].valueDefSlot != slot:
+        return false
+    let defPlace = bodyIR.exactDef.opPlaceKinds[def]
+    if defPlace != exactdef.BodyIrExactDefPlaceStackLocalTag &&
+       defPlace != exactdef.BodyIrExactDefPlaceCfgMergeTag:
+        return false
+    if bodyIR.exactDef.opPlaceKinds[op] !=
+           exactdef.BodyIrExactDefPlaceStackLocalTag:
+        return false
+    return bodyIR.exactDef.opProducerFunctionRows[def] ==
+               bodyIR.controlFunctionRow &&
+           bodyIR.exactDef.opProducerFunctionRows[op] ==
+               bodyIR.controlFunctionRow
+
+# wall127 容忍臂谓词组: mirror decode 终审 (BodyIrAccessDecode def 审)
+# 对 cp1==0 def 的两个放行臂。decode 明文契约「Manual-consume has its
+# own sealed definition authority ... A physical BodyOp row is therefore
+# not a cp1 contract」; wall116 待物化 admit 臂 (TypedExpr 全戳 + Managed
+# 槽 + 全哨兵列) 对「唯一消费 = exact call-arg CSR Move」形实放行
+# (cold_nested 实证: mc_rows=0, decode 全链绿, publisher 对该形不落
+# cp1 — publish 谓词 exactCallArgRow≥0 ∧ manualConsumeRow<0 只认
+# non-manual 形, 而物化只对 drop 义务 def 回写 cp1)。freeze 消费审计
+# brokenNoRecord 对同形要求 cp1 = dual-domain split (本墙)。本组谓词
+# mirror decode 已承认域, 零弱化: cp1==0 ∧ 唯一消费 (count==1 ∧
+# terminalCount==0, decode「unique consuming fact」同判) 收窄在先,
+# 多消费/terminal 消费/source 边消费/cp1 已录形全不豁免。
+#
+# 臂一: manual-consume 绑定 (decode manual-consume 臂同域, 且更收窄:
+# consumer 的 callOrdinal 与该行 sourceDefinition 边绑定后判定)。
+# manualConsume sidecar 未 seal 时行域 canonical empty, 遍历自然不
+# 命中 (fail-closed)。
+@borrows
+fn exactDefFreezeConsumerManualConsumeBound(
+        bodyIR: coreir.BodyIR,
+        def: int32,
+        consumer: int32): bool =
+    if consumer < 0 || consumer >= bodyIR.ops.len:
+        return false
+    let op = bodyIR.ops[consumer]
+    if op.kind != coreir.BodyOpCallTag || op.operands.len != 1:
+        return false
+    let callRow = op.operands[0]
+    if callRow < 0 || callRow >= bodyIR.callSequence.len:
+        return false
+    for row in 0..<bodyIR.manualConsume.callOrdinals.len:
+        if bodyIR.manualConsume.callOrdinals[row] == callRow &&
+           bodyIR.manualConsume.sourceDefinitionDomains[row] ==
+               coreir.BodyDefinitionDomainBodyOpTag &&
+           bodyIR.manualConsume.sourceDefinitionRows[row] == def:
+            return true
+    return false
+
+# 臂二前置: 唯一消费通道恰为 exact call-arg CSR Move (mirror decode
+# exactCallArgConsume 取反条件: source 边不同指 — snapshot 读 source
+# 边已被 exactDefFreezeOpConsumesDefinition 的 wall81 豁免先行排除)。
+@borrows
+fn exactDefFreezeSoleConsumerExactCallArgMove(
+        bodyIR: coreir.BodyIR,
+        def: int32,
+        consumer: int32): bool =
+    if consumer < 0 || consumer >= bodyIR.ops.len:
+        return false
+    let op = bodyIR.ops[consumer]
+    if op.kind != coreir.BodyOpCallTag || op.operands.len != 1:
+        return false
+    if exactDefFreezeOpSourceDefRow(op) == def:
+        return false
+    return exactDefFreezeCallArgReference(bodyIR, def, consumer) ==
+        Int32(coreir.OwnMove)
+
+# 臂二主体: decode wall116-admit 谓词的 freeze 侧镜像 (consume 同序,
+# 逐列从 decode :TypedExpr 全戳 + 全哨兵列 + Managed 槽臂转录)。rtc/
+# esc 两项是 decode index 私列, freeze 侧不可读 — 镜像取子集: 凡能
+# 携 cp1==0 抵达本审计的形, decode 同谓词必已全真 (否则 apply 内
+# 「Owned values do not disappear」先死), 子集化只能收窄豁免面,
+# fail-closed 方向不变。
+@borrows
+fn exactDefFreezeTypedMoveDefDecodeAdmitMirror(
+        bodyIR: coreir.BodyIR,
+        def: int32): bool =
+    if def < 0 || def >= bodyIR.ops.len:
+        return false
+    let op = bodyIR.ops[def]
+    if op.valueDefOwnership != coreir.OwnMove:
+        return false
+    if op.valueDefOriginKind != coreir.BodyDefinitionOriginTypedExprTag:
+        return false
+    if op.valueDefOriginId != op.valueDefSemanticRow ||
+       op.valueDefOriginId < 0 ||
+       op.valueDefExprNodeIndex < 0:
+        return false
+    if op.consumeActionRow != -1:
+        return false
+    if op.valueDefBorrowOwnerSemanticRow != -1 ||
+       op.valueDefBorrowOwnerDefinitionDomain !=
+           coreir.BodyDefinitionDomainInvalidTag ||
+       op.valueDefBorrowOwnerDefinitionRow != -1:
+        return false
+    if op.sourceDefinitionDomain != coreir.BodyDefinitionDomainInvalidTag ||
+       op.sourceDefinitionRow != -1:
+        return false
+    let slot = op.valueDefSlot
+    if slot < 0 || slot >= bodyIR.localSlots.len:
+        return false
+    if bodyIR.localSlots[slot].managedStorageKind !=
+           coreir.BodyManagedStorageManagedTag:
+        return false
+    return bodyIR.localSlots[slot].typeArenaTypeId >= 0
+
+# ---- typeFact 结构查询 helper (批 4 共享层; 自 exact_def_identity 迁入,
+#      identity 保留同名别名委托 — 单实现, 禁止第二份逐字拷贝) ----
+
+# typeFact 结构查询 (BodyIR 冻结投影; row 缺失 = -1)。
+@borrows
+fn ExactDefFreezeTypeFactStructuralKind(bodyIR: coreir.BodyIR,
+                                        typeId: int32): int32 =
+    if typeId < 0:
+        return -1
+    let row = coreir.BodyIRCanonicalTypeFactRow(bodyIR, typeId)
+    if row < 0:
+        return -1
+    return bodyIR.typeFactStructuralKinds[row]
+
+# Alias/Apply 转发行单跳展开 (typeFact childTypeIds 链); Borrow 不解 —
+# Borrow 即借用地址叶 (独立性判定用)。环/缺行 → -1。
+@borrows
+fn ExactDefFreezePhysicalTypeId(bodyIR: coreir.BodyIR,
+                                typeId: int32): int32 =
+    var current = typeId
+    var hops: int32
+    while hops < 64:
+        let row = coreir.BodyIRCanonicalTypeFactRow(bodyIR, current)
+        if row < 0:
+            return -1
+        let kind = bodyIR.typeFactStructuralKinds[row]
+        if kind != Int32(typearena.TypedExprStructuralTypeAlias) &&
+           kind != Int32(typearena.TypedExprStructuralTypeApply):
+            return current
+        let child = bodyIR.typeFactChildTypeIds[row]
+        if child < 0 || child == current:
+            return -1
+        current = child
+        hops = hops + 1
+    return -1
+
+# 定长数组元素链独立性内折 (cold_plain_value_copy_is_independent 的
+# ARRAY_I32 臂元素道): 元素必须无借用地址叶 (Borrow/RefObject/CString
+# 即地址) 且折叠 PLAIN; 嵌套定长数组逐层递归 (禁摊平); Object 元素 =
+# 字段证据缺位 (见外层的真空裁定) → false。
+@borrows
+fn ExactDefFreezeFixedArrayElementIndependent(
+        bodyIR: coreir.BodyIR,
+        typeId: int32,
+        depth: int32): bool =
+    if depth > 64:
+        return false
+    let physical = ExactDefFreezePhysicalTypeId(bodyIR, typeId)
+    if physical < 0:
+        return false
+    let row = coreir.BodyIRCanonicalTypeFactRow(bodyIR, physical)
+    if row < 0:
+        return false
+    let kind = bodyIR.typeFactStructuralKinds[row]
+    if kind == Int32(typearena.TypedExprStructuralTypeScalar):
+        let scalar = bodyIR.typeFactScalarKinds[row]
+        return scalar > Int32(typearena.TypedExprStructuralScalarInvalid) &&
+               scalar != Int32(typearena.TypedExprStructuralScalarVoid) &&
+               scalar != Int32(typearena.TypedExprStructuralScalarStr) &&
+               scalar != Int32(
+                   typearena.TypedExprStructuralScalarCString) &&
+               scalar != Int32(
+                   typearena.TypedExprStructuralScalarUtf8View) &&
+               scalar != Int32(
+                   typearena.TypedExprStructuralScalarBytesView) &&
+               scalar != Int32(
+                   typearena.TypedExprStructuralScalarPtr)
+    if kind == Int32(typearena.TypedExprStructuralTypeFixedArray):
+        let element = bodyIR.typeFactChildTypeIds[row]
+        if element < 0 || bodyIR.typeFactFixedLengths[row] <= 0:
+            return false
+        return ExactDefFreezeFixedArrayElementIndependent(
+            bodyIR, element, depth + 1)
+    return false
+
+# cold_plain_value_copy_is_independent (cold_parser.c:60240-60286) 的
+# Cheng 版: OBJECT 非 ref+无 managed drop+无借用地址 / ARRAY_I32 同款。
+# Cheng 基板 (批 3 规格 §8): OBJECT/ARRAY_I32 区分走 typeArenaTypeId 侧车
+# 列 + typeFact structural; PLAIN storage 折叠已由 derive 证明无 managed
+# drop。Object 形: 字段布局 CSR 不在冻结 BodyIR 投影 (typeFact 无
+# layoutChild 列), 字段级独立性证据缺位 → 真空裁定 (恒不证; 批 6 锚点 —
+# derive 接线时 evidence 窗在作用域, 独立性由上游车道落证)。
+# FixedArray 形: 元素链逐层证 + auxValue/sizeBytes 双等。
+# 消费点: 批 3 plain_copy_edge 臂 (identity) 与批 4
+# independent_plain_merge + transfer ownership PLAIN 判定 (merge) 同源。
+@borrows
+fn ExactDefFreezePlainValueCopyIndependent(bodyIR: coreir.BodyIR,
+                                           slot: int32): bool =
+    if slot < 0 || slot >= bodyIR.localSlots.len:
+        return false
+    let local = bodyIR.localSlots[slot]
+    if local.typeKind != coreir.LocalAggregateTag ||
+       local.typeArenaTypeId < 0:
+        return false
+    if bodyIR.exactDef.slotStorageKinds[slot] !=
+           exactdef.BodyIrExactDefStoragePlainTag:
+        return false
+    let physical =
+        ExactDefFreezePhysicalTypeId(bodyIR, local.typeArenaTypeId)
+    if physical < 0:
+        return false
+    let row = coreir.BodyIRCanonicalTypeFactRow(bodyIR, physical)
+    if row < 0:
+        return false
+    let kind = bodyIR.typeFactStructuralKinds[row]
+    if kind == Int32(typearena.TypedExprStructuralTypeObject):
+        return false
+    if kind != Int32(typearena.TypedExprStructuralTypeFixedArray):
+        return false
+    let element = bodyIR.typeFactChildTypeIds[row]
+    if element < 0 || bodyIR.typeFactFixedLengths[row] <= 0 ||
+       local.auxValue != bodyIR.typeFactFixedLengths[row] ||
+       local.sizeBytes != bodyIR.typeFactSizeBytes[row]:
+        return false
+    return ExactDefFreezeFixedArrayElementIndependent(
+        bodyIR, element, 0)
+
+# 消费者摘要单遍构建 (C consumer_summary_build+record 54334-54456
+# 同构; terminal 经 term sourceDefinition 单列)。
+@borrows
+fn exactDefFreezeConsumerSummaryBuild(
+        bodyIR: coreir.BodyIR,
+        def: int32): ExactDefFreezeConsumerSummary =
+    var summary: ExactDefFreezeConsumerSummary
+    summary.first = -1
+    summary.second = -1
+    summary.last = -1
+    for op in 0..<bodyIR.ops.len:
+        if !exactDefFreezeOpConsumesDefinition(bodyIR, def, op):
+            continue
+        if summary.count == 0:
+            summary.first = op
+        elif summary.count == 1:
+            summary.second = op
+        summary.last = op
+        summary.count = summary.count + 1
+    for term in 0..<bodyIR.terms.len:
+        if bodyIR.terms[term].sourceDefinitionDomain ==
+               coreir.BodyDefinitionDomainBodyOpTag &&
+           bodyIR.terms[term].sourceDefinitionRow == def:
+            summary.terminalCount = summary.terminalCount + 1
+    return summary
+
+# ---- 判词文本构建器 (C 文本逐字保留, 含 cheng_cold: 前缀与字段序;
+#      基板替换: %.*s 函数名 → controlFunctionRow int32, 见模块头) ----
+
+@borrows
+fn exactDefFreezePointLivenessFailedLine(functionRow: int32,
+                                         definition: int32,
+                                         queryBlock: int32,
+                                         valid: int32,
+                                         state: int32,
+                                         consume: int32,
+                                         definitionBlock: int32): str =
+    return Fmt"cheng_cold: exact point liveness failed function={functionRow} definition={definition} query_block={queryBlock} valid={valid} state={state} consume={consume} definition_block={definitionBlock}"
+
+@borrows
+fn exactDefFreezeQueryUnreachableLine(functionRow: int32,
+                                      definition: int32,
+                                      queryBlock: int32,
+                                      flowEntry: int32,
+                                      flowEnd: int32,
+                                      blockCount: int32): str =
+    return Fmt"cheng_cold: exact point liveness query is unreachable body={functionRow} definition={definition} query_block={queryBlock} flow_entry={flowEntry} flow_end={flowEnd} block_count={blockCount}"
+
+@borrows
+fn exactDefFreezePointGraphBlockLine(block: int32,
+                                     relevant: int32,
+                                     opStart: int32,
+                                     opCount: int32,
+                                     term: int32,
+                                     kind: int32,
+                                     trueBlock: int32,
+                                     falseBlock: int32): str =
+    return Fmt"cheng_cold: exact point graph block={block} relevant={relevant} op_start={opStart} op_count={opCount} term={term} kind={kind} true={trueBlock} false={falseBlock}"
+
+@borrows
+fn exactDefFreezeConsumeDataflowBodyLine(
+        bodyIR: coreir.BodyIR,
+        definition: int32,
+        block: int32,
+        consumer: int32,
+        state: int32): str =
+    let defOp = bodyIR.ops[definition]
+    let consumerOp = bodyIR.ops[consumer]
+    let functionRow = bodyIR.controlFunctionRow
+    let defKind = defOp.kind
+    let defDst = defOp.target
+    let defA = exactDefFreezeOpOperandOrInvalid(defOp, 0)
+    let defB = exactDefFreezeOpOperandOrInvalid(defOp, 1)
+    let defC = exactDefFreezeOpOperandOrInvalid(defOp, 2)
+    let defOwnership = Int32(defOp.valueDefOwnership)
+    let defPlace = bodyIR.exactDef.opPlaceKinds[definition]
+    let consumerKind = consumerOp.kind
+    let consumerDst = consumerOp.target
+    let consumerA = exactDefFreezeOpOperandOrInvalid(consumerOp, 0)
+    let consumerB = exactDefFreezeOpOperandOrInvalid(consumerOp, 1)
+    let consumerC = exactDefFreezeOpOperandOrInvalid(consumerOp, 2)
+    let consumerSourceDef = exactDefFreezeOpSourceDefRow(consumerOp)
+    return Fmt"cheng_cold: exact consume dataflow body={functionRow} definition={definition} block={block} consumer={consumer} state={state} def_kind={defKind} def_dst={defDst} def_a={defA} def_b={defB} def_c={defC} def_ownership={defOwnership} def_place={defPlace} consumer_kind={consumerKind} consumer_dst={consumerDst} consumer_a={consumerA} consumer_b={consumerB} consumer_c={consumerC} consumer_source_def={consumerSourceDef}"
+
+@borrows
+fn exactDefFreezeConsumeDataflowEdgeMergeLine(definition: int32,
+                                              block: int32,
+                                              edgeMerge: int32,
+                                              state: int32): str =
+    return Fmt"cheng_cold: exact consume dataflow definition={definition} block={block} edge_merge={edgeMerge} state={state}"
+
+@borrows
+fn exactDefFreezeConsumeDataflowTermLine(definition: int32,
+                                         block: int32,
+                                         term: int32,
+                                         state: int32): str =
+    return Fmt"cheng_cold: exact consume dataflow definition={definition} block={block} term={term} state={state}"
+
+@borrows
+fn exactDefFreezeRedefinesLiveLine(definition: int32,
+                                   block: int32,
+                                   op: int32,
+                                   state: int32): str =
+    return Fmt"cheng_cold: exact consume dataflow definition={definition} block={block} op={op} redefines live state={state}"
+
+@borrows
+fn exactDefFreezeRedefineConsumerLine(bodyIR: coreir.BodyIR,
+                                      definition: int32,
+                                      op: int32,
+                                      block: int32): str =
+    let consumerOp = bodyIR.ops[op]
+    let kind = consumerOp.kind
+    let source = exactDefFreezeOpSourceDefRow(consumerOp)
+    let place = bodyIR.exactDef.opPlaceKinds[op]
+    let ownership = Int32(consumerOp.valueDefOwnership)
+    let origin = bodyIR.exactDef.opOriginIds[op]
+    return Fmt"cheng_cold: exact redefine consumer definition={definition} op={op} block={block} kind={kind} source={source} place={place} ownership={ownership} origin={origin}"
+
+@borrows
+fn exactDefFreezeInvalidPathConsumeLine(
+        phase: str,
+        bodyIR: coreir.BodyIR,
+        opRow: int32,
+        summary: ExactDefFreezeConsumerSummary,
+        consumePlusOne: int32,
+        recordedFound: bool,
+        dataflowValid: bool): str =
+    let functionRow = bodyIR.controlFunctionRow
+    let kind = bodyIR.ops[opRow].kind
+    let slot = bodyIR.ops[opRow].valueDefSlot
+    let consumerCount = summary.count
+    let terminalCount = summary.terminalCount
+    let first = summary.first
+    var firstKind: int32 = -1
+    if first >= 0:
+        firstKind = bodyIR.ops[first].kind
+    let second = summary.second
+    var secondKind: int32 = -1
+    if second >= 0:
+        secondKind = bodyIR.ops[second].kind
+    let recorded = consumePlusOne - 1
+    var recordedFoundInt: int32
+    if recordedFound:
+        recordedFoundInt = 1
+    var dataflowValidInt: int32
+    if dataflowValid:
+        dataflowValidInt = 1
+    return Fmt"cheng_cold: exact identity schema [{phase}] fn={functionRow} op row={opRow} kind={kind} slot={slot} has invalid path consume op_consumers={consumerCount} term_consumers={terminalCount} first={first} first_kind={firstKind} second={second} second_kind={secondKind} recorded={recorded} recorded_found={recordedFoundInt} dataflow_valid={dataflowValidInt}"
+
+@borrows
+fn exactDefFreezeConsumeCandidateLine(bodyIR: coreir.BodyIR,
+                                      candidate: int32,
+                                      block: int32,
+                                      effectiveBlock: int32): str =
+    let kind = bodyIR.ops[candidate].kind
+    let place = bodyIR.exactDef.opPlaceKinds[candidate]
+    let ownership = Int32(bodyIR.ops[candidate].valueDefOwnership)
+    return Fmt"cheng_cold: consume candidate op={candidate} kind={kind} block={block} effective_block={effectiveBlock} place={place} ownership={ownership}"
+
+@borrows
+fn exactDefFreezeConsumeEdgeBrokenLine(
+        phase: str,
+        bodyIR: coreir.BodyIR,
+        opRow: int32,
+        summary: ExactDefFreezeConsumerSummary,
+        consumePlusOne: int32,
+        recordedFound: bool,
+        dataflowValid: bool): str =
+    let functionRow = bodyIR.controlFunctionRow
+    let consumerCount = summary.count
+    let terminalCount = summary.terminalCount
+    let first = summary.first
+    var firstKind: int32 = -1
+    if first >= 0:
+        firstKind = bodyIR.ops[first].kind
+    let second = summary.second
+    var secondKind: int32 = -1
+    if second >= 0:
+        secondKind = bodyIR.ops[second].kind
+    let recorded = consumePlusOne - 1
+    var recordedFoundInt: int32
+    if recordedFound:
+        recordedFoundInt = 1
+    var dataflowValidInt: int32
+    if dataflowValid:
+        dataflowValidInt = 1
+    return Fmt"cheng_cold: exact identity schema [{phase}] fn={functionRow} op row={opRow} consume edge is broken consumers={consumerCount} term_consumers={terminalCount} first={first} first_kind={firstKind} second={second} second_kind={secondKind} recorded={recorded} recorded_found={recordedFoundInt} dataflow_valid={dataflowValidInt}"
+
+# use of consumed managed value (cold_parser.c:3961): C 在 `cheng_cold: `
+# 后接解析期 error_loc 段再前导空格接本体; error_loc 与 expression 文本
+# 段在 seal 后无载体 → 基板替换为空串 (字段序保留)。
+@borrows
+fn exactDefFreezeUseOfConsumedLine(
+        bodyIR: coreir.BodyIR,
+        slotId: int32,
+        definition: int32,
+        currentBlock: int32,
+        consumeBlock: int32): str =
+    let functionRow = bodyIR.controlFunctionRow
+    let slot = bodyIR.localSlots[slotId]
+    let localName = slot.name
+    let kind = slot.typeKind
+    let consumeOp =
+        bodyIR.ops[definition].valueDefConsumeOpIndexPlusOne - 1
+    var consumeKind: int32 = -1
+    var consumeDst: int32 = -1
+    var consumeA: int32 = -1
+    var consumeB: int32 = -1
+    var consumeSourceDef: int32 = -1
+    if consumeOp >= 0 && consumeOp < bodyIR.ops.len:
+        let consumerOp = bodyIR.ops[consumeOp]
+        consumeKind = consumerOp.kind
+        consumeDst = consumerOp.target
+        consumeA = exactDefFreezeOpOperandOrInvalid(consumerOp, 0)
+        consumeB = exactDefFreezeOpOperandOrInvalid(consumerOp, 1)
+        consumeSourceDef = exactDefFreezeOpSourceDefRow(consumerOp)
+    let expression = ""
+    return Fmt"cheng_cold: use of consumed managed value function={functionRow} local={localName} slot={slotId} kind={kind} def={definition} current_block={currentBlock} consume_op={consumeOp} consume_block={consumeBlock} consume_kind={consumeKind} consume_dst={consumeDst} consume_a={consumeA} consume_b={consumeB} consume_source_def={consumeSourceDef} expression={expression}"
+
+@borrows
+fn exactDefFreezeReissuefailLine(bodyIR: coreir.BodyIR,
+                                 definition: int32): str =
+    let op = bodyIR.ops[definition]
+    let functionRow = bodyIR.controlFunctionRow
+    let kind = op.kind
+    let place = bodyIR.exactDef.opPlaceKinds[definition]
+    let own = Int32(op.valueDefOwnership)
+    let origin = bodyIR.exactDef.opOriginIds[definition]
+    let src = exactDefFreezeOpSourceDefRow(op)
+    let consume = op.valueDefConsumeOpIndexPlusOne
+    let dst = op.target
+    let a = exactDefFreezeOpOperandOrInvalid(op, 0)
+    let b = exactDefFreezeOpOperandOrInvalid(op, 1)
+    let c = exactDefFreezeOpOperandOrInvalid(op, 2)
+    let slot = op.valueDefSlot
+    let typeId = bodyIR.exactDef.opExactTypeIds[definition]
+    return Fmt"cheng_cold: [reissuefail] fn={functionRow} def={definition} kind={kind} place={place} own={own} origin={origin} src={src} consume={consume} dst={dst} a={a} b={b} c={c} slot={slot} type={typeId}"
+
+@borrows
+fn exactDefFreezeReadEdgeFreezeFailLine(functionRow: int32): str =
+    return Fmt"cheng_cold: read-edge freeze fail row={functionRow} fn={functionRow}"
+
+@borrows
+fn exactDefFreezeDirectReadInvalidLine(functionRow: int32,
+                                       op: int32,
+                                       kind: int32,
+                                       operand: int32,
+                                       slot: int32,
+                                       source: int32): str =
+    return Fmt"cheng_cold: managed direct-read edge invalid fn={functionRow} op={op} kind={kind} operand={operand} slot={slot} source={source}"
+
+@borrows
+fn exactDefFreezeDirectReadMissingExtraLine(functionRow: int32,
+                                            op: int32,
+                                            kind: int32,
+                                            operand: int32,
+                                            slot: int32,
+                                            source: int32,
+                                            required: int32,
+                                            b: int32,
+                                            c: int32,
+                                            slotKind: int32,
+                                            slotPlace: int32,
+                                            slotStorage: int32): str =
+    return Fmt"cheng_cold: managed direct-read edge missing/extra fn={functionRow} op={op} kind={kind} operand={operand} slot={slot} source={source} required={required} b={b} c={c} slot_kind={slotKind} slot_place={slotPlace} slot_storage={slotStorage}"
+
+@borrows
+fn exactDefFreezeReadEdgeAmbiguousLine(op: int32,
+                                       operand: int32,
+                                       slot: int32,
+                                       resolved: int32,
+                                       cand: int32,
+                                       opkind: int32): str =
+    return Fmt"cheng_cold: read-edge ambiguous op={op} operand={operand} slot={slot} resolved={resolved} cand={cand} opkind={opkind}"
+
+@borrows
+fn exactDefFreezeReadEdgeUnresolvedLine(op: int32,
+                                        operand: int32,
+                                        slot: int32,
+                                        candidates: int32,
+                                        opkind: int32,
+                                        dst: int32,
+                                        a: int32,
+                                        b: int32,
+                                        c: int32,
+                                        fnRow: int32,
+                                        cand0: int32,
+                                        cand0kind: int32,
+                                        cand0defslot: int32,
+                                        cand0tid: int32,
+                                        slotTid: int32,
+                                        cand0own: int32,
+                                        cand0place: int32,
+                                        cand0origin: int32,
+                                        cand0prod: int32,
+                                        cand0bod: int32,
+                                        cand0bor: int32,
+                                        sub2: int32,
+                                        sub3: int32,
+                                        sub4: int32,
+                                        sub5: int32,
+                                        sub6: int32): str =
+    # [wall146] 失败臂富化 (wall139/141 同法纯读投影, 零语义变化):
+    # 首候选行六子检查 (type/producerFn/placeKind/ownership/isCurrent)
+    # 逐项取数一次入判词 — candidates=1 却 unresolved 的「候选存在但
+    # 未被主张」形下线即可读全投影, 零烤机起步。
+    return Fmt"cheng_cold: read-edge unresolved op={op} operand={operand} slot={slot} candidates={candidates} opkind={opkind} dst={dst} a={a} b={b} c={c} fn={fnRow} cand0={cand0} c_kind={cand0kind} c_dslot={cand0defslot} c_tid={cand0tid} slot_tid={slotTid} c_own={cand0own} c_place={cand0place} c_origin={cand0origin} c_prod={cand0prod} c_bod={cand0bod} c_bor={cand0bor} sub2_tid={sub2} sub3_prod={sub3} sub4_place={sub4} sub5_own={sub5} sub6_cur={sub6}"
+
+# ---- 点活性 walker (C 54949-55841 主循环 + 49213-49292 切片) ----
+
+# 工作区构建: opBlockIds 由 blocks 派生 (派生 owner, 非权威); 重叠即
+# 结构破坏 → panic。flow_queue 容量 5*blockCount+1 (C 55006 同阈值)。
+fn exactDefFreezeWorkspaceAcquire(
+        bodyIR: var coreir.BodyIR): ExactDefFreezeWorkspace =
+    var workspace: ExactDefFreezeWorkspace
+    let blockCount = bodyIR.blocks.len
+    setLen(workspace.entryStates, blockCount)
+    setLen(workspace.exitStates, blockCount)
+    setLen(workspace.flowQueued, blockCount)
+    setLen(workspace.queryRelevant, blockCount)
+    setLen(workspace.flowQueue, blockCount * 5 + 1)
+    setLen(workspace.opBlockIds, bodyIR.ops.len)
+    for op in 0..<bodyIR.ops.len:
+        workspace.opBlockIds[op] = -1
+    for block in 0..<blockCount:
+        let start = bodyIR.blocks[block].opStart
+        let count = bodyIR.blocks[block].opCount
+        if start < 0 || count < 0 ||
+           start > bodyIR.ops.len - count:
+            panic("exact def freeze: block op range invalid")
+        for op in start..<start + count:
+            if workspace.opBlockIds[op] >= 0:
+                panic("exact def freeze: op block partition drift")
+            workspace.opBlockIds[op] = block
+    return workspace
+
+# query-relevant 切片 (C 49213-49292): 从 queryBlock 沿前驱逆 BFS,
+# 裁到 [flowEntry,flowEnd); 哨兵 1 同阈值。返 false = 结构非法
+# (C 返 0 → 调用方 false)。
+@borrows
+fn exactDefFreezeQueryRelevantBuild(
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace,
+        limits: ExactDefFreezeLimits,
+        flowEntry: int32,
+        flowEnd: int32,
+        queryBlock: int32): bool =
+    if flowEntry < 0 || flowEntry >= dom.blockCount ||
+       flowEnd <= flowEntry || flowEnd > dom.blockCount ||
+       queryBlock < flowEntry || queryBlock >= flowEnd:
+        return false
+    var cap = limits.reverseQueueCap
+    if cap < 0:
+        cap = dom.blockCount
+    for block in 0..<dom.blockCount:
+        workspace.queryRelevant[block] = 0
+    var queue: int32[]
+    setLen(queue, dom.blockCount)
+    var head: int32
+    var tail: int32 = 1
+    workspace.queryRelevant[queryBlock] = 1
+    queue[0] = queryBlock
+    while head < tail:
+        let successor = queue[head]
+        head = head + 1
+        let edgeStart = dom.predOffsets[successor]
+        let edgeEnd = dom.predOffsets[successor + 1]
+        if edgeStart < 0 || edgeEnd < edgeStart ||
+           edgeEnd > dom.edgeCount:
+            return false
+        for edge in edgeStart..<edgeEnd:
+            let predecessor = dom.predecessors[edge]
+            if predecessor < flowEntry || predecessor >= flowEnd ||
+               workspace.queryRelevant[predecessor] != 0:
+                continue
+            if tail >= cap:
+                exactDefFreezeDie(
+                    "exact point liveness reverse queue overflow")
+            workspace.queryRelevant[predecessor] = 1
+            queue[tail] = predecessor
+            tail = tail + 1
+    return true
+
+# join_successor (C 54807-54841): 越界 false, 不 relevant true,
+# 有增量才入队。
+fn exactDefFreezeJoinSuccessorState(
+        successor: int32,
+        flowEntry: int32,
+        flowEnd: int32,
+        hasRelevant: bool,
+        state: int32,
+        workspace: var ExactDefFreezeWorkspace,
+        queueTail: var int32): bool =
+    if successor == -1 && hasRelevant:
+        return true
+    if successor < flowEntry || successor >= flowEnd:
+        return false
+    if hasRelevant && workspace.queryRelevant[successor] == 0:
+        return true
+    let joined = workspace.entryStates[successor] | state
+    if joined != workspace.entryStates[successor]:
+        workspace.entryStates[successor] = joined
+        if !workspace.flowQueued[successor]:
+            if queueTail < 0 || queueTail >= workspace.flowQueue.len:
+                return false
+            workspace.flowQueued[successor] = true
+            workspace.flowQueue[queueTail] = successor
+            queueTail = queueTail + 1
+    return true
+
+# 主循环。Cheng 消解: 无 cur_open_block (seal 后块区间恒完整);
+# 无 pending 边; 无 SWITCH; edge_merge 恒 -1 (Cheng 无 CFG_MERGE
+# 块首行, 批 4 hook); 七条重入臂与容忍 (a)(c) 的 NOP/MV/CFG_MERGE
+# 载体真空 → 恒 false; consume_only_drop (COPY_COMPOSITE 载体)
+# 真空 → 消费恒 CONSUMED。
+@borrows
+fn exactDefFreezeConsumptionDataflowFrom(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace,
+        limits: ExactDefFreezeLimits,
+        definition: int32,
+        flowEntry: int32,
+        flowEnd: int32,
+        flowEntryState: int32,
+        queryBlock: int32,
+        queryOpExcl: int32,
+        queryExitState: var int32): bool =
+    queryExitState = 0
+    if definition < 0 || definition >= bodyIR.ops.len ||
+       flowEntry < 0 || flowEntry >= bodyIR.blocks.len ||
+       flowEnd <= flowEntry || flowEnd > bodyIR.blocks.len ||
+       flowEntryState == 0 ||
+       (flowEntryState & 15) != flowEntryState:
+        return false
+    if queryBlock >= 0 &&
+       (queryBlock < flowEntry || queryBlock >= flowEnd):
+        return false
+    if queryOpExcl >= 0:
+        if queryOpExcl >= bodyIR.ops.len ||
+           workspace.opBlockIds[queryOpExcl] != queryBlock:
+            return false
+    # 哨兵 2 (C 55006 同阈值)。
+    if bodyIR.blocks.len > limits.workQueueBlockCap:
+        exactDefFreezeDie("exact definition work queue size overflow")
+    var hasRelevant = false
+    if queryBlock >= 0 && queryBlock < bodyIR.blocks.len:
+        if !exactDefFreezeQueryRelevantBuild(
+               dom, workspace, limits, flowEntry, flowEnd, queryBlock):
+            return false
+        hasRelevant = true
+        if workspace.queryRelevant[flowEntry] == 0:
+            let functionRow = bodyIR.controlFunctionRow
+            exactDefFreezeVerdictEmit(
+                exactDefFreezeQueryUnreachableLine(
+                    functionRow, definition, queryBlock, flowEntry,
+                    flowEnd, bodyIR.blocks.len))
+            for block in flowEntry..<flowEnd:
+                let termIndex = bodyIR.blocks[block].termIndex
+                var kind: int32 = -1
+                var trueBlock: int32 = -1
+                var falseBlock: int32 = -1
+                if termIndex >= 0 && termIndex < bodyIR.terms.len:
+                    kind = bodyIR.terms[termIndex].kind
+                    trueBlock = bodyIR.terms[termIndex].trueBlock
+                    falseBlock = bodyIR.terms[termIndex].falseBlock
+                exactDefFreezeVerdictEmit(
+                    exactDefFreezePointGraphBlockLine(
+                        block, workspace.queryRelevant[block],
+                        bodyIR.blocks[block].opStart,
+                        bodyIR.blocks[block].opCount,
+                        termIndex, kind, trueBlock, falseBlock))
+            return false
+    elif queryBlock >= 0:
+        return false
+    for block in 0..<bodyIR.blocks.len:
+        workspace.entryStates[block] = 0
+        workspace.exitStates[block] = 0
+        workspace.flowQueued[block] = false
+    workspace.entryStates[flowEntry] = flowEntryState
+    var valid = true
+    var head: int32
+    var tail: int32 = 1
+    workspace.flowQueue[0] = flowEntry
+    workspace.flowQueued[flowEntry] = true
+    let defOwnership = bodyIR.ops[definition].valueDefOwnership
+    let borrowedDefinition =
+        defOwnership == coreir.OwnBorrowUnique ||
+        defOwnership == coreir.OwnBorrowShared
+    while head < tail && valid:
+        let block = workspace.flowQueue[head]
+        head = head + 1
+        workspace.flowQueued[block] = false
+        if hasRelevant && workspace.queryRelevant[block] == 0:
+            valid = false
+            break
+        var state = workspace.entryStates[block]
+        var batchConsumeOp: int32 = -1
+        if state == 0:
+            valid = false
+            break
+        let start = bodyIR.blocks[block].opStart
+        var count = bodyIR.blocks[block].opCount
+        if queryOpExcl >= 0 && block == queryBlock:
+            if queryOpExcl < start || queryOpExcl >= start + count:
+                valid = false
+                break
+            count = queryOpExcl - start
+        if start < 0 || count < 0 ||
+           start > bodyIR.ops.len - count:
+            valid = false
+            break
+        var op = start
+        while op < start + count && valid:
+            if op == definition:
+                if (state & ExactDefFreezeStateLiveTag) != 0:
+                    # 批 4: owned_same_place_merge_reentry
+                    # (C 55277-55298 逐字): 自有 origin 的 owned merge
+                    # 行, 双输入 consume 均记本行+1 — 每迭代重发布
+                    # (overwrite-with-drop 语义), 环重入合法, 新纪元。
+                    # 其余重入臂: borrowed/plain 重入权威
+                    # (cold_exact_borrowed/plain_merge_reentry_
+                    # authority_valid, 借用/PLAIN loop phi 形)、
+                    # call_var_out/owned_cfg_merge_version_link/
+                    # version_marker_rep/plain_cfg_merge_incoming
+                    # (NOP/MV 载体或同槽非 staging 形) — Cheng 无
+                    # 对应载体, 真空锚定 (任何未来产生对应上游形态
+                    # 即被本门接住)。
+                    var loopReentry = false
+                    if bodyIR.exactDef.opPlaceKinds[definition] ==
+                           exactdef.BodyIrExactDefPlaceCfgMergeTag &&
+                       (bodyIR.ops[definition].valueDefOwnership ==
+                            coreir.OwnMove ||
+                        bodyIR.ops[definition].valueDefOwnership ==
+                            coreir.OwnPlain) &&
+                       bodyIR.exactDef.opOriginIds[definition] ==
+                           definition:
+                        let mergeInA =
+                            exactDefFreezeOpSourceDefRow(
+                                bodyIR.ops[definition])
+                        let mergeInB =
+                            exactDefFreezeMergeSecondInputRow(
+                                bodyIR, definition)
+                        var mergeInAConsume: int32 = -1
+                        if mergeInA >= 0 && mergeInA < bodyIR.ops.len:
+                            let mergeInAOp = bodyIR.ops[mergeInA]
+                            mergeInAConsume =
+                                mergeInAOp.valueDefConsumeOpIndexPlusOne
+                        var mergeInBConsume: int32 = -1
+                        if mergeInB >= 0 && mergeInB < bodyIR.ops.len:
+                            let mergeInBOp = bodyIR.ops[mergeInB]
+                            mergeInBConsume =
+                                mergeInBOp.valueDefConsumeOpIndexPlusOne
+                        loopReentry = mergeInA >= 0 &&
+                            mergeInA < definition &&
+                            mergeInB >= 0 &&
+                            mergeInB < definition &&
+                            mergeInAConsume == definition + 1 &&
+                            mergeInBConsume == definition + 1
+                    let exactNonresourceLoopReentry =
+                        (state & ExactDefFreezeStateUndefinedTag) != 0 &&
+                        (state & ExactDefFreezeStateReleasedTag) == 0 &&
+                        (loopReentry ||
+                         (state & ExactDefFreezeStateConsumedTag) == 0) &&
+                        loopReentry
+                    if exactNonresourceLoopReentry:
+                        state = ExactDefFreezeStateLiveTag
+                        batchConsumeOp = -1
+                        op = op + 1
+                        continue
+                    if limits.diagPointLiveness:
+                        exactDefFreezeVerdictEmit(
+                            exactDefFreezeRedefinesLiveLine(
+                                definition, block, op, state))
+                        for candidate in 0..<bodyIR.ops.len:
+                            if exactDefFreezeOpConsumesDefinition(
+                                   bodyIR, definition, candidate):
+                                exactDefFreezeVerdictEmit(
+                                    exactDefFreezeRedefineConsumerLine(
+                                        bodyIR, definition, candidate,
+                                        workspace.opBlockIds[candidate]))
+                    valid = false
+                    break
+                state = ExactDefFreezeStateLiveTag
+                batchConsumeOp = -1
+                op = op + 1
+                continue
+            let namesCandidate =
+                exactDefFreezeOpNamesDefinitionCandidate(
+                    bodyIR, definition, op)
+            let consumes = namesCandidate &&
+                exactDefFreezeOpConsumesDefinition(bodyIR, definition, op)
+            let pureLive =
+                (state & ExactDefFreezeStateLiveTag) != 0 &&
+                (state & (ExactDefFreezeStateUndefinedTag |
+                          ExactDefFreezeStateConsumedTag |
+                          ExactDefFreezeStateReleasedTag)) == 0
+            if !consumes &&
+               !(pureLive &&
+                 exactDefFreezeOwnedSlotOverwriteConsumes(
+                     bodyIR, definition, op)):
+                op = op + 1
+                continue
+            if bodyIR.exactDef.opPlaceKinds[op] ==
+                   exactdef.BodyIrExactDefPlaceCfgMergeTag:
+                # phi 边上消费 (批 4); Cheng 无 CFG_MERGE 行 → 真空。
+                op = op + 1
+                continue
+            if !pureLive:
+                # 容忍 (a) var_out_batch_supersede /
+                # version_chain_supersede: NOP+MV 载体真空 → 不移植。
+                # cp1 仅是确定性的代表消费者，不是消费集合。若当前点
+                # 已含 Consumed，则存在一条到达本点的执行路径已消费同一
+                # 纪元；本点再次消费必非法。真正互斥的分支各自只接收
+                # 其独立 predecessor 的 Live 状态，不会走到本分支。
+                # 因此这里必须 hard-red；否则 A(cp1) 与 B 互斥、但 B 后
+                # 又有 C 的三消费者图会被 A/C 两两检查错误放行。
+                # 容忍 (c) 跨槽 MV/CFG_MERGE 谱系戳: place 载体真空
+                # → 不移植。
+                exactDefFreezeVerdictEmit(
+                    exactDefFreezeConsumeDataflowBodyLine(
+                        bodyIR, definition, block, op, state))
+                valid = false
+                break
+            # consume_only_drop (C 51828-51858): COPY_COMPOSITE 全空组
+            # 载体真空 → 恒 CONSUMED, 无 RELEASED 道。
+            state = ExactDefFreezeStateConsumedTag
+            batchConsumeOp = op
+            op = op + 1
+        if !valid:
+            break
+        if queryOpExcl >= 0 && block == queryBlock:
+            # 点前查询: 块出口前的 edge/term 消费不属于 before-op 答案。
+            workspace.exitStates[block] = state
+            continue
+        let termIndex = bodyIR.blocks[block].termIndex
+        # edge_merge (批 4 落地; C 54467-54499 + 55727-55748): 当前块
+        # BR 后继块首的 CFG_MERGE 行在本边上消费 definition 时, 纯
+        # LIVE 才许消费; 借用定义随 merge 转发保持 LIVE (不 transition)。
+        var edgeMerge: int32 = -1
+        if termIndex >= 0 && termIndex < bodyIR.terms.len &&
+           bodyIR.terms[termIndex].kind == coreir.BodyTermBrTag:
+            let successor = bodyIR.terms[termIndex].trueBlock
+            if successor >= 0 && successor < bodyIR.blocks.len:
+                edgeMerge = exactDefFreezeMergeConsumerOnEdge(
+                    bodyIR, workspace.opBlockIds, block, successor,
+                    definition)
+        if edgeMerge >= 0:
+            let pureLiveAtEdge =
+                (state & ExactDefFreezeStateLiveTag) != 0 &&
+                (state & (ExactDefFreezeStateUndefinedTag |
+                          ExactDefFreezeStateConsumedTag |
+                          ExactDefFreezeStateReleasedTag)) == 0
+            if !pureLiveAtEdge:
+                exactDefFreezeVerdictEmit(
+                    exactDefFreezeConsumeDataflowEdgeMergeLine(
+                        definition, block, edgeMerge, state))
+                valid = false
+                break
+            if !borrowedDefinition:
+                state = ExactDefFreezeStateConsumedTag
+        var termSourceIsDef = false
+        if termIndex >= 0 && termIndex < bodyIR.terms.len &&
+           bodyIR.terms[termIndex].sourceDefinitionDomain ==
+               coreir.BodyDefinitionDomainBodyOpTag &&
+           bodyIR.terms[termIndex].sourceDefinitionRow == definition:
+            termSourceIsDef = true
+        if termSourceIsDef:
+            let pureLiveAtTerm =
+                (state & ExactDefFreezeStateLiveTag) != 0 &&
+                (state & (ExactDefFreezeStateUndefinedTag |
+                          ExactDefFreezeStateConsumedTag |
+                          ExactDefFreezeStateReleasedTag)) == 0
+            if bodyIR.terms[termIndex].kind !=
+                   coreir.BodyTermReturnTag || !pureLiveAtTerm:
+                exactDefFreezeVerdictEmit(
+                    exactDefFreezeConsumeDataflowTermLine(
+                        definition, block, termIndex, state))
+                valid = false
+                break
+            if !borrowedDefinition:
+                state = ExactDefFreezeStateConsumedTag
+        workspace.exitStates[block] = state
+        if hasRelevant && block == queryBlock:
+            continue
+        if termIndex < 0 || termIndex >= bodyIR.terms.len:
+            continue
+        let successorStart = bodyIR.termSuccessorStarts[termIndex]
+        let successorCount = bodyIR.termSuccessorCounts[termIndex]
+        var successorOrdinal: int32
+        while successorOrdinal < successorCount && valid:
+            let successor = bodyIR.successorBlockIds[
+                successorStart + successorOrdinal]
+            valid = exactDefFreezeJoinSuccessorState(
+                successor, flowEntry, flowEnd, hasRelevant, state,
+                workspace, tail)
+            successorOrdinal = successorOrdinal + 1
+    if valid && queryBlock >= 0 && queryBlock < bodyIR.blocks.len:
+        queryExitState = workspace.exitStates[queryBlock]
+    return valid
+
+# BR-only 链尾块 (批 4): 从 fromBlock 沿 BR-only 链走, 返回 BR 直接
+# 指向 joinBlock 的那一块; 断链 -1。merge 的 op_c 空间回收与
+# edge_merge 车同源 (单实现, exact_def_merge 经出口复用)。
+@borrows
+fn exactDefFreezeBrChainTail(bodyIR: coreir.BodyIR,
+                             fromBlock: int32,
+                             joinBlock: int32): int32 =
+    var current = fromBlock
+    var hops: int32
+    while current >= 0 && hops <= bodyIR.blocks.len:
+        let termIndex = bodyIR.blocks[current].termIndex
+        if termIndex < 0 || termIndex >= bodyIR.terms.len:
+            return -1
+        let term = bodyIR.terms[termIndex]
+        if term.kind != coreir.BodyTermBrTag:
+            return -1
+        if term.trueBlock == joinBlock:
+            return current
+        current = term.trueBlock
+        hops = hops + 1
+    return -1
+
+# merge_consumer_on_edge (批 4; C 54467-54499 的 Cheng 版): 在
+# predecessor 的 BR 后继块首找唯一消费 definition 的 CFG_MERGE 行 —
+# 第一输入且 first 侧链尾==predecessor, 或第二输入且 != predecessor;
+# 多候选/无 → -1。
+@borrows
+fn exactDefFreezeMergeConsumerOnEdge(bodyIR: coreir.BodyIR,
+                                     opBlockIds: int32[],
+                                     predecessor: int32,
+                                     successor: int32,
+                                     definition: int32): int32 =
+    if definition < 0 || definition >= bodyIR.ops.len:
+        return -1
+    let start = bodyIR.blocks[successor].opStart
+    let count = bodyIR.blocks[successor].opCount
+    var found: int32 = -1
+    for op in start..<start + count:
+        if bodyIR.exactDef.opPlaceKinds[op] !=
+               exactdef.BodyIrExactDefPlaceCfgMergeTag:
+            continue
+        let firstInput = exactDefFreezeOpSourceDefRow(bodyIR.ops[op])
+        var firstPred: int32 = -1
+        if firstInput >= 0 && firstInput < bodyIR.ops.len:
+            firstPred = exactDefFreezeBrChainTail(
+                bodyIR, opBlockIds[firstInput], successor)
+        var matched = firstInput == definition && firstPred == predecessor
+        if !matched:
+            let secondInput =
+                exactDefFreezeMergeSecondInputRow(bodyIR, op)
+            matched = secondInput == definition &&
+                firstPred != predecessor
+        if !matched:
+            continue
+        if found >= 0:
+            return -1
+        found = op
+    return found
+
+# 全体消费 dataflow (C 56195-56201): audit 的唯一权威证明。
+@borrows
+fn exactDefFreezeDefinitionConsumptionDataflowValid(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace,
+        limits: ExactDefFreezeLimits,
+        definition: int32): bool =
+    var exitState: int32
+    return exactDefFreezeConsumptionDataflowFrom(
+        bodyIR, dom, workspace, limits, definition, 0,
+        bodyIR.blocks.len, ExactDefFreezeStateUndefinedTag, -1, -1,
+        exitState)
+
+# 互斥消费者对：定义支配双消费者块，且两个消费块在完整 CFG 上双向
+# 不可达。若一次执行能经过二者，则按执行顺序必有一个块可达另一个；
+# 因而双向不可达是“不可能共执行”的精确必要条件。Return 没有后继，
+# 但反向可达仍必须检查，不能把“第一个块以 Return 结束”当作豁免。
+@borrows
+fn exactDefFreezeMutuallyExclusiveConsumerPairValid(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace,
+        limits: ExactDefFreezeLimits,
+        definition: int32,
+        firstConsumer: int32,
+        secondConsumer: int32): bool =
+    if firstConsumer == secondConsumer ||
+       firstConsumer < 0 || firstConsumer >= bodyIR.ops.len ||
+       secondConsumer < 0 || secondConsumer >= bodyIR.ops.len:
+        return false
+    if !exactDefFreezeOpConsumesDefinition(
+           bodyIR, definition, firstConsumer) ||
+       !exactDefFreezeOpConsumesDefinition(
+           bodyIR, definition, secondConsumer):
+        return false
+    # consumer_effective_block (C 51932): CFG_MERGE 段真空 → 块 id。
+    let firstBlock = workspace.opBlockIds[firstConsumer]
+    let secondBlock = workspace.opBlockIds[secondConsumer]
+    if firstBlock < 0 || secondBlock < 0 || firstBlock == secondBlock:
+        return false
+    let defBlock = workspace.opBlockIds[definition]
+    let defDominatesBoth =
+        defBlock >= 0 &&
+        exactDefFreezeBlockDominates(dom, defBlock, firstBlock) &&
+        exactDefFreezeBlockDominates(dom, defBlock, secondBlock)
+    if !defDominatesBoth:
+        return false
+    # Use dedicated scratch: the point walker reuses workspace slices and a
+    # nested reachability query must not invalidate them.
+    var crosses = false
+    var cap = limits.mutexQueueCap
+    if cap < 0:
+        cap = bodyIR.blocks.len
+    var pass: int32
+    while pass < 2 && !crosses:
+        var startBlock = firstBlock
+        var forbidden = secondBlock
+        if pass == 1:
+            startBlock = secondBlock
+            forbidden = firstBlock
+        var marks: int32[]
+        setLen(marks, bodyIR.blocks.len)
+        var queue: int32[]
+        setLen(queue, bodyIR.blocks.len)
+        var head: int32
+        var tail: int32 = 1
+        marks[startBlock] = 1
+        queue[0] = startBlock
+        while head < tail && !crosses:
+            let block = queue[head]
+            head = head + 1
+            let term = bodyIR.blocks[block].termIndex
+            if term < 0 || term >= bodyIR.terms.len:
+                continue
+            let successorStart = bodyIR.termSuccessorStarts[term]
+            let successorCount = bodyIR.termSuccessorCounts[term]
+            for row in successorStart..<successorStart + successorCount:
+                let target = bodyIR.successorBlockIds[row]
+                if target == forbidden:
+                    crosses = true
+                    break
+                if target >= 0 && target < bodyIR.blocks.len &&
+                   marks[target] == 0:
+                    if tail >= cap:
+                        exactDefFreezeDie(
+                            "mutually exclusive consumer queue overflow")
+                    marks[target] = 1
+                    queue[tail] = target
+                    tail = tail + 1
+        pass = pass + 1
+    return !crosses
+
+# ---- reissue (cold_parser.c:26838-27024) ----
+#
+# 四循环全部 NOP/MV/CALL 钉载体, Cheng 基板无对应行 → 真空;
+# Cheng var-out 写回物理形态重证属批 5 (var-out 五形态)。循环 4
+# 证书授予的判词保留: 任何 MEMORY_VERSION place 定义在 Cheng 无
+# exact_var_provenance_certificates 权威可证 → [reissuefail] +
+# false (严格方向, 无放宽; derive/同步扩列均不落 MV 戳, 本循环
+# 结构上不可触发, 仅作判词保真锚点)。
+fn exactDefFreezeReissueVarProvenance(
+        bodyIR: var coreir.BodyIR): bool =
+    for definition in 0..<bodyIR.ops.len:
+        if bodyIR.ops[definition].valueDefSlot < 0:
+            continue
+        if bodyIR.exactDef.opPlaceKinds[definition] ==
+               exactdef.BodyIrExactDefPlaceMemoryVersionTag:
+            exactDefFreezeVerdictEmit(
+                exactDefFreezeReissuefailLine(bodyIR, definition))
+            return false
+    return true
+
+# ---- read-edge (cold_parser.c:21525-21676 完成器 +
+#      21447-21518 终校验; 解析期七处不移植, 设计 §5-7) ----
+
+# operand 角色映射 (C 20535-20635 的 Cheng 19-op 域子集):
+# readA 读槽 (C operand A 对应列 = opReadADefOpRows)。
+# 布局依据 core_types.cheng 形状校验段 (2040-2173)。
+# 无映射 → -1 (C 的 b/c/dst 读边在 Cheng 侧车无存储载体)。
+@borrows
+fn exactDefFreezeReadASlot(bodyIR: coreir.BodyIR, opRow: int32): int32 =
+    let op = bodyIR.ops[opRow]
+    let kind = op.kind
+    if kind == coreir.BodyOpCopyLocalTag ||
+       kind == coreir.BodyOpStoreLocalTag ||
+       kind == coreir.BodyOpFieldLoadTag ||
+       kind == coreir.BodyOpStrEqTag ||
+       kind == coreir.BodyOpStrEqLiteralTag ||
+       kind == coreir.BodyOpIndexedLoadTag:
+        if op.operands.len >= 1:
+            return op.operands[0]
+        return -1
+    if kind == coreir.BodyOpBinOpTag:
+        if op.operands.len >= 3:
+            return op.operands[2]
+        return -1
+    if kind == coreir.BodyOpCmpTag:
+        if op.operands.len >= 2:
+            return op.operands[1]
+        return -1
+    if kind == coreir.BodyOpLoadLocalTag:
+        # 裸装载单槽形; 地址投影子kind (tag 在 operands[0]) 是借用载体,
+        # C 的 LOCAL_ADDR 哨兵豁免同族 → 非 direct-read。
+        if op.operands.len == 1:
+            return op.operands[0]
+        return -1
+    return -1
+
+# use-after-consume 扫描的 b 读槽 (活性语义覆盖, 无存储载体)。
+@borrows
+fn exactDefFreezeReadBSlot(bodyIR: coreir.BodyIR, opRow: int32): int32 =
+    let op = bodyIR.ops[opRow]
+    let kind = op.kind
+    if kind == coreir.BodyOpBinOpTag:
+        if op.operands.len >= 4:
+            return op.operands[3]
+        return -1
+    if kind == coreir.BodyOpCmpTag:
+        if op.operands.len >= 3:
+            return op.operands[2]
+        return -1
+    if kind == coreir.BodyOpStrEqTag ||
+       kind == coreir.BodyOpIndexedLoadTag:
+        if op.operands.len >= 2:
+            return op.operands[1]
+        return -1
+    if kind == coreir.BodyOpBranchTag:
+        if op.operands.len >= 2:
+            return op.operands[1]
+        return -1
+    return -1
+
+# shared_borrow_param 车道 (C cold_exact_shared_borrow_param_definition_
+# valid 的 Cheng 侧车道): source 是 slot 的 PARAM place 定义,
+# own==BORROW_SHARED, origin 形参序与槽车道一致。
+@borrows
+fn exactDefFreezeSharedBorrowParamLane(bodyIR: coreir.BodyIR,
+                                       source: int32,
+                                       slot: int32): bool =
+    if bodyIR.exactDef.opPlaceKinds[source] !=
+           exactdef.BodyIrExactDefPlaceParamTag:
+        return false
+    if bodyIR.ops[source].valueDefOwnership != coreir.OwnBorrowShared:
+        return false
+    if bodyIR.ops[source].valueDefSlot != slot:
+        return false
+    let origin = bodyIR.exactDef.opOriginIds[source]
+    return origin >= 0 &&
+           origin < bodyIR.entryParameterSlotIds.len &&
+           bodyIR.entryParameterSlotIds[origin] == slot &&
+           bodyIR.exactDef.slotOriginIds[slot] == origin
+
+# source_edge_valid (C 20637-20873) 的 Cheng 车道。
+# C 四条当代性旁路 (version_chain/cert/self_merge/sole_mv) 全
+# MV/CFG_MERGE 载体 → 真空; 自边两形 (CFG_MERGE 双臂 / PARAM raw
+# 载体边界) 在 Cheng 无载体 (参数定义 op 直接定义入参槽) → false。
+# 一般形 = 槽链全等 + (shared_borrow_param 或 is_current_at_consumer;
+# 后者内含 reaches 门 — 缺陷修复 1 同标准)。
+@borrows
+fn exactDefFreezeReadSourceEdgeValid(
+        bodyIR: coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        opBlockIds: int32[],
+        op: int32,
+        slot: int32,
+        source: int32): bool =
+    if op < 0 || op >= bodyIR.ops.len ||
+       source < 0 || source >= bodyIR.ops.len ||
+       slot < 0 || slot >= bodyIR.localSlots.len:
+        return false
+    if source == op:
+        # CFG_MERGE 自环臂 (批 4; C 20783-20816 的 Cheng 版): merge 行
+        # (CopyLocal+CFG_MERGE place) 的 readA 自边是 canonical 物理源
+        # 标记 — 双输入都是 staging 槽定义, 类型/产地链全等, staging 槽
+        # 头戳==op 精确类型且 storage 已分类。C 的 ([ev1]) 探针不移植。
+        if bodyIR.exactDef.opPlaceKinds[op] !=
+               exactdef.BodyIrExactDefPlaceCfgMergeTag ||
+           bodyIR.ops[op].kind != coreir.BodyOpCopyLocalTag:
+            return false
+        let destination = bodyIR.ops[op].valueDefSlot
+        let firstInput = exactDefFreezeOpSourceDefRow(bodyIR.ops[op])
+        let secondInput = exactDefFreezeMergeSecondInputRow(bodyIR, op)
+        if destination < 0 || destination >= bodyIR.localSlots.len ||
+           firstInput < 0 || firstInput >= op ||
+           secondInput < 0 || secondInput >= op:
+            return false
+        let opExactType = bodyIR.exactDef.opExactTypeIds[op]
+        let firstExactType = bodyIR.exactDef.opExactTypeIds[firstInput]
+        return bodyIR.ops[firstInput].valueDefSlot == slot &&
+               bodyIR.ops[secondInput].valueDefSlot == slot &&
+               firstExactType >= 0 &&
+               firstExactType ==
+                   bodyIR.exactDef.opExactTypeIds[secondInput] &&
+               firstExactType == opExactType &&
+               bodyIR.exactDef.opProducerFunctionRows[firstInput] ==
+                   bodyIR.controlFunctionRow &&
+               bodyIR.exactDef.opProducerFunctionRows[secondInput] ==
+                   bodyIR.controlFunctionRow &&
+               bodyIR.localSlots[slot].typeArenaTypeId == opExactType &&
+               bodyIR.exactDef.slotStorageKinds[slot] !=
+                   exactdef.BodyIrExactDefStorageUnknownTag
+    if bodyIR.ops[source].valueDefSlot != slot:
+        return false
+    if bodyIR.exactDef.opExactTypeIds[source] !=
+           bodyIR.localSlots[slot].typeArenaTypeId:
+        # [wall146] 字段投影借视形容忍臂 (mirror derive [wall90] 放行域,
+        # 与 identity BORROW_PROJECTION 主门同列解释): 字段投影借视形
+        # (FieldLoad ∧ OwnBorrowShared ∧ 借主域非 Invalid) 的 def 行
+        # opExactTypeIds 列 = 沿投影链上溯的借主定义行权威 (primary
+        # ManagedSemanticValueDefinitionRowExact 契约, derive [wall90]
+        # 明文裁定), destination 槽 typeArenaTypeId = 字段自身 storage
+        # 权威 (BodyIRBindLocalSlotTypeArenaProof 幂等绑定) — 两列各自
+        # 忠实于两个不同权威, 相等在该形按构造不成立 (v6 实况: 借视
+        # exact_tid=20 var Node vs 槽 tid=16 Box 句柄)。derive 相等核对
+        # 臂已保证: 凡 exact_tid≠slot_tid 抵达 freeze 的 def 行必为该形
+        # (其余形 tid 漂移在 derive 即 hard fail 判词), 字段证明责任由
+        # derive field-borrow 臂 layout children (TypeId,offset,width)
+        # 精确三元组 hop + fact closure bind 放电 (identity 主门同款
+        # 上游不变式论证)。故本臂谓词与 derive 放行域三列严格对齐 =
+        # 零漏放; 非 FieldLoad/非 BorrowShared/借主域 Invalid 的 tid
+        # 漂移仍 fail-closed。投影借视是纯读视图 (无消费/无重定义),
+        # currency 语义与 C shared-param 容忍臂同强度 (v6 read-edge
+        # unresolved op=35/31 实证墙)。
+        if !(bodyIR.ops[source].kind == coreir.BodyOpFieldLoadTag &&
+             bodyIR.ops[source].valueDefOwnership ==
+                 coreir.OwnBorrowShared &&
+             bodyIR.ops[source].valueDefBorrowOwnerDefinitionDomain !=
+                 coreir.BodyDefinitionDomainInvalidTag):
+            return false
+    if bodyIR.exactDef.opProducerFunctionRows[source] !=
+           bodyIR.controlFunctionRow:
+        return false
+    if bodyIR.exactDef.opPlaceKinds[source] ==
+           exactdef.BodyIrExactDefPlaceInvalidTag:
+        return false
+    if bodyIR.ops[source].valueDefOwnership == coreir.OwnInvalid:
+        return false
+    return exactDefFreezeSharedBorrowParamLane(bodyIR, source, slot) ||
+           exactDefFreezeIsCurrentAtConsumer(
+               bodyIR, dom, opBlockIds, source, op)
+
+# operand_required (C 20977-21041) 的 Cheng 车道: 槽行合法、非
+# sentinel、全 body 有同槽 op 行定义 (C 的参数定义恒有 op 行; Cheng
+# entry 域定义无 op 行时由 entry ownership 权威覆盖, 见模块头裁定)。
+@borrows
+fn exactDefFreezeReadOperandRequired(
+        bodyIR: coreir.BodyIR,
+        slotDefCounts: int32[],
+        slot: int32): bool =
+    if slot < 0 || slot >= bodyIR.localSlots.len:
+        return false
+    if exactdef.BodyIrExactDefSlotIsSentinel(bodyIR, slot):
+        return false
+    return slotDefCounts[slot] > 0
+
+# 每槽定义索引 (C 21525 步 1 同构): CSR, 按 op 行升序。
+fn exactDefFreezeSlotDefinitionIndexBuild(
+        bodyIR: var coreir.BodyIR,
+        slotDefStarts: var int32[],
+        slotDefCounts: var int32[],
+        slotDefRows: var int32[]) =
+    let slotCount = bodyIR.localSlots.len
+    setLen(slotDefStarts, slotCount)
+    setLen(slotDefCounts, slotCount)
+    for op in 0..<bodyIR.ops.len:
+        let slot = bodyIR.ops[op].valueDefSlot
+        if slot >= 0 && slot < slotCount:
+            slotDefCounts[slot] = slotDefCounts[slot] + 1
+    var total: int32
+    for slot in 0..<slotCount:
+        slotDefStarts[slot] = total
+        total = total + slotDefCounts[slot]
+    setLen(slotDefRows, total)
+    var cursor: int32[]
+    setLen(cursor, slotCount)
+    for op in 0..<bodyIR.ops.len:
+        let slot = bodyIR.ops[op].valueDefSlot
+        if slot >= 0 && slot < slotCount:
+            slotDefRows[slotDefStarts[slot] + cursor[slot]] = op
+            cursor[slot] = cursor[slot] + 1
+
+# 唯一定义解析: pass1 = edge_valid && is_current; pass2 = edge_valid。
+# 返 (resolved, candidates, ambiguous 对手行); 判词发射在调用方。
+@borrows
+fn exactDefFreezeReadEdgeResolve(
+        bodyIR: coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        opBlockIds: int32[],
+        slotDefStarts: int32[],
+        slotDefCounts: int32[],
+        slotDefRows: int32[],
+        op: int32,
+        slot: int32,
+        resolved: var int32,
+        ambiguousCand: var int32): int32 =
+    resolved = -1
+    ambiguousCand = -1
+    let start = slotDefStarts[slot]
+    let count = slotDefCounts[slot]
+    var pass1Count: int32
+    for ordinal in 0..<count:
+        let candidate = slotDefRows[start + ordinal]
+        if exactDefFreezeReadSourceEdgeValid(
+               bodyIR, dom, opBlockIds, op, slot, candidate) &&
+           exactDefFreezeIsCurrentAtConsumer(
+               bodyIR, dom, opBlockIds, candidate, op):
+            if pass1Count == 0:
+                resolved = candidate
+            elif pass1Count == 1:
+                ambiguousCand = candidate
+            pass1Count = pass1Count + 1
+    if pass1Count == 1:
+        return 1
+    if pass1Count >= 2:
+        return 2
+    resolved = -1
+    var pass2Count: int32
+    for ordinal in 0..<count:
+        let candidate = slotDefRows[start + ordinal]
+        if exactDefFreezeReadSourceEdgeValid(
+               bodyIR, dom, opBlockIds, op, slot, candidate):
+            if pass2Count == 0:
+                resolved = candidate
+            elif pass2Count == 1:
+                ambiguousCand = candidate
+            pass2Count = pass2Count + 1
+    if pass2Count == 1:
+        return 1
+    if pass2Count >= 2:
+        return 2
+    resolved = -1
+    return 0
+
+# 完成器 (C 21525-21676 步 2-5): 逐 op 的 readA 列解析落戳;
+# ambiguous/unresolved 判词 + false。陈旧钉线重解析 (不静默死)。
+@borrows
+fn exactDefFreezeCompleteReadEdges(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace): bool =
+    var slotDefStarts: int32[]
+    var slotDefCounts: int32[]
+    var slotDefRows: int32[]
+    exactDefFreezeSlotDefinitionIndexBuild(
+        bodyIR, slotDefStarts, slotDefCounts, slotDefRows)
+    for op in 0..<bodyIR.ops.len:
+        let slot = exactDefFreezeReadASlot(bodyIR, op)
+        if !exactDefFreezeReadOperandRequired(bodyIR, slotDefCounts, slot):
+            continue
+        let existing = bodyIR.exactDef.opReadADefOpRows[op]
+        if existing >= 0 &&
+           exactDefFreezeReadSourceEdgeValid(
+               bodyIR, dom, workspace.opBlockIds, op, slot, existing):
+            continue
+        var resolved: int32
+        var ambiguousCand: int32
+        let outcome = exactDefFreezeReadEdgeResolve(
+            bodyIR, dom, workspace.opBlockIds,
+            slotDefStarts, slotDefCounts, slotDefRows,
+            op, slot, resolved, ambiguousCand)
+        if outcome == 2:
+            exactDefFreezeVerdictEmit(
+                exactDefFreezeReadEdgeAmbiguousLine(
+                    op, exactDefFreezeReadOperandA, slot, resolved,
+                    ambiguousCand, bodyIR.ops[op].kind))
+            return false
+        if outcome == 0:
+            # [wall146] 首候选行六子检查取数 (纯读投影; unresolved 时
+            # operandRequired 已保证 slotDefCounts>0, cand0 必在界内)。
+            var cand0: int32 = -1
+            var cand0kind: int32 = -1
+            var cand0defslot: int32 = -1
+            var cand0tid: int32 = -1
+            var cand0own: int32 = -1
+            var cand0place: int32 = -1
+            var cand0origin: int32 = -1
+            var cand0prod: int32 = -1
+            var cand0bod: int32 = -1
+            var cand0bor: int32 = -1
+            var slotTid: int32 = -1
+            var sub2: int32
+            var sub3: int32
+            var sub4: int32
+            var sub5: int32
+            var sub6: int32
+            if slot >= 0 && slot < bodyIR.localSlots.len &&
+               slotDefCounts[slot] > 0:
+                cand0 = slotDefRows[slotDefStarts[slot]]
+                if cand0 >= 0 && cand0 < bodyIR.ops.len:
+                    let candOp = bodyIR.ops[cand0]
+                    cand0kind = Int32(candOp.kind)
+                    cand0defslot = candOp.valueDefSlot
+                    cand0tid = bodyIR.exactDef.opExactTypeIds[cand0]
+                    cand0own = Int32(candOp.valueDefOwnership)
+                    cand0place = bodyIR.exactDef.opPlaceKinds[cand0]
+                    cand0origin = bodyIR.exactDef.opOriginIds[cand0]
+                    cand0prod = bodyIR.exactDef.opProducerFunctionRows[cand0]
+                    cand0bod = Int32(candOp.valueDefBorrowOwnerDefinitionDomain)
+                    cand0bor = candOp.valueDefBorrowOwnerDefinitionRow
+                    slotTid = bodyIR.localSlots[slot].typeArenaTypeId
+                    if cand0tid == slotTid:
+                        sub2 = 1
+                    if cand0prod == bodyIR.controlFunctionRow:
+                        sub3 = 1
+                    if cand0place != exactdef.BodyIrExactDefPlaceInvalidTag:
+                        sub4 = 1
+                    if cand0own != Int32(coreir.OwnInvalid):
+                        sub5 = 1
+                    if exactDefFreezeIsCurrentAtConsumer(
+                           bodyIR, dom, workspace.opBlockIds, cand0, op):
+                        sub6 = 1
+            exactDefFreezeVerdictEmit(
+                exactDefFreezeReadEdgeUnresolvedLine(
+                    op, exactDefFreezeReadOperandA, slot,
+                    slotDefCounts[slot], bodyIR.ops[op].kind,
+                    bodyIR.ops[op].target,
+                    exactDefFreezeOpOperandOrInvalid(bodyIR.ops[op], 0),
+                    exactDefFreezeOpOperandOrInvalid(bodyIR.ops[op], 1),
+                    exactDefFreezeOpOperandOrInvalid(bodyIR.ops[op], 2),
+                    bodyIR.controlFunctionRow,
+                    cand0, cand0kind, cand0defslot, cand0tid, slotTid,
+                    cand0own, cand0place, cand0origin, cand0prod,
+                    cand0bod, cand0bor, sub2, sub3, sub4, sub5, sub6))
+            return false
+        bodyIR.exactDef.opReadADefOpRows[op] = resolved
+    return true
+
+# 终校验 (C 21447-21518): source>=0 ⇒ valid; required ⇔ source>=0。
+@borrows
+fn exactDefFreezeReadEdgeTerminalValidate(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace): bool =
+    var slotDefStarts: int32[]
+    var slotDefCounts: int32[]
+    var slotDefRows: int32[]
+    exactDefFreezeSlotDefinitionIndexBuild(
+        bodyIR, slotDefStarts, slotDefCounts, slotDefRows)
+    let functionRow = bodyIR.controlFunctionRow
+    for op in 0..<bodyIR.ops.len:
+        let slot = exactDefFreezeReadASlot(bodyIR, op)
+        let source = bodyIR.exactDef.opReadADefOpRows[op]
+        if source >= 0 &&
+           !exactDefFreezeReadSourceEdgeValid(
+               bodyIR, dom, workspace.opBlockIds, op, slot, source):
+            exactDefFreezeVerdictEmit(
+                exactDefFreezeDirectReadInvalidLine(
+                    functionRow, op, bodyIR.ops[op].kind,
+                    exactDefFreezeReadOperandA, slot, source))
+            return false
+        let required = exactDefFreezeReadOperandRequired(
+            bodyIR, slotDefCounts, slot)
+        if required != (source >= 0):
+            var requiredInt: int32
+            if required:
+                requiredInt = 1
+            var slotKind: int32 = -1
+            var slotPlace: int32 = -1
+            var slotStorage: int32 = -1
+            if slot >= 0 && slot < bodyIR.localSlots.len:
+                slotKind = bodyIR.localSlots[slot].typeKind
+                slotPlace = bodyIR.exactDef.slotPlaceKinds[slot]
+                slotStorage = bodyIR.exactDef.slotStorageKinds[slot]
+            exactDefFreezeVerdictEmit(
+                exactDefFreezeDirectReadMissingExtraLine(
+                    functionRow, op, bodyIR.ops[op].kind,
+                    exactDefFreezeReadOperandA, slot, source,
+                    requiredInt,
+                    exactDefFreezeOpOperandOrInvalid(bodyIR.ops[op], 1),
+                    exactDefFreezeOpOperandOrInvalid(bodyIR.ops[op], 2),
+                    slotKind, slotPlace, slotStorage))
+            return false
+    return true
+
+# ---- use-after-consume 扫描 ----
+#
+# 托管 storage (STR/SEQUENCE/OBJECT) 定义的读点活性: 解析唯一定义 →
+# 点前查询 (queryOpExcl=读 op); 非 (valid && 纯 LIVE) →
+# `use of consumed managed value`。PLAIN storage 读是字节快照
+# (C plain_read_then_scope_end 同族容忍), 不扫。借用定义永不消费,
+# 不扫。无记录消费戳的定义不可能已消费 → 跳过查询 (性能裁剪同 C
+# first-consume 语义: 无消费者必 LIVE)。
+@borrows
+fn exactDefFreezeUseAfterConsumeScan(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace,
+        limits: ExactDefFreezeLimits): bool =
+    var slotDefStarts: int32[]
+    var slotDefCounts: int32[]
+    var slotDefRows: int32[]
+    exactDefFreezeSlotDefinitionIndexBuild(
+        bodyIR, slotDefStarts, slotDefCounts, slotDefRows)
+    for op in 0..<bodyIR.ops.len:
+        # 批 4: CFG_MERGE 行的 readA 是 canonical 自环物理源标记
+        # (C 的 exact_source_a=merge_def), 不命名任何定义 — C 侧无
+        # 对应活性查询 (扫描按 canonical 读源列驱动), 跳过。
+        if bodyIR.exactDef.opPlaceKinds[op] ==
+               exactdef.BodyIrExactDefPlaceCfgMergeTag:
+            continue
+        for operandOrdinal in 0..<2:
+            var slot: int32
+            if operandOrdinal == 0:
+                slot = exactDefFreezeReadASlot(bodyIR, op)
+            else:
+                slot = exactDefFreezeReadBSlot(bodyIR, op)
+            if slot < 0 || slot >= bodyIR.localSlots.len:
+                continue
+            let storage = bodyIR.exactDef.slotStorageKinds[slot]
+            if storage != exactdef.BodyIrExactDefStorageStrTag &&
+               storage != exactdef.BodyIrExactDefStorageSequenceTag &&
+               storage != exactdef.BodyIrExactDefStorageObjectTag:
+                continue
+            # 唯一定义解析 (pass1 语义, 无判词: 边族判词归完成器)。
+            var definition: int32 = -1
+            let start = slotDefStarts[slot]
+            let count = slotDefCounts[slot]
+            for ordinal in 0..<count:
+                let candidate = slotDefRows[start + ordinal]
+                if exactDefFreezeReadSourceEdgeValid(
+                       bodyIR, dom, workspace.opBlockIds, op, slot,
+                       candidate) &&
+                   exactDefFreezeIsCurrentAtConsumer(
+                       bodyIR, dom, workspace.opBlockIds, candidate, op):
+                    definition = candidate
+                    break
+            if definition < 0:
+                continue
+            let defOwnership = bodyIR.ops[definition].valueDefOwnership
+            if defOwnership != coreir.OwnMove &&
+               defOwnership != coreir.OwnPlain:
+                continue
+            let consumePlusOne =
+                bodyIR.ops[definition].valueDefConsumeOpIndexPlusOne
+            if consumePlusOne <= 0:
+                continue
+            let queryBlock = workspace.opBlockIds[op]
+            if queryBlock < 0:
+                panic("exact def freeze: read op outside block partition")
+            var exitState: int32
+            let queryValid = exactDefFreezeConsumptionDataflowFrom(
+                bodyIR, dom, workspace, limits, definition, 0,
+                bodyIR.blocks.len, ExactDefFreezeStateUndefinedTag,
+                queryBlock, op, exitState)
+            let liveAtPoint = queryValid &&
+                exitState == ExactDefFreezeStateLiveTag
+            if liveAtPoint:
+                continue
+            if limits.diagPointLiveness:
+                var validInt: int32
+                if queryValid:
+                    validInt = 1
+                exactDefFreezeVerdictEmit(
+                    exactDefFreezePointLivenessFailedLine(
+                        bodyIR.controlFunctionRow, definition,
+                        queryBlock, validInt, exitState,
+                        consumePlusOne,
+                        workspace.opBlockIds[definition]))
+            var consumeBlock: int32 = -1
+            let consumeOp = consumePlusOne - 1
+            if consumeOp >= 0 && consumeOp < bodyIR.ops.len:
+                consumeBlock = workspace.opBlockIds[consumeOp]
+            exactDefFreezeVerdictEmit(
+                exactDefFreezeUseOfConsumedLine(
+                    bodyIR, slot, definition, queryBlock, consumeBlock))
+            return false
+    return true
+
+# ---- consume-edge 审计 (C 69563-69758 条件逐字对齐) ----
+#
+# PLAIN 容忍臂: EXACT_PLAIN_SCOPE_END op 与静态 str PLAIN storage 在
+# Cheng 无载体 → plain_read_then_scope_end_valid /
+# plain_static_string_multi_read_valid 恒 false。单消费者支配快道
+# (cyclic_blocks 门) 不移植 → consumption_dataflow_valid 恒由全量
+# dataflow 证明 (语义不变)。dataflow 不合法时 walker 已先发
+# `exact consume dataflow` 判词 (C 同序)。
+@borrows
+fn exactDefFreezeConsumeEdgeAudit(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace,
+        limits: ExactDefFreezeLimits,
+        phase: str): bool =
+    for definition in 0..<bodyIR.ops.len:
+        if bodyIR.ops[definition].valueDefSlot < 0:
+            continue
+        let summary = exactDefFreezeConsumerSummaryBuild(bodyIR, definition)
+        let consumePlusOne =
+            bodyIR.ops[definition].valueDefConsumeOpIndexPlusOne
+        let slot = bodyIR.ops[definition].valueDefSlot
+        let slotStorage = bodyIR.exactDef.slotStorageKinds[slot]
+        # PLAIN storage 无 drop 义务: 单构造 move 不记消费合法
+        # (C 69572-69581 同条件)。
+        let plainSingleConstructorMove =
+            slotStorage == exactdef.BodyIrExactDefStoragePlainTag &&
+            consumePlusOne == 0 &&
+            summary.count == 1 &&
+            summary.terminalCount == 0
+        var recordedFound = false
+        if consumePlusOne > 0 && consumePlusOne <= bodyIR.ops.len &&
+           exactDefFreezeOpConsumesDefinition(
+               bodyIR, definition, consumePlusOne - 1):
+            recordedFound = true
+        var dataflowValid = true
+        if summary.count + summary.terminalCount > 0:
+            dataflowValid =
+                exactDefFreezeDefinitionConsumptionDataflowValid(
+                    bodyIR, dom, workspace, limits, definition)
+        let plainReadThenScopeEndValid = false
+        let plainStaticStringMultiReadValid = false
+        if summary.count + summary.terminalCount > 1 &&
+           !dataflowValid &&
+           !plainReadThenScopeEndValid &&
+           !plainStaticStringMultiReadValid:
+            exactDefFreezeVerdictEmit(
+                exactDefFreezeInvalidPathConsumeLine(
+                    phase, bodyIR, definition, summary, consumePlusOne,
+                    recordedFound, dataflowValid))
+            for candidate in 0..<bodyIR.ops.len:
+                if exactDefFreezeOpSourceDefRow(
+                       bodyIR.ops[candidate]) != definition:
+                    continue
+                # effective_block: CFG_MERGE 段真空 → 块 id。
+                exactDefFreezeVerdictEmit(
+                    exactDefFreezeConsumeCandidateLine(
+                        bodyIR, candidate,
+                        workspace.opBlockIds[candidate],
+                        workspace.opBlockIds[candidate]))
+            return false
+        # wall127 容忍臂: mirror decode 终审已放行的 cp1==0 域 (臂一
+        # manual-consume 绑定 / 臂二 wall116-admit 形 + 唯一消费 = exact
+        # call-arg CSR Move)。cp1==0 ∧ 唯一消费收窄在先, 多消费/
+        # terminal/source 边消费仍 broken, 零弱化。
+        let decodeAdmittedNoRecord =
+            consumePlusOne == 0 &&
+            summary.count == 1 &&
+            summary.terminalCount == 0 &&
+            (exactDefFreezeConsumerManualConsumeBound(
+                 bodyIR, definition, summary.first) ||
+             (exactDefFreezeSoleConsumerExactCallArgMove(
+                  bodyIR, definition, summary.first) &&
+              exactDefFreezeTypedMoveDefDecodeAdmitMirror(
+                  bodyIR, definition)))
+        let brokenNoRecord =
+            !plainSingleConstructorMove &&
+            consumePlusOne == 0 &&
+            !decodeAdmittedNoRecord &&
+            (summary.count == 1 ||
+             (summary.count > 1 && !dataflowValid) ||
+             (summary.terminalCount > 0 && !dataflowValid))
+        var brokenWithRecord = false
+        if consumePlusOne != 0:
+            if summary.count == 1 &&
+               summary.last != consumePlusOne - 1:
+                brokenWithRecord = true
+            if summary.count > 1 && !recordedFound:
+                brokenWithRecord = true
+            if summary.count > 0 && !dataflowValid &&
+               !plainReadThenScopeEndValid &&
+               !plainStaticStringMultiReadValid:
+                brokenWithRecord = true
+        if brokenNoRecord || brokenWithRecord:
+            exactDefFreezeVerdictEmit(
+                exactDefFreezeConsumeEdgeBrokenLine(
+                    phase, bodyIR, definition, summary, consumePlusOne,
+                    recordedFound, dataflowValid))
+            return false
+    return true
+
+# ---- 同步扩列 (裁定②): ApplyOwned 物化追加行后的侧车同步 ----
+#
+# derive 在 ApplyOwned 前落戳+seal (追加前推导); ApplyOwned 内部
+# CleanupPlanMaterialize 追加 snapshot/flag 槽与 cleanup 物化 op/call
+# (consume 戳此时才产生, 见 cleanup_cfg.cheng:9983/10313/12275/12333)。
+# 本 helper 在 ApplyOwned 返回后立即同步扩列, 保持
+# 「sealed ⇒ 形状合法」全程不变式 (backend2 codec 入场校验
+# backend2_bodyir_codec_exact_def_shape_invalid 前置)。
+#
+# 追加 op 戳车道: origin 权威是 CanonicalCleanupAction (非 TypedExpr),
+# 落 TEMPORARY place + 自 op 行 origin (物化定义是函数内新物理定义);
+# source 列镜像 BodyOp.sourceDefinitionRow (域 BodyOp 时), 与谓词
+# 通道①同源。追加槽: sentinel 三格 (place INVALID/origin -1/storage
+# UNKNOWN); 被物化定义命中的 fresh 槽落 (TEMPORARY, 定义 op 行,
+# storage 继承 source 槽车道 — 物化 CopyLocal operands[0] 是唯一
+# 物理 source 证据); storage 证据洞 → panic, UNKNOWN 不通行。
+# 追加 call 的 arg: address 编码形 → (-1, INVALID, BORROW_SHARED, -1)
+# (drop-glue 消费经通道① source 边); 普通槽形 → (-1, INVALID,
+# PLAIN, -1) — 物化 call 的普通槽 arg 无 CSR 消费证据, lowering
+# call 的 CSR 戳在 derive 批 2 臂已落。
+fn ExactDefFreezeSidecarSyncAppended(bodyIR: var coreir.BodyIR): bool =
+    if !bodyIR.exactDef.sealed:
+        panic("exact def freeze: sync requires sealed sidecar")
+    let oldOpCount = bodyIR.exactDef.opPlaceKinds.len
+    let oldSlotCount = bodyIR.exactDef.slotPlaceKinds.len
+    let oldCallCount = bodyIR.exactDef.callArgStarts.len
+    if bodyIR.ops.len < oldOpCount ||
+       bodyIR.localSlots.len < oldSlotCount ||
+       bodyIR.callSequence.len < oldCallCount:
+        panic("exact def freeze: sidecar append-only violated")
+    for slot in oldSlotCount..<bodyIR.localSlots.len:
+        add(bodyIR.exactDef.slotPlaceKinds,
+            exactdef.BodyIrExactDefPlaceInvalidTag)
+        add(bodyIR.exactDef.slotOriginIds, -1)
+        add(bodyIR.exactDef.slotStorageKinds,
+            exactdef.BodyIrExactDefStorageUnknownTag)
+    for op in oldOpCount..<bodyIR.ops.len:
+        let bodyOp = bodyIR.ops[op]
+        var sourceDefRow: int32 = -1
+        if bodyOp.sourceDefinitionDomain ==
+               coreir.BodyDefinitionDomainBodyOpTag:
+            sourceDefRow = bodyOp.sourceDefinitionRow
+        if bodyOp.valueDefSlot >= 0 &&
+           bodyOp.valueDefOwnership != coreir.OwnInvalid:
+            let slot = bodyOp.valueDefSlot
+            if slot >= bodyIR.localSlots.len:
+                panic(Fmt"exact def freeze: appended def slot invalid op={op}")
+            add(bodyIR.exactDef.opPlaceKinds,
+                exactdef.BodyIrExactDefPlaceTemporaryTag)
+            add(bodyIR.exactDef.opExactTypeIds,
+                bodyIR.localSlots[slot].typeArenaTypeId)
+            add(bodyIR.exactDef.opOriginIds, op)
+            add(bodyIR.exactDef.opProducerFunctionRows,
+                bodyIR.controlFunctionRow)
+            add(bodyIR.exactDef.opSourceDefOpRows, sourceDefRow)
+            add(bodyIR.exactDef.opReadADefOpRows, -1)
+            if bodyIR.exactDef.slotPlaceKinds[slot] ==
+                   exactdef.BodyIrExactDefPlaceInvalidTag &&
+               bodyIR.exactDef.slotOriginIds[slot] == -1:
+                var storage = exactdef.BodyIrExactDefStorageUnknownTag
+                # wall94 证据道判定: 0=无 operands 1=CopyLocal 源槽道
+                # 2=快照 intrinsic 源槽道(证据落) 3=call 行号无效
+                # 4=call 行在但形状列不符/源槽越界。
+                var evidenceLane = 0
+                if bodyOp.kind == coreir.BodyOpCallTag:
+                    # wall94: 追加 def 的 Call 形 = cleanup owned 返回快照
+                    # runtime intrinsic 物化 (cleanup_cfg 材料化点
+                    # operands[0]=call 行, 非 slot; 旧 CopyLocal 车道把
+                    # call 行号误读槽域 = 证据洞本墙)。物理 source =
+                    # call 地址编码 arg 槽; intrinsic 权威构建
+                    # (cleanupCfgRuntimeIntrinsicInterfaceCid) 已契约查
+                    # arg/result 同 TypeId, storage 义务是 TypeId 纯函数
+                    # ⇒ source 槽 recorded 车道即本槽规范义务 (identity
+                    # 冻结层「recorded 即规范义务」同裁定)。形状列不全 →
+                    # 证据洞不变 (UNKNOWN 不通行, 零弱化)。
+                    evidenceLane = 3
+                    if bodyOp.operands.len >= 1:
+                        let callOrdinal = bodyOp.operands[0]
+                        if callOrdinal >= 0 &&
+                           callOrdinal < bodyIR.callSequence.len:
+                            let snapCall =
+                                bodyIR.callSequence[callOrdinal]
+                            if snapCall.managedStoreKind ==
+                                   coreir.ManagedStoreSnapshotRetainTag ||
+                               snapCall.managedStoreKind ==
+                                   coreir.ManagedStoreSnapshotCloneTag:
+                                evidenceLane = 4
+                                let arg0IsAddress =
+                                    coreir.CallArgSlotIsAddress(
+                                        snapCall.argSlots[0])
+                                if snapCall.resultSlot == slot &&
+                                   snapCall.resultPassKind ==
+                                       coreir.BodyCallPassSretResultTag &&
+                                   snapCall.argSlots.len == 1 &&
+                                   snapCall.argPassKinds.len == 1 &&
+                                   snapCall.argPassKinds[0] ==
+                                       coreir.BodyCallPassByAddressAggregateTag &&
+                                   arg0IsAddress:
+                                    let callSourceSlot =
+                                        coreir.CallArgSlotAddressId(
+                                            snapCall.argSlots[0])
+                                    if callSourceSlot >= 0 &&
+                                       callSourceSlot <
+                                           bodyIR.localSlots.len:
+                                        storage =
+                                            bodyIR.exactDef.slotStorageKinds[
+                                                callSourceSlot]
+                                        evidenceLane = 2
+                else:
+                    evidenceLane = 1
+                    if bodyOp.operands.len >= 1:
+                        let sourceSlot = bodyOp.operands[0]
+                        if sourceSlot >= 0 &&
+                           sourceSlot < bodyIR.localSlots.len:
+                            storage =
+                                bodyIR.exactDef.slotStorageKinds[sourceSlot]
+                if storage == exactdef.BodyIrExactDefStorageUnknownTag:
+                    # wall94 判词富化 (wall91 先例): storage 证据洞实况全列 —
+                    # 追加 def 声明坐标 (origin/source 列) + 目标槽声明
+                    # (name/tk/sz/tid + sidecar sentinel 态) + 证据道判定
+                    # 与 operands[0] 物理证据实况 (原始值/槽域判定/源槽声明
+                    # 与 storage 车道); Call 形追加 call 行形状列实况。
+                    var op0 = -1
+                    var op0InRange = 0
+                    var srcName: str = "#none"
+                    var srcTk = -1
+                    var srcTid = -1
+                    var srcMg = -1
+                    var srcStorage = -1
+                    if bodyOp.operands.len >= 1:
+                        op0 = bodyOp.operands[0]
+                        if op0 >= 0 && op0 < bodyIR.localSlots.len:
+                            op0InRange = 1
+                            srcName = bodyIR.localSlots[op0].name
+                            srcTk = bodyIR.localSlots[op0].typeKind
+                            srcTid = bodyIR.localSlots[op0].typeArenaTypeId
+                            srcMg = bodyIR.localSlots[op0].managedStorageKind
+                            srcStorage =
+                                bodyIR.exactDef.slotStorageKinds[op0]
+                    var callMsk = -1
+                    var callRs = -1
+                    var callRpk = -1
+                    var callArg0 = -1
+                    var callArg0Addr = -1
+                    var callSrc = -1
+                    if bodyOp.kind == coreir.BodyOpCallTag &&
+                       op0 >= 0 && op0 < bodyIR.callSequence.len:
+                        let diagCall = bodyIR.callSequence[op0]
+                        callMsk = diagCall.managedStoreKind
+                        callRs = diagCall.resultSlot
+                        callRpk = diagCall.resultPassKind
+                        if diagCall.argSlots.len >= 1:
+                            callArg0 = diagCall.argSlots[0]
+                            if coreir.CallArgSlotIsAddress(callArg0):
+                                callArg0Addr = 1
+                                callSrc =
+                                    coreir.CallArgSlotAddressId(callArg0)
+                    panic(Fmt"exact def freeze: appended definition storage evidence missing fn={bodyIR.controlFunctionRow} op={op} op_kind={bodyOp.kind} slot={slot} slot_name={bodyIR.localSlots[slot].name} slot_tk={bodyIR.localSlots[slot].typeKind} slot_sz={bodyIR.localSlots[slot].sizeBytes} slot_tid={bodyIR.localSlots[slot].typeArenaTypeId} slot_place={bodyIR.exactDef.slotPlaceKinds[slot]} slot_origin={bodyIR.exactDef.slotOriginIds[slot]} def_own={bodyOp.valueDefOwnership} def_okind={bodyOp.valueDefOriginKind} def_oid={bodyOp.valueDefOriginId} src_dom={bodyOp.sourceDefinitionDomain} src_row={bodyOp.sourceDefinitionRow} operands={bodyOp.operands.len} lane={evidenceLane} op0={op0} op0_in_range={op0InRange} src_name={srcName} src_tk={srcTk} src_tid={srcTid} src_mg={srcMg} src_storage={srcStorage} call_rows={bodyIR.callSequence.len} call_msk={callMsk} call_rs={callRs} call_rpk={callRpk} call_arg0={callArg0} call_arg0_addr={callArg0Addr} call_src={callSrc}")
+                bodyIR.exactDef.slotPlaceKinds[slot] =
+                    exactdef.BodyIrExactDefPlaceTemporaryTag
+                bodyIR.exactDef.slotOriginIds[slot] = op
+                bodyIR.exactDef.slotStorageKinds[slot] = storage
+        else:
+            add(bodyIR.exactDef.opPlaceKinds,
+                exactdef.BodyIrExactDefPlaceInvalidTag)
+            add(bodyIR.exactDef.opExactTypeIds, -1)
+            add(bodyIR.exactDef.opOriginIds, -1)
+            add(bodyIR.exactDef.opProducerFunctionRows, -1)
+            add(bodyIR.exactDef.opSourceDefOpRows, sourceDefRow)
+            add(bodyIR.exactDef.opReadADefOpRows, -1)
+    for call in oldCallCount..<bodyIR.callSequence.len:
+        add(bodyIR.exactDef.callArgStarts,
+            bodyIR.exactDef.argDefOpRows.len)
+        let argCount = bodyIR.callSequence[call].argSlots.len
+        add(bodyIR.exactDef.callArgCounts, argCount)
+        for arg in 0..<argCount:
+            let encoded = bodyIR.callSequence[call].argSlots[arg]
+            if coreir.CallArgSlotIsAddress(encoded):
+                add(bodyIR.exactDef.argDefOpRows, -1)
+                add(bodyIR.exactDef.argPlaceKinds,
+                    exactdef.BodyIrExactDefPlaceInvalidTag)
+                add(bodyIR.exactDef.argOwnerships,
+                    Int32(coreir.OwnBorrowShared))
+                add(bodyIR.exactDef.argOriginIds, -1)
+            else:
+                add(bodyIR.exactDef.argDefOpRows, -1)
+                add(bodyIR.exactDef.argPlaceKinds,
+                    exactdef.BodyIrExactDefPlaceInvalidTag)
+                add(bodyIR.exactDef.argOwnerships,
+                    Int32(coreir.OwnPlain))
+                add(bodyIR.exactDef.argOriginIds, -1)
+    exactdef.BodyIrExactDefSidecarRefreezeCidInto(bodyIR)
+    return true
+
+# ---- 验证器入口 (设计 §3.3) ----
+#
+# 相位序 (C cold_freeze_body_rewrites 24462 + body-store-freeze 同序):
+# reissue → read-edge 完成+终校验 (失败走 die 链) → consume-edge
+# 审计 (内嵌全体 dataflow) → use-after-consume。
+fn ExactDefFreezeValidateInto(
+        bodyIR: var coreir.BodyIR,
+        limits: ExactDefFreezeLimits): bool =
+    if !bodyIR.exactDef.sealed:
+        panic("exact def freeze: validate requires sealed sidecar")
+    if !exactdef.BodyIrExactDefSidecarShapeValid(bodyIR):
+        panic("exact def freeze: validate sidecar shape invalid")
+    var managedDefinitions: int32
+    for op in 0..<bodyIR.ops.len:
+        if bodyIR.ops[op].valueDefSlot >= 0 &&
+           bodyIR.ops[op].valueDefOwnership != coreir.OwnInvalid:
+            managedDefinitions = managedDefinitions + 1
+    if managedDefinitions == 0 && bodyIR.blocks.len == 0:
+        return true
+    if !bodyIR.controlFlowSealed || bodyIR.blocks.len == 0:
+        panic("exact def freeze: managed body requires sealed control flow")
+    if bodyIR.controlFunctionRow < 0:
+        panic("exact def freeze: producer function row missing")
+    var dom = ExactDefFreezeDominatorsBuild(bodyIR)
+    var workspace = exactDefFreezeWorkspaceAcquire(bodyIR)
+    if !exactDefFreezeReissueVarProvenance(bodyIR):
+        return false
+    # read-edge die 链 (C 24462-24486): 完成/终校验失败 →
+    # `read-edge freeze fail` 行 → die canonicalization invalid。
+    if !exactDefFreezeCompleteReadEdges(bodyIR, dom, workspace) ||
+       !exactDefFreezeReadEdgeTerminalValidate(bodyIR, dom, workspace):
+        let functionRow = bodyIR.controlFunctionRow
+        exactDefFreezeVerdictEmit(
+            exactDefFreezeReadEdgeFreezeFailLine(functionRow))
+        exactDefFreezeDie(
+            "cold BodyIR physical-source canonicalization invalid")
+    exactdef.BodyIrExactDefSidecarRefreezeCidInto(bodyIR)
+    if !exactDefFreezeConsumeEdgeAudit(
+           bodyIR, dom, workspace, limits, "freeze"):
+        return false
+    if !exactDefFreezeUseAfterConsumeScan(
+           bodyIR, dom, workspace, limits):
+        return false
+    return true
+
+# ---- 夹具专用判词文本出口 (unit 腿⑥文本断言; 活体结构性裁定见
+#      exact_def_freeze_smoke.cheng 文件头) ----
+
+@borrows
+fn ExactDefFreezeTestDirectReadMissingExtraLine(functionRow: int32,
+                                                op: int32,
+                                                kind: int32,
+                                                operand: int32,
+                                                slot: int32,
+                                                source: int32,
+                                                required: int32,
+                                                b: int32,
+                                                c: int32,
+                                                slotKind: int32,
+                                                slotPlace: int32,
+                                                slotStorage: int32): str =
+    return exactDefFreezeDirectReadMissingExtraLine(
+        functionRow, op, kind, operand, slot, source, required, b, c,
+        slotKind, slotPlace, slotStorage)
+
+@borrows
+fn ExactDefFreezeTestDirectReadInvalidLine(functionRow: int32,
+                                           op: int32,
+                                           kind: int32,
+                                           operand: int32,
+                                           slot: int32,
+                                           source: int32): str =
+    return exactDefFreezeDirectReadInvalidLine(
+        functionRow, op, kind, operand, slot, source)
+
+
+# ---- 批 3 同源出口 (exact_def_identity 的批 2 基元复用面) ----
+#
+# 批 3 (identity schema 主审 + 投影权威) 与批 2 共享同一支配缓存 / reaches /
+# current 基元 / 点活性 walker / consume 谓词 / consumer summary / read-edge
+# 完成器+终校验 / consume-edge 审计。本段是批 2 私有基元的纯转发出口
+# (与上方 ExactDefFreezeTest* 判词文本出口同例): 零逻辑新增, 零既有行改动,
+# 结构上不可能出现第二份逐字实现 (设计 §4 批 3「与批 2 共享 helper」)。
+# 调用方纪律: 与批 2 验证器同 — sealed 侧车 + 已建支配缓存/工作区。
+
+fn ExactDefFreezeIdentityWorkspaceAcquire(
+        bodyIR: var coreir.BodyIR): ExactDefFreezeWorkspace =
+    return exactDefFreezeWorkspaceAcquire(bodyIR)
+
+@borrows
+fn ExactDefFreezeIdentityReaches(bodyIR: coreir.BodyIR,
+                                 dom: ExactDefFreezeDominators,
+                                 opBlockIds: int32[],
+                                 definition: int32,
+                                 consumer: int32): bool =
+    return exactDefFreezeReaches(bodyIR, dom, opBlockIds, definition,
+                                 consumer)
+
+@borrows
+fn ExactDefFreezeIdentityIsCurrentAtPredecessor(
+        bodyIR: coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        opBlockIds: int32[],
+        definition: int32,
+        predecessor: int32,
+        boundaryOp: int32): bool =
+    return exactDefFreezeIsCurrentAtPredecessor(
+        bodyIR, dom, opBlockIds, definition, predecessor, boundaryOp)
+
+@borrows
+fn ExactDefFreezeIdentityIsCurrentAtConsumer(
+        bodyIR: coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        opBlockIds: int32[],
+        definition: int32,
+        consumer: int32): bool =
+    return exactDefFreezeIsCurrentAtConsumer(
+        bodyIR, dom, opBlockIds, definition, consumer)
+
+# 点活性 walker (点前查询同 batch-2 use-after-consume 的调用形)。
+@borrows
+fn ExactDefFreezeIdentityConsumptionDataflowFrom(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace,
+        limits: ExactDefFreezeLimits,
+        definition: int32,
+        flowEntry: int32,
+        flowEnd: int32,
+        flowEntryState: int32,
+        queryBlock: int32,
+        queryOpExcl: int32,
+        queryExitState: var int32): bool =
+    return exactDefFreezeConsumptionDataflowFrom(
+        bodyIR, dom, workspace, limits, definition, flowEntry, flowEnd,
+        flowEntryState, queryBlock, queryOpExcl, queryExitState)
+
+@borrows
+fn ExactDefFreezeIdentityOpNamesDefinitionCandidate(
+        bodyIR: coreir.BodyIR,
+        def: int32,
+        consumer: int32): bool =
+    return exactDefFreezeOpNamesDefinitionCandidate(bodyIR, def, consumer)
+
+@borrows
+fn ExactDefFreezeIdentityOpConsumesDefinition(bodyIR: coreir.BodyIR,
+                                              def: int32,
+                                              consumer: int32): bool =
+    return exactDefFreezeOpConsumesDefinition(bodyIR, def, consumer)
+
+@borrows
+fn ExactDefFreezeIdentityOwnedSlotOverwriteConsumes(
+        bodyIR: coreir.BodyIR,
+        def: int32,
+        op: int32): bool =
+    return exactDefFreezeOwnedSlotOverwriteConsumes(bodyIR, def, op)
+
+@borrows
+fn ExactDefFreezeIdentityConsumerSummaryBuild(
+        bodyIR: coreir.BodyIR,
+        def: int32): ExactDefFreezeConsumerSummary =
+    return exactDefFreezeConsumerSummaryBuild(bodyIR, def)
+
+# read-edge 完成器 / 终校验 (批 3 read-edge 总门与夹具预跑共用;
+# 完成器失败时批 2 组合序的 die 链语义由调用方自决)。
+@borrows
+fn ExactDefFreezeIdentityCompleteReadEdges(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace): bool =
+    return exactDefFreezeCompleteReadEdges(bodyIR, dom, workspace)
+
+@borrows
+fn ExactDefFreezeIdentityReadEdgeTerminalValidate(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace): bool =
+    return exactDefFreezeReadEdgeTerminalValidate(bodyIR, dom, workspace)
+
+# consume-edge 审计 (批 3 审计段的共享 consumer summary 同源调用;
+# phase 为判词 [phase] 替换段)。
+@borrows
+fn ExactDefFreezeIdentityConsumeEdgeAudit(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace,
+        limits: ExactDefFreezeLimits,
+        phase: str): bool =
+    return exactDefFreezeConsumeEdgeAudit(
+        bodyIR, dom, workspace, limits, phase)
+
+# 谓词 source 列读取 (与批 2 谓词通道①同源: 域 BodyOp 才是物理定义边)。
+@borrows
+fn ExactDefFreezeIdentityOpSourceDefRow(op: coreir.BodyOp): int32 =
+    return exactDefFreezeOpSourceDefRow(op)
+
+# ---- 批 4 同源出口 (exact_def_merge 的批 2/批 3 基元复用面) ----
+#
+# 批 4 (CFG merge batch + 借用合并权威) 与批 2 共享同一支配缓存 / 块支配 /
+# op-支配前驱 / 互斥消费者对 / merge 第二输入空间回收。本段是私有基元的
+# 纯转发出口 (与批 3 同源出口同例): 零逻辑新增, 零既有行改动。
+# 调用方纪律: 与批 2 验证器同 — sealed 侧车 + 已建支配缓存/工作区。
+
+@borrows
+fn ExactDefFreezeMergeBlockDominates(dom: ExactDefFreezeDominators,
+                                     dominatorBlock: int32,
+                                     block: int32): bool =
+    return exactDefFreezeBlockDominates(dom, dominatorBlock, block)
+
+@borrows
+fn ExactDefFreezeMergeOpDominatesPredecessor(
+        bodyIR: coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        opBlockIds: int32[],
+        definition: int32,
+        predecessor: int32): bool =
+    return exactDefFreezeOpDominatesPredecessor(
+        bodyIR, dom, opBlockIds, definition, predecessor)
+
+@borrows
+fn ExactDefFreezeMergeMutuallyExclusiveConsumerPairValid(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace,
+        limits: ExactDefFreezeLimits,
+        definition: int32,
+        firstConsumer: int32,
+        secondConsumer: int32): bool =
+    return exactDefFreezeMutuallyExclusiveConsumerPairValid(
+        bodyIR, dom, workspace, limits, definition, firstConsumer,
+        secondConsumer)
+
+# merge 第二输入空间回收 (通道③同实现; 批 4 校验器与自环臂同源)。
+@borrows
+fn ExactDefFreezeMergeSecondInputRowForMerge(
+        bodyIR: coreir.BodyIR,
+        consumer: int32): int32 =
+    return exactDefFreezeMergeSecondInputRow(bodyIR, consumer)
+
+# BR-only 链尾块 (edge_merge/op_c 回收同源单实现; merge 模块复用)。
+@borrows
+fn ExactDefFreezeMergeBrChainTail(bodyIR: coreir.BodyIR,
+                                  fromBlock: int32,
+                                  joinBlock: int32): int32 =
+    return exactDefFreezeBrChainTail(bodyIR, fromBlock, joinBlock)
+
+# read-edge source 边校验 (含批 4 CFG_MERGE 自环臂; merge 物理源自环
+# 校验同源调用)。
+@borrows
+fn ExactDefFreezeMergeReadSourceEdgeValid(
+        bodyIR: coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        opBlockIds: int32[],
+        op: int32,
+        slot: int32,
+        source: int32): bool =
+    return exactDefFreezeReadSourceEdgeValid(
+        bodyIR, dom, opBlockIds, op, slot, source)
+
+# ---- 批 5 同源出口 (exact_def_call_authority 的批 3 基元复用面) ----
+#
+# 批 5 (var-out 分类器 + 调用权威三族 + seal root 校验 + 程序契约) 需要的
+# 三个批 3 域谓词 (param 定义边 / 点前活性查询 / 借用根冻结权威) 按批 4
+# typeFact 四 helper 同款裁定迁入本模块持单实现 (identity 留委托别名,
+# 调用方经本出口同源复用 — 结构上不可能出现第二份逐字实现; 规格
+# docs/cheng-exact-def-batch5-authority-spec.md §6 「全部批 3 单实现复
+# 用, 禁止重实现」)。迁入背景: 批 5 首版在 identity 加同名出口段时死
+# 点行号漂移 (其后定案真源为 body_ir_exact_def 的契约函数, identity
+# 实证在死点后; 迁移保留 — 单实现归位与批 4 typeFact 先例一致, 零漂
+# 移口径下对死点前模块新增函数一律禁止)。实现逐字自 identity.cheng
+# 迁入 (谓词本体零改动)。
+# 调用方纪律: 与批 2 验证器同 — sealed 侧车 + 已建支配缓存/工作区。
+
+# param 定义边谓词 (自 identity.cheng exactDefIdentityParamDefinitionEdgeValid
+# 逐字迁入; C 69054-69106 参数臂的边子句)。
+@borrows
+fn ExactDefFreezeAuthorityParamDefinitionEdgeValid(
+        bodyIR: coreir.BodyIR,
+        opRow: int32): bool =
+    if opRow < 0 || opRow >= bodyIR.ops.len:
+        return false
+    if bodyIR.exactDef.opPlaceKinds[opRow] !=
+           exactdef.BodyIrExactDefPlaceParamTag:
+        return false
+    let origin = bodyIR.exactDef.opOriginIds[opRow]
+    if origin < 0 || origin >= bodyIR.entryParameterSlotIds.len:
+        return false
+    let rawSlot = bodyIR.entryParameterSlotIds[origin]
+    if rawSlot < 0 || rawSlot >= bodyIR.localSlots.len:
+        return false
+    let op = bodyIR.ops[opRow]
+    if op.valueDefSlot != rawSlot || op.target != rawSlot:
+        return false
+    let ownership = op.valueDefOwnership
+    let uniqueBorrow = ownership == coreir.OwnBorrowUnique
+    let sharedBorrow = ownership == coreir.OwnBorrowShared
+    let borrowed = uniqueBorrow || sharedBorrow
+    let local = bodyIR.localSlots[rawSlot]
+    var physicalRef = local.typeKind == coreir.LocalPtrTag
+    if !physicalRef && local.typeArenaTypeId >= 0:
+        physicalRef = ExactDefFreezeTypeFactStructuralKind(
+            bodyIR, local.typeArenaTypeId) ==
+            Int32(typearena.TypedExprStructuralTypeRefObject)
+    var rawIsArray = false
+    var rawIsObject = false
+    if local.typeArenaTypeId >= 0:
+        let structural = ExactDefFreezeTypeFactStructuralKind(
+            bodyIR, local.typeArenaTypeId)
+        rawIsArray = structural ==
+            Int32(typearena.TypedExprStructuralTypeFixedArray)
+        rawIsObject = structural ==
+            Int32(typearena.TypedExprStructuralTypeObject)
+    if op.kind != coreir.BodyOpLoadLocalTag || op.operands.len != 0:
+        return false
+    if exactDefFreezeOpSourceDefRow(op) != -1:
+        return false
+    let ownershipValid =
+        (!borrowed &&
+         (ownership == coreir.OwnMove ||
+          ownership == coreir.OwnPlain)) ||
+        (borrowed && uniqueBorrow &&
+         (physicalRef || rawIsArray || rawIsObject)) ||
+        (borrowed && sharedBorrow && !physicalRef)
+    if !ownershipValid:
+        return false
+    return !borrowed || op.valueDefConsumeOpIndexPlusOne == 0
+
+# 点前活性查询 (自 identity.cheng exactDefIdentityIsLiveBeforeOp 逐字迁入;
+# C 55968-56043 同块快道+全体 dataflow)。
+@borrows
+fn ExactDefFreezeAuthorityIsLiveBeforeOp(
+        bodyIR: var coreir.BodyIR,
+        dom: ExactDefFreezeDominators,
+        workspace: var ExactDefFreezeWorkspace,
+        limits: ExactDefFreezeLimits,
+        definition: int32,
+        consumer: int32): bool =
+    if definition < 0 || definition >= bodyIR.ops.len ||
+       consumer < 0 || consumer >= bodyIR.ops.len ||
+       definition == consumer:
+        return false
+    let block = workspace.opBlockIds[consumer]
+    let definitionBlock = workspace.opBlockIds[definition]
+    if block >= 0 && definitionBlock == block && definition < consumer:
+        for op in definition + 1..<consumer:
+            if (exactDefFreezeOpNamesDefinitionCandidate(
+                    bodyIR, definition, op) &&
+                exactDefFreezeOpConsumesDefinition(
+                    bodyIR, definition, op)) ||
+               exactDefFreezeOwnedSlotOverwriteConsumes(
+                   bodyIR, definition, op):
+                return false
+        return true
+    if block < 0:
+        return false
+    var exitState: int32
+    return exactDefFreezeConsumptionDataflowFrom(
+        bodyIR, dom, workspace, limits, definition, 0,
+        bodyIR.blocks.len, ExactDefFreezeStateUndefinedTag,
+        block, consumer, exitState) &&
+        exitState == ExactDefFreezeStateLiveTag
+
+# 借用根冻结权威 (自 identity.cheng exactDefIdentityBorrowResultRootValid
+# 逐字迁入; cold_borrow_result_root_valid 的 Cheng 基板裁定 — 冻结
+# borrow-owner 列在界即根已证, 上游不变式放电)。
+@borrows
+fn ExactDefFreezeAuthorityBorrowResultRootValid(
+        bodyIR: coreir.BodyIR,
+        source: int32): bool =
+    if source < 0 || source >= bodyIR.ops.len:
+        return false
+    let op = bodyIR.ops[source]
+    if op.valueDefOwnership != coreir.OwnBorrowShared &&
+       op.valueDefOwnership != coreir.OwnBorrowUnique:
+        return false
+    if op.valueDefBorrowOwnerDefinitionDomain ==
+           coreir.BodyDefinitionDomainBodyOpTag:
+        return op.valueDefBorrowOwnerDefinitionRow >= 0 &&
+               op.valueDefBorrowOwnerDefinitionRow < bodyIR.ops.len
+    if op.valueDefBorrowOwnerDefinitionDomain ==
+           coreir.BodyDefinitionDomainEntrySlotTag:
+        return op.valueDefBorrowOwnerDefinitionRow >= 0 &&
+               op.valueDefBorrowOwnerDefinitionRow <
+                   bodyIR.localSlots.len
+    return false

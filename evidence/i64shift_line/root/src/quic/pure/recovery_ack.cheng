@@ -1,0 +1,214 @@
+# W4 recovery: ACK packet-number range set, ACK frame generation and ACK frame
+# range processing (RFC 9000 Section 13.2 / 19.3, pure logic layer of the
+# RFC 9002 reliability slice).
+#
+# Alignment with the W3a codec is structural:
+# - generation writes the plain 0x02 ACK frame through frames_varint
+#   primitives: Largest Acknowledged, Ack Delay, ACK Range Count (additional
+#   (Gap, Range Length) pairs only, per the W3a-verified semantics), First ACK
+#   Range; ECN counts are absent (no 0x03 form; ECN stays 0 in this slice).
+# - processing consumes exactly the scalars a W3a QuicFrameDecodeAt yields
+#   (largestAck, firstAckRange, ackRangeCount, rangesOff view into the source
+#   buffer) and re-derives (Gap, Range Length) pairs with the same varint
+#   reads quicAckScanRanges performs.
+#
+# The range set is the single accumulation/merge primitive: the receiver
+# accumulates received packet numbers into it (peer side of the event
+# simulator) and the sender never needs one (loss state resolves acked
+# packets per frame directly). Ranges are kept sorted ascending, disjoint
+# and non-adjacent (adjacent ranges merge). On overflow the lowest range is
+# dropped and counted; the frame generator therefore emits at most
+# QuicAckMaxRanges ranges, largest first, which is wire-legal.
+#
+# No clock lives here: every timestamp is a parameter. The set is plain
+# scalars and fixed arrays (SoA) so stage3 lowering stays stable.
+
+import std/rawbytes
+import cheng/quic/pure/frames_varint as quicvarint
+
+const
+    QuicAckFrameType: int32 = 0x02
+    QuicAckMaxRanges: int32 = 64
+
+type
+    # A set of packet numbers as sorted disjoint ranges.
+    QuicAckSet =
+        rangeStart: int64[QuicAckMaxRanges]   # lowest packet number of range
+        rangeLen: int64[QuicAckMaxRanges]     # number of packet numbers, >= 1
+        count: int32
+        largestSeen: int64
+        hasAny: bool
+        rangesDropped: int64                  # lowest-range evictions on overflow
+        dupAdds: int64                        # adds fully covered already
+
+    # One decoded additional (Gap, Range Length) pair.
+    QuicAckPairRead =
+        ok: bool
+        gap: int64
+        rangeLen: int64
+        nextOff: int32
+
+fn QuicAckSetInit(s: var QuicAckSet) =
+    s.count = 0
+    s.largestSeen = 0
+    s.hasAny = false
+    s.rangesDropped = 0
+    s.dupAdds = 0
+
+fn QuicAckSetCovered(s: var QuicAckSet): int64 =
+    var total: int64
+    var i: int32
+    while i < s.count:
+        total = total + s.rangeLen[i]
+        i = i + 1
+    return total
+
+fn QuicAckSetContains(s: var QuicAckSet, pn: int64): bool =
+    var i: int32
+    while i < s.count:
+        if pn >= s.rangeStart[i] && pn < s.rangeStart[i] + s.rangeLen[i]:
+            return true
+        i = i + 1
+    return false
+
+# Insert [lo, hi] with merge of overlapping and adjacent ranges. Returns true
+# when the covered packet-number count grew. On capacity overflow the lowest
+# range is evicted (rangesDropped++), which only loses coverage below the
+# ACK window — wire-legal, and counted for honesty.
+fn QuicAckSetAddRange(s: var QuicAckSet, lo: int64, hi: int64): bool =
+    if hi < lo:
+        return false
+    var newLo: int64 = lo
+    var newHi: int64 = hi
+    var keepStart: int64[QuicAckMaxRanges]
+    var keepLen: int64[QuicAckMaxRanges]
+    var keepCount: int32
+    var merged: bool = false
+    var before: int64 = QuicAckSetCovered(s)
+    var i: int32
+    while i < s.count:
+        let curLo: int64 = s.rangeStart[i]
+        let curHi: int64 = curLo + s.rangeLen[i] - 1
+        if curHi + 1 < newLo || curLo > newHi + 1:
+            keepStart[keepCount] = curLo
+            keepLen[keepCount] = s.rangeLen[i]
+            keepCount = keepCount + 1
+        else:
+            if curLo < newLo:
+                newLo = curLo
+            if curHi > newHi:
+                newHi = curHi
+            merged = true
+        i = i + 1
+    # Rebuild ascending: keep-ranges below the merged one, then the merged
+    # range, then the rest (keep order preserved; keep list is ascending).
+    # At capacity the lowest range is evicted to make room (ACK-window
+    # semantics: the newest range wins) — eviction happens BEFORE the write
+    # so the fixed arrays are never indexed past QuicAckMaxRanges.
+    var outStart: int64[QuicAckMaxRanges]
+    var outLen: int64[QuicAckMaxRanges]
+    var outCount: int32
+    var placed: bool = false
+    var k: int32
+    while k < keepCount:
+        if !placed && keepStart[k] > newLo:
+            placed = true
+            if outCount == QuicAckMaxRanges:
+                var m: int32 = 1
+                while m < outCount:
+                    outStart[m - 1] = outStart[m]
+                    outLen[m - 1] = outLen[m]
+                    m = m + 1
+                outCount = outCount - 1
+                s.rangesDropped = s.rangesDropped + 1
+            outStart[outCount] = newLo
+            outLen[outCount] = newHi - newLo + 1
+            outCount = outCount + 1
+        if outCount == QuicAckMaxRanges:
+            var m: int32 = 1
+            while m < outCount:
+                outStart[m - 1] = outStart[m]
+                outLen[m - 1] = outLen[m]
+                m = m + 1
+            outCount = outCount - 1
+            s.rangesDropped = s.rangesDropped + 1
+        outStart[outCount] = keepStart[k]
+        outLen[outCount] = keepLen[k]
+        outCount = outCount + 1
+        k = k + 1
+    if !placed:
+        if outCount == QuicAckMaxRanges:
+            var m: int32 = 1
+            while m < outCount:
+                outStart[m - 1] = outStart[m]
+                outLen[m - 1] = outLen[m]
+                m = m + 1
+            outCount = outCount - 1
+            s.rangesDropped = s.rangesDropped + 1
+        outStart[outCount] = newLo
+        outLen[outCount] = newHi - newLo + 1
+        outCount = outCount + 1
+    var w: int32
+    while w < outCount:
+        s.rangeStart[w] = outStart[w]
+        s.rangeLen[w] = outLen[w]
+        w = w + 1
+    s.count = outCount
+    if hi > s.largestSeen || !s.hasAny:
+        s.largestSeen = hi
+        s.hasAny = true
+    if !merged && keepCount == s.count - 1 && QuicAckSetCovered(s) == before:
+        s.dupAdds = s.dupAdds + 1
+        return false
+    return QuicAckSetCovered(s) > before
+
+fn QuicAckSetAdd(s: var QuicAckSet, pn: int64): bool =
+    return QuicAckSetAddRange(s, pn, pn)
+
+# Append the 0x02 ACK frame for the current set into b. Returns bytes
+# appended, 0 when the set is empty. The wire form is exactly what the W3a
+# codec decodes: Largest, Delay, Range Count (= additional pairs only),
+# First Range, then (Gap, Range Length) pairs newest-to-oldest.
+fn QuicAckFrameAppend(s: var QuicAckSet, b: var BytesBuilder, ackDelayUs: int64): int32 =
+    if s.count == 0:
+        return 0
+    let top: int32 = s.count - 1
+    let largest: int64 = s.rangeStart[top] + s.rangeLen[top] - 1
+    let firstRange: int64 = s.rangeLen[top] - 1
+    let before: int32 = BytesBuilderLen(b)
+    BytesBuilderAppendByte(b, QuicAckFrameType)
+    if quicvarint.QuicVarintAppend(b, largest) < 0: return -1
+    if quicvarint.QuicVarintAppend(b, ackDelayUs) < 0: return -1
+    if quicvarint.QuicVarintAppend(b, int64(s.count - 1)) < 0: return -1
+    if quicvarint.QuicVarintAppend(b, firstRange) < 0: return -1
+    var prevLow: int64 = s.rangeStart[top]
+    var i: int32 = s.count - 2
+    while i >= 0:
+        let curHi: int64 = s.rangeStart[i] + s.rangeLen[i] - 1
+        let gap: int64 = prevLow - curHi - 1
+        if quicvarint.QuicVarintAppend(b, gap) < 0: return -1
+        if quicvarint.QuicVarintAppend(b, s.rangeLen[i] - 1) < 0: return -1
+        prevLow = s.rangeStart[i]
+        i = i - 1
+    return BytesBuilderLen(b) - before
+
+# Read one additional (Gap, Range Length) pair at off (mirrors the pair scan
+# of the W3a codec). ok=false on truncation.
+@borrows
+fn QuicAckReadPairAt(buf: Bytes, off: int32): QuicAckPairRead =
+    var out: QuicAckPairRead
+    out.ok = false
+    out.gap = 0
+    out.rangeLen = 0
+    out.nextOff = 0
+    let g: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, off)
+    if !g.ok:
+        return out
+    let r: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, off + g.size)
+    if !r.ok:
+        return out
+    out.ok = true
+    out.gap = g.value
+    out.rangeLen = r.value
+    out.nextOff = off + g.size + r.size
+    return out

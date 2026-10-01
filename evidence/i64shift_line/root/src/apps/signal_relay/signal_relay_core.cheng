@@ -1,0 +1,489 @@
+# signal_relay_core.cheng
+# Core signal relay: TCP accept loop, HTTP routing, WebSocket upgrade, signal dispatching.
+# Extends the existing libp2p_ingress_http.cheng pattern with WebSocket support.
+# Reuses HTTP parsing and ICE config from libp2p_ingress_http.cheng.
+
+import std/result
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
+import std/cmdline
+import std/os
+import std/times
+import std/net/transports/tcp_syscall as tcp
+import std/crypto/sha1
+import cheng/apps/signal_relay/signal_relay_ws as ws
+import cheng/apps/signal_relay/signal_relay_bridge as bridge
+
+# Re-export the types and constants for external use
+
+const
+    SignalRelayDefaultListenHost: str = "127.0.0.1"
+    SignalRelayDefaultListenPort: int32 = 4190
+    SignalRelayHttpReadMaxChars: int32 = 8192
+    SignalRelayHttpReadChunks: int32 = 16
+    SignalRelayWsFrameMaxBytes: int32 = 65536
+
+# Reuse ICE config constants and functions from the existing ingress
+# (These are copied here for standalone compilation)
+
+const
+    SignalRelayBase64Alphabet: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    SignalRelaySha1BlockSize: int32 = 64
+
+type
+    SignalRelayConfig =
+        listenHost: str = "127.0.0.1"
+        listenPort: int32 = 4190
+        seed: str
+        turnPublicHost: str
+        turnPort: int32 = 3478
+        turnSharedSecret: str
+        turnRealm: str = "unimaker.fun"
+        turnCredentialTtlSec: int32 = 600
+        maxRequests: int32
+
+type
+    SignalRelayHttpResponse =
+        statusCode: int32
+        reason: str
+        contentType: str
+        body: str
+
+type
+    SignalRelayState =
+        config: SignalRelayConfig
+        bridge: bridge.SignalRelayBridgeState
+
+# --- String and utility helpers ---
+
+fn SignalRelayConcat(a: str, b: str): str =
+    return strings.ConcatStr(a, b)
+
+fn SignalRelayConcat3(a: str, b: str, c: str): str =
+    return strings.ConcatStr(strings.ConcatStr(a, b), c)
+
+fn SignalRelayConcat4(a: str, b: str, c: str, d: str): str =
+    return strings.ConcatStr(strings.ConcatStr(strings.ConcatStr(a, b), c), d)
+
+fn SignalRelayConcat5(a: str, b: str, c: str, d: str, e: str): str =
+    return strings.ConcatStr(strings.ConcatStr(strings.ConcatStr(strings.ConcatStr(a, b), c), d), e)
+
+fn SignalRelayFindChar(text: str, needle: char, start: int32): int32 =
+    let n: int32 = len(text)
+    var i: int32 = start
+    while i < n:
+        if text[i] == needle:
+            return i
+        i = i + 1
+    return -1
+
+fn SignalRelayFindSub(text: str, needle: str): int32 =
+    let n: int32 = len(text)
+    let m: int32 = len(needle)
+    if m <= 0:
+        return 0
+    if m > n:
+        return -1
+    var i: int32
+    while i + m <= n:
+        var matched = true
+        for j in 0..<m:
+            if text[i + j] != needle[j]:
+                matched = false
+                break
+        if matched:
+            return i
+        i = i + 1
+    return -1
+
+fn SignalRelayJsonQuote(text: str): str =
+    var out = "\""
+    for i in 0..<len(text):
+        let ch: char = text[i]
+        if ch == '"':
+            out = SignalRelayConcat(out, "\\\"")
+        elif ch == '\\':
+            out = SignalRelayConcat(out, "\\\\")
+        elif ch == '\n':
+            out = SignalRelayConcat(out, "\\n")
+        elif ch == '\r':
+            out = SignalRelayConcat(out, "\\r")
+        elif ch == '\t':
+            out = SignalRelayConcat(out, "\\t")
+        else:
+            out = SignalRelayConcat(out, strings.SliceBytes(text, i, 1))
+    return SignalRelayConcat(out, "\"")
+
+fn SignalRelayErrorJson(error: str): str =
+    return SignalRelayConcat3("{\"ok\":false,\"error\":", SignalRelayJsonQuote(error), "}")
+
+fn SignalRelayHttpResponseWire(response: SignalRelayHttpResponse): str =
+    var out = SignalRelayConcat5("HTTP/1.1 ", strings.IntToStr(response.statusCode), " ", response.reason, "\r\n")
+    out = SignalRelayConcat4(out, "Content-Type: ", response.contentType, "\r\n")
+    out = SignalRelayConcat(out, "Cache-Control: no-store\r\n")
+    out = SignalRelayConcat4(out, "Content-Length: ", strings.IntToStr(len(response.body)), "\r\n")
+    out = SignalRelayConcat(out, "Connection: close\r\n\r\n")
+    return SignalRelayConcat(out, response.body)
+
+fn SignalRelayJsonResponse(statusCode: int32, reason: str, body: str): SignalRelayHttpResponse =
+    var out: SignalRelayHttpResponse
+    out.statusCode = statusCode
+    out.reason = reason
+    out.contentType = "application/json; charset=utf-8"
+    out.body = body
+    return out
+
+# --- HTTP request parsing (reuse pattern from libp2p_ingress_http.cheng) ---
+
+fn SignalRelayParseRequestLine(requestText: str, outMethod: var str, outTarget: var str): bool =
+    let lineEnd: int32 = SignalRelayFindSub(requestText, "\r\n")
+    if lineEnd <= 0:
+        return false
+    let line: str = strings.SliceBytes(requestText, 0, lineEnd)
+    let firstSpace: int32 = SignalRelayFindChar(line, char(32), 0)
+    if firstSpace <= 0:
+        return false
+    let secondSpace: int32 = SignalRelayFindChar(line, char(32), firstSpace + 1)
+    if secondSpace <= firstSpace + 1:
+        return false
+    outMethod = strutil.Strip(strings.SliceBytes(line, 0, firstSpace))
+    outTarget = strutil.Strip(strings.SliceBytes(line, firstSpace + 1, secondSpace - firstSpace - 1))
+    return len(outMethod) > 0 && len(outTarget) > 0
+
+fn SignalRelaySplitTarget(target: str, outPath: var str, outQuery: var str) =
+    let q: int32 = SignalRelayFindChar(target, '?', 0)
+    if q < 0:
+        outPath = target
+        outQuery = ""
+        return
+    outPath = strings.SliceBytes(target, 0, q)
+    outQuery = strings.SliceBytes(target, q + 1, len(target) - q - 1)
+
+fn SignalRelayQueryValue(query: str, key: str): str =
+    var start: int32
+    while start < len(query):
+        var stop: int32 = SignalRelayFindChar(query, '&', start)
+        if stop < 0:
+            stop = len(query)
+        let item: str = strings.SliceBytes(query, start, stop - start)
+        let eq: int32 = SignalRelayFindChar(item, '=', 0)
+        if eq > 0:
+            let itemKey: str = strings.SliceBytes(item, 0, eq)
+            if itemKey == key:
+                return strings.SliceBytes(item, eq + 1, len(item) - eq - 1)
+        start = stop + 1
+    return ""
+
+fn SignalRelayFindHeader(requestText: str, headerName: str): str =
+    let headerColon: str = SignalRelayConcat(headerName, ":")
+    let needleLen: int32 = len(headerColon)
+    var i: int32
+    while i < len(requestText):
+        if i + needleLen <= len(requestText):
+            var matched = true
+            for j in 0..<needleLen:
+                let a: char = requestText[i + j]
+                let b: char = headerColon[j]
+                if a != b:
+                    matched = false
+                    break
+            if matched:
+                let valueStart: int32 = i + needleLen
+                var valueEnd: int32 = valueStart
+                while valueEnd < len(requestText):
+                    if requestText[valueEnd] == '\r' or requestText[valueEnd] == '\n':
+                        break
+                    valueEnd = valueEnd + 1
+                return strutil.Strip(strings.SliceBytes(requestText, valueStart, valueEnd - valueStart))
+        i = i + 1
+    return ""
+
+fn SignalRelayReadHttpRequest(conn: var tcp.TcpConnectionHandle): Result[str] =
+    var requestText: str
+    for _ in 0..<SignalRelayHttpReadChunks:
+        let readRes: Result[Bytes] = tcp.TcpRecv(conn, 4096)
+        if IsErr(readRes):
+            return Err[str](Error(readRes))
+        let chunk: Bytes = Value(readRes)
+        if BytesLen(chunk) <= 0:
+            break
+        requestText = SignalRelayConcat(requestText, BytesToString(chunk))
+        if len(requestText) > SignalRelayHttpReadMaxChars:
+            return Err[str]("signal_relay: http request too large")
+        if SignalRelayFindSub(requestText, "\r\n\r\n") >= 0:
+            return Ok[str](requestText)
+    return Err[str]("signal_relay: incomplete http request")
+
+# --- SHA1 + Base64 for WebSocket accept key ---
+
+fn SignalRelayBase64Char(idx: int32): str =
+    return strings.SliceBytes(SignalRelayBase64Alphabet, idx & 63, 1)
+
+fn SignalRelayBase64Encode(data: Bytes): str =
+    let n: int32 = BytesLen(data)
+    if n <= 0:
+        return ""
+    var out: str
+    var i: int32
+    while i < n:
+        let b0: int32 = BytesGet(data, i)
+        let b1: int32 = if i + 1 < n: BytesGet(data, i + 1) else: 0
+        let b2: int32 = if i + 2 < n: BytesGet(data, i + 2) else: 0
+        let triple: int32 = (b0 << 16) | (b1 << 8) | b2
+        out = SignalRelayConcat(out, SignalRelayBase64Char((triple >> 18) & 63))
+        out = SignalRelayConcat(out, SignalRelayBase64Char((triple >> 12) & 63))
+        if i + 1 < n:
+            out = SignalRelayConcat(out, SignalRelayBase64Char((triple >> 6) & 63))
+        else:
+            out = SignalRelayConcat(out, "=")
+        if i + 2 < n:
+            out = SignalRelayConcat(out, SignalRelayBase64Char(triple & 63))
+        else:
+            out = SignalRelayConcat(out, "=")
+        i = i + 3
+    return out
+
+fn SignalRelayComputeAcceptKey(clientKey: str): str =
+    let input: str = SignalRelayConcat(strutil.Strip(clientKey), ws.SignalRelayWsMagicGuid)
+    let inputBytes: Bytes = BytesFromString(input)
+    let hash: Bytes = sha1.sha1Digest(inputBytes)
+    return SignalRelayBase64Encode(hash)
+
+# --- HTTP request handler ---
+
+fn SignalRelayHandleHttpRequest(
+    config: var SignalRelayConfig,
+    requestText: str,
+): SignalRelayHttpResponse =
+    var method: str
+    var target: str
+    if !SignalRelayParseRequestLine(requestText, method, target):
+        return SignalRelayJsonResponse(400, "Bad Request", SignalRelayErrorJson("bad_request"))
+    if method != "GET":
+        return SignalRelayJsonResponse(405, "Method Not Allowed", SignalRelayErrorJson("method_not_allowed"))
+    var path: str
+    var query: str
+    SignalRelaySplitTarget(target, path, query)
+    if path == "/healthz":
+        return SignalRelayJsonResponse(200, "OK", "{\"ok\":true,\"service\":\"cheng_signal_relay\"}")
+    if path == "/readyz":
+        return SignalRelayJsonResponse(200, "OK", "{\"ok\":true,\"service\":\"cheng_signal_relay\"}")
+    return SignalRelayJsonResponse(404, "Not Found", SignalRelayErrorJson("not_found"))
+
+# --- WebSocket signal handler ---
+
+fn SignalRelayHandleWsMessage(
+    state: var SignalRelayState,
+    connFd: int32,
+    message: str,
+    nowMs: int64,
+    outResponse: var str,
+): bool =
+    let trimmed: str = strutil.Strip(message)
+    if len(trimmed) <= 0:
+        return true
+    # Parse JSON message minimally (no full JSON parser - check for key fields)
+    let typeField: str = SignalRelayFindJsonString(trimmed, "type")
+
+    if typeField == "auth":
+        let peerId: str = SignalRelayFindJsonString(trimmed, "peerId")
+        if len(peerId) > 0:
+            bridge.SignalRelayBridgeRegister(state.bridge.sessions, peerId, connFd, nowMs)
+        outResponse = "{\"type\":\"auth_ok\"}"
+        return true
+
+    if typeField == "ping":
+        outResponse = "{\"type\":\"pong\"}"
+        return true
+
+    if typeField == "signal":
+        bridge.SignalRelayBridgeTouch(state.bridge.sessions, connFd, nowMs)
+        let toPeerId: str = SignalRelayFindJsonString(trimmed, "to")
+        if len(toPeerId) <= 0:
+            return true
+        # Check if destination peer is connected to this relay
+        let destFd: int32 = bridge.SignalRelayBridgeGetConnFd(state.bridge.sessions, toPeerId)
+        if destFd >= 0:
+            # Direct delivery - write frame to destination WebSocket
+            let frame = ws.SignalRelayWsEncodeTextFrame(trimmed)
+            let _ = tcp.TcpSendRaw(destFd, frame)
+            outResponse = ""
+            return true
+        # Cross-relay: would publish to gossipsub here
+        # For now, relay to all connected peers as a simple broadcast
+        for i in 0..<state.bridge.sessions.len:
+            let sessionFd: int32 = state.bridge.sessions[i].connFd
+            if sessionFd != connFd and sessionFd >= 0:
+                let frame = ws.SignalRelayWsEncodeTextFrame(trimmed)
+                let _ = tcp.TcpSendRaw(sessionFd, frame)
+        outResponse = ""
+        return true
+
+    # Unknown message type - echo error
+    outResponse = "{\"type\":\"error\",\"error\":\"unknown_message_type\"}"
+    return true
+
+# Minimal JSON field extraction (no full parser needed for relay)
+fn SignalRelayFindJsonString(json: str, key: str): str =
+    let searchKey: str = SignalRelayConcat3("\"", key, "\"")
+    let keyPos: int32 = SignalRelayFindSub(json, searchKey)
+    if keyPos < 0:
+        return ""
+    # Find colon after key
+    var colonPos: int32 = keyPos + len(searchKey)
+    while colonPos < len(json):
+        if json[colonPos] == ':':
+            break
+        colonPos = colonPos + 1
+    if colonPos >= len(json):
+        return ""
+    colonPos = colonPos + 1
+    # Find opening quote
+    while colonPos < len(json):
+        if json[colonPos] == '"':
+            break
+        colonPos = colonPos + 1
+    if colonPos >= len(json):
+        return ""
+    let valueStart: int32 = colonPos + 1
+    var valueEnd: int32 = valueStart
+    while valueEnd < len(json):
+        if json[valueEnd] == '"':
+            if valueEnd > valueStart and json[valueEnd - 1] != '\\':
+                break
+        valueEnd = valueEnd + 1
+    if valueEnd <= valueStart:
+        return ""
+    return strings.SliceBytes(json, valueStart, valueEnd - valueStart)
+
+# --- Connection handler ---
+
+fn SignalRelayServeConnection(state: var SignalRelayState, conn: var tcp.TcpConnectionHandle) =
+    let readRes: Result[str] = SignalRelayReadHttpRequest(conn)
+    if IsErr(readRes):
+        let response = SignalRelayJsonResponse(400, "Bad Request", SignalRelayErrorJson(Error(readRes)))
+        let _ = tcp.TcpSend(conn, BytesFromString(SignalRelayHttpResponseWire(response)))
+        return
+
+    let requestText: str = Value(readRes)
+    let nowMs: int64 = times.EpochTimeMilliseconds()
+
+    # Check for WebSocket upgrade
+    let upgradeHeader: str = SignalRelayFindHeader(requestText, "Upgrade")
+    if strutil.Strip(upgradeHeader).lower() == "websocket":
+        let wsKey: str = SignalRelayFindHeader(requestText, "Sec-WebSocket-Key")
+        if len(strutil.Strip(wsKey)) <= 0:
+            let response = SignalRelayJsonResponse(400, "Bad Request", SignalRelayErrorJson("missing_ws_key"))
+            let _ = tcp.TcpSend(conn, BytesFromString(SignalRelayHttpResponseWire(response)))
+            return
+        let acceptKey: str = SignalRelayComputeAcceptKey(wsKey)
+        var upgradeResponse: str = "HTTP/1.1 101 Switching Protocols\r\n"
+        upgradeResponse = SignalRelayConcat(upgradeResponse, "Upgrade: websocket\r\n")
+        upgradeResponse = SignalRelayConcat(upgradeResponse, "Connection: Upgrade\r\n")
+        upgradeResponse = SignalRelayConcat3(upgradeResponse, "Sec-WebSocket-Accept: ", acceptKey, "\r\n\r\n")
+        let _ = tcp.TcpSend(conn, BytesFromString(upgradeResponse))
+
+        # WebSocket frame loop
+        var connFd: int32 = conn.fd
+        while true:
+            let rawRead: Result[Bytes] = tcp.TcpRecv(conn, SignalRelayWsFrameMaxBytes)
+            if IsErr(rawRead):
+                break
+            let raw: Bytes = Value(rawRead)
+            if BytesLen(raw) <= 0:
+                break
+            var frame: ws.SignalRelayWsFrame
+            if ws.SignalRelayWsDecodeFrame(raw, frame):
+                if frame.opcode == ws.SignalRelayWsOpcodeClose or frame.opcode == ws.SignalRelayWsOpcodePing:
+                    let pong = ws.SignalRelayWsEncodeTextFrame("{\"type\":\"pong\"}")
+                    let _ = tcp.TcpSend(conn, pong)
+                    if frame.opcode == ws.SignalRelayWsOpcodeClose:
+                        break
+                elif frame.opcode == ws.SignalRelayWsOpcodeText:
+                    var outResponse: str
+                    if SignalRelayHandleWsMessage(state, connFd, frame.payload, nowMs, outResponse):
+                        if len(outResponse) > 0:
+                            let respFrame = ws.SignalRelayWsEncodeTextFrame(outResponse)
+                            let _ = tcp.TcpSend(conn, respFrame)
+        # Clean up session on disconnect
+        bridge.SignalRelayBridgeRemoveByFd(state.bridge.sessions, connFd)
+        return
+
+    # Handle as regular HTTP request
+    let response = SignalRelayHandleHttpRequest(state.config, requestText)
+    let _ = tcp.TcpSend(conn, BytesFromString(SignalRelayHttpResponseWire(response)))
+
+# --- Main serve loop ---
+
+fn SignalRelayServe(config: var SignalRelayConfig): int32 =
+    let listenRes: Result[tcp.TcpListenerHandle] = tcp.TcpListen(
+        config.listenHost,
+        config.listenPort,
+        strings.StrContains(config.listenHost, ":")
+    )
+    if IsErr(listenRes):
+        os.WriteLine(os.Get_stderr(), Error(listenRes))
+        return 1
+
+    var listener: tcp.TcpListenerHandle = Value(listenRes)
+    os.WriteLine(os.Get_stdout(), SignalRelayConcat4(
+        "cheng signal relay listening ",
+        config.listenHost,
+        ":",
+        strings.IntToStr(listener.addr.port),
+    ))
+
+    var state: SignalRelayState
+    state.config = config
+    state.bridge = bridge.SignalRelayBridgeInit()
+
+    var served: int32
+    while config.maxRequests <= 0 or served < config.maxRequests:
+        var conn: tcp.TcpConnectionHandle
+        conn.localAddr = listener.addr
+        if !tcp.TcpAcceptFdInto(listener.fd, conn):
+            os.WriteLine(os.Get_stderr(), "signal_relay: accept failed")
+            tcp.TcpListenerClose(listener)
+            return 1
+        SignalRelayServeConnection(state, conn)
+        tcp.TcpClose(conn)
+        served = served + 1
+        # Periodic cleanup of expired sessions
+        if served % 64 == 0:
+            bridge.SignalRelayBridgeCleanupExpired(state.bridge.sessions, times.EpochTimeMilliseconds())
+
+    tcp.TcpListenerClose(listener)
+    return 0
+
+# --- Config from env/args ---
+
+fn SignalRelayReadFlagOrEnv(flag: str, envKey: str, defaultValue: str): str =
+    var value: str
+    if cmdline.readLastFlagValue(flag, value):
+        return value
+    return os.GetEnvDefault(envKey, defaultValue)
+
+fn SignalRelayReadIntFlagOrEnv(flag: str, envKey: str, defaultValue: int32): int32 =
+    let raw: str = SignalRelayReadFlagOrEnv(flag, envKey, "")
+    if len(strutil.Strip(raw)) <= 0:
+        return defaultValue
+    var out: int32
+    if cmdline.ParseInt32(raw, out):
+        return out
+    return defaultValue
+
+fn SignalRelayConfigFromEnvAndArgs(): SignalRelayConfig =
+    var out: SignalRelayConfig
+    out.listenHost = SignalRelayReadFlagOrEnv("--host", "SIGNAL_RELAY_LISTEN_HOST", SignalRelayDefaultListenHost)
+    out.listenPort = SignalRelayReadIntFlagOrEnv("--port", "SIGNAL_RELAY_LISTEN_PORT", SignalRelayDefaultListenPort)
+    out.seed = SignalRelayReadFlagOrEnv("--seed", "SIGNAL_RELAY_SEED", "")
+    out.turnPublicHost = SignalRelayReadFlagOrEnv("--turn-public-host", "SIGNAL_RELAY_TURN_PUBLIC_HOST", "")
+    out.turnPort = SignalRelayReadIntFlagOrEnv("--turn-port", "SIGNAL_RELAY_TURN_PORT", 3478)
+    out.turnSharedSecret = SignalRelayReadFlagOrEnv("--turn-shared-secret", "SIGNAL_RELAY_TURN_SHARED_SECRET", "")
+    out.maxRequests = SignalRelayReadIntFlagOrEnv("--max-requests", "SIGNAL_RELAY_MAX_REQUESTS", 0)
+    return out
+
+fn SignalRelayMain(): int32 =
+    var config: SignalRelayConfig = SignalRelayConfigFromEnvAndArgs()
+    return SignalRelayServe(config)

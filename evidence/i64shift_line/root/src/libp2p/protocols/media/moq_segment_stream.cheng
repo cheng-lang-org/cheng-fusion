@@ -1,0 +1,439 @@
+import std/result
+import std/rawbytes
+import cheng/libp2p/core/types
+import cheng/libp2p/core/multistream
+import cheng/quic/connection as qconn
+import cheng/quic/msquictransport_native as qtransport
+import cheng/libp2p/transports/quic_transport as quictransport
+
+const
+    Libp2pMoqSegmentStreamTransport = "native_quic_moq_stream"
+    Libp2pMoqSegmentStreamWireMagic = "unimaker.moq.segment.stream.v1"
+    Libp2pMoqSegmentStreamMaxRequestBytes = 4096
+    # Negotiate-ack read timeout: a blocking read on an unreachable peer would
+    # otherwise hang ~20s (pipe read timeout) and freeze a synchronous caller (the
+    # GUI render thread). Cap it so the dial fails fast (~2s) when the peer is down.
+    Libp2pMoqSegmentStreamNegotiateTimeoutMs = 2000
+
+type
+    Libp2pMoqSegmentStreamRequest =
+        streamId: str
+        segmentKey: str
+        offsetBytes: int32
+        lengthBytes: int32
+        readChunkBytes: int32
+
+    Libp2pMoqSegmentStreamReader =
+        streamId: str
+        segmentKey: str
+        expectedBytes: int32
+        bytesRead: int32
+        closed: bool
+        conn: qconn.Connection
+
+fn Libp2pMoqSegmentStreamTransportText(): str =
+    return Libp2pMoqSegmentStreamTransport
+
+fn Libp2pMoqSegmentStreamProtocolId(): types.Libp2pProtocolId =
+    return types.Libp2pProtocolMoqMedia
+
+fn Libp2pMoqSegmentStreamMinInt(left: int32, right: int32): int32 =
+    if left < right:
+        return left
+    return right
+
+# Writes through out's data pointer; does not consume the struct.
+@borrows
+fn Libp2pMoqSegmentStreamWriteInt32(out: var rawbytes.Bytes, offset: int32, value: int32) =
+    BytesSet(out, offset, (value >> 24) & 255)
+    BytesSet(out, offset + 1, (value >> 16) & 255)
+    BytesSet(out, offset + 2, (value >> 8) & 255)
+    BytesSet(out, offset + 3, value & 255)
+
+fn Libp2pMoqSegmentStreamReadInt32(data: rawbytes.Bytes, offset: int32): Result[int32] =
+    if offset < 0 || offset + 4 > BytesLen(data):
+        return Err[int32]("moq segment stream: int32 out of range")
+    let b0 = BytesGet(data, offset) & 255
+    let b1 = BytesGet(data, offset + 1) & 255
+    let b2 = BytesGet(data, offset + 2) & 255
+    let b3 = BytesGet(data, offset + 3) & 255
+    return Ok[int32]((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+
+@borrows
+fn Libp2pMoqSegmentStreamCopyInto(dst: var rawbytes.Bytes, offset: int32, src: rawbytes.Bytes): Result[int32] =
+    if offset < 0:
+        return Err[int32]("moq segment stream: negative copy offset")
+    if offset + BytesLen(src) > BytesLen(dst):
+        return Err[int32]("moq segment stream: copy past end")
+    for i in 0..<BytesLen(src):
+        BytesSet(dst, offset + i, BytesGet(src, i))
+    return Ok[int32](BytesLen(src))
+
+fn Libp2pMoqSegmentStreamAppendBytes(left: rawbytes.Bytes, right: rawbytes.Bytes): rawbytes.Bytes =
+    let out = BytesAlloc(BytesLen(left) + BytesLen(right))
+    for i in 0..<BytesLen(left):
+        BytesSet(out, i, BytesGet(left, i))
+    for j in 0..<BytesLen(right):
+        BytesSet(out, BytesLen(left) + j, BytesGet(right, j))
+    return out
+
+fn Libp2pMoqSegmentStreamReadExact(conn: var qconn.Connection, byteCount: int32): Result[rawbytes.Bytes] =
+    if byteCount < 0:
+        return Err[rawbytes.Bytes]("moq segment stream: negative exact read")
+    if byteCount == 0:
+        return Ok[rawbytes.Bytes](emptyBytes())
+    var out: rawbytes.Bytes
+    var readBytes: int32
+    while readBytes < byteCount:
+        let want = Libp2pMoqSegmentStreamMinInt(byteCount - readBytes, 32768)
+        let readRes = qconn.connRead(conn, want)
+        if IsErr(readRes):
+            return Err[rawbytes.Bytes](ErrorText(readRes))
+        let chunk = Value(readRes)
+        let chunkLen = BytesLen(chunk)
+        if chunkLen <= 0:
+            return Err[rawbytes.Bytes]("moq segment stream: empty exact read")
+        out = Libp2pMoqSegmentStreamAppendBytes(out, chunk)
+        readBytes = readBytes + chunkLen
+    return Ok[rawbytes.Bytes](out)
+
+fn Libp2pMoqSegmentStreamWriteFrame(conn: var qconn.Connection, payload: rawbytes.Bytes): Result[int32] =
+    let payloadLen = BytesLen(payload)
+    if payloadLen <= 0:
+        return Err[int32]("moq segment stream: empty frame")
+    var frame = BytesAlloc(payloadLen + 4)
+    Libp2pMoqSegmentStreamWriteInt32(frame, 0, payloadLen)
+    let copyRes = Libp2pMoqSegmentStreamCopyInto(frame, 4, payload)
+    if IsErr(copyRes):
+        return Err[int32](ErrorText(copyRes))
+    let writeRes = qconn.connWrite(conn, frame)
+    if IsErr(writeRes):
+        return Err[int32](ErrorText(writeRes))
+    if Value(writeRes) != BytesLen(frame):
+        return Err[int32]("moq segment stream: short frame write")
+    return Ok[int32](payloadLen)
+
+fn Libp2pMoqSegmentStreamReadFrame(conn: var qconn.Connection, maxPayloadBytes: int32): Result[rawbytes.Bytes] =
+    let headerRes = Libp2pMoqSegmentStreamReadExact(conn, 4)
+    if IsErr(headerRes):
+        return Err[rawbytes.Bytes](ErrorText(headerRes))
+    let lengthRes = Libp2pMoqSegmentStreamReadInt32(Value(headerRes), 0)
+    if IsErr(lengthRes):
+        return Err[rawbytes.Bytes](ErrorText(lengthRes))
+    let payloadLen = Value(lengthRes)
+    if payloadLen <= 0:
+        return Err[rawbytes.Bytes]("moq segment stream: invalid frame length")
+    if payloadLen > maxPayloadBytes:
+        return Err[rawbytes.Bytes]("moq segment stream: frame too large")
+    return Libp2pMoqSegmentStreamReadExact(conn, payloadLen)
+
+@borrows
+fn Libp2pMoqSegmentStreamRequestPayloadBytes(request: Libp2pMoqSegmentStreamRequest): Result[rawbytes.Bytes] =
+    if len(request.streamId) <= 0:
+        return Err[rawbytes.Bytes]("moq segment stream: missing stream id")
+    if len(request.segmentKey) <= 0:
+        return Err[rawbytes.Bytes]("moq segment stream: missing segment key")
+    if request.offsetBytes < 0:
+        return Err[rawbytes.Bytes]("moq segment stream: negative offset")
+    if request.lengthBytes <= 0:
+        return Err[rawbytes.Bytes]("moq segment stream: empty range")
+    if request.readChunkBytes <= 0:
+        return Err[rawbytes.Bytes]("moq segment stream: empty read chunk")
+    let magicBytes = BytesFromString(Libp2pMoqSegmentStreamWireMagic)
+    let streamBytes = BytesFromString(request.streamId)
+    let keyBytes = BytesFromString(request.segmentKey)
+    let payloadLen = 4 + BytesLen(magicBytes) + 4 + BytesLen(streamBytes) + 4 + BytesLen(keyBytes) + 12
+    if payloadLen > Libp2pMoqSegmentStreamMaxRequestBytes:
+        return Err[rawbytes.Bytes]("moq segment stream: request too large")
+    var out = BytesAlloc(payloadLen)
+    var offset: int32
+    Libp2pMoqSegmentStreamWriteInt32(out, offset, BytesLen(magicBytes))
+    offset = offset + 4
+    let magicCopyRes = Libp2pMoqSegmentStreamCopyInto(out, offset, magicBytes)
+    if IsErr(magicCopyRes):
+        return Err[rawbytes.Bytes](ErrorText(magicCopyRes))
+    offset = offset + BytesLen(magicBytes)
+    Libp2pMoqSegmentStreamWriteInt32(out, offset, BytesLen(streamBytes))
+    offset = offset + 4
+    let streamCopyRes = Libp2pMoqSegmentStreamCopyInto(out, offset, streamBytes)
+    if IsErr(streamCopyRes):
+        return Err[rawbytes.Bytes](ErrorText(streamCopyRes))
+    offset = offset + BytesLen(streamBytes)
+    Libp2pMoqSegmentStreamWriteInt32(out, offset, BytesLen(keyBytes))
+    offset = offset + 4
+    let keyCopyRes = Libp2pMoqSegmentStreamCopyInto(out, offset, keyBytes)
+    if IsErr(keyCopyRes):
+        return Err[rawbytes.Bytes](ErrorText(keyCopyRes))
+    offset = offset + BytesLen(keyBytes)
+    Libp2pMoqSegmentStreamWriteInt32(out, offset, request.offsetBytes)
+    offset = offset + 4
+    Libp2pMoqSegmentStreamWriteInt32(out, offset, request.lengthBytes)
+    offset = offset + 4
+    Libp2pMoqSegmentStreamWriteInt32(out, offset, request.readChunkBytes)
+    return Ok[rawbytes.Bytes](out)
+
+fn Libp2pMoqSegmentStreamReadStringField(payload: rawbytes.Bytes, offset: var int32): Result[str] =
+    let lenRes = Libp2pMoqSegmentStreamReadInt32(payload, offset)
+    if IsErr(lenRes):
+        return Err[str](ErrorText(lenRes))
+    let fieldLen = Value(lenRes)
+    offset = offset + 4
+    if fieldLen <= 0:
+        return Err[str]("moq segment stream: empty string field")
+    if offset + fieldLen > BytesLen(payload):
+        return Err[str]("moq segment stream: string field past end")
+    let fieldBytes = Libp2pMoqSegmentStreamCopyRange(payload, offset, fieldLen)
+    if IsErr(fieldBytes):
+        return Err[str](ErrorText(fieldBytes))
+    offset = offset + fieldLen
+    return Ok[str](BytesToString(Value(fieldBytes)))
+
+fn Libp2pMoqSegmentStreamParseRequestPayload(payload: rawbytes.Bytes): Result[Libp2pMoqSegmentStreamRequest] =
+    if BytesLen(payload) <= 0:
+        return Err[Libp2pMoqSegmentStreamRequest]("moq segment stream: empty request")
+    if BytesLen(payload) > Libp2pMoqSegmentStreamMaxRequestBytes:
+        return Err[Libp2pMoqSegmentStreamRequest]("moq segment stream: request too large")
+    var offset: int32
+    let magicRes = Libp2pMoqSegmentStreamReadStringField(payload, offset)
+    if IsErr(magicRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(magicRes))
+    if Value(magicRes) != Libp2pMoqSegmentStreamWireMagic:
+        return Err[Libp2pMoqSegmentStreamRequest]("moq segment stream: invalid request magic")
+    let streamRes = Libp2pMoqSegmentStreamReadStringField(payload, offset)
+    if IsErr(streamRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(streamRes))
+    let keyRes = Libp2pMoqSegmentStreamReadStringField(payload, offset)
+    if IsErr(keyRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(keyRes))
+    let offsetRes = Libp2pMoqSegmentStreamReadInt32(payload, offset)
+    if IsErr(offsetRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(offsetRes))
+    offset = offset + 4
+    let lengthRes = Libp2pMoqSegmentStreamReadInt32(payload, offset)
+    if IsErr(lengthRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(lengthRes))
+    offset = offset + 4
+    let readChunkRes = Libp2pMoqSegmentStreamReadInt32(payload, offset)
+    if IsErr(readChunkRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(readChunkRes))
+    offset = offset + 4
+    if offset != BytesLen(payload):
+        return Err[Libp2pMoqSegmentStreamRequest]("moq segment stream: trailing request bytes")
+    var request: Libp2pMoqSegmentStreamRequest
+    request.streamId = Value(streamRes)
+    request.segmentKey = Value(keyRes)
+    request.offsetBytes = Value(offsetRes)
+    request.lengthBytes = Value(lengthRes)
+    request.readChunkBytes = Value(readChunkRes)
+    return Ok[Libp2pMoqSegmentStreamRequest](request)
+
+@borrows
+fn Libp2pMoqSegmentStreamCopyRange(data: rawbytes.Bytes,
+                                    offsetBytes: int32,
+                                    lengthBytes: int32): Result[rawbytes.Bytes] =
+    if offsetBytes < 0:
+        return Err[rawbytes.Bytes]("moq segment stream: negative offset")
+    if lengthBytes < 0:
+        return Err[rawbytes.Bytes]("moq segment stream: negative length")
+    let dataLen = BytesLen(data)
+    if offsetBytes > dataLen:
+        return Err[rawbytes.Bytes]("moq segment stream: offset past end")
+    if offsetBytes == dataLen && lengthBytes > 0:
+        return Err[rawbytes.Bytes]("moq segment stream: offset past end")
+    var take = lengthBytes
+    let available = dataLen - offsetBytes
+    if take > available:
+        take = available
+    if take <= 0:
+        return Ok[rawbytes.Bytes](emptyBytes())
+    let out = BytesAlloc(take)
+    for i in 0..<take:
+        BytesSet(out, i, BytesGet(data, offsetBytes + i))
+    return Ok[rawbytes.Bytes](out)
+
+fn Libp2pMoqSegmentStreamOpen(reader: var Libp2pMoqSegmentStreamReader,
+                               conn: qconn.Connection,
+                               request: Libp2pMoqSegmentStreamRequest): Result[bool] =
+    if len(request.streamId) <= 0:
+        return Err[bool]("moq segment stream: missing stream id")
+    if len(request.segmentKey) <= 0:
+        return Err[bool]("moq segment stream: missing segment key")
+    if request.offsetBytes < 0:
+        return Err[bool]("moq segment stream: negative offset")
+    if request.lengthBytes <= 0:
+        return Err[bool]("moq segment stream: empty range")
+    if request.readChunkBytes <= 0:
+        return Err[bool]("moq segment stream: empty read chunk")
+    reader.streamId = request.streamId
+    reader.segmentKey = request.segmentKey
+    reader.expectedBytes = request.lengthBytes
+    reader.bytesRead = 0
+    reader.closed = false
+    reader.conn = conn
+    return Ok[bool](true)
+
+fn Libp2pMoqSegmentStreamClientOpen(reader: var Libp2pMoqSegmentStreamReader,
+                                     conn: qconn.Connection,
+                                     request: Libp2pMoqSegmentStreamRequest): Result[bool] =
+    let payloadRes = Libp2pMoqSegmentStreamRequestPayloadBytes(request)
+    if IsErr(payloadRes):
+        return Err[bool](ErrorText(payloadRes))
+    var writeConn = conn
+    let frameRes = Libp2pMoqSegmentStreamWriteFrame(writeConn, Value(payloadRes))
+    if IsErr(frameRes):
+        return Err[bool](ErrorText(frameRes))
+    return Libp2pMoqSegmentStreamOpen(reader, writeConn, request)
+
+fn Libp2pMoqSegmentStreamServerReadRequest(serverConn: var qconn.Connection): Result[Libp2pMoqSegmentStreamRequest] =
+    let payloadRes = Libp2pMoqSegmentStreamReadFrame(serverConn, Libp2pMoqSegmentStreamMaxRequestBytes)
+    if IsErr(payloadRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(payloadRes))
+    return Libp2pMoqSegmentStreamParseRequestPayload(Value(payloadRes))
+
+fn Libp2pMoqSegmentStreamRead(reader: var Libp2pMoqSegmentStreamReader,
+                               maxBytes: int32): Result[rawbytes.Bytes] =
+    if reader.closed:
+        return Err[rawbytes.Bytes]("moq segment stream: closed")
+    if maxBytes <= 0:
+        return Err[rawbytes.Bytes]("moq segment stream: invalid read size")
+    let remaining = reader.expectedBytes - reader.bytesRead
+    if remaining <= 0:
+        reader.closed = true
+        return Ok[rawbytes.Bytes](emptyBytes())
+    let want = Libp2pMoqSegmentStreamMinInt(maxBytes, remaining)
+    let readRes = qconn.connRead(reader.conn, want)
+    if IsErr(readRes):
+        return Err[rawbytes.Bytes](ErrorText(readRes))
+    let chunk = Value(readRes)
+    let chunkLen = BytesLen(chunk)
+    if chunkLen <= 0:
+        return Err[rawbytes.Bytes]("moq segment stream: empty read before eof")
+    reader.bytesRead = reader.bytesRead + chunkLen
+    if reader.bytesRead >= reader.expectedBytes:
+        reader.closed = true
+    return Ok[rawbytes.Bytes](chunk)
+
+fn Libp2pMoqSegmentStreamClose(reader: var Libp2pMoqSegmentStreamReader) =
+    reader.closed = true
+    qconn.ConnClose(reader.conn)
+
+@borrows
+fn Libp2pMoqSegmentStreamServerWriteRange(serverConn: var qconn.Connection,
+                                           segmentBytes: rawbytes.Bytes,
+                                           offsetBytes: int32,
+                                           lengthBytes: int32,
+                                           maxChunkBytes: int32): Result[int32] =
+    if maxChunkBytes <= 0:
+        return Err[int32]("moq segment stream: invalid server chunk")
+    let rangeRes = Libp2pMoqSegmentStreamCopyRange(segmentBytes, offsetBytes, lengthBytes)
+    if IsErr(rangeRes):
+        return Err[int32](ErrorText(rangeRes))
+    let rangeBytes = Value(rangeRes)
+    var sent: int32
+    while sent < BytesLen(rangeBytes):
+        let remain = BytesLen(rangeBytes) - sent
+        let take = Libp2pMoqSegmentStreamMinInt(maxChunkBytes, remain)
+        let chunkRes = Libp2pMoqSegmentStreamCopyRange(rangeBytes, sent, take)
+        if IsErr(chunkRes):
+            return Err[int32](ErrorText(chunkRes))
+        let writeRes = qconn.connWrite(serverConn, Value(chunkRes))
+        if IsErr(writeRes):
+            return Err[int32](ErrorText(writeRes))
+        if Value(writeRes) != take:
+            return Err[int32]("moq segment stream: short write")
+        sent = sent + take
+    return Ok[int32](sent)
+
+@borrows
+fn Libp2pMoqSegmentStreamServerWriteRequestedRange(serverConn: var qconn.Connection,
+                                                    segmentBytes: rawbytes.Bytes,
+                                                    request: Libp2pMoqSegmentStreamRequest): Result[int32] =
+    let writeRes = Libp2pMoqSegmentStreamServerWriteRange(serverConn,
+                                                          segmentBytes,
+                                                          request.offsetBytes,
+                                                          request.lengthBytes,
+                                                          request.readChunkBytes)
+    if IsErr(writeRes):
+        return Err[int32](ErrorText(writeRes))
+    let shutdownRes = qconn.connShutdownWrite(serverConn)
+    if IsErr(shutdownRes):
+        return Err[int32](ErrorText(shutdownRes))
+    return writeRes
+
+fn Libp2pMoqSegmentStreamClientNegotiate(client: var qtransport.MsQuicTransport,
+                                           conn: var qconn.Connection): Result[bool] =
+    return quictransport.Libp2pQuicClientSelectProtocol(client,
+                                                        conn,
+                                                        Libp2pMoqSegmentStreamProtocolId())
+
+fn Libp2pMoqSegmentStreamClientSendNegotiate(client: var qtransport.MsQuicTransport,
+                                               conn: var qconn.Connection): Result[bool] =
+    let selectBytes = multistream.Libp2pMultistreamSelectBytes(Libp2pMoqSegmentStreamProtocolId())
+    return quictransport.Libp2pQuicWriteExact(client, conn, selectBytes)
+
+fn Libp2pMoqSegmentStreamClientReadNegotiateAck(client: var qtransport.MsQuicTransport,
+                                                  conn: var qconn.Connection): Result[bool] =
+    let selectBytes = multistream.Libp2pMultistreamSelectBytes(Libp2pMoqSegmentStreamProtocolId())
+    let ackRes = quictransport.Libp2pQuicReadExactWithTimeout(client, conn, BytesLen(selectBytes),
+                                                              Libp2pMoqSegmentStreamNegotiateTimeoutMs)
+    if IsErr(ackRes):
+        return Err[bool](ErrorText(ackRes))
+    if !multistream.Libp2pMultistreamAccepts(Value(ackRes), Libp2pMoqSegmentStreamProtocolId()):
+        return Err[bool]("moq segment stream: negotiate ack mismatch")
+    return Ok[bool](true)
+
+fn Libp2pMoqSegmentStreamServerNegotiate(listener: var qtransport.MsQuicTransport,
+                                           conn: var qconn.Connection): Result[bool] =
+    return quictransport.Libp2pQuicServerSelectProtocol(listener,
+                                                        conn,
+                                                        Libp2pMoqSegmentStreamProtocolId())
+
+fn Libp2pMoqSegmentStreamServerHandleRequestedRange(serverConn: var qconn.Connection,
+                                                     segmentBytes: rawbytes.Bytes): Result[Libp2pMoqSegmentStreamRequest] =
+    let requestRes = Libp2pMoqSegmentStreamServerReadRequest(serverConn)
+    if IsErr(requestRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(requestRes))
+    let request = Value(requestRes)
+    let writeRes = Libp2pMoqSegmentStreamServerWriteRequestedRange(serverConn,
+                                                                   segmentBytes,
+                                                                   request)
+    if IsErr(writeRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(writeRes))
+    return Ok[Libp2pMoqSegmentStreamRequest](request)
+
+fn Libp2pMoqSegmentStreamServerHandleRequestedObjectRange(serverConn: var qconn.Connection,
+                                                           assetBytes: rawbytes.Bytes,
+                                                           expectedSegmentKey: str,
+                                                           objectOffsetBytes: int32,
+                                                           objectLengthBytes: int32): Result[Libp2pMoqSegmentStreamRequest] =
+    if len(expectedSegmentKey) <= 0:
+        return Err[Libp2pMoqSegmentStreamRequest]("moq segment stream: missing expected segment key")
+    if objectOffsetBytes < 0 || objectLengthBytes <= 0:
+        return Err[Libp2pMoqSegmentStreamRequest]("moq segment stream: invalid object range")
+    let objectEnd = objectOffsetBytes + objectLengthBytes
+    if objectEnd > BytesLen(assetBytes):
+        return Err[Libp2pMoqSegmentStreamRequest]("moq segment stream: object range past asset")
+    let requestRes = Libp2pMoqSegmentStreamServerReadRequest(serverConn)
+    if IsErr(requestRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(requestRes))
+    let request = Value(requestRes)
+    if request.segmentKey != expectedSegmentKey:
+        return Err[Libp2pMoqSegmentStreamRequest]("moq segment stream: segment key mismatch")
+    if request.offsetBytes < objectOffsetBytes:
+        return Err[Libp2pMoqSegmentStreamRequest]("moq segment stream: range before object")
+    if request.offsetBytes + request.lengthBytes > objectEnd:
+        return Err[Libp2pMoqSegmentStreamRequest]("moq segment stream: range past object")
+    let writeRes = Libp2pMoqSegmentStreamServerWriteRequestedRange(serverConn,
+                                                                   assetBytes,
+                                                                   request)
+    if IsErr(writeRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(writeRes))
+    return Ok[Libp2pMoqSegmentStreamRequest](request)
+
+fn Libp2pMoqSegmentStreamServerServeRequestedRange(listener: var qtransport.MsQuicTransport,
+                                                    serverConn: var qconn.Connection,
+                                                    segmentBytes: rawbytes.Bytes): Result[Libp2pMoqSegmentStreamRequest] =
+    let negotiateRes = Libp2pMoqSegmentStreamServerNegotiate(listener, serverConn)
+    if IsErr(negotiateRes):
+        return Err[Libp2pMoqSegmentStreamRequest](ErrorText(negotiateRes))
+    return Libp2pMoqSegmentStreamServerHandleRequestedRange(serverConn, segmentBytes)

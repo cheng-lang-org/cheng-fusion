@@ -1,0 +1,176 @@
+# bmi270.cheng - six-axis IMU (BMI270) builder, parser, shake detector.
+#
+# Bus facts from the Espressif Mosaico hardware reference: I2C address 0x69
+# on the shared bus, interrupt line on GPIO2 (SENSOR_INT). Register values,
+# chip id and sensitivity constants come from the Bosch BMI270 datasheet
+# (community-documented values); they are marked and must be confirmed
+# against the real part during P4 bring-up.
+#
+# Time windows are expressed in SAMPLE COUNTS at the configured 100 Hz ODR,
+# which keeps the detector a pure scalar state machine (see frame.cheng
+# header for the compiler-surface rules behind that choice).
+
+import "src/mosaico/frame.cheng" as frame
+import "src/mosaico/board.cheng" as board
+
+const ChipIdReg: int32 = 0x00
+const ChipIdValue: int32 = 0x24          # BMI270 WHO_AM_I (Bosch datasheet)
+const RegPowerCtrl: int32 = 0x7C
+const RegAccConf: int32 = 0x40
+const RegGyrConf: int32 = 0x42
+
+# accel data starts at 0x3C, six bytes, LSB first per axis (datasheet)
+const RegAccDataStart: int32 = 0x3C
+
+# +-2 g range: 1 g = 16384 LSB (datasheet). Milligee approximation with
+# integer math: mg = raw * 61 / 1000.
+const MgNum: int32 = 61
+const MgDen: int32 = 1000
+
+# Build the power-up init burst as [reg, value] write pairs executed in
+# order by the wire layer: enable acc+gyr, ACC_CONF 100 Hz, GYR_CONF 200 Hz.
+# Staged-copy pattern (see bmm150x2 note): local array + one copy loop.
+fn BuildInitSeq(buf: var uint8[frame.FrameCap], n: int32): int32 =
+    var tmp: uint8[frame.FrameCap]
+    var m = 0
+    tmp[m] = uint8(RegPowerCtrl)
+    m = m + 1
+    tmp[m] = uint8(0x0E)
+    m = m + 1
+    tmp[m] = uint8(RegAccConf)
+    m = m + 1
+    tmp[m] = uint8(0x28)
+    m = m + 1
+    tmp[m] = uint8(RegGyrConf)
+    m = m + 1
+    tmp[m] = uint8(0xA8)
+    m = m + 1
+    var i = 0
+    while i < m:
+        let dst = n + i
+        buf[dst] = tmp[i]
+        i = i + 1
+    return n + m
+
+# Read command frame for one accel burst: [RegAccDataStart] then read 6.
+fn BuildAccelReadCmd(buf: var uint8[frame.FrameCap], n: int32): int32 =
+    buf[n] = uint8(RegAccDataStart)
+    return n + 1
+
+# Parse one accelerometer triple starting at idx (six bytes, LE s16).
+# Returns packed mg axes biased by +2048 per axis:
+#   bits 23..0 : x | y<<12 | z<<24 layout ((x+2048)) etc, or -1 on range err.
+fn PackAccelMgFrom(buf: var uint8[frame.FrameCap], n: int32, idx: int32): int32 =
+    if idx < 0 or idx + 6 > n:
+        return -1
+    let rawX = frame.S16FromU16(frame.FrameGet16Le(buf, n, idx))
+    let rawY = frame.S16FromU16(frame.FrameGet16Le(buf, n, idx + 2))
+    let rawZ = frame.S16FromU16(frame.FrameGet16Le(buf, n, idx + 4))
+    var mgX = rawX * MgNum / MgDen
+    var mgY = rawY * MgNum / MgDen
+    var mgZ = rawZ * MgNum / MgDen
+    if mgX < -2048:
+        mgX = -2048
+    if mgX > 2047:
+        mgX = 2047
+    if mgY < -2048:
+        mgY = -2048
+    if mgY > 2047:
+        mgY = 2047
+    if mgZ < -2048:
+        mgZ = -2048
+    if mgZ > 2047:
+        mgZ = 2047
+    return ((mgX + 2048) & 0xFFF) | (((mgY + 2048) & 0xFFF) << 12) | (((mgZ + 2048) & 0xFFF) << 24)
+
+fn UnpackAxis(packed: int32, slot: int32): int32 =
+    if slot == 0:
+        return (packed & 0xFFF) - 2048
+    if slot == 1:
+        return ((packed >> 12) & 0xFFF) - 2048
+    return ((packed >> 24) & 0xFFF) - 2048
+
+# ---- shake detector -----------------------------------------------------------
+# Pure scalar state machine driven once per accelerometer sample (100 Hz).
+# State word packing:
+#   bits 0..1   phase: 0 armed, 1 counting, 2 cooling
+#   bits 4..9   crossing counter (alternating excursions)
+#   bits 10..17 samples seen in current window (max 255)
+#   bits 18..25 cooling countdown remaining (max 255)
+#   bit  26     last sample above threshold
+# A "crossing" = transition into above-threshold while counting. Three
+# crossings inside a 40-sample window (400 ms) fire once, then 60 samples
+# (600 ms) of quiet before re-arm. Plan P2 requires fixture-measured
+# thresholds; constants are bring-up defaults.
+
+const ShakeThresholdMg: int32 = 1800
+const ShakeWindowSamples: int32 = 40
+const ShakeNeedCrossings: int32 = 3
+const ShakeCoolSamples: int32 = 60
+
+fn ShakeInitState(): int32 =
+    return 0
+
+# Returns bits: 0..7 next state, bit 8 fired-this-sample flag.
+fn ShakeStep(state: int32, magMg: int32): int32 =
+    let phase = state & 3
+    var cross = (state >> 4) & 0x3F
+    var win = (state >> 10) & 0xFF
+    var cool = (state >> 18) & 0xFF
+    var lastHigh = (state >> 26) & 1
+    var fired = 0
+    var newPhase = phase
+
+    var high = 0
+    if magMg > ShakeThresholdMg:
+        high = 1
+
+    if phase == 0:
+        # armed: start window on first excursion
+        if high == 1:
+            newPhase = 1
+            cross = 1
+            win = 1
+            lastHigh = 1
+    elif phase == 1:
+        # counting window
+        var nextWin = win + 1
+        if nextWin > 255:
+            nextWin = 255
+        win = nextWin
+        if high == 1 && lastHigh == 0:
+            var nc = cross + 1
+            cross = nc
+        lastHigh = high
+        if cross >= ShakeNeedCrossings:
+            newPhase = 2
+            cool = ShakeCoolSamples
+            fired = 1
+        if win >= ShakeWindowSamples:
+            # window expired without enough crossings: re-arm
+            newPhase = 0
+            cross = 0
+            win = 0
+    else:
+        # cooling after fire
+        var nc2 = cool - 1
+        if nc2 < 0:
+            nc2 = 0
+        cool = nc2
+        if cool == 0:
+            newPhase = 0
+            cross = 0
+            win = 0
+
+    var ns = newPhase
+    ns = ns | (cross << 4)
+    ns = ns | (win << 10)
+    ns = ns | (cool << 18)
+    ns = ns | (lastHigh << 26)
+    return (ns << 8) | fired
+
+fn ShakeStateOf(result: int32): int32 =
+    return result >> 8
+
+fn ShakeFiredOf(result: int32): int32 =
+    return result & 1

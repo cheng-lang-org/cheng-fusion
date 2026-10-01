@@ -1,0 +1,26 @@
+import { type ChengCsgMode } from "./csg-cheng-bridge.js";
+import type { CsgFact } from "./schema.js";
+export interface CsgcHeader {
+    headerSize: number;
+    factCount: number;
+    flags: number;
+}
+/**
+ * The semantic sections consumed by the Web materializer. The order is part of
+ * the bridge contract: pure Cheng decodes each section in this exact byte order.
+ */
+export declare const CsgWebMaterializerFactKinds: readonly ["csg.async_function", "csg.binding", "csg.block", "csg.call", "csg.class", "csg.class_heritage", "csg.core.schema", "csg.data", "csg.debug_map", "csg.export", "csg.external_symbol", "csg.function", "csg.import", "csg.inline_handler", "csg.jsx", "csg.module", "csg.op", "csg.project", "csg.relfact", "csg.runtime_requirement", "csg.symbol", "csg.term", "csg.type", "csg.type_decl", "csg.unsupported", "csg.web.computer_use_action", "csg.web.confirmation_gate", "csg.web.control_action", "csg.web.control_guard", "csg.web.control_surface", "csg.web.control_trace", "csg.web.dom_node_template", "csg.web.external_symbol", "csg.web.js_call_ref", "csg.web.js_class_heritage_ref", "csg.web.js_class_ref", "csg.web.js_function_ref", "csg.web.jsx_element", "csg.web.media_asset", "csg.web.media_control_action", "csg.web.media_control_receipt", "csg.web.media_delivery_receipt", "csg.web.media_frame_receipt", "csg.web.media_lifecycle_event", "csg.web.media_playback_slot", "csg.web.media_receipt_identity", "csg.web.module_import_ref", "csg.web.pixel_region", "csg.web.project", "csg.web.runtime_requirement", "csg.web.scene.component_prop", "csg.web.scene.css_utility", "csg.web.scene.css_variant_rule", "csg.web.scene.event_handler", "csg.web.scene.hit_target", "csg.web.scene.layer", "csg.web.scene.layout", "csg.web.scene.node", "csg.web.scene.paint", "csg.web.scene.project", "csg.web.scene.prop", "csg.web.scene.resource", "csg.web.scene.route", "csg.web.scene.route_edge", "csg.web.scene.route_hit_rect", "csg.web.scene.schema", "csg.web.scene.style", "csg.web.schema", "csg.web.state_layout", "csg.web.subgraph_cid", "csg.web.surface_owner", "csg.web.truth_ref", "csg.web.unsupported_ref", "csg.web.voice_computer_use_scenario", "csg.web.voice_task_step", "csg.web.voice_task_template"];
+export interface CsgcAuthorizedFactKindsResult {
+    facts: CsgFact[];
+    sourceFactCount: number;
+    selectedFactCount: number;
+    selectedFactsRoot: string;
+    directoryCid: string;
+    kinds: readonly string[];
+}
+export declare function csgcReadFactKindsAuthorized(_csgcPath: string, _manifestPath: string, _kinds?: readonly string[]): CsgcAuthorizedFactKindsResult;
+/** Debug/conformance-only whole-container read. Production materializers must not call it. */
+export declare function csgcReadFacts(buffer: Buffer, mode?: ChengCsgMode): {
+    facts: CsgFact[];
+    header: CsgcHeader;
+};

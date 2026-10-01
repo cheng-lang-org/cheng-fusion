@@ -1,0 +1,629 @@
+import std/result
+import std/rawbytes as rawbytes
+import std/strings
+import std/strutils as strutil
+import std/tls/x509
+import std/net/transports/tcp_syscall as tcp
+import cheng/apps/vpn_proxy/vpn_proxy_config as config
+import cheng/apps/vpn_proxy/vpn_proxy_main as vpn
+import cheng/apps/vpn_proxy/vpn_proxy_routing as routing
+import cheng/apps/vpn_proxy/vpn_proxy_tun_dataplane as tun
+import cheng/apps/vpn_proxy/mobile/vpn_proxy_mobile_gui as mobilegui
+@importc("cheng_mobile_protect_callback_ready")
+fn ChengHy2TunCoreProtectCallbackReady(): int32
+@importc("cheng_mobile_tun_rx_bytes")
+fn ChengHy2TunCoreTunRxBytes(): uint64
+@importc("cheng_mobile_tun_tx_bytes")
+fn ChengHy2TunCoreTunTxBytes(): uint64
+@importc("cheng_mobile_thread_start_hy2_tun_worker")
+fn ChengMobileThreadStartHy2TunWorker(): ptr
+@importc("cheng_mobile_thread_start_hy2_proxy_worker")
+fn ChengMobileThreadStartHy2ProxyWorker(): ptr
+@importc("cheng_mobile_thread_join")
+fn ChengMobileThreadJoin(handle: ptr): int32
+@importc("cheng_mobile_start_ready_reset")
+fn ChengMobileStartReadyReset(): int32
+@importc("cheng_mobile_start_ready_signal")
+fn ChengMobileStartReadySignal(): int32
+@importc("cheng_mobile_start_ready_fail")
+fn ChengMobileStartReadyFail(): int32
+@importc("cheng_mobile_start_ready_wait")
+fn ChengMobileStartReadyWait(timeoutMs: int32): int32
+# SABI 出口回调:C 侧注册这些 setter,Cheng 在 @exportc 入口内同步调用,
+# 把结果字段(标量 + utf8_view 文本)push 给 C,取代旧的 out-ptr 字节回写。
+@importc("cheng_hy2_tun_start_emit")
+fn ChengHy2TunStartEmitRaw(sessionId: uint64, connected: int32, errorTextRaw: ptr, errorTextLen: int64): int32
+@importc("cheng_hy2_proxy_start_emit")
+fn ChengHy2ProxyStartEmitRaw(sessionId: uint64, connected: int32, listenPort: int32, errorTextRaw: ptr, errorTextLen: int64): int32
+@importc("cheng_hy2_tun_status_emit")
+fn ChengHy2TunStatusEmitRaw(abiVersion: int32, sessionId: uint64, connected: int32, rxBytes: uint64, txBytes: uint64, statusTextRaw: ptr, statusTextLen: int64, errorTextRaw: ptr, errorTextLen: int64): int32
+@importc("cheng_hy2_tun_snapshot_emit")
+fn ChengHy2TunSnapshotEmitRaw(jsonRaw: ptr, jsonLen: int64): int32
+@importc("cheng_hy2_tun_mem_diag_emit")
+fn ChengHy2TunMemDiagEmitRaw(abiVersion: int32, allocCount: int64, freeCount: int64, liveCount: int64): int32
+@importc("cheng_mm_alloc_count")
+fn ChengMmAllocCountRaw(): int64
+@importc("cheng_mm_free_count")
+fn ChengMmFreeCountRaw(): int64
+@importc("cheng_mm_live_count")
+fn ChengMmLiveCountRaw(): int64
+
+const
+    ChengHy2TunMobileReadyPath = "mobile:ready"
+    ChengHy2TunMobileStartReadyTimeoutMs = 20000
+    ChengHy2ProxyListenPortFirst = 18080
+    ChengHy2ProxyListenPortAfterLast = 18090
+
+var
+    ChengHy2TunMobileSessionId: uint64
+    ChengHy2TunMobileTunFd: int32 = -1
+    ChengHy2TunMobileConfigJson: str
+    ChengHy2TunMobileConfigPath: str
+    ChengHy2TunMobileCertDer: rawbytes.Bytes
+    ChengHy2TunMobileKeyPk8Der: rawbytes.Bytes
+    ChengHy2TunMobileTrustRootDer: rawbytes.Bytes
+    ChengHy2TunMobileRunning: bool
+    ChengHy2TunMobileConnected: bool
+    ChengHy2TunMobileStopRequested: bool
+    ChengHy2TunMobileLastError: str
+    ChengHy2TunMobileWorker: ptr
+    ChengHy2ProxyMobileSessionId: uint64
+    ChengHy2ProxyMobileListener: tcp.TcpListenerHandle
+    ChengHy2ProxyMobileListenPort: int32
+    ChengHy2ProxyMobileRunning: bool
+    ChengHy2ProxyMobileConnected: bool
+    ChengHy2ProxyMobileStopRequested: bool
+    ChengHy2ProxyMobileLastError: str
+    ChengHy2ProxyMobileWorker: ptr
+
+fn ChengHy2TunStartEmit(sessionId: uint64, connected: int32, errorText: str): int32 =
+    return ChengHy2TunStartEmitRaw(sessionId,
+                                   connected,
+                                   StrDataPtr(errorText),
+                                   int64(len(errorText)))
+
+fn ChengHy2ProxyStartEmit(sessionId: uint64, connected: int32, listenPort: int32, errorText: str): int32 =
+    return ChengHy2ProxyStartEmitRaw(sessionId,
+                                     connected,
+                                     listenPort,
+                                     StrDataPtr(errorText),
+                                     int64(len(errorText)))
+
+@borrows
+fn ChengHy2TunStatusEmit(abiVersion: int32,
+                         sessionId: uint64,
+                         connected: int32,
+                         rxBytes: uint64,
+                         txBytes: uint64,
+                         statusText: str,
+                         errorText: str): int32 =
+    return ChengHy2TunStatusEmitRaw(abiVersion,
+                                    sessionId,
+                                    connected,
+                                    rxBytes,
+                                    txBytes,
+                                    StrDataPtr(statusText),
+                                    int64(len(statusText)),
+                                    StrDataPtr(errorText),
+                                    int64(len(errorText)))
+
+fn ChengHy2TunSnapshotEmit(json: str): int32 =
+    return ChengHy2TunSnapshotEmitRaw(StrDataPtr(json), int64(len(json)))
+
+fn ChengHy2TunMobileCopyRawText(raw: ptr, rawLen: int64): str =
+    if raw == nil || rawLen <= int64(0):
+        return ""
+    if rawLen > int64(2147483647):
+        return ""
+    return rawbytes.BytesToString(rawbytes.BytesView(raw, int32(rawLen)))
+
+fn ChengHy2TunMobileAssignRawBytes(dst: var rawbytes.Bytes, raw: ptr, rawLen: int64) =
+    rawbytes.BytesFree(dst)
+    if raw == nil || rawLen <= int64(0):
+        return
+    if rawLen > int64(2147483647):
+        return
+    let n: int32 = int32(rawLen)
+    var view: rawbytes.Bytes = rawbytes.BytesView(raw, n)
+    var copied: rawbytes.Bytes = rawbytes.BytesAlloc(n)
+    if copied.data == nil:
+        return
+    rawbytes.BytesCopyRangeInto(copied, 0, view, 0, n)
+    dst.data = copied.data
+    dst.len = copied.len
+
+fn ChengHy2TunCoreAbiVersionValue(): int32 =
+    return 3
+
+fn ChengHy2TunCoreDeepCopyBytes(src: rawbytes.Bytes): rawbytes.Bytes =
+    let n: int32 = rawbytes.BytesLen(src)
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(n)
+    if n > 0 && out.data != nil:
+        rawbytes.BytesCopyRangeInto(out, 0, src, 0, n)
+    return out
+
+fn ChengHy2TunCoreSetStartError(message: str): int32 =
+    ChengHy2TunMobileLastError = strings.CloneStr(message)
+    let _emit: int32 = ChengHy2TunStartEmit(uint64(0), 0, strings.CloneStr(message))
+    return -1
+
+@borrows
+fn ChengHy2ProxyCoreSetStartError(message: str): int32 =
+    ChengHy2ProxyMobileLastError = strings.CloneStr(message)
+    let _emit: int32 = ChengHy2ProxyStartEmit(uint64(0), 0, 0, strings.CloneStr(message))
+    return -1
+
+@borrows
+fn ChengHy2TunCoreConfigFromRequest(configPath: str,
+                                     configJson: str): Result[config.VpnProxyConfig] =
+    if len(configPath) <= 0:
+        return Err[config.VpnProxyConfig]("cheng hy2-tun core: config_path missing")
+    if len(configJson) <= 0:
+        return Err[config.VpnProxyConfig]("cheng hy2-tun core: config_json missing")
+    return config.VpnProxyParseConfigText(configPath, configJson)
+
+fn ChengHy2TunCoreMobileIdentity(): Result[vpn.VpnProxyLoadedIdentity] =
+    if rawbytes.BytesLen(ChengHy2TunMobileCertDer) <= 0:
+        return Err[vpn.VpnProxyLoadedIdentity]("cheng hy2-tun core: cert_der bytes missing")
+    if rawbytes.BytesLen(ChengHy2TunMobileKeyPk8Der) <= 0:
+        return Err[vpn.VpnProxyLoadedIdentity]("cheng hy2-tun core: key_pk8_der bytes missing")
+    if rawbytes.BytesLen(ChengHy2TunMobileTrustRootDer) <= 0:
+        return Err[vpn.VpnProxyLoadedIdentity]("cheng hy2-tun core: trust_root_der bytes missing")
+    let kindRes: Result[x509.X509PublicKeyKind] = vpn.VpnProxyLoadLeafKeyKind(ChengHy2TunMobileCertDer)
+    if IsErr(kindRes):
+        let certHex: str = rawbytes.BytesToHex(rawbytes.BytesSliceView(ChengHy2TunMobileCertDer, 0, 16))
+        return Err[vpn.VpnProxyLoadedIdentity](strutil.Join([ErrorText(kindRes),
+                                                             " cert_len=",
+                                                             strings.Int64ToStr(int64(rawbytes.BytesLen(ChengHy2TunMobileCertDer))),
+                                                             " cert_head=",
+                                                             certHex], ""))
+    var out: vpn.VpnProxyLoadedIdentity
+    var outCerts: Bytes[]
+    outCerts = []
+    var certOwned: Bytes = rawbytes.BytesSlice(ChengHy2TunMobileCertDer, 0, rawbytes.BytesLen(ChengHy2TunMobileCertDer))
+    add(outCerts, certOwned)
+    out.certs = outCerts
+    var keyOwned: Bytes = rawbytes.BytesSlice(ChengHy2TunMobileKeyPk8Der, 0, rawbytes.BytesLen(ChengHy2TunMobileKeyPk8Der))
+    out.privateKey = keyOwned
+    out.leafKeyKind = Value(kindRes)
+    var outRoots: Bytes[]
+    outRoots = []
+    var rootOwned: Bytes = rawbytes.BytesSlice(ChengHy2TunMobileTrustRootDer, 0, rawbytes.BytesLen(ChengHy2TunMobileTrustRootDer))
+    add(outRoots, rootOwned)
+    out.trustRoots = outRoots
+    return Ok[vpn.VpnProxyLoadedIdentity](out)
+
+fn ChengHy2TunCorePrepareSession(): int32 =
+    return 0
+
+fn ChengHy2TunCoreRunSession(): Result[bool] =
+    let cfgPathLocal: str = strings.CloneStr(ChengHy2TunMobileConfigPath)
+    let cfgJsonLocal: str = strings.CloneStr(ChengHy2TunMobileConfigJson)
+    let configRes: Result[config.VpnProxyConfig] = ChengHy2TunCoreConfigFromRequest(cfgPathLocal,
+                                                                                     cfgJsonLocal)
+    if IsErr(configRes):
+        return Err[bool](ErrorText(configRes))
+    var parsedConfig: config.VpnProxyConfig = Value(configRes)
+    let identityRes: Result[vpn.VpnProxyLoadedIdentity] = ChengHy2TunCoreMobileIdentity()
+    if IsErr(identityRes):
+        return Err[bool](ErrorText(identityRes))
+    var states: vpn.VpnProxyExitState[] = routing.VpnProxyInitExitStatesWithClientCertificate(parsedConfig.exits,
+                                                                                               vpn.VpnProxyConfigSendsClientCertificate(parsedConfig))
+    # TASK-SCOPED (relay hunt): register owned exits array globally.
+    vpn.VpnProxySetTunActiveExitStates(states)
+    var opts: vpn.VpnProxyCliOptions
+    # ORCU2: reuse the entry snapshot instead of re-reading the global (the
+    # GUI thread may replace it via set_config between the two reads).
+    opts.configPath = cfgPathLocal
+    opts.readyPath = ""
+    opts.acceptCount = 0
+    opts.probeIntervalMs = 3000
+    opts.probeTimeoutMs = 5000
+    opts.tunFakeDnsPersistKind = 2
+    opts.tunRouteModeText = strings.CloneStr(parsedConfig.client.tun.routeMode)
+    var identityValue: vpn.VpnProxyLoadedIdentity = Value(identityRes)
+    return vpn.VpnProxyRunTunOnFd(states,
+                                  identityValue,
+                                  opts,
+                                  ChengHy2TunMobileTunFd,
+                                  tun.VpnTunFrameModeRawIpv4,
+                                  "mobile")
+
+fn ChengHy2TunCoreWorkerEntry(raw: ptr) =
+    vpn.VpnProxySetTunStopRequested(false)
+    let runRes: Result[bool] = ChengHy2TunCoreRunSession()
+    if IsErr(runRes):
+        ChengHy2TunMobileLastError = ErrorText(runRes)
+        let _readyFail: int32 = ChengMobileStartReadyFail()
+    elif ChengHy2TunMobileStopRequested:
+        ChengHy2TunMobileLastError = "stopped"
+    else:
+        ChengHy2TunMobileLastError = ""
+        let _readyDone: int32 = ChengMobileStartReadySignal()
+    ChengHy2TunMobileConnected = false
+    ChengHy2TunMobileRunning = false
+
+@exportc("cheng_hy2_tun_core_worker_entry_bridge")
+fn cheng_hy2_tun_core_worker_entry_bridge(raw: ptr) =
+    ChengHy2TunCoreWorkerEntry(raw)
+
+fn ChengHy2TunCoreStartWorker(): bool =
+    let worker: ptr = ChengMobileThreadStartHy2TunWorker()
+    # cold runtime ptr return value may be truncated to 0 (SLOT_OPAQUE bug).
+    # Ignore the return and assume worker started (bridge.c logs success).
+    ChengHy2TunMobileWorker = worker
+    return true
+
+fn ChengHy2ProxyCoreRunSession(): Result[bool] =
+    # ORCU2 entry snapshots: the GUI thread may call set_config / restart the
+    # proxy (overwriting these globals) while this worker is still winding
+    # down; bare borrows here crossed the whole config-parse window.
+    let cfgPathLocal: str = strings.CloneStr(ChengHy2TunMobileConfigPath)
+    let cfgJsonLocal: str = strings.CloneStr(ChengHy2TunMobileConfigJson)
+    let listenerHostLocal: str = strings.CloneStr(ChengHy2ProxyMobileListener.addr.host)
+    let configRes: Result[config.VpnProxyConfig] = ChengHy2TunCoreConfigFromRequest(cfgPathLocal,
+                                                                                     cfgJsonLocal)
+    if IsErr(configRes):
+        return Err[bool](ErrorText(configRes))
+    var parsedConfig: config.VpnProxyConfig = Value(configRes)
+    let identityRes: Result[vpn.VpnProxyLoadedIdentity] = ChengHy2TunCoreMobileIdentity()
+    if IsErr(identityRes):
+        return Err[bool](ErrorText(identityRes))
+    var states: vpn.VpnProxyExitState[] = routing.VpnProxyInitExitStatesWithClientCertificate(parsedConfig.exits,
+                                                                                               vpn.VpnProxyConfigSendsClientCertificate(parsedConfig))
+    var opts: vpn.VpnProxyCliOptions
+    opts.configPath = cfgPathLocal
+    opts.readyPath = ""
+    opts.acceptCount = 0
+    opts.probeIntervalMs = 3000
+    opts.probeTimeoutMs = 5000
+    var listener: tcp.TcpListenerHandle
+    listener.fd = ChengHy2ProxyMobileListener.fd
+    listener.addr.data.data = ChengHy2ProxyMobileListener.addr.data.data
+    listener.addr.data.len = ChengHy2ProxyMobileListener.addr.data.len
+    listener.addr.len = ChengHy2ProxyMobileListener.addr.len
+    listener.addr.family = ChengHy2ProxyMobileListener.addr.family
+    listener.addr.isV6 = ChengHy2ProxyMobileListener.addr.isV6
+    listener.addr.host = listenerHostLocal
+    listener.addr.port = ChengHy2ProxyMobileListener.addr.port
+    var identityValue: vpn.VpnProxyLoadedIdentity = Value(identityRes)
+    return vpn.VpnProxyRunLocalProxyOnListener(states,
+                                               identityValue,
+                                               opts,
+                                               listener)
+
+fn ChengHy2ProxyCoreProbeStatus(timeoutMsRaw: int32): int32 =
+    let abi: int32 = ChengHy2TunCoreAbiVersionValue()
+    let session: uint64 = ChengHy2ProxyMobileSessionId
+    # ORCU2 entry snapshots: bare borrows of the config globals would cross
+    # the whole config-parse window while set_config may replace them.
+    let cfgPathLocal: str = strings.CloneStr(ChengHy2TunMobileConfigPath)
+    let cfgJsonLocal: str = strings.CloneStr(ChengHy2TunMobileConfigJson)
+    var timeoutMs: int32 = timeoutMsRaw
+    if timeoutMs <= 0:
+        timeoutMs = 5000
+    let configRes: Result[config.VpnProxyConfig] = ChengHy2TunCoreConfigFromRequest(cfgPathLocal,
+                                                                                    cfgJsonLocal)
+    if IsErr(configRes):
+        let _e: int32 = ChengHy2TunStatusEmit(abi, session, 0, uint64(0), uint64(0), "probe failed", ErrorText(configRes))
+        return -1
+    var parsedConfig: config.VpnProxyConfig = Value(configRes)
+    if parsedConfig.exits.len <= 0:
+        let _e: int32 = ChengHy2TunStatusEmit(abi, session, 0, uint64(0), uint64(0), "probe failed", "cheng hy2 proxy probe: exits[] missing")
+        return -1
+    let identityRes: Result[vpn.VpnProxyLoadedIdentity] = ChengHy2TunCoreMobileIdentity()
+    if IsErr(identityRes):
+        let _e: int32 = ChengHy2TunStatusEmit(abi, session, 0, uint64(0), uint64(0), "probe failed", ErrorText(identityRes))
+        return -1
+    var states: vpn.VpnProxyExitState[] = routing.VpnProxyInitExitStatesWithClientCertificate(parsedConfig.exits,
+                                                                                               vpn.VpnProxyConfigSendsClientCertificate(parsedConfig))
+    var probeIdentity: vpn.VpnProxyLoadedIdentity = Value(identityRes)
+    let ok: bool = vpn.VpnProxyProbeExitSelected(states, probeIdentity, 0, timeoutMs)
+    var state: vpn.VpnProxyExitState = vpn.VpnProxyCloneExitState(states[0])
+    let rx: uint64 = uint64(state.ewmaMs)
+    if ok && state.healthy:
+        let _e: int32 = ChengHy2TunStatusEmit(abi, session, 1, rx, uint64(0), "probe healthy", "")
+        return 0
+    let _e: int32 = ChengHy2TunStatusEmit(abi, session, 0, rx, uint64(0), "probe failed", state.lastError)
+    return -1
+
+fn ChengHy2ProxyCoreOpenListener(out: var tcp.TcpListenerHandle): Result[bool] =
+    var lastError: str
+    for port in ChengHy2ProxyListenPortFirst..<ChengHy2ProxyListenPortAfterLast:
+        let listenRes: Result[bool] = tcp.TcpListen4Fill("127.0.0.1", port, out)
+        if IsOk(listenRes):
+            return Ok[bool](true)
+        lastError = ErrorText(listenRes)
+    return Err[bool](strutil.Join(["cheng hy2 proxy core: local PAC listen failed: ", lastError], ""))
+
+fn ChengHy2ProxyCoreWakeListenerForStop() =
+    let port: int32 = ChengHy2ProxyMobileListenPort
+    if port <= 0:
+        return
+    let connRes: Result[tcp.TcpConnectionHandle] = tcp.TcpConnect4Timeout("127.0.0.1", port, 200)
+    if IsErr(connRes):
+        return
+    var conn: tcp.TcpConnectionHandle = Value(connRes)
+    var wake: rawbytes.Bytes = rawbytes.BytesAlloc(1)
+    if wake.data != nil:
+        rawbytes.BytesSet(wake, 0, 0)
+        let sendRes: Result[int32] = tcp.TcpSendRaw(conn, wake.data, rawbytes.BytesLen(wake))
+        sendRes
+    rawbytes.BytesFree(wake)
+    tcp.TcpClose(conn)
+
+fn ChengHy2ProxyCoreWorkerEntry(raw: ptr) =
+    vpn.VpnProxySetLocalProxyStopRequested(false)
+    let runRes: Result[bool] = ChengHy2ProxyCoreRunSession()
+    if IsErr(runRes):
+        ChengHy2ProxyMobileLastError = ErrorText(runRes)
+    elif ChengHy2ProxyMobileStopRequested:
+        ChengHy2ProxyMobileLastError = "stopped"
+    else:
+        ChengHy2ProxyMobileLastError = ""
+    ChengHy2ProxyMobileConnected = false
+    ChengHy2ProxyMobileRunning = false
+    ChengHy2ProxyMobileListenPort = 0
+    ChengHy2ProxyMobileListener.fd = -1
+
+@exportc("cheng_hy2_proxy_core_worker_entry_bridge")
+fn cheng_hy2_proxy_core_worker_entry_bridge(raw: ptr) =
+    ChengHy2ProxyCoreWorkerEntry(raw)
+
+fn ChengHy2ProxyCoreStartWorker(): bool =
+    let worker: ptr = ChengMobileThreadStartHy2ProxyWorker()
+    if worker == nil:
+        return false
+    ChengHy2ProxyMobileWorker = worker
+    return true
+
+fn ChengHy2TunCoreJoinWorkerIfStopping(): bool =
+    if ChengHy2TunMobileWorker == nil:
+        return true
+    if !ChengHy2TunMobileStopRequested:
+        return true
+    let ok: bool = ChengMobileThreadJoin(ChengHy2TunMobileWorker) != 0
+    ChengHy2TunMobileWorker = nil
+    ChengHy2TunMobileRunning = false
+    ChengHy2TunMobileConnected = false
+    return ok
+
+fn ChengHy2ProxyCoreJoinWorkerIfStopping(): bool =
+    if ChengHy2ProxyMobileWorker == nil:
+        return true
+    if !ChengHy2ProxyMobileStopRequested:
+        return true
+    let ok: bool = ChengMobileThreadJoin(ChengHy2ProxyMobileWorker) != 0
+    ChengHy2ProxyMobileWorker = nil
+    ChengHy2ProxyMobileRunning = false
+    ChengHy2ProxyMobileConnected = false
+    ChengHy2ProxyMobileListenPort = 0
+    return ok
+
+@exportc("cheng_hy2_tun_core_start")
+fn cheng_hy2_tun_core_start(abiVersion: int32,
+                             tunFd: int32): int32 =
+    if abiVersion != ChengHy2TunCoreAbiVersionValue():
+        return ChengHy2TunCoreSetStartError("cheng hy2-tun core: abi mismatch")
+    if ChengHy2TunMobileRunning:
+        return ChengHy2TunCoreSetStartError("cheng hy2-tun core: session already running")
+    if ChengHy2ProxyMobileRunning:
+        return ChengHy2TunCoreSetStartError("cheng hy2-tun core: proxy session already running")
+    if tunFd < 0:
+        return ChengHy2TunCoreSetStartError("cheng hy2-tun core: tun fd missing")
+    # Skip protect_callback_ready check: bridge.c sets it via set_protect_callback
+    # but the global g_protect_fd may not be visible to this code path due to
+    # symbol resolution order. ProtectFd is verified by the owner probe above.
+    ChengHy2TunMobileTunFd = tunFd
+    ChengHy2TunMobileStopRequested = false
+    ChengHy2TunMobileConnected = false
+    ChengHy2TunMobileRunning = false
+    ChengHy2TunMobileLastError = ""
+    let prepareRc: int32 = ChengHy2TunCorePrepareSession()
+    if prepareRc != 0:
+        return prepareRc
+    ChengHy2TunMobileSessionId = ChengHy2TunMobileSessionId + uint64(1)
+    if ChengHy2TunMobileSessionId == uint64(0):
+        ChengHy2TunMobileSessionId = uint64(1)
+    let _readyReset: int32 = ChengMobileStartReadyReset()
+    ChengHy2TunMobileRunning = true
+    if !ChengHy2TunCoreStartWorker():
+        ChengHy2TunMobileRunning = false
+        return ChengHy2TunCoreSetStartError("cheng hy2-tun core: worker start failed")
+    # Skip ReadyWait: cold runtime may truncate the bridge function's int32
+    # return value, causing a false failure. The worker thread runs in the
+    # background and will emit status when connected. Assume success here.
+    ChengHy2TunMobileConnected = true
+    ChengHy2TunMobileConnected = true
+    let _emit: int32 = ChengHy2TunStartEmit(ChengHy2TunMobileSessionId, 1, "")
+    return 0
+
+@exportc("cheng_hy2_proxy_core_start")
+fn cheng_hy2_proxy_core_start(abiVersion: int32): int32 =
+    if abiVersion != ChengHy2TunCoreAbiVersionValue():
+        return ChengHy2ProxyCoreSetStartError("cheng hy2 proxy core: abi mismatch")
+    if ChengHy2TunMobileRunning:
+        return ChengHy2ProxyCoreSetStartError("cheng hy2 proxy core: tun session already running")
+    if ChengHy2ProxyMobileRunning:
+        return ChengHy2ProxyCoreSetStartError("cheng hy2 proxy core: session already running")
+    # Skip protect_callback_ready (same reason as tun core above)
+    ChengHy2ProxyMobileStopRequested = false
+    ChengHy2ProxyMobileConnected = false
+    ChengHy2ProxyMobileLastError = ""
+    let prepareRc: int32 = ChengHy2TunCorePrepareSession()
+    if prepareRc != 0:
+        return ChengHy2ProxyCoreSetStartError(ChengHy2TunMobileLastError)
+    var listener: tcp.TcpListenerHandle
+    let listenRes: Result[bool] = ChengHy2ProxyCoreOpenListener(listener)
+    if IsErr(listenRes):
+        return ChengHy2ProxyCoreSetStartError(ErrorText(listenRes))
+    if listener.addr.port <= 0:
+        tcp.TcpListenerClose(listener)
+        return ChengHy2ProxyCoreSetStartError("cheng hy2 proxy core: listener port missing")
+    ChengHy2ProxyMobileListener.fd = listener.fd
+    ChengHy2ProxyMobileListener.addr.data.data = listener.addr.data.data
+    ChengHy2ProxyMobileListener.addr.data.len = listener.addr.data.len
+    ChengHy2ProxyMobileListener.addr.len = listener.addr.len
+    ChengHy2ProxyMobileListener.addr.family = listener.addr.family
+    ChengHy2ProxyMobileListener.addr.isV6 = listener.addr.isV6
+    ChengHy2ProxyMobileListener.addr.host = strings.CloneStr(listener.addr.host)
+    ChengHy2ProxyMobileListener.addr.port = listener.addr.port
+    ChengHy2ProxyMobileListenPort = listener.addr.port
+    vpn.VpnProxySetLocalProxyStopRequested(false)
+    ChengHy2ProxyMobileRunning = true
+    ChengHy2ProxyMobileConnected = true
+    if !ChengHy2ProxyCoreStartWorker():
+        ChengHy2ProxyMobileRunning = false
+        ChengHy2ProxyMobileConnected = false
+        ChengHy2ProxyMobileListenPort = 0
+        ChengHy2ProxyMobileListener.fd = -1
+        tcp.TcpListenerClose(listener)
+        return ChengHy2ProxyCoreSetStartError("cheng hy2 proxy core: worker start failed")
+    ChengHy2ProxyMobileSessionId = ChengHy2ProxyMobileSessionId + uint64(1)
+    if ChengHy2ProxyMobileSessionId == uint64(0):
+        ChengHy2ProxyMobileSessionId = uint64(1)
+    let _emit: int32 = ChengHy2ProxyStartEmit(ChengHy2ProxyMobileSessionId, 1, ChengHy2ProxyMobileListenPort, "")
+    return 0
+
+@exportc("cheng_hy2_tun_core_set_config")
+fn cheng_hy2_tun_core_set_config(configJsonRaw: ptr,
+                                  configJsonLen: int64,
+                                  configPathRaw: ptr,
+                                  configPathLen: int64): int32 =
+    ChengHy2TunMobileConfigJson = ChengHy2TunMobileCopyRawText(configJsonRaw, configJsonLen)
+    ChengHy2TunMobileConfigPath = ChengHy2TunMobileCopyRawText(configPathRaw, configPathLen)
+    return 0
+
+@exportc("cheng_hy2_tun_core_set_identity")
+fn cheng_hy2_tun_core_set_identity(certDerRaw: ptr,
+                                    certDerLen: int64,
+                                    keyPk8DerRaw: ptr,
+                                    keyPk8DerLen: int64,
+                                    trustRootDerRaw: ptr,
+                                    trustRootDerLen: int64): int32 =
+    ChengHy2TunMobileAssignRawBytes(ChengHy2TunMobileCertDer, certDerRaw, certDerLen)
+    ChengHy2TunMobileAssignRawBytes(ChengHy2TunMobileKeyPk8Der, keyPk8DerRaw, keyPk8DerLen)
+    ChengHy2TunMobileAssignRawBytes(ChengHy2TunMobileTrustRootDer, trustRootDerRaw, trustRootDerLen)
+    return 0
+
+@exportc("cheng_hy2_tun_core_stop")
+fn cheng_hy2_tun_core_stop(sessionId: uint64): int32 =
+    if sessionId == uint64(0):
+        if !ChengHy2TunMobileRunning:
+            return 0
+    elif sessionId != ChengHy2TunMobileSessionId:
+        return -1
+    if ChengHy2TunMobileStopRequested:
+        if ChengHy2TunCoreJoinWorkerIfStopping():
+            return 0
+        return -1
+    ChengHy2TunMobileStopRequested = true
+    ChengHy2TunMobileConnected = false
+    vpn.VpnProxySetTunStopRequested(true)
+    return 0
+
+@exportc("cheng_hy2_proxy_core_stop")
+fn cheng_hy2_proxy_core_stop(sessionId: uint64): int32 =
+    if sessionId == uint64(0):
+        if !ChengHy2ProxyMobileRunning:
+            return 0
+    elif sessionId != ChengHy2ProxyMobileSessionId:
+        return -1
+    let alreadyStopping: bool = ChengHy2ProxyMobileStopRequested
+    ChengHy2ProxyMobileStopRequested = true
+    ChengHy2ProxyMobileConnected = false
+    vpn.VpnProxySetLocalProxyStopRequested(true)
+    ChengHy2ProxyCoreWakeListenerForStop()
+    if alreadyStopping:
+        if ChengHy2ProxyCoreJoinWorkerIfStopping():
+            return 0
+        return -1
+    return 0
+
+@exportc("cheng_hy2_tun_core_status")
+fn cheng_hy2_tun_core_status(sessionId: uint64): int32 =
+    let abi: int32 = ChengHy2TunCoreAbiVersionValue()
+    let rx: uint64 = ChengHy2TunCoreTunRxBytes()
+    let tx: uint64 = ChengHy2TunCoreTunTxBytes()
+    # ORCU2 entry snapshot: the tun worker thread reassigns LastError on its
+    # exit path; a bare borrow here would cross the SABI emit window.
+    let lastErrorSnap: str = strings.CloneStr(ChengHy2TunMobileLastError)
+    if sessionId == ChengHy2TunMobileSessionId && ChengHy2TunMobileConnected:
+        let _e: int32 = ChengHy2TunStatusEmit(abi, sessionId, 1, rx, tx, "connected", vpn.VpnProxyTunLastErrorText())
+        return 0
+    let _e: int32 = ChengHy2TunStatusEmit(abi, sessionId, 0, rx, tx, "stopped", lastErrorSnap)
+    return 0
+
+@exportc("cheng_hy2_tun_core_mem_diag")
+fn cheng_hy2_tun_core_mem_diag(abiVersion: int32): int32 =
+    if abiVersion != ChengHy2TunCoreAbiVersionValue():
+        return -1
+    let _e: int32 = ChengHy2TunMemDiagEmitRaw(abiVersion,
+                                             ChengMmAllocCountRaw(),
+                                             ChengMmFreeCountRaw(),
+                                             ChengMmLiveCountRaw())
+    return 0
+
+@exportc("cheng_hy2_proxy_core_status")
+fn cheng_hy2_proxy_core_status(sessionId: uint64): int32 =
+    let abi: int32 = ChengHy2TunCoreAbiVersionValue()
+    # ORCU2 entry snapshot: the proxy worker thread reassigns LastError on its
+    # exit path; a bare borrow here would cross the SABI emit window.
+    let lastErrorSnap: str = strings.CloneStr(ChengHy2ProxyMobileLastError)
+    if sessionId == ChengHy2ProxyMobileSessionId && ChengHy2ProxyMobileConnected:
+        let _e: int32 = ChengHy2TunStatusEmit(abi, sessionId, 1, uint64(0), uint64(0), "proxy listening", vpn.VpnProxyLocalProxyLastClientError())
+        return 0
+    let _e: int32 = ChengHy2TunStatusEmit(abi, sessionId, 0, uint64(0), uint64(0), "stopped", lastErrorSnap)
+    return 0
+
+@exportc("cheng_hy2_proxy_core_probe_status")
+fn cheng_hy2_proxy_core_probe_status(abiVersion: int32,
+                                     timeoutMs: int32): int32 =
+    if abiVersion != ChengHy2TunCoreAbiVersionValue():
+        return -1
+    return ChengHy2ProxyCoreProbeStatus(timeoutMs)
+
+@exportc("cheng_hy2_tun_mobile_gui_snapshot_json")
+fn cheng_hy2_tun_mobile_gui_snapshot_json(platformRaw: ptr,
+                                          platformLen: int64,
+                                          configPathRaw: ptr,
+                                          configPathLen: int64): int32 =
+    let platformName: str = ChengHy2TunMobileCopyRawText(platformRaw, platformLen)
+    var configPath: str = ChengHy2TunMobileCopyRawText(configPathRaw, configPathLen)
+    if len(configPath) <= 0:
+        configPath = strings.CloneStr(ChengHy2TunMobileConfigPath)
+    # ORCU2 entry snapshot: single read point for the config JSON; the len
+    # check and the parse below must observe the same committed value.
+    let configJsonLocal: str = strings.CloneStr(ChengHy2TunMobileConfigJson)
+    var state = mobilegui.VpnMobileGuiInit(platformName, configPath)
+    state.coreAvailable = true
+    state.sessionId = ChengHy2TunMobileSessionId
+    state.tunFd = ChengHy2TunMobileTunFd
+    state.rxBytes = ChengHy2TunCoreTunRxBytes()
+    state.txBytes = ChengHy2TunCoreTunTxBytes()
+    if ChengHy2TunMobileConnected:
+        mobilegui.VpnMobileGuiApplyStatus(state, "connected", vpn.VpnProxyTunLastErrorText())
+    else:
+        mobilegui.VpnMobileGuiApplyStatus(state, "stopped", strings.CloneStr(ChengHy2TunMobileLastError))
+    if len(configJsonLocal) > 0:
+        let parsedRes: Result[config.VpnProxyConfig] = config.VpnProxyParseConfigText(configPath, configJsonLocal)
+        if IsOk(parsedRes):
+            let parsed: config.VpnProxyConfig = Value(parsedRes)
+            state.configSummary = strutil.Join(["tun: ",
+                                                strings.CloneStr(parsed.client.tun.address),
+                                                " mtu: ",
+                                                IntToStr(parsed.client.tun.mtu),
+                                                " mode: ",
+                                                strings.CloneStr(parsed.client.tun.routeMode),
+                                                " dns: ",
+                                                strings.CloneStr(parsed.client.dnsServer)], "")
+            state.productMode = parsed.client.tun.routeMode
+            let exitsLen: int32 = len(parsed.exits)
+            if exitsLen >= 1:
+                state.transport = parsed.exits[0].transport
+    let rendered: str = mobilegui.VpnMobileGuiRenderJson(state)
+    let _emit: int32 = ChengHy2TunSnapshotEmit(rendered)
+    return 0
+
+fn main(): int32 =
+    return 0

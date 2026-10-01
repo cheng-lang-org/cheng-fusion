@@ -1,0 +1,405 @@
+# CSG 本地决策头数学核心 (任务 11 首切片)。
+#
+# learn 三类头 (contract: docs/campaigns/2026-09-21-csg-decision-computer-use/
+# contract.md §1) 的纯整数域数学; 概率类型唯一载体是
+# cheng/core/runtime/csg_decision_contract 的 CsgDecisionProbValue 定点口径。
+#
+#   Choice: 候选受限 argmax (同 src/inference/planner_task.cheng 的
+#           PlannerTaskClassifyWithDenseFixture 受限 argmax 语义, 抽象成
+#           可复用决策头)。并列必须显式: 返回并列成员集合 + 确定性
+#           tie-break 规则 = 最小索引, 禁止静默任选; 空候选集 -> 显式
+#           no-match (chosen = CsgDecisionChosenNone, contract.md §3:
+#           无候选匹配是显式选项, 不是服务失败)。
+#   Noul:   单 logits 值 + 调用方显式阈值 (int32 域比较) -> 二元判定。
+#           边界行为显式定义: 恰等阈值 -> 触发 (>=)。阈值与输入值必须
+#           声明在同一 int32 定点 scale (调用方义务, 本模块不做跨 scale
+#           换算)。
+#   Score:  有序等级打分 (int32 数组, 长度 = 等级数, 值域 2..10) ->
+#           等级索引排列 (从高到低; 同分确定性规则 = 小等级索引在前,
+#           不是静默任选) + 定点加权值 (权重由调用方传入定点 numer +
+#           声明精度; 加权求和全程 int64, 逐项/累计双溢出检查, 溢出
+#           显式拒绝; 恰到 int64 下界的负项用精确构造, 不依赖乘法
+#           溢出 wrap)。
+#
+# 批量入口: 多问题共享编码只算一次 -- 本切片只定义共享 logits 池上的
+# 每问题头输入切片索引账 (DecisionBatchPlan) 与其逐位校验/消费入口,
+# 不做任何编码计算 (编码属后续切片)。
+#
+# 边界与明确不做 (如实登记):
+# - 输入口径对齐 kernel TensorQ 的 int32 展开 (data int32[] + scale int32),
+#   本模块不 import kernel, 定义本地等价输入结构 DecisionLogits。
+# - 禁止浮点 softmax/exp (后端 f64 位型绑定不可靠 + 无浮点库保障):
+#   本切片 Choice/Noul 只产显式决策, 不产概率; logits -> 定点概率的
+#   分布校准类头延后到任务 12 校准切片。
+# - 模型执行器接线 / 真权重 / 训练属后续切片 (编译器墙 B 未清 +
+#   tokenizer/权重工件缺失)。
+# - 内存: 头输入向量与输出为每次决策调用瞬时对象, 无驻留。
+
+import std/result
+import cheng/core/runtime/csg_decision_contract as dc
+
+# -------------------------------------------------------------------
+# Score 头等级数显式值域 (verify e: 2..10 边界)
+# -------------------------------------------------------------------
+const
+    CsgScoreGradeCountMin: int32 = 2
+    CsgScoreGradeCountMax: int32 = 10
+
+# -------------------------------------------------------------------
+# 输入结构: 与 kernel TensorQ 同口径的本地等价展开 (data int32[] +
+# scale int32; 真值 = data[i] / scale, scale 由生产方声明, 必须 > 0)。
+# -------------------------------------------------------------------
+type
+    DecisionLogits =
+        data: int32[]
+        scale: int32
+
+    # Choice 头输出: 并列显式。chosen = 并列成员最小绝对索引
+    # (确定性 tie-break); 空候选集 -> noMatch = true 且 chosen =
+    # CsgDecisionChosenNone (映射合同 no-match 语义)。
+    DecisionChoiceResult =
+        noMatch: bool
+        chosen: int32
+        tie: bool
+        tieMembers: int32[]
+
+    # Noul 头输出: value/threshold 回显供审计; fires = value >= threshold
+    # (恰等触发, 显式合同)。
+    DecisionNoulResult =
+        fires: bool
+        value: int32
+        threshold: int32
+
+    # Score 头输出: ranks = 等级索引排列 (从高到低, 同分小索引在前);
+    # weighted = sum(scores[i] * weights[i]) 的定点承载 (precision =
+    # 调用方声明权重精度)。weighted 是期望值不是概率, 数值不限于
+    # [0, 10^precision] (与合同 Score weighted 语义一致)。
+    DecisionScoreResult =
+        ranks: int32[]
+        weighted: dc.CsgDecisionProbValue
+
+    # 多问题共享编码批量索引账: 每问题在共享 logits 池上的 choice 段 /
+    # noul 单槽 / score 段起始与长度, 以及计划自带的定点权重池分段。
+    # questionCount = 各列长度; 索引账铁律: 一切引用半开区间
+    # [start, start+count), 逐位校验越界与两两不交。
+    DecisionBatchPlan =
+        weightPrecision: int32
+        weights: int64[]
+        choiceStart: int32[]
+        choiceCount: int32[]
+        noulIndex: int32[]
+        noulThreshold: int32[]
+        scoreStart: int32[]
+        scoreCount: int32[]
+        scoreWeightStart: int32[]
+
+    # 批量输出: 与计划逐问题对齐的三头结果列 (无部分成功: 任一头失败
+    # 整批显式 Err)。
+    DecisionBatchOutputs =
+        choices: DecisionChoiceResult[]
+        nouls: DecisionNoulResult[]
+        scores: DecisionScoreResult[]
+
+# -------------------------------------------------------------------
+# 内部精确算术: int64 上界倍增构造 (>32 位整型字面量截断缺陷绕开)
+# -------------------------------------------------------------------
+
+# 2^62。
+fn decisionPow62(): int64 =
+    var m: int64 = 1
+    var i: int32 = 0
+    while i < 62:
+        m = m * 2
+        i = i + 1
+    return m
+
+# int64 上界 2^63 - 1: (2^62 - 1) + 2^62, 每步中间值可表示。
+fn decisionInt64Max(): int64 =
+    let m = decisionPow62()
+    return (m - 1) + m
+
+# w > 0 是否 2 的幂: 反复折半, 只用精确整除与乘法。
+fn decisionIsPow2(w: int64): bool =
+    var x: int64 = w
+    while x > 1:
+        let half: int64 = x / 2
+        if x != half * 2:
+            return false
+        x = half
+    return x == 1
+
+# 单项 s*w 精确求值: 先在除法域判定可表示性, 再相乘。
+#   正向: s*w > 2^63-1  <=>  s > floor(max/w)   (两正数截断除 = 下取整)
+#   负向: |s|*w > 2^63  <=>  |s| > floor(max/w) + (w 为 2 幂 ? 1 : 0)
+#         (2^63 恰可表示为 int64 下界; w 为 2 幂时 floor((max+1)/w) =
+#         floor(max/w) + 1, 此时 |s| 恰等 allow 的负项精确构造,
+#         不依赖溢出 wrap)。
+fn decisionScoreTermOf(s: int64, w: int64): Result[int64] =
+    if w == 0:
+        return Ok[int64](int64(0))
+    let maxI64 = decisionInt64Max()
+    let lim: int64 = maxI64 / w
+    var sAbs: int64 = s
+    if s < 0:
+        sAbs = 0 - s
+    if sAbs == 0:
+        return Ok[int64](int64(0))
+    var allow: int64 = lim
+    var negBoundary: bool = false
+    if s < 0:
+        if decisionIsPow2(w):
+            # w == 1 时 lim = max, lim+1 不可表示; 但 sAbs <= 2^31,
+            # 恒 <= lim, 不可能触负向边界, 不需要 +1。
+            if w > 1:
+                allow = lim + 1
+                if sAbs == allow:
+                    negBoundary = true
+    if sAbs > allow:
+        return Err[int64]("InvalidOutput: decision head score term overflow")
+    if negBoundary:
+        # |s*w| == 2^63: 精确构造 -(lim*w) - w = int64 下界。
+        return Ok[int64]((0 - lim) * w - w)
+    return Ok[int64](s * w)
+
+# -------------------------------------------------------------------
+# 输入合同
+# -------------------------------------------------------------------
+
+fn DecisionLogitsValidate(logits: DecisionLogits): Result[bool] =
+    if logits.scale <= 0:
+        return Err[bool]("InvalidOutput: decision head logits scale not positive")
+    return Ok[bool](true)
+
+# -------------------------------------------------------------------
+# Choice 头: 候选受限 argmax (并列显式 + 空集显式 no-match)
+# -------------------------------------------------------------------
+
+fn DecisionHeadChoice(logits: DecisionLogits,
+                      candidateStart: int32,
+                      candidateCount: int32): Result[DecisionChoiceResult] =
+    let lv = DecisionLogitsValidate(share(logits))
+    if IsErr(lv):
+        return Err[DecisionChoiceResult](Error(lv))
+    # 无溢出比较形: 先界 candidateCount, 再用差值界 candidateStart。
+    if candidateStart < 0 || candidateCount < 0 || candidateStart > logits.data.len ||
+       candidateCount > logits.data.len - candidateStart:
+        return Err[DecisionChoiceResult]("InvalidOutput: decision head choice candidate range out of bounds")
+    var out: DecisionChoiceResult
+    var emptyMembers: int32[]
+    out.tieMembers = emptyMembers
+    if candidateCount == 0:
+        # 显式 no-match (contract.md §3): 不是服务失败, 不混入概率。
+        out.noMatch = true
+        out.chosen = dc.CsgDecisionChosenNone
+        out.tie = false
+        return Ok[DecisionChoiceResult](out)
+    # 第一遍求最大值, 第二遍收集并列成员 (升序扫描 => 成员升序,
+    # chosen = 最小索引 tie-break)。
+    var bestVal: int32 = logits.data[candidateStart]
+    let last: int32 = candidateStart + candidateCount
+    var i: int32 = candidateStart + 1
+    while i < last:
+        let v = logits.data[i]
+        if v > bestVal:
+            bestVal = v
+        i = i + 1
+    var members: int32[]
+    var j: int32 = candidateStart
+    while j < last:
+        if logits.data[j] == bestVal:
+            add(members, j)
+        j = j + 1
+    out.noMatch = false
+    out.tie = members.len >= 2
+    out.tieMembers = members
+    out.chosen = members[0]
+    return Ok[DecisionChoiceResult](out)
+
+# -------------------------------------------------------------------
+# Noul 头: 显式阈值二元判定 (恰等触发)
+# -------------------------------------------------------------------
+
+fn DecisionHeadNoul(value: int32, threshold: int32): DecisionNoulResult =
+    var out: DecisionNoulResult
+    out.fires = value >= threshold
+    out.value = value
+    out.threshold = threshold
+    return out
+
+# -------------------------------------------------------------------
+# Score 头: 等级排列 + 定点加权值 (溢出显式拒绝)
+# -------------------------------------------------------------------
+
+fn DecisionHeadScore(scores: int32[],
+                     weights: int64[],
+                     weightPrecision: int32): Result[DecisionScoreResult] =
+    if weightPrecision < 1 || weightPrecision > 9:
+        return Err[DecisionScoreResult]("InvalidOutput: decision head score weight precision out of range")
+    let n: int32 = scores.len
+    if n < CsgScoreGradeCountMin || n > CsgScoreGradeCountMax:
+        return Err[DecisionScoreResult]("InvalidOutput: decision head score grade count out of range")
+    if weights.len != n:
+        return Err[DecisionScoreResult]("InvalidOutput: decision head score weights length mismatch")
+    for i in 0..<n:
+        if weights[i] < 0:
+            return Err[DecisionScoreResult]("InvalidOutput: decision head score weight negative")
+    # 加权求和: 逐项与累计双检查, 任一溢出显式拒绝, 无截断无兜底。
+    let maxI64 = decisionInt64Max()
+    var acc: int64 = 0
+    for i in 0..<n:
+        let termRes = decisionScoreTermOf(int64(scores[i]), weights[i])
+        if IsErr(termRes):
+            return Err[DecisionScoreResult](Error(termRes))
+        let term = Value(termRes)
+        if term > 0:
+            if acc > maxI64 - term:
+                return Err[DecisionScoreResult]("InvalidOutput: decision head score sum overflow")
+        elif term < 0:
+            let minI64: int64 = (0 - maxI64) - 1
+            if acc < minI64 - term:
+                return Err[DecisionScoreResult]("InvalidOutput: decision head score sum overflow")
+        acc = acc + term
+    # 排列: 选择法, 严格大于才替换 => 同分保持先遇小索引 (确定性规则)。
+    var ranks: int32[]
+    var used: uint8[]
+    for i in 0..<n:
+        add(used, uint8(0))
+    for k in 0..<n:
+        var best: int32 = 0 - 1
+        for i in 0..<n:
+            if used[i] != uint8(0):
+                continue
+            if best < 0:
+                best = i
+            elif scores[i] > scores[best]:
+                best = i
+        used[best] = uint8(1)
+        add(ranks, best)
+    var weighted: dc.CsgDecisionProbValue
+    weighted.numer = acc
+    weighted.precision = weightPrecision
+    var out: DecisionScoreResult
+    out.ranks = ranks
+    out.weighted = weighted
+    return Ok[DecisionScoreResult](out)
+
+# -------------------------------------------------------------------
+# 批量索引账: 构造 / 校验 / 消费
+# -------------------------------------------------------------------
+
+fn DecisionBatchPlanNew(weightPrecision: int32): DecisionBatchPlan =
+    var out: DecisionBatchPlan
+    out.weightPrecision = weightPrecision
+    return out
+
+# 追加一问: 权重段起点 = 追加前权重池长度 (显式记账); 权重数组按末次
+# 使用传入 (消耗进计划权重池)。返回问题索引。只做记账不做校验, 校验
+# 唯一权威是 DecisionBatchPlanValidate。
+fn DecisionBatchPlanAddQuestion(plan: var DecisionBatchPlan,
+                                choiceStart: int32,
+                                choiceCount: int32,
+                                noulIndex: int32,
+                                noulThreshold: int32,
+                                scoreStart: int32,
+                                scoreCount: int32,
+                                weights: int64[]): int32 =
+    let segStart: int32 = plan.weights.len
+    for i in 0..<weights.len:
+        add(plan.weights, weights[i])
+    add(plan.choiceStart, choiceStart)
+    add(plan.choiceCount, choiceCount)
+    add(plan.noulIndex, noulIndex)
+    add(plan.noulThreshold, noulThreshold)
+    add(plan.scoreStart, scoreStart)
+    add(plan.scoreCount, scoreCount)
+    add(plan.scoreWeightStart, segStart)
+    return plan.choiceStart.len - 1
+
+# 索引账逐位校验: 列长一致 / 非负 / 越界 (无溢出比较形) / score 段长
+# 落在头值域 / logits 池引用段两两不交 (含同一问题内三段互斥) / 权重池
+# 分段两两不交。未引用槽位合法 (索引账只登记引用段)。
+fn DecisionBatchPlanValidate(plan: DecisionBatchPlan, poolLen: int32): Result[bool] =
+    if plan.weightPrecision < 1 || plan.weightPrecision > 9:
+        return Err[bool]("InvalidOutput: decision head batch plan weight precision out of range")
+    let q: int32 = plan.choiceStart.len
+    if plan.choiceCount.len != q || plan.noulIndex.len != q || plan.noulThreshold.len != q ||
+       plan.scoreStart.len != q || plan.scoreCount.len != q || plan.scoreWeightStart.len != q:
+        return Err[bool]("InvalidOutput: decision head batch plan column length mismatch")
+    for i in 0..<q:
+        let cc = plan.choiceCount[i]
+        let ni = plan.noulIndex[i]
+        let sc = plan.scoreCount[i]
+        if plan.choiceStart[i] < 0 || cc < 0 || ni < 0 || plan.scoreStart[i] < 0 ||
+           sc < 0 || plan.scoreWeightStart[i] < 0:
+            return Err[bool]("InvalidOutput: decision head batch plan negative index")
+        if cc > poolLen || plan.choiceStart[i] > poolLen - cc:
+            return Err[bool]("InvalidOutput: decision head batch plan slice out of bounds")
+        if ni >= poolLen:
+            return Err[bool]("InvalidOutput: decision head batch plan slice out of bounds")
+        if sc < CsgScoreGradeCountMin || sc > CsgScoreGradeCountMax:
+            return Err[bool]("InvalidOutput: decision head batch plan score count out of range")
+        if plan.scoreStart[i] > poolLen - sc:
+            return Err[bool]("InvalidOutput: decision head batch plan slice out of bounds")
+        if plan.scoreWeightStart[i] > plan.weights.len - sc:
+            return Err[bool]("InvalidOutput: decision head batch plan weight slice out of bounds")
+    var rStart: int32[]
+    var rEnd: int32[]
+    for i in 0..<q:
+        add(rStart, plan.choiceStart[i])
+        add(rEnd, plan.choiceStart[i] + plan.choiceCount[i])
+        add(rStart, plan.noulIndex[i])
+        add(rEnd, plan.noulIndex[i] + 1)
+        add(rStart, plan.scoreStart[i])
+        add(rEnd, plan.scoreStart[i] + plan.scoreCount[i])
+    var a: int32 = 0
+    while a < rStart.len:
+        var b: int32 = a + 1
+        while b < rStart.len:
+            if rStart[a] < rEnd[b] && rStart[b] < rEnd[a]:
+                return Err[bool]("InvalidOutput: decision head batch plan slice overlap")
+            b = b + 1
+        a = a + 1
+    var wStart: int32[]
+    var wEnd: int32[]
+    for i in 0..<q:
+        add(wStart, plan.scoreWeightStart[i])
+        add(wEnd, plan.scoreWeightStart[i] + plan.scoreCount[i])
+    a = 0
+    while a < wStart.len:
+        var b: int32 = a + 1
+        while b < wStart.len:
+            if wStart[a] < wEnd[b] && wStart[b] < wEnd[a]:
+                return Err[bool]("InvalidOutput: decision head batch plan weight slice overlap")
+            b = b + 1
+        a = a + 1
+    return Ok[bool](true)
+
+# 批量消费: 共享编码池 + 索引账 -> 逐问题三头结果。先整账校验, 再按
+# 问题序逐头求值; 任一头失败整批显式 Err (无部分成功输出)。
+fn DecisionBatchRun(logits: DecisionLogits, plan: DecisionBatchPlan): Result[DecisionBatchOutputs] =
+    let lv = DecisionLogitsValidate(share(logits))
+    if IsErr(lv):
+        return Err[DecisionBatchOutputs](Error(lv))
+    let pv = DecisionBatchPlanValidate(share(plan), logits.data.len)
+    if IsErr(pv):
+        return Err[DecisionBatchOutputs](Error(pv))
+    var out: DecisionBatchOutputs
+    let q: int32 = plan.choiceStart.len
+    for i in 0..<q:
+        let cRes = DecisionHeadChoice(share(logits), plan.choiceStart[i], plan.choiceCount[i])
+        if IsErr(cRes):
+            return Err[DecisionBatchOutputs](Error(cRes))
+        add(out.choices, Value(cRes))
+        add(out.nouls, DecisionHeadNoul(logits.data[plan.noulIndex[i]], plan.noulThreshold[i]))
+        var scores: int32[]
+        var weights: int64[]
+        let ss = plan.scoreStart[i]
+        let sc = plan.scoreCount[i]
+        for j in 0..<sc:
+            add(scores, logits.data[ss + j])
+            add(weights, plan.weights[plan.scoreWeightStart[i] + j])
+        let sRes = DecisionHeadScore(scores, weights, plan.weightPrecision)
+        if IsErr(sRes):
+            return Err[DecisionBatchOutputs](Error(sRes))
+        add(out.scores, Value(sRes))
+    return Ok[DecisionBatchOutputs](out)

@@ -23,7 +23,12 @@ tree_guard.sh verify <tree>     # compare current state to the manifest;
 tree that a concurrent session silently mutated mid-bake; both chains'
 final verdicts were read against a tree that no longer matched what was
 actually baked, wasting both burns. `verify` before trusting any judgement
-read off a shared tree.
+read off a shared tree. Pre-run complement (2026-07-27, same incident
+recurring): run `cheng_tree_quiesce_probe` before any frontier/chain burn,
+and when `cheng_driver_frontier_probe` returns
+`entrySourceClosureTrusted=false changed=<file>`, that file is under an
+active concurrent editor -- coordinate the file mutex or use
+`waitQuietSeconds`; blind retry just burns the same window again.
 
 ## zc_census_diff.sh
 
@@ -249,3 +254,112 @@ is caught with an exact FAIL reason. item27 wires the two former GAP-1 mutants
 (M-EVIDENCE-SEED-SWAP, M-EVIDENCE-VERDICT-DROP) onto this gate. Current full
 item27 run is 27/29: both evidence mutants still return `evidence_verify rc=-1`;
 the module-header and flat-zero corpus mutants are killed by their exact contract.
+
+## seed_artifact_desymlink.sh
+
+Replaces a symlink directory entry with a verified regular copy of its
+resolved target: O_EXCL|O_NOFOLLOW same-directory temp staged with the
+target's mode, sha256 re-verified, symlink+target inode/mtime/size drift
+re-checked, atomic rename, parent fsync. Targets outside the entry's own
+directory are refused outright -- the tool never follows the link for
+writes and never mutates the target.
+
+```
+seed_artifact_desymlink.sh <canonical-absolute-dir-entry>
+```
+
+**Lesson**: Fusion audits (`cheng_semantic_snapshot_audit` compiler input,
+regalloc preflight seed path) lstat every bound input and hard-reject
+symlinks; `artifacts/bootstrap/cheng.stage3 -> cheng.stage3.bin` blocked the
+snapshot audit twice (2026-07-26 probe round, 2026-07-27 production-closure
+round). The inverse trap is documented in cheng-lang lessons.md: a plain
+`cp --regen` over the symlink follows it and silently overwrites the target
+bytes, polluting the baseline while leaving the symlink in place. The
+verified stage3 bytes were already byte-identical to stage2 (fixed point),
+so the honest fix is replacing the directory entry, not rebuilding and not
+relaxing the audit. First executed by hand on 2026-07-27
+(`cheng.stage3` sha256 026113bc..a2a2b preserved); toolized here on its
+second manual occurrence, and the same trap was found and fixed through
+this tool on `artifacts/backend_driver/cheng -> cheng.bin` the same day
+(the seven-stage producer binds that path and would hit the same lstat
+rejection).
+
+## ebnf_parser_node_map_gen.ts
+
+Regenerates `fixtures/semantic/ebnf_parser_node_map.json` from the live
+`docs/cheng-formal-spec.md` + `src/core/lang/parser.cheng` + producer
+claims, staging to a pid-suffixed sibling and renaming only after a
+post-write source-closure drift re-read.
+
+```
+bun tools/ebnf_parser_node_map_gen.ts --prepare-current-unwitnessed
+bun tools/ebnf_parser_node_map_gen.ts --official-current-build-binding <binding.kv>
+```
+
+**Lesson**: `cheng_regalloc_preflight` recomputes the map's producer
+projection in-memory and compares it against the committed file; any
+spec/parser edit since the last regen fails as "generated EBNF parser map
+producer projection is not current" (hit 2026-07-27 after a formal-spec
+touch). The fix is always the unwitnessed regen above -- never hand-editing
+the JSON, which cannot survive the canonical-JSON comparison anyway. After
+regen the same check honestly reports "zero, rejected or malformed
+production receipts" until the witnessed mode runs against a real official
+current build binding; that residual is the actual 971-obligation witness
+workload, not staleness, and must not be "fixed" by faking receipts.
+spec/parser 变更后必须成对再生：map 之外还要跑
+`bun run generate:grammar-corpus-sources`，否则 `bun run test:item25`
+以 "corpus.json: 内容漂移" 拒绝（2026-07-27 同轮命中）；两项 regen +
+item25 PASS（rows=125 PARTIAL、missingRequiredCount=971 与计划基线一致）
+才算 EBNF artifact 收敛。
+
+### 已知状态(2026-07-27 定位):57 个 statement-root obligation 是 pin 住的故意缺失
+
+`parserOwnedStructuredWitnessAccepted` 对 `statement_root_span` 要求 role
+kind(`ParserValueExprStatement*`)且 ∈ claims `nodeKinds`;claims 对 7 个
+转发 production(topLevelDecl/topLevelCore/templateBody/statement/
+statementCore/matchArm/blockStmt)刻意 `nodeKinds: []`(不复制无意义
+AST)。曾怀疑是两 authority 矛盾并试过放宽 membership 要求——被 item25
+否决:该测试同时 pin 正反两类用例(statementCore 空声明时必须拒绝
+Condition 冒充),且明确断言这 57 个 obligation "必须继续缺失"。结论:这
+是 owner 刻意保留的 witness 缺口,闭合需要 owner 决定转发 production 的
+witness role 声明粒度,任何侧不得擅自放宽 acceptance 或伪造 claims 声明。
+同轮修复的真 bug:`cheng_regalloc_preflight_m9022.ts` validator 调用点漏
+传 `production`/`node_kinds` 两参(真实 witness 路径一直传 4 参);
+`item22:formal-profile` 在 57 缺口闭合前保持诚实 RED。
+
+### 维护例(2026-07-27):跨仓 exact-hash pin 漂移
+
+`cheng_regalloc_preflight_m9022.ts` 内三组 pin 会随 cheng-lang gate 工具
+演进过期：`PRODUCTION_GATE_DEPENDENCY_EXPECTED_SHA256`、
+`AARCH64_F64_RUNTIME_GATE_EXPECTED_SHA256`、
+`X86_64_F64_RUNTIME_GATE_EXPECTED_SHA256`。cheng-lang 侧 gate/guard/
+evidence 脚本一旦提交，item22 即报
+`exact_source_hash_mismatch:<path>`。判定与修法：先用
+`git -C cheng-lang diff` 确认目标文件是已提交的权威变更（非脏改动），
+再把 pin 更新为当前字节 sha——昨日 cb0379d 即为同款例行 re-pin，不是
+放宽。注意同一文件可能出现在多个 pin 集(guard 三处)，漏改一处会继续
+红。re-pin 后 item22 从 [B] 段推进到 formal binding 段；其最终 GREEN
+依赖 witnessed map,属 971 witness 生产任务，不是 pin 问题。
+
+### 维护例(2026-07-27):fusion src 编辑后 MCP 长进程即 stale
+
+`cheng_fusion_source_guard` 对 `src/` 53 个文件取指纹，任何编辑（包括
+改后还原、仅 mtime 变化）都会让常驻 MCP server 拒绝后续调用：
+`fusion_source_drift_since_process_start`。编辑 fusion src 后本会话内
+一律改用 headless CLI(`bun cli.ts run <tool> --root … --input '…'`),
+或重启 MCP server;CLI 每次起新进程，永远吃当前字节。后台长任务
+(chain/probe）本来就该走 CLI，天然免疫。
+
+### 维护例(2026-07-27):receipt key 扩容后旧 fixture 静默假值
+
+`HARD_GATE_RECEIPT_KEYS` 新增 `native_descriptor_candidate_entry_path` 等
+绑定字段后，item32 的 synthetic receipt 只按 key 模板填默认值
+(path/module 默认 "0")，报 "只接受两个官方 entry"。修法是在 fixture
+里显式绑定一个官方 entry(path+module_path 与 `CID_OFFICIAL_ENTRY_SPECS`
+一致）;sha256 类字段默认同 hash，等式链自动成立。凡 receipt key 扩容，
+同轮必须 grep 所有按 key 模板生成 synthetic receipt 的测试 fixture。
+
+变种（2026-07-29 第四例）:symlink 指向**外部 baseline seed**（如
+regalloc-baseline-current)——工具按设计拒绝（不复制外部字节）。此时正确
+修法是用**同目录内**已验证的 bin(stage3.bin）替换目录项；绝不顺链接写
+外部 target(baseline 是 perf-gate 不可变基线，覆写即毁证据）。

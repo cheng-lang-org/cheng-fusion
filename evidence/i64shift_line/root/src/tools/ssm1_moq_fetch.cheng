@@ -1,0 +1,424 @@
+# SSM1 MoQ 段流跨机 fetch 端 (M2 双端拆分, opensmoke client 侧调用序列复用;
+# M5 秒开优化线, 逐轮改动见 docs/campaigns/2026-09-06-csg-asset-pipeline/
+# task_m5_transport_opt.md。轮 0 = M2 交付语义重建基线)。
+#
+# 用法: ssm1_moq_fetch <server地址> [port]   (port 默认 4443)
+# 地址格式 = quic_transport 现役 dial 形态: IPv4/IPv6 字面量, 内部
+# Libp2pQuicAddrFromHostPort 构造 /ip<n>/<host>/udp/<port>/quic-v1。
+#
+# 时序 (轮 2 M5 终态): dial (真 QUIC 1-RTT) → neg4/neg8 背靠背发出, 各流等
+# ack 闭环 (opensmoke 双流先例的并行调度) → t_ready → stream4 manifest 请求
+# 与 stream8 chunk 请求背靠背预发 (chunk 请求无法预知 kf range: offset=0 +
+# length=配额上界, 段内容由 serve 端权威给出; 逐字节正确性由本端双断言兜底:
+# chunkLen == 声明 payloadLen 且 sha256(chunkSeg) == cid[kf], SSM1 v1 内容 CID
+# 即 payload sha256 hex) → 两段在一条 QUIC 连接上并行传输 → drain manifest
+# (EOF 语义 = Err("msquic: stream closed")) → 纯头解析 (合同复刻: magic/
+# version/count/条目/audioRef 全同款校验, range 完整性由 serve 端 embedded
+# 解析背书 + chunk sha256 逐字节断言兜底; audioRef 后恰 EOF ⇒ 段长精确性证明)
+# → NearestKeyframeIndexForTime(0) 定位 → drain chunk 余量 → 双断言 →
+# monotimes 时间线, FAIL 行带诊断。
+import std/cmdline
+import std/monotimes
+import std/os
+import std/parseutils
+import std/rawbytes
+import std/crypto/sha256
+import cheng/quic/connection
+import cheng/quic/multiaddress
+import cheng/quic/msquicruntime
+import cheng/quic/msquictransport_native
+import cheng/quic/native_runtime
+import cheng/libp2p/transports/quic_transport
+import cheng/libp2p/protocols/media/moq_segment_stream
+import cheng/game/assets/stream/manifest
+import cheng/game/assets/import/reader
+
+const
+    FetchDefaultPort = 4443
+    FetchManifestSegmentKey = "ssm1-manifest"
+    FetchKeyframeSegmentKey = "ssm1-keyframe"
+    # native runtime 会话槽游标缺陷绕开 (opensmoke 同款): 读前扫描定位数据槽,
+    # 窗口精确收敛到会话槽总数 N_SLOTS (过宽越界, M2 实证 brk)。
+    FetchNegotiateBytes = 45
+    FetchScanMaxSpins = 3000
+    FetchSegmentChunkBytes = 65536
+    FetchEofText = "msquic: stream closed"
+    # 轮 1 (M5): 扫描等待事件驱动化——空扫后阻塞在本侧 UDP fd 上等下一个
+    # 数据报 (µs 级唤醒), 到点 (cap) 或唤醒后泵一次再扫; 取代 M2 的 10ms
+    # 步进扫描量化。单角色进程安全 (本进程只有 client 数据路径)。
+    FetchScanWaitCapMs = 20
+    # 轮 3 (M5): 初始发送窗口 (现役公开 settings 旋钮, 默认 10 包 ≈ 12KB)。
+    # 两段合计 70197B ≈ 58 包 ≤ 64 包: 一次突发窗口内发完, 消除 64KB 段的
+    # 慢启动爬坡。运行时乱序位图预算 160 包 (cwnd cap 192KB), 64 包在界内。
+    FetchInitialWindowPackets: int32 = 64
+
+fn FetchEmit(line: str) =
+    os.Write(os.Get_stdout(), line)
+    os.Write(os.Get_stdout(), "\n")
+    var flushed: int32
+    flushed = os.C_fflush(os.Get_stdout())
+    if flushed != 0:
+        panic("fetch_stdout_flush_failed")
+
+# 严格十进制 int32 (可带一个前导 '-')。
+fn FetchParseI32(s: str, out: var int32): bool =
+    out = 0
+    let n = len(s)
+    if n <= 0:
+        return false
+    var start: int32
+    start = 0
+    if s[0] == '-':
+        start = 1
+    if start >= n:
+        return false
+    for i in start..<n:
+        if s[i] < '0' || s[i] > '9':
+            return false
+    return parseutils.ParseInt32(s, out) > 0
+
+# 扫描 AppRecvAvailable 定位数据槽 (opensmoke OpenSmokeWaitReadable)。轮 1
+# (M5): 每候选槽 bind → msquicNativePump(1) → AppRecvAvailable (跨进程无人泵
+# UDP); 空扫后 msquicNativeWaitReadableForSide 阻塞等数据报 (事件驱动, 无
+# 10ms 步进量化), 唤醒/到点后泵一次再扫。
+fn FetchWaitReadable(side: int32, streamId: int64, want: int32): int32 =
+    var spins: int32
+    spins = 0
+    while spins < FetchScanMaxSpins:
+        for k in 0..<native_runtime.N_SLOTS:
+            native_runtime.msquicNativeBindSlotFromPipeIdx(1000001 + k)
+            let pumpRes = native_runtime.msquicNativePump(1)
+            if IsErr(pumpRes):
+                return -1
+            let avail = native_runtime.msquicNativeAppRecvAvailable(side, streamId)
+            if avail >= want:
+                return k
+        native_runtime.msquicNativeWaitReadableForSide(side, FetchScanWaitCapMs)
+        let wakePump = native_runtime.msquicNativePump(1)
+        if IsErr(wakePump):
+            return -1
+        spins = spins + 1
+    return -1
+
+# 段 drain: 累积到 EOF。EOF = Err("msquic: stream closed") (peer shutdown 后
+# buffered 空才报); 配额护栏防失控; 0 字节读亦收尾 (与 opensmoke OsmDrainAll
+# 同形)。累积只经 var 形参 bytesAppend 填充 (托管 Bytes 合同)。
+fn FetchDrainSegment(reader: var moq_segment_stream.Libp2pMoqSegmentStreamReader,
+                     maxChunkBytes: int32, quotaBytes: int64,
+                     out: var rawbytes.Bytes): bool =
+    while !reader.closed:
+        let readRes = moq_segment_stream.Libp2pMoqSegmentStreamRead(reader, maxChunkBytes)
+        if IsErr(readRes):
+            if ErrorText(readRes) == FetchEofText:
+                return true
+            return false
+        let chunk = Value(readRes)
+        let chunkLen = rawbytes.BytesLen(chunk)
+        if chunkLen <= 0:
+            return true
+        if int64(rawbytes.BytesLen(out)) + int64(chunkLen) > quotaBytes:
+            return false
+        connection.bytesAppend(out, chunk)
+    return true
+
+# 纯头段解析 (M2 合同复刻, 未改 manifest.cheng): StreamManifestParse 的 range
+# 校验以传入字节长度为界 (opensmoke v1 域: payload 声明须落在 manifestLen 内),
+# 真实 embedded 全包的 payloadOffset 深达 MB 级, 纯头段过不了该条。本复刻保留
+# magic/version/count/条目字段/audioRef 全同款校验 (原子读取复用现役导出
+# manifest.StreamManifestI64At/StreamManifestHexByte/reader.AssetReaderU32At),
+# 仅省略 payload 落界检查; keyframeBefore 前缀数组同款构建以复用
+# StreamManifestNearestKeyframeIndexForTime/ChunkAt。audioRef 后须恰为段 EOF。
+@borrows
+fn FetchParseManifestHeader(data: rawbytes.Bytes,
+                            outM: var manifest.StreamManifest): bool =
+    var fresh: manifest.StreamManifest
+    outM = fresh
+    let n64 = int64(rawbytes.BytesLen(data))
+    if n64 > manifest.StreamManifestQuotaMaxBytes():
+        return false
+    if n64 < int64(12):
+        return false
+    if rawbytes.BytesGet(data, 0) != Int32('S'):
+        return false
+    if rawbytes.BytesGet(data, 1) != Int32('S'):
+        return false
+    if rawbytes.BytesGet(data, 2) != Int32('M'):
+        return false
+    if rawbytes.BytesGet(data, 3) != Int32('1'):
+        return false
+    var version: int64
+    if !reader.AssetReaderU32At(data, 4, version):
+        return false
+    if version != int64(1):
+        return false
+    var count64: int64
+    if !reader.AssetReaderU32At(data, 8, count64):
+        return false
+    if count64 < int64(1) || count64 > int64(manifest.StreamManifestQuotaMaxChunks()):
+        return false
+    var m: manifest.StreamManifest
+    m.chunkCount = int32(count64)
+    var cursor: int64
+    cursor = int64(12)
+    var prevEnd: int64
+    prevEnd = int64(0)
+    var lastKf: int32
+    lastKf = -1
+    for i in 0..<m.chunkCount:
+        var startMs: int64
+        if !manifest.StreamManifestI64At(data, int32(cursor), startMs):
+            return false
+        if startMs < int64(0):
+            return false
+        var durationMs: int64
+        if !manifest.StreamManifestI64At(data, int32(cursor + 8), durationMs):
+            return false
+        if durationMs < int64(0):
+            return false
+        # 单调不重叠: 间隙允许; start+dur 溢出 int64 显式拒绝 (同款)。
+        if startMs < prevEnd:
+            return false
+        if durationMs > int64(9223372036854775807) - startMs:
+            return false
+        prevEnd = startMs + durationMs
+        cursor = cursor + 16
+        if cursor >= n64:
+            return false
+        let kf = rawbytes.BytesGet(data, int32(cursor))
+        if kf != 0 && kf != 1:
+            return false
+        cursor = cursor + 1
+        var cidLen: int64
+        if !reader.AssetReaderU32At(data, int32(cursor), cidLen):
+            return false
+        cursor = cursor + 4
+        if cidLen != int64(manifest.StreamManifestCidLenV1()):
+            return false
+        if cursor + cidLen > n64:
+            return false
+        for k in 0..<manifest.StreamManifestCidLenV1():
+            if !manifest.StreamManifestHexByte(rawbytes.BytesGet(data, int32(cursor) + k)):
+                return false
+        add(m.cid, rawbytes.BytesToString(
+            rawbytes.BytesSliceView(data, int32(cursor), manifest.StreamManifestCidLenV1())))
+        cursor = cursor + cidLen
+        var payloadLen: int64
+        if !manifest.StreamManifestI64At(data, int32(cursor), payloadLen):
+            return false
+        if payloadLen < int64(0):
+            return false
+        var payloadOffset: int64
+        if !manifest.StreamManifestI64At(data, int32(cursor + 8), payloadOffset):
+            return false
+        if payloadOffset < int64(0):
+            return false
+        cursor = cursor + 16
+        add(m.startMs, startMs)
+        add(m.durationMs, durationMs)
+        add(m.keyframe, kf)
+        add(m.payloadLen, payloadLen)
+        add(m.payloadOffset, payloadOffset)
+        if kf == 1:
+            lastKf = i
+        add(m.keyframeBefore, lastKf)
+    # 末尾 audioTrackRef: 0 = 无音轨; 否则 v1 冻结 64 hex (同款)。
+    var audioLen: int64
+    if !reader.AssetReaderU32At(data, int32(cursor), audioLen):
+        return false
+    cursor = cursor + 4
+    if audioLen != int64(0):
+        if audioLen != int64(manifest.StreamManifestCidLenV1()):
+            return false
+        if cursor + audioLen > n64:
+            return false
+        for k in 0..<manifest.StreamManifestCidLenV1():
+            if !manifest.StreamManifestHexByte(rawbytes.BytesGet(data, int32(cursor) + k)):
+                return false
+        m.audioCid = rawbytes.BytesToString(
+            rawbytes.BytesSliceView(data, int32(cursor), manifest.StreamManifestCidLenV1()))
+        cursor = cursor + audioLen
+    # audioRef 后恰为段 EOF (段长精确性证明)。
+    if cursor != n64:
+        return false
+    m.totalDurationMs = prevEnd
+    m.ok = true
+    outM = m
+    return true
+
+fn main(argc: int32, argv: ptr): int32 =
+    argc
+    argv
+    cmdline.CaptureCmdLine(argc, argv)
+    if cmdline.ParamCount() < 1:
+        FetchEmit("usage: ssm1_moq_fetch <server地址> [port]")
+        return 2
+    let hostArg = cmdline.ParamStr(1)
+    var port = FetchDefaultPort
+    if cmdline.ParamCount() >= 2:
+        var portArg: str
+        portArg = cmdline.ParamStr(2)
+        if !FetchParseI32(portArg, port) || port <= 0 || port > 65535:
+            FetchEmit("ERR bad_port")
+            return 2
+
+    # === dial (真 QUIC 1-RTT, quic_transport 现役合同) ===
+    var tDialStart = monotimes.GetMonoTime()
+    var settings = msquicruntime.initMsQuicSettings()
+    settings.allowDatagram = true
+    settings.initialWindowPackets = FetchInitialWindowPackets
+    var client = msquictransport_native.InitMsQuicTransport()
+    if !IsOk(msquictransport_native.setMsQuicTransportSettings(client, settings)):
+        FetchEmit("ERR client_settings")
+        return 1
+    if !IsOk(quic_transport.Libp2pQuicConfigureTls(client)):
+        FetchEmit("ERR client_tls")
+        return 1
+    let dialAddrRes = quic_transport.Libp2pQuicAddrFromHostPort(hostArg, port)
+    if IsErr(dialAddrRes):
+        FetchEmit(Fmt"ERR dial_addr {ErrorText(dialAddrRes)}")
+        return 1
+    # 本地 Result 直接消费 (QuicCloneMultiAddress 中转在多地址克隆 API 收敛后
+    # 不再可用; 本地值按值传参同 start(listener, Value) 形态)。
+    let dialRes = msquictransport_native.dial(client, Value(dialAddrRes))
+    if IsErr(dialRes):
+        FetchEmit(Fmt"FAIL dial {ErrorText(dialRes)}")
+        return 1
+    var clientLegacy = Value(dialRes)
+    var tDialed = monotimes.GetMonoTime()
+
+    # === negotiate x2 (轮 2 M5: 两流交错——neg4/neg8 背靠背发出, 再各自等 ack;
+    # 单流协议序列不变, opensmoke 双流先例的并行调度) ===
+    var streamClient4 = connection.ConnDeriveStream(clientLegacy, 4, 4)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientSendNegotiate(client,
+        streamClient4)):
+        FetchEmit("FAIL negotiate_send_4")
+        return 1
+    var streamClient8 = connection.ConnDeriveStream(clientLegacy, 8, 8)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientSendNegotiate(client,
+        streamClient8)):
+        FetchEmit("FAIL negotiate_send_8")
+        return 1
+    let kc4 = FetchWaitReadable(0, 4, FetchNegotiateBytes)
+    if kc4 < 0:
+        FetchEmit("FAIL negotiate_ack_slot_4")
+        return 1
+    var clientReader4 = connection.ConnFromPipeIdx(1000001 + kc4, 0, 4, 4)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client,
+        clientReader4)):
+        FetchEmit("FAIL negotiate_ack_4")
+        return 1
+    let kc8 = FetchWaitReadable(0, 8, FetchNegotiateBytes)
+    if kc8 < 0:
+        FetchEmit("FAIL negotiate_ack_slot_8")
+        return 1
+    var clientReader8 = connection.ConnFromPipeIdx(1000001 + kc8, 0, 8, 8)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client,
+        clientReader8)):
+        FetchEmit("FAIL negotiate_ack_8")
+        return 1
+    var tReady = monotimes.GetMonoTime()
+
+    # === 轮 4 (M5): 服务端主动推段——fetch 不再发请求帧, 仅在本地把两段
+    # reader 绑定到各自流 (expectedBytes = 配额上界, 收尾靠 EOF); serve 端
+    # negotiate 完成即推 manifest+chunk 两段。段内容由 serve 端权威给出
+    # (服务端声明 kf range); 逐字节正确性由本端双断言兜底 (chunkLen == 声明
+    # payloadLen 且 sha256(chunkSeg) == cid[kf], SSM1 v1 内容 CID 即 payload
+    # sha256 hex)。两段在一条 QUIC 连接上并行传输。 ===
+    var manifestReq: moq_segment_stream.Libp2pMoqSegmentStreamRequest
+    manifestReq.streamId = "ssm1-fetch"
+    manifestReq.segmentKey = FetchManifestSegmentKey
+    manifestReq.offsetBytes = 0
+    manifestReq.lengthBytes = 268435456
+    manifestReq.readChunkBytes = FetchSegmentChunkBytes
+
+    var chunkReq: moq_segment_stream.Libp2pMoqSegmentStreamRequest
+    chunkReq.streamId = "ssm1-fetch"
+    chunkReq.segmentKey = FetchKeyframeSegmentKey
+    chunkReq.offsetBytes = 0
+    chunkReq.lengthBytes = 268435456
+    chunkReq.readChunkBytes = FetchSegmentChunkBytes
+
+    var manifestSeg = rawbytes.EmptyBytes()
+    defer:
+        rawbytes.BytesFree(manifestSeg)
+    var chunkSeg = rawbytes.EmptyBytes()
+    defer:
+        rawbytes.BytesFree(chunkSeg)
+    var manifestReader: moq_segment_stream.Libp2pMoqSegmentStreamReader
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamOpen(manifestReader,
+        clientReader4, manifestReq)):
+        FetchEmit("FAIL manifest_open")
+        return 1
+    var chunkReader: moq_segment_stream.Libp2pMoqSegmentStreamReader
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamOpen(chunkReader,
+        clientReader8, chunkReq)):
+        FetchEmit("FAIL chunk_open")
+        return 1
+    var tReqsSent = monotimes.GetMonoTime()
+
+    if !FetchDrainSegment(manifestReader, FetchSegmentChunkBytes,
+                          manifest.StreamManifestQuotaMaxBytes(), manifestSeg):
+        FetchEmit("FAIL manifest_drain")
+        return 1
+    var tManifestDone = monotimes.GetMonoTime()
+
+    # === B 线解析 + 首关键帧定位 (对取回的 manifest 段) ===
+    var m: manifest.StreamManifest
+    if !FetchParseManifestHeader(manifestSeg, m):
+        FetchEmit(Fmt"FAIL manifest_parse len={rawbytes.BytesLen(manifestSeg)}")
+        return 1
+    let kfIdx = manifest.StreamManifestNearestKeyframeIndexForTime(m, int64(0))
+    if kfIdx < 0:
+        FetchEmit("FAIL no_keyframe")
+        return 1
+    var kf: manifest.StreamChunk
+    if !manifest.StreamManifestChunkAt(m, kfIdx, kf):
+        FetchEmit("FAIL keyframe_chunk_at")
+        return 1
+    if !kf.isKeyframe:
+        FetchEmit("FAIL first_kf_not_keyframe")
+        return 1
+    var tParseDone = monotimes.GetMonoTime()
+
+    # === 段 2 残余 drain (轮 2 M5: chunk 传输自请求预发起与 manifest 并行,
+    # 此处只等余量到 EOF) ===
+    if !FetchDrainSegment(chunkReader, FetchSegmentChunkBytes,
+                          manifest.StreamManifestQuotaMaxBytes(), chunkSeg):
+        FetchEmit("FAIL chunk_drain")
+        return 1
+    var tChunkDone = monotimes.GetMonoTime()
+
+    # === 双断言: 段长 + 内容 CID (SSM1 v1 内容 CID = payload sha256 hex) ===
+    let chunkGotLen = int64(rawbytes.BytesLen(chunkSeg))
+    if chunkGotLen != kf.payloadLen:
+        FetchEmit(Fmt"FAIL chunk_len got={chunkGotLen} want={kf.payloadLen}")
+        return 1
+    var digest = sha256.Sha256Digest(chunkSeg)
+    defer:
+        rawbytes.BytesFree(digest)
+    let digestHex = rawbytes.BytesToHex(digest)
+    if digestHex != kf.cid:
+        FetchEmit(Fmt"FAIL sha256 got={digestHex} want={kf.cid} kfIdx={kfIdx} off={kf.payloadOffset} len={kf.payloadLen}")
+        return 1
+
+    # === 时间线 (轮 2 M5: 两段并行, manifest/chunk 各自从请求发出点计时) ===
+    let dialNs = monotimes.MonoTimeNs(tDialed) - monotimes.MonoTimeNs(tDialStart)
+    let readyNs = monotimes.MonoTimeNs(tReady) - monotimes.MonoTimeNs(tDialed)
+    let reqsNs = monotimes.MonoTimeNs(tReqsSent) - monotimes.MonoTimeNs(tReady)
+    let manifestNs = monotimes.MonoTimeNs(tManifestDone) - monotimes.MonoTimeNs(tReqsSent)
+    let parseNs = monotimes.MonoTimeNs(tParseDone) - monotimes.MonoTimeNs(tManifestDone)
+    let chunkNs = monotimes.MonoTimeNs(tChunkDone) - monotimes.MonoTimeNs(tParseDone)
+    let firstNs = monotimes.MonoTimeNs(tChunkDone) - monotimes.MonoTimeNs(tReady)
+    let totalNs = monotimes.MonoTimeNs(tChunkDone) - monotimes.MonoTimeNs(tDialStart)
+    FetchEmit("SSM1 MoQ fetch timeline:")
+    FetchEmit(Fmt"  dial (transport+tls+handshake): {dialNs} ns")
+    FetchEmit(Fmt"  connect ready (negotiate x2): {readyNs} ns")
+    FetchEmit(Fmt"  requests issued (both streams): {reqsNs} ns")
+    FetchEmit(Fmt"  manifest segment ({rawbytes.BytesLen(manifestSeg)} bytes): {manifestNs} ns")
+    FetchEmit(Fmt"  parse + locate first keyframe: {parseNs} ns")
+    FetchEmit(Fmt"  keyframe chunk segment residual ({rawbytes.BytesLen(chunkSeg)} bytes): {chunkNs} ns")
+    FetchEmit(Fmt"  ready->first-frame ready: {firstNs} ns")
+    FetchEmit(Fmt"  total dial->first-frame ready: {totalNs} ns")
+    FetchEmit(Fmt"fetch ok chunks={m.chunkCount} kfChunk={kfIdx} manifest={rawbytes.BytesLen(manifestSeg)}B chunk={chunkGotLen}B sha256-match={digestHex}")
+    connection.ConnClose(clientLegacy)
+    return 0

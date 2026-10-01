@@ -12,6 +12,7 @@ import {buildChengGrammarObligationContract} from "./cheng_semantic_pipeline_mat
 import {canonicalJson} from "./cheng_semantic_matrix_m9023.ts";
 import {
   bindCurrentReceiptAgainstObligations,
+  currentParserReceiptBindingAuthority,
   tokenKindNamesFromParserSource,
   valueExprKindNamesFromParserSource,
   type BindOneResult,
@@ -339,6 +340,13 @@ export function parserOwnedStructuredWitnessAccepted(
     return parserNodeKind === "ParserAnnotation" ||
       parserNodeKind.startsWith("ParserAnnotationArg");
   }
+  if (spanModel === "forwarding_production_span") {
+    return parserNodeKind.startsWith(
+      "ParserForwardingProduction",
+    ) && !parserNodeKind.startsWith(
+      "ParserForwardingProductionChild",
+    );
+  }
   if (spanModel === "value_node_char_span") {
     return parserNodeKind.startsWith("ParserValueExpr") &&
       !parserNodeKind.startsWith("ParserValueExprRegion") &&
@@ -436,10 +444,39 @@ const SPAN_MODELS = new Set([
   "pattern_span",
   "annotation_span",
   "annotation_arg_span",
+  "forwarding_production_span",
   "region_span",
   "declaration_span",
   "none",
 ]);
+
+const CURRENT_FORWARDING_PRODUCTION_CONTRACTS:
+Readonly<Record<string, {
+  readonly parserFunctions: readonly string[];
+  readonly nodeKinds: readonly string[];
+  readonly spanModel: "forwarding_production_span";
+}>> = Object.fromEntries([
+  ["topLevelDecl", "ParserForwardingProductionTopLevelDecl"],
+  ["topLevelCore", "ParserForwardingProductionTopLevelCore"],
+  ["templateBody", "ParserForwardingProductionTemplateBody"],
+  ["statement", "ParserForwardingProductionStatement"],
+  ["statementCore", "ParserForwardingProductionStatementCore"],
+  ["matchArm", "ParserForwardingProductionMatchArm"],
+  ["blockStmt", "ParserForwardingProductionBlockStmt"],
+].map(([production, nodeKind]) => [production, {
+  parserFunctions: [
+    "parserForwardingProductionBegin",
+    "parserForwardingProductionFinish",
+    "parserForwardingProductionsSeal",
+    "ParserValueExprTreeForwardingProductionsStrictValidateInto",
+  ],
+  nodeKinds: [
+    "ParserForwardingProductionKind",
+    "ParserForwardingProductionChildKind",
+    nodeKind,
+  ],
+  spanModel: "forwarding_production_span" as const,
+}]));
 
 const CURRENT_ANNOTATION_PRODUCER_CONTRACTS: Readonly<Record<string, {
   readonly parserFunctions: readonly string[];
@@ -1523,6 +1560,8 @@ export interface EbnfParserNodeMapBuildOptions {
   readonly receiptEvidence?: readonly ParserReceiptEvidenceInput[];
   readonly harnessFormalSpecPath?: string;
   readonly harnessParserPath?: string;
+  readonly harnessParserNodeMapPath?: string;
+  readonly harnessParserNodeMapSha256?: string;
   readonly harnessReceiptProducerPath?: string;
   readonly harnessDriverEntryPath?: string;
   readonly harnessDriverEntrySha256?: string;
@@ -1551,6 +1590,9 @@ interface HarnessReceiptIdentity {
   readonly driverRole: string;
   readonly driverSha256: string;
   readonly parserTraceRootSha256: string;
+  readonly parserBindingSha256: string;
+  readonly parserBindingRequiredResultCount: number;
+  readonly parserBindingHitCount: number;
 }
 
 function assertExactKeys(
@@ -1759,6 +1801,8 @@ export interface ParserProductionReceiptHarnessValidationInput {
   readonly formalEbnfSha256: string;
   readonly parserPath: string;
   readonly parserSha256: string;
+  readonly parserNodeMapPath: string;
+  readonly parserNodeMapSha256: string;
   readonly receiptProducerPath: string;
   readonly receiptProducerSha256: string;
   readonly driverEntryPath: string;
@@ -1927,6 +1971,7 @@ export function validateParserProductionReceiptHarnessIdentity(
     "driverEntry",
     "bootstrap",
     "harness",
+    "parserNodeMap",
     "dependencyClosure",
     "toolClosure",
     "buildCompiler",
@@ -2023,6 +2068,23 @@ export function validateParserProductionReceiptHarnessIdentity(
     if (row.path !== expectedPath || row.sha256 !== expectedSha) {
       throw new Error(`${label}_identity_invalid`);
     }
+  }
+
+  assertExactKeys(
+    manifest.parserNodeMap,
+    ["path", "sha256"],
+    "harness_parser_node_map",
+  );
+  assertSha256(
+    manifest.parserNodeMap.sha256,
+    "harness_parser_node_map",
+  );
+  if (typeof manifest.parserNodeMap.path !== "string" ||
+      manifest.parserNodeMap.path !==
+        resolve(manifest.parserNodeMap.path) ||
+      manifest.parserNodeMap.path !== input.parserNodeMapPath ||
+      manifest.parserNodeMap.sha256 !== input.parserNodeMapSha256) {
+    throw new Error("harness_parser_node_map_identity_invalid");
   }
   for (const [label, row, expectedPath, expectedSha] of [
     [
@@ -2237,10 +2299,14 @@ export function validateParserProductionReceiptHarnessIdentity(
       "driverRole",
       "driverSha256",
       "parserTraceRootSha256",
+      "parserBindingSha256",
+      "parserBindingRequiredResultCount",
+      "parserBindingHitCount",
     ], "harness_receipt");
     assertSha256(receipt.sha256, "harness_receipt");
     assertSha256(receipt.driverSha256, "harness_receipt_driver");
     assertSha256(receipt.parserTraceRootSha256, "parser_trace_root");
+    assertSha256(receipt.parserBindingSha256, "parser_binding");
     const driver = manifest.drivers.find(
       (row: any) => row.role === receipt.driverRole,
     );
@@ -2248,6 +2314,13 @@ export function validateParserProductionReceiptHarnessIdentity(
         receiptPaths.has(receipt.path) ||
         typeof receipt.inode !== "string" || receipt.inode.length === 0 ||
         !Number.isSafeInteger(receipt.byteLength) || receipt.byteLength <= 0 ||
+        !Number.isSafeInteger(
+          receipt.parserBindingRequiredResultCount) ||
+        receipt.parserBindingRequiredResultCount <= 0 ||
+        !Number.isSafeInteger(receipt.parserBindingHitCount) ||
+        receipt.parserBindingHitCount <= 0 ||
+        receipt.parserBindingHitCount >
+          receipt.parserBindingRequiredResultCount ||
         !sourcePaths.has(receipt.sourcePath) ||
         driver === undefined || driver.sha256 !== receipt.driverSha256) {
       throw new Error("harness_receipt_identity_invalid");
@@ -2261,7 +2334,14 @@ export function validateParserProductionReceiptHarnessIdentity(
     if (pair.length !== 2 ||
         new Set(pair.map((row: any) => row.driverRole)).size !== 2 ||
         pair[0].inode === pair[1].inode ||
-        pair[0].parserTraceRootSha256 !== pair[1].parserTraceRootSha256) {
+        pair[0].parserTraceRootSha256 !==
+          pair[1].parserTraceRootSha256 ||
+        pair[0].parserBindingSha256 !==
+          pair[1].parserBindingSha256 ||
+        pair[0].parserBindingRequiredResultCount !==
+          pair[1].parserBindingRequiredResultCount ||
+        pair[0].parserBindingHitCount !==
+          pair[1].parserBindingHitCount) {
       throw new Error("harness_receipt_fixed_point_invalid");
     }
   }
@@ -2333,6 +2413,20 @@ export function buildEbnfParserNodeMap(
         `${production.name} current TypeSyntax producer declaration invalid`,
       );
     }
+    const forwardingContract =
+      CURRENT_FORWARDING_PRODUCTION_CONTRACTS[production.name];
+    if (forwardingContract !== undefined &&
+        (claim.spanModel !== forwardingContract.spanModel ||
+         canonicalJson([...claim.parserFunctions].sort()) !==
+           canonicalJson(
+             [...forwardingContract.parserFunctions].sort(),
+           ) ||
+         canonicalJson([...claim.nodeKinds].sort()) !==
+           canonicalJson([...forwardingContract.nodeKinds].sort()))) {
+      throw new Error(
+        `${production.name} current forwarding producer declaration invalid`,
+      );
+    }
     const patternContract =
       CURRENT_PATTERN_PRODUCER_CONTRACTS[production.name];
     if (patternContract !== undefined) {
@@ -2398,7 +2492,8 @@ export function buildEbnfParserNodeMap(
     if (producerDeclared && claim.spanModel === "none") {
       throw new Error(`producer declaration lacks span model: ${production.name}`);
     }
-    if (["type_syntax_span", "pattern_span", "annotation_span", "annotation_arg_span"]
+    if (["type_syntax_span", "pattern_span", "annotation_span",
+         "annotation_arg_span", "forwarding_production_span"]
           .includes(claim.spanModel) && realNodeKinds.length === 0) {
       throw new Error(`structured producer node missing: ${production.name}`);
     }
@@ -2512,6 +2607,10 @@ export function buildEbnfParserNodeMap(
           formalEbnfSha256: contract.ebnfSha256,
           parserPath: options.harnessParserPath ?? "",
           parserSha256,
+          parserNodeMapPath:
+            options.harnessParserNodeMapPath ?? "",
+          parserNodeMapSha256:
+            options.harnessParserNodeMapSha256 ?? "",
           receiptProducerPath:
             options.harnessReceiptProducerPath ?? "",
           receiptProducerSha256,
@@ -2575,6 +2674,25 @@ export function buildEbnfParserNodeMap(
         mapRows,
         valueExprKindNamesFromParserSource(parserSource),
       );
+      const binding = currentParserReceiptBindingAuthority(
+        evidence.receiptBytes.toString("utf8"),
+        evidence.sourceBytes.toString("utf8"),
+        formalSpecBytes.toString("utf8"),
+        contract.obligations,
+        tokenKindNamesFromParserSource(parserSource),
+        mapRows,
+        manifestRecord.parserNodeMap?.sha256 ?? "",
+        valueExprKindNamesFromParserSource(parserSource),
+      );
+      if (receiptManifest.parserBindingSha256 !==
+            binding.bindingSha256 ||
+          receiptManifest.parserBindingRequiredResultCount !==
+            binding.requiredResultCount ||
+          receiptManifest.parserBindingHitCount !== binding.hitCount ||
+          manifestRecord.parserNodeMap?.sha256 !==
+            binding.parserNodeMapSha256) {
+        throw new Error("harness_receipt_binding_invalid");
+      }
       const evidenceWitnesses =
         new Map<string, Map<string, Set<string>>>();
       const evidenceWitnessProjections =
@@ -3030,6 +3148,8 @@ export function rebuildSerializedEbnfParserNodeMapFromReceiptArtifacts(
       receiptEvidence,
       harnessFormalSpecPath: manifest.formalSpec?.path,
       harnessParserPath: manifest.parser?.path,
+      harnessParserNodeMapPath: manifest.parserNodeMap?.path,
+      harnessParserNodeMapSha256: manifest.parserNodeMap?.sha256,
       harnessReceiptProducerPath: manifest.receiptProducer?.path,
       harnessDriverEntryPath: manifest.driverEntry?.path,
       harnessDriverEntrySha256: manifest.driverEntry?.sha256,

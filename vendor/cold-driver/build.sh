@@ -55,19 +55,24 @@ if [ -z "$BUN_PATH" ] || [[ "$BUN_PATH" != /* ]] || [ ! -f "$BUN_PATH" ] || [ -L
   exit 1
 fi
 
-# cheng_cold.c #includes these local headers/units (direct closure, verified
-# against upstream bootstrap/cheng_cold.c); copy them alongside so the patched
-# copy compiles standalone without touching the main repo tree.
+# cheng_cold.c #includes these local headers/units (transitive local closure,
+# verified against upstream bootstrap/cheng_cold.c); copy them alongside so the
+# patched copy compiles standalone without touching the main repo tree.
+# 2026-08-08 re-vendor: cold_chengcsg_format.h was deleted upstream;
+# cold_type_identity_contract.h is newly included by cheng_cold.c.
+# 2026-08-27 re-vendor: elf32_direct.h is newly included by the sibling emit units.
 UPSTREAM_SIBLINGS=(
   cold_parser.h
   cold_parser.c
+  cold_context.h
   cold_types.h
+  cold_type_identity_contract.h
   macho_direct.h
   elf64_direct.h
+  elf32_direct.h
   coff_direct.h
   x64_emit.h
   rv64_emit.h
-  cold_chengcsg_format.h
   host_runtime.c
 )
 

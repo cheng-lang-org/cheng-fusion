@@ -1,0 +1,1383 @@
+# SSM1 MoQ 单进程环回导出面变体 (M6a: UniMaker 鸿蒙侧「发布 CSG 视频→秒发→
+# 接收端 CSG 播放器秒开」同机环回 E2E)。
+#
+# 语义同源: src/tools/ssm1_moq_serve.cheng + ssm1_moq_fetch.cheng (M5 终版:
+# 两流并行 / 服务端主动推段 / 64KB 段粒度 / 事件驱动扫描), 差异只有进程模型——
+# serve 与 fetch 两个角色共存于宿主进程 (一个 NAPI .so), 走 127.0.0.1 UDP
+# 真环回。运行时 pump (native_runtime msquicNativePumpCode) 本就按 dual-role
+# 处理 client + listener 两个 datapath (connection.cheng 注释 "Dual-role slot
+# discipline"), 单线程顺序推进即可闭环:
+#   dial (内部阻塞泵环: 本进程 listener 同步握手) → client 发 negotiate x2
+#   → serve 侧 accept + 双流 negotiate + 权威推段 + 写关 (线性, 无需交错)
+#   → fetch 侧读 ack → 绑 reader → drain manifest (内容完成式收尾: 纯头
+#   解析 cursor==n64 段长自证) → 首关键帧定位 → drain chunk 至声明 payloadLen
+#   → 双断言 (chunkLen==payloadLen 且 sha256==cid) → 时间线。
+# 与 M4 导出面同款纪律: 本模块不 import std/os、不碰任何流 (stdio 归宿主),
+# 应答经 out/cap 缓冲返回。
+#
+# 编译器借用合同注记 (本轮实测): rawbytes.Bytes 含裸 data: ptr, 非
+# address-free 值对象——模块级全局 Bytes 不得按值读出 (传参/求长均算拷贝,
+# "plain local copy requires an address-free value object")。全局只作
+# 所有权槽位 (写入合法), 读取一律经 BytesView(data, len) 从标量字段重建
+# 局部视图后按值传递; 释放同理经等值视图 (Bytes = {data, len}, 视图与
+# 原 handle 逐字段相等, 释放语义不变)。托管 handle 结构体 (StreamManifest/
+# StreamPlayerQ) 无此限制 (ssm1d_m = freshM 先例)。
+#
+# 导出面:
+#   ssm1q_serve_start(data, len, port, out, cap) -> int32
+#       内存载包 (rawfile 字节直传) + ParseEx embedded + listen 0.0.0.0:port。
+#       发布即就绪: 返回 OK 行即资产可被拉取。
+#   ssm1q_fetch_run(hostCstr, port, out, cap) -> int32
+#       完整 fetch 状态机 (上序), 应答 = M5 同款时间线 + fetch ok 行。
+#   ssm1q_first_frame_gray(out, cap, metaOut, metaCap) -> int32
+#       取回的首关键帧 chunk (sha256 已断言) → DPD1 头校验 → uint16 深度
+#       → 实域 min/max → 逐像素灰度 RGBA8888 (R=G=B=g, A=255)。
+#       平场 (max==min) 显式拒绝。meta 行回报 w/h/minV/maxV/grayMin/grayMax。
+#   ssm1q_assembled_len() -> int32
+#   ssm1q_assembled_copy(out, cap) -> int32
+#       接收侧组装: 取回 manifest 段 + 首关键帧段拼成完整 embedded 跨度
+#       (header 实字节 + chunk0 实字节置于真实 payloadOffset + 其余未取回
+#       chunk 置零), 供宿主 malloc 后调既有 ssm1d_load 走 ParseEx embedded
+#       → PlayerInit → PlayerTick 调度链。未取回 chunk 为零字节仅占位, 不进
+#       任何渲染/解码消费 (首帧只消费 sha256 已断言的 chunk0 字节)。
+import std/monotimes
+import std/rawbytes
+import std/strutils
+import std/system
+import std/crypto/sha256
+import cheng/quic/connection
+import cheng/quic/msquicruntime
+import cheng/quic/msquictransport_native
+import cheng/quic/native_runtime
+import cheng/libp2p/transports/quic_transport
+import cheng/libp2p/protocols/media/moq_segment_stream
+import cheng/game/assets/stream/manifest
+import cheng/game/assets/import/reader
+
+# 设备层探测桥 (与 QUIC datapath 同一 provider 符号, 链接期解析)。
+@importc("cheng_host_socket")
+fn qProbeSocket(domain: int32, typ: int32, protocol: int32): int32
+@importc("cheng_host_bind")
+fn qProbeBind(fd: int32, addr: ptr, len: int32): int32
+@importc("cheng_host_sendto")
+fn qProbeSendto(fd: int32, buf: ptr, len: int32, flags: int32, addr: ptr,
+                addrlen: int32): int32
+@importc("cheng_host_recvfrom")
+fn qProbeRecvfrom(fd: int32, buf: ptr, len: int32, flags: int32, addr: ptr,
+                  addrlen: ptr): int32
+@importc("cheng_host_close")
+fn qProbeClose(fd: int32): int32
+@importc("cheng_mobile_udp_fd_wait_readable")
+fn qProbeWaitReadable(fd: int32, timeoutMs: int32): int32
+@importc("cheng_errno")
+fn qProbeErrno(): int32
+@importc("cheng_host_connect")
+fn qProbeConnect(fd: int32, addr: ptr, len: int32): int32
+@importc("cheng_host_send")
+fn qProbeSend(fd: int32, buf: ptr, len: int32, flags: int32): int32
+@importc("libc_getsockname")
+fn qProbeGetSockName(fd: int32, addr: ptr, lenPtr: ptr): int32
+
+# M6q 真机打点桥 (宿主 C 侧定义, hilog 直出): probe/fetch 逐层回报卡点。
+# probe step: 1=enter 2=socket(rx) 3=bind 4=socket(tx) 5=sendto(A 127.0.0.1)
+#   6=wait(A) 7=recvfrom(A) 60=connect(B) 61=send(B) 62=wait(B)
+#   80=lip-socket 81=lip-connect(8.8.8.8) 82=lip-getsockname 83=rx2-bind
+#   90=sendto(C lip) 91=wait(C) 92=connect(D lip) 93=send(D) 94=wait(D)
+#   8=exit;  a/b = 该层 rc 与紧随的 errno (tick 前先取 errno)。
+# fetch step: 100=enter 101=settings 102=transport 103=tsettings 104=tls
+#   105=addr 106=dial(-1=first 失败转 lip 重试) 107=lip-dial 108=negotiate 8 结束。
+@importc("cheng_qprobe_tick")
+fn qProbeTick(step: int32, a: int32, b: int32)
+
+const
+    QNegotiateBytes = 45
+    QScanMaxSpins = 3000
+    QSegmentChunkBytes = 65536
+    QScanWaitCapMs = 20
+    QInitialWindowPackets: int32 = 64
+    QEofText = "msquic: stream closed"
+    QReadTimeoutText = "msquic native: pipe read timeout"
+    QDrainMaxIdleSpins = 2000
+    QManifestSegmentKey = "ssm1-manifest"
+    QKeyframeSegmentKey = "ssm1-keyframe"
+    QDpd1HdrBytes = 36
+    # f2 ohos serve 专项 (2026-09-17): serve_once 的 accept 改有界切片。阻塞
+    # accept (waitMs=-1) 在非阻塞 fd 上是 EAGAIN 忙转且半开握手挂死时零日志
+    # (fb §7: event8×22040, T_SERVE 零输出); 空闲切片退回 NAPI 线程按既有
+    # 「FAIL serve_accept 空闲重试」语义再入。
+    QServeAcceptSliceMs = 100
+    QServeAcceptIdleText = "msquic: accept timeout"
+
+type
+    QDpd1Header =
+        frameIndex: int64
+        ptsMs: int64
+        width: int64
+        height: int64
+        depthScale: int64
+
+var
+    q_pack: rawbytes.Bytes
+    q_m: manifest.StreamManifest
+    q_kfIdx: int32
+    q_kfOffset: int64
+    q_kfLen: int64
+    q_listener: msquictransport_native.MsQuicTransport
+    q_port: int32
+    q_listening: bool
+    q_manifestSeg: rawbytes.Bytes
+    q_chunkSeg: rawbytes.Bytes
+    q_frameW: int64
+    q_frameH: int64
+    q_minV: int32
+    q_maxV: int32
+    q_lastErr: str
+    q_stage: int32
+    # M6q: probe 发现的本机实 IP (UDP connect 选路 getsockname), fetch 第二跳用。
+    q_lip0: int32 = -1
+    q_lip1: int32 = -1
+    q_lip2: int32 = -1
+    q_lip3: int32 = -1
+
+type QBytePtr = uint8 *
+
+fn q_ptr_plus(base: ptr, off: int32): ptr =
+    if base == nil:
+        return nil
+    return ptr(uint64(base) + uint64(off))
+
+# 全局 Bytes 槽位的按值读取视图 (见头部借用合同注记)。
+fn q_pack_view(): rawbytes.Bytes =
+    return rawbytes.BytesView(q_pack.data, q_pack.len)
+
+fn q_manifest_seg_view(): rawbytes.Bytes =
+    return rawbytes.BytesView(q_manifestSeg.data, q_manifestSeg.len)
+
+fn q_chunk_seg_view(): rawbytes.Bytes =
+    return rawbytes.BytesView(q_chunkSeg.data, q_chunkSeg.len)
+
+# 应答 str -> 调用方缓冲区 (字节拷贝 + NUL, 同 ssm1d_copy_out)。
+fn q_copy_out(resp: str, out: ptr, cap: int32): int32 =
+    if out == nil:
+        return -1
+    if resp.len < 0 || resp.len + 1 > cap:
+        return -2
+    var i: int32
+    for i in 0..<resp.len:
+        *(QBytePtr(q_ptr_plus(out, i))) = *(QBytePtr(q_ptr_plus(resp.data, i)))
+    *(QBytePtr(q_ptr_plus(out, resp.len))) = uint8(0)
+    return resp.len
+
+# === serve 侧 (同源 ssm1_moq_serve.cheng) ===
+
+# 扫描 AppRecvAvailable 定位数据槽 (opensmoke/M5 同款: bind → pump → 查询,
+# 空扫后事件驱动等待)。
+fn QWaitReadable(side: int32, streamId: int64, want: int32): int32 =
+    # 单进程双角色形态: pump 放在每轮开头推一次 (同时推进 client+listener 两
+    # 个 datapath), 随后一次性扫全部槽。M5 的「每 bind 一泵」会把 pump 的内部
+    # 重绑定混进逐槽读数, 在双角色同进程下产生跨槽错读 (实测 scan 报槽 0、
+    # 数据实际落槽 1), 故回退 opensmoke 原形 (扫内不泵)。
+    # fb ohos 重建 (2026-09-17): 纯客户端单角色下, 轮首单泵依赖上一轮遗留的
+    # cur 槽 (pump 的 active/closed gate 用 stale cur 检查), negotiate 发送后
+    # 遗留 cur 非 active 槽 → pump 全程空转 (真机实证 3000 spin 零 recv,
+    # fd 恒可读)。纯客户端 (listener 未运行) 时回退 M5 exe 形「每 bind 一泵」
+    # (单角色无跨槽错读问题, exe 形在 android/Mac 真机 PASS); 双角色保持
+    # 轮首单泵原形不变。
+    var spins: int32
+    spins = 0
+    while spins < QScanMaxSpins:
+        let pumpRes = native_runtime.msquicNativePump(1)
+        if IsErr(pumpRes):
+            q_lastErr = Fmt"scan_pump_err spins={spins} err={ErrorText(pumpRes)}"
+            return -2
+        for k in 0..<native_runtime.N_SLOTS:
+            if ! q_listening:
+                let bindPumpRes = native_runtime.msquicNativePump(1)
+                if IsErr(bindPumpRes):
+                    q_lastErr = Fmt"scan_bind_pump_err spins={spins} slot={k} err={ErrorText(bindPumpRes)}"
+                    return -2
+            # 槽显式锁内扫读 (F-J): 旧形裸写 cur 再读, dual-role 下 ks 错槽。
+            let avail = native_runtime.msquicNativeAppRecvAvailableAt(k, side, streamId)
+            if avail >= want:
+                return k
+        native_runtime.msquicNativeWaitReadableForSide(side, QScanWaitCapMs)
+        if ! q_listening:
+            let wakePumpRes = native_runtime.msquicNativePump(1)
+            if IsErr(wakePumpRes):
+                q_lastErr = Fmt"scan_wake_pump_err spins={spins} err={ErrorText(wakePumpRes)}"
+                return -2
+        spins = spins + 1
+    q_lastErr = Fmt"scan_exhausted spins={QScanMaxSpins} stream={streamId}"
+    return -1
+
+# 单流 negotiate 服务半环。
+fn QAcceptStream(listener: var msquictransport_native.MsQuicTransport,
+                 streamId: int64,
+                 serverConn: var connection.Connection): bool =
+    let ks = QWaitReadable(1, streamId, QNegotiateBytes)
+    if ks < 0:
+        # -1 = 扫描窗口耗尽; -2 = pump Err (q_lastErr 已带真实错误文本)。
+        if ks == -1:
+            q_lastErr = Fmt"scan_failed spins={QScanMaxSpins} stream={streamId}"
+        return false
+    serverConn = connection.ConnFromPipeIdx(1000001 + ks, 1, streamId, streamId)
+    let negRes = moq_segment_stream.Libp2pMoqSegmentStreamServerNegotiate(listener,
+        serverConn)
+    if IsErr(negRes):
+        q_lastErr = Fmt"negotiate_failed stream={streamId} slot={ks} err={ErrorText(negRes)}"
+        return false
+    q_lastErr = Fmt"ok stream={streamId} slot={ks}"
+    return true
+
+# 服务端权威段长写出 + 写侧 shutdown (EOF 语义)。
+# 服务端权威段长写出 + 写侧 shutdown (EOF 语义)。失败面带 q_lastErr 出
+# serve_write detail= (F-H4 §14.2 探针, 诊断 dual-role 写错槽/短写形态)。
+fn QWriteAuthoritativeRange(serverConn: var connection.Connection,
+                            segmentBytes: rawbytes.Bytes,
+                            offsetBytes: int32,
+                            lengthBytes: int32): bool =
+    let writeRes = moq_segment_stream.Libp2pMoqSegmentStreamServerWriteRange(
+        serverConn, segmentBytes, offsetBytes, lengthBytes, QSegmentChunkBytes)
+    if IsErr(writeRes):
+        q_lastErr = Fmt"serve_write_range err={ErrorText(writeRes)} off={offsetBytes} len={lengthBytes}"
+        return false
+    if Value(writeRes) != lengthBytes:
+        q_lastErr = Fmt"serve_write_range short wrote={Value(writeRes)} want={lengthBytes}"
+        return false
+    let shutRes = connection.ConnShutdownWrite(serverConn)
+    if IsErr(shutRes):
+        q_lastErr = Fmt"serve_write_shutdown err={ErrorText(shutRes)}"
+        return false
+    return true
+
+# === fetch 侧 (同源 ssm1_moq_fetch.cheng) ===
+
+# 段 drain (单进程环回形态)。M5 跨进程以 peer 写关 EOF ("msquic: stream
+# closed") 收尾; 单进程同线程下 FIN 排在流 8 64KB 数据之后, 等 FIN 属病态
+# (读侧 timeout 滴灌)。改用内容完成式收尾, 校验强度不降:
+#   manifest 段: QParseManifestHeader 的 cursor==n64 判定即 M5「audioRef 后
+#                恰为段 EOF」的段长精确性证明, 每轮增量读后即试解析;
+#   chunk 段:    取满声明 payloadLen 为界 (随后 sha256==cid 内容寻址自证)。
+# 读侧 timeout 仅在 send 队列 flush 期间出现, 重试前显式推 dual-role pump
+# (读侧阻塞只泵本侧), QDrainMaxIdleSpins 封顶防空转。
+fn QDrainSegmentRead(reader: var moq_segment_stream.Libp2pMoqSegmentStreamReader,
+                     out: var rawbytes.Bytes, quotaBytes: int64,
+                     idleSpins: var int32): bool =
+    let readRes = moq_segment_stream.Libp2pMoqSegmentStreamRead(reader, QSegmentChunkBytes)
+    if IsErr(readRes):
+        if ErrorText(readRes) == QEofText:
+            return true
+        if ErrorText(readRes) == QReadTimeoutText:
+            idleSpins = idleSpins + 1
+            if idleSpins > QDrainMaxIdleSpins:
+                q_lastErr = Fmt"drain_idle_cap got={rawbytes.BytesLen(out)}"
+                return false
+            let _ = native_runtime.msquicNativePump(1)
+            return true
+        q_lastErr = Fmt"drain_err err={ErrorText(readRes)} got={rawbytes.BytesLen(out)}"
+        return false
+    let chunk = Value(readRes)
+    let chunkLen = rawbytes.BytesLen(chunk)
+    if chunkLen <= 0:
+        return true
+    idleSpins = 0
+    if int64(rawbytes.BytesLen(out)) + int64(chunkLen) > quotaBytes:
+        q_lastErr = Fmt"drain_quota got={rawbytes.BytesLen(out)}"
+        return false
+    connection.bytesAppend(out, chunk)
+    return true
+
+fn QDrainManifestUntilParse(
+        reader: var moq_segment_stream.Libp2pMoqSegmentStreamReader,
+        out: var rawbytes.Bytes,
+        outM: var manifest.StreamManifest): bool =
+    var idleSpins: int32 = 0
+    while true:
+        var fm: manifest.StreamManifest
+        if QParseManifestHeader(out, fm):
+            outM = fm
+            return true
+        if rawbytes.BytesLen(out) > manifest.StreamManifestQuotaMaxBytes():
+            q_lastErr = Fmt"drain_quota got={rawbytes.BytesLen(out)}"
+            return false
+        if !QDrainSegmentRead(reader, out,
+                              manifest.StreamManifestQuotaMaxBytes(), idleSpins):
+            return false
+
+fn QDrainChunkUntilLen(
+        reader: var moq_segment_stream.Libp2pMoqSegmentStreamReader,
+        out: var rawbytes.Bytes, wantLen: int64): bool =
+    var idleSpins: int32 = 0
+    while int64(rawbytes.BytesLen(out)) < wantLen:
+        if !QDrainSegmentRead(reader, out,
+                              manifest.StreamManifestQuotaMaxBytes(), idleSpins):
+            return false
+    return true
+
+# 纯头段解析 (M5 FetchParseManifestHeader 合同复刻: 省略 payload 落界检查,
+# 其余字段校验同款; audioRef 后恰为段 EOF)。
+@borrows
+fn QParseManifestHeader(data: rawbytes.Bytes,
+                        outM: var manifest.StreamManifest): bool =
+    var fresh: manifest.StreamManifest
+    outM = fresh
+    let n64 = int64(rawbytes.BytesLen(data))
+    if n64 > manifest.StreamManifestQuotaMaxBytes():
+        return false
+    if n64 < int64(12):
+        return false
+    if rawbytes.BytesGet(data, 0) != Int32('S'):
+        return false
+    if rawbytes.BytesGet(data, 1) != Int32('S'):
+        return false
+    if rawbytes.BytesGet(data, 2) != Int32('M'):
+        return false
+    if rawbytes.BytesGet(data, 3) != Int32('1'):
+        return false
+    var version: int64
+    if !reader.AssetReaderU32At(data, 4, version):
+        return false
+    if version != int64(1):
+        return false
+    var count64: int64
+    if !reader.AssetReaderU32At(data, 8, count64):
+        return false
+    if count64 < int64(1) || count64 > int64(manifest.StreamManifestQuotaMaxChunks()):
+        return false
+    var m: manifest.StreamManifest
+    m.chunkCount = int32(count64)
+    var cursor: int64
+    cursor = int64(12)
+    var prevEnd: int64
+    prevEnd = int64(0)
+    var lastKf: int32
+    lastKf = -1
+    for i in 0..<m.chunkCount:
+        var startMs: int64
+        if !manifest.StreamManifestI64At(data, int32(cursor), startMs):
+            return false
+        if startMs < int64(0):
+            return false
+        var durationMs: int64
+        if !manifest.StreamManifestI64At(data, int32(cursor + 8), durationMs):
+            return false
+        if durationMs < int64(0):
+            return false
+        if startMs < prevEnd:
+            return false
+        if durationMs > int64(9223372036854775807) - startMs:
+            return false
+        prevEnd = startMs + durationMs
+        cursor = cursor + 16
+        if cursor >= n64:
+            return false
+        let kf = rawbytes.BytesGet(data, int32(cursor))
+        if kf != 0 && kf != 1:
+            return false
+        cursor = cursor + 1
+        var cidLen: int64
+        if !reader.AssetReaderU32At(data, int32(cursor), cidLen):
+            return false
+        cursor = cursor + 4
+        if cidLen != int64(manifest.StreamManifestCidLenV1()):
+            return false
+        if cursor + cidLen > n64:
+            return false
+        for k in 0..<manifest.StreamManifestCidLenV1():
+            if !manifest.StreamManifestHexByte(rawbytes.BytesGet(data, int32(cursor) + k)):
+                return false
+        add(m.cid, rawbytes.BytesToString(
+            rawbytes.BytesSliceView(data, int32(cursor), manifest.StreamManifestCidLenV1())))
+        cursor = cursor + cidLen
+        var payloadLen: int64
+        if !manifest.StreamManifestI64At(data, int32(cursor), payloadLen):
+            return false
+        if payloadLen < int64(0):
+            return false
+        var payloadOffset: int64
+        if !manifest.StreamManifestI64At(data, int32(cursor + 8), payloadOffset):
+            return false
+        if payloadOffset < int64(0):
+            return false
+        cursor = cursor + 16
+        add(m.startMs, startMs)
+        add(m.durationMs, durationMs)
+        add(m.keyframe, kf)
+        add(m.payloadLen, payloadLen)
+        add(m.payloadOffset, payloadOffset)
+        if kf == 1:
+            lastKf = i
+        add(m.keyframeBefore, lastKf)
+    var audioLen: int64
+    if !reader.AssetReaderU32At(data, int32(cursor), audioLen):
+        return false
+    cursor = cursor + 4
+    if audioLen != int64(0):
+        if audioLen != int64(manifest.StreamManifestCidLenV1()):
+            return false
+        if cursor + audioLen > n64:
+            return false
+        for k in 0..<manifest.StreamManifestCidLenV1():
+            if !manifest.StreamManifestHexByte(rawbytes.BytesGet(data, int32(cursor) + k)):
+                return false
+        m.audioCid = rawbytes.BytesToString(
+            rawbytes.BytesSliceView(data, int32(cursor), manifest.StreamManifestCidLenV1()))
+        cursor = cursor + audioLen
+    if cursor != n64:
+        return false
+    m.totalDurationMs = prevEnd
+    m.ok = true
+    outM = m
+    return true
+
+# DPD1 头校验 (同源 ssm1_depth_preview.Dpd1ParseHeader: magic/version/bits=16/
+# reserved=0/尺寸自洽; scale 正 int32 域)。
+fn QParseDpd1Header(view: rawbytes.Bytes, outHdr: var QDpd1Header): bool =
+    var fresh: QDpd1Header
+    outHdr = fresh
+    let n64 = int64(rawbytes.BytesLen(view))
+    if n64 < int64(QDpd1HdrBytes):
+        return false
+    if rawbytes.BytesGet(view, 0) != Int32('D'):
+        return false
+    if rawbytes.BytesGet(view, 1) != Int32('P'):
+        return false
+    if rawbytes.BytesGet(view, 2) != Int32('D'):
+        return false
+    if rawbytes.BytesGet(view, 3) != Int32('1'):
+        return false
+    if rawbytes.BytesGet(view, 4) != 1:
+        return false
+    if rawbytes.BytesGet(view, 5) != 16:
+        return false
+    if rawbytes.BytesGet(view, 6) != 0:
+        return false
+    if rawbytes.BytesGet(view, 7) != 0:
+        return false
+    var frameIndex: int64
+    if !reader.AssetReaderU32At(view, 8, frameIndex):
+        return false
+    var ptsMs: int64
+    if !manifest.StreamManifestI64At(view, 12, ptsMs):
+        return false
+    var width: int64
+    if !reader.AssetReaderU32At(view, 20, width):
+        return false
+    var height: int64
+    if !reader.AssetReaderU32At(view, 24, height):
+        return false
+    var scale: int64
+    if !reader.AssetReaderU32At(view, 28, scale):
+        return false
+    if scale < int64(1) || scale > int64(2147483647):
+        return false
+    if width < int64(1) || height < int64(1):
+        return false
+    if width > int64(65536) || height > int64(65536):
+        return false
+    let px64 = width * height
+    if int64(QDpd1HdrBytes) + px64 * int64(2) != n64:
+        return false
+    outHdr.frameIndex = frameIndex
+    outHdr.ptsMs = ptsMs
+    outHdr.width = width
+    outHdr.height = height
+    outHdr.depthScale = scale
+    return true
+
+# === 导出: 发布即就绪 ===
+@exportc("ssm1q_serve_start")
+fn ssm1q_serve_start(data: ptr, len: int32, port: int32, out: ptr,
+                     cap: int32): int32 =
+    if data == nil:
+        return q_copy_out("ERR serve_nil_data", out, cap)
+    if len <= 0 || port <= 0 || port > 65535:
+        return q_copy_out("ERR serve_bad_args", out, cap)
+    var b = rawbytes.BytesBuilderNew(len)
+    for i in 0..<len:
+        rawbytes.BytesBuilderAppendByte(b,
+            *(QBytePtr(q_ptr_plus(data, i))))
+    var packBytes = rawbytes.BytesBuilderFinish(b)
+    var freshM: manifest.StreamManifest
+    if !manifest.StreamManifestParseEx(packBytes, freshM, true):
+        rawbytes.BytesFree(packBytes)
+        return q_copy_out("ERR serve_pack_parse_failed", out, cap)
+    let headerLen = freshM.payloadOffset[0]
+    let kfIdx = manifest.StreamManifestNearestKeyframeIndexForTime(freshM, int64(0))
+    if kfIdx < 0:
+        rawbytes.BytesFree(packBytes)
+        return q_copy_out("ERR serve_no_keyframe", out, cap)
+    var kf: manifest.StreamChunk
+    if !manifest.StreamManifestChunkAt(freshM, kfIdx, kf):
+        rawbytes.BytesFree(packBytes)
+        return q_copy_out("ERR serve_keyframe_chunk_at_failed", out, cap)
+    if !kf.isKeyframe:
+        rawbytes.BytesFree(packBytes)
+        return q_copy_out("ERR serve_first_kf_not_keyframe", out, cap)
+    if kf.payloadOffset > int64(2147483647) - kf.payloadLen:
+        rawbytes.BytesFree(packBytes)
+        return q_copy_out("ERR serve_kf_range_past_i32", out, cap)
+    if headerLen > int64(2147483647):
+        rawbytes.BytesFree(packBytes)
+        return q_copy_out("ERR serve_header_len_past_i32", out, cap)
+    var settings = msquicruntime.initMsQuicSettings()
+    settings.allowDatagram = true
+    settings.initialWindowPackets = QInitialWindowPackets
+    # MsQuicTransport 含托管 MultiAddress 字段, 模块级槽位原地构造
+    # (InitMsQuicTransportInto), 后续全部按 var 引用推进。
+    if q_listening:
+        msquictransport_native.Stop(q_listener)
+        var oldPack = q_pack_view()
+        rawbytes.BytesFree(oldPack)
+    msquictransport_native.InitMsQuicTransportInto(q_listener)
+    if !IsOk(msquictransport_native.setMsQuicTransportSettings(q_listener, settings)):
+        rawbytes.BytesFree(packBytes)
+        return q_copy_out("ERR serve_listener_settings", out, cap)
+    if !IsOk(quic_transport.Libp2pQuicConfigureTls(q_listener)):
+        rawbytes.BytesFree(packBytes)
+        return q_copy_out("ERR serve_listener_tls", out, cap)
+    let listenAddrRes = quic_transport.Libp2pQuicAddrFromHostPort("0.0.0.0", port)
+    if IsErr(listenAddrRes):
+        rawbytes.BytesFree(packBytes)
+        return q_copy_out("ERR serve_listen_addr", out, cap)
+    msquictransport_native.start(q_listener, Value(listenAddrRes))
+    if !q_listener.running:
+        rawbytes.BytesFree(packBytes)
+        let lErr = q_listener.lastError
+        return q_copy_out(Fmt"ERR serve_listen_start_failed err={lErr}", out, cap)
+    q_pack = packBytes
+    q_m = freshM
+    q_kfIdx = kfIdx
+    q_kfOffset = kf.payloadOffset
+    q_kfLen = kf.payloadLen
+    q_port = port
+    q_listening = true
+    let fileLen = rawbytes.BytesLen(packBytes)
+    let resp = Fmt"OK serve chunks={freshM.chunkCount} headerLen={headerLen} kfChunk={kfIdx} kfLen={kf.payloadLen} fileLen={fileLen} port={port} state=listening"
+    return q_copy_out(resp, out, cap)
+
+# === 导出: 独立服务半环 (task_x 双真机互发) ===
+# 对本进程 listener 的下一个外部连接做 accept + 双流 negotiate + 权威推段 +
+# flush + 关闭 (fetch_run 内联 serve 半环 stage 3 的原样拆出; 段内容恒为
+# 服务端权威 kf range, 逐字节正确性由 fetch 端 sha256==cid 断言兜底)。
+# 空闲/超时由调用方 (NAPI serve 循环线程) 按 ssm1_moq_serve.cheng accept 主
+# 循环同款语义处理: Err accept → 重试, 其余 FAIL → fail-stop。
+@exportc("ssm1q_serve_serve_once")
+fn ssm1q_serve_serve_once(out: ptr, cap: int32): int32 =
+    if !q_listening:
+        return q_copy_out("FAIL not_listening", out, cap)
+    let acceptRes = msquictransport_native.AcceptGlobalTimed(QServeAcceptSliceMs)
+    if IsErr(acceptRes):
+        let acceptErr = ErrorText(acceptRes)
+        if acceptErr == QServeAcceptIdleText:
+            let idlePumpRes = native_runtime.msquicNativePump(1)
+            if IsErr(idlePumpRes):
+                return q_copy_out(Fmt"FAIL serve_accept idle_pump {ErrorText(idlePumpRes)}", out, cap)
+            return q_copy_out("FAIL serve_accept idle", out, cap)
+        return q_copy_out(Fmt"FAIL serve_accept {acceptErr}", out, cap)
+    var serverLegacy = Value(acceptRes)
+    var streamServer4: connection.Connection
+    if !QAcceptStream(q_listener, int64(4), streamServer4):
+        connection.ConnClose(serverLegacy)
+        return q_copy_out(Fmt"FAIL serve_negotiate_4 detail={q_lastErr}", out, cap)
+    var streamServer8: connection.Connection
+    if !QAcceptStream(q_listener, int64(8), streamServer8):
+        connection.ConnClose(serverLegacy)
+        return q_copy_out("FAIL serve_negotiate_8", out, cap)
+    let headerLen = int32(q_m.payloadOffset[0])
+    var packView = q_pack_view()
+    if !QWriteAuthoritativeRange(streamServer4, packView, 0, headerLen):
+        connection.ConnClose(serverLegacy)
+        return q_copy_out(Fmt"FAIL serve_manifest_write detail={q_lastErr}", out, cap)
+    if !QWriteAuthoritativeRange(streamServer8, packView,
+                                 int32(q_kfOffset), int32(q_kfLen)):
+        connection.ConnClose(serverLegacy)
+        return q_copy_out(Fmt"FAIL serve_chunk_write detail={q_lastErr}", out, cap)
+    # 推段 + FIN 落盘 flush (同 fetch_run stage 3 尾部: 单线程无独立 serve
+    # 线程持续泵 socket, 关连接前固定 pump 轮把两段与写关 FIN 推入 socket)。
+    var flushSpin: int32 = 0
+    while flushSpin < 16:
+        let _ = native_runtime.msquicNativePump(1)
+        flushSpin = flushSpin + 1
+    connection.ConnClose(serverLegacy)
+    return q_copy_out(Fmt"OK served headerLen={headerLen} kfLen={q_kfLen} port={q_port}", out, cap)
+
+# === 导出: 完整 fetch 状态机 (同源 M5 终版语义) ===
+@exportc("ssm1q_fetch_run")
+fn ssm1q_fetch_run(hostCstr: cstring, port: int32, out: ptr,
+                   cap: int32): int32 =
+    if !q_listening:
+        return q_copy_out("FAIL not_listening", out, cap)
+    if port <= 0 || port > 65535:
+        return q_copy_out("FAIL bad_port", out, cap)
+    let host = strFromCStringCopy(hostCstr)
+
+    q_stage = 1
+    qProbeTick(100, port, 0)
+    var tDialStart = monotimes.GetMonoTime()
+    var settings = msquicruntime.initMsQuicSettings()
+    settings.allowDatagram = true
+    settings.initialWindowPackets = QInitialWindowPackets
+    # 第一跳 127.0.0.1 快速失败 (ohos 环回可能被内核丢包, 20s 全额等待不可接受)。
+    settings.handshakeIdleTimeoutMs = 3000
+    var client = msquictransport_native.InitMsQuicTransport()
+    if !IsOk(msquictransport_native.setMsQuicTransportSettings(client, settings)):
+        qProbeTick(103, -1, 0)
+        return q_copy_out("FAIL client_settings", out, cap)
+    if !IsOk(quic_transport.Libp2pQuicConfigureTls(client)):
+        qProbeTick(104, -1, 0)
+        return q_copy_out("FAIL client_tls", out, cap)
+    let dialAddrRes = quic_transport.Libp2pQuicAddrFromHostPort(host, port)
+    if IsErr(dialAddrRes):
+        return q_copy_out("FAIL dial_addr", out, cap)
+    qProbeTick(105, 0, 0)
+    var dialRes = msquictransport_native.dial(client, Value(dialAddrRes))
+    if IsErr(dialRes):
+        qProbeTick(106, -1, 0)
+        # 第二跳: 本机实 IP (listener 绑 0.0.0.0, 双地址都可达; 环回被丢包时的
+        # 唯一 UDP 自连通道)。
+        if q_lip0 < 0:
+            let dialErrNoLip = ErrorText(dialRes)
+            return q_copy_out(Fmt"FAIL dial {dialErrNoLip} nolip", out, cap)
+        var settings2 = msquicruntime.initMsQuicSettings()
+        settings2.allowDatagram = true
+        settings2.initialWindowPackets = QInitialWindowPackets
+        if !IsOk(msquictransport_native.setMsQuicTransportSettings(client, settings2)):
+            return q_copy_out("FAIL lip_settings", out, cap)
+        if !IsOk(quic_transport.Libp2pQuicConfigureTls(client)):
+            return q_copy_out("FAIL lip_tls", out, cap)
+        let lipHost = Fmt"{q_lip0}.{q_lip1}.{q_lip2}.{q_lip3}"
+        let lipAddrRes = quic_transport.Libp2pQuicAddrFromHostPort(lipHost, port)
+        if IsErr(lipAddrRes):
+            return q_copy_out(Fmt"FAIL lip_addr {lipHost}", out, cap)
+        dialRes = msquictransport_native.dial(client, Value(lipAddrRes))
+        if IsErr(dialRes):
+            let dialErr2 = ErrorText(dialRes)
+            qProbeTick(107, -1, 0)
+            return q_copy_out(Fmt"FAIL lip_dial {dialErr2} lip={lipHost}", out, cap)
+        qProbeTick(107, 0, 0)
+    q_stage = 2
+    var clientLegacy = Value(dialRes)
+    var tDialed = monotimes.GetMonoTime()
+
+    # client: 双流 negotiate 背靠背发出 (M5 轮 2 调度)。
+    var streamClient4 = connection.ConnDeriveStream(clientLegacy, 4, 4)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientSendNegotiate(client,
+        streamClient4)):
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL negotiate_send_4", out, cap)
+    var streamClient8 = connection.ConnDeriveStream(clientLegacy, 8, 8)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientSendNegotiate(client,
+        streamClient8)):
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL negotiate_send_8", out, cap)
+
+    q_stage = 3
+    # serve 侧: accept + 双流 negotiate + 权威推段 (M5 轮 4/5 语义; 单线程
+    # 顺序推进, 扫描循环内的 pump 同时推进两角色)。
+    let acceptRes = msquictransport_native.accept(q_listener)
+    if IsErr(acceptRes):
+        connection.ConnClose(clientLegacy)
+        let acceptErr = ErrorText(acceptRes)
+        return q_copy_out(Fmt"FAIL serve_accept {acceptErr}", out, cap)
+    var serverLegacy = Value(acceptRes)
+    var streamServer4: connection.Connection
+    if !QAcceptStream(q_listener, int64(4), streamServer4):
+        var dbg: str[]
+        add(dbg, Fmt"FAIL serve_negotiate_4 detail={q_lastErr} clientRecv4={native_runtime.msquicNativeAppRecvAvailable(0, 4)} clientRecv8={native_runtime.msquicNativeAppRecvAvailable(0, 8)}")
+        for k in 0..<native_runtime.N_SLOTS:
+            add(dbg, Fmt"  slot{k} s4={native_runtime.msquicNativeAppRecvAvailableAt(k, 1, 4)} s8={native_runtime.msquicNativeAppRecvAvailableAt(k, 1, 8)} c4={native_runtime.msquicNativeAppRecvAvailableAt(k, 0, 4)} c8={native_runtime.msquicNativeAppRecvAvailableAt(k, 0, 8)}")
+        connection.ConnClose(serverLegacy)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(strutils.Join(dbg, "|"), out, cap)
+    var streamServer8: connection.Connection
+    if !QAcceptStream(q_listener, int64(8), streamServer8):
+        connection.ConnClose(serverLegacy)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL serve_negotiate_8", out, cap)
+    let headerLen = int32(q_m.payloadOffset[0])
+    var packView = q_pack_view()
+    if !QWriteAuthoritativeRange(streamServer4, packView, 0, headerLen):
+        connection.ConnClose(serverLegacy)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL serve_manifest_write", out, cap)
+    if !QWriteAuthoritativeRange(streamServer8, packView,
+                                 int32(q_kfOffset), int32(q_kfLen)):
+        connection.ConnClose(serverLegacy)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL serve_chunk_write", out, cap)
+    # 推段 + FIN 落盘 flush: 单线程形态下无独立 serve 线程持续泵 socket,
+    # 关连接前给 server 侧固定 pump 轮把两段数据与写关 FIN 推入本进程 socket
+    # (否则客户端 drain 末尾只能等到 pipe read timeout, 见 M5 §5.③)。
+    var flushSpin: int32 = 0
+    while flushSpin < 16:
+        let _ = native_runtime.msquicNativePump(1)
+        flushSpin = flushSpin + 1
+    connection.ConnClose(serverLegacy)
+
+    q_stage = 4
+    # fetch 侧: 读 ack → 绑 reader → drain。
+    let kc4 = QWaitReadable(0, 4, QNegotiateBytes)
+    if kc4 < 0:
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL negotiate_ack_slot_4 lastErr={q_lastErr}", out, cap)
+    var clientReader4 = connection.ConnFromPipeIdx(1000001 + kc4, 0, 4, 4)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client,
+        clientReader4)):
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL negotiate_ack_4", out, cap)
+    let kc8 = QWaitReadable(0, 8, QNegotiateBytes)
+    if kc8 < 0:
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL negotiate_ack_slot_8 lastErr={q_lastErr}", out, cap)
+    var clientReader8 = connection.ConnFromPipeIdx(1000001 + kc8, 0, 8, 8)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client,
+        clientReader8)):
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL negotiate_ack_8", out, cap)
+    var tReady = monotimes.GetMonoTime()
+
+    var manifestReq: moq_segment_stream.Libp2pMoqSegmentStreamRequest
+    manifestReq.streamId = "ssm1-fetch"
+    manifestReq.segmentKey = QManifestSegmentKey
+    manifestReq.offsetBytes = 0
+    manifestReq.lengthBytes = 268435456
+    manifestReq.readChunkBytes = QSegmentChunkBytes
+    var chunkReq: moq_segment_stream.Libp2pMoqSegmentStreamRequest
+    chunkReq.streamId = "ssm1-fetch"
+    chunkReq.segmentKey = QKeyframeSegmentKey
+    chunkReq.offsetBytes = 0
+    chunkReq.lengthBytes = 268435456
+    chunkReq.readChunkBytes = QSegmentChunkBytes
+
+    var manifestSeg = rawbytes.EmptyBytes()
+    var chunkSeg = rawbytes.EmptyBytes()
+    var manifestReader: moq_segment_stream.Libp2pMoqSegmentStreamReader
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamOpen(manifestReader,
+        clientReader4, manifestReq)):
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL manifest_open", out, cap)
+    var chunkReader: moq_segment_stream.Libp2pMoqSegmentStreamReader
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamOpen(chunkReader,
+        clientReader8, chunkReq)):
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL chunk_open", out, cap)
+    q_stage = 5
+    var tReqsSent = monotimes.GetMonoTime()
+
+    var fm: manifest.StreamManifest
+    q_stage = 6
+    if !QDrainManifestUntilParse(manifestReader, manifestSeg, fm):
+        let mLen = rawbytes.BytesLen(manifestSeg)
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL manifest_drain detail={q_lastErr} len={mLen}", out, cap)
+    var tManifestDone = monotimes.GetMonoTime()
+    let fKfIdx = manifest.StreamManifestNearestKeyframeIndexForTime(fm, int64(0))
+    if fKfIdx < 0:
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL no_keyframe", out, cap)
+    var fKf: manifest.StreamChunk
+    if !manifest.StreamManifestChunkAt(fm, fKfIdx, fKf):
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL keyframe_chunk_at", out, cap)
+    if !fKf.isKeyframe:
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL first_kf_not_keyframe", out, cap)
+    var tParseDone = monotimes.GetMonoTime()
+
+    q_stage = 7
+    if !QDrainChunkUntilLen(chunkReader, chunkSeg, fKf.payloadLen):
+        let cLen = rawbytes.BytesLen(chunkSeg)
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL chunk_drain detail={q_lastErr} len={cLen} want={fKf.payloadLen}", out, cap)
+    var tChunkDone = monotimes.GetMonoTime()
+
+    let chunkGotLen = int64(rawbytes.BytesLen(chunkSeg))
+    if chunkGotLen != fKf.payloadLen:
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL chunk_len got={chunkGotLen} want={fKf.payloadLen}", out, cap)
+    var digest = sha256.Sha256Digest(chunkSeg)
+    let digestHex = rawbytes.BytesToHex(digest)
+    rawbytes.BytesFree(digest)
+    if digestHex != fKf.cid:
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL sha256 got={digestHex} want={fKf.cid}", out, cap)
+
+    q_stage = 8
+    # 时间线 (M5 轮 2 同款形状)。
+    let dialNs = monotimes.MonoTimeNs(tDialed) - monotimes.MonoTimeNs(tDialStart)
+    let readyNs = monotimes.MonoTimeNs(tReady) - monotimes.MonoTimeNs(tDialed)
+    let reqsNs = monotimes.MonoTimeNs(tReqsSent) - monotimes.MonoTimeNs(tReady)
+    let manifestNs = monotimes.MonoTimeNs(tManifestDone) - monotimes.MonoTimeNs(tReqsSent)
+    let parseNs = monotimes.MonoTimeNs(tParseDone) - monotimes.MonoTimeNs(tManifestDone)
+    let chunkNs = monotimes.MonoTimeNs(tChunkDone) - monotimes.MonoTimeNs(tParseDone)
+    let firstNs = monotimes.MonoTimeNs(tChunkDone) - monotimes.MonoTimeNs(tReady)
+    let totalNs = monotimes.MonoTimeNs(tChunkDone) - monotimes.MonoTimeNs(tDialStart)
+    let manifestLen = rawbytes.BytesLen(manifestSeg)
+    var parts: str[]
+    add(parts, "SSM1 MoQ loopback fetch timeline:")
+    add(parts, Fmt"  dial (transport+tls+handshake): {dialNs} ns")
+    add(parts, Fmt"  connect ready (negotiate x2 + serve push): {readyNs} ns")
+    add(parts, Fmt"  readers bound (both streams): {reqsNs} ns")
+    add(parts, Fmt"  manifest segment ({manifestLen} bytes): {manifestNs} ns")
+    add(parts, Fmt"  parse + locate first keyframe: {parseNs} ns")
+    add(parts, Fmt"  keyframe chunk segment residual ({chunkGotLen} bytes): {chunkNs} ns")
+    add(parts, Fmt"  ready->first-frame ready: {firstNs} ns")
+    add(parts, Fmt"  total dial->first-frame ready: {totalNs} ns")
+    add(parts, Fmt"fetch ok chunks={fm.chunkCount} kfChunk={fKfIdx} manifest={manifestLen}B chunk={chunkGotLen}B sha256-match={digestHex}")
+    let timeline = strutils.Join(parts, "\n")
+    connection.ConnClose(clientLegacy)
+
+    # 接收侧状态切换: 旧段经等值视图释放, 新段接管槽位。
+    if rawbytes.BytesLen(q_manifestSeg) > 0:
+        var oldM = q_manifest_seg_view()
+        rawbytes.BytesFree(oldM)
+    if rawbytes.BytesLen(q_chunkSeg) > 0:
+        var oldC = q_chunk_seg_view()
+        rawbytes.BytesFree(oldC)
+    q_manifestSeg = manifestSeg
+    q_chunkSeg = chunkSeg
+    return q_copy_out(timeline, out, cap)
+
+# === 导出: 纯客户端 fetch (task_x 双真机互发, 无本地 listener 耦合) ===
+# 与 ssm1q_fetch_run 的差异仅两处:
+#   ① 无 `!q_listening` 守卫 (接收设备不发布);
+#   ② 无 stage 3 服务半环与环回 lip 第二跳重试 (对端是跨设备服务端, 单拨号
+#      失败即如实失败)。
+# stage 4-8 客户端路径与段/组装全局槽交换逻辑逐字节同源, sha256==cid 双断言
+# 不变; 时间线头改标 client fetch 以区分环回形态。
+@exportc("ssm1q_fetch_client_run")
+fn ssm1q_fetch_client_run(hostCstr: cstring, port: int32, out: ptr,
+                          cap: int32): int32 =
+    if port <= 0 || port > 65535:
+        return q_copy_out("FAIL bad_port", out, cap)
+    let host = strFromCStringCopy(hostCstr)
+
+    q_stage = 1
+    qProbeTick(100, port, 0)
+    var tDialStart = monotimes.GetMonoTime()
+    var settings = msquicruntime.initMsQuicSettings()
+    settings.allowDatagram = true
+    settings.initialWindowPackets = QInitialWindowPackets
+    settings.handshakeIdleTimeoutMs = 3000
+    var client = msquictransport_native.InitMsQuicTransport()
+    if !IsOk(msquictransport_native.setMsQuicTransportSettings(client, settings)):
+        qProbeTick(103, -1, 0)
+        return q_copy_out("FAIL client_settings", out, cap)
+    if !IsOk(quic_transport.Libp2pQuicConfigureTls(client)):
+        qProbeTick(104, -1, 0)
+        return q_copy_out("FAIL client_tls", out, cap)
+    let dialAddrRes = quic_transport.Libp2pQuicAddrFromHostPort(host, port)
+    if IsErr(dialAddrRes):
+        return q_copy_out("FAIL dial_addr", out, cap)
+    qProbeTick(105, 0, 0)
+    let dialRes = msquictransport_native.dial(client, Value(dialAddrRes))
+    if IsErr(dialRes):
+        let dialErr = ErrorText(dialRes)
+        qProbeTick(106, -1, 0)
+        return q_copy_out(Fmt"FAIL dial {dialErr}", out, cap)
+    q_stage = 2
+    var clientLegacy = Value(dialRes)
+    var tDialed = monotimes.GetMonoTime()
+
+    # client: 双流 negotiate 背靠背发出 (M5 轮 2 调度)。
+    var streamClient4 = connection.ConnDeriveStream(clientLegacy, 4, 4)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientSendNegotiate(client,
+        streamClient4)):
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL negotiate_send_4", out, cap)
+    var streamClient8 = connection.ConnDeriveStream(clientLegacy, 8, 8)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientSendNegotiate(client,
+        streamClient8)):
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL negotiate_send_8", out, cap)
+
+    q_stage = 4
+    # fetch 侧: 读 ack → 绑 reader → drain。
+    let kc4 = QWaitReadable(0, 4, QNegotiateBytes)
+    if kc4 < 0:
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL negotiate_ack_slot_4 lastErr={q_lastErr}", out, cap)
+    var clientReader4 = connection.ConnFromPipeIdx(1000001 + kc4, 0, 4, 4)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client,
+        clientReader4)):
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL negotiate_ack_4", out, cap)
+    let kc8 = QWaitReadable(0, 8, QNegotiateBytes)
+    if kc8 < 0:
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL negotiate_ack_slot_8 lastErr={q_lastErr}", out, cap)
+    var clientReader8 = connection.ConnFromPipeIdx(1000001 + kc8, 0, 8, 8)
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client,
+        clientReader8)):
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL negotiate_ack_8", out, cap)
+    var tReady = monotimes.GetMonoTime()
+
+    var manifestReq: moq_segment_stream.Libp2pMoqSegmentStreamRequest
+    manifestReq.streamId = "ssm1-fetch"
+    manifestReq.segmentKey = QManifestSegmentKey
+    manifestReq.offsetBytes = 0
+    manifestReq.lengthBytes = 268435456
+    manifestReq.readChunkBytes = QSegmentChunkBytes
+    var chunkReq: moq_segment_stream.Libp2pMoqSegmentStreamRequest
+    chunkReq.streamId = "ssm1-fetch"
+    chunkReq.segmentKey = QKeyframeSegmentKey
+    chunkReq.offsetBytes = 0
+    chunkReq.lengthBytes = 268435456
+    chunkReq.readChunkBytes = QSegmentChunkBytes
+
+    var manifestSeg = rawbytes.EmptyBytes()
+    var chunkSeg = rawbytes.EmptyBytes()
+    var manifestReader: moq_segment_stream.Libp2pMoqSegmentStreamReader
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamOpen(manifestReader,
+        clientReader4, manifestReq)):
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL manifest_open", out, cap)
+    var chunkReader: moq_segment_stream.Libp2pMoqSegmentStreamReader
+    if !IsOk(moq_segment_stream.Libp2pMoqSegmentStreamOpen(chunkReader,
+        clientReader8, chunkReq)):
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL chunk_open", out, cap)
+    q_stage = 5
+    var tReqsSent = monotimes.GetMonoTime()
+
+    var fm: manifest.StreamManifest
+    q_stage = 6
+    if !QDrainManifestUntilParse(manifestReader, manifestSeg, fm):
+        let mLen = rawbytes.BytesLen(manifestSeg)
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL manifest_drain detail={q_lastErr} len={mLen}", out, cap)
+    var tManifestDone = monotimes.GetMonoTime()
+    let fKfIdx = manifest.StreamManifestNearestKeyframeIndexForTime(fm, int64(0))
+    if fKfIdx < 0:
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL no_keyframe", out, cap)
+    var fKf: manifest.StreamChunk
+    if !manifest.StreamManifestChunkAt(fm, fKfIdx, fKf):
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL keyframe_chunk_at", out, cap)
+    if !fKf.isKeyframe:
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out("FAIL first_kf_not_keyframe", out, cap)
+    var tParseDone = monotimes.GetMonoTime()
+
+    q_stage = 7
+    if !QDrainChunkUntilLen(chunkReader, chunkSeg, fKf.payloadLen):
+        let cLen = rawbytes.BytesLen(chunkSeg)
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL chunk_drain detail={q_lastErr} len={cLen} want={fKf.payloadLen}", out, cap)
+    var tChunkDone = monotimes.GetMonoTime()
+
+    let chunkGotLen = int64(rawbytes.BytesLen(chunkSeg))
+    if chunkGotLen != fKf.payloadLen:
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL chunk_len got={chunkGotLen} want={fKf.payloadLen}", out, cap)
+    var digest = sha256.Sha256Digest(chunkSeg)
+    let digestHex = rawbytes.BytesToHex(digest)
+    rawbytes.BytesFree(digest)
+    if digestHex != fKf.cid:
+        rawbytes.BytesFree(manifestSeg)
+        rawbytes.BytesFree(chunkSeg)
+        connection.ConnClose(clientLegacy)
+        return q_copy_out(Fmt"FAIL sha256 got={digestHex} want={fKf.cid}", out, cap)
+
+    q_stage = 8
+    # 时间线 (M5 轮 2 同款形状)。
+    let dialNs = monotimes.MonoTimeNs(tDialed) - monotimes.MonoTimeNs(tDialStart)
+    let readyNs = monotimes.MonoTimeNs(tReady) - monotimes.MonoTimeNs(tDialed)
+    let reqsNs = monotimes.MonoTimeNs(tReqsSent) - monotimes.MonoTimeNs(tReady)
+    let manifestNs = monotimes.MonoTimeNs(tManifestDone) - monotimes.MonoTimeNs(tReqsSent)
+    let parseNs = monotimes.MonoTimeNs(tParseDone) - monotimes.MonoTimeNs(tManifestDone)
+    let chunkNs = monotimes.MonoTimeNs(tChunkDone) - monotimes.MonoTimeNs(tParseDone)
+    let firstNs = monotimes.MonoTimeNs(tChunkDone) - monotimes.MonoTimeNs(tReady)
+    let totalNs = monotimes.MonoTimeNs(tChunkDone) - monotimes.MonoTimeNs(tDialStart)
+    let manifestLen = rawbytes.BytesLen(manifestSeg)
+    var parts: str[]
+    add(parts, "SSM1 MoQ client fetch timeline:")
+    add(parts, Fmt"  dial (transport+tls+handshake): {dialNs} ns")
+    add(parts, Fmt"  connect ready (negotiate x2 + serve push): {readyNs} ns")
+    add(parts, Fmt"  readers bound (both streams): {reqsNs} ns")
+    add(parts, Fmt"  manifest segment ({manifestLen} bytes): {manifestNs} ns")
+    add(parts, Fmt"  parse + locate first keyframe: {parseNs} ns")
+    add(parts, Fmt"  keyframe chunk segment residual ({chunkGotLen} bytes): {chunkNs} ns")
+    add(parts, Fmt"  ready->first-frame ready: {firstNs} ns")
+    add(parts, Fmt"  total dial->first-frame ready: {totalNs} ns")
+    add(parts, Fmt"fetch ok chunks={fm.chunkCount} kfChunk={fKfIdx} manifest={manifestLen}B chunk={chunkGotLen}B sha256-match={digestHex}")
+    let timeline = strutils.Join(parts, "\n")
+    connection.ConnClose(clientLegacy)
+
+    # 接收侧状态切换: 旧段经等值视图释放, 新段接管槽位。
+    if rawbytes.BytesLen(q_manifestSeg) > 0:
+        var oldM = q_manifest_seg_view()
+        rawbytes.BytesFree(oldM)
+    if rawbytes.BytesLen(q_chunkSeg) > 0:
+        var oldC = q_chunk_seg_view()
+        rawbytes.BytesFree(oldC)
+    q_manifestSeg = manifestSeg
+    q_chunkSeg = chunkSeg
+    return q_copy_out(timeline, out, cap)
+
+# === 导出: 首关键帧灰度 RGBA (只消费 sha256 已断言的取回字节) ===
+@exportc("ssm1q_first_frame_gray")
+fn ssm1q_first_frame_gray(out: ptr, cap: int32, metaOut: ptr,
+                          metaCap: int32): int32 =
+    if rawbytes.BytesLen(q_chunkSeg) <= 0:
+        return q_copy_out("ERR no_fetched_chunk", metaOut, metaCap)
+    var chunkView = q_chunk_seg_view()
+    var hdr: QDpd1Header
+    if !QParseDpd1Header(chunkView, hdr):
+        return q_copy_out("ERR dpd1_header_invalid", metaOut, metaCap)
+    let pxCount64 = hdr.width * hdr.height
+    if pxCount64 > int64(2147483647) / int64(4):
+        return q_copy_out("ERR frame_too_large", metaOut, metaCap)
+    let pxCount = int32(pxCount64)
+    if int64(cap) < pxCount64 * int64(4):
+        return q_copy_out(Fmt"ERR out_cap_too_small cap={cap} need={pxCount64 * int64(4)} w={hdr.width} h={hdr.height}", metaOut, metaCap)
+    var v0: int32
+    if !reader.AssetReaderU16At(chunkView, QDpd1HdrBytes, v0):
+        return q_copy_out("ERR depth_read_failed", metaOut, metaCap)
+    var minV: int32
+    var maxV: int32
+    minV = v0
+    maxV = v0
+    for i in 1..<pxCount:
+        var v: int32
+        if !reader.AssetReaderU16At(chunkView, QDpd1HdrBytes + i * 2, v):
+            return q_copy_out("ERR depth_read_failed", metaOut, metaCap)
+        if v < minV:
+            minV = v
+        if v > maxV:
+            maxV = v
+    if maxV == minV:
+        return q_copy_out("ERR flat_field_rejected", metaOut, metaCap)
+    let span = maxV - minV
+    var grayMin: int32
+    var grayMax: int32
+    grayMin = 255
+    grayMax = 0
+    for i in 0..<pxCount:
+        var v: int32
+        if !reader.AssetReaderU16At(chunkView, QDpd1HdrBytes + i * 2, v):
+            return q_copy_out("ERR depth_read_failed", metaOut, metaCap)
+        var g = ((v - minV) * 255) / span
+        if g < 0:
+            g = 0
+        if g > 255:
+            g = 255
+        if g < grayMin:
+            grayMin = g
+        if g > grayMax:
+            grayMax = g
+        let base = i * 4
+        *(QBytePtr(q_ptr_plus(out, base + 0))) = uint8(g)
+        *(QBytePtr(q_ptr_plus(out, base + 1))) = uint8(g)
+        *(QBytePtr(q_ptr_plus(out, base + 2))) = uint8(g)
+        *(QBytePtr(q_ptr_plus(out, base + 3))) = uint8(255)
+    q_frameW = hdr.width
+    q_frameH = hdr.height
+    q_minV = minV
+    q_maxV = maxV
+    let meta = Fmt"OK frame w={hdr.width} h={hdr.height} minV={minV} maxV={maxV} grayMin={grayMin} grayMax={grayMax} bytes={pxCount64} ptsMs={hdr.ptsMs}"
+    return q_copy_out(meta, metaOut, metaCap)
+
+# === 导出: 接收侧组装 (完整 embedded 跨度 → 宿主转调 ssm1d_load) ===
+@exportc("ssm1q_assembled_len")
+fn ssm1q_assembled_len(): int32 =
+    if rawbytes.BytesLen(q_manifestSeg) <= 0 || rawbytes.BytesLen(q_chunkSeg) <= 0:
+        return -1
+    var mSeg = q_manifest_seg_view()
+    var fm: manifest.StreamManifest
+    if !QParseManifestHeader(mSeg, fm):
+        return -2
+    var fileLen: int64
+    fileLen = fm.payloadOffset[0]
+    for i in 0..<fm.chunkCount:
+        fileLen = fileLen + fm.payloadLen[i]
+    if fileLen > int64(2147483647):
+        return -3
+    return int32(fileLen)
+
+@exportc("ssm1q_assembled_copy")
+fn ssm1q_assembled_copy(out: ptr, cap: int32, metaOut: ptr,
+                        metaCap: int32): int32 =
+    # M6b 双缓冲合同: payload 写 out, 全部 ERR/应答行写 metaOut——
+    # 应答行不得覆写 payload 头 (M6a bug: "OK assembled..." 覆 "SSM1")。
+    if metaOut == nil:
+        return -1
+    if rawbytes.BytesLen(q_manifestSeg) <= 0 || rawbytes.BytesLen(q_chunkSeg) <= 0:
+        return q_copy_out("ERR no_fetched_segments", metaOut, metaCap)
+    var mSeg = q_manifest_seg_view()
+    var cSeg = q_chunk_seg_view()
+    var fm: manifest.StreamManifest
+    if !QParseManifestHeader(mSeg, fm):
+        return q_copy_out("ERR assembled_manifest_parse", metaOut, metaCap)
+    let headerLen64 = fm.payloadOffset[0]
+    var fileLen: int64
+    fileLen = headerLen64
+    for i in 0..<fm.chunkCount:
+        fileLen = fileLen + fm.payloadLen[i]
+    if fileLen > int64(cap):
+        return q_copy_out(Fmt"ERR out_cap_too_small cap={cap} need={fileLen}", metaOut, metaCap)
+    if headerLen64 > int64(2147483647):
+        return q_copy_out("ERR header_len_past_i32", metaOut, metaCap)
+    let headerLen = int32(headerLen64)
+    for i in 0..<headerLen:
+        *(QBytePtr(q_ptr_plus(out, i))) = uint8(rawbytes.BytesGet(mSeg, i))
+    for i in headerLen..<int32(fileLen):
+        *(QBytePtr(q_ptr_plus(out, i))) = uint8(0)
+    let fKfIdx = manifest.StreamManifestNearestKeyframeIndexForTime(fm, int64(0))
+    if fKfIdx < 0:
+        return q_copy_out("ERR assembled_no_keyframe", metaOut, metaCap)
+    var fKf: manifest.StreamChunk
+    if !manifest.StreamManifestChunkAt(fm, fKfIdx, fKf):
+        return q_copy_out("ERR assembled_keyframe_chunk_at", metaOut, metaCap)
+    if fKf.payloadOffset > int64(2147483647) - fKf.payloadLen:
+        return q_copy_out("ERR assembled_kf_range_past_i32", metaOut, metaCap)
+    let kfOff = int32(fKf.payloadOffset)
+    let kfLen = int32(fKf.payloadLen)
+    if int64(rawbytes.BytesLen(cSeg)) != int64(kfLen):
+        return q_copy_out("ERR assembled_chunk_len_mismatch", metaOut, metaCap)
+    for i in 0..<kfLen:
+        *(QBytePtr(q_ptr_plus(out, kfOff + i))) = uint8(rawbytes.BytesGet(cSeg, i))
+    let resp = Fmt"OK assembled fileLen={fileLen} headerLen={headerLen} kfChunk={fKfIdx} kfOff={kfOff} kfLen={kfLen}"
+    return q_copy_out(resp, metaOut, metaCap)
+
+# === 设备层 UDP 环回探测 (QUIC datapath 同款 socket 桥) ===
+# fd1 = UDP 0.0.0.0:port (recv); fd2 = UDP 临时 (send → 127.0.0.1:port)。
+# 回报 socket/bind/sendto/wait/recvfrom 各层真实 rc, 隔离网络层与 QUIC 层。
+@exportc("ssm1q_udp_probe")
+fn ssm1q_udp_probe(port: int32, out: ptr, cap: int32): int32 =
+    qProbeTick(1, port, 0)
+    let afInet = 2
+    let sockDgram = 2
+    let rx = qProbeSocket(afInet, sockDgram, 0)
+    let rxErr = qProbeErrno()
+    qProbeTick(2, rx, rxErr)
+    if rx < 0:
+        return q_copy_out(Fmt"ERR probe socket rx={rx} errno={rxErr}", out, cap)
+    # sockaddr_in {family=u16, port=be16, addr=u32, zero[8]} = 16B; rx 绑 0.0.0.0:port
+    var sa = rawbytes.BytesAlloc(16)
+    defer:
+        rawbytes.BytesFree(sa)
+    rawbytes.BytesSet(sa, 0, 2)
+    rawbytes.BytesSet(sa, 1, 0)
+    rawbytes.BytesSet(sa, 2, int32((port / 256) % 256))
+    rawbytes.BytesSet(sa, 3, int32(port % 256))
+    for z in 4..<16:
+        rawbytes.BytesSet(sa, z, 0)
+    let bindRc = qProbeBind(rx, sa.data, 16)
+    let bindErr = qProbeErrno()
+    qProbeTick(3, bindRc, bindErr)
+    if bindRc != 0:
+        let _closeRx1 = qProbeClose(rx)
+        return q_copy_out(Fmt"ERR probe bind={bindRc} errno={bindErr}", out, cap)
+    var txSa = rawbytes.BytesAlloc(16)
+    defer:
+        rawbytes.BytesFree(txSa)
+    # 通道 A: sendto 127.0.0.1:port (M6a 同款基线)。
+    rawbytes.BytesSet(txSa, 0, 2)
+    rawbytes.BytesSet(txSa, 1, 0)
+    rawbytes.BytesSet(txSa, 2, int32((port / 256) % 256))
+    rawbytes.BytesSet(txSa, 3, int32(port % 256))
+    rawbytes.BytesSet(txSa, 4, 127)
+    rawbytes.BytesSet(txSa, 5, 0)
+    rawbytes.BytesSet(txSa, 6, 0)
+    rawbytes.BytesSet(txSa, 7, 1)
+    for z in 8..<16:
+        rawbytes.BytesSet(txSa, z, 0)
+    let tx = qProbeSocket(afInet, sockDgram, 0)
+    let txErr = qProbeErrno()
+    qProbeTick(4, tx, txErr)
+    if tx < 0:
+        let _closeRx2 = qProbeClose(rx)
+        return q_copy_out(Fmt"ERR probe socket tx={tx} errno={txErr}", out, cap)
+    let sendRc = qProbeSendto(tx, txSa.data, 4, 0, txSa.data, 16)
+    let sendErr = qProbeErrno()
+    qProbeTick(5, sendRc, sendErr)
+    var rxSa = rawbytes.BytesAlloc(16)
+    defer:
+        rawbytes.BytesFree(rxSa)
+    var buf = rawbytes.BytesAlloc(16)
+    defer:
+        rawbytes.BytesFree(buf)
+    for z in 0..<16:
+        rawbytes.BytesSet(buf, z, 0)
+    var addrLen: int32 = 16
+    # 有界化: 仅 readable 后 recvfrom (M6a 崩因: 阻塞 recvfrom 永等 → FREEZE 击杀)。
+    var recvRc: int32 = 0
+    let waitRc = qProbeWaitReadable(rx, 1000)
+    let waitErr = qProbeErrno()
+    qProbeTick(6, waitRc, waitErr)
+    if waitRc > 0:
+        recvRc = qProbeRecvfrom(rx, buf.data, 16, 0, rxSa.data, ptr(&addrLen))
+        let recvErr2 = qProbeErrno()
+        qProbeTick(7, recvRc, recvErr2)
+    let _closeTx = qProbeClose(tx)
+    # 通道 B: connect(127.0.0.1:port) + send。
+    let tb = qProbeSocket(afInet, sockDgram, 0)
+    var connectB: int32 = 0
+    var sendB: int32 = 0
+    var waitB: int32 = 0
+    if tb >= 0:
+        connectB = qProbeConnect(tb, txSa.data, 16)
+        let connectBErr = qProbeErrno()
+        qProbeTick(60, connectB, connectBErr)
+        if connectB == 0:
+            sendB = qProbeSend(tb, txSa.data, 4, 0)
+            let sendBErr = qProbeErrno()
+            qProbeTick(61, sendB, sendBErr)
+            waitB = qProbeWaitReadable(rx, 1000)
+            qProbeTick(62, waitB, qProbeErrno())
+    let _closeTb = qProbeClose(tb)
+    # 本机实 IP 发现: UDP connect(8.8.8.8:53) → getsockname (选路不发包)。
+    var lip0: int32 = -1
+    var lip1: int32 = -1
+    var lip2: int32 = -1
+    var lip3: int32 = -1
+    var ls = qProbeSocket(afInet, sockDgram, 0)
+    if ls >= 0:
+        var dstSa = rawbytes.BytesAlloc(16)
+        defer:
+            rawbytes.BytesFree(dstSa)
+        rawbytes.BytesSet(dstSa, 0, 2)
+        rawbytes.BytesSet(dstSa, 1, 0)
+        rawbytes.BytesSet(dstSa, 2, 0)
+        rawbytes.BytesSet(dstSa, 3, 53)
+        rawbytes.BytesSet(dstSa, 4, 8)
+        rawbytes.BytesSet(dstSa, 5, 8)
+        rawbytes.BytesSet(dstSa, 6, 8)
+        rawbytes.BytesSet(dstSa, 7, 8)
+        for z in 8..<16:
+            rawbytes.BytesSet(dstSa, z, 0)
+        let lc = qProbeConnect(ls, dstSa.data, 16)
+        let lcErr = qProbeErrno()
+        qProbeTick(81, lc, lcErr)
+        if lc == 0:
+            var lipSa = rawbytes.BytesAlloc(16)
+            defer:
+                rawbytes.BytesFree(lipSa)
+            for z in 0..<16:
+                rawbytes.BytesSet(lipSa, z, 0)
+            var lipLen: int32 = 16
+            let gs = qProbeGetSockName(ls, lipSa.data, ptr(&lipLen))
+            let gsErr = qProbeErrno()
+            qProbeTick(82, gs, gsErr)
+            if gs == 0:
+                lip0 = rawbytes.BytesGet(lipSa, 4)
+                lip1 = rawbytes.BytesGet(lipSa, 5)
+                lip2 = rawbytes.BytesGet(lipSa, 6)
+                lip3 = rawbytes.BytesGet(lipSa, 7)
+                q_lip0 = lip0
+                q_lip1 = lip1
+                q_lip2 = lip2
+                q_lip3 = lip3
+    let _closeLs = qProbeClose(ls)
+    ls = -1
+    # 通道 C/D: 本机实 IP 自连 (port2 = port+1, rx2 绑 0.0.0.0:port2)。
+    var connectC: int32 = -99
+    var sendC: int32 = -99
+    var waitC: int32 = -99
+    var connectD: int32 = -99
+    var sendD: int32 = -99
+    var waitD: int32 = -99
+    if lip0 >= 0:
+        let port2 = port + 1
+        var rx2Sa = rawbytes.BytesAlloc(16)
+        defer:
+            rawbytes.BytesFree(rx2Sa)
+        rawbytes.BytesSet(rx2Sa, 0, 2)
+        rawbytes.BytesSet(rx2Sa, 1, 0)
+        rawbytes.BytesSet(rx2Sa, 2, int32((port2 / 256) % 256))
+        rawbytes.BytesSet(rx2Sa, 3, int32(port2 % 256))
+        for z in 4..<16:
+            rawbytes.BytesSet(rx2Sa, z, 0)
+        let rx2 = qProbeSocket(afInet, sockDgram, 0)
+        let bind2Rc = qProbeBind(rx2, rx2Sa.data, 16)
+        let bind2Err = qProbeErrno()
+        qProbeTick(83, bind2Rc, bind2Err)
+        var lipSa2 = rawbytes.BytesAlloc(16)
+        defer:
+            rawbytes.BytesFree(lipSa2)
+        rawbytes.BytesSet(lipSa2, 0, 2)
+        rawbytes.BytesSet(lipSa2, 1, 0)
+        rawbytes.BytesSet(lipSa2, 2, int32((port2 / 256) % 256))
+        rawbytes.BytesSet(lipSa2, 3, int32(port2 % 256))
+        rawbytes.BytesSet(lipSa2, 4, lip0)
+        rawbytes.BytesSet(lipSa2, 5, lip1)
+        rawbytes.BytesSet(lipSa2, 6, lip2)
+        rawbytes.BytesSet(lipSa2, 7, lip3)
+        for z in 8..<16:
+            rawbytes.BytesSet(lipSa2, z, 0)
+        if bind2Rc == 0:
+            let t2 = qProbeSocket(afInet, sockDgram, 0)
+            if t2 >= 0:
+                sendC = qProbeSendto(t2, lipSa2.data, 4, 0, lipSa2.data, 16)
+                let sendCErr = qProbeErrno()
+                qProbeTick(90, sendC, sendCErr)
+                waitC = qProbeWaitReadable(rx2, 1000)
+                qProbeTick(91, waitC, qProbeErrno())
+                # 排水: 防 C 通道报文滞留令 D 通道 wait 误报。
+                if waitC > 0:
+                    var drainSa = rawbytes.BytesAlloc(16)
+                    defer:
+                        rawbytes.BytesFree(drainSa)
+                    var drainLen: int32 = 16
+                    let _drain = qProbeRecvfrom(rx2, lipSa2.data, 4, 0,
+                                                drainSa.data, ptr(&drainLen))
+                let _closeT2 = qProbeClose(t2)
+            let td = qProbeSocket(afInet, sockDgram, 0)
+            if td >= 0:
+                connectD = qProbeConnect(td, lipSa2.data, 16)
+                let connectDErr = qProbeErrno()
+                qProbeTick(92, connectD, connectDErr)
+                if connectD == 0:
+                    sendD = qProbeSend(td, lipSa2.data, 4, 0)
+                    let sendDErr = qProbeErrno()
+                    qProbeTick(93, sendD, sendDErr)
+                    waitD = qProbeWaitReadable(rx2, 1000)
+                    qProbeTick(94, waitD, qProbeErrno())
+                let _closeTd = qProbeClose(td)
+        let _closeRx2b = qProbeClose(rx2)
+    let resp = Fmt"OK udp_probe send={sendRc} wait={waitRc} recv={recvRc} connectB={connectB} sendB={sendB} waitB={waitB} lip={lip0}.{lip1}.{lip2}.{lip3} sendC={sendC} waitC={waitC} connectD={connectD} sendD={sendD} waitD={waitD}"
+    qProbeTick(8, sendRc, waitRc)
+    return q_copy_out(resp, out, cap)
+
+# === fetch 阶段查询 (卡点定位) ===
+@exportc("ssm1q_stage")
+fn ssm1q_stage(): int32 =
+    return q_stage

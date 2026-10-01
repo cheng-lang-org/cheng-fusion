@@ -17,7 +17,7 @@ import {tmpdir} from "node:os";
 import {dirname, isAbsolute, join, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {b as defineModuleInitializer} from "./runtime.ts";
-import {createChengTextTool, jsonResult, runChengDriver, takeTrailingText, initChengToolkitModule, zodSchema} from "./cheng_toolkit_m9000.ts";
+import {createChengTextTool, jsonResult, runChengDriver, runPool, takeTrailingText, mkdtempInRootSrc, initChengToolkitModule, zodSchema} from "./cheng_toolkit_m9000.ts";
 
 var chengShapeMatrixInputSchema, ChengShapeMatrixTool;
 
@@ -260,7 +260,7 @@ function matchesFilterTag(entry, filterTag) {
   return entryTags(entry).includes(filterTag);
 }
 
-function preflightMatrixEntries(entries, matrixDir, snapshotDir, inputBudget) {
+function preflightMatrixEntries(entries, matrixDir, snapshotDir, fixtureDir, inputBudget) {
   const prepared = [];
   const names = new Set();
   const fixtureSnapshots = new Map();
@@ -283,7 +283,7 @@ function preflightMatrixEntries(entries, matrixDir, snapshotDir, inputBudget) {
     if (!fixtureSnapshot) {
       fixtureSnapshot = budgetedSnapshot(
         fixtureInput,
-        join(snapshotDir, `fixture-${index}.cheng`),
+        join(fixtureDir, `fixture-${index}.cheng`),
         `matrix entry ${entry.name} fixture`,
         {maxBytes: MAX_FIXTURE_BYTES},
         inputBudget,
@@ -693,6 +693,7 @@ var initChengShapeMatrixModule = defineModuleInitializer(() => {
       const matrixPath = resolveMatrixPath(input.matrixPath);
       const matrixDir = dirname(matrixPath);
       const snapshotDir = mkdtempSync(join(tmpdir(), "cheng-shape-inputs-"));
+      let srcDir = null;
       try {
         chmodSync(snapshotDir, 0o700);
         const inputBudget = {used: 0, limit: MAX_TOTAL_INPUT_BYTES};
@@ -702,19 +703,18 @@ var initChengShapeMatrixModule = defineModuleInitializer(() => {
         const rootInput = input.root ? String(input.root) : String(matrix.defaultRoot || matrixDir);
         const root = resolveExistingAbsolutePath(rootInput, "root", {directory: true});
         resolveExistingAbsolutePath(join(root, "cheng-package.toml"), "root cheng-package.toml", {rejectSymlink: true});
+        // fixture 快照必须在 root/src 内(冷快照模块身份约束), driver/matrix 快照留在 /tmp。
+        srcDir = mkdtempInRootSrc(root);
         const timeoutMs = Math.round((input.timeoutSec || DEFAULT_TIMEOUT_SEC) * 1000);
         const maxBuffer = input.maxOutputBytes || DEFAULT_MAX_OUTPUT_BYTES;
-        const preparedEntries = preflightMatrixEntries(matrix.entries, matrixDir, snapshotDir, inputBudget);
+        const preparedEntries = preflightMatrixEntries(matrix.entries, matrixDir, snapshotDir, srcDir, inputBudget);
         const selectedEntries = selectPreparedEntries(preparedEntries, input.filterTag);
         const coverageGaps = preparedEntries
           .filter((entry) => !matchesFilterTag(entry, input.filterTag))
           .map((entry) => ({name: entry.name, tags: entryTags(entry), reason: "filtered_out"}));
 
-        const results = [];
-        for (const entry of selectedEntries) {
-          const result = await runOneEntry(entry, driver.snapshotPath, root, timeoutMs, maxBuffer);
-          results.push(result);
-        }
+        const results = await runPool(selectedEntries, (entry) =>
+          runOneEntry(entry, driver.snapshotPath, root, timeoutMs, maxBuffer));
         const summary = {
           total: matrix.entries.length,
           selected: selectedEntries.length,
@@ -745,6 +745,7 @@ var initChengShapeMatrixModule = defineModuleInitializer(() => {
         }));
       } finally {
         rmSync(snapshotDir, {recursive: true, force: true});
+        if (srcDir) rmSync(srcDir, {recursive: true, force: true});
       }
     },
   });

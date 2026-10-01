@@ -1,0 +1,779 @@
+# Local Connection abstraction for Cheng-QUIC (ZRPC-safe, no raw pointers).
+
+import std/result
+import std/rawbytes
+import std/strings
+import std/seqs
+import std/os
+import cheng/quic/multiaddress
+import cheng/quic/native_runtime
+
+type
+    Direction = enum
+        Inbound = 0
+        Outbound = 1
+
+    # In-process pipe storage is retained for host tests. Android production
+    # paths below accept only native MsQuic pipe tokens.
+    # dir: 0 = aToB (written by side 0), 1 = bToA (written by side 1).
+    QPipeRec =
+        closed: int32
+        aCursor: int32
+        bCursor: int32
+        aPending: int64
+        bPending: int64
+
+    QPipeChunkRec =
+        pipeSlot: int32
+        dir: int32
+        dataIdx: int32
+        offset: int32
+        length: int32
+
+    Connection =
+        localAddr: multiaddress.MultiAddress
+        remoteAddr: multiaddress.MultiAddress
+        dir: Direction
+        stream: rawbytes.Bytes
+        open: bool
+        pipeIdx: int32
+        pipeSide: int32
+        sendStreamId: int64
+        recvStreamId: int64
+        remotePeer: str
+        accounting: bool
+        queueReserved: bool
+        queueReservedBytes: int64
+
+    ConnectionQueue =
+        count: int32
+        head: int32
+        tail: int32
+        items: Connection[connectionQueueCapacity]
+
+    ConnectionPair =
+        outbound: Connection
+        inbound: Connection
+
+const
+    maxPipes = 128
+    connectionQueueCapacity = 64
+    connectionQueueFootprintBase = 128
+
+var
+    qpipeRecs: QPipeRec[]
+    qpipeChunkRecs: QPipeChunkRec[]
+    qpipeChunkData: Bytes[]
+
+fn copyBytesRange(src: rawbytes.Bytes, start: int32, count: int32): rawbytes.Bytes =
+    if count <= 0:
+        return emptyBytes()
+    let srcLen: int32 = BytesLen(src)
+    if srcLen <= 0:
+        return emptyBytes()
+    if start < 0 || start >= srcLen:
+        return emptyBytes()
+    var take: int32 = count
+    if start + take > srcLen:
+        take = srcLen - start
+    if take <= 0:
+        return emptyBytes()
+    let out: rawbytes.Bytes = BytesAlloc(take)
+    for i in 0..<take:
+        BytesSet(out, i, BytesGet(src, start + i))
+    return out
+
+fn bytesAppend(dst: var rawbytes.Bytes, extra: rawbytes.Bytes) =
+    let oldLen: int32 = dst.len
+    let addLen: int32 = BytesLen(extra)
+    if addLen <= 0:
+        return
+    let out: rawbytes.Bytes = BytesAlloc(oldLen + addLen)
+    for i in 0..<oldLen:
+        BytesSet(out, i, BytesGet(dst, i))
+    for j in 0..<addLen:
+        BytesSet(out, oldLen + j, BytesGet(extra, j))
+    dst = out
+
+fn bytesTakePrefix(buf: var rawbytes.Bytes, count: int32): rawbytes.Bytes =
+    if count <= 0:
+        return emptyBytes()
+    let curLen: int32 = buf.len
+    if curLen <= 0:
+        return emptyBytes()
+    var take: int32 = count
+    if take > curLen:
+        take = curLen
+    let out: rawbytes.Bytes = copyBytesRange(buf, 0, take)
+    let remain: int32 = curLen - take
+    if remain <= 0:
+        buf = emptyBytes()
+        return out
+    buf = copyBytesRange(buf, take, remain)
+    return out
+
+fn qpipeClosedAt(idx: int32): bool =
+    let r: QPipeRec = qpipeRecs[idx]
+    return r.closed != 0
+
+# Find-only helper (cold miscompile #7: never add to a seq in a function
+# that also scans its elements).
+fn qpipeFindClosedSlot(): int32 =
+    let total: int32 = qpipeRecs.len
+    for i in 0..<total:
+        let r: QPipeRec = qpipeRecs[i]
+        if r.closed != 0:
+            return i
+    return -1
+
+# Leaf append helper; fresh cursors point past every chunk logged so far.
+fn qpipeAppendRec(): int32 =
+    var r: QPipeRec
+    let cur: int32 = qpipeChunkRecs.len
+    r.aCursor = cur
+    r.bCursor = cur
+    add(qpipeRecs, r)
+    return qpipeRecs.len - 1
+
+fn qpipeResetAt(idx: int32) =
+    var r: QPipeRec
+    let cur: int32 = qpipeChunkRecs.len
+    r.aCursor = cur
+    r.bCursor = cur
+    qpipeRecs[idx] = r
+
+fn qpipeWriteDir(side: int32): int32 =
+    if side == 0:
+        return 0
+    return 1
+
+fn qpipeReadDir(side: int32): int32 =
+    if side == 0:
+        return 1
+    return 0
+
+fn qpipePendingFor(idx: int32, dir: int32): int64 =
+    let r: QPipeRec = qpipeRecs[idx]
+    if dir == 0:
+        return r.aPending
+    return r.bPending
+
+fn qpipeChunkDataAppend(data: rawbytes.Bytes): int32 =
+    add(qpipeChunkData, data)
+    return qpipeChunkData.len - 1
+
+fn qpipeChunkRecAppend(pipeSlot: int32, dir: int32, dataIdx: int32, length: int32) =
+    var rec: QPipeChunkRec
+    rec.pipeSlot = pipeSlot
+    rec.dir = dir
+    rec.dataIdx = dataIdx
+    rec.length = length
+    add(qpipeChunkRecs, rec)
+
+fn qpipeAddPending(idx: int32, dir: int32, delta: int64) =
+    var r: QPipeRec = qpipeRecs[idx]
+    if dir == 0:
+        r.aPending = r.aPending + delta
+    else:
+        r.bPending = r.bPending + delta
+    qpipeRecs[idx] = r
+
+# Copies count pending bytes out of the (idx, dir) chunk queue in FIFO
+# order. Caller must have verified pending >= count.
+fn qpipeConsume(idx: int32, dir: int32, count: int32): rawbytes.Bytes =
+    var out: rawbytes.Bytes = BytesAlloc(count)
+    var filled: int32
+    var rec0: QPipeRec = qpipeRecs[idx]
+    var cur: int32
+    if dir == 0:
+        cur = rec0.aCursor
+    else:
+        cur = rec0.bCursor
+    while filled < count:
+        let rec: QPipeChunkRec = qpipeChunkRecs[cur]
+        var exhausted: bool = true
+        if rec.pipeSlot == idx && rec.dir == dir:
+            if rec.offset < rec.length:
+                exhausted = false
+        if exhausted:
+            cur = cur + 1
+        else:
+            var take: int32 = rec.length - rec.offset
+            if take > count - filled:
+                take = count - filled
+            let src: rawbytes.Bytes = qpipeChunkData[rec.dataIdx]
+            BytesCopyRangeInto(out, filled, src, rec.offset, take)
+            filled = filled + take
+            var upd: QPipeChunkRec = rec
+            upd.offset = rec.offset + take
+            qpipeChunkRecs[cur] = upd
+            if upd.offset >= upd.length:
+                cur = cur + 1
+    var r2: QPipeRec = qpipeRecs[idx]
+    if dir == 0:
+        r2.aCursor = cur
+        r2.aPending = r2.aPending - int64(count)
+    else:
+        r2.bCursor = cur
+        r2.bPending = r2.bPending - int64(count)
+    qpipeRecs[idx] = r2
+    return out
+
+fn qpipeCloseAt(idx: int32) =
+    var r: QPipeRec = qpipeRecs[idx]
+    if r.closed != 0:
+        return
+    r.closed = 1
+    r.aPending = 0
+    r.bPending = 0
+    let cur: int32 = qpipeChunkRecs.len
+    r.aCursor = cur
+    r.bCursor = cur
+    qpipeRecs[idx] = r
+
+fn initConnectionQueue(): ConnectionQueue =
+    return ConnectionQueue(count: 0, head: 0, tail: 0)
+
+fn connectionQueueIsEmpty(q: ConnectionQueue): bool =
+    q.count <= 0
+
+fn connectionQueueIsFull(q: ConnectionQueue): bool =
+    q.count >= connectionQueueCapacity
+
+fn enqueueConnection(q: var ConnectionQueue, conn: Connection): Result[bool] =
+    if connectionQueueIsFull(q):
+        return Err[bool]("connectionqueue: full")
+    q.items[q.tail] = conn
+    q.tail = (q.tail + 1) % connectionQueueCapacity
+    q.count = q.count + 1
+    return Ok[bool](true)
+
+fn dequeueConnection(q: var ConnectionQueue): Result[Connection] =
+    if connectionQueueIsEmpty(q):
+        return Err[Connection]("connectionqueue: empty")
+    let conn: Connection = q.items[q.head]
+    q.head = (q.head + 1) % connectionQueueCapacity
+    q.count = q.count - 1
+    return Ok[Connection](conn)
+
+fn allocPipe(): Result[int32] =
+    let reuse: int32 = qpipeFindClosedSlot()
+    if reuse >= 0:
+        qpipeResetAt(reuse)
+        return Ok[int32](reuse)
+    if qpipeRecs.len >= maxPipes:
+        return Err[int32]("pipe: full")
+    return Ok[int32](qpipeAppendRec())
+
+fn pipeIsClosed(idx: int32): bool =
+    if msquicNativeIsPipeIdx(idx):
+        return msquicNativePipeIsClosed(idx)
+    return true
+
+fn pipeWrite(idx: int32, side: int32, streamId: int64, data: rawbytes.Bytes): Result[int32] =
+    if msquicNativeIsPipeIdx(idx):
+        return msquicNativePipeWrite(idx, side, streamId, data)
+    return Err[int32]("pipe: native token required")
+
+fn pipeShutdownWrite(idx: int32, side: int32, streamId: int64): Result[bool] =
+    if msquicNativeIsPipeIdx(idx):
+        return msquicNativePipeCloseWrite(idx, side, streamId)
+    return Err[bool]("pipe: shutdown write unsupported")
+
+fn pipeRead(idx: int32, side: int32, streamId: int64, count: int32): Result[rawbytes.Bytes] =
+    if msquicNativeIsPipeIdx(idx):
+        return msquicNativePipeRead(idx, side, streamId, count)
+    return Err[rawbytes.Bytes]("pipe: native token required")
+
+fn pipeReadNonblocking(idx: int32, side: int32, streamId: int64, count: int32): Result[rawbytes.Bytes] =
+    if msquicNativeIsPipeIdx(idx):
+        return msquicNativePipeReadNonblocking(idx, side, streamId, count)
+    return Err[rawbytes.Bytes]("pipe: native token required")
+
+fn pipeClose(idx: int32) =
+    if msquicNativeIsPipeIdx(idx):
+        msquicNativePipeClose(idx)
+        return
+    return
+
+fn newConnection(localAddr: multiaddress.MultiAddress, remoteAddr: multiaddress.MultiAddress, dir: Direction): Connection =
+    Connection(
+        localAddr: localAddr,
+        remoteAddr: remoteAddr,
+        dir: dir,
+        stream: emptyBytes(),
+        open: true,
+        pipeIdx: -1,
+        pipeSide: 0,
+        sendStreamId: 0,
+        recvStreamId: 0,
+        remotePeer: "",
+        accounting: false,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+
+# Rebuild a stack-local Connection that references an already-dialed native session by
+# its small token state (pipeIdx/pipeSide + the stream ids). The persistent-connection ES
+# pump dials ONCE, persists only these scalars in module globals (the large MsQuicTransport
+# can't be a global), and every render-thread tick rebuilds a Connection from them to pull
+# another frame run — the native session/socket keyed by pipeIdx stays alive across ticks.
+# Value-only: it constructs a small struct (no global writes, empty addr/stream); it does
+# NOT allocate a pipe (the pipe already exists), so it must NEVER be ConnClose'd here.
+fn ConnFromPipeIdx(pipeIdx: int32, pipeSide: int32, sendStreamId: int64, recvStreamId: int64): Connection =
+    var emptyAddr: multiaddress.MultiAddress
+    multiaddress.InitMultiAddressEmptyInto(emptyAddr)
+    return Connection(
+        localAddr: emptyAddr,
+        remoteAddr: emptyAddr,
+        dir: Outbound,
+        stream: emptyBytes(),
+        open: true,
+        pipeIdx: pipeIdx,
+        pipeSide: pipeSide,
+        sendStreamId: sendStreamId,
+        recvStreamId: recvStreamId,
+        remotePeer: "",
+        accounting: false,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+
+fn newConnectionPair(outLocal: multiaddress.MultiAddress, outRemote: multiaddress.MultiAddress, inLocal: multiaddress.MultiAddress, inRemote: multiaddress.MultiAddress): Result[ConnectionPair] =
+    let pipeRes: Result[int32] = allocPipe()
+    if IsErr(pipeRes):
+        return Err[ConnectionPair](ErrorText(pipeRes))
+    let idx: int32 = Value(pipeRes)
+    let outbound: Connection = Connection(
+        localAddr: outLocal,
+        remoteAddr: outRemote,
+        dir: Outbound,
+        stream: emptyBytes(),
+        open: true,
+        pipeIdx: idx,
+        pipeSide: 0,
+        sendStreamId: 0,
+        recvStreamId: 0,
+        remotePeer: "",
+        accounting: false,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+    let inbound: Connection = Connection(
+        localAddr: inLocal,
+        remoteAddr: inRemote,
+        dir: Inbound,
+        stream: emptyBytes(),
+        open: true,
+        pipeIdx: idx,
+        pipeSide: 1,
+        sendStreamId: 0,
+        recvStreamId: 0,
+        remotePeer: "",
+        accounting: false,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+    return Ok[ConnectionPair](ConnectionPair(outbound: outbound, inbound: inbound))
+
+fn newNativeConnectionPairForStreams(outLocal: multiaddress.MultiAddress,
+                                     outRemote: multiaddress.MultiAddress,
+                                     inLocal: multiaddress.MultiAddress,
+                                     inRemote: multiaddress.MultiAddress,
+                                     outboundSendStreamId: int64,
+                                     outboundRecvStreamId: int64,
+                                     inboundSendStreamId: int64,
+                                     inboundRecvStreamId: int64): Result[ConnectionPair] =
+    let idx: int32 = msquicNativePipeIdxForSession(1)
+    if idx < 0:
+        return Err[ConnectionPair]("msquic native: invalid pipe token")
+    let outbound: Connection = Connection(
+        localAddr: outLocal,
+        remoteAddr: outRemote,
+        dir: Outbound,
+        stream: emptyBytes(),
+        open: true,
+        pipeIdx: idx,
+        pipeSide: 0,
+        sendStreamId: outboundSendStreamId,
+        recvStreamId: outboundRecvStreamId,
+        remotePeer: "",
+        accounting: false,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+    let inbound: Connection = Connection(
+        localAddr: inLocal,
+        remoteAddr: inRemote,
+        dir: Inbound,
+        stream: emptyBytes(),
+        open: true,
+        pipeIdx: idx,
+        pipeSide: 1,
+        sendStreamId: inboundSendStreamId,
+        recvStreamId: inboundRecvStreamId,
+        remotePeer: "",
+        accounting: false,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+    return Ok[ConnectionPair](ConnectionPair(outbound: outbound, inbound: inbound))
+
+# Derive a per-stream handle from an already-dialed connection: reuse base.pipeIdx
+# (the SAME native QUIC session) and base.pipeSide (same endpoint role), only swap the
+# streamId. This is the ONLY way to ride the dialed session on a different QUIC stream —
+# *ForStreams calls msquicNativePipeIdxForSession which opens ANOTHER session. The derived
+# handle shares base.pipeIdx, so NEVER ConnClose it (that pipeClose kills the whole
+# connection); close only the dialed base once after all streams are drained.
+@borrows
+fn ConnDeriveStream(base: Connection, sendStreamId: int64, recvStreamId: int64): Connection =
+    # Clone so the caller keeps its base handle for subsequent derives/close.
+    var out = ConnDup(base)
+    out.sendStreamId = sendStreamId
+    out.recvStreamId = recvStreamId
+    out.open = true
+    out.stream = emptyBytes()
+    return out
+
+fn newNativeConnectionForStreams(localAddr: multiaddress.MultiAddress,
+                                 remoteAddr: multiaddress.MultiAddress,
+                                 dir: Direction,
+                                 pipeSide: int32,
+                                 sendStreamId: int64,
+                                 recvStreamId: int64): Result[Connection] =
+    let idx: int32 = msquicNativePipeIdxForSession(1)
+    if idx < 0:
+        return Err[Connection]("msquic native: invalid pipe token")
+    var out: Connection
+    out.localAddr = localAddr
+    out.remoteAddr = remoteAddr
+    out.dir = dir
+    out.stream = emptyBytes()
+    out.open = true
+    out.pipeIdx = idx
+    out.pipeSide = pipeSide
+    out.sendStreamId = sendStreamId
+    out.recvStreamId = recvStreamId
+    out.remotePeer = ""
+    out.accounting = false
+    out.queueReserved = false
+    out.queueReservedBytes = 0
+    return Ok[Connection](out)
+
+fn msquicNativeConnectionInto(out: var Connection,
+                              localAddr: multiaddress.MultiAddress,
+                              remoteAddr: multiaddress.MultiAddress,
+                              dir: Direction,
+                              pipeSide: int32,
+                              sendStreamId: int64,
+                              recvStreamId: int64): Result[bool] =
+    let idx: int32 = msquicNativePipeIdxForSession(1)
+    if idx < 0:
+        return Err[bool]("msquic native: invalid pipe token")
+    out.localAddr = localAddr
+    out.remoteAddr = remoteAddr
+    out.dir = dir
+    out.stream = emptyBytes()
+    out.open = true
+    out.pipeIdx = idx
+    out.pipeSide = pipeSide
+    out.sendStreamId = sendStreamId
+    out.recvStreamId = recvStreamId
+    out.remotePeer = ""
+    out.accounting = false
+    out.queueReserved = false
+    out.queueReservedBytes = 0
+    return Ok[bool](true)
+
+fn MsQuicNativeInboundConnectionInto(out: var Connection,
+                                     localAddr: multiaddress.MultiAddress,
+                                     remoteAddr: multiaddress.MultiAddress): Result[bool] =
+    return msquicNativeConnectionInto(out, localAddr, remoteAddr, Inbound, 1, 0, 0)
+
+fn MsQuicNativeOutboundConnectionInto(out: var Connection,
+                                      localAddr: multiaddress.MultiAddress,
+                                      remoteAddr: multiaddress.MultiAddress): Result[bool] =
+    return msquicNativeConnectionInto(out, localAddr, remoteAddr, Outbound, 0, 0, 0)
+
+fn msquicNativeConnectionCodeInto(out: var Connection,
+                                  localAddr: multiaddress.MultiAddress,
+                                  remoteAddr: multiaddress.MultiAddress,
+                                  dir: Direction,
+                                  pipeSide: int32): bool =
+    let idx: int32 = msquicNativePipeIdxForSession(1)
+    if idx < 0:
+        return false
+    out.localAddr = localAddr
+    out.remoteAddr = remoteAddr
+    out.dir = dir
+    out.open = true
+    out.pipeIdx = idx
+    out.pipeSide = pipeSide
+    return true
+
+fn MsQuicNativeInboundConnectionCodeInto(out: var Connection,
+                                         localAddr: multiaddress.MultiAddress,
+                                         remoteAddr: multiaddress.MultiAddress): bool =
+    return msquicNativeConnectionCodeInto(out, localAddr, remoteAddr, Inbound, 1)
+
+fn MsQuicNativeOutboundConnectionCodeInto(out: var Connection,
+                                          localAddr: multiaddress.MultiAddress,
+                                          remoteAddr: multiaddress.MultiAddress): bool =
+    return msquicNativeConnectionCodeInto(out, localAddr, remoteAddr, Outbound, 0)
+
+fn newSimConnectionPairForStreams(outLocal: multiaddress.MultiAddress,
+                                  outRemote: multiaddress.MultiAddress,
+                                  inLocal: multiaddress.MultiAddress,
+                                  inRemote: multiaddress.MultiAddress,
+                                  simPipeIdx: int32,
+                                  outboundSendStreamId: int64,
+                                  outboundRecvStreamId: int64,
+                                  inboundSendStreamId: int64,
+                                  inboundRecvStreamId: int64): Result[ConnectionPair] =
+    let outbound: Connection = Connection(
+        localAddr: outLocal,
+        remoteAddr: outRemote,
+        dir: Outbound,
+        stream: emptyBytes(),
+        open: true,
+        pipeIdx: simPipeIdx,
+        pipeSide: 0,
+        sendStreamId: outboundSendStreamId,
+        recvStreamId: outboundRecvStreamId,
+        remotePeer: "",
+        accounting: false,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+    let inbound: Connection = Connection(
+        localAddr: inLocal,
+        remoteAddr: inRemote,
+        dir: Inbound,
+        stream: emptyBytes(),
+        open: true,
+        pipeIdx: simPipeIdx,
+        pipeSide: 1,
+        sendStreamId: inboundSendStreamId,
+        recvStreamId: inboundRecvStreamId,
+        remotePeer: "",
+        accounting: false,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+    return Ok[ConnectionPair](ConnectionPair(outbound: outbound, inbound: inbound))
+
+# 角色显式 pair: pipeIdx 由调用方经 msquicNativeRetagPipeIdxFor{Server,Client}
+# Session 持锁取自本角色槽, 不再隐式读全局 cur（dual-role 下 accept 返回与
+# pair 建立之间 cur 可被另一线程 dial 尾翻走 → serverConn 标到 client 槽,
+# 自连实测 serve_manifest_write 即时败）。既有隐式形态保留给单线程调用面。
+fn newNativeConnectionPairForSlot(pipeIdx: int32,
+                                  outLocal: multiaddress.MultiAddress,
+                                  outRemote: multiaddress.MultiAddress,
+                                  inLocal: multiaddress.MultiAddress,
+                                  inRemote: multiaddress.MultiAddress,
+                                  outboundSendStreamId: int64,
+                                  outboundRecvStreamId: int64,
+                                  inboundSendStreamId: int64,
+                                  inboundRecvStreamId: int64): Result[ConnectionPair] =
+    if pipeIdx < 0:
+        return Err[ConnectionPair]("msquic native: invalid pipe token")
+    let outbound: Connection = Connection(
+        localAddr: outLocal,
+        remoteAddr: outRemote,
+        dir: Outbound,
+        stream: emptyBytes(),
+        open: true,
+        pipeIdx: pipeIdx,
+        pipeSide: 0,
+        sendStreamId: outboundSendStreamId,
+        recvStreamId: outboundRecvStreamId,
+        remotePeer: "",
+        accounting: false,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+    let inbound: Connection = Connection(
+        localAddr: inLocal,
+        remoteAddr: inRemote,
+        dir: Inbound,
+        stream: emptyBytes(),
+        open: true,
+        pipeIdx: pipeIdx,
+        pipeSide: 1,
+        sendStreamId: inboundSendStreamId,
+        recvStreamId: inboundRecvStreamId,
+        remotePeer: "",
+        accounting: false,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+    return Ok[ConnectionPair](ConnectionPair(outbound: outbound, inbound: inbound))
+
+fn newNativeConnectionPair(outLocal: multiaddress.MultiAddress, outRemote: multiaddress.MultiAddress, inLocal: multiaddress.MultiAddress, inRemote: multiaddress.MultiAddress): Result[ConnectionPair] =
+    return newNativeConnectionPairForStreams(outLocal,
+                                             outRemote,
+                                             inLocal,
+                                             inRemote,
+                                             0,
+                                             1,
+                                             1,
+                                             0)
+
+fn setConnectionAccounting(c: var Connection, enabled: bool) =
+    c.accounting = enabled
+
+fn connectionQueueFootprintBytes(conn: Connection): int64 =
+    var size: int64 = connectionQueueFootprintBase
+    size = size + int64(BytesLen(conn.localAddr.data))
+    size = size + int64(BytesLen(conn.remoteAddr.data))
+    if size < 0:
+        return 0
+    return size
+
+fn clearQueueReservation(c: var Connection) =
+    c.queueReserved = false
+    c.queueReservedBytes = 0
+
+fn quicConnRecordOutbound(c: var Connection, count: int32): Result[bool] =
+    c
+    if count <= 0:
+        return Ok[bool](false)
+    return Ok[bool](true)
+
+fn quicConnRecordInbound(c: var Connection, count: int32): Result[bool] =
+    c
+    if count <= 0:
+        return Ok[bool](false)
+    return Ok[bool](true)
+
+fn quicConnIsOpen(c: Connection): bool =
+    if ! c.open:
+        return false
+    if c.pipeIdx >= 0 && pipeIsClosed(c.pipeIdx):
+        return false
+    return true
+
+fn localAddress(c: Connection): multiaddress.MultiAddress =
+    c.localAddr
+
+fn remoteAddress(c: var Connection): multiaddress.MultiAddress =
+    c.remoteAddr
+
+fn direction(c: Connection): Direction =
+    c.dir
+
+fn remotePeerId(c: Connection): str =
+    c.remotePeer
+
+fn quicConnWrite(c: var Connection, data: rawbytes.Bytes): Result[int32] =
+    if ! c.open:
+        return Err[int32]("connection: closed")
+    if c.pipeIdx < 0:
+        return Err[int32]("connection: native pipe missing")
+    return pipeWrite(c.pipeIdx, c.pipeSide, c.sendStreamId, data)
+
+fn quicConnRead(c: var Connection, count: int32): Result[rawbytes.Bytes] =
+    if ! c.open:
+        return Err[rawbytes.Bytes]("connection: closed")
+    if count <= 0:
+        return Ok[rawbytes.Bytes](emptyBytes())
+    if c.pipeIdx < 0:
+        return Err[rawbytes.Bytes]("connection: native pipe missing")
+    return pipeRead(c.pipeIdx, c.pipeSide, c.recvStreamId, count)
+
+fn quicConnReadNonblocking(c: var Connection, count: int32): Result[rawbytes.Bytes] =
+    if ! c.open:
+        return Err[rawbytes.Bytes]("connection: closed")
+    if count <= 0:
+        return Ok[rawbytes.Bytes](emptyBytes())
+    if c.pipeIdx < 0:
+        return Err[rawbytes.Bytes]("connection: native pipe missing")
+    return pipeReadNonblocking(c.pipeIdx, c.pipeSide, c.recvStreamId, count)
+
+fn nativeReadableStreamId(c: var Connection, minStreamId: int64): Result[int64] =
+    if ! c.open:
+        return Err[int64]("connection: closed")
+    if c.pipeIdx < 0:
+        return Err[int64]("connection: native pipe missing")
+    return native_runtime.MsQuicNativeReadableAppStreamId(c.pipeIdx, c.pipeSide, minStreamId)
+
+fn quicConnShutdownWrite(c: var Connection): Result[bool] =
+    if ! c.open:
+        return Err[bool]("connection: closed")
+    if c.pipeIdx >= 0:
+        return pipeShutdownWrite(c.pipeIdx, c.pipeSide, c.sendStreamId)
+    return Err[bool]("connection: shutdown write unsupported")
+
+fn quicConnClose(c: var Connection) =
+    c.open = false
+    if c.pipeIdx >= 0:
+        pipeClose(c.pipeIdx)
+    c.stream = emptyBytes()
+
+fn connWrite(c: var Connection, data: rawbytes.Bytes): Result[int32] =
+    return quicConnWrite(c, data)
+
+fn ConnWrite(c: var Connection, data: rawbytes.Bytes): Result[int32] =
+    return quicConnWrite(c, data)
+
+fn QuicConnWrite(c: var Connection, data: rawbytes.Bytes): Result[int32] =
+    return quicConnWrite(c, data)
+
+fn connRead(c: var Connection, count: int32): Result[rawbytes.Bytes] =
+    return quicConnRead(c, count)
+
+fn ConnRead(c: var Connection, count: int32): Result[rawbytes.Bytes] =
+    return quicConnRead(c, count)
+
+fn QuicConnRead(c: var Connection, count: int32): Result[rawbytes.Bytes] =
+    return quicConnRead(c, count)
+
+fn connReadNonblocking(c: var Connection, count: int32): Result[rawbytes.Bytes] =
+    return quicConnReadNonblocking(c, count)
+
+fn ConnReadNonblocking(c: var Connection, count: int32): Result[rawbytes.Bytes] =
+    return quicConnReadNonblocking(c, count)
+
+fn QuicConnReadNonblocking(c: var Connection, count: int32): Result[rawbytes.Bytes] =
+    return quicConnReadNonblocking(c, count)
+
+fn connShutdownWrite(c: var Connection): Result[bool] =
+    return quicConnShutdownWrite(c)
+
+fn ConnShutdownWrite(c: var Connection): Result[bool] =
+    return quicConnShutdownWrite(c)
+
+fn connIsOpen(c: Connection): bool =
+    return quicConnIsOpen(c)
+
+fn ConnClose(c: var Connection) =
+    quicConnClose(c)
+
+# Second owned handle for a connection: stream readers take ownership of the
+# handle they are handed, while the dialer keeps its own for ConnClose.
+# Scalar fields copy, str fields clone, byte buffers copy byte-for-byte.
+@borrows
+fn ConnDup(c: Connection): Connection =
+    var out: Connection
+    out.localAddr.raw = strings.ConcatStr(c.localAddr.raw, "")
+    out.localAddr.data = rawbytes.BytesAlloc(rawbytes.BytesLen(c.localAddr.data))
+    rawbytes.BytesCopyInto(out.localAddr.data, 0, c.localAddr.data)
+    out.remoteAddr.raw = strings.ConcatStr(c.remoteAddr.raw, "")
+    out.remoteAddr.data = rawbytes.BytesAlloc(rawbytes.BytesLen(c.remoteAddr.data))
+    rawbytes.BytesCopyInto(out.remoteAddr.data, 0, c.remoteAddr.data)
+    out.dir = c.dir
+    out.stream = rawbytes.BytesAlloc(rawbytes.BytesLen(c.stream))
+    rawbytes.BytesCopyInto(out.stream, 0, c.stream)
+    out.open = c.open
+    out.pipeIdx = c.pipeIdx
+    out.pipeSide = c.pipeSide
+    out.sendStreamId = c.sendStreamId
+    out.recvStreamId = c.recvStreamId
+    out.remotePeer = strings.ConcatStr(c.remotePeer, "")
+    out.accounting = c.accounting
+    out.queueReserved = c.queueReserved
+    out.queueReservedBytes = c.queueReservedBytes
+    return out
+
+fn QuicConnClose(c: var Connection) =
+    quicConnClose(c)

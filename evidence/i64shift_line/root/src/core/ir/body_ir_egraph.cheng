@@ -1,0 +1,1848 @@
+# BodyIR EGraph rewrite pass.
+# Only safe pure integer ops (add/sub/mul/comparison/const) enter the egraph.
+# Call/pointer/mutable/escaped operations are blacklisted from CSE.
+#
+# Three phases:
+#   1. Build: extract pure integer ops into e-classes
+#   2. Rewrite: constant folding, identities, comparison folding, select folding
+#   3. Extract: apply egraph rewrites back to BodyIR (slot-canonicalized CSE)
+
+import cheng/core/ir/core_types as coreir
+import cheng/core/lang/typed_expr as texpr
+import std/monotimes as mt
+import std/strings
+
+# === abstract e-class node operation kinds ===
+const
+    EOpConst = 0
+    EOpAdd  = 1
+    EOpSub  = 2
+    EOpMul  = 3
+    EOpCmp  = 4
+    EOpSel  = 5
+
+const
+    EGraphMaxRounds = 8
+    EClassNoClass   = -1
+    EClassNoSlot    = -1
+
+type
+    EGraphNode =
+        id: int32
+        opKind: int32        # EOpConst/Add/Sub/Mul/Cmp/Sel
+        childClasses: int32[]  # operand class indices (post-resolve, snapshot)
+        info0: int32         # per-node-type meaning (see below)
+        info1: int32         # per-node-type meaning (see below)
+        constVal: int32      # for EOpConst: the literal integer value
+        targetSlot: int32    # original BodyIR slot this node writes to
+
+    EGraphClass =
+        nodeIds: int32[]
+        canonicalNode: int32  # index into nodes[] (-1 = unset)
+        mergedInto: int32     # union-find redirect target, -1 = self
+
+    EGraph =
+        nodes: EGraphNode[]
+        classes: EGraphClass[]
+        slotToClass: int32[]
+
+    EGraphOpSnapshot =
+        kind: int32
+        target: int32
+        operandCount: int32
+        operand0: int32
+        operand1: int32
+        operand2: int32
+        operand3: int32
+        operand4: int32
+        operand5: int32
+        operand6: int32
+        operand7: int32
+
+    EGraphRunReport =
+        egraphClasses: int32
+        rewriteRounds: int32
+        ruleHits: int32
+        extracted: int32
+        opDelta: int32
+        egraphMs: int32
+        blockCount: int32
+        candidateBlockCount: int32
+        changedBlockCount: int32
+        skippedBlockCount: int32
+        hardFailBlockCount: int32
+        unsafeOpCount: int32
+        applied: bool
+        skipped: bool
+        hardFail: bool
+        blockedReason: str
+
+    EGraphPassResult =
+        egraphClasses: int32
+        rewriteRounds: int32
+        ruleHits: int32
+        extracted: int32
+        opDelta: int32
+        egraphMs: int32
+        blockCount: int32
+        candidateBlockCount: int32
+        changedBlockCount: int32
+        skippedBlockCount: int32
+        hardFailBlockCount: int32
+        unsafeOpCount: int32
+        applied: bool
+        skipped: bool
+        hardFail: bool
+        blockedReason: str
+
+# ---- helpers ----
+
+fn EGraphReportInit(report: var EGraphRunReport) =
+    report.applied = false
+    report.skipped = false
+    report.hardFail = false
+    report.egraphClasses = 0
+    report.rewriteRounds = 0
+    report.ruleHits = 0
+    report.extracted = 0
+    report.opDelta = 0
+    report.egraphMs = 0
+    report.blockCount = 0
+    report.candidateBlockCount = 0
+    report.changedBlockCount = 0
+    report.skippedBlockCount = 0
+    report.hardFailBlockCount = 0
+    report.unsafeOpCount = 0
+    report.blockedReason = ""
+
+fn EGraphReportReason(report: var EGraphRunReport,
+                       reason: str) =
+    if len(report.blockedReason) <= 0:
+        report.blockedReason = reason
+
+fn EGraphPassResultFrom(report: EGraphRunReport): EGraphPassResult =
+    var out: EGraphPassResult
+    out.applied = report.applied
+    out.skipped = report.skipped
+    out.hardFail = report.hardFail
+    out.egraphClasses = report.egraphClasses
+    out.rewriteRounds = report.rewriteRounds
+    out.ruleHits = report.ruleHits
+    out.extracted = report.extracted
+    out.opDelta = report.opDelta
+    out.egraphMs = report.egraphMs
+    out.blockCount = report.blockCount
+    out.candidateBlockCount = report.candidateBlockCount
+    out.changedBlockCount = report.changedBlockCount
+    out.skippedBlockCount = report.skippedBlockCount
+    out.hardFailBlockCount = report.hardFailBlockCount
+    out.unsafeOpCount = report.unsafeOpCount
+    out.blockedReason = report.blockedReason
+    return out
+
+@borrows
+fn EGraphElapsedMs(startTime: mt.MonoTime): int32 =
+    let now = mt.GetMonoTime()
+    let nowNs = mt.MonoTimeNs(now)
+    let startNs = mt.MonoTimeNs(startTime)
+    let elapsedNs = nowNs - startNs
+    return int32(elapsedNs / 1000000)
+
+@borrows
+fn EGraphLocalValid(bodyIR: coreir.BodyIR,
+                     slot: int32): bool =
+    if slot < 0:
+        return false
+    if slot >= bodyIR.localSlots.len:
+        return false
+    return true
+
+@borrows
+fn EGraphIsPureOp(op: coreir.BodyOp): bool =
+    # Only i32 const, i32 binop (add/sub/mul), i32 cmp
+    if op.kind == coreir.BodyOpLoadConstTag:
+        if op.operands.len < 2:
+            return false
+        if op.operands[0] == coreir.LocalI32Tag:
+            return true
+        return false
+    if op.kind == coreir.BodyOpBinOpTag:
+        if op.operands.len < 4:
+            return false
+        if op.operands[0] != coreir.LocalI32Tag:
+            return false
+        let kind = op.operands[1]
+        if kind == int32(texpr.TypedExprIrOpI32Add):
+            return true
+        if kind == int32(texpr.TypedExprIrOpI32Sub):
+            return true
+        if kind == int32(texpr.TypedExprIrOpI32Mul):
+            return true
+        return false
+    if op.kind == coreir.BodyOpCmpTag:
+        if op.operands.len < 3:
+            return false
+        let cond = op.operands[0]
+        if cond < coreir.BodyCondI32EqTag:
+            return false
+        if cond > coreir.BodyCondI32GeTag:
+            return false
+        return true
+    return false
+
+@borrows
+fn EGraphIsPureOpAt(bodyIR: var coreir.BodyIR,
+                     opIndex: int32): bool =
+    if opIndex < 0 || opIndex >= bodyIR.ops.len:
+        return false
+    let opKind = bodyIR.ops[opIndex].kind
+    if opKind == coreir.BodyOpLoadConstTag:
+        if bodyIR.ops[opIndex].operands.len < 2:
+            return false
+        if bodyIR.ops[opIndex].operands[0] == coreir.LocalI32Tag:
+            return true
+        return false
+    if opKind == coreir.BodyOpBinOpTag:
+        if bodyIR.ops[opIndex].operands.len < 4:
+            return false
+        if bodyIR.ops[opIndex].operands[0] != coreir.LocalI32Tag:
+            return false
+        let kind = bodyIR.ops[opIndex].operands[1]
+        if kind == int32(texpr.TypedExprIrOpI32Add):
+            return true
+        if kind == int32(texpr.TypedExprIrOpI32Sub):
+            return true
+        if kind == int32(texpr.TypedExprIrOpI32Mul):
+            return true
+        return false
+    if opKind == coreir.BodyOpCmpTag:
+        if bodyIR.ops[opIndex].operands.len < 3:
+            return false
+        let cond = bodyIR.ops[opIndex].operands[0]
+        if cond < coreir.BodyCondI32EqTag:
+            return false
+        if cond > coreir.BodyCondI32GeTag:
+            return false
+        return true
+    return false
+
+@borrows
+fn EGraphFlatOperand(flat: var coreir.BodyIRFlatSoA,
+                      opIndex: int32,
+                      operandIndex: int32): int32 =
+    if opIndex < 0 || opIndex >= flat.opOperandStarts.len:
+        return 0
+    if opIndex >= flat.opOperandCounts.len:
+        return 0
+    if operandIndex < 0 || operandIndex >= flat.opOperandCounts[opIndex]:
+        return 0
+    let operandOffset = flat.opOperandStarts[opIndex] + operandIndex
+    if operandOffset < 0 || operandOffset >= flat.operands.len:
+        return 0
+    return flat.operands[operandOffset]
+
+@borrows
+fn EGraphFlatCloneOp(flat: var coreir.BodyIRFlatSoA,
+                      opIndex: int32): coreir.BodyOp =
+    var out: coreir.BodyOp
+    if opIndex < 0 || opIndex >= flat.opKinds.len:
+        return out
+    out.kind = flat.opKinds[opIndex]
+    if opIndex < flat.opTargets.len:
+        out.target = flat.opTargets[opIndex]
+    var operands: int32[]
+    if opIndex >= 0 && opIndex < flat.opOperandCounts.len:
+        for operandIndex in 0..<flat.opOperandCounts[opIndex]:
+            add(operands, EGraphFlatOperand(flat, opIndex, operandIndex))
+    out.operands = operands
+    return out
+
+fn EGraphFlatSlice(source: var coreir.BodyIRFlatSoA,
+                    opStart: int32,
+                    opCount: int32,
+                    out: var coreir.BodyIRFlatSoA): bool =
+    if opStart < 0 || opCount < 0 ||
+       opStart + opCount > source.opKinds.len ||
+       source.opKinds.len != source.opTargets.len ||
+       source.opKinds.len != source.opOperandStarts.len ||
+       source.opKinds.len != source.opOperandCounts.len:
+        return false
+    for opIndex in opStart..<(opStart + opCount):
+        let operandStart = source.opOperandStarts[opIndex]
+        let operandCount = source.opOperandCounts[opIndex]
+        if operandStart < 0 || operandCount < 0 ||
+           operandStart + operandCount > source.operands.len:
+            return false
+        add(out.opKinds, source.opKinds[opIndex])
+        add(out.opTargets, source.opTargets[opIndex])
+        add(out.opOperandStarts, out.operands.len)
+        add(out.opOperandCounts, operandCount)
+        for operandIndex in 0..<operandCount:
+            add(out.operands,
+                source.operands[operandStart + operandIndex])
+    return true
+
+fn EGraphApplyDirectIdentityCanonical(flat: var coreir.BodyIRFlatSoA,
+                                      slotToCanonical: var int32[]) =
+    var constKnown: int32[]
+    var constValues: int32[]
+    for _ in 0..<slotToCanonical.len:
+        add(constKnown, 0)
+        add(constValues, 0)
+    for opIndex in 0..<flat.opKinds.len:
+        let opKind = flat.opKinds[opIndex]
+        let target = flat.opTargets[opIndex]
+        if target < 0 || target >= slotToCanonical.len:
+            continue
+        if opKind == coreir.BodyOpLoadConstTag:
+            if flat.opOperandCounts[opIndex] >= 2:
+                if EGraphFlatOperand(flat, opIndex, 0) == coreir.LocalI32Tag:
+                    constKnown[target] = 1
+                    constValues[target] = EGraphFlatOperand(flat, opIndex, 1)
+            continue
+        if opKind == coreir.BodyOpBinOpTag:
+            if flat.opOperandCounts[opIndex] < 4:
+                continue
+            if EGraphFlatOperand(flat, opIndex, 0) != coreir.LocalI32Tag:
+                continue
+            if EGraphFlatOperand(flat, opIndex, 1) != int32(texpr.TypedExprIrOpI32Add):
+                continue
+            let lhs = EGraphFlatOperand(flat, opIndex, 2)
+            let rhs = EGraphFlatOperand(flat, opIndex, 3)
+            if rhs >= 0 && rhs < slotToCanonical.len:
+                if constKnown[rhs] == 1:
+                    if constValues[rhs] == 0:
+                        if lhs >= 0 && lhs < slotToCanonical.len:
+                            slotToCanonical[target] = slotToCanonical[lhs]
+                            continue
+            if lhs >= 0 && lhs < slotToCanonical.len:
+                if constKnown[lhs] == 1:
+                    if constValues[lhs] == 0:
+                        if rhs >= 0 && rhs < slotToCanonical.len:
+                            slotToCanonical[target] = slotToCanonical[rhs]
+
+@borrows
+fn EGraphFlatMatchesBody(bodyIR: var coreir.BodyIR,
+                          flat: var coreir.BodyIRFlatSoA): bool =
+    if flat.opKinds.len != bodyIR.ops.len ||
+       flat.opTargets.len != bodyIR.ops.len ||
+       flat.opOperandStarts.len != bodyIR.ops.len ||
+       flat.opOperandCounts.len != bodyIR.ops.len:
+        return false
+    for opIndex in 0..<bodyIR.ops.len:
+        let op = bodyIR.ops[opIndex]
+        if flat.opKinds[opIndex] != op.kind ||
+           flat.opTargets[opIndex] != op.target ||
+           flat.opOperandCounts[opIndex] != op.operands.len:
+            return false
+        let start = flat.opOperandStarts[opIndex]
+        if start < 0 || start + op.operands.len > flat.operands.len:
+            return false
+        for operandIndex in 0..<op.operands.len:
+            if flat.operands[start + operandIndex] != op.operands[operandIndex]:
+                return false
+    return true
+
+fn EGraphAppendSnapshotOperands(flat: var coreir.BodyIRFlatSoA,
+                                operands: var int32[],
+                                snap: EGraphOpSnapshot): bool =
+    if snap.operandCount < 0 || snap.operandCount > 8:
+        return false
+    add(flat.opOperandStarts, flat.operands.len)
+    add(flat.opOperandCounts, snap.operandCount)
+    if snap.operandCount >= 1:
+        add(flat.operands, snap.operand0)
+        add(operands, snap.operand0)
+    if snap.operandCount >= 2:
+        add(flat.operands, snap.operand1)
+        add(operands, snap.operand1)
+    if snap.operandCount >= 3:
+        add(flat.operands, snap.operand2)
+        add(operands, snap.operand2)
+    if snap.operandCount >= 4:
+        add(flat.operands, snap.operand3)
+        add(operands, snap.operand3)
+    if snap.operandCount >= 5:
+        add(flat.operands, snap.operand4)
+        add(operands, snap.operand4)
+    if snap.operandCount >= 6:
+        add(flat.operands, snap.operand5)
+        add(operands, snap.operand5)
+    if snap.operandCount >= 7:
+        add(flat.operands, snap.operand6)
+        add(operands, snap.operand6)
+    if snap.operandCount >= 8:
+        add(flat.operands, snap.operand7)
+        add(operands, snap.operand7)
+    return true
+
+fn EGraphBodyWithOpSnapshots(bodyIR: var coreir.BodyIR,
+                              snapshots: EGraphOpSnapshot[],
+                              flat: var coreir.BodyIRFlatSoA,
+                              ok: var bool) =
+    ok = false
+    if snapshots.len != bodyIR.ops.len:
+        return
+    var rebuiltOps: coreir.BodyOp[]
+    for opIndex in 0..<snapshots.len:
+        let snap = snapshots[opIndex]
+        var op: coreir.BodyOp
+        op.kind = snap.kind
+        op.target = snap.target
+        var operands: int32[]
+        if !EGraphAppendSnapshotOperands(flat, operands, snap):
+            return
+        op.operands = operands
+        add(flat.opKinds, op.kind)
+        add(flat.opTargets, op.target)
+        add(rebuiltOps, op)
+    bodyIR.ops = rebuiltOps
+    ok = true
+
+@borrows
+fn EGraphParseSignedIntField(text: str,
+                              start: int32,
+                              finish: int32,
+                              value: var int32): bool =
+    if start >= finish:
+        return false
+    var pos = start
+    var sign: int32 = 1
+    if text[pos] == '-':
+        sign = -1
+        pos = pos + 1
+        if pos >= finish:
+            return false
+    var out: int32
+    while pos < finish:
+        let ch = text[pos]
+        if ch < '0' || ch > '9':
+            return false
+        out = out * 10 + (Int32(ch) - Int32('0'))
+        pos = pos + 1
+    value = out * sign
+    return true
+
+@borrows
+fn EGraphSnapshotSetField(snap: var EGraphOpSnapshot,
+                           fieldIndex: int32,
+                           value: int32): bool =
+    if fieldIndex == 0:
+        snap.kind = value
+    elif fieldIndex == 1:
+        snap.target = value
+    elif fieldIndex == 2:
+        snap.operandCount = value
+    elif fieldIndex == 3:
+        snap.operand0 = value
+    elif fieldIndex == 4:
+        snap.operand1 = value
+    elif fieldIndex == 5:
+        snap.operand2 = value
+    elif fieldIndex == 6:
+        snap.operand3 = value
+    elif fieldIndex == 7:
+        snap.operand4 = value
+    elif fieldIndex == 8:
+        snap.operand5 = value
+    elif fieldIndex == 9:
+        snap.operand6 = value
+    elif fieldIndex == 10:
+        snap.operand7 = value
+    else:
+        return false
+    return true
+
+@borrows
+fn EGraphParseSnapshotText(text: str,
+                            snapshots: var EGraphOpSnapshot[]): bool =
+    var fieldStart: int32
+    var fieldIndex: int32
+    var snap: EGraphOpSnapshot
+    for pos in 0..<len(text):
+        let ch = text[pos]
+        if ch == ',' || ch == ';':
+            var value: int32
+            if !EGraphParseSignedIntField(text, fieldStart, pos, value):
+                return false
+            if !EGraphSnapshotSetField(snap, fieldIndex, value):
+                return false
+            fieldIndex = fieldIndex + 1
+            if ch == ';':
+                if fieldIndex != 11:
+                    return false
+                if snap.operandCount < 0 || snap.operandCount > 8:
+                    return false
+                add(snapshots, snap)
+                var nextSnap: EGraphOpSnapshot
+                snap = nextSnap
+                fieldIndex = 0
+            fieldStart = pos + 1
+    if fieldStart != len(text):
+        return false
+    if fieldIndex != 0:
+        return false
+    return true
+
+@borrows
+fn EGraphIsPureFlatOp(flat: var coreir.BodyIRFlatSoA,
+                       opIndex: int32): bool =
+    if opIndex < 0:
+        return false
+    if opIndex >= flat.opKinds.len:
+        return false
+    let opKind = flat.opKinds[opIndex]
+    if opKind == coreir.BodyOpLoadConstTag:
+        if flat.opOperandCounts[opIndex] < 2:
+            return false
+        if EGraphFlatOperand(flat, opIndex, 0) == coreir.LocalI32Tag:
+            return true
+        return false
+    if opKind == coreir.BodyOpBinOpTag:
+        if flat.opOperandCounts[opIndex] < 4:
+            return false
+        if EGraphFlatOperand(flat, opIndex, 0) != coreir.LocalI32Tag:
+            return false
+        let kind = EGraphFlatOperand(flat, opIndex, 1)
+        if kind == int32(texpr.TypedExprIrOpI32Add):
+            return true
+        if kind == int32(texpr.TypedExprIrOpI32Sub):
+            return true
+        if kind == int32(texpr.TypedExprIrOpI32Mul):
+            return true
+        return false
+    if opKind == coreir.BodyOpCmpTag:
+        if flat.opOperandCounts[opIndex] < 3:
+            return false
+        let cond = EGraphFlatOperand(flat, opIndex, 0)
+        if cond < coreir.BodyCondI32EqTag:
+            return false
+        if cond > coreir.BodyCondI32GeTag:
+            return false
+        return true
+    return false
+
+@borrows
+fn EGraphLocalUnsafeReason(bodyIR: coreir.BodyIR,
+                            slot: int32): str =
+    if !EGraphLocalValid(bodyIR, slot):
+        return ""
+    let local = bodyIR.localSlots[slot]
+    if local.typeKind == coreir.LocalPtrTag:
+        return "ptr_local"
+    if int32(local.escapeKind) != coreir.EscapeInvalidTag:
+        if int32(local.escapeKind) != coreir.EscapeNoneTag:
+            return "escaped_mutable_local"
+    if !local.noAlias:
+        if !coreir.IsOwnershipNoAlias(local.ownership, local.aliasClass):
+            return "may_alias_local"
+    return ""
+
+@borrows
+fn EGraphOpSlotUnsafeReason(bodyIR: coreir.BodyIR,
+                             slot: int32): str =
+    if slot < 0:
+        return ""
+    return EGraphLocalUnsafeReason(bodyIR, slot)
+
+@borrows
+fn EGraphOpUnsafeReason(bodyIR: coreir.BodyIR,
+                         op: coreir.BodyOp): str =
+    if op.kind == coreir.BodyOpCallTag:
+        return "call"
+    if op.kind == coreir.BodyOpLoadLocalTag ||
+       op.kind == coreir.BodyOpIndexedLoadTag ||
+       op.kind == coreir.BodyOpFieldLoadTag ||
+       op.kind == coreir.BodyOpGlobalLoadTag:
+        return "load"
+    if op.kind == coreir.BodyOpStoreLocalTag ||
+       op.kind == coreir.BodyOpIndexedStoreTag ||
+       op.kind == coreir.BodyOpFieldStoreTag ||
+       op.kind == coreir.BodyOpGlobalStoreTag:
+        return "store"
+    let targetReason = EGraphOpSlotUnsafeReason(bodyIR, op.target)
+    if len(targetReason) > 0:
+        return targetReason
+    if op.kind == coreir.BodyOpBinOpTag:
+        for oi in 2..<op.operands.len:
+            let reason = EGraphOpSlotUnsafeReason(bodyIR, op.operands[oi])
+            if len(reason) > 0:
+                return reason
+    elif op.kind == coreir.BodyOpCmpTag:
+        for oi in 1..<op.operands.len:
+            let reason = EGraphOpSlotUnsafeReason(bodyIR, op.operands[oi])
+            if len(reason) > 0:
+                return reason
+    if !EGraphIsPureOp(op):
+        if op.kind == coreir.BodyOpLoadConstTag:
+            return "unsupported_load_const"
+        if op.kind == coreir.BodyOpBinOpTag:
+            return "unsupported_binop"
+        if op.kind == coreir.BodyOpCmpTag:
+            return "unsupported_cmp"
+        return "unsupported_op"
+    return ""
+
+@borrows
+fn EGraphOpUnsafeReasonAt(bodyIR: var coreir.BodyIR,
+                           opIndex: int32): str =
+    if opIndex < 0 || opIndex >= bodyIR.ops.len:
+        return "invalid_op_index"
+    let opKind = bodyIR.ops[opIndex].kind
+    if opKind == coreir.BodyOpCallTag:
+        return "call"
+    if opKind == coreir.BodyOpLoadLocalTag ||
+       opKind == coreir.BodyOpIndexedLoadTag ||
+       opKind == coreir.BodyOpFieldLoadTag ||
+       opKind == coreir.BodyOpGlobalLoadTag:
+        return "load"
+    if opKind == coreir.BodyOpStoreLocalTag ||
+       opKind == coreir.BodyOpIndexedStoreTag ||
+       opKind == coreir.BodyOpFieldStoreTag ||
+       opKind == coreir.BodyOpGlobalStoreTag:
+        return "store"
+    let targetReason = EGraphOpSlotUnsafeReason(bodyIR, bodyIR.ops[opIndex].target)
+    if len(targetReason) > 0:
+        return targetReason
+    if opKind == coreir.BodyOpBinOpTag:
+        for oi in 2..<bodyIR.ops[opIndex].operands.len:
+            let reason = EGraphOpSlotUnsafeReason(bodyIR, bodyIR.ops[opIndex].operands[oi])
+            if len(reason) > 0:
+                return reason
+    elif opKind == coreir.BodyOpCmpTag:
+        for oi in 1..<bodyIR.ops[opIndex].operands.len:
+            let reason = EGraphOpSlotUnsafeReason(bodyIR, bodyIR.ops[opIndex].operands[oi])
+            if len(reason) > 0:
+                return reason
+    if !EGraphIsPureOpAt(bodyIR, opIndex):
+        if opKind == coreir.BodyOpLoadConstTag:
+            return "unsupported_load_const"
+        if opKind == coreir.BodyOpBinOpTag:
+            return "unsupported_binop"
+        if opKind == coreir.BodyOpCmpTag:
+            return "unsupported_cmp"
+        return "unsupported_op"
+    return ""
+
+@borrows
+fn EGraphFlatOpUnsafeReason(bodyIR: coreir.BodyIR,
+                             flat: var coreir.BodyIRFlatSoA,
+                             opIndex: int32): str =
+    if opIndex < 0 || opIndex >= flat.opKinds.len:
+        return "invalid_op_index"
+    let opKind = flat.opKinds[opIndex]
+    if opKind == coreir.BodyOpCallTag:
+        return "call"
+    if opKind == coreir.BodyOpLoadLocalTag ||
+       opKind == coreir.BodyOpIndexedLoadTag ||
+       opKind == coreir.BodyOpFieldLoadTag ||
+       opKind == coreir.BodyOpGlobalLoadTag:
+        return "load"
+    if opKind == coreir.BodyOpStoreLocalTag ||
+       opKind == coreir.BodyOpIndexedStoreTag ||
+       opKind == coreir.BodyOpFieldStoreTag ||
+       opKind == coreir.BodyOpGlobalStoreTag:
+        return "store"
+    let targetReason = EGraphOpSlotUnsafeReason(bodyIR, flat.opTargets[opIndex])
+    if len(targetReason) > 0:
+        return targetReason
+    if opKind == coreir.BodyOpBinOpTag:
+        for oi in 2..<flat.opOperandCounts[opIndex]:
+            let reason = EGraphOpSlotUnsafeReason(bodyIR, EGraphFlatOperand(flat, opIndex, oi))
+            if len(reason) > 0:
+                return reason
+    elif opKind == coreir.BodyOpCmpTag:
+        for oi in 1..<flat.opOperandCounts[opIndex]:
+            let reason = EGraphOpSlotUnsafeReason(bodyIR, EGraphFlatOperand(flat, opIndex, oi))
+            if len(reason) > 0:
+                return reason
+    if !EGraphIsPureFlatOp(flat, opIndex):
+        if opKind == coreir.BodyOpLoadConstTag:
+            return "unsupported_load_const"
+        if opKind == coreir.BodyOpBinOpTag:
+            return "unsupported_binop"
+        if opKind == coreir.BodyOpCmpTag:
+            return "unsupported_cmp"
+        return "unsupported_op"
+    return ""
+
+@borrows
+fn EGraphTermUnsafeReason(bodyIR: coreir.BodyIR,
+                           term: coreir.BodyTerm): str =
+    let resultReason = EGraphOpSlotUnsafeReason(bodyIR, term.resultSlot)
+    if len(resultReason) > 0:
+        return resultReason
+    let lhsReason = EGraphOpSlotUnsafeReason(bodyIR, term.lhsSlot)
+    if len(lhsReason) > 0:
+        return lhsReason
+    let rhsReason = EGraphOpSlotUnsafeReason(bodyIR, term.rhsSlot)
+    if len(rhsReason) > 0:
+        return rhsReason
+    return ""
+
+@borrows
+fn EGraphBlockSkipReason(bodyIR: var coreir.BodyIR,
+                          flat: var coreir.BodyIRFlatSoA,
+                          block: coreir.BodyBlock,
+                          report: var EGraphRunReport): str =
+    if block.opStart < 0 ||
+       block.opCount < 0 ||
+       block.opStart + block.opCount > bodyIR.ops.len:
+        return "invalid_block_range"
+    if block.termIndex < 0 ||
+       block.termIndex >= bodyIR.terms.len:
+        return "invalid_block_term"
+    var pureCount: int32
+    for opIndex in block.opStart..<(block.opStart + block.opCount):
+        let reason = EGraphFlatOpUnsafeReason(bodyIR, flat, opIndex)
+        if len(reason) > 0:
+            report.unsafeOpCount = report.unsafeOpCount + 1
+            return reason
+        if EGraphIsPureFlatOp(flat, opIndex):
+            pureCount = pureCount + 1
+    let termReason = EGraphTermUnsafeReason(bodyIR, bodyIR.terms[block.termIndex])
+    if len(termReason) > 0:
+        report.unsafeOpCount = report.unsafeOpCount + 1
+        return termReason
+    if pureCount <= 0:
+        return "no_pure_integer_ops"
+    return ""
+
+@borrows
+fn EGraphCloneOp(op: coreir.BodyOp): coreir.BodyOp =
+    var out: coreir.BodyOp
+    out.kind = op.kind
+    out.target = op.target
+    var cloneOperands: int32[]
+    for oi in 0..<op.operands.len:
+        add(cloneOperands, op.operands[oi])
+    out.operands = cloneOperands
+    return out
+
+@borrows
+fn EGraphCloneTerm(term: coreir.BodyTerm): coreir.BodyTerm =
+    var out: coreir.BodyTerm
+    out.kind = term.kind
+    out.conditionKind = term.conditionKind
+    out.resultSlot = term.resultSlot
+    out.sourceDefinitionDomain = term.sourceDefinitionDomain
+    out.sourceDefinitionRow = term.sourceDefinitionRow
+    out.lhsSlot = term.lhsSlot
+    out.rhsSlot = term.rhsSlot
+    out.trueBlock = term.trueBlock
+    out.falseBlock = term.falseBlock
+    var operands: int32[]
+    for operand in term.operands:
+        add(operands, operand)
+    out.operands = operands
+    return out
+
+@borrows
+fn EGraphOpsEquivalent(left: coreir.BodyOp[],
+                        right: coreir.BodyOp[]): bool =
+    if left.len != right.len:
+        return false
+    for i in 0..<left.len:
+        if left[i].kind != right[i].kind:
+            return false
+        if left[i].target != right[i].target:
+            return false
+        if left[i].operands.len != right[i].operands.len:
+            return false
+        for oi in 0..<left[i].operands.len:
+            if left[i].operands[oi] != right[i].operands[oi]:
+                return false
+    return true
+
+@borrows
+fn EGraphTermEquivalent(left: coreir.BodyTerm,
+                         right: coreir.BodyTerm): bool =
+    if left.kind != right.kind:
+        return false
+    if left.conditionKind != right.conditionKind:
+        return false
+    if left.resultSlot != right.resultSlot:
+        return false
+    if left.lhsSlot != right.lhsSlot:
+        return false
+    if left.rhsSlot != right.rhsSlot:
+        return false
+    if left.trueBlock != right.trueBlock:
+        return false
+    if left.falseBlock != right.falseBlock:
+        return false
+    return true
+
+# Resolve class through union-find redirect chain (EGraph context).
+@borrows
+fn EGraphResolveClass(eg: EGraph,
+                       classIdx: int32): int32 =
+    var idx = classIdx
+    while idx >= 0 && idx < eg.classes.len:
+        let cl = eg.classes[idx]
+        if cl.mergedInto < 0:
+            return idx
+        if cl.mergedInto == idx:
+            return idx
+        idx = cl.mergedInto
+    return idx
+
+# Resolve class from a flat EGraphClass array (no EGraph wrapper).
+@borrows
+fn EGraphClassResolveFlat(classes: EGraphClass[],
+                           classIdx: int32): int32 =
+    var idx = classIdx
+    while idx >= 0 && idx < classes.len:
+        let cl = classes[idx]
+        if cl.mergedInto < 0:
+            return idx
+        if cl.mergedInto == idx:
+            return idx
+        idx = cl.mergedInto
+    return idx
+
+# Inline resolve for build context (arrays, no EGraph wrapper).
+@borrows
+fn EGraphBuildClassResolve(classes: var EGraphClass[],
+                            classIdx: int32): int32 =
+    var idx = classIdx
+    while idx >= 0 && idx < classes.len:
+        let cl = classes[idx]
+        if cl.mergedInto < 0:
+            return idx
+        if cl.mergedInto == idx:
+            return idx
+        idx = cl.mergedInto
+    return idx
+
+# Return true if node n matches the given tuple.
+@borrows
+fn EGraphNodeMatches(n: EGraphNode,
+                      opKind: int32,
+                      child0: int32,
+                      child1: int32,
+                      info0: int32,
+                      info1: int32,
+                      constVal: int32): bool =
+    if n.opKind != opKind:
+        return false
+    if n.info0 != info0 || n.info1 != info1 || n.constVal != constVal:
+        return false
+    if n.childClasses.len >= 1 && n.childClasses[0] != child0:
+        return false
+    if n.childClasses.len >= 2 && n.childClasses[1] != child1:
+        return false
+    return true
+
+@borrows
+fn egraphCloneNode(src: EGraphNode): EGraphNode =
+    var copied: EGraphNode
+    copied.id = src.id
+    copied.opKind = src.opKind
+    var kids: int32[]
+    for i in 0..<src.childClasses.len:
+        add(kids, src.childClasses[i])
+    copied.childClasses = kids
+    copied.info0 = src.info0
+    copied.info1 = src.info1
+    copied.constVal = src.constVal
+    copied.targetSlot = src.targetSlot
+    return copied
+
+@borrows
+fn egraphCloneNodeSeq(items: EGraphNode[]): EGraphNode[] =
+    var out: EGraphNode[]
+    for i in 0..<items.len:
+        add(out, egraphCloneNode(items[i]))
+    return out
+
+@borrows
+fn egraphCloneClass(src: EGraphClass): EGraphClass =
+    var copied: EGraphClass
+    var ids: int32[]
+    for i in 0..<src.nodeIds.len:
+        add(ids, src.nodeIds[i])
+    copied.nodeIds = ids
+    copied.canonicalNode = src.canonicalNode
+    copied.mergedInto = src.mergedInto
+    return copied
+
+@borrows
+fn egraphCloneClassSeq(items: EGraphClass[]): EGraphClass[] =
+    var out: EGraphClass[]
+    for i in 0..<items.len:
+        add(out, egraphCloneClass(items[i]))
+    return out
+
+# ---- build ----
+
+fn EGraphBuild(flat: var coreir.BodyIRFlatSoA,
+                nodes: var EGraphNode[],
+                classes: var EGraphClass[],
+                slotToClass: var int32[]): int32 =
+    # Initialize slotToClass to -1
+    for i in 0..<slotToClass.len:
+        slotToClass[i] = EClassNoClass
+
+    var classCount: int32
+
+    for opIndex in 0..<flat.opKinds.len:
+        let opKind = flat.opKinds[opIndex]
+        let opTarget = flat.opTargets[opIndex]
+        if !EGraphIsPureFlatOp(flat, opIndex):
+            # Blacklisted: invalidate target slot (break def-use chain)
+            if opTarget >= 0 && opTarget < slotToClass.len:
+                slotToClass[opTarget] = EClassNoClass
+            continue
+
+        if opTarget < 0 || opTarget >= slotToClass.len:
+            continue
+
+        # Map operator to abstract egraph op kind
+        var eopKind: int32
+        var info0: int32
+        var info1: int32
+        var constVal: int32
+        var child0: int32 = EClassNoClass
+        var child1: int32 = EClassNoClass
+
+        if opKind == coreir.BodyOpLoadConstTag:
+            eopKind = EOpConst
+            info0 = EGraphFlatOperand(flat, opIndex, 0)
+            constVal = EGraphFlatOperand(flat, opIndex, 1)
+
+        elif opKind == coreir.BodyOpBinOpTag:
+            let subKind = EGraphFlatOperand(flat, opIndex, 1)
+            if subKind == int32(texpr.TypedExprIrOpI32Add):
+                eopKind = EOpAdd
+            elif subKind == int32(texpr.TypedExprIrOpI32Sub):
+                eopKind = EOpSub
+            elif subKind == int32(texpr.TypedExprIrOpI32Mul):
+                eopKind = EOpMul
+            info0 = EGraphFlatOperand(flat, opIndex, 0)
+            info1 = subKind
+            let lhsSlot = EGraphFlatOperand(flat, opIndex, 2)
+            let rhsSlot = EGraphFlatOperand(flat, opIndex, 3)
+            if lhsSlot >= 0 && lhsSlot < slotToClass.len:
+                let raw = slotToClass[lhsSlot]
+                if raw >= 0:
+                    child0 = EGraphBuildClassResolve(classes, raw)
+                else:
+                    child0 = -(lhsSlot + 2)  # encode unknown slot for identity
+            if rhsSlot >= 0 && rhsSlot < slotToClass.len:
+                let raw = slotToClass[rhsSlot]
+                if raw >= 0:
+                    child1 = EGraphBuildClassResolve(classes, raw)
+                else:
+                    child1 = -(rhsSlot + 2)
+
+        elif opKind == coreir.BodyOpCmpTag:
+            eopKind = EOpCmp
+            info0 = EGraphFlatOperand(flat, opIndex, 0)
+            let lhsSlot = EGraphFlatOperand(flat, opIndex, 1)
+            let rhsSlot = EGraphFlatOperand(flat, opIndex, 2)
+            if lhsSlot >= 0 && lhsSlot < slotToClass.len:
+                let raw = slotToClass[lhsSlot]
+                if raw >= 0:
+                    child0 = EGraphBuildClassResolve(classes, raw)
+                else:
+                    child0 = -(lhsSlot + 2)
+            if rhsSlot >= 0 && rhsSlot < slotToClass.len:
+                let raw = slotToClass[rhsSlot]
+                if raw >= 0:
+                    child1 = EGraphBuildClassResolve(classes, raw)
+                else:
+                    child1 = -(rhsSlot + 2)
+
+        else:
+            continue
+
+        # Try to find an existing class with a matching node
+        var foundClass = EClassNoClass
+        for ci in 0..<classCount:
+            if ci >= classes.len:
+                break
+            let cl = classes[ci]
+            if cl.mergedInto >= 0:
+                continue
+            for ni in 0..<cl.nodeIds.len:
+                let nodeId = cl.nodeIds[ni]
+                if nodeId >= 0 && nodeId < nodes.len:
+                    let n = nodes[nodeId]
+                    if EGraphNodeMatches(n, eopKind, child0, child1, info0, info1, constVal):
+                        foundClass = ci
+                        break
+            if foundClass >= 0:
+                break
+
+        # Create the node
+        var node: EGraphNode
+        node.id = nodes.len
+        node.opKind = eopKind
+        var childClasses: int32[]
+        add(childClasses, child0)
+        if child1 != EClassNoClass:
+            add(childClasses, child1)
+        # For 0-child ops (Const), ensure at least one entry
+        if childClasses.len == 0:
+            add(childClasses, EClassNoClass)
+        node.childClasses = childClasses
+        node.info0 = info0
+        node.info1 = info1
+        node.constVal = constVal
+        node.targetSlot = opTarget
+        let nodeId = node.id
+        add(nodes, node)
+
+        # If no matching class, create one
+        if foundClass < 0:
+            var cl: EGraphClass
+            var nodeIds: int32[]
+            add(nodeIds, nodeId)
+            cl.nodeIds = nodeIds
+            cl.canonicalNode = nodeId
+            cl.mergedInto = -1
+            add(classes, cl)
+            foundClass = classCount
+            classCount = classCount + 1
+
+        # Add the node to the found class (skip if just created — already in)
+        if foundClass >= 0 && foundClass < classCount:
+            let cl = classes[foundClass]
+            var alreadyInClass = false
+            for ni in 0..<cl.nodeIds.len:
+                if cl.nodeIds[ni] == nodeId:
+                    alreadyInClass = true
+                    break
+            if !alreadyInClass:
+                var nodeIds: int32[]
+                for i in 0..<cl.nodeIds.len:
+                    add(nodeIds, cl.nodeIds[i])
+                add(nodeIds, nodeId)
+                classes[foundClass].nodeIds = nodeIds
+                if classes[foundClass].canonicalNode < 0:
+                    classes[foundClass].canonicalNode = nodeId
+            slotToClass[opTarget] = foundClass
+
+    return classCount
+
+# ---- rewrite ----
+
+# Merge `fromClass` into `toClass`. All nodes move; slotToClass updated.
+fn EGraphMergeClass(eg: var EGraph,
+                     fromClass: int32,
+                     toClass: int32) =
+    if fromClass == toClass:
+        return
+    if fromClass < 0 || fromClass >= eg.classes.len:
+        return
+    if toClass < 0 || toClass >= eg.classes.len:
+        return
+    if eg.classes[fromClass].mergedInto >= 0:
+        return
+    if eg.classes[toClass].mergedInto >= 0:
+        return
+
+    # Append fromCl's nodes to toCl
+    var mergedNodeIds: int32[]
+    for i in 0..<eg.classes[toClass].nodeIds.len:
+        add(mergedNodeIds, eg.classes[toClass].nodeIds[i])
+    for ni in 0..<eg.classes[fromClass].nodeIds.len:
+        let nid = eg.classes[fromClass].nodeIds[ni]
+        var found = false
+        for ti in 0..<mergedNodeIds.len:
+            if mergedNodeIds[ti] == nid:
+                found = true
+                break
+        if !found:
+            add(mergedNodeIds, nid)
+    eg.classes[toClass].nodeIds = mergedNodeIds
+
+    if eg.classes[toClass].canonicalNode < 0 &&
+       eg.classes[fromClass].canonicalNode >= 0:
+        eg.classes[toClass].canonicalNode = eg.classes[fromClass].canonicalNode
+
+    eg.classes[fromClass].nodeIds = []
+    eg.classes[fromClass].canonicalNode = -1
+    eg.classes[fromClass].mergedInto = toClass
+
+    # Update slotToClass entries that pointed to the dead class
+    for si in 0..<eg.slotToClass.len:
+        if eg.slotToClass[si] == fromClass:
+            eg.slotToClass[si] = toClass
+
+# Check if class `ci` contains an EOpConst node with value `val`.
+@borrows
+fn EGraphClassHasConst(eg: EGraph,
+                        ci: int32,
+                        val: int32): bool =
+    if ci < 0 || ci >= eg.classes.len:
+        return false
+    let cl = eg.classes[ci]
+    if cl.mergedInto >= 0:
+        return false
+    for ni in 0..<cl.nodeIds.len:
+        let nid = cl.nodeIds[ni]
+        if nid < 0 || nid >= eg.nodes.len:
+            continue
+        let n = eg.nodes[nid]
+        if n.opKind == EOpConst:
+            if n.constVal == val:
+                return true
+    return false
+
+# Check if class `ci` contains any EOpConst node; return value via `val`.
+@borrows
+fn EGraphClassTryConst(eg: EGraph,
+                        ci: int32,
+                        val: var int32): bool =
+    if ci < 0 || ci >= eg.classes.len:
+        return false
+    let cl = eg.classes[ci]
+    if cl.mergedInto >= 0:
+        return false
+    for ni in 0..<cl.nodeIds.len:
+        let nid = cl.nodeIds[ni]
+        if nid < 0 || nid >= eg.nodes.len:
+            continue
+        let n = eg.nodes[nid]
+        if n.opKind == EOpConst:
+            val = n.constVal
+            return true
+    return false
+
+# Add a new EOpConst node to class `ci`.
+fn EGraphAddConstToClass(eg: var EGraph,
+                          ci: int32,
+                          value: int32) =
+    if ci < 0 || ci >= eg.classes.len:
+        return
+    if eg.classes[ci].mergedInto >= 0:
+        return
+    if EGraphClassHasConst(eg, ci, value):
+        return
+    var node: EGraphNode
+    node.id = eg.nodes.len
+    node.opKind = EOpConst
+    var childClasses: int32[]
+    add(childClasses, EClassNoClass)
+    node.childClasses = childClasses
+    node.info0 = coreir.LocalI32Tag
+    node.info1 = 0
+    node.constVal = value
+    node.targetSlot = EClassNoSlot
+    let nodeId = node.id
+    var nodes: EGraphNode[]
+    for i in 0..<eg.nodes.len:
+        let src = eg.nodes[i]
+        var copied: EGraphNode
+        copied.id = src.id
+        copied.opKind = src.opKind
+        var kids: int32[]
+        for j in 0..<src.childClasses.len:
+            add(kids, src.childClasses[j])
+        copied.childClasses = kids
+        copied.info0 = src.info0
+        copied.info1 = src.info1
+        copied.constVal = src.constVal
+        copied.targetSlot = src.targetSlot
+        add(nodes, copied)
+    add(nodes, node)
+    eg.nodes = nodes
+    var nodeIds: int32[]
+    for i in 0..<eg.classes[ci].nodeIds.len:
+        add(nodeIds, eg.classes[ci].nodeIds[i])
+    add(nodeIds, nodeId)
+    eg.classes[ci].nodeIds = nodeIds
+    if eg.classes[ci].canonicalNode < 0:
+        eg.classes[ci].canonicalNode = nodeId
+
+# Fold ADD(CONST(a), CONST(b)) by creating CONST(a+b) in the class.
+fn EGraphFoldAdd(eg: var EGraph,
+                  ci: int32,
+                  lhsClass: int32,
+                  rhsClass: int32): bool =
+    var lhsVal: int32
+    var rhsVal: int32
+    if !EGraphClassTryConst(eg, lhsClass, lhsVal):
+        return false
+    if !EGraphClassTryConst(eg, rhsClass, rhsVal):
+        return false
+    let folded = lhsVal + rhsVal
+    EGraphAddConstToClass(eg, ci, folded)
+    return true
+
+fn EGraphFoldSub(eg: var EGraph,
+                  ci: int32,
+                  lhsClass: int32,
+                  rhsClass: int32): bool =
+    var lhsVal: int32
+    var rhsVal: int32
+    if !EGraphClassTryConst(eg, lhsClass, lhsVal):
+        return false
+    if !EGraphClassTryConst(eg, rhsClass, rhsVal):
+        return false
+    let folded = lhsVal - rhsVal
+    EGraphAddConstToClass(eg, ci, folded)
+    return true
+
+fn EGraphFoldMul(eg: var EGraph,
+                  ci: int32,
+                  lhsClass: int32,
+                  rhsClass: int32): bool =
+    var lhsVal: int32
+    var rhsVal: int32
+    if !EGraphClassTryConst(eg, lhsClass, lhsVal):
+        return false
+    if !EGraphClassTryConst(eg, rhsClass, rhsVal):
+        return false
+    let folded = lhsVal * rhsVal
+    EGraphAddConstToClass(eg, ci, folded)
+    return true
+
+fn EGraphFoldCmp(eg: var EGraph,
+                  ci: int32,
+                  condKind: int32,
+                  lhsClass: int32,
+                  rhsClass: int32): bool =
+    var lhsVal: int32
+    var rhsVal: int32
+    if !EGraphClassTryConst(eg, lhsClass, lhsVal):
+        return false
+    if !EGraphClassTryConst(eg, rhsClass, rhsVal):
+        return false
+    var result = false
+    if condKind == coreir.BodyCondI32EqTag:
+        result = lhsVal == rhsVal
+    elif condKind == coreir.BodyCondI32NeTag:
+        result = lhsVal != rhsVal
+    elif condKind == coreir.BodyCondI32LtTag:
+        result = lhsVal < rhsVal
+    elif condKind == coreir.BodyCondI32LeTag:
+        result = lhsVal <= rhsVal
+    elif condKind == coreir.BodyCondI32GtTag:
+        result = lhsVal > rhsVal
+    elif condKind == coreir.BodyCondI32GeTag:
+        result = lhsVal >= rhsVal
+    var resultValue: int32
+    if result:
+        resultValue = 1
+    EGraphAddConstToClass(eg, ci, resultValue)
+    return true
+
+# Apply one round of rewrite rules across all classes.
+# Returns number of rule hits in this round.
+fn EGraphRewriteRound(eg: var EGraph): int32 =
+    var hits: int32
+
+    var ci: int32
+    while ci < eg.classes.len:
+        let resolvedCI = EGraphResolveClass(eg, ci)
+        if resolvedCI != ci:
+            ci = ci + 1
+            continue
+
+        let cl = eg.classes[ci]
+        if cl.mergedInto >= 0:
+            ci = ci + 1
+            continue
+
+        # Snapshot the current node IDs (we may add new nodes during rewriting)
+        var nodeIds: int32[]
+        for ni in 0..<cl.nodeIds.len:
+            add(nodeIds, cl.nodeIds[ni])
+
+        for ni in 0..<nodeIds.len:
+            let nid = nodeIds[ni]
+            if nid < 0 || nid >= eg.nodes.len:
+                continue
+            let n = eg.nodes[nid]
+
+            if n.opKind == EOpAdd:
+                var lhsClass = EClassNoClass
+                if n.childClasses.len >= 1:
+                    lhsClass = n.childClasses[0]
+                var rhsClass = EClassNoClass
+                if n.childClasses.len >= 2:
+                    rhsClass = n.childClasses[1]
+                let lhsR = EGraphResolveClass(eg, lhsClass)
+                let rhsR = EGraphResolveClass(eg, rhsClass)
+
+                # ADD(x, 0) → x
+                if rhsR >= 0:
+                    if EGraphClassHasConst(eg, rhsR, 0):
+                        EGraphMergeClass(eg, ci, lhsR)
+                        hits = hits + 1
+                        break
+                # ADD(0, x) → x
+                if lhsR >= 0:
+                    if EGraphClassHasConst(eg, lhsR, 0):
+                        EGraphMergeClass(eg, ci, rhsR)
+                        hits = hits + 1
+                        break
+                # ADD(CONST(a), CONST(b)) → CONST(a+b)
+                if lhsR >= 0 && rhsR >= 0:
+                    if EGraphFoldAdd(eg, ci, lhsR, rhsR):
+                        hits = hits + 1
+                        break
+
+            elif n.opKind == EOpSub:
+                var lhsClass = EClassNoClass
+                if n.childClasses.len >= 1:
+                    lhsClass = n.childClasses[0]
+                var rhsClass = EClassNoClass
+                if n.childClasses.len >= 2:
+                    rhsClass = n.childClasses[1]
+                let lhsR = EGraphResolveClass(eg, lhsClass)
+                let rhsR = EGraphResolveClass(eg, rhsClass)
+
+                # SUB(x, 0) → x
+                if rhsR >= 0:
+                    if EGraphClassHasConst(eg, rhsR, 0):
+                        EGraphMergeClass(eg, ci, lhsR)
+                        hits = hits + 1
+                        break
+                # SUB(CONST(a), CONST(b)) → CONST(a-b)
+                if lhsR >= 0 && rhsR >= 0:
+                    if EGraphFoldSub(eg, ci, lhsR, rhsR):
+                        hits = hits + 1
+                        break
+
+            elif n.opKind == EOpMul:
+                var lhsClass = EClassNoClass
+                if n.childClasses.len >= 1:
+                    lhsClass = n.childClasses[0]
+                var rhsClass = EClassNoClass
+                if n.childClasses.len >= 2:
+                    rhsClass = n.childClasses[1]
+                let lhsR = EGraphResolveClass(eg, lhsClass)
+                let rhsR = EGraphResolveClass(eg, rhsClass)
+
+                # MUL(x, 0) → 0
+                if lhsR >= 0:
+                    if EGraphClassHasConst(eg, lhsR, 0):
+                        EGraphAddConstToClass(eg, ci, 0)
+                        hits = hits + 1
+                        break
+                if rhsR >= 0:
+                    if EGraphClassHasConst(eg, rhsR, 0):
+                        EGraphAddConstToClass(eg, ci, 0)
+                        hits = hits + 1
+                        break
+                # MUL(x, 1) → x
+                if rhsR >= 0:
+                    if EGraphClassHasConst(eg, rhsR, 1):
+                        EGraphMergeClass(eg, ci, lhsR)
+                        hits = hits + 1
+                        break
+                # MUL(1, x) → x
+                if lhsR >= 0:
+                    if EGraphClassHasConst(eg, lhsR, 1):
+                        EGraphMergeClass(eg, ci, rhsR)
+                        hits = hits + 1
+                        break
+                # MUL(CONST(a), CONST(b)) → CONST(a*b)
+                if lhsR >= 0 && rhsR >= 0:
+                    if EGraphFoldMul(eg, ci, lhsR, rhsR):
+                        hits = hits + 1
+                        break
+
+            elif n.opKind == EOpCmp:
+                var lhsClass = EClassNoClass
+                if n.childClasses.len >= 1:
+                    lhsClass = n.childClasses[0]
+                var rhsClass = EClassNoClass
+                if n.childClasses.len >= 2:
+                    rhsClass = n.childClasses[1]
+                let lhsR = EGraphResolveClass(eg, lhsClass)
+                let rhsR = EGraphResolveClass(eg, rhsClass)
+
+                # CMP(x, x, EQ) → 1, CMP(x, x, NE) → 0,
+                # CMP(x, x, LE/GE) → 1, CMP(x, x, LT/GT) → 0
+                if lhsR >= 0 && lhsR == rhsR:
+                    let condKind = n.info0
+                    if condKind == coreir.BodyCondI32EqTag ||
+                       condKind == coreir.BodyCondI32LeTag ||
+                       condKind == coreir.BodyCondI32GeTag:
+                        EGraphAddConstToClass(eg, ci, 1)
+                    else:
+                        EGraphAddConstToClass(eg, ci, 0)
+                    hits = hits + 1
+                    break
+                # CMP(CONST(a), CONST(b), cond) → CONST(result)
+                if lhsR >= 0 && rhsR >= 0:
+                    if EGraphFoldCmp(eg, ci, n.info0, lhsR, rhsR):
+                        hits = hits + 1
+                        break
+
+            # Select rules (dormant — no SELECT nodes are created during build)
+            # When SELECT nodes are injected by a future build phase:
+            #   SELECT(1, a, b) → a,  SELECT(0, a, b) → b
+            if n.opKind == EOpSel && n.childClasses.len >= 3:
+                let condR = EGraphResolveClass(eg, n.childClasses[0])
+                let trueR = EGraphResolveClass(eg, n.childClasses[1])
+                let falseR = EGraphResolveClass(eg, n.childClasses[2])
+                if EGraphClassHasConst(eg, condR, 1):
+                    EGraphMergeClass(eg, ci, trueR)
+                    hits = hits + 1
+                    break
+                if EGraphClassHasConst(eg, condR, 0):
+                    EGraphMergeClass(eg, ci, falseR)
+                    hits = hits + 1
+                    break
+
+        ci = ci + 1
+
+    return hits
+
+# Run rewrite rounds up to maxRounds. Returns total hits and the rounds executed.
+fn EGraphRewrite(eg: var EGraph,
+                 rounds: var int32): int32 =
+    var totalHits: int32
+    rounds = 0
+    for round in 0..<EGraphMaxRounds:
+        let roundHits = EGraphRewriteRound(eg)
+        rounds = rounds + 1
+        totalHits = totalHits + roundHits
+        if roundHits == 0:
+            break
+    return totalHits
+
+# ---- extract ----
+
+# Build slot-to-canonical-slot mapping and replace only the owned op/term
+# columns.  No BodyIR header or managed metadata is copied.
+fn EGraphExtract(ops: var coreir.BodyOp[],
+                  terms: var coreir.BodyTerm[],
+                  flat: var coreir.BodyIRFlatSoA,
+                  localCount: int32,
+                  eg: var EGraph) =
+    if localCount <= 0:
+        return
+
+    # Phase 1: class → canonical slot
+    var classToCanonicalSlot: int32[]
+    for ci in 0..<eg.classes.len:
+        add(classToCanonicalSlot, EClassNoSlot)
+
+    for si in 0..<localCount:
+        let raw = eg.slotToClass[si]
+        if raw < 0 || raw >= eg.classes.len:
+            continue
+        let resolved = EGraphClassResolveFlat(eg.classes, raw)
+        if resolved < 0 || resolved >= classToCanonicalSlot.len:
+            continue
+        if classToCanonicalSlot[resolved] < 0:
+            classToCanonicalSlot[resolved] = si
+
+    # Phase 2: slot → canonical slot
+    var slotToCanonical: int32[]
+    for si in 0..<localCount:
+        add(slotToCanonical, si)
+
+    for si in 0..<localCount:
+        let raw = eg.slotToClass[si]
+        if raw < 0 || raw >= eg.classes.len:
+            continue
+        let resolved = EGraphClassResolveFlat(eg.classes, raw)
+        if resolved < 0 || resolved >= classToCanonicalSlot.len:
+            continue
+        let canonical = classToCanonicalSlot[resolved]
+        if canonical >= 0 && canonical != si:
+            slotToCanonical[si] = canonical
+    EGraphApplyDirectIdentityCanonical(flat, slotToCanonical)
+
+    # Phase 3: emit ops
+    var outOps: coreir.BodyOp[]
+    for opIndex in 0..<flat.opKinds.len:
+        let opKind = flat.opKinds[opIndex]
+        let opTarget = flat.opTargets[opIndex]
+
+        # Handle non-pure ops: emit as-is with slot fixup
+        if !EGraphIsPureFlatOp(flat, opIndex):
+            let newOp = EGraphFlatCloneOp(flat, opIndex)
+            add(outOps, newOp)
+            continue
+
+        # Pure op: check if it's canonical for its class
+        if opTarget < 0 || opTarget >= eg.slotToClass.len:
+            continue
+
+        let raw = eg.slotToClass[opTarget]
+        if raw < 0 || raw >= eg.classes.len:
+            add(outOps, EGraphFlatCloneOp(flat, opIndex))
+            continue
+
+        let resolved = EGraphClassResolveFlat(eg.classes, raw)
+        if resolved < 0 || resolved >= eg.classes.len:
+            add(outOps, EGraphFlatCloneOp(flat, opIndex))
+            continue
+
+        var canonicalSlot = classToCanonicalSlot[resolved]
+        if opTarget >= 0 && opTarget < slotToCanonical.len:
+            canonicalSlot = slotToCanonical[opTarget]
+
+        # Skip if this slot is not the canonical slot for its class (CSE dead)
+        if canonicalSlot != opTarget:
+            continue
+
+        # Emit the canonical node for this class
+        let cl = eg.classes[resolved]
+        let cn = cl.canonicalNode
+        if cn < 0 || cn >= eg.nodes.len:
+            add(outOps, EGraphFlatCloneOp(flat, opIndex))
+            continue
+
+        let node = eg.nodes[cn]
+
+        if node.opKind == EOpConst:
+            var newOp: coreir.BodyOp
+            newOp.kind = coreir.BodyOpLoadConstTag
+            newOp.target = opTarget
+            var operands: int32[]
+            var typeKind = node.info0
+            if typeKind == 0:
+                typeKind = coreir.LocalI32Tag
+            add(operands, typeKind)
+            add(operands, node.constVal)
+            newOp.operands = operands
+            add(outOps, newOp)
+
+        elif node.opKind == EOpAdd || node.opKind == EOpSub || node.opKind == EOpMul:
+            var newOp: coreir.BodyOp
+            newOp.kind = coreir.BodyOpBinOpTag
+            newOp.target = opTarget
+            var lhsSlot = EClassNoSlot
+            var rhsSlot = EClassNoSlot
+            if node.childClasses.len >= 1 && node.childClasses[0] >= 0:
+                let childR0 = EGraphClassResolveFlat(eg.classes,
+                                                      node.childClasses[0])
+                if childR0 >= 0 && childR0 < classToCanonicalSlot.len:
+                    lhsSlot = classToCanonicalSlot[childR0]
+            elif node.childClasses.len >= 1 && node.childClasses[0] < EClassNoClass:
+                lhsSlot = -(node.childClasses[0] + 2)
+            if node.childClasses.len >= 2 && node.childClasses[1] >= 0:
+                let childR1 = EGraphClassResolveFlat(eg.classes,
+                                                      node.childClasses[1])
+                if childR1 >= 0 && childR1 < classToCanonicalSlot.len:
+                    rhsSlot = classToCanonicalSlot[childR1]
+            elif node.childClasses.len >= 2 && node.childClasses[1] < EClassNoClass:
+                rhsSlot = -(node.childClasses[1] + 2)
+            var operands: int32[]
+            var typeKind = node.info0
+            if typeKind == 0:
+                typeKind = coreir.LocalI32Tag
+            var lhsOut = lhsSlot
+            var rhsOut = rhsSlot
+            if lhsOut < 0:
+                lhsOut = 0
+            if rhsOut < 0:
+                rhsOut = 0
+            add(operands, typeKind)
+            add(operands, node.info1)
+            add(operands, lhsOut)
+            add(operands, rhsOut)
+            newOp.operands = operands
+            add(outOps, newOp)
+
+        elif node.opKind == EOpCmp:
+            var newOp: coreir.BodyOp
+            newOp.kind = coreir.BodyOpCmpTag
+            newOp.target = opTarget
+            var lhsSlot = EClassNoSlot
+            var rhsSlot = EClassNoSlot
+            if node.childClasses.len >= 1 && node.childClasses[0] >= 0:
+                let childR0 = EGraphClassResolveFlat(eg.classes,
+                                                      node.childClasses[0])
+                if childR0 >= 0 && childR0 < classToCanonicalSlot.len:
+                    lhsSlot = classToCanonicalSlot[childR0]
+            elif node.childClasses.len >= 1 && node.childClasses[0] < EClassNoClass:
+                lhsSlot = -(node.childClasses[0] + 2)
+            if node.childClasses.len >= 2 && node.childClasses[1] >= 0:
+                let childR1 = EGraphClassResolveFlat(eg.classes,
+                                                      node.childClasses[1])
+                if childR1 >= 0 && childR1 < classToCanonicalSlot.len:
+                    rhsSlot = classToCanonicalSlot[childR1]
+            elif node.childClasses.len >= 2 && node.childClasses[1] < EClassNoClass:
+                rhsSlot = -(node.childClasses[1] + 2)
+            var operands: int32[]
+            var lhsOut = lhsSlot
+            var rhsOut = rhsSlot
+            if lhsOut < 0:
+                lhsOut = 0
+            if rhsOut < 0:
+                rhsOut = 0
+            add(operands, node.info0)
+            add(operands, lhsOut)
+            add(operands, rhsOut)
+            newOp.operands = operands
+            add(outOps, newOp)
+
+        elif node.opKind == EOpSel:
+            # SELECT: dormant — no SELECT nodes exist in build.
+            # If one appears, emit as original op (fallback).
+            add(outOps, EGraphFlatCloneOp(flat, opIndex))
+
+        else:
+            add(outOps, EGraphFlatCloneOp(flat, opIndex))
+
+    ops = outOps
+    for termIndex in 0..<terms.len:
+        var term = EGraphCloneTerm(terms[termIndex])
+        if term.resultSlot >= 0 && term.resultSlot < slotToCanonical.len:
+            term.resultSlot = slotToCanonical[term.resultSlot]
+        if term.lhsSlot >= 0 && term.lhsSlot < slotToCanonical.len:
+            term.lhsSlot = slotToCanonical[term.lhsSlot]
+        if term.rhsSlot >= 0 && term.rhsSlot < slotToCanonical.len:
+            term.rhsSlot = slotToCanonical[term.rhsSlot]
+        terms[termIndex] = term
+
+# ---- top-level entry ----
+
+fn EGraphRunFlatBody(ops: var coreir.BodyOp[],
+                      terms: var coreir.BodyTerm[],
+                      flat: var coreir.BodyIRFlatSoA,
+                      localCount: int32,
+                      report: var EGraphRunReport) =
+    let startTime = mt.GetMonoTime()
+
+    EGraphReportInit(report)
+
+    if localCount <= 0 || ops.len <= 0:
+        report.skipped = true
+        EGraphReportReason(report, "empty_body_ir")
+        report.egraphMs = EGraphElapsedMs(startTime)
+        return
+
+    # 1. BUILD
+    var nodes: EGraphNode[]
+    var classes: EGraphClass[]
+    var slotToClass: int32[]
+    for _ in 0..<localCount:
+        add(slotToClass, EClassNoClass)
+
+    let classCount = EGraphBuild(flat, nodes, classes, slotToClass)
+
+    if classCount <= 0:
+        report.egraphMs = EGraphElapsedMs(startTime)
+        return
+
+    # 2. REWRITE
+    var eg: EGraph
+    eg.nodes = nodes
+    eg.classes = classes
+    eg.slotToClass = slotToClass
+
+    var rewriteRounds: int32
+    let totalHits = EGraphRewrite(eg, rewriteRounds)
+
+    # 3. EXTRACT
+    let oldOpCount = ops.len
+    EGraphExtract(ops,
+                  terms,
+                  flat,
+                  localCount,
+                  eg)
+
+    let elapsedMs = EGraphElapsedMs(startTime)
+
+    # Fill report
+    report.egraphClasses = classCount
+    report.rewriteRounds = rewriteRounds
+    report.ruleHits = totalHits
+    report.extracted = ops.len
+    report.opDelta = ops.len - oldOpCount
+    report.egraphMs = elapsedMs
+    report.applied = totalHits > 0
+    if !report.applied:
+        report.skipped = true
+        EGraphReportReason(report, "no_rewrite")
+
+fn BodyIrEgraphPassWithFlat(bodyIR: var coreir.BodyIR,
+                             flat: var coreir.BodyIRFlatSoA,
+                             report: var EGraphRunReport) =
+    let startTime = mt.GetMonoTime()
+    EGraphReportInit(report)
+
+    let dodReport = coreir.BodyIRDodSoAContractCheck(bodyIR)
+    if !dodReport.ok:
+        report.hardFail = true
+        report.hardFailBlockCount = 1
+        EGraphReportReason(report, "body_ir_dod_soa_invalid")
+        report.egraphMs = EGraphElapsedMs(startTime)
+        return
+
+    if !EGraphFlatMatchesBody(bodyIR, flat):
+        report.hardFail = true
+        report.hardFailBlockCount = 1
+        EGraphReportReason(report, "body_ir_flat_soa_mismatch")
+        report.egraphMs = EGraphElapsedMs(startTime)
+        return
+
+    if bodyIR.blocks.len <= 0:
+        report.skipped = true
+        EGraphReportReason(report, "no_cfg_blocks")
+        report.egraphMs = EGraphElapsedMs(startTime)
+        return
+
+    var outOps: coreir.BodyOp[]
+    var outBlocks: coreir.BodyBlock[]
+    var outTerms: coreir.BodyTerm[]
+    for term in bodyIR.terms:
+        add(outTerms, EGraphCloneTerm(term))
+    var blockCount: int32
+    var candidateBlockCount: int32
+    var changedBlockCount: int32
+    var skippedBlockCount: int32
+    var hardFailBlockCount: int32
+
+    var expectedOpStart: int32
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        blockCount = blockCount + 1
+        report.blockCount = blockCount
+        if block.opStart != expectedOpStart:
+            report.hardFail = true
+            hardFailBlockCount = hardFailBlockCount + 1
+            report.hardFailBlockCount = hardFailBlockCount
+            EGraphReportReason(report, "non_contiguous_cfg_blocks")
+            report.egraphMs = EGraphElapsedMs(startTime)
+            return
+        if block.opStart < 0 ||
+           block.opCount < 0 ||
+           block.opStart + block.opCount > bodyIR.ops.len ||
+           block.termIndex < 0 ||
+           block.termIndex >= bodyIR.terms.len:
+            report.hardFail = true
+            hardFailBlockCount = hardFailBlockCount + 1
+            report.hardFailBlockCount = hardFailBlockCount
+            EGraphReportReason(report, "invalid_cfg_block")
+            report.egraphMs = EGraphElapsedMs(startTime)
+            return
+
+        var newBlock = block
+        newBlock.opStart = outOps.len
+
+        let skipReason = EGraphBlockSkipReason(bodyIR, flat, block, report)
+        if len(skipReason) > 0:
+            skippedBlockCount = skippedBlockCount + 1
+            report.skippedBlockCount = skippedBlockCount
+            EGraphReportReason(report, skipReason)
+            for opIndex in block.opStart..<(block.opStart + block.opCount):
+                add(outOps, EGraphCloneOp(bodyIR.ops[opIndex]))
+            newBlock.opCount = block.opCount
+            add(outBlocks, newBlock)
+            expectedOpStart = block.opStart + block.opCount
+            continue
+
+        candidateBlockCount = candidateBlockCount + 1
+        report.candidateBlockCount = candidateBlockCount
+        var blockOps: coreir.BodyOp[]
+        for opIndex in block.opStart..<(block.opStart + block.opCount):
+            add(blockOps, EGraphCloneOp(bodyIR.ops[opIndex]))
+        var originalBlockOps: coreir.BodyOp[]
+        for op in blockOps:
+            add(originalBlockOps, EGraphCloneOp(op))
+        var blockTerms: coreir.BodyTerm[]
+        add(blockTerms,
+            EGraphCloneTerm(bodyIR.terms[block.termIndex]))
+        var blockFlat: coreir.BodyIRFlatSoA
+        if !EGraphFlatSlice(flat,
+                            block.opStart,
+                            block.opCount,
+                            blockFlat):
+            report.hardFail = true
+            hardFailBlockCount = hardFailBlockCount + 1
+            report.hardFailBlockCount = hardFailBlockCount
+            EGraphReportReason(report, "invalid_flat_block_slice")
+            report.egraphMs = EGraphElapsedMs(startTime)
+            return
+
+        var blockReport: EGraphRunReport
+        EGraphRunFlatBody(blockOps,
+                          blockTerms,
+                          blockFlat,
+                          bodyIR.localSlots.len,
+                          blockReport)
+        if blockReport.hardFail:
+            report.hardFail = true
+            hardFailBlockCount = hardFailBlockCount + 1
+            report.hardFailBlockCount = hardFailBlockCount
+            EGraphReportReason(
+                report,
+                strings.CloneStr(blockReport.blockedReason))
+            report.egraphMs = EGraphElapsedMs(startTime)
+            return
+
+        report.egraphClasses = report.egraphClasses + blockReport.egraphClasses
+        report.rewriteRounds = report.rewriteRounds + blockReport.rewriteRounds
+        report.ruleHits = report.ruleHits + blockReport.ruleHits
+        report.opDelta = report.opDelta + blockReport.opDelta
+
+        var termChanged = false
+        if blockTerms.len > 0:
+            termChanged = !EGraphTermEquivalent(bodyIR.terms[block.termIndex],
+                                                blockTerms[0])
+        if !EGraphOpsEquivalent(originalBlockOps, blockOps) || termChanged:
+            report.applied = true
+            changedBlockCount = changedBlockCount + 1
+            report.changedBlockCount = changedBlockCount
+
+        for opIndex in 0..<blockOps.len:
+            add(outOps, EGraphCloneOp(blockOps[opIndex]))
+        if blockTerms.len > 0:
+            outTerms[block.termIndex] = EGraphCloneTerm(blockTerms[0])
+        newBlock.opCount = blockOps.len
+        add(outBlocks, newBlock)
+        expectedOpStart = block.opStart + block.opCount
+
+    if expectedOpStart != bodyIR.ops.len:
+        report.hardFail = true
+        hardFailBlockCount = hardFailBlockCount + 1
+        report.hardFailBlockCount = hardFailBlockCount
+        EGraphReportReason(report, "cfg_ops_not_fully_covered")
+        report.egraphMs = EGraphElapsedMs(startTime)
+        return
+
+    report.extracted = outOps.len
+    report.opDelta = outOps.len - bodyIR.ops.len
+    if !report.applied:
+        report.skipped = true
+        if report.candidateBlockCount > 0:
+            EGraphReportReason(report, "no_rewrite")
+        else:
+            EGraphReportReason(report, "no_candidate_blocks")
+    report.egraphMs = EGraphElapsedMs(startTime)
+    coreir.BodyIRClearFrameLayoutCache(bodyIR)
+    bodyIR.ops = outOps
+    bodyIR.blocks = outBlocks
+    bodyIR.terms = outTerms
+
+fn BodyIrEgraphPass(bodyIR: var coreir.BodyIR,
+                     report: var EGraphRunReport) =
+    var flat = coreir.BodyIRFlattenSoA(bodyIR)
+    BodyIrEgraphPassWithFlat(bodyIR, flat, report)
+
+fn BodyIrEgraphPassWithSnapshotTextResult(bodyIR: var coreir.BodyIR,
+                                           snapshotText: str): EGraphPassResult =
+    let startTime = mt.GetMonoTime()
+    var report: EGraphRunReport
+    EGraphReportInit(report)
+    var snapshots: EGraphOpSnapshot[]
+    if !EGraphParseSnapshotText(snapshotText, snapshots):
+        report.hardFail = true
+        report.hardFailBlockCount = 1
+        EGraphReportReason(report, "body_ir_snapshot_text_invalid")
+        report.egraphMs = EGraphElapsedMs(startTime)
+        return EGraphPassResultFrom(report)
+    var flat: coreir.BodyIRFlatSoA
+    var ok: bool
+    EGraphBodyWithOpSnapshots(bodyIR, snapshots, flat, ok)
+    if !ok:
+        report.hardFail = true
+        report.hardFailBlockCount = 1
+        EGraphReportReason(report, "body_ir_op_snapshots_invalid")
+        report.egraphMs = EGraphElapsedMs(startTime)
+        return EGraphPassResultFrom(report)
+    BodyIrEgraphPassWithFlat(bodyIR, flat, report)
+    return EGraphPassResultFrom(report)

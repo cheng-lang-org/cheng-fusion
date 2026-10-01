@@ -1,0 +1,298 @@
+# WebTransport MoQ client (test companion of webtransport_moq_relay_main.cheng).
+#
+# Mirrors a browser's WebTransport client: real QUIC dial with ALPN "h3",
+# serverCertificateHashes pinning (explicit loud failure on mismatch), real h3
+# SETTINGS preamble + Extended CONNECT, then ONE bidi data stream carrying the
+# WT_STREAM signal + a standard moq segment-stream request frame, then reads
+# the exact requested range back RAW and verifies its SHA-256 against
+# --expected-hash (the same hash==asset_cid hard assertion the PWA player
+# uses).
+
+import std/result
+import std/strings
+import std/rawbytes
+import std/os as os
+import std/times as times
+import std/strutils as strutil
+import std/cmdline as cmdline
+import std/tls/x509_issue as x509issue
+import cheng/quic/connection as qconn
+import cheng/quic/multiaddress as qaddr
+import cheng/quic/msquictransport_native as qtransport
+import cheng/quic/tls/policy as qpolicy
+import cheng/quic/tls/handshake13 as handshake13
+import cheng/libp2p/transports/quic_transport as quic_transport
+import cheng/libp2p/transports/webtransport_common as wtcommon
+import cheng/libp2p/transports/webtransport_h3_session as wth3
+import cheng/libp2p/protocols/media/moq_segment_stream as moqstream
+import cheng/moq/media_asset_manifest as media
+
+fn wtMoqClientLog(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+# Announce block fields (mirrors web_scene_media_network_bridge.cheng's parser):
+# the announce is space-separated key=value text padded to 1024 bytes.
+fn wtMoqClientAnnounceField(text: str, key: str): str =
+    let parts = strutil.Split(strings.CloneStr(text), ' ')
+    var i: int32
+    while i < parts.len:
+        let kv = strutil.Split(parts[i], '=')
+        if kv.len == 2 && kv[0] == key:
+            return strings.ConcatStr(kv[1], "")
+        i = i + 1
+    return ""
+
+# One moq request on one WT bidi stream of the current session: WT_STREAM signal
+# + request frame, then the exact-length reply. The PWA player (moq-wt.js) issues
+# this same sequence per stream (announce / poster / esindex / asset range).
+fn wtMoqClientFetchOne(client: var qtransport.MsQuicTransport,
+                       base: var qconn.Connection,
+                       streamIdNum: int64,
+                       request: moqstream.Libp2pMoqSegmentStreamRequest): Result[Bytes] =
+    let wantLen: int32 = request.lengthBytes
+    let sigRes: Result[Bytes] = wtcommon.WebtransportEncodeBidiStreamSignal(0)
+    if IsErr(sigRes):
+        return Err[Bytes]("signal: " + ErrorText(sigRes))
+    let payloadRes: Result[Bytes] = moqstream.Libp2pMoqSegmentStreamRequestPayloadBytes(request)
+    if IsErr(payloadRes):
+        return Err[Bytes]("request: " + ErrorText(payloadRes))
+    var dataConn: qconn.Connection = qconn.ConnDeriveStream(base, streamIdNum, streamIdNum)
+    let sigBytes: Bytes = Value(sigRes)
+    let payloadBytes: Bytes = Value(payloadRes)
+    let sigWriteRes: Result[bool] = quic_transport.Libp2pQuicWriteExact(client, dataConn, sigBytes)
+    if IsErr(sigWriteRes):
+        return Err[Bytes]("signal write: " + ErrorText(sigWriteRes))
+    let frameWriteRes: Result[int32] = moqstream.Libp2pMoqSegmentStreamWriteFrame(dataConn, payloadBytes)
+    if IsErr(frameWriteRes):
+        return Err[Bytes]("frame write: " + ErrorText(frameWriteRes))
+    let replyRes: Result[Bytes] = moqstream.Libp2pMoqSegmentStreamReadExact(dataConn, wantLen)
+    if IsErr(replyRes):
+        return Err[Bytes]("read: " + ErrorText(replyRes))
+    return Ok[Bytes](Value(replyRes))
+
+fn main(): int32 =
+    let port: int32 = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    if port <= 0:
+        wtMoqClientLog(" wt_moq_client: missing --port")
+        return 2
+    var certHashHexRaw: str
+    let hasCertHash: bool = cmdline.ReadFirstFlagValue("--certhash", certHashHexRaw)
+    var certDerHexRaw: str
+    let hasCertDer: bool = cmdline.ReadFirstFlagValue("--certder-hex", certDerHexRaw)
+    if !hasCertHash || !hasCertDer:
+        wtMoqClientLog(" wt_moq_client: missing --certhash/--certder-hex")
+        return 2
+    var sanHostRaw: str
+    let hasSanHost: bool = cmdline.ReadFirstFlagValue("--san-host", sanHostRaw)
+    let sanHost: str = if hasSanHost: sanHostRaw else: "127.0.0.1"
+    var hostRaw: str
+    let hasHost: bool = cmdline.ReadFirstFlagValue("--host", hostRaw)
+    let dialHost: str = if hasHost: hostRaw else: "127.0.0.1"
+    var pathRaw: str
+    let hasPath: bool = cmdline.ReadFirstFlagValue("--path", pathRaw)
+    let path: str = if hasPath: pathRaw else: "/wt"
+    var segmentKeyRaw: str
+    let hasKey: bool = cmdline.ReadFirstFlagValue("--segment-key", segmentKeyRaw)
+    if !hasKey:
+        wtMoqClientLog(" wt_moq_client: missing --segment-key")
+        return 2
+    let segmentKey: str = if hasKey: segmentKeyRaw else: ""
+    let offset: int32 = cmdline.ReadInt32FlagOrDefault("--offset", 0)
+    let length: int32 = cmdline.ReadInt32FlagOrDefault("--length", 0)
+    if length <= 0:
+        wtMoqClientLog(" wt_moq_client: missing --length")
+        return 2
+    let chunk: int32 = cmdline.ReadInt32FlagOrDefault("--chunk", 4096)
+    var expectedHashRaw: str
+    let hasExpectedHash: bool = cmdline.ReadFirstFlagValue("--expected-hash", expectedHashRaw)
+    let expectedHash: str = if hasExpectedHash: expectedHashRaw else: ""
+    let withH3SettingsPreamble: bool = cmdline.HasFlag("--h3-settings-preamble")
+
+    # --- certhash pinning gate: explicit, loud failure on mismatch, no dial ---
+    let certDer: Bytes = BytesFromHex(certDerHexRaw)
+    let expectedHashBytes: Bytes = BytesFromHex(certHashHexRaw)
+    let actualHash: Bytes = x509issue.X509CertHash(certDer)
+    if !BytesEqual(actualHash, expectedHashBytes):
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_CERTHASH_MISMATCH expected=" + certHashHexRaw + " actual=" + BytesToHex(actualHash))
+        return 6
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_CERTHASH_OK=" + BytesToHex(actualHash))
+
+    var policy: qpolicy.MsQuicTlsPolicy
+    policy.serverName = sanHost
+    policy.allowInsecure = false
+    policy.trustRootsCount = 1
+    policy.trustRoot0 = certDer
+    let alpnRes: Result[bool] = qpolicy.msquicTlsPolicyAddAlpn(policy, "h3")
+    if IsErr(alpnRes):
+        wtMoqClientLog(" wt_moq_client: alpn: " + ErrorText(alpnRes))
+        return 3
+    var client = qtransport.InitMsQuicTransport()
+    let tlsRes: Result[bool] = qtransport.setMsQuicTransportTlsPolicy(client, policy)
+    if IsErr(tlsRes):
+        wtMoqClientLog(" wt_moq_client: tls policy: " + ErrorText(tlsRes))
+        return 3
+    handshake13.msquicTls13ResetClientDefault(true)
+    let addrText = "/ip4/" + strings.CloneStr(dialHost) + "/udp/" + IntToStr(port) + "/quic-v1"
+    let addrData = BytesSlice(BytesFromString(addrText), 0, len(addrText))
+    var addr: qaddr.MultiAddress
+    addr.raw = addrText
+    addr.data = addrData
+    let t0: int64 = times.MonotimeMs()
+    let dialRes: Result[qconn.Connection] = qtransport.dial(client, addr)
+    if IsErr(dialRes):
+        wtMoqClientLog(" wt_moq_client: dial: " + ErrorText(dialRes))
+        return 4
+    var base: qconn.Connection = Value(dialRes)
+    let negotiated: str = handshake13.msquicTls13ClientNegotiatedAlpn()
+    if negotiated != "h3":
+        wtMoqClientLog(" wt_moq_client: alpn negotiation failed, got=" + negotiated)
+        qconn.ConnClose(base)
+        return 5
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_ALPN=" + negotiated)
+    let authority: str = sanHost + ":" + IntToStr(port)
+    let handshakeRes: Result[bool] = wth3.Wth3ClientHandshake(client, base, authority, path, withH3SettingsPreamble)
+    if IsErr(handshakeRes):
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_SESSION_REJECTED=" + ErrorText(handshakeRes))
+        qconn.ConnClose(base)
+        return 7
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_SESSION_ESTABLISHED=1")
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_SESSION_MS=" + strings.Int64ToStr(times.MonotimeMs() - t0))
+
+    # --- player flow: the PWA player's request sequence over ONE WT session ---
+    # announce (learn identity + poster length) -> poster -> video object range,
+    # three bidi streams (4/8/12) on the same session, each one moq request.
+    if cmdline.HasFlag("--player-flow"):
+        var annReq: moqstream.Libp2pMoqSegmentStreamRequest
+        annReq.streamId = "pwa-announce-1"
+        annReq.segmentKey = "moq-announce"
+        annReq.offsetBytes = 0
+        annReq.lengthBytes = 1024
+        annReq.readChunkBytes = 1024
+        let annRes: Result[Bytes] = wtMoqClientFetchOne(client, base, 4, annReq)
+        if IsErr(annRes):
+            wtMoqClientLog(" wt_moq_client: announce: " + ErrorText(annRes))
+            qconn.ConnClose(base)
+            return 20
+        let announce: Bytes = Value(annRes)
+        let announceStr: str = BytesToString(announce)
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_ANNOUNCE_TEXT=" + share(announceStr))
+        let objectHashField: str = wtMoqClientAnnounceField(strings.CloneStr(announceStr), "object_hash")
+        let posterLenField: str = wtMoqClientAnnounceField(strings.CloneStr(announceStr), "poster_length")
+        let esIndexKeyField: str = wtMoqClientAnnounceField(strings.CloneStr(announceStr), "es_index_segment_key")
+        let pubIngestField: str = wtMoqClientAnnounceField(strings.CloneStr(announceStr), "publish_ingest_ms")
+        let pubListenField: str = wtMoqClientAnnounceField(strings.CloneStr(announceStr), "publish_listen_ms")
+        let pubTotalField: str = wtMoqClientAnnounceField(strings.CloneStr(announceStr), "publish_total_ms")
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_ANNOUNCE_BYTES=" + IntToStr(BytesLen(announce)))
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_ANNOUNCE_OBJECT_HASH=" + objectHashField)
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_ANNOUNCE_POSTER_LENGTH=" + posterLenField)
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_ANNOUNCE_ES_INDEX_KEY=" + esIndexKeyField)
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_PUBLISH_INGEST_MS=" + pubIngestField)
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_PUBLISH_LISTEN_MS=" + pubListenField)
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_PUBLISH_TOTAL_MS=" + pubTotalField)
+        if len(expectedHash) > 0 && objectHashField != expectedHash:
+            os.WriteLine(os.Get_stdout(), "WT_MOQ_ANNOUNCE_HASH_MISMATCH expected=" + expectedHash + " got=" + objectHashField)
+            qconn.ConnClose(base)
+            return 21
+        let posterLen: int32 = int32(strutil.ParseInt(posterLenField))
+        if posterLen <= 0:
+            os.WriteLine(os.Get_stdout(), "WT_MOQ_POSTER_LENGTH_PARSE_FAIL=" + posterLenField)
+            qconn.ConnClose(base)
+            return 22
+        var posterReq: moqstream.Libp2pMoqSegmentStreamRequest
+        posterReq.streamId = "pwa-poster-1"
+        posterReq.segmentKey = "moq-poster"
+        posterReq.offsetBytes = 0
+        posterReq.lengthBytes = posterLen
+        posterReq.readChunkBytes = 4096
+        let posterRes: Result[Bytes] = wtMoqClientFetchOne(client, base, 8, posterReq)
+        if IsErr(posterRes):
+            wtMoqClientLog(" wt_moq_client: poster: " + ErrorText(posterRes))
+            qconn.ConnClose(base)
+            return 23
+        let poster: Bytes = Value(posterRes)
+        let jpegMagic: bool = BytesLen(poster) >= 3 && BytesGet(poster, 0) == 255 && BytesGet(poster, 1) == 216 && BytesGet(poster, 2) == 255
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_POSTER_BYTES=" + IntToStr(BytesLen(poster)))
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_POSTER_JPEG=" + (if jpegMagic: "1" else: "0"))
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_POSTER_HASH=" + media.MediaAssetSha256Hex(poster))
+        if !jpegMagic:
+            os.WriteLine(os.Get_stdout(), "WT_MOQ_POSTER_JPEG_MAGIC_FAIL")
+            qconn.ConnClose(base)
+            return 24
+        var segReq: moqstream.Libp2pMoqSegmentStreamRequest
+        segReq.streamId = "pwa-segment-1"
+        segReq.segmentKey = segmentKey
+        segReq.offsetBytes = offset
+        segReq.lengthBytes = length
+        segReq.readChunkBytes = chunk
+        let segRes: Result[Bytes] = wtMoqClientFetchOne(client, base, 12, segReq)
+        if IsErr(segRes):
+            wtMoqClientLog(" wt_moq_client: segment: " + ErrorText(segRes))
+            qconn.ConnClose(base)
+            return 25
+        let segReply: Bytes = Value(segRes)
+        let segHash: str = media.MediaAssetSha256Hex(segReply)
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_SEGMENT_BYTES=" + IntToStr(BytesLen(segReply)))
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_SEGMENT_HASH=" + segHash)
+        if len(expectedHash) > 0 && segHash != expectedHash:
+            os.WriteLine(os.Get_stdout(), "WT_MOQ_SEGMENT_HASH_MISMATCH expected=" + expectedHash + " got=" + segHash)
+            qconn.ConnClose(base)
+            return 26
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_PLAYER_OK=1")
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_OPEN_MS=" + strings.Int64ToStr(times.MonotimeMs() - t0))
+        qconn.ConnClose(base)
+        return 0
+
+    # --- one bidi stream: WT_STREAM signal + moq request frame ---
+    var request: moqstream.Libp2pMoqSegmentStreamRequest
+    request.streamId = "wt-moq-client-1"
+    request.segmentKey = segmentKey
+    request.offsetBytes = offset
+    request.lengthBytes = length
+    request.readChunkBytes = chunk
+    let sigRes: Result[Bytes] = wtcommon.WebtransportEncodeBidiStreamSignal(0)
+    if IsErr(sigRes):
+        wtMoqClientLog(" wt_moq_client: encode WT_STREAM signal: " + ErrorText(sigRes))
+        qconn.ConnClose(base)
+        return 8
+    let payloadRes: Result[Bytes] = moqstream.Libp2pMoqSegmentStreamRequestPayloadBytes(request)
+    if IsErr(payloadRes):
+        wtMoqClientLog(" wt_moq_client: encode request: " + ErrorText(payloadRes))
+        qconn.ConnClose(base)
+        return 8
+    var dataConn: qconn.Connection = qconn.ConnDeriveStream(base, 4, 4)
+    let sigBytes: Bytes = Value(sigRes)
+    let payloadBytes: Bytes = Value(payloadRes)
+    let sigWriteRes: Result[bool] = quic_transport.Libp2pQuicWriteExact(client, dataConn, sigBytes)
+    if IsErr(sigWriteRes):
+        wtMoqClientLog(" wt_moq_client: write WT_STREAM signal: " + ErrorText(sigWriteRes))
+        qconn.ConnClose(base)
+        return 8
+    let frameWriteRes: Result[int32] = moqstream.Libp2pMoqSegmentStreamWriteFrame(dataConn, payloadBytes)
+    if IsErr(frameWriteRes):
+        wtMoqClientLog(" wt_moq_client: write request frame: " + ErrorText(frameWriteRes))
+        qconn.ConnClose(base)
+        return 8
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_SENT request_len=" + IntToStr(length))
+    # Wire-format cross-check anchor for the PWA JS client (moq-wt.js must build
+    # byte-identical frames): the WT_STREAM signal and the request payload hex.
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_SIGNAL_HEX=" + BytesToHex(sigBytes))
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_PAYLOAD_HEX=" + BytesToHex(payloadBytes))
+
+    # --- read the exact requested range back, then the hard hash assertion ---
+    let replyRes: Result[Bytes] = moqstream.Libp2pMoqSegmentStreamReadExact(dataConn, length)
+    if IsErr(replyRes):
+        wtMoqClientLog(" wt_moq_client: read reply: " + ErrorText(replyRes))
+        qconn.ConnClose(base)
+        return 9
+    let reply: Bytes = Value(replyRes)
+    let replyHash: str = media.MediaAssetSha256Hex(reply)
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_BYTES=" + IntToStr(BytesLen(reply)))
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_HASH=" + replyHash)
+    if len(expectedHash) > 0 && replyHash != expectedHash:
+        os.WriteLine(os.Get_stdout(), "WT_MOQ_HASH_MISMATCH expected=" + expectedHash + " got=" + replyHash)
+        qconn.ConnClose(base)
+        return 10
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_HASH_OK=1")
+    os.WriteLine(os.Get_stdout(), "WT_MOQ_OPEN_MS=" + strings.Int64ToStr(times.MonotimeMs() - t0))
+    qconn.ConnClose(base)
+    return 0

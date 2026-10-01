@@ -1,0 +1,566 @@
+import std/os
+import std/strings
+import std/system
+import std/rawbytes
+import cheng/std/bytes_layout as layout
+import cheng/std/crypto/hash256
+import cheng/core/tooling/path as chengpath
+
+const
+    # The process-lifetime arena never recycles rows. Claim hard-fails after
+    # this exact capacity instead of reusing a stale generation.
+    HeldOutputFdRegistryRowCount: int32 = 128
+    HeldOutputFdStateEmpty: int32 = 0
+    HeldOutputFdStateBuilding: int32 = 1
+    HeldOutputFdStateIssued: int32 = 2
+    HeldOutputFdStatePublishing: int32 = 3
+    HeldOutputFdStatePublished: int32 = 4
+    HeldOutputFdStateVerifying: int32 = 5
+    HeldOutputFdStateVerified: int32 = 6
+    HeldOutputFdStateMoving: int32 = 7
+    HeldOutputFdStateFailed: int32 = 8
+    HeldOutputFdStateRetiring: int32 = 9
+    HeldOutputFdStateRetired: int32 = 10
+
+type
+    # Public identity is only an Arena row plus exact generation and owner.
+    # The fd, vnode identity and receipt never leave the private SoA registry.
+    HeldOutputFdLease =
+        slot: int32
+        generation: int32
+        owner: int32
+
+var
+    heldOutputFdRegistryInit: int32
+    heldOutputFdRegistryClaimLock: int32
+
+fn heldOutputFdRegistryStateLoad(row: int32): int32 =
+    return system.RuntimeHeldOutputAtomicStateLoad(row)
+
+fn heldOutputFdRegistryStateStore(row: int32, state: int32) =
+    system.RuntimeHeldOutputAtomicStateStore(row, state)
+
+fn heldOutputFdRegistryStateCas(
+        row: int32,
+        expected: int32,
+        desired: int32): bool =
+    return system.RuntimeHeldOutputAtomicStateCas(
+        row, expected, desired)
+
+fn heldOutputFdRegistryLockAcquire(row: int32): bool =
+    return system.RuntimeHeldOutputAtomicLockAcquire(row)
+
+fn heldOutputFdRegistryLockRelease(row: int32) =
+    system.RuntimeHeldOutputAtomicLockRelease(row)
+
+fn heldOutputFdRegistryGenerationLoad(row: int32): int32 =
+    return system.RuntimeHeldOutputAtomicGenerationLoad(row)
+
+fn heldOutputFdRegistryGenerationStore(row: int32, value: int32) =
+    system.RuntimeHeldOutputAtomicGenerationStore(row, value)
+
+fn heldOutputFdRegistryOwnerLoad(row: int32): int32 =
+    return system.RuntimeHeldOutputAtomicOwnerLoad(row)
+
+fn heldOutputFdRegistryOwnerStore(row: int32, value: int32) =
+    system.RuntimeHeldOutputAtomicOwnerStore(row, value)
+
+fn HeldOutputFdRegistryInitializeBeforeWorkload(): bool =
+    let current = system.RuntimeAtomicLoadI32(
+        heldOutputFdRegistryInit)
+    if current == 2:
+        return true
+    if current != 0 ||
+       !system.RuntimeAtomicCompareExchangeI32(
+           heldOutputFdRegistryInit, 0, 1):
+        return false
+    system.RuntimeAtomicStoreI32(
+        heldOutputFdRegistryInit, 2)
+    return true
+
+fn HeldOutputFdLeaseIsEmpty(lease: HeldOutputFdLease): bool =
+    return lease.slot == 0 &&
+        lease.generation == 0 && lease.owner == 0
+
+fn HeldOutputFdLeaseShapeValid(lease: HeldOutputFdLease): bool =
+    return lease.slot >= 0 &&
+        lease.slot < HeldOutputFdRegistryRowCount &&
+        lease.generation > 0 && lease.owner > 0
+
+fn heldOutputFdRegistryStateAllowedForMove(state: int32): bool =
+    return state == HeldOutputFdStateIssued ||
+        state == HeldOutputFdStatePublished
+
+fn heldOutputFdRegistryTokenMatches(
+        lease: HeldOutputFdLease): bool =
+    return heldOutputFdRegistryGenerationLoad(lease.slot) ==
+            lease.generation &&
+        heldOutputFdRegistryOwnerLoad(lease.slot) == lease.owner
+
+fn heldOutputFdRegistryEnter(
+        lease: HeldOutputFdLease): bool =
+    return HeldOutputFdLeaseShapeValid(lease) &&
+        system.RuntimeAtomicLoadI32(
+            heldOutputFdRegistryInit) == 2 &&
+        heldOutputFdRegistryTokenMatches(lease) &&
+        heldOutputFdRegistryLockAcquire(lease.slot)
+
+fn heldOutputFdRegistryLeave(row: int32) =
+    heldOutputFdRegistryLockRelease(row)
+
+fn heldOutputFdRegistryRotateTokenLocked(
+        lease: var HeldOutputFdLease): bool =
+    let priorOwner = heldOutputFdRegistryOwnerLoad(lease.slot)
+    let priorGeneration = heldOutputFdRegistryGenerationLoad(lease.slot)
+    if priorOwner <= 0 || priorOwner == int32(2147483647) ||
+       priorGeneration <= 0 ||
+       priorGeneration == int32(2147483647):
+        return false
+    let nextOwner = priorOwner + 1
+    let nextGeneration = priorGeneration + 1
+    heldOutputFdRegistryOwnerStore(lease.slot, nextOwner)
+    heldOutputFdRegistryGenerationStore(lease.slot, nextGeneration)
+    lease.owner = nextOwner
+    lease.generation = nextGeneration
+    return true
+
+fn heldOutputFdRegistryInvalidateTokenLocked(row: int32) =
+    let priorGeneration = heldOutputFdRegistryGenerationLoad(row)
+    let nextGeneration = priorGeneration < int32(2147483647) ?
+        priorGeneration + 1 : priorGeneration
+    heldOutputFdRegistryGenerationStore(row, nextGeneration)
+    heldOutputFdRegistryOwnerStore(row, 0)
+
+fn HeldOutputFdMove(
+        source: var HeldOutputFdLease,
+        out: var HeldOutputFdLease,
+        err: var str): bool =
+    out = HeldOutputFdLease()
+    err = ""
+    if !heldOutputFdRegistryEnter(source):
+        err = "held output fd: move source is stale or consumed"
+        return false
+    let row = source.slot
+    defer:
+        heldOutputFdRegistryLeave(row)
+    if !heldOutputFdRegistryTokenMatches(source):
+        err = "held output fd: move source is stale or consumed"
+        return false
+    let priorState = heldOutputFdRegistryStateLoad(row)
+    if !heldOutputFdRegistryStateAllowedForMove(priorState) ||
+       !heldOutputFdRegistryStateCas(
+           row, priorState, HeldOutputFdStateMoving):
+        err = "held output fd: move source is stale or consumed"
+        return false
+    if !heldOutputFdRegistryTokenMatches(source):
+        heldOutputFdRegistryStateStore(row, priorState)
+        err = "held output fd: move source is stale or consumed"
+        return false
+    out = source
+    if !heldOutputFdRegistryRotateTokenLocked(out):
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        out = HeldOutputFdLease()
+        err = "held output fd: move token exhausted"
+        return false
+    source = HeldOutputFdLease()
+    heldOutputFdRegistryStateStore(out.slot, priorState)
+    return true
+
+fn HeldOutputFdStatusReadWritable(fd: int32): bool =
+    # F_GETFL=3 and O_ACCMODE=3 are POSIX values on supported Darwin/Linux
+    # hosts. The existing typed std/os bridge keeps the raw address private.
+    let statusFlags = os.UdpFcntl(fd, 3, 0)
+    if statusFlags < 0:
+        return false
+    let accessMode = statusFlags & int32(3)
+    return accessMode == int32(2)
+
+@borrows
+fn heldOutputFdPathIdentityFromRuntime(
+        stored: system.RuntimeHeldOutputStaticIdentity):
+        chengpath.PathStableFileIdentity =
+    var out: chengpath.PathStableFileIdentity
+    out.size = stored.size
+    out.mode = stored.mode
+    out.device = stored.device
+    out.inode = stored.inode
+    out.ownerUid = stored.ownerUid
+    out.ownerGid = stored.ownerGid
+    out.mtimeSec = stored.mtimeSec
+    out.mtimeNsec = stored.mtimeNsec
+    out.ctimeSec = stored.ctimeSec
+    out.ctimeNsec = stored.ctimeNsec
+    out.changeVersion = stored.changeVersion
+    out.linkCount = stored.linkCount
+    return out
+
+fn heldOutputFdRegistryStoreIdentity(
+        row: int32,
+        fd: int32,
+        platformCode: int32,
+        identity: chengpath.PathStableFileIdentity) =
+    var stored: system.RuntimeHeldOutputStaticIdentity
+    stored.fd = fd
+    stored.platformCode = platformCode
+    stored.size = identity.size
+    stored.mode = identity.mode
+    stored.device = identity.device
+    stored.inode = identity.inode
+    stored.ownerUid = identity.ownerUid
+    stored.ownerGid = identity.ownerGid
+    stored.mtimeSec = identity.mtimeSec
+    stored.mtimeNsec = identity.mtimeNsec
+    stored.ctimeSec = identity.ctimeSec
+    stored.ctimeNsec = identity.ctimeNsec
+    stored.changeVersion = identity.changeVersion
+    stored.linkCount = identity.linkCount
+    system.RuntimeHeldOutputStaticIdentityStore(row, stored)
+
+fn heldOutputFdRegistryPublishedDigestStore(
+        row: int32,
+        digest: layout.FixedBytes32) =
+    for wordIndex in 0..<8:
+        let byteIndex = wordIndex * 4
+        let word = uint32(digest.data[byteIndex]) |
+            (uint32(digest.data[byteIndex + 1]) << 8) |
+            (uint32(digest.data[byteIndex + 2]) << 16) |
+            (uint32(digest.data[byteIndex + 3]) << 24)
+        system.RuntimeHeldOutputPublishedDigestWordStore(
+            row, wordIndex, word)
+
+fn heldOutputFdRegistryPublishedDigestLoad(
+        row: int32): layout.FixedBytes32 =
+    var digest: layout.FixedBytes32
+    for wordIndex in 0..<8:
+        let byteIndex = wordIndex * 4
+        let word = system.RuntimeHeldOutputPublishedDigestWordLoad(
+            row, wordIndex)
+        digest.data[byteIndex] = uint8(word & uint32(255))
+        digest.data[byteIndex + 1] =
+            uint8((word >> 8) & uint32(255))
+        digest.data[byteIndex + 2] =
+            uint8((word >> 16) & uint32(255))
+        digest.data[byteIndex + 3] =
+            uint8((word >> 24) & uint32(255))
+    return digest
+
+@borrows
+fn HeldOutputFdClaimEmpty(
+        fd: int32,
+        out: var HeldOutputFdLease,
+        err: var str): bool =
+    out = HeldOutputFdLease()
+    err = ""
+    if system.RuntimeAtomicLoadI32(
+           heldOutputFdRegistryInit) != 2:
+        err = "held output fd: registry is not initialized"
+        return false
+    if fd < 3:
+        err = "held output fd: descriptor must be inherited and >=3"
+        return false
+    if !HeldOutputFdStatusReadWritable(fd):
+        err = "held output fd: descriptor is not read-write"
+        return false
+    var platformError: str
+    let platformCode = chengpath.PathStablePlatformCode(platformError)
+    if platformCode == 0:
+        err = strings.CloneStr(platformError)
+        return false
+    var before: chengpath.PathStableFileIdentity
+    if !chengpath.PathStableIdentityRead(
+           fd, platformCode, int32(32768), true, before):
+        err = "held output fd: descriptor is not regular single-link"
+        return false
+    if before.size != Int64(0):
+        err = "held output fd: descriptor is not empty"
+        return false
+    if !chengpath.PathStableSeekStart(fd):
+        err = "held output fd: descriptor offset cannot be set to zero"
+        return false
+    var afterSeek: chengpath.PathStableFileIdentity
+    if !chengpath.PathStableIdentityRead(
+           fd, platformCode, int32(32768), true, afterSeek) ||
+       !chengpath.PathStableIdentityEqual(before, afterSeek):
+        err = "held output fd: identity changed while claiming"
+        return false
+    if !system.RuntimeAtomicCompareExchangeI32(
+           heldOutputFdRegistryClaimLock, 0, 1):
+        err = "held output fd: concurrent claim rejected"
+        return false
+    defer:
+        system.RuntimeAtomicStoreI32(heldOutputFdRegistryClaimLock, 0)
+    for row in 0..<HeldOutputFdRegistryRowCount:
+        let state = heldOutputFdRegistryStateLoad(row)
+        if state != HeldOutputFdStateEmpty:
+            let rowStored = system.RuntimeHeldOutputStaticIdentityLoad(row)
+            let rowIdentity = heldOutputFdPathIdentityFromRuntime(rowStored)
+            if rowStored.fd == fd ||
+               chengpath.PathStableSameNode(rowIdentity, before):
+                err = "held output fd: descriptor is already claimed"
+                return false
+    var slot: int32 = -1
+    for row in 0..<HeldOutputFdRegistryRowCount:
+        if slot < 0 && heldOutputFdRegistryStateCas(
+               row,
+               HeldOutputFdStateEmpty,
+               HeldOutputFdStateBuilding):
+            slot = row
+    if slot < 0:
+        err = "held output fd: registry is exhausted"
+        return false
+    let owner: int32 = 1
+    let generation: int32 = 1
+    if heldOutputFdRegistryOwnerLoad(slot) != 0 ||
+       heldOutputFdRegistryGenerationLoad(slot) != 0:
+        heldOutputFdRegistryStateStore(
+            slot, HeldOutputFdStateFailed)
+        err = "held output fd: non-recyclable arena row was reused"
+        return false
+    heldOutputFdRegistryGenerationStore(slot, generation)
+    heldOutputFdRegistryOwnerStore(slot, owner)
+    heldOutputFdRegistryStoreIdentity(
+        slot, fd, platformCode, before)
+    system.RuntimeHeldOutputPublishedSizeStore(slot, Int64(0))
+    out.slot = slot
+    out.generation = generation
+    out.owner = owner
+    heldOutputFdRegistryStateStore(slot, HeldOutputFdStateIssued)
+    return true
+
+fn HeldOutputFdClaimsDistinct(
+        left: HeldOutputFdLease,
+        right: HeldOutputFdLease): bool =
+    if !HeldOutputFdLeaseShapeValid(left) ||
+       !HeldOutputFdLeaseShapeValid(right) ||
+       left.slot == right.slot:
+        return false
+    let leftState = heldOutputFdRegistryStateLoad(left.slot)
+    let rightState = heldOutputFdRegistryStateLoad(right.slot)
+    if leftState == HeldOutputFdStateEmpty ||
+       leftState == HeldOutputFdStateBuilding ||
+       leftState == HeldOutputFdStateFailed ||
+       rightState == HeldOutputFdStateEmpty ||
+       rightState == HeldOutputFdStateBuilding ||
+       rightState == HeldOutputFdStateFailed ||
+       heldOutputFdRegistryGenerationLoad(left.slot) != left.generation ||
+       heldOutputFdRegistryGenerationLoad(right.slot) != right.generation ||
+       heldOutputFdRegistryOwnerLoad(left.slot) != left.owner ||
+       heldOutputFdRegistryOwnerLoad(right.slot) != right.owner:
+        return false
+    let leftStored = system.RuntimeHeldOutputStaticIdentityLoad(left.slot)
+    let rightStored = system.RuntimeHeldOutputStaticIdentityLoad(right.slot)
+    return leftStored.fd != rightStored.fd &&
+        !chengpath.PathStableSameNode(
+            heldOutputFdPathIdentityFromRuntime(leftStored),
+            heldOutputFdPathIdentityFromRuntime(rightStored))
+
+@borrows
+fn HeldOutputFdPublishBytes(
+        lease: var HeldOutputFdLease,
+        bytes: rawbytes.Bytes,
+        expectedSha256: str,
+        outSha256: var layout.FixedBytes32,
+        err: var str): bool =
+    outSha256 = layout.FixedBytes32()
+    err = ""
+    if bytes.len <= 0 || bytes.data == nil ||
+       !heldOutputFdRegistryEnter(lease):
+        err = "held output fd: lease is stale or already consumed"
+        return false
+    let row = lease.slot
+    defer:
+        heldOutputFdRegistryLeave(row)
+    if !heldOutputFdRegistryTokenMatches(lease) ||
+       !heldOutputFdRegistryStateCas(
+           row,
+           HeldOutputFdStateIssued,
+           HeldOutputFdStatePublishing):
+        err = "held output fd: lease is stale or already consumed"
+        return false
+    let stored = system.RuntimeHeldOutputStaticIdentityLoad(row)
+    let fd = stored.fd
+    let platformCode = stored.platformCode
+    let claimedIdentity = heldOutputFdPathIdentityFromRuntime(stored)
+    var before: chengpath.PathStableFileIdentity
+    if !HeldOutputFdStatusReadWritable(fd) ||
+       !chengpath.PathStableIdentityRead(
+           fd, platformCode, int32(32768), true, before) ||
+       before.size != Int64(0) ||
+       !chengpath.PathStableIdentityEqual(
+           claimedIdentity, before) ||
+       !chengpath.PathStableSeekStart(fd):
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: claim changed before publish"
+        return false
+    let digest = hash256.Sha256Fixed(
+        layout.ByteSpanFromBytes(bytes))
+    let digestHex = layout.FixedBytes32Hex(digest)
+    let digestText = strings.ConcatStr(
+        "sha256:", digestHex)
+    if expectedSha256 != "" && expectedSha256 != digestText:
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: emission hash mismatch before write"
+        return false
+    if !chengpath.PathStableWriteAll(fd, bytes):
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: complete write failed"
+        return false
+    if !chengpath.PathStableFsync(fd):
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: fsync failed"
+        return false
+    var after: chengpath.PathStableFileIdentity
+    if !chengpath.PathStableIdentityRead(
+           fd, platformCode, int32(32768), true, after) ||
+       !chengpath.PathStableSameNode(
+           claimedIdentity, after) ||
+       after.linkCount != uint64(1) ||
+       after.size != Int64(bytes.len):
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: published identity or size mismatch"
+        return false
+    system.RuntimeHeldOutputPublishedSizeStore(row, after.size)
+    heldOutputFdRegistryPublishedDigestStore(row, digest)
+    outSha256 = digest
+    if !heldOutputFdRegistryRotateTokenLocked(lease):
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: publish token exhausted"
+        return false
+    if !heldOutputFdRegistryStateCas(
+           row,
+           HeldOutputFdStatePublishing,
+           HeldOutputFdStatePublished):
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: publish state drifted"
+        return false
+    return true
+
+@borrows
+fn HeldOutputFdVerifyPublished(
+        lease: var HeldOutputFdLease,
+        expectedSha256: layout.FixedBytes32,
+        err: var str): bool =
+    err = ""
+    if !heldOutputFdRegistryEnter(lease):
+        err = "held output fd: published lease is stale or consumed"
+        return false
+    let row = lease.slot
+    defer:
+        heldOutputFdRegistryLeave(row)
+    if !heldOutputFdRegistryTokenMatches(lease) ||
+       !heldOutputFdRegistryStateCas(
+           row,
+           HeldOutputFdStatePublished,
+           HeldOutputFdStateVerifying):
+        err = "held output fd: published lease is stale or consumed"
+        return false
+    let publishedSize =
+        system.RuntimeHeldOutputPublishedSizeLoad(row)
+    let publishedSha256 = heldOutputFdRegistryPublishedDigestLoad(row)
+    let stored = system.RuntimeHeldOutputStaticIdentityLoad(row)
+    let fd = stored.fd
+    let platformCode = stored.platformCode
+    if publishedSize <= Int64(0) ||
+       !layout.FixedBytes32Equal(
+           publishedSha256,
+           expectedSha256):
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: published receipt digest invalid"
+        return false
+    var beforeReadIdentity: chengpath.PathStableFileIdentity
+    var finalIdentity: chengpath.PathStableFileIdentity
+    let claimedIdentity = heldOutputFdPathIdentityFromRuntime(stored)
+    if !HeldOutputFdStatusReadWritable(
+           fd) ||
+       !chengpath.PathStableIdentityRead(
+           fd,
+           platformCode,
+           int32(32768),
+           true,
+           beforeReadIdentity) ||
+       !chengpath.PathStableSameNode(
+           claimedIdentity, beforeReadIdentity) ||
+       beforeReadIdentity.linkCount != uint64(1) ||
+       beforeReadIdentity.size != publishedSize:
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: published file identity changed"
+        return false
+    var readback = chengpath.PathStableReadExact(
+        fd, beforeReadIdentity.size)
+    if !readback.ok:
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: published bytes cannot be read back"
+        return false
+    var readbackBytes = rawbytes.BytesTake(readback.bytes)
+    let readbackDigest = hash256.Sha256Fixed(
+        layout.ByteSpanFromBytes(readbackBytes))
+    rawbytes.BytesFree(readbackBytes)
+    if !layout.FixedBytes32Equal(
+           readbackDigest, expectedSha256) ||
+       !chengpath.PathStableIdentityRead(
+           fd,
+           platformCode,
+           int32(32768),
+           true,
+           finalIdentity) ||
+       !chengpath.PathStableIdentityEqual(
+           beforeReadIdentity, finalIdentity):
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: published receipt readback mismatch"
+        return false
+    if !heldOutputFdRegistryStateCas(
+           row,
+           HeldOutputFdStateVerifying,
+           HeldOutputFdStateVerified):
+        heldOutputFdRegistryStateStore(row, HeldOutputFdStateFailed)
+        err = "held output fd: verify state drifted"
+        return false
+    heldOutputFdRegistryInvalidateTokenLocked(row)
+    lease = HeldOutputFdLease()
+    return true
+
+fn heldOutputFdRegistryStateAllowedForRetire(state: int32): bool =
+    return state == HeldOutputFdStateIssued ||
+        state == HeldOutputFdStatePublishing ||
+        state == HeldOutputFdStatePublished ||
+        state == HeldOutputFdStateVerifying ||
+        state == HeldOutputFdStateFailed
+
+fn HeldOutputFdRetire(
+        lease: var HeldOutputFdLease,
+        err: var str): bool =
+    err = ""
+    if !heldOutputFdRegistryEnter(lease):
+        err = "held output fd: retire lease is stale or consumed"
+        return false
+    let row = lease.slot
+    defer:
+        heldOutputFdRegistryLeave(row)
+    if !heldOutputFdRegistryTokenMatches(lease):
+        err = "held output fd: retire lease is stale or consumed"
+        return false
+    let priorState = heldOutputFdRegistryStateLoad(row)
+    if !heldOutputFdRegistryStateAllowedForRetire(priorState) ||
+       !heldOutputFdRegistryStateCas(
+           row, priorState, HeldOutputFdStateRetiring):
+        err = "held output fd: retire state is not terminal"
+        return false
+    heldOutputFdRegistryInvalidateTokenLocked(row)
+    lease = HeldOutputFdLease()
+    if !heldOutputFdRegistryStateCas(
+           row,
+           HeldOutputFdStateRetiring,
+           HeldOutputFdStateRetired):
+        panic("held output fd: retire state drifted")
+    return true
+
+@borrows
+fn HeldOutputFdRetireOrPanic(
+        lease: var HeldOutputFdLease,
+        context: str) =
+    if HeldOutputFdLeaseIsEmpty(lease):
+        return
+    var err: str
+    if !HeldOutputFdRetire(lease, err):
+        panic(strings.ConcatStr(
+            strings.ConcatStr(context, ": "), err))

@@ -1,0 +1,372 @@
+# libp2p P3 收尾片: channel 授权状态库 + admit + TOFU 状态机扩展 T5-T11 (正典 §11.6 P3)。
+# 三副平行库 (不改 tofu.cheng 的 channel_trust.txt, 换钥硬拒 default 零改动; rotation 是独立
+# 代码路径而非放松 TofuAdmit —— rotation 唯一豁免通道的结构化保证):
+#   recovery pin 库  channel_recovery.txt   行式: channelIdHex=recoveryKeyHashHex,bindEpoch    (钉一次不可变)
+#   rotation 库      channel_rotations.txt   行式: oldChannelIdHex=newChannelIdHex,rotationEpoch (严格单调)
+#   撤销 wire 库     channel_revocations/<channelIdHex>/<targetHex>  原始 169B (镜像 head_store; sticky 存在性 + epoch 单调)
+#
+# 生产纪律 (no fallback / let it crash): 授权不过 / epoch 回退 / recovery 不可变 = 硬 Err 带独立
+# rejectReason; tmp+rename 原子写; 缺文件=空非错。
+
+import std/result
+import std/rawbytes
+import std/os
+import std/strutils as strutil
+import std/strings
+import std/parseutils
+import cheng/std/bytes_layout as layout
+import cheng/libp2p/protocols/cas_source/channel_head/authz_codec as authz
+
+type
+    AuthzLineLookup =
+        found: bool
+        value: str      # rhs 逗号前 (recovery: hashHex; rotation: newHex)
+        epoch: int64    # rhs 逗号后
+
+# ==== 通用行库 (照 tofu.cheng 镜像; key=value,epoch 单行) ====
+
+@borrows
+fn authzLineLoad(path: str): Result[str[]] =
+    var lines: str[]
+    if !os.FileExists(path):
+        return Ok[str[]](lines)
+    var readRes: Result[str] = os.ReadFileResult(path)
+    if IsErr(readRes):
+        return Err[str[]]("authz store: read failed: " + path)
+    lines = strutil.Split(Value(readRes), '\n')
+    return Ok[str[]](lines)
+
+@borrows
+fn authzLineLookup(lines: str[], keyHex: str): AuthzLineLookup =
+    var out: AuthzLineLookup
+    out.found = false
+    out.value = ""
+    out.epoch = 0
+    for i in 0..<lines.len:
+        let line = strutil.Strip(lines[i])
+        if line == "":
+            continue
+        let parts = strutil.Split(line, '=')
+        if parts.len != 2:
+            continue
+        if strutil.Strip(parts[0]) != keyHex:
+            continue
+        let rhs = strutil.Strip(parts[1])
+        let rparts = strutil.Split(rhs, ',')
+        if rparts.len != 2:
+            continue
+        out.found = true
+        out.value = strutil.Strip(rparts[0])
+        var ep: int64
+        let _consumed = parseutils.parseInt64(strutil.Strip(rparts[1]), ep)
+        out.epoch = ep
+        return out
+    return out
+
+# 重建全部行 (keyHex 行替换; 其余原样) → tmp+rename 原子写。
+@borrows
+fn authzLineUpsert(path: str, storeRoot: str, keyHex: str, valueStr: str, epoch: int64): Result[bool] =
+    var loadRes = authzLineLoad(path)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    let existing = Value(loadRes)
+    var rebuilt = ""
+    for i in 0..<existing.len:
+        let line = strutil.Strip(existing[i])
+        if line == "":
+            continue
+        let parts = strutil.Split(line, '=')
+        if parts.len == 2 && strutil.Strip(parts[0]) != keyHex:
+            rebuilt = rebuilt + strutil.Strip(parts[0]) + "=" + strutil.Strip(parts[1]) + "\n"
+    rebuilt = rebuilt + keyHex + "=" + valueStr + "," + strings.Int64ToStr(epoch) + "\n"
+    os.MkdirAll(storeRoot, 493)
+    let tmpPath = path + ".tmp"
+    if os.FileExists(tmpPath):
+        os.RemoveFile(tmpPath)
+    var wr: Result[bool] = os.WriteFileResult(tmpPath, rebuilt)
+    if !wr.ok:
+        os.RemoveFile(tmpPath)
+        return Err[bool]("authz store: tmp write failed: " + tmpPath)
+    if os.RenameFile(tmpPath, path):
+        return Ok[bool](true)
+    os.RemoveFile(tmpPath)
+    return Err[bool]("authz store: rename failed: " + path)
+
+# ==== recovery pin 库 (channel_recovery.txt) ====
+
+@borrows
+fn AuthzRecoveryPath(storeRoot: str): str =
+    return storeRoot + "/channel_recovery.txt"
+
+type
+    AuthzRecoveryPin =
+        found: bool
+        recoveryKeyHash: layout.FixedBytes32
+        bindEpoch: int64
+
+# 查 channelId 的 recovery pin (hex → FixedBytes32)。缺 = found:false。
+@borrows
+fn AuthzRecoveryPinLookup(storeRoot: str, channelIdHex: str): AuthzRecoveryPin =
+    var out: AuthzRecoveryPin
+    out.found = false
+    out.bindEpoch = 0
+    var loadRes = authzLineLoad(AuthzRecoveryPath(storeRoot))
+    if IsErr(loadRes):
+        return out
+    let look = authzLineLookup(Value(loadRes), channelIdHex)
+    if !look.found:
+        return out
+    var hashRes = layout.FixedBytes32FromHex(look.value)
+    if IsErr(hashRes):
+        return out
+    out.found = true
+    out.recoveryKeyHash = Value(hashRes)
+    out.bindEpoch = look.epoch
+    return out
+
+# 内部 upsert (rotation 继承用; 不做不可变检查)。
+@borrows
+fn authzRecoveryPinUpsert(storeRoot: str, channelIdHex: str, recoveryKeyHashHex: str, bindEpoch: int64): Result[bool] =
+    return authzLineUpsert(AuthzRecoveryPath(storeRoot), storeRoot, channelIdHex, recoveryKeyHashHex, bindEpoch)
+
+# T9/T10: recovery 绑定 admit (根钥签; 首见钉死不可变; 二次不同 hash 拒)。
+@borrows
+fn AuthzRecoveryBindAdmit(storeRoot: str, rec: authz.AuthzRecord): Result[bool] =
+    if storeRoot == "":
+        return Err[bool]("recovery-bind: empty storeRoot")
+    var verifyRes = authz.RecoveryBindVerify(rec)
+    if IsErr(verifyRes):
+        return Err[bool](Error(verifyRes))
+    let recoveryKeyHash = Value(verifyRes)
+    let channelIdHex = layout.FixedBytes32Hex(rec.a)
+    let recoveryKeyHashHex = layout.FixedBytes32Hex(recoveryKeyHash)
+    let prior = AuthzRecoveryPinLookup(storeRoot, channelIdHex)
+    if prior.found:
+        if !layout.FixedBytes32Equal(prior.recoveryKeyHash, recoveryKeyHash):
+            return Err[bool]("recovery-bind: recovery 钥不可变 (换 recovery 拒) channel=" + channelIdHex)
+        return Ok[bool](true)   # 幂等: 同 hash 二次绑无副作用
+    return authzRecoveryPinUpsert(storeRoot, channelIdHex, recoveryKeyHashHex, rec.epoch)
+
+# ==== rotation 库 (channel_rotations.txt) ====
+
+@borrows
+fn AuthzRotationPath(storeRoot: str): str =
+    return storeRoot + "/channel_rotations.txt"
+
+type
+    AuthzRotationEdge =
+        found: bool
+        newChannelId: layout.FixedBytes32
+        epoch: int64
+
+@borrows
+fn AuthzRotationLookup(storeRoot: str, oldChannelIdHex: str): AuthzRotationEdge =
+    var out: AuthzRotationEdge
+    out.found = false
+    out.epoch = 0
+    var loadRes = authzLineLoad(AuthzRotationPath(storeRoot))
+    if IsErr(loadRes):
+        return out
+    let look = authzLineLookup(Value(loadRes), oldChannelIdHex)
+    if !look.found:
+        return out
+    var newRes = layout.FixedBytes32FromHex(look.value)
+    if IsErr(newRes):
+        return out
+    out.found = true
+    out.newChannelId = Value(newRes)
+    out.epoch = look.epoch
+    return out
+
+# 沿 rotation 链跟随到终态 (currentRoot)。有界循环防环 (最多 64 跳)。
+@borrows
+fn authzRotationFollowStep(storeRoot: str, channelId: layout.FixedBytes32, hopsLeft: int32): layout.FixedBytes32 =
+    if hopsLeft <= 0:
+        return layout.FixedBytes32Copy(channelId)
+    let cid = layout.FixedBytes32Copy(channelId)
+    let currentHex = layout.FixedBytes32Hex(cid)
+    let edge = AuthzRotationLookup(storeRoot, currentHex)
+    if !edge.found:
+        return cid
+    let next = layout.FixedBytes32Copy(edge.newChannelId)
+    return authzRotationFollowStep(storeRoot, next, hopsLeft - 1)
+
+@borrows
+fn AuthzRotationFollow(storeRoot: str, channelId: layout.FixedBytes32): layout.FixedBytes32 =
+    return authzRotationFollowStep(storeRoot, channelId, 64)
+
+# T5-T7: rotation admit (recovery 钥签的 old→new redirect)。
+# T6 无 recovery pin → 拒; T7 非 recovery 钥 → 拒; epoch 回退 → 拒。
+# 成功: 写 rotation 边 + new 继承同一 recoveryKeyHash (recovery 钥全生命周期不变)。
+@borrows
+fn AuthzRotationAdmit(storeRoot: str, rec: authz.AuthzRecord): Result[bool] =
+    if storeRoot == "":
+        return Err[bool]("rotate: empty storeRoot")
+    if rec.tag != authz.AuthzTagRotate:
+        return Err[bool]("rotate: tag 不符")
+    let oldHex = layout.FixedBytes32Hex(rec.a)
+    let newHex = layout.FixedBytes32Hex(rec.b)
+    let pin = AuthzRecoveryPinLookup(storeRoot, oldHex)
+    if !pin.found:
+        return Err[bool]("rotate: 无 recovery 授权, 不可 rotate channel=" + oldHex)
+    var verifyRes = authz.RotationVerify(rec, pin.recoveryKeyHash)
+    if IsErr(verifyRes):
+        return Err[bool](Error(verifyRes))
+    let prior = AuthzRotationLookup(storeRoot, oldHex)
+    if prior.found:
+        if rec.epoch <= prior.epoch:
+            return Err[bool]("rotate: epoch 回退拒 (重放) channel=" + oldHex + " have=" + strings.Int64ToStr(prior.epoch) + " got=" + strings.Int64ToStr(rec.epoch))
+    var writeRes = authzLineUpsert(AuthzRotationPath(storeRoot), storeRoot, oldHex, newHex, rec.epoch)
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    # new 继承同一 recoveryKeyHash (bindEpoch 用 rotationEpoch)。
+    let recoveryKeyHashHex = layout.FixedBytes32Hex(pin.recoveryKeyHash)
+    return authzRecoveryPinUpsert(storeRoot, newHex, recoveryKeyHashHex, rec.epoch)
+
+# ==== 撤销 wire 库 (channel_revocations/<channelIdHex>/<targetHex>, 原始 169B) ====
+
+@borrows
+fn AuthzRevocationDir(storeRoot: str, channelIdHex: str): str =
+    return storeRoot + "/channel_revocations/" + channelIdHex
+
+@borrows
+fn AuthzRevocationPath(storeRoot: str, channelIdHex: str, targetHex: str): str =
+    return AuthzRevocationDir(storeRoot, channelIdHex) + "/" + targetHex
+
+@borrows
+fn AuthzRevocationExistsHex(storeRoot: str, channelIdHex: str, targetHex: str): bool =
+    if storeRoot == "":
+        return false
+    return os.FileExists(AuthzRevocationPath(storeRoot, channelIdHex, targetHex))
+
+# 存在性查 (先取撤销硬拒的判据)。targetPubKey = 32B raw 公钥。
+@borrows
+fn AuthzRevocationExists(storeRoot: str, channelId: layout.FixedBytes32, targetPubKey: Bytes): bool =
+    return AuthzRevocationExistsHex(storeRoot, layout.FixedBytes32Hex(channelId), rawbytes.BytesToHex(targetPubKey))
+
+@borrows
+fn AuthzRevocationGetWire(storeRoot: str, channelIdHex: str, targetHex: str): Result[Bytes] =
+    if storeRoot == "":
+        return Err[Bytes]("revoke store: empty storeRoot")
+    let path = AuthzRevocationPath(storeRoot, channelIdHex, targetHex)
+    if !os.FileExists(path):
+        return Err[Bytes]("revoke store: no revocation channel=" + channelIdHex + " target=" + targetHex)
+    var readRes: Result[Bytes] = os.ReadFileBytesResult(path)
+    if IsErr(readRes):
+        return Err[Bytes]("revoke store: read failed: " + path)
+    var wire = Value(readRes)
+    if BytesLen(wire) != 169:
+        return Err[Bytes]("revoke store: stored wire 非 169B channel=" + channelIdHex)
+    return Ok[Bytes](wire)
+
+@borrows
+fn authzRevocationPutWire(storeRoot: str, channelIdHex: str, targetHex: str, wire: Bytes): Result[bool] =
+    if BytesLen(wire) != 169:
+        return Err[bool]("revoke store: wire 必须 169B")
+    let dir = AuthzRevocationDir(storeRoot, channelIdHex)
+    os.MkdirAll(dir, 493)
+    let finalPath = AuthzRevocationPath(storeRoot, channelIdHex, targetHex)
+    let tmpPath = finalPath + ".tmp"
+    if os.FileExists(tmpPath):
+        os.RemoveFile(tmpPath)
+    var wr: Result[bool] = os.WriteFileBytesResult(tmpPath, wire)
+    if !wr.ok:
+        os.RemoveFile(tmpPath)
+        return Err[bool]("revoke store: tmp write failed: " + tmpPath)
+    if os.RenameFile(tmpPath, finalPath):
+        return Ok[bool](true)
+    os.RemoveFile(tmpPath)
+    return Err[bool]("revoke store: rename failed: " + finalPath)
+
+# ① 撤销 admit (已解出 AuthzRecord): 授权谓词 (recovery pin 自库取) + epoch 单调 → 落 wire。
+# sticky: 存在性即永久拒收; epoch 单调只拒低 epoch 重放 (已见高 epoch 后拒低)。
+@borrows
+fn AuthzRevocationAdmit(storeRoot: str, rec: authz.AuthzRecord): Result[bool] =
+    if storeRoot == "":
+        return Err[bool]("revoke: empty storeRoot")
+    if rec.tag != authz.AuthzTagRevoke:
+        return Err[bool]("revoke: tag 不符")
+    let channelIdHex = layout.FixedBytes32Hex(rec.a)
+    let targetHex = layout.FixedBytes32Hex(rec.b)
+    let pin = AuthzRecoveryPinLookup(storeRoot, channelIdHex)
+    var verifyRes = authz.RevocationVerify(rec, pin.found, pin.recoveryKeyHash)
+    if IsErr(verifyRes):
+        return Err[bool](Error(verifyRes))
+    # epoch 单调: 已存 wire 的 epoch 若 >= 新 epoch → stale 拒。
+    if AuthzRevocationExistsHex(storeRoot, channelIdHex, targetHex):
+        var priorRes = AuthzRevocationGetWire(storeRoot, channelIdHex, targetHex)
+        if IsErr(priorRes):
+            return Err[bool](Error(priorRes))
+        var priorDec = authz.AuthzRecordDecode(Value(priorRes), authz.AuthzTagRevoke)
+        if IsErr(priorDec):
+            return Err[bool](Error(priorDec))
+        let priorRec = Value(priorDec)
+        if rec.epoch <= priorRec.epoch:
+            return Err[bool]("revoke: epoch 回退拒 (stale) channel=" + channelIdHex + " have=" + strings.Int64ToStr(priorRec.epoch) + " got=" + strings.Int64ToStr(rec.epoch))
+    var encRes = authz.AuthzRecordEncode(rec)
+    if IsErr(encRes):
+        return Err[bool](Error(encRes))
+    var wire = Value(encRes)
+    return authzRevocationPutWire(storeRoot, channelIdHex, targetHex, wire)
+
+# ② 撤销 admit (从网络收到的原始 169B wire): 先 decode 再 admit (网络腿 B 侧用)。
+@borrows
+fn AuthzRevocationAdmitWire(storeRoot: str, wire: Bytes): Result[bool] =
+    var decRes = authz.AuthzRecordDecode(wire, authz.AuthzTagRevoke)
+    if IsErr(decRes):
+        return Err[bool](Error(decRes))
+    return AuthzRevocationAdmit(storeRoot, Value(decRes))
+
+# ==== 委托 cert 库 (channel_delegations/<channelIdHex>, 原始 169B tag 0x40) ====
+# 键 = 逻辑 channel L 的 hex (每 channel 一份当前委托 cert); 值 = 169B 委托 cert wire。
+# A 对自库负责 (cert 原样透传, 不重验), 可覆盖 (换 delegate/cert 轮换时同 key 覆盖同/新字节)。
+# 消费面 (B) 取 cert 后自行 DelegationVerify + 请求绑定 cert.a==L, 授权链全在请求方。
+
+@borrows
+fn AuthzDelegationDir(storeRoot: str): str =
+    return storeRoot + "/channel_delegations"
+
+@borrows
+fn AuthzDelegationPath(storeRoot: str, channelIdHex: str): str =
+    return AuthzDelegationDir(storeRoot) + "/" + channelIdHex
+
+@borrows
+fn AuthzDelegationExistsHex(storeRoot: str, channelIdHex: str): bool =
+    if storeRoot == "":
+        return false
+    return os.FileExists(AuthzDelegationPath(storeRoot, channelIdHex))
+
+@borrows
+fn AuthzDelegationGetWire(storeRoot: str, channelIdHex: str): Result[Bytes] =
+    if storeRoot == "":
+        return Err[Bytes]("deleg store: empty storeRoot")
+    let path = AuthzDelegationPath(storeRoot, channelIdHex)
+    if !os.FileExists(path):
+        return Err[Bytes]("deleg store: no delegation channel=" + channelIdHex)
+    var readRes: Result[Bytes] = os.ReadFileBytesResult(path)
+    if IsErr(readRes):
+        return Err[Bytes]("deleg store: read failed: " + path)
+    var wire = Value(readRes)
+    if BytesLen(wire) != 169:
+        return Err[Bytes]("deleg store: stored wire 非 169B channel=" + channelIdHex)
+    return Ok[Bytes](wire)
+
+# cert wire 落库 (原子 tmp+rename; 可覆盖同 key)。A 侧发布委托时用。
+@borrows
+fn AuthzDelegationPutWire(storeRoot: str, channelIdHex: str, wire: Bytes): Result[bool] =
+    if BytesLen(wire) != 169:
+        return Err[bool]("deleg store: wire 必须 169B")
+    let dir = AuthzDelegationDir(storeRoot)
+    os.MkdirAll(dir, 493)
+    let finalPath = AuthzDelegationPath(storeRoot, channelIdHex)
+    let tmpPath = finalPath + ".tmp"
+    if os.FileExists(tmpPath):
+        os.RemoveFile(tmpPath)
+    var wr: Result[bool] = os.WriteFileBytesResult(tmpPath, wire)
+    if !wr.ok:
+        os.RemoveFile(tmpPath)
+        return Err[bool]("deleg store: tmp write failed: " + tmpPath)
+    if os.RenameFile(tmpPath, finalPath):
+        return Ok[bool](true)
+    os.RemoveFile(tmpPath)
+    return Err[bool]("deleg store: rename failed: " + finalPath)

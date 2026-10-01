@@ -1,0 +1,153 @@
+# CSG 场景流播放状态机 (StreamPlayerQ)。
+#
+# 合同 (campaigns/2026-09-06-csg-asset-pipeline/task_stream_player_core.md):
+# 纯 Cheng 时间轴状态机, 将来经宿主播放器控制协议 v1 (task_player_shell.md §3)
+# 驱动壳层; 只管时间轴推进 / EOF 门闩 / chunk 取数调度, 不解码。
+# 取数复用 B 线 ChunkIndexForTime / NearestKeyframeIndexForTime。
+# 语义:
+# - posMs 恒在 [0, durationMs]; 推进 = dtMs*rateX10/10, 不越过 durationMs。
+# - eofLatched 一次性门闩: Tick 中 playing 且 pos>=duration 时置位; 仅
+#   PlayerSeek 复位 (协议规则 2/3: EOF 后 play/setRate 不产生推进, play 显式
+#   false, 宿主必须先 seekMs 回有效区间, 二次 EOF 由门闩自行再判定)。
+# - seek: targetMs 显式校验 [0,durationMs] (钳制是宿主职责, 规则 1), 复位门闩,
+#   置 entrySnap: 下一次 Tick 应取 chunk 走最近关键帧 (seek 落在间隙/非关键帧
+#   处从关键帧 chunk 开始解码), 其后回常规顺序取数 (间隙保持前 chunk 画面)。
+# - 预取: 半开窗口 [posMs, bufferedToMs), bufferedToMs = min(pos+bufWindow,
+#   duration), 每次 posMs 变更同步维护; chunk 时间区间与窗口相交即预取。
+# 错误契约: 全部显式 false, 无兜底无部分结果。
+import cheng/game/assets/stream/manifest
+
+# 协议域: r∈[0.5,2.0] => rateX10 ∈ [5,20]; 0 = 定格 (暂停语义, pos 不动)。
+fn PlayerRateMinX10(): int32 =
+    return 5
+
+fn PlayerRateMaxX10(): int32 =
+    return 20
+
+type
+    StreamPlayerQ =
+        ok: bool
+        playing: bool
+        eofLatched: bool          # EOF 一次性门闩, 仅 PlayerSeek 复位
+        entrySnap: bool           # seek 后一次性: 下次 Tick 应取走最近关键帧
+        rateX10: int32            # 0.1x 步进, 1x=10; 0 = 定格
+        posMs: int64
+        bufferedToMs: int64       # = min(posMs + bufWindowMs, durationMs)
+        durationMs: int64
+        bufWindowMs: int64
+
+# min(posMs + bufWindowMs, durationMs), 宽域防溢出: 不做 pos+win 裸加。
+fn PlayerBufferedMsFor(p: StreamPlayerQ): int64 =
+    if p.bufWindowMs >= p.durationMs:
+        return p.durationMs
+    if p.posMs >= p.durationMs - p.bufWindowMs:
+        return p.durationMs
+    return p.posMs + p.bufWindowMs
+
+# Init: 失败时 player 复位零值, 不留半初始化状态。
+fn PlayerInit(p: var StreamPlayerQ, durationMs: int64, bufWindowMs: int64): bool =
+    var fresh: StreamPlayerQ
+    p = fresh
+    if durationMs <= int64(0):
+        return false
+    if bufWindowMs < int64(0):
+        return false
+    p.ok = true
+    p.playing = false
+    p.eofLatched = false
+    p.entrySnap = false
+    p.rateX10 = 10
+    p.posMs = int64(0)
+    p.durationMs = durationMs
+    p.bufWindowMs = bufWindowMs
+    p.bufferedToMs = PlayerBufferedMsFor(p)
+    return true
+
+# play: rate 保持当前值起播; EOF 门闩未解除时显式 false (协议规则 2: 先 seek)。
+fn PlayerPlay(p: var StreamPlayerQ): bool =
+    if !p.ok:
+        return false
+    if p.eofLatched:
+        return false
+    p.playing = true
+    return true
+
+# pause: 冻结在当前帧; 门闩状态不变。
+fn PlayerPause(p: var StreamPlayerQ): bool =
+    if !p.ok:
+        return false
+    p.playing = false
+    return true
+
+# setRate: 协议域 [5,20] 或 0 (定格); 域外显式 false 且速率保持原值。
+# EOF 门闩下允许改速率但不产生推进 (规则 3, 由 Tick 的门闩分支保证)。
+fn PlayerSetRate(p: var StreamPlayerQ, rateX10: int32): bool =
+    if !p.ok:
+        return false
+    if rateX10 != 0:
+        if rateX10 < PlayerRateMinX10() || rateX10 > PlayerRateMaxX10():
+            return false
+    p.rateX10 = rateX10
+    return true
+
+# seek: 越界显式 false (钳制 [0,durationMs] 是宿主职责, 规则 1); 复位 EOF
+# 门闩, 修正 posMs, 置 entrySnap。
+fn PlayerSeek(p: var StreamPlayerQ, targetMs: int64): bool =
+    if !p.ok:
+        return false
+    if targetMs < int64(0) || targetMs > p.durationMs:
+        return false
+    p.posMs = targetMs
+    p.eofLatched = false
+    p.entrySnap = true
+    p.bufferedToMs = PlayerBufferedMsFor(p)
+    return true
+
+# Tick: 推进 + EOF 门闩维护 + 取数调度。未 init / dtMs<0 / manifest 未加载 /
+# manifest 总时长与 player 不一致 => 显式 false。输出 fetchOut = 当前应取
+# chunk 序号 (无 => -1); preOut = 预取窗口内 chunk 序号列表 (整体重建)。
+@borrows
+fn PlayerTick(p: var StreamPlayerQ, dtMs: int64, m: manifest.StreamManifest,
+              fetchOut: var int32, preOut: var int32[]): bool =
+    fetchOut = -1
+    preOut = []
+    if !p.ok:
+        return false
+    if dtMs < int64(0):
+        return false
+    if !m.ok:
+        return false
+    if m.totalDurationMs != p.durationMs:
+        return false
+    if p.playing && !p.eofLatched:
+        if p.rateX10 > 0:
+            # 宽域防溢出: 先证明 dt*rate 不溢出; adv 钳在剩余时长内,
+            # pos 恒 <= duration, 相加无溢出。
+            if dtMs > int64(9223372036854775807) / int64(p.rateX10):
+                return false
+            var adv: int64
+            adv = dtMs * int64(p.rateX10) / int64(10)
+            var remain: int64
+            remain = p.durationMs - p.posMs
+            if adv > remain:
+                adv = remain
+            p.posMs = p.posMs + adv
+        # EOF 门闩: pos>=duration 且 playing 即置位 (含 seek 到末端后起播)。
+        if p.posMs >= p.durationMs:
+            p.eofLatched = true
+    p.bufferedToMs = PlayerBufferedMsFor(p)
+    # 应取: seek 吸附态一次性走最近关键帧 (间隙/非关键帧处从关键帧解码);
+    # 常规顺序态走时间定位 (间隙保持前 chunk 画面)。
+    if p.entrySnap:
+        fetchOut = manifest.StreamManifestNearestKeyframeIndexForTime(m, p.posMs)
+        p.entrySnap = false
+    else:
+        fetchOut = manifest.StreamManifestChunkIndexForTime(m, p.posMs)
+    # 预取: chunk 时间区间与半开窗口 [posMs, bufferedToMs) 相交即取。
+    if p.bufferedToMs > p.posMs:
+        for i in 0..<m.chunkCount:
+            let s = m.startMs[i]
+            let e = m.startMs[i] + m.durationMs[i]
+            if s < p.bufferedToMs && e > p.posMs:
+                add(preOut, i)
+    return true

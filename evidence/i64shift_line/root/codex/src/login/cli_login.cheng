@@ -1,0 +1,583 @@
+# CLI login orchestration
+# Provides functions called by cheng CLI (cli/main.cheng) for:
+#   - login status
+#   - login --api-key <KEY>
+#   - login --device-code [--issuer <URL>]
+#   - login [--app-server-url <URL>]  (browser mode)
+#   - logout
+#
+# Device code flow uses direct C provider HTTP calls (avoids importing
+# auth/oauth.cheng which triggers cold-compiler fallback).
+# API key login and logout use inlined auth file I/O (avoids hot-compiler
+# @importc ABI bug in imported modules).
+
+import std/strings
+import std/strutils as strutil
+import cheng/codex/login/cli_device as cli_device
+
+# ── C provider bindings ─────────────────────────────────────────────────────
+
+@ffi_owned_result(free = free)
+@importc("cheng_http_post")
+fn rawHttpPostAbi(url: cstring, body: cstring, headers: cstring): owned_cstring
+
+@importc("calloc")
+fn cliLoginCalloc(count: int64, size: int64): ptr
+
+@importc("memcpy")
+fn cliLoginMemcpy(dst: ptr, src: ptr, count: int64): ptr
+
+@importc("free")
+fn cliLoginFree(raw: ptr)
+
+fn cliLoginCString(text: str): cstring =
+    let raw = cliLoginCalloc(int64(text.len) + int64(1), int64(1))
+    if raw == nil:
+        return cstring(nil)
+    if text.len > 0:
+        cliLoginMemcpy(raw, text.data, int64(text.len))
+    return cstring(raw)
+
+fn cliLoginFreeCString(raw: cstring) =
+    if ptr(raw) != nil:
+        cliLoginFree(ptr(raw))
+
+fn rawHttpPost(url: str, body: str, headers: str): str =
+    let urlRaw = cliLoginCString(url)
+    let bodyRaw = cliLoginCString(body)
+    let headersRaw = cliLoginCString(headers)
+    let out: str = rawHttpPostAbi(urlRaw, bodyRaw, headersRaw)
+    cliLoginFreeCString(urlRaw)
+    cliLoginFreeCString(bodyRaw)
+    cliLoginFreeCString(headersRaw)
+    return out
+
+@abi_internal
+@importc("cheng_auth_file_exists")
+fn authFileExists(path: str): int32
+
+@abi_internal
+@importc("cheng_auth_write_file")
+fn authWriteFile(path: str, content: str): int32
+
+@abi_internal
+@importc("cheng_auth_remove_file")
+fn authRemoveFile(path: str): int32
+
+# ── String helpers ──────────────────────────────────────────────────────────
+
+fn cat3(a: str, b: str, c: str): str =
+    return strings.ConcatStr(strings.ConcatStr(a, b), c)
+
+# ── Mask helpers ────────────────────────────────────────────────────────────
+
+# Show first 4 + "****" + last 4 chars of a key for safe display
+fn maskKey(key: str): str =
+    let n: int32 = strings.Len(key)
+    if n <= 8:
+        return "****"
+    var first4: str = strings.SliceBytes(key, 0, 4)
+    var last4: str = strings.SliceBytes(key, n - 4, 4)
+    return strutil.Join([first4, "****", last4], "")
+
+# ── AuthDotJson type ────────────────────────────────────────────────────────
+
+# auth.json payload (flat — nested struct types not supported in Cheng).
+# Empty string = absent/null in JSON.
+type
+    AuthDotJson =
+        authMode: str         # "ApiKey"|"Chatgpt"|"ChatgptAuthTokens"|"AgentIdentity"
+        openaiApiKey: str
+        rawIdToken: str       # Raw JWT id_token
+        accessToken: str
+        refreshToken: str
+        accountId: str
+        lastRefresh: str
+        agentIdentity: str
+
+fn NewAuthDotJson(): AuthDotJson =
+    var result: AuthDotJson
+    result.authMode = ""
+    result.openaiApiKey = ""
+    result.rawIdToken = ""
+    result.accessToken = ""
+    result.refreshToken = ""
+    result.accountId = ""
+    result.lastRefresh = ""
+    result.agentIdentity = ""
+    return result
+
+fn AuthAvailable(auth: AuthDotJson): bool =
+    return auth.authMode != ""
+
+# ── HTTP response parsing for C provider ───────────────────────────────────
+# C provider returns JSON: {"status":200,"body":"..."} or {"error":"..."}
+
+# Extract status code from C provider JSON response
+fn parseHttpStatus(json: str): int32 =
+    if json == "":
+        return 0
+    # Check if it's an error response
+    if strings.HasPrefix(json, "{\"error\":"):
+        return 0
+    # Parse {"status":NNN,...}
+    if strings.HasPrefix(json, "{\"status\":"):
+        var i: int32 = 10
+        var code: int32 = 0
+        let n: int32 = strings.Len(json)
+        while i < n:
+            let cv: int32 = int32(json[i])
+            if cv >= 48:
+                if cv <= 57:
+                    code = code * 10 + (cv - 48)
+                    i = i + 1
+                else:
+                    break
+            else:
+                break
+        return code
+    return 0
+
+# Extract body string from C provider JSON response
+fn parseHttpBody(json: str): str =
+    if json == "":
+        return ""
+    if strings.HasPrefix(json, "{\"error\":"):
+        return ""
+    # Find "body":" in the response
+    let marker: str = "\"body\":\""
+    var ml: int32 = strings.Len(marker)
+    var pos: int32 = -1
+    var i: int32 = 0
+    let n: int32 = strings.Len(json)
+    while i <= n - ml:
+        var slice: str = strings.SliceBytes(json, i, n - i)
+        if strings.HasPrefix(slice, marker):
+            pos = i + ml
+            break
+        i = i + 1
+    if pos < 0:
+        return ""
+    # Parse JSON-escaped string (basic unescape)
+    var result: str = ""
+    i = pos
+    while i < n:
+        let cv: int32 = int32(json[i])
+        if cv == 34:  # closing quote
+            break
+        if cv == 92:  # backslash (escape)
+            i = i + 1
+            if i >= n:
+                break
+            let ecv: int32 = int32(json[i])
+            if ecv == 110:      # \n
+                result = strings.ConcatStr(result, "\n")
+            elif ecv == 114:    # \r
+                result = strings.ConcatStr(result, "\r")
+            elif ecv == 116:    # \t
+                result = strings.ConcatStr(result, "\t")
+            elif ecv == 34:     # \"
+                result = strings.ConcatStr(result, "\"")
+            elif ecv == 92:     # \\
+                result = strings.ConcatStr(result, "\\")
+            elif ecv == 47:     # \/
+                result = strings.ConcatStr(result, "/")
+            else:
+                result = strings.ConcatStr(result, strings.SliceBytes(json, i, 1))
+            i = i + 1
+        else:
+            result = strings.ConcatStr(result, strings.SliceBytes(json, i, 1))
+            i = i + 1
+    return result
+
+# ── JSON field extraction (local, avoids auth/login dependency for HTTP) ────
+
+fn jsonSkipWs(json: str, i: int32): int32 =
+    var pos: int32 = i
+    let n: int32 = strings.Len(json)
+    while pos < n:
+        let cv: int32 = int32(json[pos])
+        if cv == 32 || cv == 9 || cv == 10 || cv == 13:
+            pos = pos + 1
+        else:
+            break
+    return pos
+
+fn jsonGetStr(json: str, key: str): str =
+    let n: int32 = strings.Len(json)
+    if n == 0 || key == "":
+        return ""
+    # Build "\"key\":"
+    var prefix: str = cat3("\"", key, "\":")
+    var pl: int32 = strings.Len(prefix)
+    var i: int32 = 0
+    while i <= n - pl:
+        var slice: str = strings.SliceBytes(json, i, n - i)
+        if strings.HasPrefix(slice, prefix):
+            # Found key. Advance past prefix to value.
+            i = i + pl
+            i = jsonSkipWs(json, i)
+            if i >= n:
+                return ""
+            if int32(json[i]) == 110:
+                return ""
+            if int32(json[i]) != 34:
+                return ""
+            i = i + 1
+            var result: str = ""
+            while i < n:
+                let cv: int32 = int32(json[i])
+                if cv == 92:
+                    i = i + 1
+                    if i >= n:
+                        break
+                    let ecv: int32 = int32(json[i])
+                    if ecv == 34:
+                        result = strings.ConcatStr(result, "\"")
+                    elif ecv == 92:
+                        result = strings.ConcatStr(result, "\\")
+                    elif ecv == 110:
+                        result = strings.ConcatStr(result, "\n")
+                    elif ecv == 116:
+                        result = strings.ConcatStr(result, "\t")
+                    elif ecv == 47:
+                        result = strings.ConcatStr(result, "/")
+                    else:
+                        result = strings.ConcatStr(result, strings.SliceBytes(json, i, 1))
+                    i = i + 1
+                elif cv == 34:
+                    break
+                else:
+                    result = strings.ConcatStr(result, strings.SliceBytes(json, i, 1))
+                    i = i + 1
+            return result
+        i = i + 1
+    return ""
+
+# ── JSON string escaping (for writing auth.json) ──────────────────────────
+
+# Escape a string value for JSON: backslash, quote, and control chars
+fn jsonEscapeStr(s: str): str =
+    let n: int32 = strings.Len(s)
+    if n == 0:
+        return ""
+    var result: str = ""
+    var i: int32 = 0
+    while i < n:
+        let ch: char = s[i]
+        let cv: int32 = int32(ch)
+        if cv == 34:   # double quote
+            result = strings.ConcatStr(result, "\\\"")
+        elif cv == 92:  # backslash
+            result = strings.ConcatStr(result, "\\\\")
+        elif cv == 8:   # backspace
+            result = strings.ConcatStr(result, "\\b")
+        elif cv == 12:  # form feed
+            result = strings.ConcatStr(result, "\\f")
+        elif cv == 10:  # newline
+            result = strings.ConcatStr(result, "\\n")
+        elif cv == 13:  # carriage return
+            result = strings.ConcatStr(result, "\\r")
+        elif cv == 9:   # tab
+            result = strings.ConcatStr(result, "\\t")
+        elif cv < 32:
+            let hexTable: str = "0123456789abcdef"
+            var nv: int32 = cv
+            var d4: int32 = nv / 4096
+            nv = nv % 4096
+            var d3: int32 = nv / 256
+            nv = nv % 256
+            var d2: int32 = nv / 16
+            var d1: int32 = nv % 16
+            result = strings.ConcatStr(result, "\\u")
+            result = strings.ConcatStr(strings.ConcatStr(result, strings.SliceBytes(hexTable, d4, 1)), strings.SliceBytes(hexTable, d3, 1))
+            result = strings.ConcatStr(strings.ConcatStr(result, strings.SliceBytes(hexTable, d2, 1)), strings.SliceBytes(hexTable, d1, 1))
+        else:
+            result = strings.ConcatStr(result, strings.SliceBytes(s, i, 1))
+        i = i + 1
+    return result
+
+# Append a JSON string field: ,"key":"value"
+fn jsonAppendStrField(buf: var str, key: str, value: str) =
+    buf = strings.ConcatStr(buf, ",\"")
+    buf = strings.ConcatStr(buf, key)
+    buf = strings.ConcatStr(buf, "\":\"")
+    buf = strings.ConcatStr(buf, jsonEscapeStr(value))
+    buf = strings.ConcatStr(buf, "\"")
+
+# JSON field extraction for nested objects (e.g. "tokens" -> "access_token")
+fn jsonGetNestedStr(json: str, outerKey: str, innerKey: str): str =
+    let n: int32 = strings.Len(json)
+    if n == 0:
+        return ""
+    var outerPrefix: str = cat3("\"", outerKey, "\":")
+    var opl: int32 = strings.Len(outerPrefix)
+    var i: int32 = 0
+    while i <= n - opl:
+        var slice: str = strings.SliceBytes(json, i, n - i)
+        if strings.HasPrefix(slice, outerPrefix):
+            i = i + opl
+            i = jsonSkipWs(json, i)
+            if i >= n:
+                return ""
+            if int32(json[i]) != 123:
+                return ""
+            let subJson: str = strings.SliceBytes(json, i, n - i)
+            return jsonGetStr(subJson, innerKey)
+        i = i + 1
+    return ""
+
+# ── auth.json path ──────────────────────────────────────────────────────
+
+fn authJsonPath(codexHome: str): str =
+    if strings.Len(codexHome) == 0:
+        return "auth.json"
+    if codexHome[strings.Len(codexHome) - 1] == '/':
+        return strings.ConcatStr(codexHome, "auth.json")
+    return strings.ConcatStr(strings.ConcatStr(codexHome, "/"), "auth.json")
+
+# ── Write auth.json ─────────────────────────────────────────────────────
+
+fn SaveAuth(codexHome: str, auth: AuthDotJson): bool =
+    let path: str = authJsonPath(codexHome)
+    var content: str = cat3("{\"auth_mode\":\"", jsonEscapeStr(auth.authMode), "\"")
+    if auth.openaiApiKey != "":
+        jsonAppendStrField(content, "openai_api_key", auth.openaiApiKey)
+    var hasTokens: bool = false
+    if auth.accessToken != "":
+        hasTokens = true
+    if !hasTokens:
+        if auth.refreshToken != "":
+            hasTokens = true
+    if !hasTokens:
+        if auth.accountId != "":
+            hasTokens = true
+    if hasTokens:
+        content = strings.ConcatStr(content, ",\"tokens\":{")
+        var tokFirst: bool = true
+        if auth.rawIdToken != "":
+            content = cat3(content, "\"id_token\":\"", jsonEscapeStr(auth.rawIdToken))
+            content = strings.ConcatStr(content, "\"")
+            tokFirst = false
+        if auth.accessToken != "":
+            if !tokFirst:
+                content = strings.ConcatStr(content, ",")
+            content = cat3(content, "\"access_token\":\"", jsonEscapeStr(auth.accessToken))
+            content = strings.ConcatStr(content, "\"")
+            tokFirst = false
+        if auth.refreshToken != "":
+            if !tokFirst:
+                content = strings.ConcatStr(content, ",")
+            content = cat3(content, "\"refresh_token\":\"", jsonEscapeStr(auth.refreshToken))
+            content = strings.ConcatStr(content, "\"")
+            tokFirst = false
+        if auth.accountId != "":
+            if !tokFirst:
+                content = strings.ConcatStr(content, ",")
+            content = cat3(content, "\"account_id\":\"", jsonEscapeStr(auth.accountId))
+            content = strings.ConcatStr(content, "\"")
+        content = strings.ConcatStr(content, "}")
+    if auth.lastRefresh != "":
+        jsonAppendStrField(content, "last_refresh", auth.lastRefresh)
+    if auth.agentIdentity != "":
+        jsonAppendStrField(content, "agent_identity", auth.agentIdentity)
+    content = strings.ConcatStr(content, "}")
+    return authWriteFile(path, content) != 0
+
+# ── Parse auth.json content (no file I/O — caller must read) ─────────────
+
+fn ParseAuthJson(json: str): AuthDotJson =
+    var result: AuthDotJson = NewAuthDotJson()
+    if json == "":
+        return result
+    result.authMode = jsonGetStr(json, "auth_mode")
+    result.openaiApiKey = jsonGetStr(json, "openai_api_key")
+    result.lastRefresh = jsonGetStr(json, "last_refresh")
+    result.agentIdentity = jsonGetStr(json, "agent_identity")
+    result.rawIdToken = jsonGetNestedStr(json, "tokens", "id_token")
+    result.accessToken = jsonGetNestedStr(json, "tokens", "access_token")
+    result.refreshToken = jsonGetNestedStr(json, "tokens", "refresh_token")
+    result.accountId = jsonGetNestedStr(json, "tokens", "account_id")
+    return result
+
+# ── Delete auth.json ────────────────────────────────────────────────────
+
+fn Logout(codexHome: str): bool =
+    let path: str = authJsonPath(codexHome)
+    if authFileExists(path) != 0:
+        return authRemoveFile(path) != 0
+    return false
+
+# ── Login status ────────────────────────────────────────────────────────────
+
+fn CliLoginStatus(codexHome: str, authJsonContent: str): int32 =
+    let auth: AuthDotJson = ParseAuthJson(authJsonContent)
+    if !AuthAvailable(auth):
+        echo("Not logged in.")
+        echo("Run 'login --help' for available login methods.")
+        return 0
+
+    echo(strutil.Join(["Auth mode:    ", auth.authMode], ""))
+    if auth.authMode == "ApiKey":
+        if auth.openaiApiKey != "":
+            echo(strutil.Join(["API key:      ", maskKey(auth.openaiApiKey)], ""))
+        else:
+            echo("API key: (empty)")
+    elif auth.authMode == "Chatgpt" || auth.authMode == "ChatgptAuthTokens":
+        if auth.accountId != "":
+            echo(strutil.Join(["Account ID:   ", auth.accountId], ""))
+        if auth.openaiApiKey != "":
+            echo(strutil.Join(["API key:      ", maskKey(auth.openaiApiKey)], ""))
+        if auth.accessToken != "":
+            echo(strutil.Join(["Access token: ", maskKey(auth.accessToken)], ""))
+    else:
+        echo("(unknown auth mode)")
+    return 0
+
+# ── API key login ──────────────────────────────────────────────────────────
+
+fn CliLoginApiKey(codexHome: str, apiKey: str): int32 =
+    if apiKey == "":
+        echo("Error: --api-key requires a non-empty value.")
+        return 1
+    var auth: AuthDotJson = NewAuthDotJson()
+    auth.authMode = "ApiKey"
+    auth.openaiApiKey = apiKey
+    if !SaveAuth(codexHome, auth):
+        echo("Error: failed to save credentials.")
+        return 1
+    echo("Login successful (API key).")
+    return 0
+
+# ── Device code login (delegated to cli_device.cheng) ────────────────────────
+
+fn CliLoginDeviceCode(codexHome: str, issuer: str): int32 =
+    var useIssuer: str = issuer
+    if useIssuer == "":
+        useIssuer = "https://auth.openai.com"
+    let n: int32 = strings.Len(useIssuer)
+    var base: str = useIssuer
+    if n > 0:
+        if useIssuer[n - 1] == '/':
+            base = strings.SliceBytes(useIssuer, 0, n - 1)
+    let apiBaseUrl: str = strings.ConcatStr(base, "/api/accounts")
+    let redirectUri: str = strings.ConcatStr(base, "/deviceauth/callback")
+    var deviceAuthId: str
+    var userCode: str
+    var interval: int32
+    if !cli_device.deviceRequestUserCode(apiBaseUrl, "app_EMoamEEZ73f0CkXaXp7hrann", deviceAuthId, userCode, interval):
+        echo("Error: failed to request device code")
+        return 1
+    let verificationUrl: str = strings.ConcatStr(base, "/codex/device")
+    echo("")
+    echo("Follow these steps to sign in with ChatGPT using device code authorization:")
+    echo("")
+    echo("1. Open this link in your browser and sign in to your account")
+    echo(strutil.Join(["   ", verificationUrl], ""))
+    echo("")
+    echo("2. Enter this one-time code (expires in 15 minutes)")
+    echo(strutil.Join(["   ", userCode], ""))
+    echo("")
+    echo("Device codes are a common phishing target. Never share this code.")
+    echo("")
+    var authCode: str
+    var codeVerifier: str
+    if !cli_device.devicePollForToken(apiBaseUrl, deviceAuthId, userCode, authCode, codeVerifier):
+        echo("Error: device code polling failed")
+        return 1
+    var accessToken: str
+    var refreshToken: str
+    var idToken: str
+    if !cli_device.deviceExchangeCode(base, "app_EMoamEEZ73f0CkXaXp7hrann", redirectUri, codeVerifier, authCode, accessToken, refreshToken, idToken):
+        echo("Error: failed to exchange authorization code for tokens")
+        return 1
+    var auth: AuthDotJson = NewAuthDotJson()
+    auth.authMode = "Chatgpt"
+    auth.accessToken = accessToken
+    auth.refreshToken = refreshToken
+    auth.rawIdToken = idToken
+    var subKey: str = "\"sub\":\""
+    var skl: int32 = strings.Len(subKey)
+    var subPos: int32 = -1
+    var si: int32 = 0
+    let sn: int32 = strings.Len(idToken)
+    while si <= sn - skl:
+        var slice: str = strings.SliceBytes(idToken, si, sn - si)
+        if strings.HasPrefix(slice, subKey):
+            subPos = si + skl
+            break
+        si = si + 1
+    if subPos >= 0:
+        si = subPos
+        var accountId: str = ""
+        while si < sn:
+            let scv: int32 = int32(idToken[si])
+            if scv == 34:
+                break
+            accountId = strings.ConcatStr(accountId, strings.SliceBytes(idToken, si, 1))
+            si = si + 1
+        auth.accountId = accountId
+    SaveAuth(codexHome, auth)
+    echo("Device code login successful.")
+    return 0
+
+# ── Browser login via app-server ──────────────────────────────────────────
+
+fn CliLoginBrowser(codexHome: str, appServerUrl: str): int32 =
+    var serverUrl: str = appServerUrl
+
+    if serverUrl == "":
+        echo("Error: app-server URL is required for browser login.")
+        echo("Use --app-server-url <URL> or set CODEX_APP_SERVER_URL.")
+        echo("Alternatively, use 'login --device-code' for device code flow.")
+        return 1
+
+    let jsonBody: str = "{\"jsonrpc\":\"2.0\",\"method\":\"account/login\",\"params\":{\"type\":\"chatgpt\",\"codexStreamlinedLogin\":true},\"id\":1}"
+    let rawResp: str = rawHttpPost(serverUrl, jsonBody, "[\"Content-Type: application/json\"]")
+    let statusCode: int32 = parseHttpStatus(rawResp)
+    let respBody: str = parseHttpBody(rawResp)
+
+    if rawResp == "":
+        echo(strutil.Join(["Error: Cannot connect to app-server at ", serverUrl], ""))
+        echo("Make sure the app-server is running.")
+        echo("Alternatively, use 'login --device-code' for device code flow.")
+        return 1
+
+    if statusCode != 200:
+        echo(strutil.Join(["Error: app-server returned HTTP status ", strings.IntToStr(statusCode)], ""))
+        if respBody != "":
+            echo(strutil.Join(["  Response: ", respBody], ""))
+        return 1
+
+    # Parse JSON-RPC response for auth_url
+    # jsonGetStr searches the full response for "auth_url":"<value>",
+    # which handles both top-level and nested (inside "result") occurrences.
+    let authUrl: str = jsonGetStr(respBody, "auth_url")
+
+    if authUrl == "":
+        # Check for JSON-RPC error response
+        let errMsg: str = jsonGetStr(respBody, "message")
+        if errMsg != "":
+            echo(strutil.Join(["App-server error: ", errMsg], ""))
+        else:
+            echo(strutil.Join(["Unexpected response from app-server: ", respBody], ""))
+        return 1
+
+    echo("")
+    echo("Open this URL in your browser to sign in to ChatGPT:")
+    echo(strutil.Join(["  ", authUrl], ""))
+    echo("")
+    echo("After completing sign-in in your browser,")
+    echo("your credentials will be saved automatically.")
+    echo("Run 'login status' to verify you are logged in.")
+    echo("")
+    return 0
+
+# ── Logout ─────────────────────────────────────────────────────────────────
+
+fn CliLoginLogout(codexHome: str): int32 =
+    if Logout(codexHome):
+        echo("Logged out.")
+        return 0
+    echo("Not logged in.")
+    return 0

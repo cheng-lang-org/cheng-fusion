@@ -1,0 +1,374 @@
+import std/strings
+import std/os
+import std/rawbytes
+import std/result
+import std/cmdline
+import std/monotimes
+import cheng/game/assets/semantic_video/schema
+import cheng/game/assets/semantic_video/reader
+import cheng/game/assets/semantic_video/validator
+import cheng/game/assets/semantic_video/writer
+import cheng/game/assets/semantic_video/source_index
+
+# semantic_player <svblock> <source.mp4> <mode> [args]
+# CSG 语义视频 v0.1 记录块语义播放器 CLI。stdout 逐行 k=v; rc=0/1。
+# 公共验证链 (所有模式先跑, 任一失败 rc=1 不降级): svblock 读入 →
+# SvReaderDecode+SvParseRecords → SvValidate ok → manifest 恰 1 条 →
+# 源文件读入 → SvResourceCid(源字节)==resCid[0] → SvSourceIndexBuild ok →
+# SvSourceIndexEncodeResource → SvResourceCid(索引字节)==resCid[1]。
+# 诚实边界: 仓内无 H.264 解码桥, 本播放器播的是记录时间轴 + 证据锚
+# (按索引实际回读样本字节), 像素呈现待解码接线。
+# 注 (2026-09-17 B3 实测): plain main 循环内把循环外定义的 str 局部按值
+# 传给 plain 函数, cheng_cold 发不出 exact owned 定义 (managed drop lacks
+# exact owned definition); 调用点用 share(sourcePath) 跨循环共享 (对齐
+# weight_store 先例), 逐样本回读封在 SvPlReadSampleCount, 循环体只持标量。
+
+type
+    SvPlTickParse =
+        ok: bool
+        value: int64
+
+@borrows
+fn SvPlParseTick(text: str): SvPlTickParse =
+    var out: SvPlTickParse
+    if text.len == 0:
+        return out
+    var at: int32 = 0
+    var value: int64 = int64(0)
+    while at < text.len:
+        let ch = text[at]
+        if ch < '0' || ch > '9':
+            return out
+        let digit = int64(int32(ch) - int32('0'))
+        if value > (Int64(9223372036854775807) - digit) / int64(10):
+            return out
+        value = value * int64(10) + digit
+        at = at + 1
+    out.ok = true
+    out.value = value
+    return out
+
+# 二分下界: 首个 pts >= tick 的样本号 (无则 sampleCount)。
+@borrows
+fn SvPlLowerBound(idx: source_index.SvSourceIndex, tick: int64): int32 =
+    var lo: int32 = 0
+    var hi: int32 = idx.sampleCount
+    while lo < hi:
+        let mid = (lo + hi) / 2
+        if idx.pts[mid] < tick:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+@borrows
+fn SvPlJoinCaps(caps: str[]): str =
+    var out: str = "["
+    for i in 0..<caps.len:
+        if i > 0:
+            out = strings.ConcatStr(out, ",")
+        out = strings.ConcatStr(out, caps[i])
+    out = strings.ConcatStr(out, "]")
+    return out
+
+@borrows
+fn SvPlSampleLine(idx: source_index.SvSourceIndex, i: int32): str =
+    var line = strings.ConcatStr("sample=", strings.IntToStr(i))
+    line = strings.ConcatStr(line, " pts=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(idx.pts[i]))
+    line = strings.ConcatStr(line, " offset=")
+    line = strings.ConcatStr(line, strings.Int64ToStr(idx.offset[i]))
+    line = strings.ConcatStr(line, " size=")
+    line = strings.ConcatStr(line, strings.IntToStr(idx.size[i]))
+    line = strings.ConcatStr(line, " key=")
+    line = strings.ConcatStr(line, strings.IntToStr(idx.key[i]))
+    return line
+
+# 逐样本证据回读: 实际读 [offset, offset+size) 并回报真实字节数。
+# Result 局部只活在本函数帧 (见文件头注)。
+fn SvPlReadSampleCount(path: str, offset: int64, size: int32): int64 =
+    let rd = os.ReadFileRangeBytesResult(path, offset, size)
+    if result.IsErr(rd):
+        return int64(-1)
+    return int64(rawbytes.BytesLen(result.Value(rd)))
+
+fn SvPlPrintHelp() =
+    echo("semantic_player <svblock> <source.mp4> <mode> [args]")
+    echo("modes:")
+    echo("  info")
+    echo("  query <tickStart> <tickEnd>   samples in [tickStart, tickEnd), left-closed right-open")
+    echo("  seek <tick>                   recovery unit covering tick (keyframe GOP + readahead)")
+    echo("  play <tickStart> <durationTicks> [--realtime]")
+    echo("validation chain (all modes): svblock decode+validate, manifest exactly 1,")
+    echo("source CID == manifest.resCid[0], rebuilt index CID == manifest.resCid[1];")
+    echo("any mismatch rejects with rc=1, no fallback.")
+    echo("honest boundary: no pixel decode. This player walks the record timeline and")
+    echo("evidence anchors (sample offset/size bytes read back from the bound source);")
+    echo("pixel presentation needs a decoder bridge this repo does not wire yet.")
+
+fn main(): int32 =
+    if cmdline.ParamCount() >= 2:
+        if cmdline.ParamStr(1) == "--help":
+            SvPlPrintHelp()
+            return 0
+    if cmdline.ParamCount() < 4:
+        echo("semantic_player error: usage semantic_player <svblock> <source.mp4> <mode> [args] (try --help)")
+        return 1
+    let svblockPath = cmdline.ParamStr(1)
+    let sourcePath = cmdline.ParamStr(2)
+    let mode = cmdline.ParamStr(3)
+
+    # ---- 公共验证链 -----------------------------------------------------
+    let blockResult = os.ReadFileBytesResult(svblockPath)
+    if result.IsErr(blockResult):
+        echo("semantic_player error: read svblock failed")
+        return 1
+    var blockBytes = result.Value(blockResult)
+    var decoded = reader.SvReaderDecode(blockBytes)
+    if !decoded.ok:
+        echo(strings.ConcatStr("semantic_player error: decode ", decoded.error))
+        return 1
+    var parsed = reader.SvParseRecords(decoded.lines)
+    if !parsed.ok:
+        echo(strings.ConcatStr("semantic_player error: parse ", parsed.error))
+        return 1
+    var validation = validator.SvValidate(blockBytes)
+    if !validation.ok:
+        echo(strings.ConcatStr("semantic_player error: sv_validate ",
+            validation.error))
+        return 1
+    if parsed.records.manifests.len != 1:
+        echo("semantic_player error: sv_ref_duplicate manifest")
+        return 1
+    let m = parsed.records.manifests[0]
+    if m.resCid.len != 2 || m.resLength.len != 2 || m.resType.len != 2:
+        echo("semantic_player error: sv_cap_arrays_mismatch res")
+        return 1
+    if m.resType[0] != "video_sample" || m.resType[1] != "index":
+        echo("semantic_player error: sv_res_type_mismatch")
+        return 1
+    let sourceResult = os.ReadFileBytesResult(sourcePath)
+    if result.IsErr(sourceResult):
+        echo("semantic_player error: read source failed")
+        return 1
+    var data = result.Value(sourceResult)
+    var sourceCid = writer.SvResourceCid(data)
+    if sourceCid != m.resCid[0]:
+        var line = strings.ConcatStr(
+            "semantic_player error: sv_cid_malformed source expected=",
+            m.resCid[0])
+        line = strings.ConcatStr(line, " actual=")
+        line = strings.ConcatStr(line, sourceCid)
+        echo(line)
+        return 1
+    var idx = source_index.SvSourceIndexBuild(data)
+    if !idx.ok:
+        echo(strings.ConcatStr("semantic_player error: ", idx.error))
+        return 1
+    var indexBytes = source_index.SvSourceIndexEncodeResource(idx)
+    var indexCid = writer.SvResourceCid(indexBytes)
+    if indexCid != m.resCid[1]:
+        var line = strings.ConcatStr(
+            "semantic_player error: sv_cid_malformed index expected=",
+            m.resCid[1])
+        line = strings.ConcatStr(line, " actual=")
+        line = strings.ConcatStr(line, indexCid)
+        echo(line)
+        return 1
+
+    # ---- info -----------------------------------------------------------
+    if mode == "info":
+        echo(strings.ConcatStr("caps=", SvPlJoinCaps(m.caps)))
+        echo(strings.ConcatStr("contentId=", m.contentId))
+        echo(strings.ConcatStr("timeStart=", strings.Int64ToStr(m.timeStart)))
+        echo(strings.ConcatStr("timeEnd=", strings.Int64ToStr(m.timeEnd)))
+        echo(strings.ConcatStr("tbNum=", strings.IntToStr(m.tbNum)))
+        echo(strings.ConcatStr("tbDen=", strings.IntToStr(m.tbDen)))
+        echo(strings.ConcatStr("entities=",
+            strings.IntToStr(parsed.records.entities.len)))
+        echo(strings.ConcatStr("observations=",
+            strings.IntToStr(parsed.records.observations.len)))
+        for i in 0..<parsed.records.observations.len:
+            var line = strings.ConcatStr("obs=", strings.IntToStr(i))
+            line = strings.ConcatStr(line, " obsId=")
+            line = strings.ConcatStr(line,
+                parsed.records.observations[i].obsId)
+            line = strings.ConcatStr(line, " tickStart=")
+            line = strings.ConcatStr(line,
+                strings.Int64ToStr(parsed.records.observations[i].tickStart))
+            line = strings.ConcatStr(line, " tickEnd=")
+            line = strings.ConcatStr(line,
+                strings.Int64ToStr(parsed.records.observations[i].tickEnd))
+            line = strings.ConcatStr(line, " srcTrack=")
+            line = strings.ConcatStr(line,
+                parsed.records.observations[i].srcTrack)
+            echo(line)
+        echo(strings.ConcatStr("indexSampleCount=",
+            strings.IntToStr(idx.sampleCount)))
+        echo(strings.ConcatStr("indexKeyframeCount=",
+            strings.IntToStr(idx.keyframeCount)))
+        echo(strings.ConcatStr("indexTimescale=",
+            strings.IntToStr(idx.timescale)))
+        var kfLine: str = "keyframePts=["
+        var first = true
+        for i in 0..<idx.sampleCount:
+            if idx.key[i] == 1:
+                if !first:
+                    kfLine = strings.ConcatStr(kfLine, ",")
+                kfLine = strings.ConcatStr(kfLine, strings.Int64ToStr(idx.pts[i]))
+                first = false
+        kfLine = strings.ConcatStr(kfLine, "]")
+        echo(kfLine)
+        return 0
+
+    # ---- query <tickStart> <tickEnd> ------------------------------------
+    if mode == "query":
+        if cmdline.ParamCount() != 6:
+            echo("semantic_player error: usage query <tickStart> <tickEnd>")
+            return 1
+        var q1 = SvPlParseTick(cmdline.ParamStr(4))
+        var q2 = SvPlParseTick(cmdline.ParamStr(5))
+        if !q1.ok || !q2.ok:
+            echo("semantic_player error: sv_tick_out_of_range query_args")
+            return 1
+        if q1.value < int64(0) || q1.value >= q2.value ||
+           q2.value > m.timeEnd:
+            echo("semantic_player error: sv_interval_reversed query")
+            return 1
+        var at = SvPlLowerBound(idx, q1.value)
+        var matched: int32 = 0
+        var total: int64 = int64(0)
+        var prev: int64 = int64(-1)
+        while at < idx.sampleCount && idx.pts[at] < q2.value:
+            echo(SvPlSampleLine(idx, at))
+            if idx.pts[at] <= prev:
+                echo("semantic_player error: sv_index_order pts")
+                return 1
+            prev = idx.pts[at]
+            total = total + int64(idx.size[at])
+            matched = matched + 1
+            at = at + 1
+        var last = strings.ConcatStr("matched=", strings.IntToStr(matched))
+        last = strings.ConcatStr(last, " bytes=")
+        last = strings.ConcatStr(last, strings.Int64ToStr(total))
+        echo(last)
+        return 0
+
+    # ---- seek <tick> ----------------------------------------------------
+    if mode == "seek":
+        if cmdline.ParamCount() != 5:
+            echo("semantic_player error: usage seek <tick>")
+            return 1
+        var t = SvPlParseTick(cmdline.ParamStr(4))
+        if !t.ok || t.value < int64(0) || t.value >= m.timeEnd:
+            echo("semantic_player error: sv_tick_out_of_range seek")
+            return 1
+        let tick = t.value
+        var target = SvPlLowerBound(idx, tick + int64(1)) - 1
+        if target < 0:
+            echo("semantic_player error: sv_tick_out_of_range seek")
+            return 1
+        var kf = target
+        while kf >= 0 && idx.key[kf] != 1:
+            kf = kf - 1
+        if kf < 0:
+            echo("semantic_player error: sv_seek_no_keyframe")
+            return 1
+        var nextKf = kf + 1
+        while nextKf < idx.sampleCount && idx.key[nextKf] != 1:
+            nextKf = nextKf + 1
+        var intervalEnd = m.timeEnd
+        if nextKf < idx.sampleCount:
+            intervalEnd = idx.pts[nextKf]
+        var readahead: int64 = int64(0)
+        for i in kf..target:
+            readahead = readahead + int64(idx.size[i])
+        var line = strings.ConcatStr("kf_pts=", strings.Int64ToStr(idx.pts[kf]))
+        line = strings.ConcatStr(line, " interval=[")
+        line = strings.ConcatStr(line, strings.Int64ToStr(idx.pts[kf]))
+        line = strings.ConcatStr(line, ",")
+        line = strings.ConcatStr(line, strings.Int64ToStr(intervalEnd))
+        line = strings.ConcatStr(line, ") readahead_samples=")
+        line = strings.ConcatStr(line, strings.IntToStr(target - kf + 1))
+        line = strings.ConcatStr(line, " readahead_bytes=")
+        line = strings.ConcatStr(line, strings.Int64ToStr(readahead))
+        line = strings.ConcatStr(line, " from_sample=")
+        line = strings.ConcatStr(line, strings.IntToStr(kf))
+        echo(line)
+        return 0
+
+    # ---- play <tickStart> <durationTicks> [--realtime] -------------------
+    if mode == "play":
+        if cmdline.ParamCount() != 6 && cmdline.ParamCount() != 7:
+            echo("semantic_player error: usage play <tickStart> <durationTicks> [--realtime]")
+            return 1
+        var realtime = false
+        if cmdline.ParamCount() == 7:
+            if cmdline.ParamStr(6) != "--realtime":
+                echo("semantic_player error: unknown_arg play")
+                return 1
+            realtime = true
+        var t1 = SvPlParseTick(cmdline.ParamStr(4))
+        var dur = SvPlParseTick(cmdline.ParamStr(5))
+        if !t1.ok || !dur.ok:
+            echo("semantic_player error: sv_tick_out_of_range play_args")
+            return 1
+        if t1.value < int64(0) || t1.value >= m.timeEnd:
+            echo("semantic_player error: sv_tick_out_of_range play")
+            return 1
+        if dur.value < int64(1):
+            echo("semantic_player error: sv_interval_reversed play")
+            return 1
+        var t2 = m.timeEnd
+        if t1.value <= m.timeEnd - dur.value:
+            t2 = t1.value + dur.value
+        var at = SvPlLowerBound(idx, t1.value)
+        var step: int32 = 0
+        var evidence: int64 = int64(0)
+        var startNs: int64 = int64(0)
+        if realtime:
+            startNs = monotimes.MonoTimeNs(monotimes.GetMonoTime())
+        while at < idx.sampleCount && idx.pts[at] < t2:
+            if realtime:
+                let delta = idx.pts[at] - t1.value
+                if delta <= Int64(9223372036854775807) / int64(1000000000):
+                    let targetNs = delta * int64(1000000000) /
+                        int64(m.tbDen)
+                    let elapsed = monotimes.MonoTimeNs(
+                        monotimes.GetMonoTime()) - startNs
+                    if targetNs > elapsed:
+                        os.SleepMs(int32((targetNs - elapsed) /
+                            int64(1000000)) + 1)
+            var line = strings.ConcatStr("step=", strings.IntToStr(step))
+            line = strings.ConcatStr(line, " tick=")
+            line = strings.ConcatStr(line, strings.Int64ToStr(idx.pts[at]))
+            line = strings.ConcatStr(line, " sample=")
+            line = strings.ConcatStr(line, strings.IntToStr(at))
+            line = strings.ConcatStr(line, " offset=")
+            line = strings.ConcatStr(line, strings.Int64ToStr(idx.offset[at]))
+            line = strings.ConcatStr(line, " size=")
+            line = strings.ConcatStr(line, strings.IntToStr(idx.size[at]))
+            line = strings.ConcatStr(line, " key=")
+            line = strings.ConcatStr(line, strings.IntToStr(idx.key[at]))
+            echo(line)
+            let got = SvPlReadSampleCount(share(sourcePath), idx.offset[at],
+                idx.size[at])
+            if got < int64(0):
+                echo("semantic_player error: read_sample_range failed")
+                return 1
+            evidence = evidence + got
+            step = step + 1
+            at = at + 1
+        var last = strings.ConcatStr("steps=", strings.IntToStr(step))
+        last = strings.ConcatStr(last, " evidence_bytes=")
+        last = strings.ConcatStr(last, strings.Int64ToStr(evidence))
+        last = strings.ConcatStr(last, " timeline=[")
+        last = strings.ConcatStr(last, strings.Int64ToStr(t1.value))
+        last = strings.ConcatStr(last, ",")
+        last = strings.ConcatStr(last, strings.Int64ToStr(t2))
+        last = strings.ConcatStr(last, ")")
+        echo(last)
+        return 0
+
+    echo(strings.ConcatStr("semantic_player error: unknown_mode ", mode))
+    return 1

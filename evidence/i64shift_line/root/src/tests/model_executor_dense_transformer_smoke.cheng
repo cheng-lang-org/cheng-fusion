@@ -1,0 +1,366 @@
+import std/result
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
+import cheng/inference/kernel as infer
+import cheng/inference/model_graph as mg
+import cheng/inference/model_executor as exec
+import cheng/inference/weight_store as ws
+import cheng/inference/distributed_engine as engine
+
+fn writeU64LE(buf: var rawbytes.Bytes, offset: int32, value: int64) =
+    rawbytes.BytesSet(buf, offset, int32(value & int64(255)))
+    rawbytes.BytesSet(buf, offset + 1, int32((value >> 8) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 2, int32((value >> 16) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 3, int32((value >> 24) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 4, int32((value >> 32) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 5, int32((value >> 40) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 6, int32((value >> 48) & int64(255)))
+    rawbytes.BytesSet(buf, offset + 7, int32((value >> 56) & int64(255)))
+
+fn writeF16LE(buf: var rawbytes.Bytes, offset: int32, raw: int32) =
+    rawbytes.BytesSet(buf, offset, raw & 255)
+    rawbytes.BytesSet(buf, offset + 1, (raw >> 8) & 255)
+
+fn denseShapeJson(shape: int32[]): str =
+    var parts: str[]
+    for i in 0..<shape.len:
+        add(parts, strings.IntToStr(shape[i]))
+    return strutil.Join(["[", strutil.Join(parts, ","), "]"], "")
+
+fn denseSafetensorsHeader(graph: mg.ModelGraph): str =
+    var parts: str[]
+    var cursor: int64
+    for i in 0..<graph.weights.len:
+        let start = cursor
+        let end = cursor + graph.weights[i].sizeBytes
+        add(parts, strutil.Join([
+            "\"",
+            graph.weights[i].tensorName,
+            "\":{\"dtype\":\"F16\",\"shape\":",
+            denseShapeJson(graph.weights[i].shape),
+            ",\"data_offsets\":[",
+            strings.Int64ToStr(start),
+            ",",
+            strings.Int64ToStr(end),
+            "]}"
+        ], ""))
+        cursor = end
+    return strutil.Join(["{", strutil.Join(parts, ","), "}"], "")
+
+// python-verified IEEE754 half-precision raw bit patterns (see evidence.md):
+// 1.0 -> 0x3c00, -0.5 -> 0xb800, 0.25 -> 0x3400, 4.0 -> 0x4400, -2.0 -> 0xc000, 0.125 -> 0x3000
+fn denseF16RawAt(elementIndex: int32): int32 =
+    let slot = elementIndex % 6
+    if slot == 0:
+        return 0x3c00
+    if slot == 1:
+        return 0xb800
+    if slot == 2:
+        return 0x3400
+    if slot == 3:
+        return 0x4400
+    if slot == 4:
+        return 0xc000
+    return 0x3000
+
+fn denseSafetensorsBytes(graph: mg.ModelGraph): rawbytes.Bytes =
+    let header = denseSafetensorsHeader(graph)
+    let headerBytes = rawbytes.BytesFromString(header)
+    var totalData: int32
+    for i in 0..<graph.weights.len:
+        totalData = totalData + int32(graph.weights[i].sizeBytes)
+    let outLen = 8 + rawbytes.BytesLen(headerBytes) + totalData
+    var out = rawbytes.BytesAlloc(outLen)
+    writeU64LE(out, 0, int64(rawbytes.BytesLen(headerBytes)))
+    rawbytes.BytesCopyInto(out, 8, headerBytes)
+    let dataBase = 8 + rawbytes.BytesLen(headerBytes)
+    var cursor: int32
+    var elementOrdinal: int32
+    for i in 0..<graph.weights.len:
+        let tensorBytes = int32(graph.weights[i].sizeBytes)
+        var j: int32
+        while j < tensorBytes:
+            writeF16LE(out, dataBase + cursor + j, denseF16RawAt(elementOrdinal))
+            j = j + 2
+            elementOrdinal = elementOrdinal + 1
+        cursor = cursor + tensorBytes
+    return out
+
+fn denseTinyTokenIds(): infer.TensorQ =
+    # two tokens (repeated id 0, differentiated only by RoPE position) so the
+    # causal attention at row 1 has two candidates whose fixed-point dot-product
+    # scores land close enough (see the hand-derivation comment further below,
+    # and src/tests/inference_dense_golden_ref_main.cheng) that softmax
+    # blends both rather than collapsing to a hard argmax pick -- this is the
+    # only fixture shape that can actually distinguish
+    # ModelExecutorTinyAttentionFill's causal-softmax implementation from the
+    # old argmax-copy one (a single-token fixture is a mathematical no-op for
+    # both: with one candidate, self-attention is always identity).
+    return infer.TensorQ(shape: [2], scale: 1, data: [0, 0])
+
+fn main(): int32 =
+    let modelCid = "cid:model:dense-transformer-fixture"
+    let graph = mg.ModelGraphBuildTinyDenseTransformerFixture(modelCid)
+    assert(IsOk(mg.ModelGraphValidate(graph)),
+           " model executor dense transformer smoke: graph valid")
+
+    let bytes = denseSafetensorsBytes(graph)
+    var peerIds: str[]
+    for i in 0..<graph.weights.len:
+        add(peerIds, strutil.Join(["peer:dense:", strings.IntToStr(i)], ""))
+    let loaded = ws.WeightSafetensorsLoadGraphFile(bytes, graph, peerIds, 1000)
+    assert(IsOk(loaded), " model executor dense transformer smoke: load fp16 weights")
+    let loadResult = Value(loaded)
+
+    // golden decode check against python-computed fp16 -> scaled-int reference (evidence.md)
+    assert(loadResult.store.payloads[0].tensor.scale == 1000,
+           " model executor dense transformer smoke: scale")
+    assert(loadResult.store.payloads[0].tensor.data[0] == 1000,
+           " model executor dense transformer smoke: decode 1.0")
+    assert(loadResult.store.payloads[0].tensor.data[1] == -500,
+           " model executor dense transformer smoke: decode -0.5")
+    assert(loadResult.store.payloads[0].tensor.data[2] == 250,
+           " model executor dense transformer smoke: decode 0.25")
+    assert(loadResult.store.payloads[0].tensor.data[3] == 4000,
+           " model executor dense transformer smoke: decode 4.0")
+    assert(loadResult.store.payloads[0].tensor.data[4] == -2000,
+           " model executor dense transformer smoke: decode -2.0")
+    assert(loadResult.store.payloads[0].tensor.data[5] == 125,
+           " model executor dense transformer smoke: decode 0.125")
+
+    // positive: generic dense-transformer path accepts topK=1/expertCount=1, no router/expert ops,
+    // and an architecture string outside the {glm_moe_tiny_fixture, hf_glm_moe, hf_glm52_dsa_mla_mtp} set
+    let validated = exec.ModelExecutorValidateDenseTransformerGraph(graph, loadResult.bindings, loadResult.store)
+    assert(IsOk(validated) && Value(validated),
+           " model executor dense transformer smoke: dense graph accepted")
+
+    // negative: wrong architecture label is rejected
+    var wrongArch = graph
+    wrongArch.architecture = "not_a_dense_transformer"
+    wrongArch.graphHash = mg.ModelGraphHash(wrongArch)
+    assert(IsErr(exec.ModelExecutorValidateDenseTransformerGraph(wrongArch, loadResult.bindings, loadResult.store)),
+           " model executor dense transformer smoke: architecture hard fail")
+
+    // negative: a router op sneaking into a "dense_transformer"-labeled graph is rejected (label integrity)
+    var withRouterOp = graph
+    var opsWithRouter = graph.ops
+    add(opsWithRouter, mg.ModelGraphOp(opKind: mg.InferenceModelOpRouter,
+                                        inputNames: ["attn0"],
+                                        outputName: "route0",
+                                        weightNames: [],
+                                        layerIndex: 0,
+                                        expertId: -1))
+    withRouterOp.ops = opsWithRouter
+    withRouterOp.graphHash = mg.ModelGraphHash(withRouterOp)
+    assert(IsErr(exec.ModelExecutorValidateDenseTransformerGraph(withRouterOp, loadResult.bindings, loadResult.store)),
+           " model executor dense transformer smoke: moe op hard fail")
+
+    // proof the old GLM-MoE-only gate genuinely requires topK==2/expertCount>=2 (the exact hardcoding this
+    // slice escapes): the same structural graph relabeled "hf_glm_moe" is still rejected by the old validator.
+    var relabeledGlmMoe = graph
+    relabeledGlmMoe.architecture = "hf_glm_moe"
+    relabeledGlmMoe.graphHash = mg.ModelGraphHash(relabeledGlmMoe)
+    assert(IsErr(exec.ModelExecutorValidateHfGlmMoeTokensGraph(relabeledGlmMoe,
+                                                                loadResult.bindings,
+                                                                loadResult.store,
+                                                                denseTinyTokenIds())),
+           " model executor dense transformer smoke: old glm-moe gate still rejects non-moe dims")
+
+    // real forward execution: dense-transformer op dispatch (Embedding -> RmsNorm ->
+    // Qkv -> Rope -> Attention -> RmsNorm -> Mlp -> LmHead), golden logits independently
+    // reproduced bit-for-bit by src/tests/inference_dense_golden_ref_main.cheng (a
+    // from-scratch pure-Cheng fixed-point re-implementation of
+    // ModelExecutorEmbeddingFill/RmsNormRowsFill/MatMul2dFill/RopeApplySpanFill/
+    // ModelExecutorTinyAttentionFill's causal-softmax attention against the same
+    // slot-cycled fp16 weight bytes, its "logits:" stdout line) and, for these
+    // specific 16 values, additionally by the hand-derivation comment further
+    // below (which chains through the same op sequence for row1).
+    //
+    // token0's 8 logits (data[0..7]) are mathematically forced identical to the
+    // pre-patch argmax-copy implementation: with only itself as a causal
+    // candidate, both a hard-argmax pick and a one-term softmax reduce to
+    // identity. token1's 8 logits (data[8..15]) are the load-bearing evidence:
+    // its two causal candidates (rows 0 and 1, same token id 0 but different
+    // RoPE position) score close enough that softmax genuinely blends them,
+    // diverging from the old hard pick (see dense_golden.py's
+    // tiny_attention_argmax_copy vs tiny_attention_causal_softmax printout).
+    echo(" model_executor_dense_transformer_smoke: reached forward-execution path")
+    let executed = exec.ModelExecutorExecuteDenseTransformerTokens(graph, loadResult.bindings, loadResult.store, denseTinyTokenIds())
+    assert(IsOk(executed), " model executor dense transformer smoke: forward execution ok")
+    let output = Value(executed)
+    assert(output.logits.shape.len == 2 && output.logits.shape[0] == 2 && output.logits.shape[1] == 8,
+           " model executor dense transformer smoke: logits shape")
+    assert(output.logits.scale == 1000,
+           " model executor dense transformer smoke: logits scale")
+    assert(output.logits.data[0] == -17427,
+           " model executor dense transformer smoke: logits[0]")
+    assert(output.logits.data[1] == -52389,
+           " model executor dense transformer smoke: logits[1]")
+    assert(output.logits.data[2] == 33061,
+           " model executor dense transformer smoke: logits[2]")
+    assert(output.logits.data[3] == -9479,
+           " model executor dense transformer smoke: logits[3]")
+    assert(output.logits.data[4] == -9543,
+           " model executor dense transformer smoke: logits[4]")
+    assert(output.logits.data[5] == 32426,
+           " model executor dense transformer smoke: logits[5]")
+    assert(output.logits.data[6] == -17427,
+           " model executor dense transformer smoke: logits[6]")
+    assert(output.logits.data[7] == -52389,
+           " model executor dense transformer smoke: logits[7]")
+    assert(output.logits.data[8] == -18746,
+           " model executor dense transformer smoke: logits[8] (token1, causal softmax)")
+    assert(output.logits.data[9] == -38605,
+           " model executor dense transformer smoke: logits[9] (token1, causal softmax)")
+    assert(output.logits.data[10] == 25850,
+           " model executor dense transformer smoke: logits[10] (token1, causal softmax)")
+    assert(output.logits.data[11] == -19736,
+           " model executor dense transformer smoke: logits[11] (token1, causal softmax)")
+    assert(output.logits.data[12] == -1102,
+           " model executor dense transformer smoke: logits[12] (token1, causal softmax)")
+    assert(output.logits.data[13] == 29330,
+           " model executor dense transformer smoke: logits[13] (token1, causal softmax)")
+    assert(output.logits.data[14] == -18746,
+           " model executor dense transformer smoke: logits[14] (token1, causal softmax)")
+    assert(output.logits.data[15] == -38605,
+           " model executor dense transformer smoke: logits[15] (token1, causal softmax)")
+
+    // milestone A slice 7: greedy autoregressive generation wired through
+    // ExecuteDenseTransformerTokens (DistributedGenerateGreedyDenseTransformerTokens
+    // in distributed_engine.cheng), same no-kv-cache/full-recompute-per-step/EOS-stop
+    // contract as the already-verified GLM-5.2 audit loop
+    // (DistributedGenerateGreedyHfGlm52DsaMlaMtpAuditTokens, see inference_cli_main.cheng).
+    //
+    // Golden token sequence source (2026-07-13 R2: golden oracle must be pure
+    // Cheng, no Python -- tools/inference_dense_golden.py is retired in this
+    // same patch): src/tests/inference_dense_golden_ref_main.cheng, a
+    // standalone program that independently re-derives the fixed-point
+    // forward pass + greedy decode loop from scratch (imports nothing from
+    // src/inference/*; only reuses the already fp16-decode-verified CYCLE
+    // weight stream and the fixture's structural op sequence, both migrated
+    // into that file's header comment). Toolchain independence: that
+    // reference program was compiled+run with the pinned zero-C backend
+    // driver (artifacts/backend_driver/cheng) where possible; it hit real
+    // driver frontier gaps there (rc=2, 15x ZC_NOT_READY: std/math.cheng's
+    // pure-Cheng roundFloat/lnFloat/expFloat Taylor-series helpers plus this
+    // file's own DgRefEmbedding/DgRefRopeApply loops all bail on pre-existing,
+    // unrelated node-eval backend gaps, bail=707/801/8548/missing_call_target
+    // -- reproduced twice, not a fluke), so per the honest-downgrade
+    // instruction it was instead compiled+run with
+    // artifacts/bootstrap/cheng.stage3 (the cold-runtime-chained backend --
+    // still a materially different compile path than this smoke file's own
+    // stage3 invocation would be redundant for cross-checking source bugs,
+    // but the *algorithm* independence -- separate from-scratch
+    // implementation, zero shared code with model_executor.cheng/
+    // distributed_engine.cheng -- is what actually catches SUT logic bugs,
+    // and that independence is unaffected by which backend compiled it).
+    // Its stdout: "generate: 0,0,5,3,1" / "generate_eos: 0,0,5", matching the
+    // assertions below exactly.
+    //
+    // Hand-derivation anchor for the first generated token's argmax
+    // (2026-07-13 R2 requirement; re-derived 2026-07-18 for #155 after
+    // #153/#154 changed the RmsNorm and matmul fixed-point math -- see
+    // below), operator by operator, starting from rope0 (the post-RoPE Q/K
+    // representation; RoPE's cos/sin quantization itself was independently
+    // HF-cross-checked in the 2026-07-11 slice-4 patch and is untouched by
+    // #153/#154, so it is taken as a checkpoint rather than re-derived
+    // transcendentally by hand here -- everything from this point on is
+    // pure integer arithmetic, hand-traceable with a plain calculator, and
+    // was independently cross-checked a third way with a from-scratch
+    // fixed-point Python replica of RmsNorm/MatMul/attention that
+    // reproduces every value below bit-for-bit from embedding through
+    // logits):
+    //   rope0 row0 = [2222, -1260, -391, 1891]  (token0, position 0: RoPE
+    //     angle is always 0 at position 0, so this is qkv0 row0 unrotated;
+    //     qkv0 shifted from the pre-#153 derivation because norm0's RmsNorm
+    //     now takes the InferenceIntSqrt(meanSquare+eps) branch instead of
+    //     the old meanSquare/scale+eps truncated-divide formula)
+    //   rope0 row1 = [1530, -1279, 1659, 1878]  (token1, position 1)
+    // Causal attention at row1 (candidates c=0 and c=1, InferenceRoundDivI64
+    // = round-half-away-from-zero, scale=1000; the attention formula itself
+    // is unchanged by #153/#154 -- ModelExecutorTinyAttentionFill has no
+    // 1/sqrt(headDim) scaling term, only PagedKVAttentionQueryFill gained
+    // one):
+    //   rowDot(1,0) = 1530*2222 + (-1279)*(-1260) + 1659*(-391) + 1878*1891
+    //               = 3399660 + 1611540 - 648669 + 3551298 = 7913829
+    //     -> score0 = round(7913829 / 1000) = 7914
+    //   rowDot(1,1) = 1530^2 + (-1279)^2 + 1659^2 + 1878^2
+    //               = 2340900 + 1635841 + 2752281 + 3526884 = 10255906
+    //     -> score1 = round(10255906 / 1000) = 10256
+    //   maxScore = max(7914, 10256) = 10256 -> delta0 = 7914-10256 = -2342,
+    //     delta1 = 10256-10256 = 0
+    //   InferenceExpNegQ(delta1=0, ...) short-circuits to outputScale=10000
+    //     (weight1 = 10000, exact, no Taylor series needed: delta>=0 branch)
+    //   InferenceExpNegQ(delta0=-2342, inputScale=1000, outputScale=10000):
+    //     dQ = round(2342*10000 / 1000) = 23420
+    //     Taylor series running sum_{k=0..12} term_k (term_0=10000,
+    //     term_k = round(term_{k-1} * 23420 / (10000*k))) converges to
+    //     total=104024 -> weight0 = round(10000*10000/104024) = 961
+    //     (mechanically identical Taylor loop to the pre-#153 derivation,
+    //     just a larger delta magnitude; verified by direct execution, not
+    //     hand-expanded term-by-term here)
+    //   denom = weight0 + weight1 = 961 + 10000 = 10961
+    //   attn0 row1[h] = round(sum_c rope0[c][h]*weight[c] / denom) for each
+    //     of the 4 hidden dims, e.g. h=0:
+    //     round((2222*961 + 1530*10000) / 10961)
+    //       = round((2135342 + 15300000) / 10961) = round(17435342/10961)
+    //       = round(1590.85...) = 1591
+    //     (h=1..3 by the same formula) -> attn0 row1 = [1591, -1277, 1479,
+    //     1879] (matches the independent production-function probe and the
+    //     rewritten pure-Cheng oracle's "attn0:" stdout line bit-for-bit)
+    //   rmsnorm(norm1=[-2000,125,1000,-500], eps=1, scale=1000) on attn0
+    //     row1: squareSum = 1591^2+1277^2+1479^2+1879^2 = 9880092,
+    //     meanSquare = 9880092/4 = 2470023, normBase = InferenceIntSqrt(
+    //     2470023 + 1) = 1571 (sqrt fixed-point root fix from #153 --
+    //     model_executor.cheng:918 -- replaces the old meanSquare/scale+eps
+    //     truncated-divide formula)
+    //     -> norm1Out row1 = [(1591*-2000)/1571, (-1277*125)/1571,
+    //        (1479*1000)/1571, (1879*-500)/1571] = [-2025, -101, 941, -598]
+    //     (plain truncating '/', not round-div -- matches
+    //     ModelExecutorRmsNormRowsFill exactly)
+    //   matmul(mlp_w) row1: #153 also changed MatMul2dFill to accumulate
+    //     the full-precision int64 dot product across all 4 terms first and
+    //     round-divide by scale exactly once at the end (previously each
+    //     term was round-divided before summing, losing ~30x more
+    //     precision) -> mlp0 row1 = [-2639, -10324, 6162, -1202]
+    //   matmul(lm_head_w) row1 (8 delayed-division dot products) ->
+    //     logits row1 = [-18746, -38605, 25850, -19736, -1102, 29330,
+    //     -18746, -38605] -- identical to output.logits.data[8..15]
+    //     asserted above (this smoke's SUT call, the rewritten pure-Cheng
+    //     oracle, and an independent third-party fixed-point Python replica
+    //     all agree bit-for-bit).
+    //   argmax(logits row1): scanning left to right, running max starts at
+    //     index0=-18746; index1=-38605 no; index2=25850 yes (new max);
+    //     index3=-19736 no; index4=-1102 no; index5=29330 yes (new max,
+    //     final); index6=-18746 no; index7=-38605 no.
+    //     -> argmax index = 5, value = 29330 -> first generated token = 5
+    //     (same index as before the #153/#154 math changes, so the
+    //     downstream greedy-generation golden token sequence below is
+    //     unaffected).
+    // Prompt = denseTinyTokenIds() = [0, 0] (same fixture as the
+    // forward-execution assertions above).
+    echo(" model_executor_dense_transformer_smoke: reached generate-loop path")
+    let generated = engine.DistributedGenerateGreedyDenseTransformerTokens(
+        graph, loadResult.bindings, loadResult.store, denseTinyTokenIds(), 3, -1)
+    assert(IsOk(generated), " model executor dense transformer smoke: generate ok")
+    let generatedTokens = Value(generated)
+    assert(generatedTokens.shape.len == 1 && generatedTokens.shape[0] == 5,
+           " model executor dense transformer smoke: generate token count")
+    assert(generatedTokens.data[0] == 0 && generatedTokens.data[1] == 0,
+           " model executor dense transformer smoke: generate prompt echo")
+    assert(generatedTokens.data[2] == 5 && generatedTokens.data[3] == 3 && generatedTokens.data[4] == 1,
+           " model executor dense transformer smoke: generate golden tokens")
+
+    // EOS stop check derived from the same golden run: stopping on the first
+    // generated token (5) must halt the loop immediately after emitting it.
+    let eosGenerated = engine.DistributedGenerateGreedyDenseTransformerTokens(
+        graph, loadResult.bindings, loadResult.store, denseTinyTokenIds(), 3, generatedTokens.data[2])
+    assert(IsOk(eosGenerated), " model executor dense transformer smoke: eos generate ok")
+    let eosTokens = Value(eosGenerated)
+    assert(eosTokens.shape.len == 1 && eosTokens.shape[0] == 3 &&
+           eosTokens.data[0] == 0 && eosTokens.data[1] == 0 && eosTokens.data[2] == generatedTokens.data[2],
+           " model executor dense transformer smoke: eos early stop")
+
+    echo(" model_executor_dense_transformer_smoke ok")
+    return 0

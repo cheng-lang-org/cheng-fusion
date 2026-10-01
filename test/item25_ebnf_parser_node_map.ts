@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -40,8 +41,12 @@ import {
   buildChengGrammarObligationContract,
 } from "../src/cheng_semantic_pipeline_matrix_m9024.ts";
 import {
+  pinCurrentParserHarnessClosure,
+} from "../src/cheng_current_release_green_audit.ts";
+import {
   bindCurrentReceiptAgainstObligations,
   bindReceiptAgainstObligations,
+  currentParserReceiptBindingAuthority,
   driverDeclarationIdentity,
   driverDeclarationLexicalScopeIdentity,
   driverImportEdgeIdentity,
@@ -50,6 +55,9 @@ import {
   driverNormalizedStatementFactIdentity,
   parserAnnotationArgIdentity,
   parserAnnotationIdentity,
+  parserCurrentForwardingTraceRoot,
+  parserForwardingChildTargetIdentity,
+  parserForwardingProductionIdentity,
   parserReceiptObjectTypeSurface,
   parserPatternIdentity,
   parserTypeEnumVariantIdentity,
@@ -114,6 +122,27 @@ function clone<T>(value: T): T {
 
 function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function driverToolchainManifestSha256(manifest: {
+  schema: string;
+  producerIdentity: string;
+  driverPath: string;
+  driverBytesSha256: string;
+  packageRoot: string;
+  rootDir: string;
+}): string {
+  return sha256(
+    "{\n" +
+    `  "schema": ${JSON.stringify(manifest.schema)},\n` +
+    `  "producerIdentity": ${JSON.stringify(manifest.producerIdentity)},\n` +
+    `  "driverPath": ${JSON.stringify(manifest.driverPath)},\n` +
+    `  "driverBytesSha256": ${JSON.stringify(
+      manifest.driverBytesSha256)},\n` +
+    `  "packageRoot": ${JSON.stringify(manifest.packageRoot)},\n` +
+    `  "rootDir": ${JSON.stringify(manifest.rootDir)}\n` +
+    "}\n",
+  );
 }
 
 function buildCurrentStructureMutationFixture(
@@ -338,6 +367,48 @@ async function main(): Promise<void> {
     ["annotation_arg_span", "ParserAnnotationArgKeyValue", "annotationEntry", []],
     ["annotation_arg_span", "ParserAnnotation", "annotationArgs", []],
     [
+      "forwarding_production_span",
+      "ParserForwardingProductionTopLevelDecl",
+      "topLevelDecl",
+      ["ParserForwardingProductionTopLevelDecl"],
+    ],
+    [
+      "forwarding_production_span",
+      "ParserForwardingProductionTopLevelCore",
+      "topLevelCore",
+      ["ParserForwardingProductionTopLevelCore"],
+    ],
+    [
+      "forwarding_production_span",
+      "ParserForwardingProductionTemplateBody",
+      "templateBody",
+      ["ParserForwardingProductionTemplateBody"],
+    ],
+    [
+      "forwarding_production_span",
+      "ParserForwardingProductionStatement",
+      "statement",
+      ["ParserForwardingProductionStatement"],
+    ],
+    [
+      "forwarding_production_span",
+      "ParserForwardingProductionStatementCore",
+      "statementCore",
+      ["ParserForwardingProductionStatementCore"],
+    ],
+    [
+      "forwarding_production_span",
+      "ParserForwardingProductionMatchArm",
+      "matchArm",
+      ["ParserForwardingProductionMatchArm"],
+    ],
+    [
+      "forwarding_production_span",
+      "ParserForwardingProductionBlockStmt",
+      "blockStmt",
+      ["ParserForwardingProductionBlockStmt"],
+    ],
+    [
       "statement_root_span",
       "ParserValueExprStatementAssignmentRhs",
       "assignStmt",
@@ -390,6 +461,18 @@ async function main(): Promise<void> {
     ["pattern_span", "ParserValueExprRegionPattern", "pattern", []],
     ["annotation_span", "ParserValueExprRegionAnnotationArgs", "annotation", []],
     ["annotation_arg_span", "ParserValueTokenColon", "annotationEntry", []],
+    [
+      "forwarding_production_span",
+      "ParserForwardingProductionChildForwardingProduction",
+      "statement",
+      ["ParserForwardingProductionStatement"],
+    ],
+    [
+      "forwarding_production_span",
+      "ParserValueExprStatementExpression",
+      "statement",
+      ["ParserForwardingProductionStatement"],
+    ],
     [
       "statement_root_span",
       "ParserValueTokenIf",
@@ -888,6 +971,59 @@ async function main(): Promise<void> {
       () => build(Buffer.from(JSON.stringify(copy)), parserBytes),
       /implicitObjectType current TypeSyntax producer declaration invalid/,
       `implicitObjectType ${label} mutation 必须 hard-fail`,
+    );
+  }
+  const forwardingProducerNames = [
+    "topLevelDecl",
+    "topLevelCore",
+    "templateBody",
+    "statement",
+    "statementCore",
+    "matchArm",
+    "blockStmt",
+  ] as const;
+  assert.equal(
+    forwardingProducerNames.reduce((sum, name) =>
+      sum + generatedWithoutReceipts.rows.find(
+        (row) => row.name === name,
+      )!.required_obligation_count, 0),
+    57,
+  );
+  for (const name of forwardingProducerNames) {
+    const row = generatedWithoutReceipts.rows.find(
+      (candidate) => candidate.name === name,
+    )!;
+    assert.equal(row.span_model, "forwarding_production_span");
+    for (const field of ["parserFunctions", "nodeKinds"] as const) {
+      const missingForwardingClaim = clone(currentDeclarations);
+      const changed = missingForwardingClaim.rows.find(
+        (candidate: any) => candidate.name === name,
+      );
+      changed[field] = changed[field].slice(1);
+      assert.throws(
+        () => build(
+          Buffer.from(JSON.stringify(missingForwardingClaim)),
+          parserBytes,
+        ),
+        new RegExp(
+          `${name} current forwarding producer declaration invalid`,
+        ),
+        `${name} ${field} 删除 mutation 必须 hard-fail`,
+      );
+    }
+    const wrongSpanClaim = clone(currentDeclarations);
+    wrongSpanClaim.rows.find(
+      (candidate: any) => candidate.name === name,
+    ).spanModel = "statement_root_span";
+    assert.throws(
+      () => build(
+        Buffer.from(JSON.stringify(wrongSpanClaim)),
+        parserBytes,
+      ),
+      new RegExp(
+        `${name} current forwarding producer declaration invalid`,
+      ),
+      `${name} spanModel mutation 必须 hard-fail`,
     );
   }
   const exactTypeSyntaxProducerNames = [
@@ -1723,17 +1859,40 @@ async function main(): Promise<void> {
     27,
     "current structure receipt 必须覆盖 line-fact 15 与 ImportEdge 12",
   );
-  const undeclaredStatementRootRows = generated.rows.filter((row) =>
-    row.span_model === "statement_root_span" &&
-    !row.node_kinds.some((kind) =>
-      kind.startsWith("ParserValueExprStatement")));
+  const forwardingRows = generated.rows.filter((row) =>
+    row.span_model === "forwarding_production_span");
   assert.equal(
-    undeclaredStatementRootRows.reduce(
+    forwardingRows.reduce(
       (sum, row) => sum + row.required_obligation_count,
       0,
     ),
     57,
-    "无正式 statement-root role 的转发/块 production 必须继续缺失",
+    "七个 forwarding production 必须精确承载全部 57 个 required obligation",
+  );
+  assert.deepEqual(
+    forwardingRows.map((row) => row.name).sort(),
+    [
+      "blockStmt",
+      "matchArm",
+      "statement",
+      "statementCore",
+      "templateBody",
+      "topLevelCore",
+      "topLevelDecl",
+    ],
+    "57 个 obligation 只能落到七个 parser-owned forwarding production",
+  );
+  assert.ok(
+    forwardingRows.every((row) =>
+      row.node_kinds.includes("ParserForwardingProductionKind") &&
+      row.node_kinds.includes(
+        "ParserForwardingProductionChildKind",
+      ) &&
+      row.node_kinds.some((kind) =>
+        kind.startsWith("ParserForwardingProduction") &&
+        kind !== "ParserForwardingProductionKind" &&
+        kind !== "ParserForwardingProductionChildKind")),
+    "每个 forwarding production 必须声明唯一 kind 与 typed child CSR",
   );
   for (const [name, kind, span] of [
     ["typeExpr", "ParserTypeSyntaxKind", "type_syntax_span"],
@@ -1872,6 +2031,8 @@ async function main(): Promise<void> {
   mutationReceipt.counts.declarationCount = 0;
   mutationReceipt.counts.patternCount = 0;
   mutationReceipt.counts.patternChildCount = 0;
+  mutationReceipt.counts.forwardingProductionCount = 0;
+  mutationReceipt.counts.forwardingProductionChildCount = 0;
   mutationReceipt.typeSyntaxes = [];
   mutationReceipt.typeSyntaxChildren = [];
   mutationReceipt.typeEnumVariants = [];
@@ -1880,6 +2041,8 @@ async function main(): Promise<void> {
   mutationReceipt.typeGenericSymbols = [];
   mutationReceipt.typeGenericSymbolChildren = [];
   mutationReceipt.declarations = [];
+  mutationReceipt.forwardingProductions = [];
+  mutationReceipt.forwardingProductionChildren = [];
   for (const root of mutationReceipt.statementRoots) {
     if (root.role ===
         "ParserValueExprStatementBindingInitializer") {
@@ -1979,6 +2142,1532 @@ async function main(): Promise<void> {
     valueExprKindNamesFromParserSource(
       parserBytes.toString("utf8"),
     );
+  const forwardingProductionNames = new Set([
+    "topLevelDecl",
+    "topLevelCore",
+    "templateBody",
+    "statement",
+    "statementCore",
+    "matchArm",
+    "blockStmt",
+  ]);
+  const forwardingObligations = grammar.obligations.filter(
+    (entry) =>
+      entry.disposition === "required" &&
+      forwardingProductionNames.has(entry.production),
+  );
+  assert.equal(
+    forwardingObligations.length,
+    57,
+    "正式 forwarding obligation 总数必须精确为 57",
+  );
+  const forwardingKind = new Map([
+    ["topLevelDecl", [1, "ParserForwardingProductionTopLevelDecl"]],
+    ["topLevelCore", [2, "ParserForwardingProductionTopLevelCore"]],
+    ["templateBody", [3, "ParserForwardingProductionTemplateBody"]],
+    ["statement", [4, "ParserForwardingProductionStatement"]],
+    ["statementCore", [5, "ParserForwardingProductionStatementCore"]],
+    ["matchArm", [6, "ParserForwardingProductionMatchArm"]],
+    ["blockStmt", [7, "ParserForwardingProductionBlockStmt"]],
+  ] as const);
+  type ForwardingSpec = {
+    readonly kind: number;
+    readonly armIndex: number;
+    readonly children: readonly ForwardingSpec[];
+  };
+  const forwardingArmDefault = (kind: number): number =>
+    [1, 4, 6].includes(kind) ? -1 : 0;
+  const statement = (core: ForwardingSpec): ForwardingSpec => ({
+    kind: 4,
+    armIndex: -1,
+    children: [core],
+  });
+  const terminalCore = (): ForwardingSpec => ({
+    kind: 5,
+    armIndex: 5,
+    children: [],
+  });
+  const template = (
+    child: ForwardingSpec = statement(terminalCore()),
+    armIndex = 0,
+  ): ForwardingSpec => ({
+    kind: 3,
+    armIndex,
+    children: [child],
+  });
+  const directCore = (
+    armIndex: number,
+    nested?: ForwardingSpec,
+  ): ForwardingSpec => {
+    if (armIndex === 9) {
+      return {
+        kind: 5,
+        armIndex,
+        children: [nested ?? {
+          kind: 6,
+          armIndex: -1,
+          children: [statement(terminalCore())],
+        }],
+      };
+    }
+    if (armIndex === 14) {
+      return {
+        kind: 5,
+        armIndex,
+        children: [nested ?? {
+          kind: 7,
+          armIndex: 0,
+          children: [statement(terminalCore())],
+        }],
+      };
+    }
+    if (armIndex === 16) {
+      return {
+        kind: 5,
+        armIndex,
+        children: [nested ?? template()],
+      };
+    }
+    return {
+      kind: 5,
+      armIndex,
+      children: nested === undefined ? [] : [nested],
+    };
+  };
+  const recursiveTarget = (
+    kind: number,
+    armIndex: number,
+    depth: number,
+  ): ForwardingSpec => {
+    if (kind === 3) {
+      return template(
+        statement(
+          depth === 0
+            ? terminalCore()
+            : directCore(
+              16,
+              recursiveTarget(kind, armIndex, depth - 1),
+            ),
+        ),
+        armIndex,
+      );
+    }
+    if (kind === 4) {
+      return statement(
+        depth === 0
+          ? terminalCore()
+          : directCore(
+            19,
+            recursiveTarget(kind, armIndex, depth - 1),
+          ),
+      );
+    }
+    if (kind === 5) {
+      if (depth === 0) return terminalCore();
+      return directCore(
+        19,
+        statement(recursiveTarget(kind, armIndex, depth - 1)),
+      );
+    }
+    if (kind === 6) {
+      return {
+        kind: 6,
+        armIndex: -1,
+        children: [statement(
+          depth === 0
+            ? terminalCore()
+            : directCore(
+              9,
+              recursiveTarget(kind, armIndex, depth - 1),
+            ),
+        )],
+      };
+    }
+    if (kind === 7) {
+      return {
+        kind: 7,
+        armIndex,
+        children: [statement(
+          depth === 0
+            ? terminalCore()
+            : directCore(
+              14,
+              recursiveTarget(kind, armIndex, depth - 1),
+            ),
+        )],
+      };
+    }
+    throw new Error(`unsupported recursive forwarding kind: ${kind}`);
+  };
+  const topLevelStatementCoreArm = (topLevelArm: number): number =>
+    [0, 19, 20, 15, 16, 17, 18, 1, 21][topLevelArm] ?? -1;
+  const wrapForwardingTarget = (
+    target: ForwardingSpec,
+  ): ForwardingSpec => {
+    if (target.kind === 1) return target;
+    if (target.kind === 2) {
+      return {kind: 1, armIndex: -1, children: [target]};
+    }
+    const topMappedArm = target.kind === 5
+      ? [0, 19, 20, 15, 16, 17, 18, 1, 21]
+        .indexOf(target.armIndex)
+      : -1;
+    let topLevelArm = 1;
+    let targetStatement: ForwardingSpec;
+    if (target.kind === 3) {
+      topLevelArm = 4;
+      targetStatement = statement(directCore(16, target));
+    } else if (target.kind === 4) {
+      if (target.children[0]?.armIndex === 21) {
+        topLevelArm = 8;
+        targetStatement = target;
+      } else if (target.children[0]?.armIndex === 19) {
+        topLevelArm = 1;
+        targetStatement = target;
+      } else {
+        topLevelArm = 1;
+        targetStatement = statement(directCore(19, target));
+      }
+    } else if (target.kind === 5 && topMappedArm >= 0) {
+      topLevelArm = topMappedArm;
+      targetStatement = statement(target);
+    } else if (target.kind === 5) {
+      targetStatement = statement(directCore(
+        19,
+        statement(target),
+      ));
+    } else if (target.kind === 6) {
+      targetStatement = statement(directCore(
+        19,
+        statement(directCore(9, target)),
+      ));
+    } else {
+      targetStatement = statement(directCore(
+        19,
+        statement(directCore(14, target)),
+      ));
+    }
+    return {
+      kind: 1,
+      armIndex: -1,
+      children: [{
+        kind: 2,
+        armIndex: topLevelArm,
+        children: [targetStatement],
+      }],
+    };
+  };
+  const forwardingReceiptFor = (
+    obligation: (typeof forwardingObligations)[number],
+  ): any => {
+    const candidate = clone(mutationReceipt);
+    const [positiveKind] =
+      forwardingKind.get(obligation.production)!;
+    let armIndex = forwardingArmDefault(positiveKind);
+    let recursionDepth = 0;
+    if (obligation.kind === "choice") {
+      armIndex = obligation.bound!;
+    } else if (obligation.kind === "optional") {
+      armIndex = obligation.variant === "present" ? 1 : 0;
+    } else if (obligation.kind === "recursion") {
+      recursionDepth = obligation.variant === "depth_zero"
+        ? 0
+        : obligation.variant === "depth_one" ? 1 : 3;
+    }
+    let target: ForwardingSpec;
+    if (positiveKind === 1) {
+      target = {
+        kind: 1,
+        armIndex: -1,
+        children: [{
+          kind: 2,
+          armIndex: 8,
+          children: [statement(directCore(21))],
+        }],
+      };
+    } else if (positiveKind === 2) {
+      target = {
+        kind: 2,
+        armIndex,
+        children: [statement(directCore(
+          topLevelStatementCoreArm(armIndex),
+        ))],
+      };
+    } else if (obligation.kind === "recursion") {
+      target = recursiveTarget(
+        positiveKind,
+        forwardingArmDefault(positiveKind),
+        recursionDepth,
+      );
+    } else if (positiveKind === 5) {
+      target = directCore(armIndex);
+    } else if (positiveKind === 3) {
+      target = template(undefined, armIndex);
+    } else if (positiveKind === 4) {
+      target = statement(directCore(21));
+    } else if (positiveKind === 6) {
+      target = {
+        kind: 6,
+        armIndex: -1,
+        children: [statement(terminalCore())],
+      };
+    } else {
+      target = {
+        kind: 7,
+        armIndex,
+        children: [statement(terminalCore())],
+      };
+    }
+    const root = wrapForwardingTarget(target);
+    const tokenKindNames =
+      tokenKindNamesFromParserSource(parserBytes.toString("utf8"));
+    const nameToken = candidate.tokens.findLast((token: any) =>
+      tokenKindNames[token.kind] === "ParserValueTokenIdentifier" &&
+      tokenKindNames[candidate.tokens[token.index + 1]?.kind] ===
+        "ParserValueTokenAssign");
+    const assignToken = candidate.tokens.find((token: any) =>
+      tokenKindNames[token.kind] === "ParserValueTokenAssign" &&
+      token.index === nameToken?.index + 1);
+    const rhsToken = assignToken === undefined
+      ? undefined : candidate.tokens[assignToken.index + 1];
+    assert.ok(nameToken !== undefined);
+    const specs: {
+      spec: ForwardingSpec;
+      ownerIndex: number;
+      childIndexes: number[];
+    }[] = [];
+    const appendSpec = (
+      spec: ForwardingSpec,
+      ownerIndex: number,
+    ): number => {
+      const index = specs.length;
+      specs.push({spec, ownerIndex, childIndexes: []});
+      for (const child of spec.children) {
+        specs[index]!.childIndexes.push(appendSpec(child, index));
+      }
+      return index;
+    };
+    appendSpec(root, -1);
+    const containsAssignment =
+      specs.some((entry) =>
+        entry.spec.kind === 5 && entry.spec.armIndex === 2);
+    if (containsAssignment) {
+      assert.ok(assignToken !== undefined && rhsToken !== undefined);
+    }
+    const relativeLevels = new Array<number>(specs.length).fill(0);
+    for (let index = 0; index < specs.length; index += 1) {
+      const parent = specs[index]!;
+      const childIncrement = [1, 2, 4].includes(parent.spec.kind)
+        ? 0 : 1;
+      for (const childIndex of parent.childIndexes) {
+        relativeLevels[childIndex] =
+          relativeLevels[index]! + childIncrement;
+      }
+    }
+    const maximumRelativeLevel = Math.max(...relativeLevels);
+    const identifierTokens = candidate.tokens.filter((token: any) =>
+      token.index <= nameToken.index &&
+      tokenKindNames[token.kind] === "ParserValueTokenIdentifier");
+    assert.ok(identifierTokens.length > maximumRelativeLevel);
+    const firstIdentifierSlot =
+      identifierTokens.length - 1 - maximumRelativeLevel;
+    const anchorTokens = relativeLevels.map((level) =>
+      identifierTokens[firstIdentifierSlot + level]!);
+    const spanEndToken = containsAssignment ? rhsToken! : nameToken;
+    const rowSpanStarts = anchorTokens.map((token) => token.start);
+    const rowSpanEnds = anchorTokens.map(() => spanEndToken.end);
+    candidate.declarationLexicalScopes = [
+      clone(sourceLexicalScope),
+    ];
+    candidate.declarations = [];
+    candidate.typeSyntaxes = [];
+    candidate.typeSyntaxChildren = [];
+    candidate.typeEnumVariants = [];
+    candidate.typeSyntaxBracketArgs = [];
+    candidate.typeConstExprs = [];
+    candidate.typeGenericSymbols = [];
+    candidate.typeGenericSymbolChildren = [];
+    candidate.patterns = [];
+    candidate.patternChildren = [];
+    const declarationAuthority = (
+      coreArm: number,
+      rowSpanStart: number,
+      rowSpanEnd: number,
+    ): number => {
+      let kind = 3;
+      let kindText = "ParserDeclarationFunction";
+      if (coreArm === 0) {
+        kind = 6;
+        kindText = "ParserDeclarationLocal";
+      } else if (coreArm === 1) {
+        kind = 2;
+        kindText = "ParserDeclarationType";
+      } else if (coreArm === 17) {
+        kind = 7;
+        kindText = "ParserDeclarationConcept";
+      } else if (coreArm === 18) {
+        kind = 8;
+        kindText = "ParserDeclarationTrait";
+      }
+      const index = candidate.declarations.length;
+      let typeSyntaxRootIndex = -1;
+      if (kind === 2) {
+        typeSyntaxRootIndex = candidate.typeSyntaxes.length;
+        const typeRow: any = {
+          index: typeSyntaxRootIndex,
+          producerSourceIndex: 0,
+          sourceLocalRow: typeSyntaxRootIndex,
+          sourceTextId: nameToken.sourceTextId,
+          kind: 1,
+          kindText: "ParserTypeSyntaxNominal",
+          spanStart: nameToken.start,
+          spanEnd: nameToken.end,
+          ownerTokenIndex: nameToken.index,
+          declarationOwnerTokenIndex: nameToken.index,
+          declarationOwnerIndex: typeSyntaxRootIndex,
+          genericSymbolStart: -1,
+          genericSymbolCount: 0,
+          childStart: 0,
+          childCount: 0,
+          bracketArgStart: 0,
+          bracketArgCount: 0,
+          nameTokenIndex: nameToken.index,
+          fixedLength: -1,
+          questionTokenIndex: -1,
+          rootKind: 3,
+          enumVariantStart: -1,
+          enumVariantCount: 0,
+          identitySha256: "",
+        };
+        typeRow.identitySha256 = parserTypeSyntaxIdentity(
+          typeRow,
+          candidate.typeSyntaxChildren,
+        );
+        candidate.typeSyntaxes.push(typeRow);
+      }
+      let suiteLexicalScopeIndex = -1;
+      if (kind === 7 || kind === 8) {
+        suiteLexicalScopeIndex =
+          candidate.declarationLexicalScopes.length;
+        const suiteScope: any = {
+          index: suiteLexicalScopeIndex,
+          producerSourceIndex: 0,
+          sourceLocalRow: suiteLexicalScopeIndex,
+          kind: 4,
+          kindText: "ParserDeclarationLexicalScopeBlock",
+          parentScopeIndex: 0,
+          ownerDeclarationIndex: index,
+          spanStart: rowSpanStart,
+          spanEnd: rowSpanEnd,
+          identitySha256: "",
+        };
+        suiteScope.identitySha256 =
+          driverDeclarationLexicalScopeIdentity(suiteScope);
+        candidate.declarationLexicalScopes.push(suiteScope);
+      }
+      const declaration: any = {
+        index,
+        producerSourceIndex: 0,
+        sourceLocalRow: index,
+        sourceTextId: nameToken.sourceTextId,
+        kind,
+        kindText,
+        nameTokenIndex: nameToken.index,
+        ownerDeclarationIndex: -1,
+        lexicalScopeIndex: 0,
+        functionRow: kind === 3 ? index : -1,
+        typeSyntaxRootIndex,
+        genericSymbolStart: -1,
+        genericSymbolCount: 0,
+        suiteLexicalScopeIndex,
+        spanStart: rowSpanStart,
+        spanEnd: rowSpanEnd,
+        nameSpanStart: nameToken.start,
+        nameSpanEnd: nameToken.end,
+        mutableFlag: 0,
+        exportedFlag: 0,
+        identitySha256: "",
+      };
+      declaration.identitySha256 = driverDeclarationIdentity(
+        declaration,
+        source,
+        candidate.tokens,
+        candidate.declarations.map(
+          (entry: any) => entry.identitySha256,
+        ),
+        candidate.declarationLexicalScopes,
+        candidate.typeSyntaxes,
+        candidate.typeGenericSymbols,
+      );
+      candidate.declarations.push(declaration);
+      return index;
+    };
+    const statementRootAuthority = (
+      coreArm: number,
+      rowAnchor: any,
+    ): number => {
+      let role = "ParserValueExprStatementCondition";
+      let anchor = rowAnchor;
+      let nodeStart = rowAnchor.index;
+      let nodeEnd = rowAnchor.index + 1;
+      if (coreArm === 2) {
+        role = "ParserValueExprStatementAssignmentRhs";
+        anchor = assignToken!;
+        nodeStart = rhsToken!.index;
+        nodeEnd = rhsToken!.index + 1;
+      } else if (coreArm === 11) {
+        role = "ParserValueExprStatementLoopSource";
+      } else if (coreArm === 21) {
+        role = "ParserValueExprStatementExpression";
+      }
+      const nodeIndex = candidate.nodes.length;
+      const node: any = {
+        index: nodeIndex,
+        kind: candidate.nodes[0].kind,
+        sourceTextId: nameToken.sourceTextId,
+        spanStart: candidate.tokens[nodeStart].start,
+        spanEnd: candidate.tokens[nodeEnd - 1].end,
+        tokenStart: nodeStart,
+        tokenEnd: nodeEnd,
+        parent: -1,
+        firstChild: -1,
+        childCount: 0,
+        nextSibling: -1,
+        identitySha256: "",
+      };
+      node.identitySha256 = parserValueNodeIdentity(
+        node,
+        valueExprKindNames.indexOf(node.kind),
+      );
+      candidate.nodes.push(node);
+      const index = candidate.statementRoots.length;
+      candidate.statementRoots.push({
+        index,
+        nodeIndex,
+        role,
+        anchorTokenIndex: anchor.index,
+        bindingDeclarationStart: -1,
+        bindingDeclarationCount: 0,
+        anchorLine: anchor.line,
+        anchorColumn: anchor.column,
+        endLine: candidate.tokens[nodeEnd - 1].line,
+        endColumn:
+          candidate.tokens[nodeEnd - 1].column +
+          candidate.tokens[nodeEnd - 1].end -
+          candidate.tokens[nodeEnd - 1].start - 1,
+      });
+      return index;
+    };
+    const blockScopeAuthority = (
+      rowSpanStart: number,
+      rowSpanEnd: number,
+    ): number => {
+      const index = candidate.declarationLexicalScopes.length;
+      const scope: any = {
+        index,
+        producerSourceIndex: 0,
+        sourceLocalRow: index,
+        kind: 4,
+        kindText: "ParserDeclarationLexicalScopeBlock",
+        parentScopeIndex: 0,
+        ownerDeclarationIndex: -1,
+        spanStart: rowSpanStart,
+        spanEnd: rowSpanEnd,
+        identitySha256: "",
+      };
+      scope.identitySha256 =
+        driverDeclarationLexicalScopeIdentity(scope);
+      candidate.declarationLexicalScopes.push(scope);
+      return index;
+    };
+    const patternAuthority = (
+      rowAnchor: any,
+      rowSpanStart: number,
+      rowSpanEnd: number,
+    ): number => {
+      const regionIndex = candidate.regions.length;
+      candidate.regions.push({
+        index: regionIndex,
+        kind: "ParserValueExprRegionCaseArm",
+        sourceTextId: nameToken.sourceTextId,
+        spanStart: rowSpanStart,
+        spanEnd: rowSpanEnd,
+        anchorTokenIndex: rowAnchor.index,
+      });
+      const index = candidate.patterns.length;
+      const pattern: any = {
+        index,
+        producerSourceIndex: 0,
+        sourceLocalRow: index,
+        kind: 3,
+        kindText: "ParserPatternLiteral",
+        nameTokenIndex: rowAnchor.index,
+        ownerLexicalScopeIndex: 0,
+        ownerKind: 1,
+        ownerRow: regionIndex,
+        bindingDeclarationIndex: -1,
+        typeSyntaxRootIndex: -1,
+        spanStart: rowAnchor.start,
+        spanEnd: rowAnchor.end,
+        childStart: 0,
+        childCount: 0,
+        identitySha256: "",
+      };
+      pattern.identitySha256 = parserPatternIdentity(pattern);
+      candidate.patterns.push(pattern);
+      return index;
+    };
+    const rows: any[] = [];
+    for (let index = 0; index < specs.length; index += 1) {
+      const entry = specs[index]!;
+      const spec = entry.spec;
+      const rowAnchor = anchorTokens[index]!;
+      const rowSpanStart = rowSpanStarts[index]!;
+      const rowSpanEnd = rowSpanEnds[index]!;
+      let authorityKind = 0;
+      let authorityKindText =
+        "ParserForwardingProductionChildInvalid";
+      let authorityRow = -1;
+      if (spec.kind === 6) {
+        authorityKind = 7;
+        authorityKindText =
+          "ParserForwardingProductionChildPattern";
+        authorityRow = patternAuthority(
+          rowAnchor,
+          rowSpanStart,
+          rowSpanEnd,
+        );
+      } else if (spec.kind === 5) {
+        if ([0, 1, 15, 16, 17, 18, 19, 20]
+          .includes(spec.armIndex)) {
+          authorityKind = 6;
+          authorityKindText =
+            "ParserForwardingProductionChildDeclaration";
+          authorityRow = declarationAuthority(
+            spec.armIndex,
+            rowSpanStart,
+            rowSpanEnd,
+          );
+        } else if ([2, 8, 9, 10, 11, 12, 13, 21]
+          .includes(spec.armIndex)) {
+          authorityKind = 3;
+          authorityKindText =
+            "ParserForwardingProductionChildStatementRoot";
+          authorityRow = statementRootAuthority(
+            spec.armIndex,
+            rowAnchor,
+          );
+        } else if ([7, 14].includes(spec.armIndex)) {
+          authorityKind = 9;
+          authorityKindText =
+            "ParserForwardingProductionChildLexicalScope";
+          authorityRow = blockScopeAuthority(
+            rowSpanStart,
+            rowSpanEnd,
+          );
+        } else {
+          authorityKind = 5;
+          authorityKindText =
+            "ParserForwardingProductionChildToken";
+          authorityRow = rowAnchor.index;
+        }
+      }
+      rows.push({
+        index,
+        producerSourceIndex: nameToken.producerSourceIndex,
+        sourceLocalRow: index,
+        kind: spec.kind,
+        kindText: [...forwardingKind.values()]
+          .find(([kind]) => kind === spec.kind)![1],
+        armIndex: spec.armIndex,
+        ownerIndex: entry.ownerIndex,
+        anchorTokenIndex: rowAnchor.index,
+        spanStartTokenIndex: rowAnchor.index,
+        spanEndTokenIndex: spanEndToken.index,
+        spanStart: rowSpanStart,
+        spanEnd: rowSpanEnd,
+        authorityKind,
+        authorityKindText,
+        authorityRow,
+        annotationStart: -1,
+        annotationCount: 0,
+        childStart: -1,
+        childCount: 0,
+        identitySha256: "",
+      });
+    }
+    const children: any[] = [];
+    for (const row of rows) {
+      row.childStart = children.length;
+      if (row.authorityKind !== 0) {
+        let authorityProducerSourceIndex = 0;
+        let authoritySourceTextId = nameToken.sourceTextId;
+        let authoritySpanStart = row.spanStart;
+        let authoritySpanEnd = row.spanEnd;
+        if (row.authorityKind === 3) {
+          const statementRoot =
+            candidate.statementRoots[row.authorityRow];
+          const node = candidate.nodes[statementRoot.nodeIndex];
+          const token = candidate.tokens[node.tokenStart];
+          authorityProducerSourceIndex = token.producerSourceIndex;
+          authoritySourceTextId = node.sourceTextId;
+          authoritySpanStart = node.spanStart;
+          authoritySpanEnd = node.spanEnd;
+        } else if (row.authorityKind === 5) {
+          const token = candidate.tokens[row.authorityRow];
+          authorityProducerSourceIndex = token.producerSourceIndex;
+          authoritySourceTextId = token.sourceTextId;
+          authoritySpanStart = token.start;
+          authoritySpanEnd = token.end;
+        } else if (row.authorityKind === 6) {
+          const declaration =
+            candidate.declarations[row.authorityRow];
+          authorityProducerSourceIndex =
+            declaration.producerSourceIndex;
+          authoritySourceTextId = declaration.sourceTextId;
+          authoritySpanStart = declaration.spanStart;
+          authoritySpanEnd = declaration.spanEnd;
+        } else if (row.authorityKind === 7) {
+          const pattern = candidate.patterns[row.authorityRow];
+          authorityProducerSourceIndex =
+            pattern.producerSourceIndex;
+          authoritySpanStart = pattern.spanStart;
+          authoritySpanEnd = pattern.spanEnd;
+        } else if (row.authorityKind === 9) {
+          const scope =
+            candidate.declarationLexicalScopes[row.authorityRow];
+          authorityProducerSourceIndex =
+            scope.producerSourceIndex;
+          authoritySpanStart = scope.spanStart;
+          authoritySpanEnd = scope.spanEnd;
+        }
+        children.push({
+          parentIndex: row.index,
+          ordinal: children.length - row.childStart,
+          role: 1,
+          roleText: "authority",
+          kind: row.authorityKind,
+          kindText: row.authorityKindText,
+          row: row.authorityRow,
+          producerSourceIndex: authorityProducerSourceIndex,
+          sourceTextId: authoritySourceTextId,
+          spanStart: authoritySpanStart,
+          spanEnd: authoritySpanEnd,
+          targetIdentitySha256: "",
+        });
+      }
+      for (const childIndex of specs[row.index]!.childIndexes) {
+        const directChild = rows[childIndex]!;
+        children.push({
+          parentIndex: row.index,
+          ordinal: children.length - row.childStart,
+          role: 3,
+          roleText: "forwarding",
+          kind: 1,
+          kindText:
+            "ParserForwardingProductionChildForwardingProduction",
+          row: directChild.index,
+          producerSourceIndex: directChild.producerSourceIndex,
+          sourceTextId: nameToken.sourceTextId,
+          spanStart: directChild.spanStart,
+          spanEnd: directChild.spanEnd,
+          targetIdentitySha256: "",
+        });
+      }
+      row.childCount = children.length - row.childStart;
+    }
+    candidate.forwardingProductions = rows;
+    candidate.forwardingProductionChildren = children;
+    candidate.counts.forwardingProductionCount = rows.length;
+    candidate.counts.forwardingProductionChildCount = children.length;
+    candidate.counts.nodeCount = candidate.nodes.length;
+    candidate.counts.statementRootCount =
+      candidate.statementRoots.length;
+    candidate.counts.regionCount = candidate.regions.length;
+    candidate.counts.declarationLexicalScopeCount =
+      candidate.declarationLexicalScopes.length;
+    candidate.counts.declarationCount =
+      candidate.declarations.length;
+    candidate.counts.typeSyntaxCount =
+      candidate.typeSyntaxes.length;
+    candidate.counts.patternCount = candidate.patterns.length;
+    for (let rowIndex = rows.length - 1; rowIndex >= 0; rowIndex -= 1) {
+      const row = rows[rowIndex]!;
+      for (const child of children.slice(
+        row.childStart,
+        row.childStart + row.childCount,
+      )) {
+        child.targetIdentitySha256 =
+          parserForwardingChildTargetIdentity(
+            child,
+            source,
+            candidate,
+            rows,
+            candidate.declarations,
+            candidate.patterns,
+            candidate.annotations,
+            candidate.declarationLexicalScopes,
+            candidate.typeSyntaxes,
+          );
+      }
+      row.identitySha256 = parserForwardingProductionIdentity(
+        row,
+        source,
+        candidate.tokens,
+        children,
+      );
+    }
+    candidate.parserTraceRootSha256 =
+      parserCurrentForwardingTraceRoot(candidate, source);
+    return candidate;
+  };
+  const rehashForwardingProjection = (candidate: any): void => {
+    for (let rowIndex = candidate.forwardingProductions.length - 1;
+         rowIndex >= 0; rowIndex -= 1) {
+      const row = candidate.forwardingProductions[rowIndex];
+      const children = candidate.forwardingProductionChildren.slice(
+        row.childStart,
+        row.childStart + row.childCount,
+      );
+      for (const child of children) {
+        child.targetIdentitySha256 =
+          parserForwardingChildTargetIdentity(
+            child,
+            source,
+            candidate,
+            candidate.forwardingProductions,
+            candidate.declarations,
+            candidate.patterns,
+            candidate.annotations,
+            candidate.declarationLexicalScopes,
+            candidate.typeSyntaxes,
+          );
+      }
+      row.identitySha256 = parserForwardingProductionIdentity(
+        row,
+        source,
+        candidate.tokens,
+        candidate.forwardingProductionChildren,
+      );
+    }
+    candidate.parserTraceRootSha256 =
+      parserCurrentForwardingTraceRoot(candidate, source);
+  };
+  const rebuildForwardingChildren = (candidate: any): void => {
+    const children: any[] = [];
+    const childFact = (
+      kind: number,
+      row: number,
+    ): {
+      producerSourceIndex: number;
+      sourceTextId: number;
+      spanStart: number;
+      spanEnd: number;
+    } => {
+      if (kind === 1) {
+        const value = candidate.forwardingProductions[row];
+        const anchor = candidate.tokens[value.anchorTokenIndex];
+        return {
+          producerSourceIndex: value.producerSourceIndex,
+          sourceTextId: anchor.sourceTextId,
+          spanStart: value.spanStart,
+          spanEnd: value.spanEnd,
+        };
+      }
+      if (kind === 3) {
+        const value = candidate.statementRoots[row];
+        const node = candidate.nodes[value.nodeIndex];
+        const token = candidate.tokens[node.tokenStart];
+        return {
+          producerSourceIndex: token.producerSourceIndex,
+          sourceTextId: node.sourceTextId,
+          spanStart: node.spanStart,
+          spanEnd: node.spanEnd,
+        };
+      }
+      if (kind === 5) {
+        const value = candidate.tokens[row];
+        return {
+          producerSourceIndex: value.producerSourceIndex,
+          sourceTextId: value.sourceTextId,
+          spanStart: value.start,
+          spanEnd: value.end,
+        };
+      }
+      if (kind === 6) {
+        const value = candidate.declarations[row];
+        return {
+          producerSourceIndex: value.producerSourceIndex,
+          sourceTextId: value.sourceTextId,
+          spanStart: value.spanStart,
+          spanEnd: value.spanEnd,
+        };
+      }
+      if (kind === 7) {
+        const value = candidate.patterns[row];
+        const token = candidate.tokens[value.nameTokenIndex];
+        return {
+          producerSourceIndex: value.producerSourceIndex,
+          sourceTextId: token.sourceTextId,
+          spanStart: value.spanStart,
+          spanEnd: value.spanEnd,
+        };
+      }
+      if (kind === 8) {
+        const value = candidate.annotations[row];
+        return {
+          producerSourceIndex: value.producerSourceIndex,
+          sourceTextId: value.sourceTextId,
+          spanStart: value.spanStart,
+          spanEnd: value.spanEnd,
+        };
+      }
+      if (kind === 9) {
+        const value = candidate.declarationLexicalScopes[row];
+        const token = candidate.tokens.find((entry: any) =>
+          entry.producerSourceIndex === value.producerSourceIndex &&
+          entry.start >= value.spanStart &&
+          entry.end <= value.spanEnd);
+        return {
+          producerSourceIndex: value.producerSourceIndex,
+          sourceTextId: token.sourceTextId,
+          spanStart: value.spanStart,
+          spanEnd: value.spanEnd,
+        };
+      }
+      throw new Error(`unsupported forwarding child fact kind: ${kind}`);
+    };
+    for (const row of candidate.forwardingProductions) {
+      row.childStart = children.length;
+      const appendChild = (
+        role: number,
+        roleText: string,
+        kind: number,
+        kindText: string,
+        childRow: number,
+      ): void => {
+        const fact = childFact(kind, childRow);
+        children.push({
+          parentIndex: row.index,
+          ordinal: children.length - row.childStart,
+          role,
+          roleText,
+          kind,
+          kindText,
+          row: childRow,
+          ...fact,
+          targetIdentitySha256: "",
+        });
+      };
+      if (row.authorityKind !== 0) {
+        appendChild(
+          1,
+          "authority",
+          row.authorityKind,
+          row.authorityKindText,
+          row.authorityRow,
+        );
+      }
+      for (let offset = 0; offset < row.annotationCount; offset += 1) {
+        appendChild(
+          2,
+          "annotation",
+          8,
+          "ParserForwardingProductionChildAnnotation",
+          row.annotationStart + offset,
+        );
+      }
+      for (const child of candidate.forwardingProductions) {
+        if (child.ownerIndex !== row.index) continue;
+        appendChild(
+          3,
+          "forwarding",
+          1,
+          "ParserForwardingProductionChildForwardingProduction",
+          child.index,
+        );
+      }
+      row.childCount = children.length - row.childStart;
+    }
+    candidate.forwardingProductionChildren = children;
+    candidate.counts.forwardingProductionChildCount = children.length;
+    rehashForwardingProjection(candidate);
+  };
+  const forwardingObligation = (
+    production: string,
+    kind: string,
+    bound?: number,
+    variant?: string,
+  ) => {
+    const obligation = forwardingObligations.find((entry) =>
+      entry.production === production &&
+      entry.kind === kind &&
+      (bound === undefined || entry.bound === bound) &&
+      (variant === undefined || entry.variant === variant));
+    assert.ok(obligation !== undefined);
+    return obligation;
+  };
+  const forwardingObligationMutationRows: {
+    obligationId: string;
+    production: string;
+    kind: string;
+    bound: number | null;
+    variant: string | null;
+    positiveBytesSha256: string;
+    negativeBytesSha256: string;
+    mutationPath: string;
+    mutationValue: number;
+    rejectionPoint: string;
+  }[] = [];
+  for (let obligationIndex = 0;
+       obligationIndex < forwardingObligations.length;
+       obligationIndex += 1) {
+    const obligation = forwardingObligations[obligationIndex]!;
+    const positiveReceipt = forwardingReceiptFor(obligation);
+    const positiveBytes = JSON.stringify(positiveReceipt);
+    const positive = bindReceiptAgainstObligations(
+      positiveBytes,
+      source,
+      [obligation],
+      tokenKindNamesFromParserSource(parserBytes.toString("utf8")),
+      mapRows,
+      valueExprKindNames,
+    ).results[0];
+    assert.equal(
+      positive?.result.kind,
+      "hit",
+      `forwarding positive 必须命中 ${obligation.obligationId}`,
+    );
+    assert.match(
+      positive?.result.kind === "hit"
+        ? positive.result.channel
+        : "",
+      /^forwarding_production_span:/,
+      `forwarding witness 必须走唯一 span channel: ${obligation.obligationId}`,
+    );
+    const negativeReceipt = clone(positiveReceipt);
+    const mutationValue =
+      negativeReceipt.sourceTexts.length + obligationIndex + 1;
+    negativeReceipt.forwardingProductions[0]
+      .producerSourceIndex = mutationValue;
+    const negativeBytes = JSON.stringify(negativeReceipt);
+    let rejectionPoint = "";
+    try {
+      bindReceiptAgainstObligations(
+        negativeBytes,
+        source,
+        [obligation],
+        tokenKindNamesFromParserSource(parserBytes.toString("utf8")),
+        mapRows,
+        valueExprKindNames,
+      );
+    } catch (error) {
+      rejectionPoint =
+        error instanceof Error ? error.message : String(error);
+    }
+    assert.equal(
+      rejectionPoint,
+      "driver forwarding production receipt row invalid: 0",
+      `forwarding negative 必须停在固定 producer source 拒绝点: ${obligation.obligationId}`,
+    );
+    forwardingObligationMutationRows.push({
+      obligationId: obligation.obligationId,
+      production: obligation.production,
+      kind: obligation.kind,
+      bound: obligation.bound ?? null,
+      variant: obligation.variant ?? null,
+      positiveBytesSha256: sha256(positiveBytes),
+      negativeBytesSha256: sha256(negativeBytes),
+      mutationPath:
+        "forwardingProductions.0.producerSourceIndex",
+      mutationValue,
+      rejectionPoint,
+    });
+  }
+  assert.equal(forwardingObligationMutationRows.length, 57);
+  assert.equal(
+    new Set(forwardingObligationMutationRows.map(
+      (row) => row.obligationId)).size,
+    57,
+    "forwarding obligation mutation map 必须逐 obligation 唯一",
+  );
+  assert.equal(
+    new Set(forwardingObligationMutationRows.map(
+      (row) => row.negativeBytesSha256)).size,
+    57,
+    "57 个 forwarding negative bytes CID 必须全部唯一",
+  );
+  const forwardingObligationMutationMap = {
+    schema: "cheng_forwarding_obligation_mutation_map",
+    positiveCount: forwardingObligationMutationRows.length,
+    negativeCount: forwardingObligationMutationRows.length,
+    uniqueNegativeBytesCidCount:
+      new Set(forwardingObligationMutationRows.map(
+        (row) => row.negativeBytesSha256)).size,
+    rows: forwardingObligationMutationRows,
+  };
+  const forwardingObligationMutationMapSha256 =
+    sha256(canonicalJson(forwardingObligationMutationMap));
+  console.log(
+    "item25 forwarding production obligations: PASS " +
+    `positives=${forwardingObligationMutationRows.length} ` +
+    `negatives=${forwardingObligationMutationRows.length} ` +
+    "unique_negative_cids=" +
+    `${forwardingObligationMutationMap.uniqueNegativeBytesCidCount} ` +
+    `map_sha256=${forwardingObligationMutationMapSha256}`,
+  );
+  if (process.argv.includes("--forwarding-mutation-map")) {
+    console.log(
+      "forwarding_obligation_mutation_map=" +
+      canonicalJson(forwardingObligationMutationMap),
+    );
+    return;
+  }
+  const forwardingMutationLog: {
+    family: string;
+    label: string;
+  }[] = [];
+  const expectForwardingMutation = (
+    family: string,
+    label: string,
+    candidate: any,
+    expected: RegExp,
+  ): void => {
+    assert.throws(
+      () => bindReceiptAgainstObligations(
+        JSON.stringify(candidate),
+        source,
+        [forwardingObligations[0]!],
+        tokenKindNamesFromParserSource(parserBytes.toString("utf8")),
+        mapRows,
+        valueExprKindNames,
+      ),
+      expected,
+      label,
+    );
+    forwardingMutationLog.push({family, label});
+  };
+  const forwardingBase = () => forwardingReceiptFor(
+    forwardingObligation("statementCore", "choice", 3),
+  );
+  {
+    const copy = forwardingBase();
+    copy.forwardingProductions[0].producerSourceIndex = 1;
+    expectForwardingMutation(
+      "producer_source",
+      "forwarding producerSourceIndex 漂移必须拒绝",
+      copy,
+      /forwarding production receipt row invalid/,
+    );
+  }
+  {
+    const copy = forwardingBase();
+    copy.forwardingProductions[0].sourceLocalRow += 1;
+    expectForwardingMutation(
+      "source_local_row",
+      "forwarding sourceLocalRow 漂移必须拒绝",
+      copy,
+      /forwarding production receipt row invalid/,
+    );
+  }
+  for (const [field, delta] of [
+    ["spanStartTokenIndex", 1],
+    ["spanEndTokenIndex", -1],
+    ["spanStart", -1],
+    ["spanEnd", 1],
+  ] as const) {
+    const copy = forwardingBase();
+    copy.forwardingProductions[0][field] += delta;
+    expectForwardingMutation(
+      "span_endpoint",
+      `forwarding ${field} 漂移必须拒绝`,
+      copy,
+      /forwarding production receipt row invalid/,
+    );
+  }
+  const childKindCandidates = [
+    ["forwarding", forwardingBase(), 1],
+    ["value_node", forwardingBase(), 2],
+    ["statement_root", forwardingReceiptFor(
+      forwardingObligation("statementCore", "choice", 2),
+    ), 3],
+    ["region", forwardingBase(), 4],
+    ["token", forwardingBase(), 5],
+    ["declaration", forwardingReceiptFor(
+      forwardingObligation("statementCore", "choice", 0),
+    ), 6],
+    ["pattern", forwardingReceiptFor(
+      forwardingObligation("matchArm", "production"),
+    ), 7],
+    ["lexical_scope", forwardingReceiptFor(
+      forwardingObligation("statementCore", "choice", 14),
+    ), 9],
+    ["type_syntax", forwardingReceiptFor(
+      forwardingObligation("statementCore", "choice", 1),
+    ), 10],
+  ] as const;
+  for (const [label, candidate, kind] of childKindCandidates) {
+    let child = candidate.forwardingProductionChildren.find(
+      (entry: any) => entry.kind === kind);
+    if (child === undefined && [2, 4, 10].includes(kind)) {
+      child = candidate.forwardingProductionChildren.find(
+        (entry: any) => entry.role === 1);
+      assert.ok(child !== undefined);
+      child.kind = kind;
+      child.kindText = [
+        "",
+        "",
+        "ParserForwardingProductionChildValueNode",
+        "",
+        "ParserForwardingProductionChildRegion",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "ParserForwardingProductionChildTypeSyntax",
+      ][kind];
+      child.row = kind === 2
+        ? 0 : kind === 4 ? 0 : candidate.typeSyntaxes[0].index;
+    }
+    assert.ok(child !== undefined);
+    child.producerSourceIndex = 1;
+    expectForwardingMutation(
+      "child_cross_source",
+      `${label} child 跨 producer source 必须拒绝`,
+      candidate,
+      /forwarding production child source\/span invalid/,
+    );
+  }
+  {
+    const copy = forwardingBase();
+    const child = copy.forwardingProductionChildren.find(
+      (entry: any) => entry.kind === 1)!;
+    child.spanStart += 1;
+    expectForwardingMutation(
+      "child_span",
+      "forwarding child span 漂移必须拒绝",
+      copy,
+      /forwarding production child source\/span invalid/,
+    );
+  }
+  {
+    const copy = forwardingBase();
+    copy.forwardingProductionChildren[0].targetIdentitySha256 =
+      "0".repeat(64);
+    expectForwardingMutation(
+      "child_target_cid",
+      "forwarding child target CID 漂移必须拒绝",
+      copy,
+      /forwarding production child target CID invalid/,
+    );
+  }
+  {
+    const copy = forwardingBase();
+    const core = copy.forwardingProductions.find(
+      (entry: any) => entry.kind === 5 && entry.armIndex === 3)!;
+    core.authorityKind = 6;
+    core.authorityKindText =
+      "ParserForwardingProductionChildDeclaration";
+    core.authorityRow = copy.declarations[0]?.index ?? -1;
+    expectForwardingMutation(
+      "authority_kind_row",
+      "StatementCore token authority 改绑 declaration 必须拒绝",
+      copy,
+      /forwarding production receipt row invalid/,
+    );
+  }
+  {
+    const copy = forwardingBase();
+    copy.forwardingProductions[1].ownerIndex = -1;
+    expectForwardingMutation(
+      "owner_back_edge",
+      "forwarding owner back-edge 缺失必须拒绝",
+      copy,
+      /forwarding production receipt row invalid|forwarding production child source\/span invalid/,
+    );
+  }
+  for (const mutation of ["missing", "duplicate", "extra"] as const) {
+    const copy = forwardingBase();
+    const row = copy.forwardingProductions[0];
+    if (mutation === "missing") {
+      copy.forwardingProductionChildren.splice(row.childStart, 1);
+      row.childCount -= 1;
+      copy.counts.forwardingProductionChildCount -= 1;
+    } else {
+      const child = clone(
+        copy.forwardingProductionChildren[row.childStart]);
+      copy.forwardingProductionChildren.splice(
+        row.childStart + row.childCount,
+        0,
+        child,
+      );
+      row.childCount += 1;
+      copy.counts.forwardingProductionChildCount += 1;
+    }
+    expectForwardingMutation(
+      "child_cardinality",
+      `forwarding child ${mutation} 必须拒绝`,
+      copy,
+      /forwarding production receipt row invalid|forwarding production child/,
+    );
+  }
+  {
+    const copy = forwardingBase();
+    copy.parserTraceRootSha256 = "0".repeat(64);
+    expectForwardingMutation(
+      "trace_root",
+      "forwarding parser trace root 漂移必须拒绝",
+      copy,
+      /parser trace root forwarding structure invalid/,
+    );
+  }
+  {
+    const copy = forwardingReceiptFor(
+      forwardingObligation("statementCore", "choice", 0),
+    );
+    const core = copy.forwardingProductions.find(
+      (entry: any) => entry.kind === 5 && entry.armIndex === 0)!;
+    const declaration = copy.declarations[core.authorityRow];
+    declaration.kind = 3;
+    declaration.kindText = "ParserDeclarationFunction";
+    declaration.functionRow = 9000;
+    declaration.identitySha256 = driverDeclarationIdentity(
+      declaration,
+      source,
+      copy.tokens,
+      copy.declarations
+        .slice(0, declaration.index)
+        .map((entry: any) => entry.identitySha256),
+      copy.declarationLexicalScopes,
+      copy.typeSyntaxes,
+      copy.typeGenericSymbols,
+    );
+    rehashForwardingProjection(copy);
+    expectForwardingMutation(
+      "target_and_edge_rehash",
+      "authority target 改 kind 并重算 target/row/trace CID 仍必须拒绝",
+      copy,
+      /forwarding production receipt row invalid/,
+    );
+  }
+  {
+    const copy = forwardingReceiptFor(
+      forwardingObligation("statementCore", "choice", 0),
+    );
+    const core = copy.forwardingProductions.find(
+      (entry: any) => entry.kind === 5 && entry.armIndex === 0)!;
+    const authority = copy.declarations[core.authorityRow];
+    const sibling = clone(authority);
+    sibling.index = copy.declarations.length;
+    sibling.sourceLocalRow = sibling.index;
+    sibling.identitySha256 = driverDeclarationIdentity(
+      sibling,
+      source,
+      copy.tokens,
+      copy.declarations.map(
+        (entry: any) => entry.identitySha256,
+      ),
+      copy.declarationLexicalScopes,
+      copy.typeSyntaxes,
+      copy.typeGenericSymbols,
+    );
+    copy.declarations.push(sibling);
+    copy.counts.declarationCount = copy.declarations.length;
+    expectForwardingMutation(
+      "same_span_extra_target",
+      "同 source/kind/span 的额外 authority sibling 必须拒绝",
+      copy,
+      /forwarding production receipt row invalid/,
+    );
+    core.authorityRow = sibling.index;
+    rebuildForwardingChildren(copy);
+    expectForwardingMutation(
+      "same_span_wrong_sibling",
+      "改绑同 source/kind/span sibling 并重算全部 edge/CID 仍必须拒绝",
+      copy,
+      /forwarding production receipt row invalid/,
+    );
+  }
+  {
+    const base = forwardingBase();
+    const traceRoot =
+      parserCurrentForwardingTraceRoot(base, source);
+    const traceMutations: readonly [
+      string,
+      (candidate: any) => void,
+    ][] = [
+      ["token.kind", (candidate) => {
+        candidate.tokens[0].kind += 1;
+      }],
+      ["token.sourceTextId", (candidate) => {
+        candidate.tokens[0].sourceTextId += 1;
+      }],
+      ["token.start", (candidate) => {
+        candidate.tokens[0].start += 1;
+      }],
+      ["token.end", (candidate) => {
+        candidate.tokens[0].end += 1;
+      }],
+      ["token.producerSourceIndex", (candidate) => {
+        candidate.tokens[0].producerSourceIndex += 1;
+      }],
+      ["token.sourceLocalIndex", (candidate) => {
+        candidate.tokens[0].sourceLocalIndex += 1;
+      }],
+      ["token.lexicalParentIndex", (candidate) => {
+        candidate.tokens[0].lexicalParentIndex += 1;
+      }],
+      ["row.identitySha256", (candidate) => {
+        candidate.forwardingProductions[0].identitySha256 =
+          "0".repeat(64);
+      }],
+      ["child.kind", (candidate) => {
+        candidate.forwardingProductionChildren[0].kind += 1;
+      }],
+      ["child.row", (candidate) => {
+        candidate.forwardingProductionChildren[0].row += 1;
+      }],
+    ];
+    for (const [label, mutate] of traceMutations) {
+      const copy = clone(base);
+      mutate(copy);
+      assert.notEqual(
+        parserCurrentForwardingTraceRoot(copy, source),
+        traceRoot,
+        `trace root 必须独立绑定 ${label}`,
+      );
+      forwardingMutationLog.push({
+        family: "trace_root_field",
+        label,
+      });
+    }
+    const row = base.forwardingProductions[0];
+    const rowIdentity = parserForwardingProductionIdentity(
+      row,
+      source,
+      base.tokens,
+      base.forwardingProductionChildren,
+    );
+    for (const [label, mutate] of [
+      ["spanStartTokenIndex", (candidate: any) => {
+        candidate.forwardingProductions[0]
+          .spanStartTokenIndex += 1;
+      }],
+      ["spanEndTokenIndex", (candidate: any) => {
+        candidate.forwardingProductions[0]
+          .spanEndTokenIndex -= 1;
+      }],
+      ["child.targetIdentitySha256", (candidate: any) => {
+        candidate.forwardingProductionChildren[0]
+          .targetIdentitySha256 = "0".repeat(64);
+      }],
+    ] as const) {
+      const copy = clone(base);
+      mutate(copy);
+      assert.notEqual(
+        parserForwardingProductionIdentity(
+          copy.forwardingProductions[0],
+          source,
+          copy.tokens,
+          copy.forwardingProductionChildren,
+        ),
+        rowIdentity,
+        `forwarding row CID 必须绑定 ${label}`,
+      );
+      forwardingMutationLog.push({
+        family: "row_cid_field",
+        label,
+      });
+    }
+  }
+  {
+    const copy = forwardingReceiptFor(
+      forwardingObligation("topLevelDecl", "production"),
+    );
+    const root = copy.forwardingProductions[0];
+    const annotationTargetTokenIndex =
+      copy.annotations[0].targetTokenIndex;
+    const annotations = copy.annotations.filter(
+      (entry: any) =>
+        entry.targetTokenIndex === annotationTargetTokenIndex);
+    assert.ok(annotations.length >= 2);
+    root.anchorTokenIndex = annotationTargetTokenIndex;
+    root.annotationStart = annotations[0].index;
+    root.annotationCount = annotations.length;
+    root.spanStartTokenIndex =
+      copy.annotations[root.annotationStart].nameTokenIndex - 1;
+    root.spanStart =
+      copy.tokens[root.spanStartTokenIndex].start;
+    rebuildForwardingChildren(copy);
+    const annotationChildren =
+      copy.forwardingProductionChildren.filter(
+        (entry: any) =>
+          entry.parentIndex === root.index && entry.role === 2);
+    assert.equal(annotationChildren.length, annotations.length);
+    const first = annotationChildren[0];
+    const second = annotationChildren[1];
+    [first.row, second.row] = [second.row, first.row];
+    [first.spanStart, second.spanStart] =
+      [second.spanStart, first.spanStart];
+    [first.spanEnd, second.spanEnd] =
+      [second.spanEnd, first.spanEnd];
+    expectForwardingMutation(
+      "annotation_order",
+      "forwarding annotation child 交换顺序必须拒绝",
+      copy,
+      /forwarding production annotation contract invalid|forwarding production child source\/span invalid/,
+    );
+    const crossSource = forwardingReceiptFor(
+      forwardingObligation("topLevelDecl", "production"),
+    );
+    const crossRoot = crossSource.forwardingProductions[0];
+    crossRoot.anchorTokenIndex = annotationTargetTokenIndex;
+    crossRoot.annotationStart = annotations[0].index;
+    crossRoot.annotationCount = annotations.length;
+    crossRoot.spanStartTokenIndex =
+      crossSource.annotations[crossRoot.annotationStart]
+        .nameTokenIndex - 1;
+    crossRoot.spanStart =
+      crossSource.tokens[crossRoot.spanStartTokenIndex].start;
+    rebuildForwardingChildren(crossSource);
+    const crossAnnotation =
+      crossSource.forwardingProductionChildren.find(
+        (entry: any) => entry.role === 2)!;
+    crossAnnotation.producerSourceIndex = 1;
+    expectForwardingMutation(
+      "child_cross_source",
+      "annotation child 跨 producer source 必须拒绝",
+      crossSource,
+      /forwarding production child source\/span invalid/,
+    );
+  }
+  const forwardingMutationFamilies =
+    new Set(forwardingMutationLog.map((entry) => entry.family));
+  assert.deepEqual(
+    [...forwardingMutationFamilies].sort(),
+    [
+      "annotation_order",
+      "authority_kind_row",
+      "child_cardinality",
+      "child_cross_source",
+      "child_span",
+      "child_target_cid",
+      "owner_back_edge",
+      "producer_source",
+      "row_cid_field",
+      "same_span_extra_target",
+      "same_span_wrong_sibling",
+      "source_local_row",
+      "span_endpoint",
+      "target_and_edge_rehash",
+      "trace_root",
+      "trace_root_field",
+    ],
+  );
+  console.log(
+    `item25 forwarding physical mutations: PASS families=${forwardingMutationFamilies.size} mutations=${forwardingMutationLog.length}`,
+  );
   const moduleObligations = grammar.obligations.filter(
     (entry) =>
       entry.disposition === "required" &&
@@ -1993,6 +3682,8 @@ async function main(): Promise<void> {
       mapRows,
       valueExprKindNames,
     );
+  mutationReceipt.parserTraceRootSha256 =
+    parserCurrentForwardingTraceRoot(mutationReceipt, source);
   const moduleBound = bindModule(mutationReceipt, source);
   const moduleResult = (
     path: string,
@@ -2075,6 +3766,11 @@ async function main(): Promise<void> {
       unrelatedImportEdge,
       unrelatedGapSource,
       unrelatedGapReceipt.tokens,
+    );
+  unrelatedGapReceipt.parserTraceRootSha256 =
+    parserCurrentForwardingTraceRoot(
+      unrelatedGapReceipt,
+      unrelatedGapSource,
     );
   const unrelatedGapBound =
     bindModule(unrelatedGapReceipt, unrelatedGapSource);
@@ -2869,6 +4565,11 @@ async function main(): Promise<void> {
   );
   childIdentityReceipt.declarations = [typeDeclaration];
   childIdentityReceipt.counts.declarationCount = 1;
+  childIdentityReceipt.parserTraceRootSha256 =
+    parserCurrentForwardingTraceRoot(
+      childIdentityReceipt,
+      childIdentitySource,
+    );
   bind(childIdentityReceipt, childIdentitySource);
   const typeExprBound = bindReceiptAgainstObligations(
     JSON.stringify(childIdentityReceipt),
@@ -3174,6 +4875,8 @@ async function main(): Promise<void> {
     anchorTokenIndex: objectTokens[5]!.index,
   });
   objectReceipt.counts.regionCount = objectReceipt.regions.length;
+  objectReceipt.parserTraceRootSha256 =
+    parserCurrentForwardingTraceRoot(objectReceipt, objectSource);
   const objectObligations = grammar.obligations.filter(
     (entry) =>
       entry.disposition === "required" &&
@@ -3297,6 +5000,11 @@ async function main(): Promise<void> {
     );
     wrongFieldDeclarationIdentities.push(declaration.identitySha256);
   }
+  wrongFieldDeclarationOwner.parserTraceRootSha256 =
+    parserCurrentForwardingTraceRoot(
+      wrongFieldDeclarationOwner,
+      objectSource,
+    );
   assert.throws(
     () => bindReceiptAgainstObligations(
       JSON.stringify(wrongFieldDeclarationOwner),
@@ -3490,6 +5198,8 @@ async function main(): Promise<void> {
   );
   enumReceipt.declarations.push(enumDeclaration);
   enumReceipt.counts.declarationCount = enumReceipt.declarations.length;
+  enumReceipt.parserTraceRootSha256 =
+    parserCurrentForwardingTraceRoot(enumReceipt, enumSource);
   const enumObligations = grammar.obligations.filter(
     (entry) =>
       entry.disposition === "required" &&
@@ -3635,6 +5345,8 @@ async function main(): Promise<void> {
   literalReceipt.patternChildren = [];
   literalReceipt.counts.patternCount = literalReceipt.patterns.length;
   literalReceipt.counts.patternChildCount = 0;
+  literalReceipt.parserTraceRootSha256 =
+    parserCurrentForwardingTraceRoot(literalReceipt, literalSource);
   const literalObligations = grammar.obligations.filter(
     (entry) =>
       entry.disposition === "required" &&
@@ -3879,6 +5591,8 @@ async function main(): Promise<void> {
   );
   conceptReceipt.counts.regionCount =
     conceptReceipt.regions.length;
+  conceptReceipt.parserTraceRootSha256 =
+    parserCurrentForwardingTraceRoot(conceptReceipt, conceptSource);
   const conceptTraitProductions = [
     "conceptDecl",
     "traitDecl",
@@ -4153,6 +5867,8 @@ async function main(): Promise<void> {
   }];
   const driverSha256 = receipt.driverBytesSha256 as string;
   const traceSha256 = receipt.parserTraceRootSha256 as string;
+  const parserBindingSha256 = "4".repeat(64);
+  const parserNodeMapSha256 = sha256(checkedInMapBytes);
   const toolClosure = await buildParserReceiptHarnessToolClosure(
     harnessToolPath,
     fusionRoot,
@@ -4232,6 +5948,10 @@ async function main(): Promise<void> {
       sha256: "2".repeat(64),
     },
     harness: {path: "/test/harness.ts", sha256: "3".repeat(64)},
+    parserNodeMap: {
+      path: mapPath,
+      sha256: parserNodeMapSha256,
+    },
     dependencyClosure: {
       fileCount: closureRows.length,
       sha256: sha256(canonicalJson(closureRows)),
@@ -4276,6 +5996,9 @@ async function main(): Promise<void> {
         driverRole: "receipt_driver_a",
         driverSha256,
         parserTraceRootSha256: traceSha256,
+        parserBindingSha256,
+        parserBindingRequiredResultCount: grammar.requiredCount,
+        parserBindingHitCount: 1,
       },
       {
         path: `${receiptPath}.independent-copy`,
@@ -4286,6 +6009,9 @@ async function main(): Promise<void> {
         driverRole: "receipt_driver_b",
         driverSha256,
         parserTraceRootSha256: traceSha256,
+        parserBindingSha256,
+        parserBindingRequiredResultCount: grammar.requiredCount,
+        parserBindingHitCount: 1,
       },
     ],
   };
@@ -4296,6 +6022,8 @@ async function main(): Promise<void> {
     formalEbnfSha256: grammar.ebnfSha256,
     parserPath: manifest.parser.path,
     parserSha256: sha256(parserBytes),
+    parserNodeMapPath: mapPath,
+    parserNodeMapSha256,
     receiptProducerPath: manifest.receiptProducer.path,
     receiptProducerSha256: sha256(readFileSync(receiptProducerPath)),
     driverEntryPath: manifest.driverEntry.path,
@@ -4344,6 +6072,13 @@ async function main(): Promise<void> {
       "parser source",
       (copy: any) => { copy.parser.sha256 = "0".repeat(64); },
       /parser_identity_invalid/,
+    ],
+    [
+      "parser node map",
+      (copy: any) => {
+        copy.parserNodeMap.sha256 = "0".repeat(64);
+      },
+      /harness_parser_node_map_identity_invalid/,
     ],
     [
       "receipt producer",
@@ -4413,6 +6148,13 @@ async function main(): Promise<void> {
       /harness_receipt_fixed_point_invalid/,
     ],
     [
+      "parser binding fixed point",
+      (copy: any) => {
+        copy.receipts[1].parserBindingSha256 = "0".repeat(64);
+      },
+      /harness_receipt_fixed_point_invalid/,
+    ],
+    [
       "receipt path",
       (copy: any) => { copy.receipts[0].path += ".swapped"; },
       /harness_receipt_not_bound/,
@@ -4428,6 +6170,264 @@ async function main(): Promise<void> {
       expected,
       `${label} mutation 必须 hard-fail`,
     );
+  }
+  const releaseHarnessRoot = mkdtempSync(
+    resolve(
+      realpathSync(tmpdir()),
+      "cheng-parser-release-binding-",
+    ),
+  );
+  try {
+    const releaseSourcePath = resolve(
+      releaseHarnessRoot,
+      "source.cheng",
+    );
+    writeFileSync(releaseSourcePath, source);
+    const releaseDriverBytes =
+      Buffer.from("current-parser-release-driver\n");
+    const releaseDriverSha256 = sha256(releaseDriverBytes);
+    const releaseDrivers: any[] = [];
+    const releaseReceipts: any[] = [];
+    for (const [driverRole, directoryName] of [
+      ["receipt_driver_a", "receipt_driver_a"],
+      ["receipt_driver_b", "receipt_driver_b"],
+    ] as const) {
+      const driverDirectory = resolve(
+        releaseHarnessRoot,
+        directoryName,
+      );
+      mkdirSync(driverDirectory);
+      const driverPath = resolve(driverDirectory, "cheng");
+      writeFileSync(driverPath, releaseDriverBytes);
+      const driverStat = lstatSync(driverPath, {bigint: true});
+      releaseDrivers.push({
+        role: driverRole,
+        path: driverPath,
+        sha256: releaseDriverSha256,
+        inode: driverStat.ino.toString(),
+        byteLength: releaseDriverBytes.length,
+      });
+      const releaseReceipt = clone(mutationReceipt);
+      releaseReceipt.counts.annotationCount = 0;
+      releaseReceipt.counts.annotationArgCount = 0;
+      releaseReceipt.counts.annotationArgRootCount = 0;
+      releaseReceipt.counts.annotationArgChildCount = 0;
+      releaseReceipt.annotations = [];
+      releaseReceipt.annotationArgs = [];
+      releaseReceipt.annotationArgRoots = [];
+      releaseReceipt.annotationArgChildren = [];
+      releaseReceipt.relativePath = releaseSourcePath;
+      releaseReceipt.sourcePath = releaseSourcePath;
+      releaseReceipt.sourceSha256 = sha256(source);
+      releaseReceipt.driverBytesSha256 = releaseDriverSha256;
+      releaseReceipt.sourceTexts[0].sha256 = sha256(source);
+      releaseReceipt.sourceTexts[0].byteLength =
+        Buffer.byteLength(source);
+      for (const edge of releaseReceipt.importEdges) {
+        edge.sourceDeclarationIdentitySha256 =
+          driverModuleDeclarationIdentity(
+            edge.ownerProducerSourceIndex,
+            releaseSourcePath,
+            edge.ownerModulePath,
+          );
+        edge.identitySha256 = driverImportEdgeIdentity(
+          edge,
+          source,
+          releaseReceipt.tokens,
+        );
+      }
+      releaseReceipt.toolchainManifest = {
+        schema: "cheng_driver_toolchain_manifest",
+        producerIdentity: releaseReceipt.producerIdentity,
+        driverPath,
+        driverBytesSha256: releaseDriverSha256,
+        packageRoot: chengRoot,
+        rootDir: chengRoot,
+      };
+      releaseReceipt.toolchainManifestSha256 =
+        driverToolchainManifestSha256(
+          releaseReceipt.toolchainManifest,
+        );
+      releaseReceipt.parserTraceRootSha256 =
+        parserCurrentForwardingTraceRoot(
+          releaseReceipt,
+          source,
+        );
+      const releaseReceiptBytes =
+        Buffer.from(JSON.stringify(releaseReceipt));
+      const releaseReceiptPath = resolve(
+        releaseHarnessRoot,
+        `${driverRole}.json`,
+      );
+      writeFileSync(releaseReceiptPath, releaseReceiptBytes);
+      const releaseReceiptStat = lstatSync(
+        releaseReceiptPath,
+        {bigint: true},
+      );
+      const releaseBinding =
+        currentParserReceiptBindingAuthority(
+          releaseReceiptBytes.toString("utf8"),
+          source,
+          specBytes.toString("utf8"),
+          grammar.obligations,
+          tokenKindNamesFromParserSource(
+            parserBytes.toString("utf8")),
+          mapRows,
+          parserNodeMapSha256,
+          valueExprKindNames,
+        );
+      releaseReceipts.push({
+        path: releaseReceiptPath,
+        sha256: sha256(releaseReceiptBytes),
+        inode: releaseReceiptStat.ino.toString(),
+        byteLength: releaseReceiptBytes.length,
+        sourcePath: releaseSourcePath,
+        driverRole,
+        driverSha256: releaseDriverSha256,
+        parserTraceRootSha256:
+          releaseBinding.parserTraceRootSha256,
+        parserBindingSha256: releaseBinding.bindingSha256,
+        parserBindingRequiredResultCount:
+          releaseBinding.requiredResultCount,
+        parserBindingHitCount: releaseBinding.hitCount,
+      });
+    }
+    const parserRelativePath = "src/core/lang/parser.cheng";
+    const releaseClosureRows = [{
+      path: parserRelativePath,
+      byteLength: parserBytes.length,
+      sha256: sha256(parserBytes),
+    }];
+    const releaseOfficialCurrentBuild = {
+      bindingPath: resolve(
+        releaseHarnessRoot,
+        "current-official-binding.kv",
+      ),
+      bindingSha256: "a".repeat(64),
+      officialBuildReceiptPath: resolve(
+        releaseHarnessRoot,
+        "cheng.current-build-receipt.kv",
+      ),
+      officialBuildReceiptSha256: "b".repeat(64),
+      sourceSnapshotManifestPath: resolve(
+        releaseHarnessRoot,
+        "cheng-source-snapshot.manifest.txt",
+      ),
+      sourceSnapshotManifestSha256: "c".repeat(64),
+      sourceSnapshotRoot: chengRoot,
+      sourceSnapshotClosureSha256: "d".repeat(64),
+      officialDriverPath: releaseDrivers[0].path,
+      officialDriverSha256: releaseDriverSha256,
+    };
+    const releaseHarnessManifest = {
+      schema: CHENG_PARSER_PRODUCTION_RECEIPT_HARNESS_SCHEMA,
+      status: "accepted",
+      officialCurrentBuild: releaseOfficialCurrentBuild,
+      formalEbnfSha256: grammar.ebnfSha256,
+      formalSpec: {
+        path: specPath,
+        sha256: sha256(specBytes),
+      },
+      parser: {
+        path: parserPath,
+        sha256: sha256(parserBytes),
+      },
+      receiptProducer: {
+        path: receiptProducerPath,
+        sha256: sha256(readFileSync(receiptProducerPath)),
+      },
+      driverEntry: {
+        path: resolve(
+          chengRoot,
+          CHENG_PARSER_RECEIPT_DRIVER_ENTRY_RELATIVE,
+        ),
+        sha256: sha256(readFileSync(resolve(
+          chengRoot,
+          CHENG_PARSER_RECEIPT_DRIVER_ENTRY_RELATIVE,
+        ))),
+      },
+      bootstrap: {
+        path: resolve(chengRoot, "bootstrap/cheng_cold.c"),
+        sha256: sha256(readFileSync(resolve(
+          chengRoot,
+          "bootstrap/cheng_cold.c",
+        ))),
+      },
+      harness: {
+        path: harnessToolPath,
+        sha256: sha256(readFileSync(harnessToolPath)),
+      },
+      parserNodeMap: {
+        path: mapPath,
+        sha256: parserNodeMapSha256,
+      },
+      dependencyClosure: {
+        fileCount: releaseClosureRows.length,
+        sha256: sha256(canonicalJson(releaseClosureRows)),
+        rows: releaseClosureRows,
+      },
+      toolClosure,
+      buildCompiler,
+      compilerProfile,
+      runtime: {
+        executablePath: process.execPath,
+        executableSha256: runtimeExecutableSha256,
+        version: Bun.version,
+      },
+      drivers: releaseDrivers,
+      sources: [{
+        path: releaseSourcePath,
+        sha256: sha256(source),
+        byteLength: Buffer.byteLength(source),
+      }],
+      receipts: releaseReceipts,
+    };
+    const releaseClosure =
+      pinCurrentParserHarnessClosure(releaseHarnessManifest);
+    assert.ok(
+      releaseClosure.files.some(
+        (file) => file.path === mapPath),
+      "current release 必须物理 pin parser node map",
+    );
+    const changedReleaseBinding =
+      clone(releaseHarnessManifest);
+    changedReleaseBinding.receipts[1].parserBindingSha256 =
+      changedReleaseBinding.receipts[1]
+        .parserBindingSha256[0] === "1"
+        ? "2" +
+          changedReleaseBinding.receipts[1]
+            .parserBindingSha256.slice(1)
+        : "1" +
+          changedReleaseBinding.receipts[1]
+            .parserBindingSha256.slice(1);
+    assert.throws(
+      () => pinCurrentParserHarnessClosure(
+        changedReleaseBinding,
+      ),
+      /current_release_harness_binding_invalid/,
+      "current release 必须独立重算而非信任 binder 自报",
+    );
+    const changedReleaseNodeMap =
+      clone(releaseHarnessManifest);
+    changedReleaseNodeMap.parserNodeMap.sha256 =
+      changedReleaseNodeMap.parserNodeMap.sha256[0] === "1"
+        ? "2" +
+          changedReleaseNodeMap.parserNodeMap.sha256.slice(1)
+        : "1" +
+          changedReleaseNodeMap.parserNodeMap.sha256.slice(1);
+    assert.throws(
+      () => pinCurrentParserHarnessClosure(
+        changedReleaseNodeMap,
+      ),
+      /current_release_harness_parser_node_map_pin_drift/,
+      "current release 必须拒绝 node map 字节身份漂移",
+    );
+    console.log(
+      "item25 current release parser binding: PASS " +
+      `receipts=${releaseReceipts.length}`,
+    );
+  } finally {
+    rmSync(releaseHarnessRoot, {recursive: true});
   }
   if (process.argv.includes("--projection-admission-only")) {
     console.log(

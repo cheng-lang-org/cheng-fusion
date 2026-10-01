@@ -1,0 +1,555 @@
+# Exit-side DNS resolution: pure Cheng DNS A-query client with TTL cache.
+# The exit receives domain targets from clients (fake-ip TUN mode and local
+# CONNECT both forward the original hostname); connecting requires resolving
+# at the exit. Resolver address comes from server config `dns_server`, else
+# the first IPv4 `nameserver` in /etc/resolv.conf; neither present hard-fails
+# at exit startup.
+
+import std/result
+import std/rawbytes
+import std/os
+import std/strings
+import std/strutils as strutil
+import std/times
+import std/crypto/rand
+import std/net/transports/udp_syscall as udp
+
+@importc("cheng_fd_wait_readable_bridge")
+fn vpnProxyExitDnsFdWaitReadable(fd: int32, timeoutMs: int32): int32
+
+const
+    VpnProxyExitDnsPort = 53
+    VpnProxyExitDnsQtypeA = 1
+    VpnProxyExitDnsQtypeAaaa = 28
+    VpnProxyExitDnsAttemptTimeoutMs = 3000
+    VpnProxyExitDnsAttempts = 2
+    VpnProxyExitDnsMaxResponseBytes = 4096
+    VpnProxyExitDnsCacheMaxEntries = 1024
+    VpnProxyExitDnsMaxTtlSeconds = 3600
+    VpnProxyExitDnsMaxNameBytes = 253
+    VpnProxyExitDnsMaxLabelBytes = 63
+
+@borrows
+fn vpnProxyExitDnsDebug(text: str) =
+    let raw: str = os.GetEnv("CHENG_VPN_PROXY_DEBUG")
+    if raw != "1" && raw != "true" && raw != "TRUE":
+        return
+    os.WriteLine(os.Get_stderr(), text)
+
+type
+    VpnProxyExitDnsCacheEntry =
+        domain: str
+        qtype: int32
+        ipText: str
+        expiresAtNs: int64
+
+    VpnProxyExitDnsAnswer =
+        ipText: str
+        ttlSeconds: int32
+
+var
+    vpnProxyExitDnsServerHost: str
+    vpnProxyExitDnsCache: VpnProxyExitDnsCacheEntry[]
+
+fn vpnProxyExitDnsAsciiSpace(c: char): bool =
+    if c == ' ':
+        return true
+    if c == '\t':
+        return true
+    if c == '\r':
+        return true
+    if c == '\n':
+        return true
+    return false
+
+fn vpnProxyExitDnsValidateIpv4Part(partLen: int32,
+                                   partValue: int32,
+                                   leadingZero: bool): bool =
+    if partLen < 1 || partLen > 3:
+        return false
+    if partValue > 255:
+        return false
+    if partLen > 1 && leadingZero:
+        return false
+    return true
+
+@borrows
+fn VpnProxyExitDnsHostIsIpv4Literal(host: str): bool =
+    if len(host) <= 0:
+        return false
+    var partCount: int32 = 1
+    var partLen: int32
+    var partValue: int32
+    var leadingZero: bool
+    for i in 0..<len(host):
+        let c: char = host[i]
+        if c == '.':
+            if !vpnProxyExitDnsValidateIpv4Part(partLen, partValue, leadingZero):
+                return false
+            partCount = partCount + 1
+            partLen = 0
+            partValue = 0
+            leadingZero = false
+            continue
+        if c < '0' || c > '9':
+            return false
+        if partLen == 0 && c == '0':
+            leadingZero = true
+        partValue = partValue * 10 + (int32(c) - int32('0'))
+        partLen = partLen + 1
+        if partLen > 3 || partValue > 255:
+            return false
+    if partCount != 4:
+        return false
+    return vpnProxyExitDnsValidateIpv4Part(partLen, partValue, leadingZero)
+
+@borrows
+fn vpnProxyExitDnsLineResolver(line: str): str =
+    var offset: int32
+    while offset < len(line) && vpnProxyExitDnsAsciiSpace(line[offset]):
+        offset = offset + 1
+    let marker: str = "nameserver"
+    if offset + len(marker) > len(line):
+        return ""
+    for i in 0..<len(marker):
+        if line[offset + i] != marker[i]:
+            return ""
+    offset = offset + len(marker)
+    if offset >= len(line) || !vpnProxyExitDnsAsciiSpace(line[offset]):
+        return ""
+    while offset < len(line) && vpnProxyExitDnsAsciiSpace(line[offset]):
+        offset = offset + 1
+    let hostStart: int32 = offset
+    while offset < len(line) && !vpnProxyExitDnsAsciiSpace(line[offset]):
+        offset = offset + 1
+    if offset <= hostStart:
+        return ""
+    let host: str = strings.SliceBytes(line, hostStart, offset - hostStart)
+    if VpnProxyExitDnsHostIsIpv4Literal(host):
+        return host
+    return ""
+
+@borrows
+fn vpnProxyExitDnsFirstIpv4Resolver(resolvConfText: str): str =
+    var lineStart: int32
+    while lineStart < len(resolvConfText):
+        var lineEnd: int32 = lineStart
+        while lineEnd < len(resolvConfText) && resolvConfText[lineEnd] != '\n':
+            lineEnd = lineEnd + 1
+        let line: str = strings.SliceBytes(resolvConfText, lineStart, lineEnd - lineStart)
+        let candidate: str = vpnProxyExitDnsLineResolver(line)
+        if len(candidate) > 0:
+            return candidate
+        lineStart = lineEnd + 1
+    return ""
+
+@borrows
+fn VpnProxyExitDnsConfigure(serverHost: str): Result[bool] =
+    if !VpnProxyExitDnsHostIsIpv4Literal(serverHost):
+        return Err[bool](Fmt"vpn proxy exit dns: resolver must be ipv4 literal: {serverHost}")
+    vpnProxyExitDnsServerHost = serverHost
+    return Ok[bool](true)
+
+fn VpnProxyExitDnsConfigured(): bool =
+    return len(vpnProxyExitDnsServerHost) > 0
+
+fn VpnProxyExitDnsConfiguredServer(): str =
+    return vpnProxyExitDnsServerHost
+
+# Resolver source chain: explicit config value first, else first IPv4
+# nameserver from /etc/resolv.conf. Empty result is an error: the exit
+# product requires domain resolution.
+@borrows
+fn VpnProxyExitDnsServerFromSources(configValue: str,
+                                    resolvConfText: str): Result[str] =
+    if len(configValue) > 0:
+        if !VpnProxyExitDnsHostIsIpv4Literal(configValue):
+            return Err[str](Fmt"vpn proxy exit dns: dns_server must be ipv4 literal: {configValue}")
+        return Ok[str](strings.CloneStr(configValue))
+    let resolver: str = vpnProxyExitDnsFirstIpv4Resolver(resolvConfText)
+    if len(resolver) > 0:
+        return Ok[str](resolver)
+    return Err[str]("vpn proxy exit dns: no ipv4 resolver in config or /etc/resolv.conf")
+
+@borrows
+fn VpnProxyExitDnsConfigureFromSystem(configValue: str): Result[bool] =
+    var resolvText: str
+    let resolvRes: Result[Bytes] = os.ReadFileBytesResult("/etc/resolv.conf")
+    if !IsErr(resolvRes):
+        resolvText = BytesToString(Value(resolvRes))
+    let serverRes: Result[str] = VpnProxyExitDnsServerFromSources(configValue, resolvText)
+    if IsErr(serverRes):
+        return Err[bool](ErrorText(serverRes))
+    return VpnProxyExitDnsConfigure(Value(serverRes))
+
+@borrows
+fn VpnProxyExitDnsBuildQuery(queryId: int32, domain: str, qtype: int32): Result[Bytes] =
+    if len(domain) < 1 || len(domain) > VpnProxyExitDnsMaxNameBytes:
+        return Err[Bytes](Fmt"vpn proxy exit dns: invalid domain length: {domain}")
+    if qtype != VpnProxyExitDnsQtypeA && qtype != VpnProxyExitDnsQtypeAaaa:
+        return Err[Bytes](Fmt"vpn proxy exit dns: unsupported qtype: {qtype}")
+    var nameBytes: int32
+    var labelLen: int32
+    for i in 0..<len(domain):
+        let c: char = domain[i]
+        if c == '.':
+            if labelLen < 1 || labelLen > VpnProxyExitDnsMaxLabelBytes:
+                return Err[Bytes](Fmt"vpn proxy exit dns: invalid label in domain: {domain}")
+            nameBytes = nameBytes + 1 + labelLen
+            labelLen = 0
+            continue
+        labelLen = labelLen + 1
+    if labelLen < 1 || labelLen > VpnProxyExitDnsMaxLabelBytes:
+        return Err[Bytes](Fmt"vpn proxy exit dns: invalid label in domain: {domain}")
+    nameBytes = nameBytes + 1 + labelLen
+    let totalLen: int32 = 12 + nameBytes + 1 + 4
+    var query: Bytes = BytesAlloc(totalLen)
+    BytesSet(query, 0, (queryId >> 8) & 255)
+    BytesSet(query, 1, queryId & 255)
+    BytesSet(query, 2, 1)
+    BytesSet(query, 3, 0)
+    BytesSet(query, 4, 0)
+    BytesSet(query, 5, 1)
+    BytesSet(query, 6, 0)
+    BytesSet(query, 7, 0)
+    BytesSet(query, 8, 0)
+    BytesSet(query, 9, 0)
+    BytesSet(query, 10, 0)
+    BytesSet(query, 11, 0)
+    var offset: int32 = 12
+    var labelStart: int32
+    labelLen = 0
+    for i in 0..<len(domain):
+        let c: char = domain[i]
+        if c != '.':
+            labelLen = labelLen + 1
+            continue
+        BytesSet(query, offset, labelLen)
+        offset = offset + 1
+        let labelBytes: Bytes = BytesFromString(strings.SliceBytes(domain, labelStart, labelLen))
+        for j in 0..<labelBytes.len:
+            BytesSet(query, offset, BytesGet(labelBytes, j))
+            offset = offset + 1
+        labelStart = i + 1
+        labelLen = 0
+    BytesSet(query, offset, labelLen)
+    offset = offset + 1
+    let labelBytes: Bytes = BytesFromString(strings.SliceBytes(domain, labelStart, labelLen))
+    for j in 0..<labelBytes.len:
+        BytesSet(query, offset, BytesGet(labelBytes, j))
+        offset = offset + 1
+    BytesSet(query, offset, 0)
+    BytesSet(query, offset + 1, (qtype >> 8) & 255)
+    BytesSet(query, offset + 2, qtype & 255)
+    BytesSet(query, offset + 3, 0)
+    BytesSet(query, offset + 4, 1)
+    return Ok[Bytes](query)
+
+# Returns offset after the (possibly compressed) name, or -1 on malformed input.
+@borrows
+fn vpnProxyExitDnsSkipName(resp: Bytes, startOffset: int32): int32 =
+    var offset: int32 = startOffset
+    let total: int32 = BytesLen(resp)
+    while true:
+        if offset >= total:
+            return -1
+        let lenByte: int32 = BytesGet(resp, offset)
+        if lenByte == 0:
+            return offset + 1
+        if (lenByte & 192) == 192:
+            if offset + 1 >= total:
+                return -1
+            return offset + 2
+        if (lenByte & 192) != 0:
+            return -1
+        offset = offset + 1 + lenByte
+
+fn vpnProxyExitDnsHexDigit(value: int32): str =
+    if value == 0:
+        return "0"
+    if value == 1:
+        return "1"
+    if value == 2:
+        return "2"
+    if value == 3:
+        return "3"
+    if value == 4:
+        return "4"
+    if value == 5:
+        return "5"
+    if value == 6:
+        return "6"
+    if value == 7:
+        return "7"
+    if value == 8:
+        return "8"
+    if value == 9:
+        return "9"
+    if value == 10:
+        return "a"
+    if value == 11:
+        return "b"
+    if value == 12:
+        return "c"
+    if value == 13:
+        return "d"
+    if value == 14:
+        return "e"
+    return "f"
+
+fn vpnProxyExitDnsU16Hex(value: int32): str =
+    if value <= 0:
+        return "0"
+    var n: int32 = value
+    var rev: str[]
+    while n > 0:
+        add(rev, share(vpnProxyExitDnsHexDigit(n & 15)))
+        n = n >> 4
+    var out: str[]
+    var i: int32 = len(rev) - 1
+    while i >= 0:
+        add(out, share(rev[i]))
+        i = i - 1
+    return strutil.Join(out, "")
+
+@borrows
+fn vpnProxyExitDnsIpv6TextAt(resp: Bytes, offset: int32): str =
+    var parts: str[]
+    for i in 0..<8:
+        if i > 0:
+            add(parts, ":")
+        let hi: int32 = BytesGet(resp, offset + i * 2)
+        let lo: int32 = BytesGet(resp, offset + i * 2 + 1)
+        add(parts, vpnProxyExitDnsU16Hex((hi << 8) | lo))
+    return strutil.Join(parts, "")
+
+@borrows
+fn VpnProxyExitDnsParseAnswer(resp: Bytes, queryId: int32, qtype: int32): Result[VpnProxyExitDnsAnswer] =
+    let total: int32 = BytesLen(resp)
+    if total < 12:
+        return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: response too short")
+    let respId: int32 = (BytesGet(resp, 0) << 8) | BytesGet(resp, 1)
+    if respId != (queryId & 65535):
+        return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: response id mismatch")
+    let flagsHi: int32 = BytesGet(resp, 2)
+    if (flagsHi & 128) == 0:
+        return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: response is not an answer")
+    if (flagsHi & 2) != 0:
+        return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: response truncated")
+    let rcode: int32 = BytesGet(resp, 3) & 15
+    if rcode != 0:
+        return Err[VpnProxyExitDnsAnswer](Fmt"vpn proxy exit dns: rcode {rcode}")
+    let questionCount: int32 = (BytesGet(resp, 4) << 8) | BytesGet(resp, 5)
+    let answerCount: int32 = (BytesGet(resp, 6) << 8) | BytesGet(resp, 7)
+    if answerCount <= 0:
+        return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: no answers")
+    var offset: int32 = 12
+    for i in 0..<questionCount:
+        offset = vpnProxyExitDnsSkipName(resp, offset)
+        if offset < 0 || offset + 4 > total:
+            return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: malformed question section")
+        offset = offset + 4
+    for i in 0..<answerCount:
+        offset = vpnProxyExitDnsSkipName(resp, offset)
+        if offset < 0 || offset + 10 > total:
+            return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: malformed answer section")
+        let rrType: int32 = (BytesGet(resp, offset) << 8) | BytesGet(resp, offset + 1)
+        let rrClass: int32 = (BytesGet(resp, offset + 2) << 8) | BytesGet(resp, offset + 3)
+        let ttlHi: int32 = (BytesGet(resp, offset + 4) << 8) | BytesGet(resp, offset + 5)
+        let ttlLo: int32 = (BytesGet(resp, offset + 6) << 8) | BytesGet(resp, offset + 7)
+        let rdLen: int32 = (BytesGet(resp, offset + 8) << 8) | BytesGet(resp, offset + 9)
+        offset = offset + 10
+        if offset + rdLen > total:
+            return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: malformed rdata")
+        if rrType == qtype && rrClass == 1 && rdLen == 4 && qtype == VpnProxyExitDnsQtypeA:
+            var answer: VpnProxyExitDnsAnswer
+            let ip0: int32 = BytesGet(resp, offset)
+            let ip1: int32 = BytesGet(resp, offset + 1)
+            let ip2: int32 = BytesGet(resp, offset + 2)
+            let ip3: int32 = BytesGet(resp, offset + 3)
+            answer.ipText = Fmt"{ip0}.{ip1}.{ip2}.{ip3}"
+            # RFC 2181: TTL with MSB set is treated as zero (do not cache).
+            var ttlSeconds: int32
+            if (ttlHi & 32768) == 0:
+                if ttlHi >= 1024:
+                    ttlSeconds = VpnProxyExitDnsMaxTtlSeconds
+                else:
+                    ttlSeconds = (ttlHi << 16) | ttlLo
+                    if ttlSeconds > VpnProxyExitDnsMaxTtlSeconds:
+                        ttlSeconds = VpnProxyExitDnsMaxTtlSeconds
+            answer.ttlSeconds = ttlSeconds
+            return Ok[VpnProxyExitDnsAnswer](answer)
+        if rrType == qtype && rrClass == 1 && rdLen == 16 && qtype == VpnProxyExitDnsQtypeAaaa:
+            var answer6: VpnProxyExitDnsAnswer
+            answer6.ipText = vpnProxyExitDnsIpv6TextAt(resp, offset)
+            var ttlSeconds6: int32
+            if (ttlHi & 32768) == 0:
+                if ttlHi >= 1024:
+                    ttlSeconds6 = VpnProxyExitDnsMaxTtlSeconds
+                else:
+                    ttlSeconds6 = (ttlHi << 16) | ttlLo
+                    if ttlSeconds6 > VpnProxyExitDnsMaxTtlSeconds:
+                        ttlSeconds6 = VpnProxyExitDnsMaxTtlSeconds
+            answer6.ttlSeconds = ttlSeconds6
+            if len(answer6.ipText) <= 0:
+                return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: invalid ipv6 answer record")
+            return Ok[VpnProxyExitDnsAnswer](answer6)
+        offset = offset + rdLen
+    if qtype == VpnProxyExitDnsQtypeAaaa:
+        return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: no ipv6 answer record")
+    return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: no ipv4 answer record")
+
+# Cache helpers. add() is confined to a leaf append helper and scans live in
+# find-only helpers: the cold backend miscompiles functions that both scan
+# and append the same global struct seq (findings 2026-06-12 miscompile #7).
+@borrows
+fn vpnProxyExitDnsCacheAppendLeaf(entry: VpnProxyExitDnsCacheEntry) =
+    var owned: VpnProxyExitDnsCacheEntry
+    owned.domain = strings.CloneStr(entry.domain)
+    owned.qtype = entry.qtype
+    owned.ipText = strings.CloneStr(entry.ipText)
+    owned.expiresAtNs = entry.expiresAtNs
+    add(vpnProxyExitDnsCache, owned)
+
+@borrows
+fn vpnProxyExitDnsCacheFindFresh(domain: str, qtype: int32, nowNs: int64): str =
+    for i in 0..<vpnProxyExitDnsCache.len:
+        let entry: VpnProxyExitDnsCacheEntry = vpnProxyExitDnsCache[i]
+        if entry.expiresAtNs > nowNs && entry.domain == domain && entry.qtype == qtype:
+            return strings.CloneStr(entry.ipText)
+    return ""
+
+fn vpnProxyExitDnsCacheCompact(nowNs: int64) =
+    var kept: VpnProxyExitDnsCacheEntry[]
+    for i in 0..<vpnProxyExitDnsCache.len:
+        if vpnProxyExitDnsCache[i].expiresAtNs > nowNs:
+            add(kept, share(vpnProxyExitDnsCache[i]))
+    vpnProxyExitDnsCache = kept
+
+@borrows
+fn VpnProxyExitDnsCacheStore(domain: str, qtype: int32, ipText: str, ttlSeconds: int32, nowNs: int64) =
+    if ttlSeconds <= 0:
+        return
+    if vpnProxyExitDnsCache.len >= VpnProxyExitDnsCacheMaxEntries:
+        vpnProxyExitDnsCacheCompact(nowNs)
+    if vpnProxyExitDnsCache.len >= VpnProxyExitDnsCacheMaxEntries:
+        return
+    var entry: VpnProxyExitDnsCacheEntry
+    entry.domain = domain
+    entry.qtype = qtype
+    entry.ipText = ipText
+    entry.expiresAtNs = nowNs + int64(ttlSeconds) * int64(1000000000)
+    vpnProxyExitDnsCacheAppendLeaf(entry)
+
+@borrows
+fn VpnProxyExitDnsCacheLookup(domain: str, qtype: int32, nowNs: int64): str =
+    return vpnProxyExitDnsCacheFindFresh(domain, qtype, nowNs)
+
+fn VpnProxyExitDnsCacheCount(): int32 =
+    return vpnProxyExitDnsCache.len
+
+fn vpnProxyExitDnsQueryId(): Result[int32] =
+    let idBytesRes: Result[Bytes] = rand.RandomBytes(2)
+    if IsErr(idBytesRes):
+        return Err[int32](ErrorText(idBytesRes))
+    let idBytes: Bytes = Value(idBytesRes)
+    return Ok[int32](((BytesGet(idBytes, 0) << 8) | BytesGet(idBytes, 1)) & 65535)
+
+fn vpnProxyExitDnsUseLenField(): bool =
+    if os.udpPlatformUseLenFieldBridge() == 0:
+        return false
+    return true
+
+@borrows
+fn vpnProxyExitDnsAttemptOnce(domain: str, qtype: int32, queryId: int32): Result[VpnProxyExitDnsAnswer] =
+    let queryRes: Result[Bytes] = VpnProxyExitDnsBuildQuery(queryId, domain, qtype)
+    if IsErr(queryRes):
+        return Err[VpnProxyExitDnsAnswer](ErrorText(queryRes))
+    let serverHost: str = VpnProxyExitDnsConfiguredServer()
+    if len(serverHost) <= 0:
+        return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: resolver not configured")
+    let socketRes: Result[udp.UdpSocketHandle] = udp.UdpSocketOpenDgram(false)
+    if IsErr(socketRes):
+        return Err[VpnProxyExitDnsAnswer](ErrorText(socketRes))
+    let socket: udp.UdpSocketHandle = Value(socketRes)
+    var serverAddr: udp.UdpSockAddr
+    let addrRes: Result[bool] = udp.UdpSockAddrFromHostPort(serverHost,
+                                                            VpnProxyExitDnsPort,
+                                                            false,
+                                                            socket.family,
+                                                            vpnProxyExitDnsUseLenField(),
+                                                            serverAddr)
+    if IsErr(addrRes):
+        udp.UdpSocketClose(socket.fd)
+        return Err[VpnProxyExitDnsAnswer](ErrorText(addrRes))
+    let sendRes: Result[int32] = udp.UdpSendTo(socket.fd, Value(queryRes), serverAddr)
+    if IsErr(sendRes):
+        udp.UdpSocketClose(socket.fd)
+        return Err[VpnProxyExitDnsAnswer](ErrorText(sendRes))
+    let deadlineNs: int64 = times.MonotimeNs() + int64(VpnProxyExitDnsAttemptTimeoutMs) * int64(1000000)
+    var lastError: str = "vpn proxy exit dns: timeout"
+    while true:
+        let remainingNs: int64 = deadlineNs - times.MonotimeNs()
+        if remainingNs <= int64(0):
+            udp.UdpSocketClose(socket.fd)
+            return Err[VpnProxyExitDnsAnswer](strings.CloneStr(lastError))
+        var remainingMs: int32 = int32(remainingNs / int64(1000000))
+        if remainingMs < 1:
+            remainingMs = 1
+        let waitRc: int32 = vpnProxyExitDnsFdWaitReadable(socket.fd, remainingMs)
+        if waitRc < 0:
+            udp.UdpSocketClose(socket.fd)
+            return Err[VpnProxyExitDnsAnswer]("vpn proxy exit dns: wait failed")
+        if waitRc == 0:
+            udp.UdpSocketClose(socket.fd)
+            return Err[VpnProxyExitDnsAnswer](strings.CloneStr(lastError))
+        var recvResult: udp.UdpRecvResult
+        let recvRes: Result[bool] = udp.UdpRecvFromNonblock(socket.fd,
+                                                            VpnProxyExitDnsMaxResponseBytes,
+                                                            recvResult)
+        if IsErr(recvRes):
+            udp.UdpSocketClose(socket.fd)
+            return Err[VpnProxyExitDnsAnswer](ErrorText(recvRes))
+        if !Value(recvRes):
+            continue
+        let answerRes: Result[VpnProxyExitDnsAnswer] = VpnProxyExitDnsParseAnswer(recvResult.data, queryId, qtype)
+        if IsErr(answerRes):
+            lastError = ErrorText(answerRes)
+            continue
+        udp.UdpSocketClose(socket.fd)
+        return answerRes
+
+@borrows
+fn vpnProxyExitDnsResolveQtype(domain: str, qtype: int32): Result[str] =
+    if !VpnProxyExitDnsConfigured():
+        return Err[str]("vpn proxy exit dns: resolver not configured")
+    vpnProxyExitDnsDebug(Fmt"vpn proxy exit dns resolve begin domain={domain} qtype={qtype} server={vpnProxyExitDnsServerHost}")
+    let nowNs: int64 = times.MonotimeNs()
+    let cached: str = vpnProxyExitDnsCacheFindFresh(strings.CloneStr(domain), qtype, nowNs)
+    if len(cached) > 0:
+        vpnProxyExitDnsDebug(Fmt"vpn proxy exit dns cache hit ip={cached}")
+        return Ok[str](cached)
+    var lastError: str
+    for attempt in 0..<VpnProxyExitDnsAttempts:
+        vpnProxyExitDnsDebug(Fmt"vpn proxy exit dns query id begin attempt={attempt}")
+        let queryIdRes: Result[int32] = vpnProxyExitDnsQueryId()
+        if IsErr(queryIdRes):
+            return Err[str](ErrorText(queryIdRes))
+        vpnProxyExitDnsDebug(Fmt"vpn proxy exit dns query id ok id={Value(queryIdRes)}")
+        let answerRes: Result[VpnProxyExitDnsAnswer] = vpnProxyExitDnsAttemptOnce(strings.CloneStr(domain), qtype, Value(queryIdRes))
+        if !IsErr(answerRes):
+            let answer: VpnProxyExitDnsAnswer = Value(answerRes)
+            VpnProxyExitDnsCacheStore(domain, qtype, answer.ipText, answer.ttlSeconds, times.MonotimeNs())
+            vpnProxyExitDnsDebug(Fmt"vpn proxy exit dns resolve ok ip={answer.ipText}")
+            return Ok[str](strings.CloneStr(answer.ipText))
+        lastError = ErrorText(answerRes)
+        vpnProxyExitDnsDebug(Fmt"vpn proxy exit dns attempt failed: {lastError}")
+    return Err[str](Fmt"vpn proxy exit dns: resolve failed: {domain}: {lastError}")
+
+@borrows
+fn VpnProxyExitDnsResolveIpv4(domain: str): Result[str] =
+    return vpnProxyExitDnsResolveQtype(domain, VpnProxyExitDnsQtypeA)
+
+@borrows
+fn VpnProxyExitDnsResolveIpv6(domain: str): Result[str] =
+    return vpnProxyExitDnsResolveQtype(domain, VpnProxyExitDnsQtypeAaaa)

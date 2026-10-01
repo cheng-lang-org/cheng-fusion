@@ -1,0 +1,422 @@
+# CPU raster (D2/G1): deterministic software rendering of the submitted
+# world state. Two specialized analytic surfaces — the ground plane (z=0)
+# and the wall pedal face (a y-plane from the world facts) — are ray-cast
+# per pixel in parallel (one scanline per ParallelFor task); bodies render
+# as analytic impostors with per-pixel depth. Shading: Lambert + ambient
+# under one directional light. Frames stream as binary PPM (P6).
+#
+# Memory model (DoD/SoA, no pointer tricks): both columns are
+# rawbytes.Bytes C-heap surfaces — color is 4 bytes BGRA per pixel, depth
+# is one int32 millimetre per pixel with sentinel 2147483647 (= empty,
+# every byte 0xFF). Both are written exclusively through the runtime's
+# rawmem/Bytes primitives, so a GPU-shared MTLBuffer can be adopted as a
+# view (RasterAdoptViews) without any copy or seq-header inspection.
+import cheng/game/world3d
+import cheng/game/cinema/camera
+import cheng/game/csg/numerics
+import std/os
+import std/math as m
+import std/rawbytes
+import std/rawmem_support
+
+
+const
+    RasterLightX = 0.35
+    RasterLightY = 0.60
+    RasterLightZ = 0.72
+    RasterDepthEmpty = 2147483647
+    # basketball seam grooves: angular half width to each orthogonal
+    # great circle (radians on the unit sphere) and the wave-channel
+    # band in the same f-unit scale; the classic curved seam look
+    BasketballGrooveHalfRad = 0.06
+    # wave channel zero set: sphere ∩ {z = ±W·x·y} — the two curved
+    # "bow" seams of a real basketball, amplitude arcsin(W/2) at
+    # longitude ±45°
+    BasketballWaveGain = 1.7
+    # the seam set is tested in a frame TILTED off the world Y axis:
+    # the rolling axis must not be an axis of pattern symmetry, or a
+    # spinning ball reads as frozen (the two great circles are invariant
+    # under rotation about an axis lying in their planes). One fixed
+    # X-tilt makes every seam feature travel visibly under Y roll.
+    BasketballSeamTiltRad = 0.6
+    # logo dot: a small dark disc on the +X face, the unmistakable
+    # rotation marker (travels a full circle under Y roll)
+    BasketballLogoDotCos = 0.985
+
+type
+    RasterFrame = ref object
+        bgra: rawbytes.Bytes   # 4 bytes per pixel: B,G,R,255 — display-surface
+                               # order, written via BytesSet only
+        zbuf: rawbytes.Bytes   # 4 bytes per pixel: int32 depth in mm,
+                               # sentinel 2147483647 (all-0xFF)
+
+    RasterTarget =
+        width: int32
+        height: int32
+        frame: RasterFrame
+
+fn RasterMake(width: int32, height: int32): RasterTarget =
+    var out: RasterTarget
+    out.width = width
+    out.height = height
+    out.frame = new(RasterFrame)
+    out.frame.bgra = rawbytes.BytesAlloc(width * height * 4)
+    out.frame.zbuf = rawbytes.BytesAlloc(width * height * 4)
+    RasterClear(out)
+    return out
+
+# Adopt externally-owned surfaces (e.g. GPU-shared MTLBuffer contents)
+# as non-owning views: zero copy, the buffers outlive every push by the
+# caller's front/back rotation contract.
+fn RasterAdoptViews(width: int32, height: int32, bgraPtr: ptr, depthPtr: ptr): RasterTarget =
+    var out: RasterTarget
+    out.width = width
+    out.height = height
+    out.frame = new(RasterFrame)
+    out.frame.bgra = rawbytes.BytesView(bgraPtr, width * height * 4)
+    out.frame.zbuf = rawbytes.BytesView(depthPtr, width * height * 4)
+    return out
+
+@borrows
+fn RasterDepthRead(t: RasterTarget, idx: int32): int32 =
+    var v: int32 = 0
+    rawmem_support.RawmemCopy(ptr(&v), rawmem_support.RawmemPtrAdd(rawbytes.BytesDataPtr(t.frame.zbuf), idx * 4), 4)
+    return v
+
+@borrows
+fn RasterDepthWrite(t: RasterTarget, idx: int32, v: int32) =
+    var local: int32 = v
+    rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(rawbytes.BytesDataPtr(t.frame.zbuf), idx * 4), ptr(&local), 4)
+
+# per-frame clear for a reused target: rewrite every pixel (sky backdrop)
+# and reset depth — no stale pixels can survive across frames. Depth via
+# native SoA writes; color via the 4-byte BGRA pattern-doubling fill
+# (20 bulk RawmemCopy calls instead of 3.7M single-byte bridge calls).
+@borrows
+fn RasterClear(t: RasterTarget) =
+    # depth sentinel 2147483647 little-endian is the per-pixel byte
+    # pattern FF FF FF 7F (all-0xFF would read back as int32 -1 and make
+    # every RasterPut depth test fail): 4-byte pattern-doubling fill,
+    # same contract the GPU kernel writes (RasterDepthEmpty semantics)
+    let zbase: ptr = rawbytes.BytesDataPtr(t.frame.zbuf)
+    rawmem_support.RawmemSet(zbase, 255, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(zbase, 1), 255, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(zbase, 2), 255, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(zbase, 3), 127, 1)
+    let totalBytes: int32 = t.width * t.height * 4
+    var zfilled: int32 = 4
+    while zfilled < totalBytes:
+        var zchunk: int32 = zfilled * 2
+        if zchunk > totalBytes:
+            zchunk = totalBytes
+        zchunk = zchunk - zfilled
+        rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(zbase, zfilled), zbase, zchunk)
+        zfilled = zfilled + zchunk
+    let base: ptr = rawbytes.BytesDataPtr(t.frame.bgra)
+    rawmem_support.RawmemSet(base, 140, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(base, 1), 120, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(base, 2), 96, 1)
+    rawmem_support.RawmemSet(rawmem_support.RawmemPtrAdd(base, 3), 255, 1)
+    let totalBytes: int32 = t.width * t.height * 4
+    var filled: int32 = 4
+    while filled < totalBytes:
+        var chunk: int32 = filled * 2
+        if chunk > totalBytes:
+            chunk = totalBytes
+        chunk = chunk - filled
+        rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(base, filled), base, chunk)
+        filled = filled + chunk
+
+@borrows
+fn RasterPut(t: RasterTarget, px: int32, py: int32, depth: float64, r: int32, g: int32, b: int32) =
+    if px < 0:
+        return
+    if px >= t.width:
+        return
+    if py < 0:
+        return
+    if py >= t.height:
+        return
+    var mm: int32 = int32(depth * 1000.0)
+    if mm < 0:
+        mm = 0
+    let idx = py * t.width + px
+    if mm < RasterDepthRead(t, idx):
+        RasterDepthWrite(t, idx, mm)
+        rawbytes.BytesSet(t.frame.bgra, idx * 4, b & 255)
+        rawbytes.BytesSet(t.frame.bgra, idx * 4 + 1, g & 255)
+        rawbytes.BytesSet(t.frame.bgra, idx * 4 + 2, r & 255)
+        rawbytes.BytesSet(t.frame.bgra, idx * 4 + 3, 255)
+
+# Ground plane z=0, x in [-20,20], y in [-20,20], checker 1m.
+# Row culling: ground rays need dir.z < 0; since look-at cameras have
+# rz = 0, dir.z is constant per scanline, so rows at/above the horizon
+# are skipped whole (mathematically exact — no pixel may hit).
+@borrows
+fn RasterGround(t: RasterTarget, cam: camera.CinemaCamera) =
+    var py: int32 = 0
+    while py < t.height:
+        let sv = (float64(t.height) * 0.5 - float64(py) - 0.5) / cam.focalPx
+        let dzRow = cam.fz + cam.uz * sv
+        if dzRow < -0.0001:
+            var px: int32 = 0
+            while px < t.width:
+                let su = (float64(px) + 0.5 - float64(t.width) * 0.5) / cam.focalPx
+                let dx = cam.fx + cam.rx * su
+                let dy = cam.fy + cam.ry * su
+                let tt = (0.0 - cam.posZ) / dzRow
+                if tt > 0.1:
+                    let hitX = cam.posX + dx * tt
+                    let hitY = cam.posY + dy * tt
+                    if hitX > -20.0:
+                        if hitX < 20.0:
+                            if hitY > -20.0:
+                                if hitY < 20.0:
+                                    let bandX: int32 = int32(m.floorFloat(hitX))
+                                    let bandY: int32 = int32(m.floorFloat(hitY))
+                                    var lum = 0.35 + 0.65 * RasterLightZ
+                                    if (bandX + bandY) % 2 == 0:
+                                        lum = lum * 0.82
+                                    RasterPut(t, px, py, tt, int32(90.0 * lum), int32(80.0 * lum), int32(70.0 * lum))
+                px = px + 1
+        py = py + 1
+
+# Wall face y = wallY, x in [xLo, xHi], z in [zLo, zHi], friction tint.
+# Face-level culling: project the four corners once and rasterize only
+# the bounding box (grown by 2 px so the per-pixel test stays the sole
+# authority — identical output, far fewer rays).
+@borrows
+fn RasterWallFace(t: RasterTarget, cam: camera.CinemaCamera, wallY: float64, xLo: float64, xHi: float64, zLo: float64, zHi: float64) =
+    let c0 = camera.CameraProject(cam, xLo, wallY, zLo)
+    let c1 = camera.CameraProject(cam, xHi, wallY, zLo)
+    let c2 = camera.CameraProject(cam, xLo, wallY, zHi)
+    let c3 = camera.CameraProject(cam, xHi, wallY, zHi)
+    var boxX0: int32 = int32(m.minFloat(m.minFloat(c0.sx, c1.sx), m.minFloat(c2.sx, c3.sx))) - 2
+    var boxX1: int32 = int32(m.maxFloat(m.maxFloat(c0.sx, c1.sx), m.maxFloat(c2.sx, c3.sx))) + 2
+    var boxY0: int32 = int32(m.minFloat(m.minFloat(c0.sy, c1.sy), m.minFloat(c2.sy, c3.sy))) - 2
+    var boxY1: int32 = int32(m.maxFloat(m.maxFloat(c0.sy, c1.sy), m.maxFloat(c2.sy, c3.sy))) + 2
+    if boxX0 < 0:
+        boxX0 = 0
+    if boxY0 < 0:
+        boxY0 = 0
+    if boxX1 > t.width - 1:
+        boxX1 = t.width - 1
+    if boxY1 > t.height - 1:
+        boxY1 = t.height - 1
+    var py: int32 = boxY0
+    while py <= boxY1:
+        var px: int32 = boxX0
+        while px <= boxX1:
+            let dir = camera.CameraRayDir(cam, px, py)
+            if dir.y < -0.0001:
+                let tt = (wallY - cam.posY) / dir.y
+                if tt > 0.1:
+                    let hitX = cam.posX + dir.x * tt
+                    let hitZ = cam.posZ + dir.z * tt
+                    if hitX > xLo:
+                        if hitX < xHi:
+                            if hitZ > zLo:
+                                if hitZ < zHi:
+                                    let band: int32 = int32(m.floorFloat(hitZ * 3.0)) % 2
+                                    var lum = 0.47
+                                    if band == 0:
+                                        lum = lum * 0.88
+                                    RasterPut(t, px, py, tt, int32(110.0 * lum), int32(105.0 * lum), int32(100.0 * lum))
+            px = px + 1
+        py = py + 1
+
+# Sphere impostor with per-pixel depth and Lambert shading.
+@borrows
+fn RasterSphere(t: RasterTarget,
+                cam: camera.CinemaCamera,
+                cx: float64,
+                cy: float64,
+                cz: float64,
+                radius: float64,
+                baseR: int32,
+                baseG: int32,
+                baseB: int32) =
+    let proj = camera.CameraProject(cam, cx, cy, cz)
+    if proj.depth <= 0.05:
+        return
+    let pixelR = radius * cam.focalPx / proj.depth
+    if pixelR < 0.5:
+        return
+    let x0: int32 = int32(proj.sx - pixelR) - 1
+    let x1: int32 = int32(proj.sx + pixelR) + 1
+    let y0: int32 = int32(proj.sy - pixelR) - 1
+    let y1: int32 = int32(proj.sy + pixelR) + 1
+    var py: int32 = y0
+    while py <= y1:
+        var px: int32 = x0
+        while px <= x1:
+            let ddx = float64(px) - proj.sx
+            let ddy = float64(py) - proj.sy
+            let rr = ddx * ddx + ddy * ddy
+            if rr <= pixelR * pixelR:
+                let half = pixelR * pixelR
+                let frac = (half - rr) / half
+                let depth = proj.depth - frac * radius
+                let nx = ddx / pixelR
+                let ny = ddy / pixelR
+                let nz = numerics.CsgSqrt(m.maxFloat(0.0, 1.0 - nx * nx - ny * ny))
+                let diff = nx * RasterLightX - ny * RasterLightY + nz * RasterLightZ
+                var lum = 0.30 + 0.70 * diff
+                if lum > 1.0:
+                    lum = 1.0
+                if lum < 0.15:
+                    lum = 0.15
+                RasterPut(t, px, py, depth, int32(float64(baseR) * lum), int32(float64(baseG) * lum), int32(float64(baseB) * lum))
+            px = px + 1
+        py = py + 1
+
+# Basketball impostor: the RasterSphere projection/bounding-box/per-pixel
+# skeleton with the real-ball seam pattern (orange leather + dark
+# grooves). Per pixel the world-frame unit vector from the ball center
+# to the surface hit (camera ray x sphere, p_rel/radius) is inverse-
+# rotated into the ball-local frame by the caller's VISUAL attitude
+# quaternion (q^-1 v: t = 2 q_vec x v, v' = v - qw t + q_vec x t; pure
+# render-layer state, the physics attitude columns stay untouched).
+# Seam test: two great circles (local z/y = 0 planes) plus the two
+# classic wave channels (sphere ∩ {z = ±W·x·y}); under the band width
+# the pixel takes the groove color, else the base color. All colors
+# pass the RasterSphere Lambert light; depth/zbuf logic is RasterSphere's.
+@borrows
+fn RasterBasketball(t: RasterTarget,
+                    cam: camera.CinemaCamera,
+                    cx: float64,
+                    cy: float64,
+                    cz: float64,
+                    radius: float64,
+                    vqw: float64,
+                    vqx: float64,
+                    vqy: float64,
+                    vqz: float64,
+                    baseR: int32,
+                    baseG: int32,
+                    baseB: int32,
+                    grooveR: int32,
+                    grooveG: int32,
+                    grooveB: int32) =
+    let proj = camera.CameraProject(cam, cx, cy, cz)
+    if proj.depth <= 0.05:
+        return
+    let pixelR = radius * cam.focalPx / proj.depth
+    if pixelR < 0.5:
+        return
+    let x0: int32 = int32(proj.sx - pixelR) - 1
+    let x1: int32 = int32(proj.sx + pixelR) + 1
+    let y0: int32 = int32(proj.sy - pixelR) - 1
+    let y1: int32 = int32(proj.sy + pixelR) + 1
+    # fixed seam-frame tilt (hoisted: constants of the call)
+    let tiltC: float64 = m.cosFloat(BasketballSeamTiltRad)
+    let tiltS: float64 = m.sinFloat(BasketballSeamTiltRad)
+    var py: int32 = y0
+    while py <= y1:
+        var px: int32 = x0
+        while px <= x1:
+            let ddx = float64(px) - proj.sx
+            let ddy = float64(py) - proj.sy
+            let rr = ddx * ddx + ddy * ddy
+            if rr <= pixelR * pixelR:
+                let half = pixelR * pixelR
+                let frac = (half - rr) / half
+                let depth = proj.depth - frac * radius
+                let nx = ddx / pixelR
+                let ny = ddy / pixelR
+                let nz = numerics.CsgSqrt(m.maxFloat(0.0, 1.0 - nx * nx - ny * ny))
+                # nearest camera-ray x sphere hit; CameraRayDir carries an
+                # unnormalized direction, so the quadratic keeps the
+                # |d|^2 factor (disc clamped at the silhouette exactly
+                # like nz above, keeping the disk solid)
+                let dir = camera.CameraRayDir(cam, px, py)
+                let ox = cam.posX - cx
+                let oy = cam.posY - cy
+                let oz = cam.posZ - cz
+                let rayA = dir.x * dir.x + dir.y * dir.y + dir.z * dir.z
+                let rayB = ox * dir.x + oy * dir.y + oz * dir.z
+                let rayC = ox * ox + oy * oy + oz * oz - radius * radius
+                let disc = rayB * rayB - rayA * rayC
+                let th = (0.0 - rayB - numerics.CsgSqrt(m.maxFloat(0.0, disc))) / rayA
+                # world-frame unit surface vector -> ball-local frame
+                let wx = (ox + dir.x * th) / radius
+                let wy = (oy + dir.y * th) / radius
+                let wz = (oz + dir.z * th) / radius
+                let tx = 2.0 * (vqy * wz - vqz * wy)
+                let ty = 2.0 * (vqz * wx - vqx * wz)
+                let tz = 2.0 * (vqx * wy - vqy * wx)
+                let lx = wx - vqw * tx + (vqy * tz - vqz * ty)
+                let ly = wy - vqw * ty + (vqz * tx - vqx * tz)
+                let lz = wz - vqw * tz + (vqx * ty - vqy * tx)
+                # the seam tests run in the tilted frame: under rotation
+                # about the rolling axis every seam feature now travels
+                let sy2 = ly * tiltC - lz * tiltS
+                let sz2 = ly * tiltS + lz * tiltC
+                var selR: int32 = baseR
+                var selG: int32 = baseG
+                var selB: int32 = baseB
+                # classic seam set: equator + one meridian great circle,
+                # plus the two curved wave channels |lz ∓ W·lx·ly| — the
+                # sphere ∩ {z = ±W·x·y} zero-set pair that reads as the
+                # real ball's bows from every angle
+                if m.absFloat(sz2) < BasketballGrooveHalfRad:
+                    selR = grooveR
+                    selG = grooveG
+                    selB = grooveB
+                if m.absFloat(sy2) < BasketballGrooveHalfRad:
+                    selR = grooveR
+                    selG = grooveG
+                    selB = grooveB
+                if m.absFloat(sz2 - BasketballWaveGain * lx * sy2) < BasketballGrooveHalfRad:
+                    selR = grooveR
+                    selG = grooveG
+                    selB = grooveB
+                if m.absFloat(sz2 + BasketballWaveGain * lx * sy2) < BasketballGrooveHalfRad:
+                    selR = grooveR
+                    selG = grooveG
+                    selB = grooveB
+                # logo dot on the +X face: the rotation marker
+                if lx > BasketballLogoDotCos:
+                    selR = grooveR
+                    selG = grooveG
+                    selB = grooveB
+                let diff = nx * RasterLightX - ny * RasterLightY + nz * RasterLightZ
+                var lum = 0.30 + 0.70 * diff
+                if lum > 1.0:
+                    lum = 1.0
+                if lum < 0.15:
+                    lum = 0.15
+                RasterPut(t, px, py, depth, int32(float64(selR) * lum), int32(float64(selG) * lum), int32(float64(selB) * lum))
+            px = px + 1
+        py = py + 1
+
+# Stream the finished frame as binary PPM (P6), fixed 1280x720 header.
+@borrows
+fn RasterWritePpm(t: RasterTarget, path: str) =
+    var out: uint8[]
+    setLen(out, 16 + t.width * t.height * 3)
+    out[0] = uint8(80)
+    out[1] = uint8(54)
+    out[2] = uint8(10)
+    out[3] = uint8(49)
+    out[4] = uint8(50)
+    out[5] = uint8(56)
+    out[6] = uint8(48)
+    out[7] = uint8(32)
+    out[8] = uint8(55)
+    out[9] = uint8(50)
+    out[10] = uint8(48)
+    out[11] = uint8(10)
+    out[12] = uint8(50)
+    out[13] = uint8(53)
+    out[14] = uint8(53)
+    out[15] = uint8(10)
+    var px: int32 = 0
+    var total: int32 = t.width * t.height
+    while px < total:
+        out[16 + px * 3] = uint8(rawbytes.BytesGet(t.frame.bgra, px * 4 + 2))
+        out[17 + px * 3] = uint8(rawbytes.BytesGet(t.frame.bgra, px * 4 + 1))
+        out[18 + px * 3] = uint8(rawbytes.BytesGet(t.frame.bgra, px * 4))
+        px = px + 1
+    os.WriteFileBytes(path, out)
+

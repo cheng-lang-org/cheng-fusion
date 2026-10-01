@@ -1,0 +1,1964 @@
+import std/strformat
+import cheng/core/analysis/ownership_drop_ir as odir
+import cheng/core/analysis/cleanup_cfg as cleanup
+import cheng/core/analysis/managed_lvalue_replace as managedreplace
+import cheng/core/ir/core_types as coreir
+import cheng/core/ir/body_ir_access as bodyaccess
+import cheng/core/lang/typed_expr_type_arena as typearena
+import cheng/std/bytes_layout as layout
+import std/strings
+
+# First production slice for deterministic function cleanup.
+#
+# The only admitted managed producer is an immutable TypedExpr-owned str
+# value-definition already carried by BodyIR.  Every physical CFG edge is
+# projected into the canonical Ownership/Init/Drop analysis and the resulting
+# CleanupPlan is materialized back into ordinary BodyIR.  Both production
+# backends consume those same ops.
+#
+# Borrowed values are intentionally rejected until TypedExpr/FunctionInterface
+# carries the exact borrow-owner value-definition identity.  Aggregate field
+# cleanup and defer action materialization remain later slices.  Multiple
+# return edges, including lowering-owned `?` exits, retain their exact block
+# identity; a Br/Cbr terminator is never guessed to mean break or continue.
+
+type
+    OwnershipBodyIrProductionReport =
+        applied: bool
+        ownedDefinitionCount: int32
+        deferCount: int32
+        breakEdgeCount: int32
+        continueEdgeCount: int32
+        normalizedReturnCount: int32
+        ownershipEdgeCount: int32
+        ownershipActionCount: int32
+        conditionFlagCount: int32
+        materializedOpCount: int32
+        materializedBlockCount: int32
+        materializedCallCount: int32
+        cleanupFingerprint: int64
+        managedReplaceCount: int32
+        managedReplaceMoveCount: int32
+        managedReplaceBorrowLiftCount: int32
+        managedReplaceFingerprint: int64
+        managedReplaceValidated: bool
+        plannerReleased: bool
+
+@borrows
+fn ownershipBodyIrFail(message: str) =
+    panic(strings.CloneStr(message))
+
+@borrows
+fn ownershipBodyIrRequireControlFacts(bodyIR: coreir.BodyIR) =
+    if !bodyIR.controlFlowSealed ||
+       !coreir.BodyIRControlFlowShapeValid(bodyIR):
+        ownershipBodyIrFail(
+            "ownership body ir production: sealed control-flow facts missing")
+
+fn ownershipBodyIrEdgeKind(
+        kind: int32): odir.OwnershipDropEdgeKind =
+    if kind == coreir.BodyControlEdgeNormal:
+        return odir.OwnershipDropEdgeNormal
+    if kind == coreir.BodyControlEdgeBreak:
+        return odir.OwnershipDropEdgeBreak
+    if kind == coreir.BodyControlEdgeContinue:
+        return odir.OwnershipDropEdgeContinue
+    if kind == coreir.BodyControlEdgeLoopBack:
+        return odir.OwnershipDropEdgeLoopBack
+    ownershipBodyIrFail(
+        "ownership body ir production: control edge kind invalid")
+    return odir.OwnershipDropEdgeUnknown
+
+@borrows
+fn ownershipBodyIrScopeIsAncestor(
+        bodyIR: coreir.BodyIR,
+        ancestorScopeId: int32,
+        scopeId: int32): bool =
+    if ancestorScopeId < 0 ||
+       ancestorScopeId >= bodyIR.controlScopeParentIds.len ||
+       scopeId < 0 ||
+       scopeId >= bodyIR.controlScopeParentIds.len:
+        ownershipBodyIrFail(
+            "ownership body ir production: control scope invalid")
+    var current = scopeId
+    while current >= 0:
+        if current == ancestorScopeId:
+            return true
+        current = bodyIR.controlScopeParentIds[current]
+    return false
+
+@borrows
+fn ownershipBodyIrAppendCleanupInventory(
+        bodyIR: coreir.BodyIR,
+        ir: var odir.OwnershipDropIr,
+        fromScopeId: int32,
+        toScopeId: int32,
+        isReturn: bool,
+        cleanupPlaces: var int32[]) =
+    var stopScopeId = -1
+    if !isReturn:
+        var current = fromScopeId
+        while current >= 0 && stopScopeId < 0:
+            if ownershipBodyIrScopeIsAncestor(
+                   bodyIR, current, toScopeId):
+                stopScopeId = current
+            current = bodyIR.controlScopeParentIds[current]
+        if stopScopeId < 0:
+            ownershipBodyIrFail(
+                "ownership body ir production: control scopes lack common root")
+    for placeIndex in 0..<ir.places.len:
+        var current = fromScopeId
+        var exitsPlaceScope: bool
+        while current >= 0:
+            if !isReturn && current == stopScopeId:
+                break
+            if current == ir.places[placeIndex].scopeId:
+                exitsPlaceScope = true
+                break
+            current = bodyIR.controlScopeParentIds[current]
+        if exitsPlaceScope:
+            add(cleanupPlaces, ir.places[placeIndex].placeId)
+
+@borrows
+fn ownershipBodyIrAppendDeferInventory(
+        bodyIR: coreir.BodyIR,
+        fromScopeId: int32,
+        toScopeId: int32,
+        isReturn: bool,
+        deferIds: var int32[]) =
+    var stopScopeId = -1
+    if !isReturn:
+        var commonCursor = fromScopeId
+        while commonCursor >= 0 && stopScopeId < 0:
+            if ownershipBodyIrScopeIsAncestor(
+                   bodyIR, commonCursor, toScopeId):
+                stopScopeId = commonCursor
+            commonCursor =
+                bodyIR.controlScopeParentIds[commonCursor]
+        if stopScopeId < 0:
+            ownershipBodyIrFail(
+                "ownership body ir production: defer scopes lack common root")
+    var deferIndex =
+        bodyIR.deferDeclarationScopeIds.len - 1
+    while deferIndex >= 0:
+        let declarationScopeId =
+            bodyIR.deferDeclarationScopeIds[deferIndex]
+        var exitsScope: bool
+        var exitCursor = fromScopeId
+        while exitCursor >= 0:
+            if !isReturn && exitCursor == stopScopeId:
+                break
+            if exitCursor == declarationScopeId:
+                exitsScope = true
+                break
+            exitCursor =
+                bodyIR.controlScopeParentIds[exitCursor]
+        if exitsScope:
+            add(deferIds, deferIndex + 1)
+        deferIndex = deferIndex - 1
+
+fn ownershipBodyIrAlignUp(value: int32, alignBytes: int32): int32 =
+    if value < 0 || alignBytes <= 0:
+        ownershipBodyIrFail(
+            "ownership body ir production: invalid stack alignment")
+    let remainder = value % alignBytes
+    if remainder == 0:
+        return value
+    let delta = alignBytes - remainder
+    if value > 2147483647 - delta:
+        ownershipBodyIrFail(
+            "ownership body ir production: stack offset overflow")
+    return value + delta
+
+@borrows
+fn ownershipBodyIrStackHighWater(bodyIR: coreir.BodyIR): int32 =
+    # 独立栈区高水位（wall42 契约补全）。StackValue 槽的负 stackOffset 是
+    # 参数槽的入口序数编码（BodyIRBindEntryParameterSlot /
+    # BodyIREntryParameterSlotsShapeValid 权威契约；placeKind 停留
+    # StackValueTag，无生产者改写为 ParamAddressTag），不是帧字节偏移：
+    # 布局生产者（PrimaryBodyIrNextLocalStackOffset /
+    # PrimaryBodyIrReflowLocalStackOffsets）以同一 IsParam(skip stackOffset<0)
+    # 谓词把参数槽排除在独立栈区外、区基 16。本函数沿用同一谓词：参数槽
+    # 仍受 schema 审（size/align 必须健康），但不贡献字节高水位；非参数
+    # StackValue 槽 schema 全列不变。区基 16 与布局生产者同源，防止
+    # 参数-only 形高水位 0 把合成槽排进 FP/LR 保存区。
+    var out: int32 = 16
+    for slotIndex in 0..<bodyIR.localSlots.len:
+        let slot = bodyIR.localSlots[slotIndex]
+        if slot.placeKind != coreir.BodyPlaceStackValueTag:
+            continue
+        if slot.stackOffset < 0:
+            if slot.sizeBytes <= 0 || slot.alignBytes <= 0:
+                ownershipBodyIrFail(
+                    "ownership body ir production: local stack schema invalid")
+            continue
+        if slot.sizeBytes <= 0 || slot.alignBytes <= 0:
+            ownershipBodyIrFail(
+                "ownership body ir production: local stack schema invalid")
+        if slot.stackOffset > 2147483647 - slot.sizeBytes:
+            ownershipBodyIrFail(
+                "ownership body ir production: local stack range overflow")
+        let slotEnd = slot.stackOffset + slot.sizeBytes
+        if slotEnd > out:
+            out = slotEnd
+    return out
+
+fn ownershipBodyIrAppendSnapshotSlot(
+        bodyIR: var coreir.BodyIR,
+        sourceSlotId: int32,
+        suffix: str): int32 =
+    if sourceSlotId < 0 || sourceSlotId >= bodyIR.localSlots.len:
+        ownershipBodyIrFail(
+            "ownership body ir production: return source slot missing")
+    let source = bodyIR.localSlots[sourceSlotId]
+    if source.placeKind != coreir.BodyPlaceStackValueTag ||
+       source.sizeBytes <= 0 || source.alignBytes <= 0:
+        ownershipBodyIrFail(
+            "ownership body ir production: return source is not stack value")
+    var snapshot: coreir.LocalSlot
+    snapshot.id = bodyIR.localSlots.len
+    snapshot.name = Fmt"#canonical_return_snapshot#{suffix}#{snapshot.id}"
+    snapshot.typeKind = source.typeKind
+    snapshot.typeArenaTypeId = source.typeArenaTypeId
+    snapshot.managedStorageKind = source.managedStorageKind
+    snapshot.placeKind = source.placeKind
+    snapshot.stackOffset = ownershipBodyIrAlignUp(
+        ownershipBodyIrStackHighWater(bodyIR), source.alignBytes)
+    snapshot.sizeBytes = source.sizeBytes
+    snapshot.alignBytes = source.alignBytes
+    snapshot.auxValue = 0
+    snapshot.ownership = coreir.OwnPlain
+    snapshot.aliasClass = coreir.AliasUnknown
+    snapshot.escapeKind = coreir.EscapeNone
+    snapshot.noAlias = false
+    let snapshotId = snapshot.id
+    add(bodyIR.localSlots, snapshot)
+    coreir.BodyIREntryDefinitionOwnershipAppendSyntheticSlot(
+        bodyIR, snapshotId)
+    coreir.BodyIRClearFrameLayoutCache(bodyIR)
+    return snapshotId
+
+fn ownershipBodyIrAppendI32FlagSlot(
+        bodyIR: var coreir.BodyIR,
+        flagId: int32): int32 =
+    var slot: coreir.LocalSlot
+    slot.id = bodyIR.localSlots.len
+    slot.name = Fmt"#canonical_drop_flag#{flagId}"
+    slot.typeKind = coreir.LocalI32Tag
+    slot.stackOffset = ownershipBodyIrAlignUp(
+        ownershipBodyIrStackHighWater(bodyIR), 4)
+    slot.sizeBytes = 4
+    slot.alignBytes = 4
+    coreir.BodyIRApplyLocalSlotDefaultProof(slot)
+    let slotId = slot.id
+    add(bodyIR.localSlots, slot)
+    coreir.BodyIREntryDefinitionOwnershipAppendSyntheticSlot(
+        bodyIR, slotId)
+    coreir.BodyIRClearFrameLayoutCache(bodyIR)
+    return slotId
+
+@borrows
+fn ownershipBodyIrCleanupDefinitionCount(bodyIR: coreir.BodyIR): int32 =
+    var out: int32
+    for opIndex in 0..<bodyIR.ops.len:
+        if bodyIR.ops[opIndex].valueDefOwnership ==
+               coreir.OwnMove &&
+           bodyIR.ops[opIndex].valueDefConsumeOpIndexPlusOne == 0 &&
+           !ownershipBodyIrManualConsumesBodyOp(
+               bodyIR, opIndex):
+            out = out + 1
+    return out
+
+fn ownershipBodyIrPublishExactCallArgConsumers(
+        bodyIR: var coreir.BodyIR,
+        access: var bodyaccess.BodyIrAccessTable) =
+    for definitionRow in 0..<bodyIR.ops.len:
+        if bodyIR.ops[definitionRow].valueDefOwnership !=
+               coreir.OwnMove ||
+           bodyIR.ops[definitionRow].valueDefConsumeOpIndexPlusOne != 0:
+            continue
+        var representative = -1
+        for opIndex in 0..<access.opFactStarts.len:
+            if bodyaccess.BodyIrAccessOpExactCallArgConsumesBodyDefinition(
+                   access, opIndex, definitionRow):
+                representative = opIndex
+                break
+        if representative >= 0:
+            # cp1 is deliberately only one canonical representative.  The
+            # complete consumer set and branch legality remain in ExactDef
+            # CSR plus BodyIrAccess CFG; never collapse those into this scalar.
+            bodyIR.ops[definitionRow].valueDefConsumeOpIndexPlusOne =
+                representative + 1
+
+@borrows
+fn ownershipBodyIrManualConsumesBodyOp(
+        bodyIR: coreir.BodyIR,
+        opIndex: int32): bool =
+    var found: bool
+    for row in 0..<bodyIR.manualConsume.sourceDefinitionRows.len:
+        if bodyIR.manualConsume.sourceDefinitionDomains[row] ==
+               coreir.BodyDefinitionDomainBodyOpTag &&
+           bodyIR.manualConsume.sourceDefinitionRows[row] ==
+               opIndex:
+            if found:
+                ownershipBodyIrFail(
+                    "ownership body ir production: manual source definition reused")
+            found = true
+    return found
+
+@borrows
+fn ownershipBodyIrRequireOwnedDefinitionSource(
+        bodyIR: coreir.BodyIR,
+        opIndex: int32) =
+    let op = bodyIR.ops[opIndex]
+    if op.valueDefOwnership != coreir.OwnMove &&
+       op.valueDefOwnership != coreir.OwnBorrowShared:
+        ownershipBodyIrFail(
+            "ownership body ir production: managed ownership class unsupported")
+    if op.valueDefOriginKind != coreir.BodyDefinitionOriginTypedExprTag ||
+       op.valueDefOriginId < 0 ||
+       op.valueDefSemanticRow != op.valueDefOriginId ||
+       op.valueDefSemanticRow < 0 ||
+       op.valueDefSlot < 0 ||
+       op.valueDefSlot >= bodyIR.localSlots.len ||
+       op.sourceDefinitionDomain !=
+           coreir.BodyDefinitionDomainInvalidTag ||
+       op.sourceDefinitionRow != -1:
+        ownershipBodyIrFail(
+            "ownership body ir production: exact TypedExpr definition authority missing")
+    if op.valueDefOwnership == coreir.OwnBorrowShared:
+        if op.valueDefBorrowOwnerSemanticRow < 0 ||
+           op.valueDefBorrowOwnerDefinitionDomain ==
+               coreir.BodyDefinitionDomainInvalidTag ||
+           op.valueDefBorrowOwnerDefinitionRow < 0 ||
+           op.valueDefConsumeOpIndexPlusOne != 0 ||
+           op.consumeActionRow != -1:
+            ownershipBodyIrFail(
+                "ownership body ir production: borrowed value owner authority missing")
+    elif op.valueDefBorrowOwnerSemanticRow != -1 ||
+         op.valueDefBorrowOwnerDefinitionDomain !=
+             coreir.BodyDefinitionDomainInvalidTag ||
+         op.valueDefBorrowOwnerDefinitionRow != -1:
+        ownershipBodyIrFail(
+            "ownership body ir production: owned value carries borrow owner")
+    let slot = bodyIR.localSlots[op.valueDefSlot]
+    if slot.managedStorageKind !=
+           coreir.BodyManagedStorageManagedTag ||
+       slot.typeArenaTypeId < 0:
+        ownershipBodyIrFail(
+            "ownership body ir production: managed TypeArena proof missing")
+    let typeFactRow =
+        coreir.BodyIRCanonicalTypeFactRow(
+            bodyIR, slot.typeArenaTypeId)
+    # [wall98] 判词富化（wall91/w94 cleanup_cfg 先例同款）：drift 判词
+    # 四条件（shape invalid / fact row 缺席 / size 漂移 / align 漂移）逐条
+    # 实况 + 节点坐标全列入判词。typeFactRow<0 时六列下标不可寻址，diag
+    # 列条件化取 -1；守卫判定零改动，fail-closed 判据原样。
+    let diagShapeValid =
+        if coreir.BodyIRCanonicalTypeFactShapeValid(bodyIR): 1 else: 0
+    let diagFactKind =
+        if typeFactRow >= 0: bodyIR.typeFactStructuralKinds[typeFactRow]
+        else: -1
+    let diagFactScalar =
+        if typeFactRow >= 0: bodyIR.typeFactScalarKinds[typeFactRow]
+        else: -1
+    let diagFactChild =
+        if typeFactRow >= 0: bodyIR.typeFactChildTypeIds[typeFactRow]
+        else: -1
+    let diagFactFixed =
+        if typeFactRow >= 0: bodyIR.typeFactFixedLengths[typeFactRow]
+        else: -1
+    let diagFactSize =
+        if typeFactRow >= 0: bodyIR.typeFactSizeBytes[typeFactRow]
+        else: -1
+    let diagFactAlign =
+        if typeFactRow >= 0: bodyIR.typeFactAlignBytes[typeFactRow]
+        else: -1
+    if !coreir.BodyIRCanonicalTypeFactShapeValid(bodyIR) ||
+       typeFactRow < 0 ||
+       bodyIR.typeFactSizeBytes[typeFactRow] !=
+           slot.sizeBytes ||
+       bodyIR.typeFactAlignBytes[typeFactRow] !=
+           slot.alignBytes:
+        ownershipBodyIrFail(
+            Fmt"ownership body ir production: managed TypeArena layout drift shape_valid={diagShapeValid} slot_type_id={slot.typeArenaTypeId} fact_row={typeFactRow} fact_count={bodyIR.typeFactTypeIds.len} slot_name={slot.name} slot_type_kind={Int32(slot.typeKind)} slot_storage={slot.managedStorageKind} slot_size={slot.sizeBytes} slot_align={slot.alignBytes} fact_kind={diagFactKind} fact_scalar={diagFactScalar} fact_child={diagFactChild} fact_fixed={diagFactFixed} fact_size={diagFactSize} fact_align={diagFactAlign} op={opIndex} op_kind={Int32(op.kind)} own={Int32(op.valueDefOwnership)} origin_kind={op.valueDefOriginKind} origin_id={op.valueDefOriginId} sem_row={op.valueDefSemanticRow} fn={bodyIR.controlFunctionRow}")
+    let structuralKind =
+        bodyIR.typeFactStructuralKinds[typeFactRow]
+    if structuralKind ==
+           Int32(typearena.TypedExprStructuralTypeScalar):
+        if bodyIR.typeFactScalarKinds[typeFactRow] !=
+               Int32(typearena.TypedExprStructuralScalarStr) ||
+           bodyIR.typeFactChildTypeIds[typeFactRow] != -1 ||
+           bodyIR.typeFactFixedLengths[typeFactRow] != 0 ||
+           slot.typeKind != coreir.LocalStrTag:
+            ownershipBodyIrFail(
+                "ownership body ir production: managed leaf is not canonical str")
+    elif structuralKind ==
+             Int32(typearena.TypedExprStructuralTypeSequence):
+        let childTypeId =
+            bodyIR.typeFactChildTypeIds[typeFactRow]
+        if bodyIR.typeFactScalarKinds[typeFactRow] !=
+               Int32(typearena.TypedExprStructuralScalarInvalid) ||
+           bodyIR.typeFactFixedLengths[typeFactRow] != 0 ||
+           childTypeId < 0 ||
+           coreir.BodyIRCanonicalTypeFactRow(
+               bodyIR, childTypeId) < 0 ||
+           slot.typeKind != coreir.LocalAggregateTag:
+            ownershipBodyIrFail(
+                Fmt"ownership body ir production: managed sequence element TypeId missing kind={structuralKind} scalar={bodyIR.typeFactScalarKinds[typeFactRow]} child={childTypeId} fixed={bodyIR.typeFactFixedLengths[typeFactRow]} slot_type_kind={Int32(slot.typeKind)} op={opIndex} own={Int32(op.valueDefOwnership)}")
+        # wall73 借视落穿臂（wall39 契约延伸）：seq 借视定义
+        # (OwnBorrowShared, 上方 Shared 臂借主权威全列 + 零消费边已证)
+        # 不引入自有堆负载、不进 ownership place 表 (ApplyOwned 主分析
+        # 仅 OwnMove 定义 AddPlace)，释放义务由借主根承担 → 无 drop-glue
+        # 权威需求，形状 fact 审计通过即落穿至 call-mirror 段 (非 call op
+        # 由 wall39 借视臂放行)。OwnMove 仍拒：seq owned 出口释放的
+        # drop-glue 权威在链上缺失 (runtime 无 var-ptr ABI glue、双
+        # backend 符号白名单无条目)，fail-closed 不变。
+        if op.valueDefOwnership != coreir.OwnBorrowShared:
+            ownershipBodyIrFail(
+                Fmt"ownership body ir production: managed sequence cleanup drop-glue authority missing kind={structuralKind} child={childTypeId} slot_type_kind={Int32(slot.typeKind)} op={opIndex} own={Int32(op.valueDefOwnership)}")
+    elif structuralKind ==
+             Int32(typearena.TypedExprStructuralTypeRefObject):
+        # wall73 新臂 (wall47 句柄权威：ref 声明 owner 行 = 8B 指针句柄，
+        # 字段行按 pointee 发布)。ref 托管槽的 fact 形状恒：scalar=Invalid、
+        # fixed=0、载体槽 LocalPtrTag；pointee 子 TypeId 在册即审 (child=-1
+        # 与 pointee fact 未投影形态按闭包域谓词放行，同
+        # BodyIRCleanupReferencedTypeFacts 的 child<0 跳过语义)。
+        let childTypeId =
+            bodyIR.typeFactChildTypeIds[typeFactRow]
+        if bodyIR.typeFactScalarKinds[typeFactRow] !=
+               Int32(typearena.TypedExprStructuralScalarInvalid) ||
+           bodyIR.typeFactFixedLengths[typeFactRow] != 0 ||
+           slot.typeKind != coreir.LocalPtrTag ||
+           (childTypeId >= 0 &&
+               coreir.BodyIRCanonicalTypeFactRow(
+                   bodyIR, childTypeId) < 0):
+            ownershipBodyIrFail(
+                Fmt"ownership body ir production: managed ref handle fact drift kind={structuralKind} scalar={bodyIR.typeFactScalarKinds[typeFactRow]} child={childTypeId} fixed={bodyIR.typeFactFixedLengths[typeFactRow]} slot_type_kind={Int32(slot.typeKind)} slot_size={slot.sizeBytes} slot_align={slot.alignBytes} fact_size={bodyIR.typeFactSizeBytes[typeFactRow]} fact_align={bodyIR.typeFactAlignBytes[typeFactRow]} op={opIndex} own={Int32(op.valueDefOwnership)}")
+        # ref 借视落穿 (同 seq 臂 wall39 契约延伸)：借主权威上方全证、
+        # 不进 place 表、零 drop 义务 → 落穿 call-mirror 段。
+        # [wall118] OwnMove 放行（wall73 移交三文件包接线完成）：
+        # runtime var-ptr ABI glue 已落 program_support_backend
+        # (@exportc("cheng_ref_drop_owned") /
+        # @exportc("cheng_ref_retain_owned")，CleanupPlan 合成调用单实参
+        # ByAddressAggregate 槽地址、8B 读写宽度、void 结果——C 级探针
+        # probe_ref_glue 实证 ABI 宽度与 refcount 语义)，本函数
+        # CleanupPlan 段按 structural kind 绑定 ref 句柄 glue，ref owned
+        # 定义出口必产 DropPlace 的 ownership_drop_ir 硬契约
+        # (`managed place lacks glue`/`owned drop lacks glue`) 由该绑定
+        # 满足；形状审计（scalar=Invalid、fixed=0、LocalPtrTag 载体、
+        # pointee child 闭包域）上方已全过，此处落穿 call-mirror 段。
+        # 非 Shared/Move ownership 类仍 fail-closed 原判词面，零弱化。
+        if op.valueDefOwnership != coreir.OwnMove &&
+           op.valueDefOwnership != coreir.OwnBorrowShared:
+            ownershipBodyIrFail(
+                Fmt"ownership body ir production: managed ref owned definition drop-glue authority missing kind={structuralKind} child={childTypeId} slot_type_kind={Int32(slot.typeKind)} slot_size={slot.sizeBytes} slot_align={slot.alignBytes} op={opIndex} own={Int32(op.valueDefOwnership)}")
+    elif structuralKind ==
+             Int32(typearena.TypedExprStructuralTypeBorrow):
+        # [wall82] var 托管借用参数借视类型臂（wall73 RefObject 臂同族契
+        # 约延伸）：`var T`（T 托管）参数的 exact 类型是非持有 BorrowedView
+        # （structural kind=Borrow，[w61] trait 派生刻意 managed=false，
+        # [w77] 冻结臂据此把参数槽建成 mg=Unmanaged）。其 fact 形状恒：
+        # scalar=Invalid、fixed=0、载体槽 LocalPtrTag（8B 借视句柄）、
+        # child=pointee TypeId（在册即审，child<0 闭包域放行同 RefObject
+        # 臂）。借视定义 (OwnBorrowShared) 的借主权威已在本函数上方
+        # Shared 臂全列证明，不引入自有堆负载、不进 ownership place 表
+        # (ApplyOwned 主分析仅 OwnMove 定义 AddPlace)，释放义务由借主根
+        # 承担 → 审计通过即落穿 call-mirror 段。OwnMove 仍 fail-closed：
+        # Borrow 视图无自有 drop-glue 权威（同 RefObject 臂理由：runtime
+        # 无 var-view ABI glue，owned 出口必产 DropPlace 在链上缺失），
+        # 补齐属 program_support_backend/双 backend 符号白名单授权面。
+        let borrowViewChildTypeId =
+            bodyIR.typeFactChildTypeIds[typeFactRow]
+        if bodyIR.typeFactScalarKinds[typeFactRow] !=
+               Int32(typearena.TypedExprStructuralScalarInvalid) ||
+           bodyIR.typeFactFixedLengths[typeFactRow] != 0 ||
+           slot.typeKind != coreir.LocalPtrTag ||
+           (borrowViewChildTypeId >= 0 &&
+               coreir.BodyIRCanonicalTypeFactRow(
+                   bodyIR, borrowViewChildTypeId) < 0):
+            ownershipBodyIrFail(
+                Fmt"ownership body ir production: managed borrow view fact drift kind={structuralKind} scalar={bodyIR.typeFactScalarKinds[typeFactRow]} child={borrowViewChildTypeId} fixed={bodyIR.typeFactFixedLengths[typeFactRow]} slot_type_kind={Int32(slot.typeKind)} slot_size={slot.sizeBytes} slot_align={slot.alignBytes} fact_size={bodyIR.typeFactSizeBytes[typeFactRow]} fact_align={bodyIR.typeFactAlignBytes[typeFactRow]} op={opIndex} own={Int32(op.valueDefOwnership)}")
+        if op.valueDefOwnership != coreir.OwnBorrowShared:
+            ownershipBodyIrFail(
+                Fmt"ownership body ir production: managed borrow view owned definition drop-glue authority missing kind={structuralKind} child={borrowViewChildTypeId} slot_type_kind={Int32(slot.typeKind)} op={opIndex} own={Int32(op.valueDefOwnership)}")
+    elif structuralKind ==
+             Int32(typearena.TypedExprStructuralTypeObject) ||
+         structuralKind ==
+             Int32(typearena.TypedExprStructuralTypeTuple) ||
+         structuralKind ==
+             Int32(typearena.TypedExprStructuralTypeEnum) ||
+         structuralKind ==
+             Int32(typearena.TypedExprStructuralTypeOptional):
+        ownershipBodyIrFail(
+            Fmt"ownership body ir production: managed aggregate field offset/drop-glue authority missing kind={structuralKind} scalar={bodyIR.typeFactScalarKinds[typeFactRow]} child={bodyIR.typeFactChildTypeIds[typeFactRow]} fixed={bodyIR.typeFactFixedLengths[typeFactRow]} slot_type_kind={Int32(slot.typeKind)} op={opIndex} own={Int32(op.valueDefOwnership)}")
+    else:
+        ownershipBodyIrFail(
+            Fmt"ownership body ir production: managed structural kind unsupported kind={structuralKind} scalar={bodyIR.typeFactScalarKinds[typeFactRow]} child={bodyIR.typeFactChildTypeIds[typeFactRow]} fixed={bodyIR.typeFactFixedLengths[typeFactRow]} slot_type_kind={Int32(slot.typeKind)} slot_size={slot.sizeBytes} slot_align={slot.alignBytes} fact_size={bodyIR.typeFactSizeBytes[typeFactRow]} fact_align={bodyIR.typeFactAlignBytes[typeFactRow]} op={opIndex} own={Int32(op.valueDefOwnership)}")
+    if op.kind != coreir.BodyOpCallTag:
+        # 借视物化拼写 (wall 系 binder PrimaryBodyIrPrepareManagedBodyOpValue
+        # DefinitionExact 打戳的 FieldLoad/IndexedLoad/CopyLocal 形; 载体节点
+        # ParamRef/LocalRef/FieldGet/IndexGet 的 expr class 按 typed_expr 权威
+        # 恒 Borrowed → OwnBorrowShared): 上方借主权威臂 (semantic row/domain/
+        # row 全列 + 零消费边) 与 managed TypeArena 布局证明已全过 = 完整生产
+        # 者契约。借视不引入自有堆负载, 释放义务由借主根承担, call-result
+        # mirror 只约束 fresh owned (OwnMove) 引入 (本函数头注释原契约);
+        # 借权列不全的 Shared def 在上方 Shared 臂即 die, 本分支零放宽。
+        if op.valueDefOwnership == coreir.OwnBorrowShared:
+            return
+        ownershipBodyIrFail(
+            "ownership body ir production: owned producer is not canonical call-result")
+    if op.operands.len != 1 ||
+       op.operands[0] < 0 ||
+       op.operands[0] >= bodyIR.callSequence.len:
+        ownershipBodyIrFail(
+            "ownership body ir production: owned producer is not canonical call-result")
+    let call = bodyIR.callSequence[op.operands[0]]
+    if call.resultSlot != op.valueDefSlot ||
+       call.resultOwnership != op.valueDefOwnership ||
+       call.resultExprNodeIndex != op.valueDefExprNodeIndex ||
+       call.resultValueDefinitionRow != op.valueDefSemanticRow ||
+       call.resultBorrowOwnerValueDefinitionRow !=
+           op.valueDefBorrowOwnerSemanticRow ||
+       call.resultBorrowOwnerDefinitionDomain !=
+           op.valueDefBorrowOwnerDefinitionDomain ||
+       call.resultBorrowOwnerDefinitionRow !=
+           op.valueDefBorrowOwnerDefinitionRow ||
+       call.resultDefinitionOriginKind != op.valueDefOriginKind ||
+       call.resultDefinitionOriginId != op.valueDefOriginId ||
+       call.sourceDefinitionDomain !=
+           coreir.BodyDefinitionDomainInvalidTag ||
+       call.sourceDefinitionRow != -1 ||
+       call.consumeActionRow != -1 ||
+       (call.resultPassKind != coreir.BodyCallPassStackValueTag &&
+        call.resultPassKind != coreir.BodyCallPassSretResultTag):
+        ownershipBodyIrFail(
+            "ownership body ir production: call-result definition mirror drift")
+
+@borrows
+fn ownershipBodyIrRequireOwnedDefinition(
+        bodyIR: coreir.BodyIR,
+        opIndex: int32) =
+    ownershipBodyIrRequireOwnedDefinitionSource(bodyIR, opIndex)
+    if bodyIR.ops[opIndex].valueDefOwnership != coreir.OwnMove ||
+       bodyIR.ops[opIndex].valueDefConsumeOpIndexPlusOne != 0 ||
+       bodyIR.ops[opIndex].consumeActionRow != -1:
+        ownershipBodyIrFail(
+            "ownership body ir production: cleanup definition is already consumed")
+@borrows
+fn ownershipBodyIrRequireManualSourceDefinition(
+        bodyIR: coreir.BodyIR,
+        access: var bodyaccess.BodyIrAccessTable,
+        definitionRow: int32,
+        consumeOpIndex: int32,
+        manualRow: int32) =
+    ownershipBodyIrRequireOwnedDefinitionSource(
+        bodyIR, definitionRow)
+    if bodyIR.ops[definitionRow].valueDefOwnership !=
+           coreir.OwnMove:
+        ownershipBodyIrFail(
+            "ownership body ir production: manual source is borrowed")
+    let sourceFactIndex =
+        bodyaccess.BodyIrAccessManualConsumeSourceFactIndex(
+            access, manualRow)
+    if consumeOpIndex < 0 ||
+       consumeOpIndex >= bodyIR.ops.len ||
+       sourceFactIndex < 0 ||
+       sourceFactIndex >= access.facts.len ||
+       access.facts[sourceFactIndex].siteKind !=
+           bodyaccess.BodyIrAccessSiteOp ||
+       access.facts[sourceFactIndex].siteIndex !=
+           consumeOpIndex ||
+       access.facts[sourceFactIndex].kind !=
+           bodyaccess.BodyIrAccessFactUse ||
+       !access.facts[sourceFactIndex].consumesDefinition ||
+       access.facts[sourceFactIndex].definitionDomain !=
+           coreir.BodyDefinitionDomainBodyOpTag ||
+       access.facts[sourceFactIndex].definitionRow !=
+           definitionRow ||
+       bodyIR.ops[definitionRow].valueDefConsumeOpIndexPlusOne != 0 ||
+       bodyIR.ops[definitionRow].consumeActionRow != -1:
+        ownershipBodyIrFail(
+            "ownership body ir production: manual source consume identity invalid")
+
+fn ownershipBodyIrReturnCount(bodyIR: var coreir.BodyIR): int32 =
+    var out: int32
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        if block.termIndex < 0 || block.termIndex >= bodyIR.terms.len:
+            ownershipBodyIrFail(
+                "ownership body ir production: block terminator missing")
+        if bodyIR.terms[block.termIndex].kind ==
+               coreir.BodyTermReturnTag:
+            out = out + 1
+    return out
+
+fn ownershipBodyIrReturnIsManaged(
+        bodyIR: var coreir.BodyIR,
+        termIndex: int32): bool =
+    if termIndex < 0 || termIndex >= bodyIR.terms.len:
+        ownershipBodyIrFail(
+            "ownership body ir production: return term out of range")
+    let sourceDefinitionDomain =
+        bodyIR.terms[termIndex].sourceDefinitionDomain
+    let sourceDefinitionRow =
+        bodyIR.terms[termIndex].sourceDefinitionRow
+    if sourceDefinitionDomain ==
+           coreir.BodyDefinitionDomainInvalidTag:
+        if sourceDefinitionRow != -1:
+            ownershipBodyIrFail(
+                "ownership body ir production: partial return definition coordinate")
+        if bodyIR.terms[termIndex].resultSlot >= 0 &&
+           bodyIR.terms[termIndex].resultSlot < bodyIR.localSlots.len &&
+           bodyIR.localSlots[
+               bodyIR.terms[termIndex].resultSlot].managedStorageKind ==
+               coreir.BodyManagedStorageManagedTag:
+            ownershipBodyIrFail(
+                "ownership body ir production: managed return value-def identity missing")
+        return false
+    if sourceDefinitionDomain !=
+           coreir.BodyDefinitionDomainBodyOpTag ||
+       sourceDefinitionRow < 0 ||
+       sourceDefinitionRow >= bodyIR.ops.len:
+        ownershipBodyIrFail(
+            "ownership body ir production: unsupported return definition domain")
+    if bodyIR.ops[sourceDefinitionRow].valueDefOwnership ==
+           coreir.OwnBorrowShared:
+        ownershipBodyIrFail(
+            "ownership body ir production: borrowed return lacks exact borrow-owner identity")
+    if bodyIR.ops[sourceDefinitionRow].valueDefOwnership !=
+           coreir.OwnMove ||
+       bodyIR.ops[sourceDefinitionRow].valueDefSlot !=
+           bodyIR.terms[termIndex].resultSlot:
+        ownershipBodyIrFail(
+            "ownership body ir production: owned return authority mismatch")
+    return true
+
+fn ownershipBodyIrValidateReturns(
+        bodyIR: var coreir.BodyIR): int32 =
+    let returnCount = ownershipBodyIrReturnCount(bodyIR)
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let termIndex = bodyIR.blocks[blockIndex].termIndex
+        if bodyIR.terms[termIndex].kind !=
+               coreir.BodyTermReturnTag:
+            continue
+        if bodyIR.terms[termIndex].resultSlot >=
+               bodyIR.localSlots.len:
+            ownershipBodyIrFail(
+                "ownership body ir production: return slot out of range")
+        let _ = ownershipBodyIrReturnIsManaged(bodyIR, termIndex)
+    return returnCount
+
+@borrows
+fn ownershipBodyIrTypeFactRow(
+        bodyIR: coreir.BodyIR,
+        typeId: int32): int32 =
+    let row = coreir.BodyIRCanonicalTypeFactRow(bodyIR, typeId)
+    if row < 0:
+        ownershipBodyIrFail(
+            "ownership body ir production: canonical TypeArena fact missing")
+    return row
+
+fn ownershipBodyIrTypeOrdinal(
+        exactTypeIds: var int32[],
+        exactTypeId: int32): int32 =
+    for index in 0..<exactTypeIds.len:
+        if exactTypeIds[index] == exactTypeId:
+            return index
+    return -1
+
+@borrows
+fn ownershipBodyIrManualConsumeCallOpIndex(
+        bodyIR: coreir.BodyIR,
+        callOrdinal: int32): int32 =
+    if callOrdinal < 0 ||
+       callOrdinal >= bodyIR.callSequence.len:
+        ownershipBodyIrFail(
+            "ownership body ir production: manual call ordinal invalid")
+    var found: int32 = -1
+    for opIndex in 0..<bodyIR.ops.len:
+        if bodyIR.ops[opIndex].kind ==
+               coreir.BodyOpCallTag &&
+           bodyIR.ops[opIndex].operands.len == 1 &&
+           bodyIR.ops[opIndex].operands[0] ==
+               callOrdinal:
+            if found >= 0:
+                ownershipBodyIrFail(
+                    "ownership body ir production: manual call op duplicated")
+            found = opIndex
+    if found < 0:
+        ownershipBodyIrFail(
+            "ownership body ir production: manual call op missing")
+    return found
+
+fn ownershipBodyIrDropDefinitionDomain(
+        domain: int32): int32 =
+    if domain == coreir.BodyDefinitionDomainEntrySlotTag:
+        return odir.OwnershipDropDefinitionDomainEntrySlot
+    if domain == coreir.BodyDefinitionDomainBodyOpTag:
+        return odir.OwnershipDropDefinitionDomainBodyOp
+    if domain ==
+           coreir.BodyDefinitionDomainManualConsumePostCallTag:
+        return odir.OwnershipDropDefinitionDomainManualConsumePostCall
+    ownershipBodyIrFail(
+        "ownership body ir production: manual definition domain invalid")
+    return 0
+
+@borrows
+fn ownershipBodyIrValidateManualConsumeEffects(
+        bodyIR: coreir.BodyIR,
+        access: var bodyaccess.BodyIrAccessTable) =
+    if !bodyIR.manualConsume.sealed:
+        if !coreir.BodyIRManualConsumeSidecarIsCanonicalEmpty(
+               bodyIR.manualConsume):
+            ownershipBodyIrFail(
+                "ownership body ir production: unsealed manual sidecar is not empty")
+        return
+    if !coreir.BodyIRManualConsumeSidecarShapeValid(bodyIR):
+        ownershipBodyIrFail(
+            "ownership body ir production: manual sidecar invalid")
+    let manualCount =
+        bodyIR.manualConsume.callOrdinals.len
+    if manualCount == 0:
+        return
+    if !bodyaccess.BodyIrAccessTableIsValid(access):
+        ownershipBodyIrFail(
+            "ownership body ir production: manual CFG access invalid")
+    ownershipBodyIrRequireControlFacts(bodyIR)
+
+    var scopeByBodyOp: int32[]
+    var manualRowByBodyOp: int32[]
+    var manualBodySourcePlaces: int32[]
+    for _ in 0..<bodyIR.ops.len:
+        add(scopeByBodyOp, -1)
+        add(manualRowByBodyOp, -1)
+        add(manualBodySourcePlaces, -1)
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let opStart = bodyIR.blocks[blockIndex].opStart
+        let opCount = bodyIR.blocks[blockIndex].opCount
+        for opOffset in 0..<opCount:
+            let opIndex = opStart + opOffset
+            if opIndex < 0 ||
+               opIndex >= bodyIR.ops.len ||
+               scopeByBodyOp[opIndex] >= 0:
+                ownershipBodyIrFail(
+                    "ownership body ir production: manual op block partition invalid")
+            scopeByBodyOp[opIndex] =
+                bodyIR.blockScopeIds[blockIndex]
+    for opIndex in 0..<scopeByBodyOp.len:
+        if scopeByBodyOp[opIndex] < 0:
+            ownershipBodyIrFail(
+                "ownership body ir production: manual op scope missing")
+
+    var exactTypeIds: int32[]
+    for row in 0..<manualCount:
+        let callOpIndex =
+            ownershipBodyIrManualConsumeCallOpIndex(
+                bodyIR,
+                bodyIR.manualConsume.callOrdinals[row])
+        if manualRowByBodyOp[callOpIndex] >= 0:
+            ownershipBodyIrFail(
+                "ownership body ir production: manual transfer op reused")
+        manualRowByBodyOp[callOpIndex] = row
+
+        let targetOwnerSlot =
+            bodyIR.manualConsume.targetOwnerSlotIds[row]
+        let sourceSlot =
+            bodyIR.manualConsume.sourcePlaceSlotIds[row]
+        if targetOwnerSlot < 0 ||
+           targetOwnerSlot >= bodyIR.localSlots.len ||
+           sourceSlot < 0 ||
+           sourceSlot >= bodyIR.localSlots.len ||
+           targetOwnerSlot == sourceSlot ||
+           !bodyIR.entryDefinitionOwnershipSealed ||
+           targetOwnerSlot >=
+               bodyIR.entryDefinitionOwnershipKinds.len ||
+           bodyIR.entryDefinitionOwnershipKinds[
+               targetOwnerSlot] !=
+               int32(coreir.OwnBorrowUnique) ||
+           bodyIR.localSlots[targetOwnerSlot].stackOffset >= 0 ||
+           bodyIR.localSlots[targetOwnerSlot].managedStorageKind !=
+               coreir.BodyManagedStorageManagedTag ||
+           bodyIR.localSlots[targetOwnerSlot].typeKind !=
+               coreir.LocalStrTag ||
+           bodyIR.localSlots[sourceSlot].managedStorageKind !=
+               coreir.BodyManagedStorageManagedTag ||
+           bodyIR.localSlots[sourceSlot].typeKind !=
+               coreir.LocalStrTag ||
+           bodyIR.localSlots[targetOwnerSlot].typeArenaTypeId !=
+               bodyIR.manualConsume.sourceTypeArenaTypeIds[row] ||
+           bodyIR.localSlots[sourceSlot].typeArenaTypeId !=
+               bodyIR.manualConsume.sourceTypeArenaTypeIds[row]:
+            ownershipBodyIrFail(
+                "ownership body ir production: external manual place authority invalid")
+        if bodyIR.manualConsume.targetDefinitionDomains[row] ==
+               coreir.BodyDefinitionDomainEntrySlotTag:
+            if bodyIR.manualConsume.targetDefinitionRows[row] !=
+                   targetOwnerSlot:
+                ownershipBodyIrFail(
+                    "ownership body ir production: external target entry definition drift")
+        elif bodyIR.manualConsume.targetDefinitionDomains[row] !=
+                 coreir.BodyDefinitionDomainManualConsumePostCallTag:
+            ownershipBodyIrFail(
+                "ownership body ir production: external target definition domain invalid")
+        else:
+            let targetPostRow =
+                bodyIR.manualConsume.targetDefinitionRows[row]
+            if targetPostRow < 0 ||
+               targetPostRow >= manualCount ||
+               bodyIR.manualConsume.targetOwnerSlotIds[
+                   targetPostRow] != targetOwnerSlot:
+                ownershipBodyIrFail(
+                    "ownership body ir production: external target post definition invalid")
+
+        let sourceDomain =
+            bodyIR.manualConsume.sourceDefinitionDomains[row]
+        let sourceDefinitionRow =
+            bodyIR.manualConsume.sourceDefinitionRows[row]
+        if sourceDomain ==
+               coreir.BodyDefinitionDomainEntrySlotTag:
+            if sourceDefinitionRow != sourceSlot ||
+               sourceSlot >=
+                   bodyIR.entryDefinitionOwnershipKinds.len ||
+               bodyIR.entryDefinitionOwnershipKinds[
+                   sourceSlot] != int32(coreir.OwnMove) ||
+               bodyIR.localSlots[sourceSlot].stackOffset >= 0:
+                ownershipBodyIrFail(
+                    "ownership body ir production: manual entry source invalid")
+        elif sourceDomain ==
+                 coreir.BodyDefinitionDomainBodyOpTag:
+            if sourceDefinitionRow < 0 ||
+               sourceDefinitionRow >= bodyIR.ops.len ||
+               bodyIR.ops[sourceDefinitionRow].valueDefSlot !=
+                   sourceSlot:
+                ownershipBodyIrFail(
+                    "ownership body ir production: manual BodyOp source invalid")
+            ownershipBodyIrRequireManualSourceDefinition(
+                bodyIR,
+                access,
+                sourceDefinitionRow,
+                callOpIndex,
+                row)
+        else:
+            ownershipBodyIrFail(
+                "ownership body ir production: manual source domain unsupported")
+        let exactTypeId =
+            bodyIR.manualConsume.sourceTypeArenaTypeIds[row]
+        if ownershipBodyIrTypeOrdinal(
+               exactTypeIds, exactTypeId) < 0:
+            add(exactTypeIds, exactTypeId)
+
+    var ir: odir.OwnershipDropIr
+    odir.OwnershipDropIrInit(ir)
+    let rootScope = odir.OwnershipDropRootScopeId(ir)
+    for scopeId in 1..<bodyIR.controlScopeParentIds.len:
+        let ownershipScope = odir.OwnershipDropAddScope(
+            ir, bodyIR.controlScopeParentIds[scopeId])
+        if ownershipScope != scopeId:
+            ownershipBodyIrFail(
+                "ownership body ir production: manual scope identity drift")
+
+    var ownershipTypeIds: int32[]
+    for typeOrdinal in 0..<exactTypeIds.len:
+        let typeFactRow = ownershipBodyIrTypeFactRow(
+            bodyIR, exactTypeIds[typeOrdinal])
+        var matchingSlot: int32 = -1
+        for row in 0..<manualCount:
+            let sourceSlot =
+                bodyIR.manualConsume.sourcePlaceSlotIds[row]
+            if bodyIR.localSlots[sourceSlot].typeArenaTypeId ==
+                   exactTypeIds[typeOrdinal]:
+                matchingSlot = sourceSlot
+                break
+        if matchingSlot < 0 ||
+           bodyIR.typeFactSizeBytes[typeFactRow] !=
+               bodyIR.localSlots[matchingSlot].sizeBytes ||
+           bodyIR.typeFactAlignBytes[typeFactRow] !=
+               bodyIR.localSlots[matchingSlot].alignBytes:
+            ownershipBodyIrFail(
+                "ownership body ir production: manual type layout drift")
+        let ownershipTypeId =
+            odir.OwnershipDropRegisterLeafType(
+                ir,
+                Fmt"manual_type_arena#{layout.FixedBytes32Hex(bodyIR.typeArenaArtifactCid)}#{exactTypeIds[typeOrdinal]}",
+                typeOrdinal + 1)
+        add(ownershipTypeIds, ownershipTypeId)
+
+    var targetPlaceBySlot: int32[]
+    var entrySourcePlaceBySlot: int32[]
+    for _ in 0..<bodyIR.localSlots.len:
+        add(targetPlaceBySlot, -1)
+        add(entrySourcePlaceBySlot, -1)
+    for row in 0..<manualCount:
+        let exactTypeId =
+            bodyIR.manualConsume.sourceTypeArenaTypeIds[row]
+        let typeOrdinal =
+            ownershipBodyIrTypeOrdinal(
+                exactTypeIds, exactTypeId)
+        let targetOwnerSlot =
+            bodyIR.manualConsume.targetOwnerSlotIds[row]
+        if targetPlaceBySlot[targetOwnerSlot] < 0:
+            let placeId = odir.OwnershipDropAddPlace(
+                ir,
+                ownershipTypeIds[typeOrdinal],
+                odir.ExternalVarBorrow,
+                rootScope)
+            odir.OwnershipDropBindEntryDefinition(
+                ir,
+                placeId,
+                odir.OwnershipDropDefinitionDomainEntrySlot,
+                targetOwnerSlot)
+            targetPlaceBySlot[targetOwnerSlot] = placeId
+        let sourceDomain =
+            bodyIR.manualConsume.sourceDefinitionDomains[row]
+        let sourceDefinitionRow =
+            bodyIR.manualConsume.sourceDefinitionRows[row]
+        if sourceDomain ==
+               coreir.BodyDefinitionDomainEntrySlotTag:
+            if entrySourcePlaceBySlot[sourceDefinitionRow] < 0:
+                let placeId = odir.OwnershipDropAddPlace(
+                    ir,
+                    ownershipTypeIds[typeOrdinal],
+                    odir.Owned,
+                    rootScope)
+                odir.OwnershipDropBindEntryDefinition(
+                    ir,
+                    placeId,
+                    odir.OwnershipDropDefinitionDomainEntrySlot,
+                    sourceDefinitionRow)
+                entrySourcePlaceBySlot[sourceDefinitionRow] =
+                    placeId
+        else:
+            if manualBodySourcePlaces[
+                   sourceDefinitionRow] >= 0:
+                ownershipBodyIrFail(
+                    "ownership body ir production: manual BodyOp source reused")
+            manualBodySourcePlaces[sourceDefinitionRow] =
+                odir.OwnershipDropAddPlace(
+                    ir,
+                    ownershipTypeIds[typeOrdinal],
+                    odir.Owned,
+                    scopeByBodyOp[sourceDefinitionRow])
+
+    var ownershipManualOps: int32[]
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let ownershipBlock =
+            odir.OwnershipDropAddBlock(
+                ir, bodyIR.blockScopeIds[blockIndex])
+        if ownershipBlock != blockIndex:
+            ownershipBodyIrFail(
+                "ownership body ir production: manual block identity drift")
+        if blockIndex == 0:
+            odir.OwnershipDropSetEntryBlock(
+                ir, ownershipBlock)
+        let opStart = bodyIR.blocks[blockIndex].opStart
+        let opCount = bodyIR.blocks[blockIndex].opCount
+        for opOffset in 0..<opCount:
+            let opIndex = opStart + opOffset
+            if manualBodySourcePlaces[opIndex] > 0:
+                let initializeOp =
+                    odir.OwnershipDropAppendInitialize(
+                        ir,
+                        ownershipBlock,
+                        manualBodySourcePlaces[opIndex])
+                odir.OwnershipDropBindOpDefinitionAuthority(
+                    ir,
+                    initializeOp,
+                    odir.DefinitionOriginTypedExpr,
+                    bodyIR.ops[opIndex].valueDefOriginId,
+                    odir.OwnershipDropDefinitionDomainBodyOp,
+                    opIndex,
+                    odir.Owned)
+                odir.OwnershipDropBindOpDefinitionCoordinate(
+                    ir,
+                    initializeOp,
+                    odir.OwnershipDropDefinitionDomainBodyOp,
+                    opIndex)
+            let manualRow =
+                manualRowByBodyOp[opIndex]
+            if manualRow < 0:
+                continue
+            let sourceDomain =
+                bodyIR.manualConsume.sourceDefinitionDomains[manualRow]
+            let sourceDefinitionRow =
+                bodyIR.manualConsume.sourceDefinitionRows[manualRow]
+            var sourcePlace: int32
+            if sourceDomain ==
+                   coreir.BodyDefinitionDomainEntrySlotTag:
+                sourcePlace =
+                    entrySourcePlaceBySlot[sourceDefinitionRow]
+            else:
+                sourcePlace =
+                    manualBodySourcePlaces[sourceDefinitionRow]
+            if sourcePlace <= 0:
+                ownershipBodyIrFail(
+                    "ownership body ir production: manual source place missing")
+            let manualOp =
+                odir.OwnershipDropAppendManualConsumeTransfer(
+                    ir,
+                    ownershipBlock,
+                    targetPlaceBySlot[
+                        bodyIR.manualConsume.targetOwnerSlotIds[manualRow]],
+                    sourcePlace,
+                    manualRow,
+                    ownershipBodyIrDropDefinitionDomain(
+                        bodyIR.manualConsume.targetDefinitionDomains[manualRow]),
+                    bodyIR.manualConsume.targetDefinitionRows[manualRow],
+                    ownershipBodyIrDropDefinitionDomain(
+                        sourceDomain),
+                    sourceDefinitionRow,
+                    odir.OwnershipDropDefinitionDomainManualConsumePostCall,
+                    manualRow)
+            add(ownershipManualOps, manualOp)
+
+    let terminalOwnershipBlock =
+        odir.OwnershipDropAddBlock(ir, rootScope)
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let termIndex =
+            bodyIR.blocks[blockIndex].termIndex
+        let successorStart =
+            bodyIR.termSuccessorStarts[termIndex]
+        let successorCount =
+            bodyIR.termSuccessorCounts[termIndex]
+        if bodyIR.terms[termIndex].kind ==
+               coreir.BodyTermReturnTag:
+            if successorCount != 0:
+                ownershipBodyIrFail(
+                    "ownership body ir production: manual return has successor")
+            var cleanupPlaces: int32[]
+            ownershipBodyIrAppendCleanupInventory(
+                bodyIR,
+                ir,
+                bodyIR.blockScopeIds[blockIndex],
+                -1,
+                true,
+                cleanupPlaces)
+            var deferIds: int32[]
+            let _ = odir.OwnershipDropAddEdge(
+                ir,
+                blockIndex,
+                terminalOwnershipBlock,
+                odir.OwnershipDropEdgeReturn,
+                -1,
+                cleanupPlaces,
+                deferIds)
+        else:
+            for successorOrdinal in 0..<successorCount:
+                let successorRow =
+                    successorStart + successorOrdinal
+                let targetBlockId =
+                    bodyIR.successorBlockIds[successorRow]
+                var cleanupPlaces: int32[]
+                ownershipBodyIrAppendCleanupInventory(
+                    bodyIR,
+                    ir,
+                    bodyIR.blockScopeIds[blockIndex],
+                    bodyIR.blockScopeIds[targetBlockId],
+                    false,
+                    cleanupPlaces)
+                var deferIds: int32[]
+                let _ = odir.OwnershipDropAddEdge(
+                    ir,
+                    blockIndex,
+                    targetBlockId,
+                    ownershipBodyIrEdgeKind(
+                        bodyIR.successorEdgeKinds[
+                            successorRow]),
+                    -1,
+                    cleanupPlaces,
+                    deferIds)
+
+    var analysis: odir.OwnershipDropAnalysis
+    odir.OwnershipDropAnalyzeCanonical(ir, analysis)
+    if !analysis.converged ||
+       ownershipManualOps.len != manualCount ||
+       analysis.cleanupActions.len != 0:
+        ownershipBodyIrFail(
+            "ownership body ir production: manual transfer produced cleanup action")
+    for row in 0..<ownershipManualOps.len:
+        let opIndex = ownershipManualOps[row]
+        if opIndex < 0 ||
+           opIndex >= analysis.opActionCounts.len ||
+           analysis.opActionCounts[opIndex] != 0:
+            ownershipBodyIrFail(
+                "ownership body ir production: manual transfer produced machine action")
+    for edgeIndex in 0..<analysis.edgeActionCounts.len:
+        if analysis.edgeActionCounts[edgeIndex] != 0:
+            ownershipBodyIrFail(
+                "ownership body ir production: manual edge produced cleanup action")
+
+    var analysisRelease: odir.OwnershipDropStorageReleaseReceipt
+    odir.OwnershipDropAnalysisRelease(
+        analysis, analysisRelease)
+    if !odir.OwnershipDropAnalysisStorageReleased(
+           analysis):
+        ownershipBodyIrFail(
+            "ownership body ir production: manual analysis release incomplete")
+    var irRelease: odir.OwnershipDropStorageReleaseReceipt
+    odir.OwnershipDropIrRelease(ir, irRelease)
+    if !odir.OwnershipDropIrStorageReleased(ir):
+        ownershipBodyIrFail(
+            "ownership body ir production: manual ir release incomplete")
+
+@borrows
+fn ownershipBodyIrValidateDeferIdentity(
+        bodyIR: coreir.BodyIR): int32 =
+    ownershipBodyIrRequireControlFacts(bodyIR)
+    let deferCount =
+        bodyIR.deferDeclarationScopeIds.len
+    if deferCount == 0:
+        return 0
+    if bodyIR.blocks.len == 0:
+        ownershipBodyIrFail(
+            "ownership body ir production: defer CFG has no entry block")
+    for deferIndex in 0..<deferCount:
+        let declarationScopeId =
+            bodyIR.deferDeclarationScopeIds[deferIndex]
+        for priorIndex in 0..<deferIndex:
+            if bodyIR.deferDeclarationScopeIds[priorIndex] ==
+                   declarationScopeId &&
+               bodyIR.deferLexicalOrdinals[priorIndex] >=
+                   bodyIR.deferLexicalOrdinals[deferIndex]:
+                ownershipBodyIrFail(
+                    "ownership body ir production: defer lexical identity is not strict")
+        if !layout.FixedBytes32Equal(
+               bodyIR.deferActionCids[deferIndex],
+               coreir.BodyIRControlFlowDeferActionCid(
+                   bodyIR, deferIndex)):
+            ownershipBodyIrFail(
+                "ownership body ir production: defer action CID identity drift")
+
+    var ir: odir.OwnershipDropIr
+    odir.OwnershipDropIrInit(ir)
+    let rootScope =
+        odir.OwnershipDropRootScopeId(ir)
+    for scopeId in 1..<bodyIR.controlScopeParentIds.len:
+        let ownershipScope = odir.OwnershipDropAddScope(
+            ir, bodyIR.controlScopeParentIds[scopeId])
+        if ownershipScope != scopeId:
+            ownershipBodyIrFail(
+                "ownership body ir production: defer scope identity drift")
+    for deferIndex in 0..<deferCount:
+        let ownershipDeferId =
+            odir.OwnershipDropRegisterDeferEffect(
+                ir,
+                bodyIR.deferDeclarationScopeIds[deferIndex],
+                odir.DeferEffectNoOwnership,
+                -1,
+                -1)
+        if ownershipDeferId != deferIndex + 1:
+            ownershipBodyIrFail(
+                "ownership body ir production: defer ID identity drift")
+
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let ownershipBlock =
+            odir.OwnershipDropAddBlock(
+                ir, bodyIR.blockScopeIds[blockIndex])
+        if ownershipBlock != blockIndex:
+            ownershipBodyIrFail(
+                "ownership body ir production: defer block identity drift")
+        if blockIndex == 0:
+            odir.OwnershipDropSetEntryBlock(ir, ownershipBlock)
+        var previousAfterOpOrdinal: int32 = -1
+        for siteIndex in
+                0..<bodyIR.deferActivationSiteBlockIds.len:
+            if bodyIR.deferActivationSiteBlockIds[siteIndex] !=
+                   blockIndex:
+                continue
+            let afterOpOrdinal =
+                bodyIR.deferActivationSiteAfterOpOrdinals[siteIndex]
+            if afterOpOrdinal <= previousAfterOpOrdinal:
+                ownershipBodyIrFail(
+                    "ownership body ir production: defer activation sites are not ordered")
+            previousAfterOpOrdinal = afterOpOrdinal
+            let start =
+                bodyIR.deferActivationSiteStarts[siteIndex]
+            let count =
+                bodyIR.deferActivationSiteCounts[siteIndex]
+            for rowOffset in 0..<count:
+                let deferIndex =
+                    bodyIR.deferActivationRows[start + rowOffset]
+                let ownershipOp =
+                    odir.OwnershipDropAppendActivateDefer(
+                        ir, ownershipBlock, deferIndex + 1)
+                if ownershipOp < 0:
+                    ownershipBodyIrFail(
+                        "ownership body ir production: defer activation identity missing")
+    let terminalBlock =
+        odir.OwnershipDropAddBlock(ir, rootScope)
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let termIndex =
+            bodyIR.blocks[blockIndex].termIndex
+        let successorStart =
+            bodyIR.termSuccessorStarts[termIndex]
+        let successorCount =
+            bodyIR.termSuccessorCounts[termIndex]
+        if bodyIR.terms[termIndex].kind ==
+               coreir.BodyTermReturnTag:
+            var cleanupPlaces: int32[]
+            var deferIds: int32[]
+            ownershipBodyIrAppendDeferInventory(
+                bodyIR,
+                bodyIR.blockScopeIds[blockIndex],
+                -1,
+                true,
+                deferIds)
+            let edgeId = odir.OwnershipDropAddEdge(
+                ir,
+                blockIndex,
+                terminalBlock,
+                odir.OwnershipDropEdgeReturn,
+                -1,
+                cleanupPlaces,
+                deferIds)
+            let _ =
+                cleanup.CleanupPlanVerifyBodyIrDeferExitIdentityBoundary(
+                    bodyIR,
+                    ir,
+                    edgeId,
+                    bodyIR.blockScopeIds[blockIndex],
+                    -1,
+                    true)
+        else:
+            for successorOrdinal in 0..<successorCount:
+                let successorRow =
+                    successorStart + successorOrdinal
+                let targetBlockId =
+                    bodyIR.successorBlockIds[successorRow]
+                var cleanupPlaces: int32[]
+                var deferIds: int32[]
+                ownershipBodyIrAppendDeferInventory(
+                    bodyIR,
+                    bodyIR.blockScopeIds[blockIndex],
+                    bodyIR.blockScopeIds[targetBlockId],
+                    false,
+                    deferIds)
+                let edgeId = odir.OwnershipDropAddEdge(
+                    ir,
+                    blockIndex,
+                    targetBlockId,
+                    ownershipBodyIrEdgeKind(
+                        bodyIR.successorEdgeKinds[successorRow]),
+                    -1,
+                    cleanupPlaces,
+                    deferIds)
+                let _ =
+                    cleanup.CleanupPlanVerifyBodyIrDeferExitIdentityBoundary(
+                        bodyIR,
+                        ir,
+                        edgeId,
+                        bodyIR.blockScopeIds[blockIndex],
+                        bodyIR.blockScopeIds[targetBlockId],
+                        false)
+    var analysis: odir.OwnershipDropAnalysis
+    odir.OwnershipDropAnalyzeCanonical(ir, analysis)
+    if !analysis.converged:
+        ownershipBodyIrFail(
+            "ownership body ir production: defer identity fixed point did not converge")
+    var analysisRelease: odir.OwnershipDropStorageReleaseReceipt
+    odir.OwnershipDropAnalysisRelease(
+        analysis, analysisRelease)
+    if !odir.OwnershipDropAnalysisStorageReleased(
+           analysis):
+        ownershipBodyIrFail(
+            "ownership body ir production: defer analysis release incomplete")
+    var irRelease: odir.OwnershipDropStorageReleaseReceipt
+    odir.OwnershipDropIrRelease(ir, irRelease)
+    if !odir.OwnershipDropIrStorageReleased(ir):
+        ownershipBodyIrFail(
+            "ownership body ir production: defer ir release incomplete")
+    return deferCount
+
+# [wall126] Ownership 拒绝判词 diag（富化，无身份参与）：给定 errorDetail
+# 槽，dump ①该槽全部已盖章 def 行（d 行:kind:ownership——CFG states 的
+# 唯一 Gen 来源）②全部 managed-replace sidecar 行（op:sourceSlot:
+# targetRoot 对——exact-call-arg Kill 的镜像守卫权威）③targetOwner 命中
+# 该槽的 manual-consume 行。用于 states[slot]<0 族（CFG replay）与注册
+# 来源的联立归因。
+@borrows
+fn ownershipBodyIrAccessRejectDiag(bodyIR: coreir.BodyIR,
+                                   slotIndex: int32): str =
+    var diag = Fmt" slot{slotIndex}defops="
+    if slotIndex >= 0 && slotIndex < bodyIR.localSlots.len:
+        for opIndex in 0..<bodyIR.ops.len:
+            let diagOp = bodyIR.ops[opIndex]
+            if diagOp.valueDefSlot == slotIndex &&
+               diagOp.valueDefOwnership != coreir.OwnInvalid:
+                diag = Fmt"{diag}d{opIndex}:k{Int32(diagOp.kind)}:o{Int32(diagOp.valueDefOwnership)}"
+    diag = Fmt"{diag} replacerows="
+    for replaceRow in 0..<bodyIR.managedLvalueReplace.replaceOpRows.len:
+        diag = Fmt"{diag}r{replaceRow}:op{bodyIR.managedLvalueReplace.replaceOpRows[replaceRow]}:ss{bodyIR.managedLvalueReplace.sourceSlotIds[replaceRow]}:trd{bodyIR.managedLvalueReplace.targetRootDefinitionDomains[replaceRow]}:{bodyIR.managedLvalueReplace.targetRootDefinitionRows[replaceRow]}"
+    diag = Fmt"{diag} mcrows="
+    for manualRow in 0..<bodyIR.manualConsume.targetOwnerSlotIds.len:
+        if bodyIR.manualConsume.targetOwnerSlotIds[manualRow] == slotIndex:
+            diag = Fmt"{diag}m{manualRow}:call{bodyIR.manualConsume.callOrdinals[manualRow]}"
+    return diag
+
+@borrows
+fn ownershipBodyIrLimits(
+        bodyIR: coreir.BodyIR,
+        definitionCount: int32,
+        edgeCount: int32,
+        flagCount: int32): cleanup.CleanupPlanLimits =
+    var limits: cleanup.CleanupPlanLimits
+    let scale =
+        bodyIR.ops.len + bodyIR.blocks.len + definitionCount +
+        edgeCount + flagCount + 32
+    limits.maxSourceBlockCount = bodyIR.blocks.len
+    limits.maxLocalSlotCount = bodyIR.localSlots.len + scale
+    limits.maxScopeCount = bodyIR.controlScopeParentIds.len
+    limits.maxDeferCount = bodyIR.deferDeclarationScopeIds.len
+    limits.maxExitCount = edgeCount
+    limits.maxExitDeferRefCount = 0
+    limits.maxFragmentCount = 0
+    limits.maxFragmentOpCount = 0
+    limits.maxFragmentOperandCount = 0
+    limits.maxFragmentCallCount = 0
+    limits.maxFragmentCallArgCount = 0
+    limits.maxFragmentBlockCount = 0
+    limits.maxFragmentTermCount = 0
+    limits.maxFragmentTermOperandCount = 0
+    limits.maxFragmentCStringCount = 0
+    limits.maxStringPayloadBytes = scale * 192
+    limits.maxMaterializedOpCount = scale * 8
+    limits.maxMaterializedOperandCount = scale * 16
+    limits.maxMaterializedCallCount = scale * 4
+    limits.maxMaterializedCallArgCount = scale * 8
+    limits.maxMaterializedBlockCount = scale * 8
+    limits.maxMaterializedTermCount = scale * 8
+    limits.maxMaterializedTermOperandCount = scale * 4
+    limits.maxMaterializedCStringCount = 0
+    limits.maxOwnershipGuardProjectionCount = 0
+    limits.maxOwnershipPlaceBindingCount = definitionCount + 8
+    limits.maxOwnershipFieldBindingCount = 0
+    limits.maxOwnershipDropGlueBindingCount = definitionCount + 8
+    limits.maxOwnershipConditionFlagBindingCount = flagCount + 8
+    limits.maxOwnershipActionCount = scale * 4
+    limits.maxOwnershipActionFlagRefCount = scale * 4
+    limits.maxOwnershipFieldProjectionStepCount = 0
+    limits.maxOwnershipFlagTransitionCount = scale * 4
+    limits.maxOwnershipOpTransitionSiteCount = scale * 4
+    return limits
+
+fn OwnershipBodyIrProductionApplyOwned(
+        bodyIR: var coreir.BodyIR): OwnershipBodyIrProductionReport =
+    var report: OwnershipBodyIrProductionReport
+    # The access decoder owns the canonical CFG reaching-definition proof.
+    # It must run before managed-replace admission and before the
+    # zero-cleanup fast return; physical BodyOp order is never dominance.
+    var entryAccess = bodyaccess.BodyIrAccessDecode(bodyIR)
+    if !bodyaccess.BodyIrAccessTableIsValid(entryAccess):
+        # [wall82] 判词富化（wall40/45/47/73/74/80 同款，原文本作前缀
+        # grep 仍命中）：op 站点失败携带该 op 全部语义权威列 + 槽表投影，
+        # 区分「位拷贝缺借视身份链」「call/result 形状漂移」「slot 管理域
+        # 漂移」三族死因；非 op 站点保持原文本。
+        var ingressSiteDump = ""
+        if entryAccess.errorSiteKind == bodyaccess.BodyIrAccessSiteOp &&
+           entryAccess.errorSiteIndex >= 0 &&
+           entryAccess.errorSiteIndex < bodyIR.ops.len:
+            let ingressOp = bodyIR.ops[entryAccess.errorSiteIndex]
+            ingressSiteDump = Fmt" op_kind={Int32(ingressOp.kind)} op_target={ingressOp.target} op_operands={ingressOp.operands.len}"
+            for ingressOperandIndex in 0..<ingressOp.operands.len:
+                ingressSiteDump = Fmt"{ingressSiteDump} a{ingressOperandIndex}={ingressOp.operands[ingressOperandIndex]}"
+            ingressSiteDump = Fmt"{ingressSiteDump} vd_slot={ingressOp.valueDefSlot} vd_own={Int32(ingressOp.valueDefOwnership)} vd_row={ingressOp.valueDefSemanticRow} vd_node={ingressOp.valueDefExprNodeIndex} vd_origin={Int32(ingressOp.valueDefOriginKind)} vd_origin_id={ingressOp.valueDefOriginId} bo_row={ingressOp.valueDefBorrowOwnerSemanticRow} bo_domain={Int32(ingressOp.valueDefBorrowOwnerDefinitionDomain)} bo_def_row={ingressOp.valueDefBorrowOwnerDefinitionRow} consume_plus1={ingressOp.valueDefConsumeOpIndexPlusOne} action_row={ingressOp.consumeActionRow} src_domain={Int32(ingressOp.sourceDefinitionDomain)} src_row={ingressOp.sourceDefinitionRow}"
+            ingressSiteDump = Fmt"{ingressSiteDump} slots={bodyIR.localSlots.len} sealed={bodyIR.entryDefinitionOwnershipSealed}"
+            # [wall126] Ownership 拒绝门相位（=body_ir_access.cheng fail
+            # 调用首行源行号，0=未打标）。detail 多门语义重叠，phase 消歧。
+            ingressSiteDump = Fmt"{ingressSiteDump} phase={entryAccess.errorPhase}"
+            # [wall126] Ownership 拒绝：detail 槽的 def-census/replace/
+            # manual-consume 联立坐标。
+            if entryAccess.errorCode ==
+                   bodyaccess.BodyIrAccessErrorOwnership:
+                ingressSiteDump = Fmt"{ingressSiteDump}{ownershipBodyIrAccessRejectDiag(bodyIR, entryAccess.errorDetail)}"
+            for ingressSlotIndex in 0..<bodyIR.localSlots.len:
+                let ingressSlot = bodyIR.localSlots[ingressSlotIndex]
+                ingressSiteDump = Fmt"{ingressSiteDump} s{ingressSlotIndex}:tk={Int32(ingressSlot.typeKind)}:pk={Int32(ingressSlot.placeKind)}:mg={Int32(ingressSlot.managedStorageKind)}:aux={ingressSlot.auxValue}:off={ingressSlot.stackOffset}:tid={ingressSlot.typeArenaTypeId}"
+        ownershipBodyIrFail(
+            Fmt"ownership body ir production: ingress BodyIR ownership invalid code={entryAccess.errorCode} site={entryAccess.errorSiteKind} index={entryAccess.errorSiteIndex} detail={entryAccess.errorDetail} fn={bodyIR.controlFunctionRow}{ingressSiteDump}")
+    # ExactDef 批 6 ingress 切换 (punch list ①) 保持休眠 (wall39 恢复
+    # 休眠裁定)。本门无事实通道: ApplyOwned 签名不携带程序契约与
+    # calleeRows 键窗, sealed 态下空窗全量审 (canonical-empty 直通态
+    # 被 N7/N8 族锁为验证器自身契约) 把 C-ABI 桥接拼写 (importc
+    # intrinsic 收编 piece / managed-replace 栈槽源的 ParamAddress 地
+    # 址实参) 误审为 var formal 绑定, 合法程序死 `borrowed managed
+    # local cannot bind a rebindable var formal` (cold_nested 实证;
+    # 冷链 cheng_w37 同输入 compile/run 全绿)。休眠前提「生产侧恒
+    # unsealed」被 f7a88ae28 打破: 两生产挂接点 (primary_object_plan
+    # /backend2_pipeline) 的 BodyIrExactDefDerive (唯一 seal 写点) 均
+    # 先于本函数运行。权威审计 = 两挂接点 ApplyOwned 之后的带窗
+    # ExactDefCallAuthorityValidateInto (批 5 组合序: 冻结验证 →
+    # merge 校验 → var-out/调用权威/seal root → identity schema 主
+    # 审; contract 按值 + calleeRows 键窗逐 callSequence 行投影, 审
+    # 消费终态戳), 与本门同一验证器且携全量事实, 本门零覆盖损失;
+    # 激活唯一合法形态 = 批 6 完成时两挂接点把契约+窗传入本函数
+    # (签名扩展, 两端同批), 无窗态恒零行为。物化追加行的
+    # ExactDefFreezeSidecarSyncAppended 同步属 ApplyOwned 返回侧,
+    # 契约不变。
+    # Validate every TypedExpr-owned producer before the zero-cleanup fast
+    # return.  Consumption does not weaken producer authority: only an exact
+    # mirrored CallOp may introduce a fresh owned managed value.
+    for opIndex in 0..<bodyIR.ops.len:
+        if bodyIR.ops[opIndex].valueDefOriginKind ==
+               coreir.BodyDefinitionOriginTypedExprTag &&
+           (bodyIR.ops[opIndex].valueDefOwnership ==
+                coreir.OwnMove ||
+            bodyIR.ops[opIndex].valueDefOwnership ==
+                coreir.OwnBorrowShared):
+            ownershipBodyIrRequireOwnedDefinitionSource(
+                bodyIR, opIndex)
+    let managedReplace =
+        managedreplace.ManagedLvalueReplaceProductionVerifyWithAccess(
+            bodyIR, entryAccess)
+    if !managedReplace.valid:
+        ownershipBodyIrFail(
+            "ownership body ir production: managed replace invalid")
+    report.managedReplaceCount =
+        managedReplace.replaceCount
+    report.managedReplaceMoveCount =
+        managedReplace.moveCount
+    report.managedReplaceBorrowLiftCount =
+        managedReplace.borrowLiftCount
+    report.managedReplaceFingerprint =
+        managedReplace.fingerprint
+    report.managedReplaceValidated = true
+    let returnCount = ownershipBodyIrValidateReturns(bodyIR)
+    report.normalizedReturnCount = returnCount
+    ownershipBodyIrValidateManualConsumeEffects(
+        bodyIR, entryAccess)
+    report.deferCount =
+        ownershipBodyIrValidateDeferIdentity(bodyIR)
+    if report.deferCount > 0:
+        ownershipBodyIrFail(
+            "ownership body ir production: defer executable body authority missing")
+    let cleanupDefinitionCount =
+        ownershipBodyIrCleanupDefinitionCount(bodyIR)
+    if cleanupDefinitionCount == 0:
+        # Every owned source may already have been consumed by a canonical
+        # managed replacement.  No cleanup planner is allocated in this
+        # branch, so the production state machine is complete with no live
+        # planner rather than "not applied".
+        report.applied = true
+        report.plannerReleased = true
+        return report
+    report.ownedDefinitionCount = cleanupDefinitionCount
+    ownershipBodyIrRequireControlFacts(bodyIR)
+
+    for opIndex in 0..<bodyIR.ops.len:
+        if bodyIR.ops[opIndex].valueDefOwnership ==
+               coreir.OwnMove &&
+           bodyIR.ops[opIndex].valueDefConsumeOpIndexPlusOne == 0 &&
+           !ownershipBodyIrManualConsumesBodyOp(
+               bodyIR, opIndex):
+            ownershipBodyIrRequireOwnedDefinition(bodyIR, opIndex)
+
+    var ir: odir.OwnershipDropIr
+    odir.OwnershipDropIrInit(ir)
+    let rootScope = odir.OwnershipDropRootScopeId(ir)
+    for scopeId in 1..<bodyIR.controlScopeParentIds.len:
+        let ownershipScope = odir.OwnershipDropAddScope(
+            ir, bodyIR.controlScopeParentIds[scopeId])
+        if ownershipScope != scopeId:
+            ownershipBodyIrFail(
+                "ownership body ir production: scope identity drift")
+    var exactTypeIds: int32[]
+    var ownershipTypeIds: int32[]
+    var typeFactRows: int32[]
+    var localTypeKinds: int32[]
+    for opIndex in 0..<bodyIR.ops.len:
+        let op = bodyIR.ops[opIndex]
+        if op.valueDefOwnership != coreir.OwnMove ||
+           op.valueDefConsumeOpIndexPlusOne != 0 ||
+           ownershipBodyIrManualConsumesBodyOp(
+               bodyIR, opIndex):
+            continue
+        let slot = bodyIR.localSlots[op.valueDefSlot]
+        var typeOrdinal = ownershipBodyIrTypeOrdinal(
+            exactTypeIds, slot.typeArenaTypeId)
+        if typeOrdinal < 0:
+            if slot.managedStorageKind !=
+                   coreir.BodyManagedStorageManagedTag ||
+               (slot.typeKind != coreir.LocalStrTag &&
+                slot.typeKind != coreir.LocalPtrTag &&
+                slot.typeKind != coreir.LocalAggregateTag):
+                ownershipBodyIrFail(
+                    "ownership body ir production: cleanup definition has no exact managed local kind")
+            let factRow = ownershipBodyIrTypeFactRow(
+                bodyIR, slot.typeArenaTypeId)
+            if bodyIR.typeFactSizeBytes[factRow] != slot.sizeBytes ||
+               bodyIR.typeFactAlignBytes[factRow] != slot.alignBytes:
+                ownershipBodyIrFail(
+                    "ownership body ir production: local layout differs from TypeArena")
+            let ownershipTypeId = odir.OwnershipDropRegisterLeafType(
+                ir,
+                Fmt"type_arena#{layout.FixedBytes32Hex(bodyIR.typeArenaArtifactCid)}#{slot.typeArenaTypeId}",
+                exactTypeIds.len + 1)
+            odir.OwnershipDropSetTypeReturnSnapshotPolicy(
+                ir,
+                ownershipTypeId,
+                odir.ReturnSnapshotRetain,
+                exactTypeIds.len + 1,
+                "cheng_str_snapshot_retain_owned")
+            add(exactTypeIds, slot.typeArenaTypeId)
+            add(ownershipTypeIds, ownershipTypeId)
+            add(typeFactRows, factRow)
+            add(localTypeKinds, slot.typeKind)
+            typeOrdinal = exactTypeIds.len - 1
+        elif typeOrdinal >= localTypeKinds.len ||
+             slot.managedStorageKind !=
+                 coreir.BodyManagedStorageManagedTag ||
+             slot.typeKind != localTypeKinds[typeOrdinal]:
+            ownershipBodyIrFail(
+                "ownership body ir production: cleanup TypeId local kind is inconsistent")
+
+    var placeByDefOp: int32[]
+    var scopeByDefOp: int32[]
+    for _ in 0..<bodyIR.ops.len:
+        add(placeByDefOp, -1)
+        add(scopeByDefOp, -1)
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        for opOffset in 0..<block.opCount:
+            let opIndex = block.opStart + opOffset
+            if opIndex < 0 || opIndex >= scopeByDefOp.len ||
+               scopeByDefOp[opIndex] >= 0:
+                ownershipBodyIrFail(
+                    "ownership body ir production: op block partition drift")
+            scopeByDefOp[opIndex] =
+                bodyIR.blockScopeIds[blockIndex]
+    for opIndex in 0..<bodyIR.ops.len:
+        let op = bodyIR.ops[opIndex]
+        if op.valueDefOwnership != coreir.OwnMove ||
+           op.valueDefConsumeOpIndexPlusOne != 0 ||
+           ownershipBodyIrManualConsumesBodyOp(
+               bodyIR, opIndex):
+            continue
+        if scopeByDefOp[opIndex] < 0:
+            ownershipBodyIrFail(
+                "ownership body ir production: value-def scope missing")
+        let exactTypeId =
+            bodyIR.localSlots[op.valueDefSlot].typeArenaTypeId
+        let typeOrdinal =
+            ownershipBodyIrTypeOrdinal(exactTypeIds, exactTypeId)
+        placeByDefOp[opIndex] = odir.OwnershipDropAddPlace(
+            ir,
+            ownershipTypeIds[typeOrdinal],
+            odir.Owned,
+            scopeByDefOp[opIndex])
+
+    var ownershipTransitionOpIds: int32[]
+    var ownershipTransitionBlockIds: int32[]
+    var ownershipTransitionAfterOpOrdinals: int32[]
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let ownershipBlock =
+            odir.OwnershipDropAddBlock(
+                ir, bodyIR.blockScopeIds[blockIndex])
+        if ownershipBlock != blockIndex:
+            ownershipBodyIrFail(
+                "ownership body ir production: CFG block identity drift")
+        if blockIndex == 0:
+            odir.OwnershipDropSetEntryBlock(ir, ownershipBlock)
+        let block = bodyIR.blocks[blockIndex]
+        for opOffset in 0..<block.opCount:
+            let opIndex = block.opStart + opOffset
+            let factStart = entryAccess.opFactStarts[opIndex]
+            let factCount = entryAccess.opFactCounts[opIndex]
+            for factOffset in 0..<factCount:
+                let fact = entryAccess.facts[factStart + factOffset]
+                if fact.exactCallArgRow < 0 ||
+                   fact.manualConsumeRow >= 0 ||
+                   !fact.consumesDefinition ||
+                   fact.definitionDomain !=
+                       coreir.BodyDefinitionDomainBodyOpTag:
+                    continue
+                let definitionRow = fact.definitionRow
+                if definitionRow < 0 ||
+                   definitionRow >= placeByDefOp.len:
+                    ownershipBodyIrFail(
+                        "ownership body ir production: exact call-arg definition out of range")
+                let consumePlace = placeByDefOp[definitionRow]
+                if consumePlace <= 0:
+                    if bodyIR.ops[definitionRow].valueDefConsumeOpIndexPlusOne ==
+                           0 &&
+                       !ownershipBodyIrManualConsumesBodyOp(
+                           bodyIR, definitionRow):
+                        ownershipBodyIrFail(
+                            "ownership body ir production: exact call-arg consume place missing")
+                    continue
+                let ownershipConsume = odir.OwnershipDropAppendConsume(
+                    ir, ownershipBlock, consumePlace)
+                add(ownershipTransitionOpIds, ownershipConsume)
+                add(ownershipTransitionBlockIds, blockIndex)
+                add(ownershipTransitionAfterOpOrdinals, opOffset)
+            if placeByDefOp[opIndex] > 0:
+                let ownershipOp = odir.OwnershipDropAppendInitialize(
+                    ir, ownershipBlock, placeByDefOp[opIndex])
+                odir.OwnershipDropBindOpDefinitionAuthority(
+                    ir,
+                    ownershipOp,
+                    odir.DefinitionOriginTypedExpr,
+                    bodyIR.ops[opIndex].valueDefOriginId,
+                    odir.OwnershipDropDefinitionDomainBodyOp,
+                    opIndex,
+                    odir.Owned)
+                odir.OwnershipDropBindOpDefinitionCoordinate(
+                    ir,
+                    ownershipOp,
+                    odir.OwnershipDropDefinitionDomainBodyOp,
+                    opIndex)
+                add(ownershipTransitionOpIds, ownershipOp)
+                add(ownershipTransitionBlockIds, blockIndex)
+                add(ownershipTransitionAfterOpOrdinals, opOffset)
+
+    let terminalOwnershipBlock =
+        odir.OwnershipDropAddBlock(ir, rootScope)
+    var ownershipEdgeByBodyEdgeKey: int32[]
+    for _ in 0..<(bodyIR.blocks.len * 2):
+        add(ownershipEdgeByBodyEdgeKey, -1)
+    var returnSourceDefinitionDomainsByBlock: int32[]
+    var returnSourceDefinitionRowsByBlock: int32[]
+    var returnSourceSlotsByBlock: int32[]
+    var returnSnapshotSlotsByBlock: int32[]
+    var returnAuthorityBoundByBlock: bool[]
+    for _ in 0..<bodyIR.blocks.len:
+        add(returnSourceDefinitionDomainsByBlock,
+            coreir.BodyDefinitionDomainInvalidTag)
+        add(returnSourceDefinitionRowsByBlock, -1)
+        add(returnSourceSlotsByBlock, -1)
+        add(returnSnapshotSlotsByBlock, -1)
+        add(returnAuthorityBoundByBlock, false)
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        let termIndex = block.termIndex
+        let successorStart =
+            bodyIR.termSuccessorStarts[termIndex]
+        let successorCount =
+            bodyIR.termSuccessorCounts[termIndex]
+        if bodyIR.terms[termIndex].kind ==
+               coreir.BodyTermReturnTag:
+            if successorCount != 0:
+                ownershipBodyIrFail(
+                    "ownership body ir production: return has successor")
+            if returnAuthorityBoundByBlock[blockIndex]:
+                ownershipBodyIrFail(
+                    "ownership body ir production: return authority rebound")
+            var cleanupPlaces: int32[]
+            ownershipBodyIrAppendCleanupInventory(
+                bodyIR,
+                ir,
+                bodyIR.blockScopeIds[blockIndex],
+                -1,
+                true,
+                cleanupPlaces)
+            var deferIds: int32[]
+            var returnPlace = -1
+            var returnSourceDefinitionDomain =
+                coreir.BodyDefinitionDomainInvalidTag
+            var returnSourceDefinitionRow = -1
+            var returnSourceSlot = -1
+            var returnSnapshotSlot = -1
+            if bodyIR.terms[termIndex].sourceDefinitionDomain !=
+                   coreir.BodyDefinitionDomainInvalidTag:
+                if bodyIR.terms[termIndex].sourceDefinitionDomain !=
+                       coreir.BodyDefinitionDomainBodyOpTag:
+                    ownershipBodyIrFail(
+                        "ownership body ir production: return definition domain unsupported")
+                returnSourceDefinitionDomain =
+                    bodyIR.terms[termIndex].sourceDefinitionDomain
+                returnSourceDefinitionRow =
+                    bodyIR.terms[termIndex].sourceDefinitionRow
+                returnPlace = placeByDefOp[returnSourceDefinitionRow]
+                if returnPlace <= 0:
+                    ownershipBodyIrFail(
+                        "ownership body ir production: owned return place missing")
+                returnSourceSlot =
+                    bodyIR.terms[termIndex].resultSlot
+                returnSnapshotSlot = ownershipBodyIrAppendSnapshotSlot(
+                    bodyIR, returnSourceSlot, "owned")
+            elif bodyIR.terms[termIndex].resultSlot >= 0:
+                returnSourceSlot =
+                    bodyIR.terms[termIndex].resultSlot
+                returnSnapshotSlot = ownershipBodyIrAppendSnapshotSlot(
+                    bodyIR, returnSourceSlot, "plain")
+            returnSourceDefinitionDomainsByBlock[blockIndex] =
+                returnSourceDefinitionDomain
+            returnSourceDefinitionRowsByBlock[blockIndex] =
+                returnSourceDefinitionRow
+            returnSourceSlotsByBlock[blockIndex] =
+                returnSourceSlot
+            returnSnapshotSlotsByBlock[blockIndex] =
+                returnSnapshotSlot
+            returnAuthorityBoundByBlock[blockIndex] = true
+            let edge = odir.OwnershipDropAddEdge(
+                ir,
+                blockIndex,
+                terminalOwnershipBlock,
+                odir.OwnershipDropEdgeReturn,
+                returnPlace,
+                cleanupPlaces,
+                deferIds)
+            if returnPlace > 0:
+                let sourceDef = bodyIR.ops[returnSourceDefinitionRow]
+                odir.OwnershipDropBindReturnDefinitionAuthority(
+                    ir,
+                    edge,
+                    sourceDef.valueDefExprNodeIndex,
+                    sourceDef.valueDefSemanticRow,
+                    odir.Owned,
+                    odir.OwnershipDropDefinitionDomainBodyOp,
+                    returnSourceDefinitionRow)
+            ownershipEdgeByBodyEdgeKey[blockIndex * 2] = edge
+        else:
+            for successorOrdinal in 0..<successorCount:
+                let successorRow =
+                    successorStart + successorOrdinal
+                let targetBlockId =
+                    bodyIR.successorBlockIds[successorRow]
+                let edgeKind = ownershipBodyIrEdgeKind(
+                    bodyIR.successorEdgeKinds[successorRow])
+                var cleanupPlaces: int32[]
+                ownershipBodyIrAppendCleanupInventory(
+                    bodyIR,
+                    ir,
+                    bodyIR.blockScopeIds[blockIndex],
+                    bodyIR.blockScopeIds[targetBlockId],
+                    false,
+                    cleanupPlaces)
+                var deferIds: int32[]
+                let edge = odir.OwnershipDropAddEdge(
+                    ir,
+                    blockIndex,
+                    targetBlockId,
+                    edgeKind,
+                    -1,
+                    cleanupPlaces,
+                    deferIds)
+                ownershipEdgeByBodyEdgeKey[
+                    blockIndex * 2 + successorOrdinal] = edge
+                if edgeKind == odir.OwnershipDropEdgeBreak:
+                    report.breakEdgeCount =
+                        report.breakEdgeCount + 1
+                elif edgeKind ==
+                         odir.OwnershipDropEdgeContinue:
+                    report.continueEdgeCount =
+                        report.continueEdgeCount + 1
+
+    var analysis: odir.OwnershipDropAnalysis
+    odir.OwnershipDropAnalyzeCanonical(ir, analysis)
+    if !analysis.converged:
+        ownershipBodyIrFail(
+            "ownership body ir production: ownership fixed point did not converge")
+    report.conditionFlagCount = analysis.conditionFlags.len
+    var ownershipFlagSlots: int32[]
+    for flagIndex in 0..<analysis.conditionFlags.len:
+        add(ownershipFlagSlots,
+            ownershipBodyIrAppendI32FlagSlot(
+                bodyIR, analysis.conditionFlags[flagIndex].flagId))
+
+    var plan: cleanup.CleanupPlan
+    let limits = ownershipBodyIrLimits(
+        bodyIR,
+        cleanupDefinitionCount,
+        ir.edges.len,
+        analysis.conditionFlags.len)
+    cleanup.CleanupPlanPrepare(plan, limits, 0)
+    for scopeId in 1..<bodyIR.controlScopeParentIds.len:
+        let cleanupScope = cleanup.CleanupPlanAddScope(
+            plan, bodyIR.controlScopeParentIds[scopeId])
+        if cleanupScope != scopeId:
+            ownershipBodyIrFail(
+                "ownership body ir production: cleanup scope identity drift")
+    var typeLayoutIndex: cleanup.CleanupTypeLayoutIndex
+    cleanup.CleanupTypeLayoutIndexPrepare(
+        typeLayoutIndex,
+        layout.FixedBytes32Hex(bodyIR.typeArenaArtifactCid),
+        exactTypeIds.len,
+        0,
+        0,
+        0)
+    for typeOrdinal in 0..<exactTypeIds.len:
+        var fieldTypeIds: int32[]
+        var fieldByteOffsets: int32[]
+        let factRow = typeFactRows[typeOrdinal]
+        if typeOrdinal >= localTypeKinds.len:
+            ownershipBodyIrFail(
+                "ownership body ir production: cleanup TypeId local kind missing")
+        cleanup.CleanupTypeLayoutIndexRegisterType(
+            typeLayoutIndex,
+            ownershipTypeIds[typeOrdinal],
+            exactTypeIds[typeOrdinal],
+            Fmt"{layout.FixedBytes32Hex(bodyIR.typeArenaArtifactCid)}:{exactTypeIds[typeOrdinal]}",
+            localTypeKinds[typeOrdinal],
+            bodyIR.typeFactSizeBytes[factRow],
+            bodyIR.typeFactAlignBytes[factRow],
+            fieldTypeIds,
+            fieldByteOffsets)
+    cleanup.CleanupTypeLayoutIndexSeal(typeLayoutIndex)
+    cleanup.CleanupPlanBindTypeLayoutIndex(plan, typeLayoutIndex)
+    cleanup.CleanupPlanBindLocalSchema(plan, bodyIR)
+    for flagIndex in 0..<analysis.conditionFlags.len:
+        cleanup.CleanupPlanBindOwnershipConditionFlag(
+            plan,
+            analysis,
+            analysis.conditionFlags[flagIndex].flagId,
+            ownershipFlagSlots[flagIndex])
+    for opIndex in 0..<bodyIR.ops.len:
+        if placeByDefOp[opIndex] <= 0:
+            continue
+        let slotId = bodyIR.ops[opIndex].valueDefSlot
+        let typeOrdinal = ownershipBodyIrTypeOrdinal(
+            exactTypeIds, bodyIR.localSlots[slotId].typeArenaTypeId)
+        cleanup.CleanupPlanBindOwnershipPlace(
+            plan,
+            placeByDefOp[opIndex],
+            slotId,
+            ownershipTypeIds[typeOrdinal])
+    for typeOrdinal in 0..<ownershipTypeIds.len:
+        # [wall118] var-ptr ABI glue 接线（wall73 移交三文件包）：ref
+        # 句柄类型（structural kind=RefObject，8B LocalPtrTag 载体槽）
+        # 的 drop/retain 权威 = program_support_backend
+        # @exportc("cheng_ref_drop_owned") /
+        # @exportc("cheng_ref_retain_owned")（var-ptr ABI：CleanupPlan
+        # 合成调用单实参 ByAddressAggregate 槽地址、argAbiSizes=8、
+        # void 结果，与 cheng_str_drop_owned 同一 call-site 约定，仅
+        # callee 读写宽度 8B ≠ str 头 24/32B）。str 头 ABI 类型保持
+        # 原 glue 原样，判定零弱化。
+        let glueFactRow = typeFactRows[typeOrdinal]
+        let glueIsRefHandle =
+            bodyIR.typeFactStructuralKinds[glueFactRow] ==
+                Int32(typearena.TypedExprStructuralTypeRefObject)
+        let dropGlueSymbol =
+            if glueIsRefHandle: "cheng_ref_drop_owned"
+            else: "cheng_str_drop_owned"
+        let retainGlueSymbol =
+            if glueIsRefHandle: "cheng_ref_retain_owned"
+            else: "cheng_str_snapshot_retain_owned"
+        cleanup.CleanupPlanBindOwnershipDropGlue(
+            plan,
+            typeOrdinal + 1,
+            ownershipTypeIds[typeOrdinal],
+            dropGlueSymbol)
+        cleanup.CleanupPlanBindOwnershipRetainGlue(
+            plan,
+            ownershipTypeIds[typeOrdinal],
+            retainGlueSymbol)
+    for transitionRow in 0..<ownershipTransitionOpIds.len:
+        cleanup.CleanupPlanBindOwnershipOpTransitions(
+            plan,
+            bodyIR,
+            analysis,
+            ownershipTransitionOpIds[transitionRow],
+            ownershipTransitionBlockIds[transitionRow],
+            ownershipTransitionAfterOpOrdinals[transitionRow])
+
+    for blockIndex in 0..<bodyIR.blocks.len:
+        let block = bodyIR.blocks[blockIndex]
+        let termIndex = block.termIndex
+        if bodyIR.terms[termIndex].kind ==
+               coreir.BodyTermReturnTag:
+            if !returnAuthorityBoundByBlock[blockIndex] ||
+               returnSourceDefinitionDomainsByBlock[blockIndex] !=
+                   bodyIR.terms[termIndex].sourceDefinitionDomain ||
+               returnSourceDefinitionRowsByBlock[blockIndex] !=
+                   bodyIR.terms[termIndex].sourceDefinitionRow ||
+               returnSourceSlotsByBlock[blockIndex] !=
+                   bodyIR.terms[termIndex].resultSlot ||
+               (returnSourceSlotsByBlock[blockIndex] >= 0 &&
+                returnSnapshotSlotsByBlock[blockIndex] < 0) ||
+               (returnSourceSlotsByBlock[blockIndex] < 0 &&
+                returnSnapshotSlotsByBlock[blockIndex] != -1):
+                ownershipBodyIrFail(
+                    "ownership body ir production: return authority row drift")
+            let _ = cleanup.CleanupPlanQueueOwnershipExit(
+                plan,
+                blockIndex,
+                0,
+                bodyIR.blockScopeIds[blockIndex],
+                -1,
+                odir.OwnershipDropEdgeReturn,
+                -1,
+                returnSourceSlotsByBlock[blockIndex],
+                returnSnapshotSlotsByBlock[blockIndex],
+                ir,
+                analysis,
+                ownershipEdgeByBodyEdgeKey[blockIndex * 2])
+        else:
+            let successorStart =
+                bodyIR.termSuccessorStarts[termIndex]
+            let successorCount =
+                bodyIR.termSuccessorCounts[termIndex]
+            for successorOrdinal in 0..<successorCount:
+                let successorRow =
+                    successorStart + successorOrdinal
+                let targetBlockId =
+                    bodyIR.successorBlockIds[successorRow]
+                let edgeKind = ownershipBodyIrEdgeKind(
+                    bodyIR.successorEdgeKinds[successorRow])
+                let _ = cleanup.CleanupPlanQueueOwnershipExit(
+                    plan,
+                    blockIndex,
+                    successorOrdinal,
+                    bodyIR.blockScopeIds[blockIndex],
+                    bodyIR.blockScopeIds[targetBlockId],
+                    edgeKind,
+                    targetBlockId,
+                    -1,
+                    -1,
+                    ir,
+                    analysis,
+                    ownershipEdgeByBodyEdgeKey[
+                        blockIndex * 2 + successorOrdinal])
+
+    report.ownershipEdgeCount = ir.edges.len
+    report.ownershipActionCount = analysis.cleanupActions.len
+    report.cleanupFingerprint =
+        cleanup.CleanupPlanOwnershipActionFingerprint(plan)
+    let materialized = cleanup.CleanupPlanMaterialize(bodyIR, plan)
+    report.materializedOpCount = materialized.materializedOpCount
+    report.materializedBlockCount = materialized.materializedBlockCount
+    report.materializedCallCount = materialized.materializedCallCount
+    report.plannerReleased = materialized.released
+    ownershipBodyIrPublishExactCallArgConsumers(
+        bodyIR, entryAccess)
+    var finalAccess = bodyaccess.BodyIrAccessDecode(bodyIR)
+    if !bodyaccess.BodyIrAccessTableIsValid(finalAccess):
+        # [wall111b] 判词富化（wall82 ingress 同款，原文本作前缀 grep 仍
+        # 命中）：物化后 final decode 重审失败携带四元组 + op 全语义权威
+        # 列 + 槽表投影，区分 canonical-consume 形漂移/清理单元 def 审/
+        # CFG 层三族死因；非 op 站点保持四元组前缀。fail 路径专属，成功
+        # 路径零行为变化。
+        var finalSiteDump = ""
+        if finalAccess.errorSiteKind == bodyaccess.BodyIrAccessSiteOp &&
+           finalAccess.errorSiteIndex >= 0 &&
+           finalAccess.errorSiteIndex < bodyIR.ops.len:
+            let finalOp = bodyIR.ops[finalAccess.errorSiteIndex]
+            finalSiteDump = Fmt" op_kind={Int32(finalOp.kind)} op_target={finalOp.target} op_operands={finalOp.operands.len}"
+            for finalOperandIndex in 0..<finalOp.operands.len:
+                finalSiteDump = Fmt"{finalSiteDump} a{finalOperandIndex}={finalOp.operands[finalOperandIndex]}"
+            finalSiteDump = Fmt"{finalSiteDump} vd_slot={finalOp.valueDefSlot} vd_own={Int32(finalOp.valueDefOwnership)} vd_row={finalOp.valueDefSemanticRow} vd_node={finalOp.valueDefExprNodeIndex} vd_origin={Int32(finalOp.valueDefOriginKind)} vd_origin_id={finalOp.valueDefOriginId} bo_row={finalOp.valueDefBorrowOwnerSemanticRow} bo_domain={Int32(finalOp.valueDefBorrowOwnerDefinitionDomain)} bo_def_row={finalOp.valueDefBorrowOwnerDefinitionRow} consume_plus1={finalOp.valueDefConsumeOpIndexPlusOne} action_row={finalOp.consumeActionRow} src_domain={Int32(finalOp.sourceDefinitionDomain)} src_row={finalOp.sourceDefinitionRow}"
+            finalSiteDump = Fmt"{finalSiteDump} slots={bodyIR.localSlots.len} sealed={bodyIR.entryDefinitionOwnershipSealed}"
+            # [wall126] 同 ingress：追加 Ownership 拒绝门相位与 diag。
+            finalSiteDump = Fmt"{finalSiteDump} phase={finalAccess.errorPhase}"
+            if finalAccess.errorCode ==
+                   bodyaccess.BodyIrAccessErrorOwnership:
+                finalSiteDump = Fmt"{finalSiteDump}{ownershipBodyIrAccessRejectDiag(bodyIR, finalAccess.errorDetail)}"
+            for finalSlotIndex in 0..<bodyIR.localSlots.len:
+                let finalSlot = bodyIR.localSlots[finalSlotIndex]
+                finalSiteDump = Fmt"{finalSiteDump} s{finalSlotIndex}:tk={Int32(finalSlot.typeKind)}:pk={Int32(finalSlot.placeKind)}:mg={Int32(finalSlot.managedStorageKind)}:aux={finalSlot.auxValue}:off={finalSlot.stackOffset}:tid={finalSlot.typeArenaTypeId}"
+        ownershipBodyIrFail(
+            Fmt"ownership body ir production: materialized BodyIR ownership invalid code={finalAccess.errorCode} site={finalAccess.errorSiteKind} index={finalAccess.errorSiteIndex} detail={finalAccess.errorDetail} fn={bodyIR.controlFunctionRow}{finalSiteDump}")
+    let finalManagedReplace =
+        managedreplace.ManagedLvalueReplaceProductionVerifyWithAccess(
+            bodyIR, finalAccess)
+    if !finalManagedReplace.valid ||
+       finalManagedReplace.replaceCount !=
+           report.managedReplaceCount ||
+       finalManagedReplace.moveCount !=
+           report.managedReplaceMoveCount ||
+       finalManagedReplace.borrowLiftCount !=
+           report.managedReplaceBorrowLiftCount:
+        ownershipBodyIrFail(
+            "ownership body ir production: managed replace remap drift")
+    report.managedReplaceFingerprint =
+        finalManagedReplace.fingerprint
+    report.applied = true
+    return report

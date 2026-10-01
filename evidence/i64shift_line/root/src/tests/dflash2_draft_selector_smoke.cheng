@@ -1,0 +1,476 @@
+# src/tests/dflash2_draft_selector_smoke.cheng - DFlash2 drafter core +
+# selector smoke (spec-decode W3 front).
+#
+# Hard asserts only, no soft/partial scoring:
+#   1. two-tap dynamic depthwise conv: zero input + zero base => zero output;
+#      single-pulse run pins tap0 (position t) and tap1 (position t+1)
+#      coefficients incl. the prevVector x_{-1} feed; grouped hidden-state
+#      correction touches ONLY its own Dflash2CorrGroupSize-channel group;
+#   2. selector scoring + greedy walk: U-dominant case reproduces the
+#      per-position U argmax exactly; fixture determinism via hashes;
+#   3. a hand-built adjacent-consistency counterexample where the top1-top1
+#      chain scores BELOW a runner-up path forces the selector off the
+#      greedy-U route (and flips back when the pairwise term flips sign);
+#   4. lossless contract: candidate ids AND logits are element-wise identical
+#      (plus hash-equal) after scoring/walking; a tampered pool breaks the
+#      check;
+#   5. shape/domain negatives: every listed case must be IsErr.
+#
+# Selector tables here come from Dflash2SyntheticSelectorTables (fixed LCG
+# seed) -- a deterministic math fixture, NOT a production weight path.
+#
+# Each section lives in its own function: keeps every stage's body small and
+# independently attributable (the frozen stage3 backend miscompiles very long
+# single-function bodies -- see lessons.md on cold liveness cliffs).
+
+import std/math as m
+import std/result
+import std/strings
+import std/strutils as strutil
+import cheng/inference/dflash2_draft as df2
+
+fn constF64(count: int32, value: float64): float64[] =
+    var out: float64[]
+    var i: int32 = 0
+    while i < count:
+        add(out, value)
+        i = i + 1
+    return out
+
+fn zerosF64(count: int32): float64[] =
+    return constF64(count, 0.0)
+
+fn makeSmokeHidden(blockLen: int32, hiddenDim: int32): float64[] =
+    var hidden: float64[]
+    for t in 0..<blockLen:
+        for d in 0..<hiddenDim:
+            add(hidden, float64((t * 7 + d * 3) % 11) * 0.25 - 1.25)
+    return hidden
+
+fn makeGroupTestHidden(): float64[] =
+    var hidden: float64[]
+    add(hidden, 1.5)
+    add(hidden, 7.0)
+    add(hidden, -0.5)
+    add(hidden, 7.0)
+    return hidden
+
+@borrows
+fn buildDominantCandidates(blockLen: int32,
+                           dominantIndex: int32[],
+                           dominantLogit: float64,
+                           backgroundLogit: float64): df2.Dflash2Candidates =
+    var ids: int32[]
+    var logits: float64[]
+    for t in 0..<blockLen:
+        for b in 0..<df2.Dflash2TopK:
+            add(ids, t * df2.Dflash2TopK + b + 1)
+            if b == dominantIndex[t]:
+                add(logits, dominantLogit)
+            else:
+                add(logits, backgroundLogit)
+    let built = df2.Dflash2CandidatesBuild(blockLen, ids, logits)
+    assert(IsOk(built), " dflash2 smoke: dominant candidates build")
+    return Value(built)
+
+# Hand-built selector tables for the adjacent-consistency counterexample.
+# Vocab {0..3}; gateWeight all-zero => H(h_t) = sigmoid(0) = 0.5 everywhere;
+# A(1) carries its only mass at dim 0 (2.0); B(2) carries the tunable pairwise
+# term at dim 0 (bTwoPenalty); everything else is zero, so every other pair
+# contributes exactly 0 regardless of the gate.
+fn buildCounterexampleTables(bTwoPenalty: float64): df2.Dflash2SelectorTables =
+    var embedA: float64[]
+    var embedB: float64[]
+    var gateWeight: float64[]
+    var i: int32 = 0
+    while i < 4 * df2.Dflash2EmbedDim:
+        add(embedA, 0.0)
+        add(embedB, 0.0)
+        i = i + 1
+    i = 0
+    while i < df2.Dflash2EmbedDim * 1:
+        add(gateWeight, 0.0)
+        i = i + 1
+    embedA[1 * df2.Dflash2EmbedDim + 0] = 2.0
+    embedB[2 * df2.Dflash2EmbedDim + 0] = bTwoPenalty
+    let built = df2.Dflash2SelectorTablesBuild(4, df2.Dflash2EmbedDim, 1, embedA, embedB, gateWeight)
+    assert(IsOk(built), " dflash2 smoke: counterexample tables build")
+    return Value(built)
+
+# Position 0: slot 0 -> token 1 with U=100 (all other slots -1000).
+# Position 1: slot 0 -> token 2 with U=100, slot 1 -> token 3 with U=99.
+# Background slots reuse ids {1,2,3} so everything stays inside the 4-token
+# vocab; their -1000 logits keep them out of contention.
+fn buildCounterexampleCandidates(): df2.Dflash2Candidates =
+    var ids: int32[]
+    var logits: float64[]
+    add(ids, 1)
+    add(logits, 100.0)
+    for b in 1..<df2.Dflash2TopK:
+        add(ids, (b * 5) % 3 + 1)
+        add(logits, -1000.0)
+    add(ids, 2)
+    add(logits, 100.0)
+    add(ids, 3)
+    add(logits, 99.0)
+    for b in 2..<df2.Dflash2TopK:
+        add(ids, (b * 5) % 3 + 1)
+        add(logits, -1000.0)
+    let built = df2.Dflash2CandidatesBuild(2, ids, logits)
+    assert(IsOk(built), " dflash2 smoke: counterexample candidates build")
+    return Value(built)
+
+fn smokeDynamicDepthwiseConv() =
+    # 1a. zero input + zero base => zero output, even with live hidden state
+    # and a populated-but-grouped correction weight (k multiplies zero x).
+    let zeroHidden = makeSmokeHidden(3, 4)
+    let zeroX = zerosF64(96)
+    let zeroPrev = zerosF64(32)
+    var zeroParams = df2.Dflash2ConvParams(
+        chanCount: 32,
+        hiddenDim: 4,
+        baseK0: zerosF64(32),
+        baseK1: zerosF64(32),
+        corrWeight: zerosF64(8)
+    )
+    var zeroOut: float64[]
+    var zi: int32 = 0
+    while zi < 3 * 32:
+        add(zeroOut, 123.0)
+        zi = zi + 1
+    let zeroRes = df2.Dflash2DynamicDepthwiseConvFill(zeroParams, zeroHidden, zeroX, zeroPrev, zeroOut)
+    assert(IsOk(zeroRes), " dflash2 smoke: zero conv run")
+    for i in 0..<zeroOut.len:
+        assert(m.ApproxEq(zeroOut[i], 0.0, 0.000000001),
+               strutil.Join([" dflash2 smoke: zero conv nonzero at ", strings.IntToStr(i)], ""))
+    # Same shape but correction weights live: coefficients shift, x stays 0,
+    # output must stay exactly zero.
+    zeroParams.corrWeight[4] = 3.0
+    let zeroRes2 = df2.Dflash2DynamicDepthwiseConvFill(zeroParams, zeroHidden, zeroX, zeroPrev, zeroOut)
+    assert(IsOk(zeroRes2), " dflash2 smoke: zero conv run 2")
+    for i in 0..<zeroOut.len:
+        assert(m.ApproxEq(zeroOut[i], 0.0, 0.000000001),
+               strutil.Join([" dflash2 smoke: zero conv 2 nonzero at ", strings.IntToStr(i)], ""))
+
+    # 1b. single pulse: pin tap0/tap1 coefficients and the prevVector feed.
+    # Pulse only channel 0 at t = 0; prevVector carries 0.5 on channel 0.
+    # Expected: out[0][0] = k0*x + k1*prev = 1*1 + 5*0.5 = 3.5,
+    #           out[1][0] = k0*x_{t=1}(0) + k1*x_{t=0}(0) = 0 + 5*1 = 5,
+    #           everything else zero.
+    let pulseHidden = zerosF64(3)
+    var pulseX: float64[]
+    var pxi: int32 = 0
+    while pxi < 3 * 16:
+        add(pulseX, 0.0)
+        pxi = pxi + 1
+    pulseX[0] = 1.0
+    var pulsePrev: float64[]
+    var ppi: int32 = 0
+    while ppi < 16:
+        add(pulsePrev, 0.0)
+        ppi = ppi + 1
+    pulsePrev[0] = 0.5
+    var pulseBase0: float64[]
+    var pulseBase1: float64[]
+    for c in 0..<16:
+        if c == 0:
+            add(pulseBase0, 1.0)
+            add(pulseBase1, 5.0)
+        else:
+            add(pulseBase0, 2.0)
+            add(pulseBase1, 6.0)
+    let pulseParams = df2.Dflash2ConvParams(
+        chanCount: 16,
+        hiddenDim: 1,
+        baseK0: pulseBase0,
+        baseK1: pulseBase1,
+        corrWeight: zerosF64(1)
+    )
+    var pulseOut: float64[]
+    var poi: int32 = 0
+    while poi < 3 * 16:
+        add(pulseOut, 0.0)
+        poi = poi + 1
+    let pulseRes = df2.Dflash2DynamicDepthwiseConvFill(pulseParams, pulseHidden, pulseX, pulsePrev, pulseOut)
+    assert(IsOk(pulseRes), " dflash2 smoke: pulse conv run")
+    assert(m.ApproxEq(pulseOut[0], 3.5, 0.000000001),
+           " dflash2 smoke: pulse tap0 + prevVector coefficient")
+    for c in 1..<16:
+        assert(m.ApproxEq(pulseOut[c], 0.0, 0.000000001),
+               strutil.Join([" dflash2 smoke: pulse t0 clean channel ", strings.IntToStr(c)], ""))
+    assert(m.ApproxEq(pulseOut[16], 5.0, 0.000000001),
+           " dflash2 smoke: pulse tap1 coefficient at channel 0")
+    for c in 1..<16:
+        assert(m.ApproxEq(pulseOut[16 + c], 0.0, 0.000000001),
+               strutil.Join([" dflash2 smoke: pulse t1 clean channel ", strings.IntToStr(c)], ""))
+    for i in 0..<16:
+        assert(m.ApproxEq(pulseOut[32 + i], 0.0, 0.000000001),
+               strutil.Join([" dflash2 smoke: pulse t2 clean at ", strings.IntToStr(i)], ""))
+
+    # 1c. grouped correction: a correction on group 1 shifts channels 16..31
+    # only; group 0 channels stay byte-identical to the baseline run.
+    # hidden[t][0] drives corr(group 1) = 4.0 * hidden[t][0]: t0 -> +6.0,
+    # t1 -> -2.0. corr feeds BOTH taps: t0 sees only tap0 (prevVector = 0),
+    # t1 sees k0 + k1 = 0.75 + 2*corr.
+    let groupHidden = makeGroupTestHidden()
+    let groupX = constF64(64, 1.0)
+    let groupPrev = zerosF64(32)
+    var groupBase0A: float64[]
+    var groupBase1A: float64[]
+    var groupBase0B: float64[]
+    var groupBase1B: float64[]
+    for c in 0..<32:
+        add(groupBase0A, 0.5)
+        add(groupBase1A, 0.25)
+        add(groupBase0B, 0.5)
+        add(groupBase1B, 0.25)
+    let groupBaseline = df2.Dflash2ConvParams(
+        chanCount: 32,
+        hiddenDim: 2,
+        baseK0: groupBase0A,
+        baseK1: groupBase1A,
+        corrWeight: zerosF64(4)
+    )
+    var groupPerturbed = df2.Dflash2ConvParams(
+        chanCount: 32,
+        hiddenDim: 2,
+        baseK0: groupBase0B,
+        baseK1: groupBase1B,
+        corrWeight: zerosF64(4)
+    )
+    groupPerturbed.corrWeight[1 * 2 + 0] = 4.0
+    var outBaseline: float64[]
+    var outPerturbed: float64[]
+    var gci: int32 = 0
+    while gci < 2 * 32:
+        add(outBaseline, 0.0)
+        add(outPerturbed, 0.0)
+        gci = gci + 1
+    let gbRes = df2.Dflash2DynamicDepthwiseConvFill(groupBaseline, groupHidden, groupX, groupPrev, outBaseline)
+    assert(IsOk(gbRes), " dflash2 smoke: grouped baseline run")
+    let gpRes = df2.Dflash2DynamicDepthwiseConvFill(groupPerturbed, groupHidden, groupX, groupPrev, outPerturbed)
+    assert(IsOk(gpRes), " dflash2 smoke: grouped perturbed run")
+    for t in 0..<2:
+        for c in 0..<32:
+            var want: float64 = 0.5
+            if t > 0:
+                want = 0.75
+            if c >= 16:
+                if t == 0:
+                    want = 6.5
+                else:
+                    want = -3.25
+            assert(m.ApproxEq(outPerturbed[t * 32 + c], want, 0.000000001),
+                   strutil.Join([" dflash2 smoke: grouped corr value t=", strings.IntToStr(t), " c=", strings.IntToStr(c)], ""))
+            if c < 16:
+                assert(m.ApproxEq(outPerturbed[t * 32 + c], outBaseline[t * 32 + c], 0.000000001),
+                       strutil.Join([" dflash2 smoke: grouped corr leaked into group 0 t=", strings.IntToStr(t), " c=", strings.IntToStr(c)], ""))
+
+fn smokeUdominantWalkAndDeterminism() =
+    let vocabSize: int32 = 128
+    let blockLen: int32 = 4
+    let tablesRes = df2.Dflash2SyntheticSelectorTables(vocabSize, 4, int64(20260822))
+    assert(IsOk(tablesRes), " dflash2 smoke: synthetic tables build")
+    let tables = Value(tablesRes)
+    var dominantIndex: int32[]
+    add(dominantIndex, 3)
+    add(dominantIndex, 1)
+    add(dominantIndex, 0)
+    add(dominantIndex, 2)
+    let domCands = buildDominantCandidates(blockLen, dominantIndex, 5000.0, -1.0)
+    let hidden4 = makeSmokeHidden(blockLen, 4)
+    let walkRes = df2.Dflash2GreedyWalkFill(domCands, tables, hidden4, 0)
+    assert(IsOk(walkRes), " dflash2 smoke: u-dominant walk")
+    let path = Value(walkRes)
+    assert(path.selectedIndices.len == blockLen && path.pathTokenIds.len == blockLen,
+           " dflash2 smoke: u-dominant path lengths")
+    for t in 0..<blockLen:
+        var best: int32 = -1
+        var bestVal: float64 = 0.0
+        for b in 0..<df2.Dflash2TopK:
+            let v = domCands.candLogits[t * df2.Dflash2TopK + b]
+            if best < 0 || v > bestVal:
+                best = b
+                bestVal = v
+        assert(path.selectedIndices[t] == best && best == dominantIndex[t],
+               strutil.Join([" dflash2 smoke: u-dominant selection t=", strings.IntToStr(t)], ""))
+        assert(path.pathTokenIds[t] == t * df2.Dflash2TopK + dominantIndex[t] + 1,
+               strutil.Join([" dflash2 smoke: u-dominant token id t=", strings.IntToStr(t)], ""))
+        assert(path.selectedIndices[t] >= 0 && path.selectedIndices[t] < df2.Dflash2TopK,
+               strutil.Join([" dflash2 smoke: selected index domain t=", strings.IntToStr(t)], ""))
+    # |dot| <= 256 per position (embeddings/gates bounded by [-1,1]), so the
+    # sum must sit within 4*256 of 4*5000 -- loose sanity band around U-sum.
+    assert(m.ApproxEq(path.pathScoreSum, 20000.0, 4096.0),
+           " dflash2 smoke: u-dominant score sum band")
+
+    # Fixture determinism: same seed => same hash, different seed => differs.
+    let tablesAgainRes = df2.Dflash2SyntheticSelectorTables(vocabSize, 4, int64(20260822))
+    assert(IsOk(tablesAgainRes), " dflash2 smoke: synthetic tables rebuild")
+    let tablesAgain = Value(tablesAgainRes)
+    assert(df2.Dflash2SelectorTablesHash(tables) == df2.Dflash2SelectorTablesHash(tablesAgain),
+           " dflash2 smoke: lcg fixture deterministic")
+    let tablesOtherRes = df2.Dflash2SyntheticSelectorTables(vocabSize, 4, int64(20260823))
+    assert(IsOk(tablesOtherRes), " dflash2 smoke: synthetic tables other seed")
+    let tablesOtherSeed = Value(tablesOtherRes)
+    assert(df2.Dflash2SelectorTablesHash(tables) != df2.Dflash2SelectorTablesHash(tablesOtherSeed),
+           " dflash2 smoke: lcg fixture seed sensitive")
+
+fn smokeAdjacentConsistencyCounterexample() =
+    # Pairwise term: <A(a) (*) H, B(b)> with H = 0.5-vector, A(1) dim0 = 2.0.
+    # With B(2)[0] = -300: S_1(prev=id1, b=slot0/id2) = 100 - 300 = -200 while
+    # S_1(prev=id1, b=slot1/id3) = 99 + 0 = 99 => the top1-top1 chain (-200)
+    # is far below the runner-up path; the selector MUST switch to slot 1.
+    # Position 0 sees A(lastVerified=0) = 0, so it follows pure U (slot 0).
+    let ceTables = buildCounterexampleTables(-300.0)
+    let ceCands = buildCounterexampleCandidates()
+    let ceHidden = constF64(2, 0.25)
+    var cePairScores: float64[]
+    var cei: int32 = 0
+    while cei < df2.Dflash2TopK * df2.Dflash2TopK:
+        add(cePairScores, 0.0)
+        cei = cei + 1
+    let ceScoreRes = df2.Dflash2ScoreAdjacentPairsFill(ceCands, ceTables, ceHidden, cePairScores)
+    assert(IsOk(ceScoreRes), " dflash2 smoke: counterexample scoring")
+    assert(m.ApproxEq(cePairScores[0], -200.0, 0.000001),
+           " dflash2 smoke: counterexample pair (slot0->slot0) score")
+    assert(m.ApproxEq(cePairScores[1], 99.0, 0.000001),
+           " dflash2 smoke: counterexample pair (slot0->slot1) score")
+    assert(m.ApproxEq(cePairScores[df2.Dflash2TopK], 100.0, 0.000001),
+           " dflash2 smoke: counterexample pair (slot1->slot0) score")
+    let ceWalkRes = df2.Dflash2GreedyWalkFill(ceCands, ceTables, ceHidden, 0)
+    assert(IsOk(ceWalkRes), " dflash2 smoke: counterexample walk")
+    let cePath = Value(ceWalkRes)
+    assert(cePath.selectedIndices.len == 2 && cePath.pathTokenIds.len == 2,
+           " dflash2 smoke: counterexample path lengths")
+    assert(cePath.selectedIndices[0] == 0 && cePath.selectedIndices[1] == 1,
+           " dflash2 smoke: counterexample switched off top1-top1 chain")
+    assert(cePath.pathTokenIds[0] == 1 && cePath.pathTokenIds[1] == 3,
+           " dflash2 smoke: counterexample path tokens [1,3]")
+    assert(m.ApproxEq(cePath.pathScoreSum, 199.0, 0.000001),
+           " dflash2 smoke: counterexample path sum 199")
+    # Sign flip: B(2)[0] = +20 makes top1-top1 win again (100+20 > 99).
+    let flipTables = buildCounterexampleTables(20.0)
+    let flipCands = buildCounterexampleCandidates()
+    let flipWalkRes = df2.Dflash2GreedyWalkFill(flipCands, flipTables, ceHidden, 0)
+    assert(IsOk(flipWalkRes), " dflash2 smoke: flip walk")
+    let flipPath = Value(flipWalkRes)
+    assert(flipPath.selectedIndices[0] == 0 && flipPath.selectedIndices[1] == 0,
+           " dflash2 smoke: flip restores top1-top1 chain")
+    assert(flipPath.pathTokenIds[0] == 1 && flipPath.pathTokenIds[1] == 2,
+           " dflash2 smoke: flip path tokens [1,2]")
+    assert(m.ApproxEq(flipPath.pathScoreSum, 220.0, 0.000001),
+           " dflash2 smoke: flip path sum 220")
+
+fn smokeLosslessContract() =
+    let vocabSize: int32 = 128
+    let blockLen: int32 = 4
+    let tablesRes = df2.Dflash2SyntheticSelectorTables(vocabSize, 4, int64(20260822))
+    assert(IsOk(tablesRes), " dflash2 smoke: synthetic tables build")
+    let tables = Value(tablesRes)
+    var dominantIndex: int32[]
+    add(dominantIndex, 3)
+    add(dominantIndex, 1)
+    add(dominantIndex, 0)
+    add(dominantIndex, 2)
+    let hidden4 = makeSmokeHidden(blockLen, 4)
+    let before = buildDominantCandidates(blockLen, dominantIndex, 5000.0, -1.0)
+    let walked = buildDominantCandidates(blockLen, dominantIndex, 5000.0, -1.0)
+    var losslessPairScores: float64[]
+    var li: int32 = 0
+    while li < 3 * df2.Dflash2TopK * df2.Dflash2TopK:
+        add(losslessPairScores, 0.0)
+        li = li + 1
+    let lsScoreRes = df2.Dflash2ScoreAdjacentPairsFill(walked, tables, hidden4, losslessPairScores)
+    assert(IsOk(lsScoreRes), " dflash2 smoke: lossless scoring run")
+    let lsWalkRes = df2.Dflash2GreedyWalkFill(walked, tables, hidden4, 0)
+    assert(IsOk(lsWalkRes), " dflash2 smoke: lossless walk run")
+    assert(df2.Dflash2CandidatesUnmodifiedAfterWalk(before, walked),
+           " dflash2 smoke: candidates modified by scoring/walking")
+    assert(df2.Dflash2CandidatesHash(before) == df2.Dflash2CandidatesHash(walked),
+           " dflash2 smoke: candidates hash drifted after walk")
+    var tampered = buildDominantCandidates(blockLen, dominantIndex, 5000.0, -1.0)
+    tampered.candLogits[5] = tampered.candLogits[5] + 1.0
+    assert(!df2.Dflash2CandidatesUnmodifiedAfterWalk(before, tampered),
+           " dflash2 smoke: tamper not detected")
+
+fn smokeShapeDomainNegatives() =
+    let vocabSize: int32 = 128
+    let blockLen: int32 = 4
+    let tablesRes = df2.Dflash2SyntheticSelectorTables(vocabSize, 4, int64(20260822))
+    assert(IsOk(tablesRes), " dflash2 smoke: synthetic tables build")
+    let tables = Value(tablesRes)
+    var dominantIndex: int32[]
+    add(dominantIndex, 3)
+    add(dominantIndex, 1)
+    add(dominantIndex, 0)
+    add(dominantIndex, 2)
+    let domCands = buildDominantCandidates(blockLen, dominantIndex, 5000.0, -1.0)
+    let hidden4 = makeSmokeHidden(blockLen, 4)
+    let ceTables = buildCounterexampleTables(-300.0)
+    let ceCands = buildCounterexampleCandidates()
+    let ceHidden = constF64(2, 0.25)
+
+    var shortIds: int32[]
+    var si: int32 = 0
+    while si < 31:
+        add(shortIds, 1)
+        si = si + 1
+    let negLogits = constF64(32, 0.0)
+    assert(IsErr(df2.Dflash2CandidatesBuild(2, shortIds, negLogits)),
+           " dflash2 smoke: neg candidates buffer shapes")
+    var badTopK = buildDominantCandidates(blockLen, dominantIndex, 5000.0, -1.0)
+    badTopK.topK = 8
+    assert(IsErr(df2.Dflash2ValidateCandidates(badTopK)),
+           " dflash2 smoke: neg candidates topK constant")
+    let badGrouping = df2.Dflash2ConvParams(
+        chanCount: 33,
+        hiddenDim: 2,
+        baseK0: zerosF64(33),
+        baseK1: zerosF64(33),
+        corrWeight: zerosF64(0)
+    )
+    assert(IsErr(df2.Dflash2ValidateConvParams(badGrouping)),
+           " dflash2 smoke: neg conv channel grouping")
+    let raggedParams = df2.Dflash2ConvParams(
+        chanCount: 16,
+        hiddenDim: 2,
+        baseK0: zerosF64(16),
+        baseK1: zerosF64(16),
+        corrWeight: zerosF64(8)
+    )
+    let raggedHidden = constF64(3, 1.0)
+    let okX = constF64(32, 1.0)
+    let okPrev = zerosF64(16)
+    let shortPrev = zerosF64(15)
+    let halfHidden = constF64(2, 1.0)
+    var okOut = zerosF64(32)
+    var shortOut = zerosF64(31)
+    assert(IsErr(df2.Dflash2DynamicDepthwiseConvFill(raggedParams, raggedHidden, okX, okPrev, okOut)),
+           " dflash2 smoke: neg conv ragged hidden")
+    assert(IsErr(df2.Dflash2DynamicDepthwiseConvFill(raggedParams, halfHidden, okX, shortPrev, okOut)),
+           " dflash2 smoke: neg conv prev vector shape")
+    assert(IsErr(df2.Dflash2DynamicDepthwiseConvFill(raggedParams, halfHidden, okX, okPrev, shortOut)),
+           " dflash2 smoke: neg conv output shape")
+    var shortPairs = zerosF64(df2.Dflash2TopK * df2.Dflash2TopK - 1)
+    assert(IsErr(df2.Dflash2ScoreAdjacentPairsFill(ceCands, ceTables, ceHidden, shortPairs)),
+           " dflash2 smoke: neg pair score output shape")
+    assert(IsErr(df2.Dflash2GreedyWalkFill(domCands, tables, hidden4, -1)),
+           " dflash2 smoke: neg walk last verified negative")
+    assert(IsErr(df2.Dflash2GreedyWalkFill(domCands, tables, hidden4, vocabSize)),
+           " dflash2 smoke: neg walk last verified out of vocab")
+    let shortEmbedA = zerosF64(1023)
+    let okEmbedB = zerosF64(1024)
+    let okGate = zerosF64(256)
+    assert(IsErr(df2.Dflash2SelectorTablesBuild(4, df2.Dflash2EmbedDim, 1, shortEmbedA, okEmbedB, okGate)),
+           " dflash2 smoke: neg tables embedding buffer")
+    assert(IsErr(df2.Dflash2SyntheticSelectorTables(0, 4, int64(1))),
+           " dflash2 smoke: neg synthetic tables vocab")
+
+fn main(): int32 =
+    smokeDynamicDepthwiseConv()
+    smokeUdominantWalkAndDeterminism()
+    smokeAdjacentConsistencyCounterexample()
+    smokeLosslessContract()
+    smokeShapeDomainNegatives()
+    echo(" dflash2_draft_selector_smoke ok")
+    return 0

@@ -1,0 +1,218 @@
+# libp2p S3 适配器: env 配置 → QUIC CAS fetcher。
+#
+# 目的: 提供一个签名严格等于 cas_store.CasSourceFetcher 别名 (fn(cidHex: str): Result[Bytes])
+# 的顶层函数, 供 parser.cheng miss-hook 在 driver-bake 窗口作为函数值注入
+# CasResolveDependencyPathWithFetch 的 fetcher 形参。它把「按 cid 走真 UDP QUIC 拉源」这条
+# transport 具体路径 (host_quic.Libp2pHostQuicFetchCasSource) 从环境变量取配置后封装成
+# 无状态、无参数化配置的纯 fetcher — cas_store 仍不 import libp2p, 依赖倒置只在此处闭合。
+#
+# 配置来源 (env, 硬错不静默):
+#   CHENG_CAS_BOOTSTRAP    多 bootstrap peer 列表, 逗号/空白分隔 "host:port"; 设置即优先。逐 peer
+#                          尝试, 第一个 cid 自证通过者胜 (OR-liveness, 与 cas_fetch_subprocess 同口径)。
+#   CHENG_CAS_PEER         单项 "host:port" (旧口径, BOOTSTRAP 未设时回退; 兼容单点)。
+#   CHENG_CAS_SERVER_NAME  可选, QUIC serverName (TLS SNI), 默认 "localhost"
+#                          (与 cas_source_quic_twoproc smoke 两进程惯例一致; 列表内各 peer 共用)。
+# 无任何 peer / 单 peer host:port 非法 / 端口非法 = Err。
+#
+# 多 bootstrap 安全论证: blob 内容寻址 cid==sha256(bytes), Libp2pHostQuicFetchCasSource 内已终校验
+# (host_quic:268)。恶意/eclipse peer 伪造不出匹配 cid 的块 (改一位即 cid 变 → 校验拒), 只能扣留
+# (回 miss/错块) → 跳下一 peer。故一个诚实可达 peer 即够 liveness, 安全来自自证非 peer 数; 多数
+# quorum 反是安全 bug。全部 peer 失败 = 聚合硬 Err 上抛, 绝不静默。
+#
+# 生产纪律 (no fallback / let it crash): env 缺失、cidHex 非法、QUIC fetch 失败、块缺失、
+# 返回块 cid 不符请求 cid 一律 Result Err 上抛; 绝不静默回磁盘, 绝不返回空/错 blob。
+# 内容寻址终校验 (sha256(data)==cid) 由 Libp2pHostQuicFetchCasSource 内部已做 (host_quic:268),
+# CAS admission 侧 CasAdmitFetchedBytes 会再校验一次 (双门), 本适配器只负责把匹配块字节交出。
+
+import std/result
+import std/rawbytes
+import std/os
+import cheng/std/bytes_layout as layout
+import cheng/libp2p/cas_store as cas
+import cheng/libp2p/protocols/cas_source/codec
+import cheng/libp2p/protocols/cas_source/channel_head/provider_set_codec as pset
+import cheng/libp2p/protocols/cas_source/channel_head/provider_snapshot_store as pstore
+import cheng/libp2p/host/host_quic as hq
+import std/strutils as strutil
+
+# 严格端口解析: 仅接受纯十进制且 1..65535; 任何非数字字符 / 越界 / 空串 = -1 (非法)。
+# 不用宽松的 parseInt (会吞尾部垃圾), 与 let-it-crash 纪律一致。
+fn casFetchEnvParsePort(text: str): int32 =
+    if text == "":
+        return -1
+    var acc: int32 = 0
+    var i: int32 = 0
+    while i < text.len:
+        let c = text[i]
+        if c < '0' || c > '9':
+            return -1
+        acc = acc * 10 + (Int32(c) - Int32('0'))
+        if acc > 65535:
+            return -1
+        i = i + 1
+    if acc <= 0:
+        return -1
+    return acc
+
+# 逗号与任意空白皆为分隔符; 空 token 丢弃。保留原始顺序 = OR 尝试顺序。
+fn CasFetchEnvParsePeers(raw: str): str[] =
+    return strutil.SplitWhitespace(strutil.Replace(raw, ",", " "))
+
+# peer 列表来源: CHENG_CAS_BOOTSTRAP 列表优先; 未设时回退单项 CHENG_CAS_PEER。皆空 → 空列表。
+fn CasFetchEnvPeerList(): str[] =
+    let boot = strutil.Strip(os.GetEnvDefault("CHENG_CAS_BOOTSTRAP", ""))
+    if boot != "":
+        return CasFetchEnvParsePeers(boot)
+    var out: str[]
+    let single = strutil.Strip(os.GetEnvDefault("CHENG_CAS_PEER", ""))
+    if single != "":
+        add(out, single)
+    return out
+
+# 单 peer "host:port" → 真 UDP QUIC WANT/BLOCK 拉 cid → 匹配块字节。host/port 非法或 fetch 失败 = Err。
+fn casFetchEnvFetchOnePeer(peer: str, serverName: str, cid: layout.FixedBytes32, cidHex: str): Result[Bytes] =
+    let parts = strutil.Split(peer, ':')
+    if parts.len != 2:
+        return Err[Bytes](strutil.Join(["cas fetch-env: peer 非 host:port 形式: ", peer], ""))
+    let host = strutil.Strip(parts[0])
+    let portText = strutil.Strip(parts[1])
+    if host == "":
+        return Err[Bytes](strutil.Join(["cas fetch-env: peer host 为空: ", peer], ""))
+    let port = casFetchEnvParsePort(portText)
+    if port < 0:
+        return Err[Bytes](strutil.Join(["cas fetch-env: peer 端口非法 (需 1..65535): ", portText], ""))
+
+    var wantCids: layout.FixedBytes32[]
+    add(wantCids, cid)
+    var outBlocks: codec.CasSourceBlockEntry[]
+    let fetchRes = hq.Libp2pHostQuicFetchCasSource(host, port, serverName, wantCids, outBlocks)
+    if IsErr(fetchRes):
+        return Err[Bytes](strutil.Join(["cas fetch-env: QUIC fetch peer=", peer, " cid=", cidHex, ": ", Error(fetchRes)], ""))
+    if outBlocks.len != 1:
+        return Err[Bytes](strutil.Join(["cas fetch-env: peer=", peer, " 期望恰好 1 块, 实得 ", IntToStr(outBlocks.len), " cid=", cidHex], ""))
+    if !layout.FixedBytes32Equal(outBlocks[0].cid, cid):
+        return Err[Bytes](strutil.Join(["cas fetch-env: peer=", peer, " 返回块 cid 不符请求 cid=", cidHex], ""))
+    return Ok[Bytes](outBlocks[0].data)
+
+# S3 入口: cidHex (64 hex) → env peer 列表 (BOOTSTRAP 优先/CHENG_CAS_PEER 回退) → 逐 peer 真 UDP QUIC
+# WANT/BLOCK, 首个 cid 自证通过者胜 (OR-liveness)。签名严格 == cas.CasSourceFetcher 别名。
+fn CasHostQuicFetcherFromEnv(cidHex: str): Result[Bytes] =
+    let peers = CasFetchEnvPeerList()
+    if peers.len == 0:
+        return Err[Bytes]("cas fetch-env: 无 bootstrap peer (需 CHENG_CAS_BOOTSTRAP 列表或 CHENG_CAS_PEER 单项)")
+    let serverName = strutil.Strip(os.GetEnvDefault("CHENG_CAS_SERVER_NAME", "localhost"))
+
+    let cidRes: Result[layout.FixedBytes32] = layout.FixedBytes32FromHex(cidHex)
+    if IsErr(cidRes):
+        return Err[Bytes](strutil.Join(["cas fetch-env: cidHex 非法 (需 64 hex): ", cidHex], ""))
+    let cid = Value(cidRes)
+
+    var errs: str[]
+    for i in 0..<peers.len:
+        let r = casFetchEnvFetchOnePeer(peers[i], serverName, cid, cidHex)
+        if !IsErr(r):
+            return r
+        add(errs, Error(r))
+    return Err[Bytes](strutil.Join(["cas fetch-env: 全部 ", IntToStr(peers.len),
+                                    " 个 bootstrap peer 取 cid=", cidHex,
+                                    " 均失败 [", strutil.Join(errs, " | "), "]"], ""))
+
+# ============================================================================
+# P5-S2 发现层: 签名 provider-set 快照消费 (设计 Part 2 + 3a③, 安全红线 C1)。
+#
+# fresh node 取物前, 向【已 pin 的根】(按 key, 非按 host:port) 请求路由快照, 验签 + 请求绑定 +
+# per-根单调 epoch 过滤后, 把快照里【该 channelId 的】endpoint 扩进取物候选。
+#
+# ★ C1 (撤销 UNION 隔离): 本函数只产出"发现的 endpoint 集", 调用方【只】把它并入 head/源
+#   liveness-OR 取物候选 (netCasFetchHeadOverPeers / CasHostQuicFetcherFromEnv)。撤销 UNION
+#   (Libp2pHostQuicFetchRevocationUnion) 的 peer 集【恒定绑静态 CHENG_CAS_BOOTSTRAP】, 绝不用
+#   发现集扩大 —— 否则作恶根注入的"撤销-miss 票"会把 fail-closed 翻成 fail-open (撤销压制)。
+#   本模块【不导出任何把发现集喂给撤销的路径】; 隔离由调用点的实参来源保证。
+#
+# ★ 发现层 fail-open (设计 2d): 根不回快照 / 网络失败 / 验签失败 (单条伪造) / epoch 陈旧 = 【跳过】,
+#   缺席只是不扩宽候选, 绝不致命, 内容/撤销安全在下游 S1 兜底。硬错【仅】留给真配置错 (pin key 非
+#   32B) —— 那是 let-it-crash 的用户配置 bug, 不是网络态。
+# ============================================================================
+
+# CHENG_CAS_BOOTSTRAP_KEYS: 与 CHENG_CAS_BOOTSTRAP host:port 列表平行的【根 pubkey hex 列表】
+# (逗号/空白分隔, 每项 64 hex = 32B raw ed25519 公钥)。照 S1 channel 存 raw hex 的收窄纪律,
+# 不做 did:key 解码 (完整首信任仪式 = S3)。未设 = 空列表 = 发现层不激活 (零扩宽, S1 行为不变)。
+fn CasFetchEnvSnapshotKeys(): str[] =
+    let raw = strutil.Strip(os.GetEnvDefault("CHENG_CAS_BOOTSTRAP_KEYS", ""))
+    if raw == "":
+        var empty: str[]
+        return empty
+    return strutil.SplitWhitespace(strutil.Replace(raw, ",", " "))
+
+# str[] 去重成员判定 (顺序保留式扩集用)。
+fn casFetchEnvEndpointSeen(acc: str[], ep: str): bool =
+    for i in 0..<acc.len:
+        if acc[i] == ep:
+            return true
+    return false
+
+# host:port → (host, port) 解析; 非法回 port=-1 (与 casFetchEnvParsePort 同严格口径)。
+fn casFetchEnvSplitPeer(peer: str, outHost: var str): int32 =
+    outHost = ""
+    let parts = strutil.Split(peer, ':')
+    if parts.len != 2:
+        return -1
+    let host = strutil.Strip(parts[0])
+    if host == "":
+        return -1
+    let port = casFetchEnvParsePort(strutil.Strip(parts[1]))
+    if port < 0:
+        return -1
+    outHost = host
+    return port
+
+# 发现聚合: 对每个 pinned 根 key, 遍历静态 peer 请求其签名快照, 验签 + 请求绑定 + 单调 epoch admit
+# 通过后, 收集快照中【channelId 匹配】的 endpoint。返回【新发现的 endpoint 集】(不含静态列表, 由调用方
+# 合并到 head/源候选; C1: 绝不合并到撤销 UNION)。
+#
+# 每个 pinned key 至多 admit 一次: 某静态 peer 首个回该 key 的合法快照即 admit + 采纳并 break 到下一 key;
+# 网络失败/miss/伪造该 peer → 跳下一 peer; epoch 陈旧 → 该 key 已有更新基线, 不扩宽, break。
+# storeRoot 空 = 硬错 (epoch 基线需落盘); pin key 非 32B = 硬错 (配置 bug)。其余全 fail-open。
+fn CasFetchEnvDiscoverEndpoints(storeRoot: str,
+                                 serverName: str,
+                                 staticPeers: str[],
+                                 pinnedKeyHexes: str[],
+                                 channelId: layout.FixedBytes32): Result[str[]] =
+    var discovered: str[]
+    if pinnedKeyHexes.len == 0:
+        return Ok[str[]](discovered)
+    if storeRoot == "":
+        return Err[str[]]("cas discover: storeRoot 空 (per-根 epoch 基线需落盘)")
+    for k in 0..<pinnedKeyHexes.len:
+        let keyHex = strutil.Strip(pinnedKeyHexes[k])
+        if keyHex == "":
+            continue
+        let signerKey = rawbytes.BytesFromHex(keyHex)
+        if BytesLen(signerKey) != 32:
+            return Err[str[]](strutil.Join(["cas discover: pinned key 非 32B (需 64 hex): ", keyHex], ""))
+        let signerHex = rawbytes.BytesToHex(signerKey)
+        for p in 0..<staticPeers.len:
+            var host = ""
+            let port = casFetchEnvSplitPeer(strutil.Strip(staticPeers[p]), host)
+            if port < 0:
+                continue
+            var found = false
+            var record: pset.ProviderSetRecord
+            let fr = hq.Libp2pHostQuicFetchSnapshot(host, port, serverName, signerKey, found, record)
+            if IsErr(fr):
+                # 网络失败 / 验签失败 / 请求绑定失败: 该 (peer,key) 视图不可用, fail-open 跳过下一 peer。
+                continue
+            if !found:
+                continue
+            # 单调 epoch admit (per-根): 陈旧 → 拒采纳, 该 key 不扩宽 (route-stability), 停止扫该 key。
+            let admitRes = pstore.ProviderSnapshotEpochAdmit(storeRoot, signerHex, record.epoch)
+            if IsErr(admitRes):
+                break
+            # 采纳: 收集该 channelId 的 endpoint (同 channelId 可多 endpoint 冗余)。
+            for e in 0..<record.entries.len:
+                if layout.FixedBytes32Equal(record.entries[e].channelId, channelId):
+                    let ep = record.entries[e].endpoint
+                    if ep != "" && !casFetchEnvEndpointSeen(discovered, ep):
+                        add(discovered, ep)
+            break
+    return Ok[str[]](discovered)

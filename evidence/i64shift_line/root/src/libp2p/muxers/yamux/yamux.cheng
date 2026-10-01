@@ -1,0 +1,804 @@
+# Yamux muxer(synchronous core framing + stream lifecycle).
+
+import cheng/libp2p/utils/result
+import cheng/libp2p/utils/bytes
+import cheng/libp2p/stream/connection as streamconn
+import cheng/libp2p/multiaddress
+import cheng/libp2p/stream/bufferstream
+import cheng/libp2p/resourcemanager
+import std/seqs
+const
+    yamuxCodec = "/yamux/1.0.0"
+    YamuxCodec = yamuxCodec
+    yamuxVersion = 0
+    yamuxDefaultWindow = 256000
+    yamuxHeaderSize = 12
+    yamuxMaxPayload = 1048576
+    yamuxReadChunk = 4096
+    yamuxMsgData = 0
+    yamuxMsgWindowUpdate = 1
+    yamuxMsgPing = 2
+    yamuxMsgGoAway = 3
+    yamuxFlagSyn = 1
+    yamuxFlagAck = 2
+    yamuxFlagFin = 4
+    yamuxFlagRst = 8
+    yamuxGoAwayNormal = 0
+    yamuxGoAwayProtocol = 1
+    yamuxGoAwayInternal = 2
+    maxYamuxMuxers = 64
+    maxYamuxStreams = 256
+    maxYamuxQueue = 64
+
+type
+    YamuxHeader =
+        version: int32
+        msgType: int32
+        flags: int32
+        streamId: int32
+        length: int32
+
+    YamuxStream =
+        muxerId: int32
+        streamId: int32
+        initiatorLocal: bool
+
+    YamuxStreamState =
+        id: int32
+        initiatorLocal: bool
+        active: bool
+        closedLocal: bool
+        closedRemote: bool
+        reset: bool
+        reserved: bool
+        recvWindow: int32
+        sendWindow: int32
+        buffer: BufferStream
+
+    YamuxStreamQueue =
+        count: int32
+        head: int32
+        tail: int32
+        items: int32[]
+
+    YamuxMuxerState =
+        active: bool
+        conn: streamconn.Connection
+        open: bool
+        initiator: bool
+        nextId: int32
+        goAway: bool
+        goAwayStatus: int32
+        rxBuffer: Bytes
+        streams: YamuxStreamState[]
+        inbound: YamuxStreamQueue
+
+    YamuxMuxer =
+        id: int32
+
+var
+    yamuxCount: int32
+    yamuxStates: YamuxMuxerState[]
+
+fn ensureYamuxStateTableInit() =
+    if len(yamuxStates) < maxYamuxMuxers:
+        setLen(yamuxStates, maxYamuxMuxers)
+
+fn ensureYamuxStreamSlots(state: var YamuxMuxerState) =
+    if len(state.streams) < maxYamuxStreams:
+        setLen(state.streams, maxYamuxStreams)
+
+fn initStreamQueue(): YamuxStreamQueue =
+    return YamuxStreamQueue(count: 0, head: 0, tail: 0)
+
+@borrows
+fn streamQueueIsEmpty(q: YamuxStreamQueue): bool =
+    q.count <= 0
+
+@borrows
+fn streamQueueIsFull(q: YamuxStreamQueue): bool =
+    q.count >= maxYamuxQueue
+
+fn enqueueStreamId(q: var YamuxStreamQueue, streamId: int32): Result[bool] =
+    if streamQueueIsFull(q):
+        return Err[bool]("yamux: inbound queue full")
+    q.items[q.tail] = streamId
+    q.tail = (q.tail + 1) % maxYamuxQueue
+    q.count = q.count + 1
+    return Ok[bool](true)
+
+fn dequeueStreamId(q: var YamuxStreamQueue): Result[int32] =
+    if streamQueueIsEmpty(q):
+        return Err[int32]("yamux: inbound queue empty")
+    let streamId: int32 = q.items[q.head]
+    q.head = (q.head + 1) % maxYamuxQueue
+    q.count = q.count - 1
+    return Ok[int32](streamId)
+
+fn initStreamStateInto(state: var YamuxMuxerState, idx: int32, streamId: int32, initiatorLocal: bool) =
+    state.streams[idx].id = streamId
+    state.streams[idx].initiatorLocal = initiatorLocal
+    state.streams[idx].active = true
+    state.streams[idx].closedLocal = false
+    state.streams[idx].closedRemote = false
+    state.streams[idx].reset = false
+    state.streams[idx].reserved = false
+    state.streams[idx].recvWindow = yamuxDefaultWindow
+    state.streams[idx].sendWindow = yamuxDefaultWindow
+    bufferstream.resetBufferStream(state.streams[idx].buffer)
+
+fn yamuxStateActive(state: var YamuxMuxerState): bool =
+    return state.active
+
+fn yamuxStateValid(id: int32): bool =
+    ensureYamuxStateTableInit()
+    if id < 0 || id >= yamuxCount:
+        return false
+    return yamuxStateActive(yamuxStates[id])
+
+fn streamResourceDir(initiatorLocal: bool): int32 =
+    if initiatorLocal:
+        return resourceDirOutbound
+    return resourceDirInbound
+
+fn streamBufferWrite(state: var YamuxMuxerState, idx: int32, data: Bytes): Result[int32] =
+    if idx < 0 || idx >= maxYamuxStreams:
+        return Err[int32]("yamux: invalid stream")
+    return bufferstream.write(state.streams[idx].buffer, data)
+
+fn streamBufferRead(state: var YamuxMuxerState, idx: int32, count: int32): Result[Bytes] =
+    if idx < 0 || idx >= maxYamuxStreams:
+        return Err[Bytes]("yamux: invalid stream")
+    return bufferstream.read(state.streams[idx].buffer, count)
+
+fn resetStreams(state: var YamuxMuxerState) =
+    for i in 0..<maxYamuxStreams:
+        if state.streams[i].reserved:
+            releaseStream(streamResourceDir(state.streams[i].initiatorLocal))
+            state.streams[i].reserved = false
+        bufferstream.resetBufferStream(state.streams[i].buffer)
+        state.streams[i].active = false
+        state.streams[i].closedLocal = false
+        state.streams[i].closedRemote = false
+        state.streams[i].reset = false
+        state.streams[i].reserved = false
+        state.streams[i].id = 0
+        state.streams[i].initiatorLocal = false
+        state.streams[i].recvWindow = yamuxDefaultWindow
+        state.streams[i].sendWindow = yamuxDefaultWindow
+
+fn clearStreamState(state: var YamuxMuxerState, idx: int32) =
+    if idx < 0 || idx >= maxYamuxStreams:
+        return
+    if state.streams[idx].reserved:
+        releaseStream(streamResourceDir(state.streams[idx].initiatorLocal))
+        state.streams[idx].reserved = false
+    bufferstream.resetBufferStream(state.streams[idx].buffer)
+    state.streams[idx].active = false
+    state.streams[idx].closedLocal = false
+    state.streams[idx].closedRemote = false
+    state.streams[idx].reset = false
+    state.streams[idx].id = 0
+    state.streams[idx].initiatorLocal = false
+    state.streams[idx].recvWindow = yamuxDefaultWindow
+    state.streams[idx].sendWindow = yamuxDefaultWindow
+
+fn maybeFinalizeStream(state: var YamuxMuxerState, idx: int32) =
+    if idx < 0 || idx >= maxYamuxStreams:
+        return
+    if !state.streams[idx].active:
+        return
+    if state.streams[idx].reset:
+        clearStreamState(state, idx)
+        return
+    if state.streams[idx].closedLocal && state.streams[idx].closedRemote:
+        if bufferstream.available(state.streams[idx].buffer) <= 0:
+            clearStreamState(state, idx)
+
+fn findStreamIndex(state: var YamuxMuxerState, streamId: int32, initiatorLocal: bool): int32 =
+    for i in 0..<maxYamuxStreams:
+        if state.streams[i].active && state.streams[i].id == streamId && state.streams[i].initiatorLocal == initiatorLocal:
+            return i
+    return -1
+
+fn allocStream(state: var YamuxMuxerState, streamId: int32, initiatorLocal: bool): Result[int32] =
+    let existing: int32 = findStreamIndex(state, streamId, initiatorLocal)
+    if existing >= 0:
+        return Ok[int32](existing)
+    for i in 0..<maxYamuxStreams:
+        if !state.streams[i].active:
+            initStreamStateInto(state, i, streamId, initiatorLocal)
+            return Ok[int32](i)
+    return Err[int32]("yamux: stream table full")
+
+fn initMuxerState(state: var YamuxMuxerState) =
+    if state.initiator:
+        state.nextId = 1
+    else:
+        state.nextId = 2
+
+fn yamuxStateSlotReusable(state: var YamuxMuxerState): bool =
+    return !state.active || !state.open
+
+fn yamuxReinitState(state: var YamuxMuxerState, conn: streamconn.Connection) =
+    ensureYamuxStreamSlots(state)
+    state.active = true
+    state.conn = conn
+    state.open = true
+    state.initiator = streamconn.ConnectionDirection(conn) == streamconn.Outbound
+    state.nextId = 1
+    state.goAway = false
+    state.goAwayStatus = yamuxGoAwayNormal
+    state.rxBuffer = EmptyBytes()
+    state.inbound = initStreamQueue()
+    resetStreams(state)
+    initMuxerState(state)
+
+fn allocMuxerState(conn: streamconn.Connection): int32 =
+    ensureYamuxStateTableInit()
+    for i in 0..<yamuxCount:
+        if yamuxStateSlotReusable(yamuxStates[i]):
+            yamuxReinitState(yamuxStates[i], conn)
+            return i
+    if yamuxCount >= maxYamuxMuxers:
+        return -1
+    let idx: int32 = yamuxCount
+    yamuxCount = yamuxCount + 1
+    yamuxReinitState(yamuxStates[idx], conn)
+    return idx
+
+fn newYamuxMuxer(conn: streamconn.Connection): Result[YamuxMuxer] =
+    let id: int32 = allocMuxerState(conn)
+    if id < 0:
+        return Err[YamuxMuxer]("yamux: muxer table full")
+    return Ok[YamuxMuxer](YamuxMuxer(id: id))
+
+fn yamuxIsOpenInState(state: var YamuxMuxerState): bool =
+    if !state.open:
+        return false
+    return streamconn.ConnectionIsOpen(state.conn)
+
+fn yamuxIsOpen(m: YamuxMuxer): bool =
+    if ! yamuxStateValid(m.id):
+        return false
+    return yamuxIsOpenInState(yamuxStates[m.id])
+
+fn yamuxStateConn(state: var YamuxMuxerState): streamconn.Connection =
+    return state.conn
+
+fn yamuxConnection(m: YamuxMuxer): streamconn.Connection =
+    if ! yamuxStateValid(m.id):
+        var conn: streamconn.Connection
+        streamconn.ConnClose(conn)
+        return conn
+    return yamuxStateConn(yamuxStates[m.id])
+
+fn hasFlag(flags: int32, flag: int32): bool =
+    return (flags & flag) != 0
+
+fn isLocalInitiator(state: var YamuxMuxerState, streamId: int32): bool =
+    let odd: bool = (streamId % 2) != 0
+    if state.initiator:
+        return odd
+    return ! odd
+
+@borrows
+fn yamuxDropFront(data: Bytes, count: int32): Bytes =
+    let total: int32 = BytesLen(data)
+    var skip: int32 = count
+    if skip < 0:
+        skip = 0
+    if skip >= total:
+        return EmptyBytes()
+    let n: int32 = total - skip
+    let out: Bytes = BytesAlloc(n)
+    BytesCopyRangeInto(out, 0, data, skip, n)
+    return out
+
+@borrows
+fn readU16BE(data: Bytes, offset: int32): Result[int32] =
+    if offset < 0 || offset + 1 >= BytesLen(data):
+        return Err[int32]("yamux: short u16")
+    let hi: int32 = BytesGet(data, offset)
+    let lo: int32 = BytesGet(data, offset + 1)
+    return Ok[int32]((hi << 8) + lo)
+
+@borrows
+fn readU32BE(data: Bytes, offset: int32): Result[int32] =
+    if offset < 0 || offset + 3 >= BytesLen(data):
+        return Err[int32]("yamux: short u32")
+    let b0: int32 = BytesGet(data, offset)
+    let b1: int32 = BytesGet(data, offset + 1)
+    let b2: int32 = BytesGet(data, offset + 2)
+    let b3: int32 = BytesGet(data, offset + 3)
+    let value: int64 = (int64(b0) << 24) + (int64(b1) << 16) + (int64(b2) << 8) + int64(b3)
+    if value < 0 || value > 2147483647:
+        return Err[int32]("yamux: u32 overflow")
+    return Ok[int32](int32(value))
+
+fn writeU16BE(buf: Bytes, offset: int32, value: int32): Result[bool] =
+    if offset < 0 || offset + 1 >= BytesLen(buf):
+        return Err[bool]("yamux: short u16 write")
+    let v: int32 = value & 65535
+    BytesSet(buf, offset, (v >> 8) & 255)
+    BytesSet(buf, offset + 1, v & 255)
+    return Ok[bool](true)
+
+fn writeU32BE(buf: Bytes, offset: int32, value: int32): Result[bool] =
+    if offset < 0 || offset + 3 >= BytesLen(buf):
+        return Err[bool]("yamux: short u32 write")
+    if value < 0:
+        return Err[bool]("yamux: negative u32")
+    BytesSet(buf, offset, (value >> 24) & 255)
+    BytesSet(buf, offset + 1, (value >> 16) & 255)
+    BytesSet(buf, offset + 2, (value >> 8) & 255)
+    BytesSet(buf, offset + 3, value & 255)
+    return Ok[bool](true)
+
+@borrows
+fn decodeHeader(data: Bytes, offset: int32): Result[YamuxHeader] =
+    if offset < 0 || offset + yamuxHeaderSize > BytesLen(data):
+        return Err[YamuxHeader]("yamux: header truncated")
+    let version: int32 = BytesGet(data, offset)
+    let msgType: int32 = BytesGet(data, offset + 1)
+    let flagsRes: Result[int32] = readU16BE(data, offset + 2)
+    if IsErr(flagsRes):
+        return Err[YamuxHeader](Error(flagsRes))
+    let streamRes: Result[int32] = readU32BE(data, offset + 4)
+    if IsErr(streamRes):
+        return Err[YamuxHeader](Error(streamRes))
+    let lenRes: Result[int32] = readU32BE(data, offset + 8)
+    if IsErr(lenRes):
+        return Err[YamuxHeader](Error(lenRes))
+    let flags: int32 = Value(flagsRes)
+    if flags < 0 || flags > 15:
+        return Err[YamuxHeader]("yamux: invalid flags")
+    return Ok[YamuxHeader](YamuxHeader(
+        version: version,
+        msgType: msgType,
+        flags: flags,
+        streamId: Value(streamRes),
+        length: Value(lenRes)
+    ))
+
+fn encodeHeader(header: YamuxHeader): Result[Bytes] =
+    if header.version != yamuxVersion:
+        return Err[Bytes]("yamux: invalid version")
+    if header.msgType < yamuxMsgData || header.msgType > yamuxMsgGoAway:
+        return Err[Bytes]("yamux: invalid msg type")
+    if header.flags < 0 || header.flags > 15:
+        return Err[Bytes]("yamux: invalid flags")
+    if header.streamId < 0:
+        return Err[Bytes]("yamux: invalid stream id")
+    if header.length < 0:
+        return Err[Bytes]("yamux: invalid length")
+    let out: Bytes = BytesAlloc(yamuxHeaderSize)
+    BytesSet(out, 0, header.version)
+    BytesSet(out, 1, header.msgType)
+    let fRes: Result[bool] = writeU16BE(out, 2, header.flags)
+    if IsErr(fRes):
+        return Err[Bytes](Error(fRes))
+    let sRes: Result[bool] = writeU32BE(out, 4, header.streamId)
+    if IsErr(sRes):
+        return Err[Bytes](Error(sRes))
+    let lRes: Result[bool] = writeU32BE(out, 8, header.length)
+    if IsErr(lRes):
+        return Err[Bytes](Error(lRes))
+    return Ok[Bytes](out)
+
+fn writeFrame(state: var YamuxMuxerState, header: YamuxHeader, payload: Bytes): Result[int32] =
+    let payloadLen: int32 = BytesLen(payload)
+    if header.msgType == yamuxMsgData:
+        if header.length != payloadLen:
+            return Err[int32]("yamux: payload length mismatch")
+    else:
+        if payloadLen != 0:
+            return Err[int32]("yamux: control payload not supported")
+    let headRes: Result[Bytes] = encodeHeader(header)
+    if IsErr(headRes):
+        return Err[int32](Error(headRes))
+    let frame: Bytes = BytesConcat(Value(headRes), payload)
+    return streamconn.ConnWrite(state.conn, frame)
+
+fn sendWindowUpdate(state: var YamuxMuxerState, streamId: int32, delta: int32, flags: int32): Result[bool] =
+    if delta <= 0:
+        return Ok[bool](true)
+    let header: YamuxHeader = YamuxHeader(
+        version: yamuxVersion,
+        msgType: yamuxMsgWindowUpdate,
+        flags: flags,
+        streamId: streamId,
+        length: delta
+    )
+    let writeRes: Result[int32] = writeFrame(state, header, EmptyBytes())
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    return Ok[bool](true)
+
+fn sendDataFrame(state: var YamuxMuxerState, streamId: int32, flags: int32, payload: Bytes): Result[int32] =
+    let header: YamuxHeader = YamuxHeader(
+        version: yamuxVersion,
+        msgType: yamuxMsgData,
+        flags: flags,
+        streamId: streamId,
+        length: BytesLen(payload)
+    )
+    return writeFrame(state, header, payload)
+
+fn handlePing(state: var YamuxMuxerState, header: YamuxHeader): Result[bool] =
+    if hasFlag(header.flags, yamuxFlagAck):
+        return Ok[bool](true)
+    let ackHeader: YamuxHeader = YamuxHeader(
+        version: yamuxVersion,
+        msgType: yamuxMsgPing,
+        flags: yamuxFlagAck,
+        streamId: 0,
+        length: header.length
+    )
+    let writeRes: Result[int32] = writeFrame(state, ackHeader, EmptyBytes())
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    return Ok[bool](true)
+
+fn handleGoAway(state: var YamuxMuxerState, header: YamuxHeader): Result[bool] =
+    state.goAway = true
+    state.goAwayStatus = header.length
+    return Ok[bool](true)
+
+fn handleFrame(state: var YamuxMuxerState, header: YamuxHeader, payload: Bytes): Result[bool] =
+    if header.version != yamuxVersion:
+        return Err[bool]("yamux: bad version")
+    if header.msgType == yamuxMsgPing:
+        return handlePing(state, header)
+    if header.msgType == yamuxMsgGoAway:
+        return handleGoAway(state, header)
+    let initiatorLocal: bool = isLocalInitiator(state, header.streamId)
+    let syn: bool = hasFlag(header.flags, yamuxFlagSyn)
+    var idx: int32 = findStreamIndex(state, header.streamId, initiatorLocal)
+    if idx < 0 && syn:
+        if initiatorLocal:
+            return Err[bool]("yamux: remote used local initiator id")
+        let idxRes: Result[int32] = allocStream(state, header.streamId, false)
+        if IsErr(idxRes):
+            return Err[bool](Error(idxRes))
+        idx = Value(idxRes)
+        if header.msgType == yamuxMsgWindowUpdate && header.length > 0:
+            state.streams[idx].sendWindow = header.length
+        let enqRes: Result[bool] = enqueueStreamId(state.inbound, header.streamId)
+        if IsErr(enqRes):
+            return Err[bool](Error(enqRes))
+    if idx < 0:
+        return Ok[bool](true)
+    if hasFlag(header.flags, yamuxFlagRst):
+        state.streams[idx].reset = true
+        state.streams[idx].closedRemote = true
+        bufferstream.resetBufferStream(state.streams[idx].buffer)
+        maybeFinalizeStream(state, idx)
+        return Ok[bool](true)
+    if hasFlag(header.flags, yamuxFlagFin):
+        state.streams[idx].closedRemote = true
+    if header.msgType == yamuxMsgWindowUpdate:
+        if header.length > 0:
+            state.streams[idx].sendWindow = state.streams[idx].sendWindow + header.length
+        return Ok[bool](true)
+    if header.msgType == yamuxMsgData:
+        let size: int32 = BytesLen(payload)
+        if size <= 0:
+            maybeFinalizeStream(state, idx)
+            return Ok[bool](true)
+        if state.streams[idx].recvWindow < size:
+            return Err[bool]("yamux: recv window exceeded")
+        state.streams[idx].recvWindow = state.streams[idx].recvWindow - size
+        let writeRes: Result[int32] = streamBufferWrite(state, idx, payload)
+        if IsErr(writeRes):
+            return Err[bool](Error(writeRes))
+        return Ok[bool](true)
+    return Ok[bool](true)
+
+fn pumpIncoming(state: var YamuxMuxerState): Result[int32] =
+    if ! state.open:
+        return Err[int32]("yamux: closed")
+    let readRes: Result[Bytes] = streamconn.ConnRead(state.conn, yamuxReadChunk)
+    if IsErr(readRes):
+        return Err[int32](Error(readRes))
+    let chunk: Bytes = Value(readRes)
+    if BytesLen(chunk) <= 0:
+        return Ok[int32](0)
+    state.rxBuffer = BytesConcat(state.rxBuffer, chunk)
+    var frames: int32
+    var idx: int32
+    while BytesLen(state.rxBuffer) - idx >= yamuxHeaderSize: # cheng-syntax-policy: allow-counting-while
+        let headerRes: Result[YamuxHeader] = decodeHeader(state.rxBuffer, idx)
+        if IsErr(headerRes):
+            return Err[int32](Error(headerRes))
+        let header: YamuxHeader = Value(headerRes)
+        if header.length < 0:
+            return Err[int32]("yamux: invalid length")
+        if header.msgType == yamuxMsgWindowUpdate && header.length > yamuxMaxPayload:
+            return Err[int32]("yamux: window update too large")
+        let payloadLen: int32 = if header.msgType == yamuxMsgData: header.length else: 0
+        if payloadLen > yamuxMaxPayload:
+            return Err[int32]("yamux: payload too large")
+        let needed: int32 = yamuxHeaderSize + payloadLen
+        if BytesLen(state.rxBuffer) - idx < needed:
+            break
+        var payload: Bytes
+        if payloadLen > 0:
+            payload = BytesAlloc(payloadLen)
+            BytesCopyRangeInto(payload, 0, state.rxBuffer, idx + yamuxHeaderSize, payloadLen)
+        idx = idx + needed
+        let handleRes: Result[bool] = handleFrame(state, header, payload)
+        if IsErr(handleRes):
+            return Err[int32](Error(handleRes))
+        frames = frames + 1
+    if idx > 0:
+        state.rxBuffer = yamuxDropFront(state.rxBuffer, idx)
+    return Ok[int32](frames)
+
+fn yamuxSetStreamReserved(state: var YamuxMuxerState, idx: int32, reserved: bool) =
+    if idx < 0 || idx >= maxYamuxStreams:
+        return
+    state.streams[idx].reserved = reserved
+
+fn yamuxOpenStreamInState(state: var YamuxMuxerState, muxerId: int32): Result[YamuxStream] =
+    if !state.open:
+        return Err[YamuxStream]("yamux: closed")
+    if state.goAway:
+        return Err[YamuxStream]("yamux: remote goaway")
+    let streamId: int32 = state.nextId
+    state.nextId = state.nextId + 2
+    var reserved: bool
+    if resourceEnabled():
+        let reserveRes: Result[bool] = reserveStream(streamResourceDir(true))
+        if IsErr(reserveRes):
+            return Err[YamuxStream](Error(reserveRes))
+        reserved = true
+    let idxRes: Result[int32] = allocStream(state, streamId, true)
+    if IsErr(idxRes):
+        if reserved:
+            releaseStream(streamResourceDir(true))
+        return Err[YamuxStream](Error(idxRes))
+    let idx: int32 = Value(idxRes)
+    yamuxSetStreamReserved(state, idx, reserved)
+    let synRes: Result[bool] = sendWindowUpdate(state, streamId, yamuxDefaultWindow, yamuxFlagSyn)
+    if IsErr(synRes):
+        if reserved:
+            releaseStream(streamResourceDir(true))
+        clearStreamState(state, idx)
+        return Err[YamuxStream](Error(synRes))
+    return Ok[YamuxStream](YamuxStream(muxerId: muxerId, streamId: streamId, initiatorLocal: true))
+
+fn yamuxOpenStream(m: var YamuxMuxer): Result[YamuxStream] =
+    if ! yamuxStateValid(m.id):
+        return Err[YamuxStream]("yamux: invalid")
+    return yamuxOpenStreamInState(yamuxStates[m.id], m.id)
+
+fn yamuxAcceptStreamInState(state: var YamuxMuxerState, muxerId: int32): Result[YamuxStream] =
+    if !state.open:
+        return Err[YamuxStream]("yamux: closed")
+    if streamQueueIsEmpty(state.inbound):
+        let pumpRes: Result[int32] = pumpIncoming(state)
+        if IsErr(pumpRes):
+            return Err[YamuxStream](Error(pumpRes))
+    if streamQueueIsEmpty(state.inbound):
+        return Err[YamuxStream]("yamux: no inbound streams")
+    let idRes: Result[int32] = dequeueStreamId(state.inbound)
+    if IsErr(idRes):
+        return Err[YamuxStream](Error(idRes))
+    let streamId: int32 = Value(idRes)
+    let idx: int32 = findStreamIndex(state, streamId, false)
+    if idx < 0:
+        return Err[YamuxStream]("yamux: inbound stream missing")
+    var reserved: bool
+    if resourceEnabled():
+        let reserveRes: Result[bool] = reserveStream(streamResourceDir(false))
+        if IsErr(reserveRes):
+            yamuxResetStreamInState(state, streamId, false)
+            return Err[YamuxStream](Error(reserveRes))
+        reserved = true
+    yamuxSetStreamReserved(state, idx, reserved)
+    return Ok[YamuxStream](YamuxStream(muxerId: muxerId, streamId: streamId, initiatorLocal: false))
+
+fn yamuxAcceptStream(m: var YamuxMuxer): Result[YamuxStream] =
+    if ! yamuxStateValid(m.id):
+        return Err[YamuxStream]("yamux: invalid")
+    return yamuxAcceptStreamInState(yamuxStates[m.id], m.id)
+
+fn yamuxStreamIsOpenInState(state: var YamuxMuxerState, streamId: int32, initiatorLocal: bool): bool =
+    if !state.open:
+        return false
+    let idx: int32 = findStreamIndex(state, streamId, initiatorLocal)
+    if idx < 0:
+        return false
+    if !state.streams[idx].active || state.streams[idx].reset:
+        return false
+    return ! (state.streams[idx].closedLocal && state.streams[idx].closedRemote)
+
+fn yamuxStreamIsOpen(s: YamuxStream): bool =
+    if ! yamuxStateValid(s.muxerId):
+        return false
+    return yamuxStreamIsOpenInState(yamuxStates[s.muxerId], s.streamId, s.initiatorLocal)
+
+fn yamuxReadInState(state: var YamuxMuxerState, streamId: int32, initiatorLocal: bool, count: int32): Result[Bytes] =
+    let idx: int32 = findStreamIndex(state, streamId, initiatorLocal)
+    if idx < 0:
+        return Err[Bytes]("yamux: unknown stream")
+    if bufferstream.available(state.streams[idx].buffer) <= 0:
+        let pumpRes: Result[int32] = pumpIncoming(state)
+        if IsErr(pumpRes):
+            return Err[Bytes](Error(pumpRes))
+    if bufferstream.available(state.streams[idx].buffer) <= 0:
+        if state.streams[idx].reset || state.streams[idx].closedRemote:
+            maybeFinalizeStream(state, idx)
+            return Err[Bytes]("yamux: stream closed")
+        return Ok[Bytes](EmptyBytes())
+    let outRes: Result[Bytes] = streamBufferRead(state, idx, count)
+    if IsErr(outRes):
+        return outRes
+    var payload: Bytes = Value(outRes)
+    let readLen: int32 = BytesLen(payload)
+    if readLen > 0:
+        let bwRes: Result[bool] = resourceRecordInboundBytes(int64(readLen))
+        if IsErr(bwRes):
+            return Err[Bytes](Error(bwRes))
+        state.streams[idx].recvWindow = state.streams[idx].recvWindow + readLen
+        let winRes: Result[bool] = sendWindowUpdate(state, streamId, readLen, 0)
+        if IsErr(winRes):
+            return Err[Bytes](Error(winRes))
+    maybeFinalizeStream(state, idx)
+    return Ok[Bytes](payload)
+
+fn yamuxRead(s: var YamuxStream, count: int32): Result[Bytes] =
+    if ! yamuxStateValid(s.muxerId):
+        return Err[Bytes]("yamux: invalid muxer")
+    return yamuxReadInState(yamuxStates[s.muxerId], s.streamId, s.initiatorLocal, count)
+
+fn yamuxWriteInState(state: var YamuxMuxerState, streamId: int32, initiatorLocal: bool, data: Bytes): Result[int32] =
+    if !state.open:
+        return Err[int32]("yamux: closed")
+    let idx: int32 = findStreamIndex(state, streamId, initiatorLocal)
+    if idx < 0:
+        return Err[int32]("yamux: unknown stream")
+    if state.streams[idx].reset || state.streams[idx].closedLocal:
+        return Err[int32]("yamux: stream closed")
+    let total: int32 = BytesLen(data)
+    if total <= 0:
+        return Ok[int32](0)
+    var remaining: int32 = total
+    var offset: int32
+    var sent: int32
+    while remaining > 0 && state.streams[idx].sendWindow > 0: # cheng-syntax-policy: allow-counting-while
+        var chunkSize: int32 = remaining
+        if chunkSize > state.streams[idx].sendWindow:
+            chunkSize = state.streams[idx].sendWindow
+        if chunkSize > yamuxMaxPayload:
+            chunkSize = yamuxMaxPayload
+        let payload: Bytes = BytesSlice(data, offset, chunkSize)
+        let writeRes: Result[int32] = sendDataFrame(state, streamId, 0, payload)
+        if IsErr(writeRes):
+            return Err[int32](Error(writeRes))
+        state.streams[idx].sendWindow = state.streams[idx].sendWindow - chunkSize
+        offset = offset + chunkSize
+        remaining = remaining - chunkSize
+        sent = sent + chunkSize
+    if sent > 0:
+        let bwRes: Result[bool] = resourceRecordOutboundBytes(int64(sent))
+        if IsErr(bwRes):
+            return Err[int32](Error(bwRes))
+    return Ok[int32](sent)
+
+fn yamuxWrite(s: var YamuxStream, data: Bytes): Result[int32] =
+    if ! yamuxStateValid(s.muxerId):
+        return Err[int32]("yamux: invalid muxer")
+    return yamuxWriteInState(yamuxStates[s.muxerId], s.streamId, s.initiatorLocal, data)
+
+fn yamuxCloseStreamInState(state: var YamuxMuxerState, streamId: int32, initiatorLocal: bool): Result[bool] =
+    ensureYamuxStreamSlots(state)
+    if !state.open:
+        return Err[bool]("yamux: closed")
+    let idx: int32 = findStreamIndex(state, streamId, initiatorLocal)
+    if idx < 0:
+        return Err[bool]("yamux: unknown stream")
+    if state.streams[idx].closedLocal:
+        return Ok[bool](true)
+    state.streams[idx].closedLocal = true
+    let header: YamuxHeader = YamuxHeader(
+        version: yamuxVersion,
+        msgType: yamuxMsgData,
+        flags: yamuxFlagFin,
+        streamId: streamId,
+        length: 0
+    )
+    let writeRes: Result[int32] = writeFrame(state, header, EmptyBytes())
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    if state.streams[idx].reserved:
+        let relRes: Result[bool] = releaseStream(streamResourceDir(initiatorLocal))
+        if IsErr(relRes):
+            return Err[bool](Error(relRes))
+        state.streams[idx].reserved = false
+    maybeFinalizeStream(state, idx)
+    return Ok[bool](true)
+
+fn yamuxCloseStream(s: var YamuxStream): Result[bool] =
+    if ! yamuxStateValid(s.muxerId):
+        return Err[bool]("yamux: invalid muxer")
+    ensureYamuxStateTableInit()
+    return yamuxCloseStreamInState(yamuxStates[s.muxerId], s.streamId, s.initiatorLocal)
+
+fn yamuxResetStreamInState(state: var YamuxMuxerState, streamId: int32, initiatorLocal: bool): Result[bool] =
+    if !state.open:
+        return Err[bool]("yamux: closed")
+    let idx: int32 = findStreamIndex(state, streamId, initiatorLocal)
+    if idx < 0:
+        return Err[bool]("yamux: unknown stream")
+    state.streams[idx].reset = true
+    state.streams[idx].closedLocal = true
+    let header: YamuxHeader = YamuxHeader(
+        version: yamuxVersion,
+        msgType: yamuxMsgData,
+        flags: yamuxFlagRst,
+        streamId: streamId,
+        length: 0
+    )
+    let writeRes: Result[int32] = writeFrame(state, header, EmptyBytes())
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    bufferstream.resetBufferStream(state.streams[idx].buffer)
+    if state.streams[idx].reserved:
+        let relRes: Result[bool] = releaseStream(streamResourceDir(initiatorLocal))
+        if IsErr(relRes):
+            return Err[bool](Error(relRes))
+        state.streams[idx].reserved = false
+    maybeFinalizeStream(state, idx)
+    return Ok[bool](true)
+
+fn yamuxResetStream(s: var YamuxStream): Result[bool] =
+    if ! yamuxStateValid(s.muxerId):
+        return Err[bool]("yamux: invalid muxer")
+    return yamuxResetStreamInState(yamuxStates[s.muxerId], s.streamId, s.initiatorLocal)
+
+fn yamuxCloseInState(state: var YamuxMuxerState) =
+    state.open = false
+    streamconn.ConnClose(state.conn)
+    resetStreams(state)
+    state.inbound = initStreamQueue()
+    state.rxBuffer = EmptyBytes()
+
+fn yamuxClose(m: var YamuxMuxer) =
+    if ! yamuxStateValid(m.id):
+        return
+    yamuxCloseInState(yamuxStates[m.id])
+
+fn NewYamuxMuxer(conn: streamconn.Connection): Result[YamuxMuxer] =
+    return newYamuxMuxer(conn)
+
+fn YamuxIsOpen(m: YamuxMuxer): bool =
+    return yamuxIsOpen(m)
+
+fn YamuxConnection(m: YamuxMuxer): streamconn.Connection =
+    return yamuxConnection(m)
+
+fn YamuxOpenStream(m: var YamuxMuxer): Result[YamuxStream] =
+    return yamuxOpenStream(m)
+
+fn YamuxAcceptStream(m: var YamuxMuxer): Result[YamuxStream] =
+    return yamuxAcceptStream(m)
+
+fn YamuxStreamIsOpen(s: YamuxStream): bool =
+    return yamuxStreamIsOpen(s)
+
+fn YamuxRead(s: var YamuxStream, count: int32): Result[Bytes] =
+    return yamuxRead(s, count)
+
+fn YamuxWrite(s: var YamuxStream, data: Bytes): Result[int32] =
+    return yamuxWrite(s, data)
+
+fn YamuxCloseStream(s: var YamuxStream): Result[bool] =
+    return yamuxCloseStream(s)
+
+fn YamuxResetStream(s: var YamuxStream): Result[bool] =
+    return yamuxResetStream(s)
+
+fn YamuxClose(m: var YamuxMuxer) =
+    yamuxClose(m)

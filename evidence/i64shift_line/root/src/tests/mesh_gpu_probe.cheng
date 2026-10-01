@@ -1,0 +1,347 @@
+# Mesh GPU probe: renders whole-mesh frames twice — once through the CPU
+# golden path (raster.RasterMake + mesh_render.MeshRasterFrame*) and once
+# through the tile-binned Metal path (mesh_render.MeshGpu*) — then
+# compares every pixel. A pixel passes when all three color channels
+# differ by at most 2 and the int32-millimetre depths differ by at most
+# 1; each frame passes when at least 99% of pixels pass (edge pixels
+# where float32 rounding flips the winning triangle land inside the 1%
+# budget). Two poses are checked: the identity pose through the legacy
+# yaw entry points, and a pitch 0.43 rad x roll 0.2 rad unit quaternion
+# (hip-pitch stance pose class) through the full-orientation entry
+# points. The pitched frame carries orientation-correctness assertions:
+# every rendered pixel must land inside the analytically projected
+# rotated bounding box (rows recomputed independently in this probe),
+# the rendered silhouette must reach the projected box on every side,
+# and the pitched image must differ from the upright image over >= 1%
+# of the frame. Reports per-path wall time; on any Metal bring-up or
+# dispatch failure it reports the cpu-fallback stage and fails loudly
+# instead of faking a gpu PASS.
+import cheng/game/cinema/camera
+import cheng/game/render/cpu_raster as raster
+import cheng/game/render/mesh_render
+import std/rawbytes
+import std/rawmem_support
+import std/monotimes
+import std/math as m
+import std/strings as strings
+
+const
+    ProbeWidth = 1280
+    ProbeHeight = 720
+    ProbeFocalPx = 950.0
+    ProbeR = 205
+    ProbeG = 170
+    ProbeB = 110
+    ProbeEdgeMarginPx = 3.0
+    # silhouette-reach bands calibrated to the measured fill of this
+    # shell's projected rotated bbox (0.69 width / 0.53 height): loose
+    # enough for edge effects, tight enough to reject a stale or
+    # degenerate silhouette inside a valid pose-box projection
+    ProbeReachMinWidthFrac = 0.60
+    ProbeReachMinHeightFrac = 0.45
+    ProbeGpuMsCap = 200
+
+# Per-pixel CPU-vs-GPU compare (<=2 per color channel, <=1 mm depth).
+@borrows
+fn ProbeCompareFrames(t: raster.RasterTarget,
+                      gpuBgra: rawbytes.Bytes,
+                      gpuZ: rawbytes.Bytes,
+                      total: int32,
+                      outGood: var int32,
+                      outColorBad: var int32,
+                      outDepthBad: var int32) =
+    let cpuZ: ptr = rawbytes.BytesDataPtr(t.frame.zbuf)
+    let gpuZp: ptr = rawbytes.BytesDataPtr(gpuZ)
+    var px: int32
+    while px < total:
+        var colorOk: bool = true
+        var ci: int32
+        while ci < 3:
+            var dc: int32 = rawbytes.BytesGet(t.frame.bgra, px * 4 + ci) - rawbytes.BytesGet(gpuBgra, px * 4 + ci)
+            if dc < 0:
+                dc = 0 - dc
+            if dc > 2:
+                colorOk = false
+            ci = ci + 1
+        let dmm: int32 = rawmem_support.RawmemReadI32(cpuZ, px * 4) - rawmem_support.RawmemReadI32(gpuZp, px * 4)
+        var depthOk: bool = true
+        if dmm > 1:
+            depthOk = false
+        if dmm < 0 - 1:
+            depthOk = false
+        if colorOk:
+            if depthOk:
+                outGood = outGood + 1
+        if !colorOk:
+            outColorBad = outColorBad + 1
+        if !depthOk:
+            outDepthBad = outDepthBad + 1
+        px = px + 1
+
+# Count pixels whose color differs by more than 2 in any channel.
+@borrows
+fn ProbeFrameDiffPixels(a: raster.RasterTarget, b: raster.RasterTarget, total: int32): int32 =
+    var n: int32
+    var px: int32
+    while px < total:
+        var differs: bool = false
+        var ci: int32
+        while ci < 3:
+            var dc: int32 = rawbytes.BytesGet(a.frame.bgra, px * 4 + ci) - rawbytes.BytesGet(b.frame.bgra, px * 4 + ci)
+            if dc < 0:
+                dc = 0 - dc
+            if dc > 2:
+                differs = true
+            ci = ci + 1
+        if differs:
+            n = n + 1
+        px = px + 1
+    return n
+
+# Non-background census (clear backdrop is BGRA (140,120,96)) with the
+# rendered pixel bbox; the bbox seeds from the first hit so no sentinel
+# initialization is needed.
+@borrows
+fn ProbeFrameStats(t: raster.RasterTarget,
+                   outCount: var int32,
+                   outMinX: var int32,
+                   outMaxX: var int32,
+                   outMinY: var int32,
+                   outMaxY: var int32) =
+    var py: int32
+    while py < t.height:
+        var px: int32
+        while px < t.width:
+            let idx: int32 = py * t.width + px
+            var isBg: bool = rawbytes.BytesGet(t.frame.bgra, idx * 4 + 2) == 96
+            if isBg:
+                isBg = rawbytes.BytesGet(t.frame.bgra, idx * 4 + 1) == 120
+            if isBg:
+                isBg = rawbytes.BytesGet(t.frame.bgra, idx * 4) == 140
+            if !isBg:
+                if outCount == 0:
+                    outMinX = px
+                    outMaxX = px
+                    outMinY = py
+                    outMaxY = py
+                if px < outMinX:
+                    outMinX = px
+                if px > outMaxX:
+                    outMaxX = px
+                if py < outMinY:
+                    outMinY = py
+                if py > outMaxY:
+                    outMaxY = py
+                outCount = outCount + 1
+            px = px + 1
+        py = py + 1
+
+fn main(): int32 =
+    let h = mesh_render.MeshStlLoad("assets/microduck_meshes/bottom_head_shell.stl")
+    if !mesh_render.MeshValid(h):
+        echo("FAIL stl load")
+        return 1
+    echo("triCount=" + strings.IntToStr(mesh_render.MeshTriCount(h)))
+    # same camera as mesh_render_probe: oblique high look-at on the mesh
+    # bbox center, 1280x720 @ 950 px focal
+    let cx = mesh_render.MeshCenterX(h)
+    let cy = mesh_render.MeshCenterY(h)
+    let cz = mesh_render.MeshCenterZ(h)
+    var cam = camera.CinemaCameraLookAt(cx - 0.16, cy - 0.16, cz + 0.18, cx, cy, cz, ProbeFocalPx, ProbeWidth, ProbeHeight)
+    let initRc: int32 = mesh_render.MeshGpuInit(ProbeWidth, ProbeHeight)
+    if initRc != 0:
+        echo("PATH cpu-fallback")
+        echo("gpuInitStage=" + strings.IntToStr(initRc))
+        echo("FAIL mesh gpu probe")
+        return 1
+    var gBgra: rawbytes.Bytes = rawbytes.BytesAlloc(ProbeWidth * ProbeHeight * 4)
+    var gDepth: rawbytes.Bytes = rawbytes.BytesAlloc(ProbeWidth * ProbeHeight * 4)
+    let total: int32 = ProbeWidth * ProbeHeight
+
+    # ---- case 1: identity pose through the legacy yaw entry points ----
+    var t: raster.RasterTarget
+    t = raster.RasterMake(ProbeWidth, ProbeHeight)
+    var t1 = monotimes.GetMonoTime()
+    mesh_render.MeshRasterFrame(t, cam, h, 0.0, 0.0, 0.0, 1.0, 0.0, ProbeR, ProbeG, ProbeB)
+    var t2 = monotimes.GetMonoTime()
+    var t3 = monotimes.GetMonoTime()
+    var frameRc: int32 = mesh_render.MeshGpuFrame(cam, h, 0.0, 0.0, 0.0, 1.0, 0.0, ProbeR, ProbeG, ProbeB)
+    var t4 = monotimes.GetMonoTime()
+    if frameRc != 0:
+        echo("PATH cpu-fallback")
+        echo("gpuFrameStage=" + strings.IntToStr(frameRc))
+        echo("FAIL mesh gpu probe")
+        return 1
+    mesh_render.MeshGpuCopyOutBgra(gBgra)
+    mesh_render.MeshGpuCopyOutDepth(gDepth)
+    var good1: int32
+    var colorBad1: int32
+    var depthBad1: int32
+    ProbeCompareFrames(t, gBgra, gDepth, total, good1, colorBad1, depthBad1)
+    let cpuNs1: int64 = monotimes.MonoTimeNs(t2) - monotimes.MonoTimeNs(t1)
+    let gpuNs1: int64 = monotimes.MonoTimeNs(t4) - monotimes.MonoTimeNs(t3)
+    echo("PATH gpu")
+    echo("cpuIdentityFrameMs=" + strings.IntToStr(int32(cpuNs1 / 1000000)))
+    echo("gpuIdentityFrameMs=" + strings.IntToStr(int32(gpuNs1 / 1000000)))
+    echo("identityGoodPixels=" + strings.IntToStr(good1) + "/" + strings.IntToStr(total))
+    echo("identityColorMismatchPixels=" + strings.IntToStr(colorBad1))
+    echo("identityDepthMismatchPixels=" + strings.IntToStr(depthBad1))
+    if int32(gpuNs1 / 1000000) > ProbeGpuMsCap:
+        echo("FAIL gpu identity frame ms above cap")
+        return 1
+
+    # ---- case 2: pitch 0.43 rad (Y) x roll 0.2 rad (X) quaternion ----
+    # q = qPitch * qRoll with the closed form below; unit by construction
+    let c1 = m.cosFloat(0.215)
+    let s1 = m.sinFloat(0.215)
+    let c2 = m.cosFloat(0.1)
+    let s2 = m.sinFloat(0.1)
+    let qw = c1 * c2
+    let qx = c1 * s2
+    let qy = s1 * c2
+    let qz = 0.0 - s1 * s2
+    var tPitched: raster.RasterTarget
+    tPitched = raster.RasterMake(ProbeWidth, ProbeHeight)
+    var t5 = monotimes.GetMonoTime()
+    mesh_render.MeshRasterFrameOrient(tPitched, cam, h, 0.0, 0.0, 0.0, 1.0, qw, qx, qy, qz, ProbeR, ProbeG, ProbeB)
+    var t6 = monotimes.GetMonoTime()
+    var t7 = monotimes.GetMonoTime()
+    frameRc = mesh_render.MeshGpuFrameOrient(cam, h, 0.0, 0.0, 0.0, 1.0, qw, qx, qy, qz, ProbeR, ProbeG, ProbeB)
+    var t8 = monotimes.GetMonoTime()
+    if frameRc != 0:
+        echo("PATH cpu-fallback")
+        echo("gpuFrameStage=" + strings.IntToStr(frameRc))
+        echo("FAIL mesh gpu probe")
+        return 1
+    mesh_render.MeshGpuCopyOutBgra(gBgra)
+    mesh_render.MeshGpuCopyOutDepth(gDepth)
+    var good2: int32
+    var colorBad2: int32
+    var depthBad2: int32
+    ProbeCompareFrames(tPitched, gBgra, gDepth, total, good2, colorBad2, depthBad2)
+    let cpuNs2: int64 = monotimes.MonoTimeNs(t6) - monotimes.MonoTimeNs(t5)
+    let gpuNs2: int64 = monotimes.MonoTimeNs(t8) - monotimes.MonoTimeNs(t7)
+    echo("cpuPitchRollFrameMs=" + strings.IntToStr(int32(cpuNs2 / 1000000)))
+    echo("gpuPitchRollFrameMs=" + strings.IntToStr(int32(gpuNs2 / 1000000)))
+    echo("pitchRollGoodPixels=" + strings.IntToStr(good2) + "/" + strings.IntToStr(total))
+    echo("pitchRollColorMismatchPixels=" + strings.IntToStr(colorBad2))
+    echo("pitchRollDepthMismatchPixels=" + strings.IntToStr(depthBad2))
+    if int32(gpuNs2 / 1000000) > ProbeGpuMsCap:
+        echo("FAIL gpu pitch-roll frame ms above cap")
+        return 1
+
+    # ---- orientation correctness of the pitched CPU frame ----
+    # rotation rows recomputed independently (textbook unit-quaternion
+    # formula, not mesh_render's helper)
+    let m00 = 1.0 - 2.0 * (qy * qy + qz * qz)
+    let m01 = 2.0 * (qx * qy - qz * qw)
+    let m02 = 2.0 * (qx * qz + qy * qw)
+    let m10 = 2.0 * (qx * qy + qz * qw)
+    let m11 = 1.0 - 2.0 * (qx * qx + qz * qz)
+    let m12 = 2.0 * (qy * qz - qx * qw)
+    let m20 = 2.0 * (qx * qz - qy * qw)
+    let m21 = 2.0 * (qy * qz + qx * qw)
+    let m22 = 1.0 - 2.0 * (qx * qx + qy * qy)
+    # rotated world bbox of the mesh under world = R * v (origin 0)
+    let hx = mesh_render.MeshHalfExtentX(h)
+    let hy = mesh_render.MeshHalfExtentY(h)
+    let hz = mesh_render.MeshHalfExtentZ(h)
+    let wcx = m00 * cx + m01 * cy + m02 * cz
+    let wcy = m10 * cx + m11 * cy + m12 * cz
+    let wcz = m20 * cx + m21 * cy + m22 * cz
+    let wex = m.absFloat(m00) * hx + m.absFloat(m01) * hy + m.absFloat(m02) * hz
+    let wey = m.absFloat(m10) * hx + m.absFloat(m11) * hy + m.absFloat(m12) * hz
+    let wez = m.absFloat(m20) * hx + m.absFloat(m21) * hy + m.absFloat(m22) * hz
+    # project all 8 box corners -> analytic screen rect
+    var cornerOk: bool = true
+    var sxMin: float64 = 0.0
+    var sxMax: float64 = 0.0
+    var syMin: float64 = 0.0
+    var syMax: float64 = 0.0
+    var si: int32
+    while si < 8:
+        var sx: float64 = wcx
+        var sy: float64 = wcy
+        var sz: float64 = wcz
+        if (si & 1) == 1:
+            sx = wcx + wex
+        else:
+            sx = wcx - wex
+        if (si & 2) == 2:
+            sy = wcy + wey
+        else:
+            sy = wcy - wey
+        if (si & 4) == 4:
+            sz = wcz + wez
+        else:
+            sz = wcz - wez
+        let pc = camera.CameraProject(cam, sx, sy, sz)
+        if pc.depth <= 0.02:
+            cornerOk = false
+        if si == 0:
+            sxMin = pc.sx
+            sxMax = pc.sx
+            syMin = pc.sy
+            syMax = pc.sy
+        if pc.sx < sxMin:
+            sxMin = pc.sx
+        if pc.sx > sxMax:
+            sxMax = pc.sx
+        if pc.sy < syMin:
+            syMin = pc.sy
+        if pc.sy > syMax:
+            syMax = pc.sy
+        si = si + 1
+    var nonBg: int32
+    var minX: int32
+    var maxX: int32
+    var minY: int32
+    var maxY: int32
+    ProbeFrameStats(tPitched, nonBg, minX, maxX, minY, maxY)
+    echo("pitchRollNonBackgroundPixels=" + strings.IntToStr(nonBg))
+    echo("pitchRollRenderedBbox=" + strings.IntToStr(minX) + "," + strings.IntToStr(minY) + " - " + strings.IntToStr(maxX) + "," + strings.IntToStr(maxY))
+    echo("pitchRollAnalyticRect=" + strings.IntToStr(int32(sxMin)) + "," + strings.IntToStr(int32(syMin)) + " - " + strings.IntToStr(int32(sxMax)) + "," + strings.IntToStr(int32(syMax)))
+    if !cornerOk:
+        echo("FAIL pose box corner behind camera")
+        return 1
+    if nonBg <= 50000:
+        echo("FAIL pitched frame degenerate")
+        return 1
+    # every rendered pixel inside the analytic rotated-bbox projection
+    if float64(minX) < sxMin - ProbeEdgeMarginPx:
+        echo("FAIL rendered pixels left of analytic pose box")
+        return 1
+    if float64(maxX) + 1.0 > sxMax + ProbeEdgeMarginPx:
+        echo("FAIL rendered pixels right of analytic pose box")
+        return 1
+    if float64(minY) < syMin - ProbeEdgeMarginPx:
+        echo("FAIL rendered pixels above analytic pose box")
+        return 1
+    if float64(maxY) + 1.0 > syMax + ProbeEdgeMarginPx:
+        echo("FAIL rendered pixels below analytic pose box")
+        return 1
+    # the silhouette must actually reach the projected pose box on every
+    # side (a stale upright image would leave whole sides uncovered)
+    let rectW: float64 = sxMax - sxMin
+    let rectH: float64 = syMax - syMin
+    if float64(maxX) + 1.0 - float64(minX) < rectW * ProbeReachMinWidthFrac:
+        echo("FAIL rendered silhouette narrower than pose box")
+        return 1
+    if float64(maxY) + 1.0 - float64(minY) < rectH * ProbeReachMinHeightFrac:
+        echo("FAIL rendered silhouette shorter than pose box")
+        return 1
+    # the pitched image must differ from the upright one over >= 1%
+    let diffPixels: int32 = ProbeFrameDiffPixels(t, tPitched, total)
+    echo("poseChangePixels=" + strings.IntToStr(diffPixels) + "/" + strings.IntToStr(total))
+    if diffPixels * 100 < total:
+        echo("FAIL pitched pose did not change the image")
+        return 1
+
+    if good1 * 100 < total * 99:
+        echo("FAIL identity match ratio below 99%")
+        return 1
+    if good2 * 100 < total * 99:
+        echo("FAIL pitch-roll match ratio below 99%")
+        return 1
+    echo("PASS mesh gpu probe")
+    return 0

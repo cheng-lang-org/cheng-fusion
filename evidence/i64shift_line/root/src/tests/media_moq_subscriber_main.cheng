@@ -1,0 +1,319 @@
+# Standalone MoQ media subscriber process.
+#
+# Reads the bound port from --ready-path (written by publisher), dials
+# QUIC 127.0.0.1:<port>, performs MoQ negotiate, sends an object-range
+# request to fetch the full bundle object, verifies the SHA-256 hash and
+# prints timing lines for the network-milestone latency table.
+#
+# Expected output lines (one per successful fetch):
+#   media_moq_subscriber announce_ms=<N> fetch_first_byte_ms=<N> fetch_complete_ms=<N>
+#
+# This is the subscriber half of the two-process MoQ network milestone.
+
+import std/result
+import std/rawbytes
+import std/os
+import std/strutils as strutil
+import std/times
+import std/cmdline as cmdline
+import cheng/quic/connection as qconn
+import cheng/quic/msquictransport_native as qtransport
+import cheng/libp2p/transports/quic_transport as quic_transport
+import cheng/libp2p/protocols/media/moq_segment_stream as moqstream
+import cheng/moq/media_asset_manifest as media
+
+fn mediaMoqSubscriberLog(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn mediaMoqSubscriberNowMs(): int64 =
+    return times.MonotimeMs()
+
+@borrows
+fn mediaMoqSubscriberAnnounceField(text: str, key: str): str =
+    let parts = strutil.Split(text, ' ')
+    var i = 0
+    while i < parts.len:
+        let kv = strutil.Split(parts[i], '=')
+        if kv.len == 2 && kv[0] == key:
+            return strings.CloneStr(kv[1])
+        i = i + 1
+    return ""
+
+fn mediaMoqSubscriberFetchAnnounce(dialHost: str, port: int32): Result[str] =
+    var client = qtransport.InitMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn, dialHost, port, "localhost")
+    if IsErr(dialRes):
+        return Err[str](Error(dialRes))
+    # Production MoQ uses a SYMMETRIC per-media QUIC stream (send==recv==streamId,
+    # e.g. video=4/audio=8) so the publisher's probe-and-derive serve loop replies
+    # on the SAME stream the client wrote on. The legacy default dial pair is
+    # asymmetric (send=0/recv=1), which makes the publisher's symmetric ack land on
+    # the wrong stream. Derive the dialed conn onto the symmetric video stream.
+    conn = qconn.ConnDeriveStream(conn, 4, 4)
+    let negotiateRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, conn)
+    if IsErr(negotiateRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return Err[str](Error(negotiateRes))
+    let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, conn)
+    if IsErr(ackRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return Err[str](Error(ackRes))
+    var request: moqstream.Libp2pMoqSegmentStreamRequest
+    request.streamId = "subscriber-announce-1"
+    request.segmentKey = "moq-announce"
+    request.offsetBytes = 0
+    request.lengthBytes = 1024
+    request.readChunkBytes = 1024
+    var reader: moqstream.Libp2pMoqSegmentStreamReader
+    let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(conn), request)
+    if IsErr(openRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return Err[str](Error(openRes))
+    var received = rawbytes.EmptyBytes()
+    while !reader.closed:
+        let chunkRes = moqstream.Libp2pMoqSegmentStreamRead(reader, 1024)
+        if IsErr(chunkRes):
+            moqstream.Libp2pMoqSegmentStreamClose(reader)
+            qtransport.Stop(client)
+            return Err[str](Error(chunkRes))
+        let chunk = Value(chunkRes)
+        if rawbytes.BytesLen(chunk) <= 0:
+            break
+        received = moqstream.Libp2pMoqSegmentStreamAppendBytes(received, chunk)
+    moqstream.Libp2pMoqSegmentStreamClose(reader)
+    qtransport.Stop(client)
+    return Ok[str](rawbytes.BytesToString(received))
+
+fn mediaMoqSubscriberReadPortFile(readyPath: str, retryMs: int32, maxWaitMs: int32): Result[int32] =
+    var waited: int32
+    while waited < maxWaitMs:
+        let fileRes = os.ReadFileResult(readyPath)
+        if IsOk(fileRes):
+            let raw: str = strutil.Strip(Value(fileRes))
+            if len(raw) > 0:
+                var portVal: int32
+                if cmdline.ParseInt32(raw, portVal):
+                    if portVal > 0:
+                        return Ok[int32](portVal)
+        os.SleepMs(retryMs)
+        waited = waited + retryMs
+    return Err[int32]("subscriber: timeout waiting for ready-path port file")
+
+fn mediaMoqSubscriberReadAll(reader: var moqstream.Libp2pMoqSegmentStreamReader,
+                              chunkBytes: int32): Result[rawbytes.Bytes] =
+    var out: rawbytes.Bytes
+    while !reader.closed:
+        let readRes = moqstream.Libp2pMoqSegmentStreamRead(reader, chunkBytes)
+        if IsErr(readRes):
+            return Err[rawbytes.Bytes](Error(readRes))
+        let chunk = Value(readRes)
+        if rawbytes.BytesLen(chunk) <= 0:
+            return Ok[rawbytes.Bytes](out)
+        out = moqstream.Libp2pMoqSegmentStreamAppendBytes(out, chunk)
+    return Ok[rawbytes.Bytes](out)
+
+fn main(): int32 =
+    let directPort: int32 = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    var dialHostRaw: str
+    let hasDialHost: bool = cmdline.ReadFirstFlagValue("--host", dialHostRaw)
+    let dialHost: str = if hasDialHost: dialHostRaw else: "127.0.0.1"
+
+    var readyPathRaw: str
+    let hasReady: bool = cmdline.ReadFirstFlagValue("--ready-path", readyPathRaw)
+    if !hasReady && directPort <= 0:
+        mediaMoqSubscriberLog(" media_moq_subscriber: missing --ready-path (or --port)")
+        return 2
+    let readyPath: str = readyPathRaw
+
+    var expectedHashRaw: str
+    let hasHash: bool = cmdline.ReadFirstFlagValue("--expected-hash", expectedHashRaw)
+    var expectedHash: str = if hasHash: expectedHashRaw else: ""
+
+    var expectedObjectIdRaw: str
+    let hasObjectId: bool = cmdline.ReadFirstFlagValue("--object-id", expectedObjectIdRaw)
+    var objectId: str = if hasObjectId: expectedObjectIdRaw else: "object-0"
+
+    var expectedOffsetRaw: str
+    let hasOffset: bool = cmdline.ReadFirstFlagValue("--object-offset", expectedOffsetRaw)
+    var objectOffset: int32
+    if hasOffset:
+        let _ = cmdline.ParseInt32(expectedOffsetRaw, objectOffset)
+
+    var expectedLengthRaw: str
+    let hasLength: bool = cmdline.ReadFirstFlagValue("--object-length", expectedLengthRaw)
+    var objectLength: int32
+    if hasLength:
+        let _ = cmdline.ParseInt32(expectedLengthRaw, objectLength)
+
+    let maxRetryMs: int32 = cmdline.ReadInt32FlagOrDefault("--wait-ms", 20000)
+    let chunkBytes: int32 = 4096
+
+    # --- Phase 1: Wait for publisher announce (port file or --port) ---
+    let announceStartMs = mediaMoqSubscriberNowMs()
+    var port: int32 = directPort
+    if directPort <= 0:
+        let portRes = mediaMoqSubscriberReadPortFile(readyPath, 20, maxRetryMs)
+        if IsErr(portRes):
+            mediaMoqSubscriberLog(strutil.Join([" media_moq_subscriber: ", Error(portRes)], ""))
+            return 3
+        port = Value(portRes)
+    var announceMs = mediaMoqSubscriberNowMs() - announceStartMs
+
+    # --- Phase 2: Connect and negotiate (single connection reused for the
+    # announce metadata request and the object fetch). ---
+    let negotiateStartMs = mediaMoqSubscriberNowMs()
+    var client = qtransport.InitMsQuicTransport()
+    let initDoneMs = mediaMoqSubscriberNowMs()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn, dialHost, port, "localhost")
+    let dialDoneMs = mediaMoqSubscriberNowMs()
+    if IsErr(dialRes):
+        mediaMoqSubscriberLog(strutil.Join([" media_moq_subscriber: dial: ", Error(dialRes)], ""))
+        return 4
+    # Real regression cross-check for the accept-side peer-address bridge (see
+    # native_runtime.cheng msquicNativePeerDialAddrInto): conn.localAddr was
+    # populated by qtransport.dial() from the actual OS-bound client UDP port
+    # (MsQuicNativeClientBoundAddrInto), a plain struct field, not re-queried
+    # through any native_runtime import alias. Emitting it lets an external
+    # verifier compare it against what the publisher's accept side captured for
+    # THIS same real connection.
+    mediaMoqSubscriberLog(strutil.Join([" media_moq_subscriber local_bound_addr=", share(conn.localAddr.raw)], ""))
+    # Symmetric per-media stream (see mediaMoqSubscriberFetchAnnounce): match the
+    # publisher's probe-and-derive serve loop by using send==recv==video stream 4.
+    conn = qconn.ConnDeriveStream(conn, 4, 4)
+
+    let negotiateRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, conn)
+    if IsErr(negotiateRes):
+        mediaMoqSubscriberLog(strutil.Join([" media_moq_subscriber: negotiate: ", Error(negotiateRes)], ""))
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return 4
+
+    let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, conn)
+    if IsErr(ackRes):
+        mediaMoqSubscriberLog(strutil.Join([" media_moq_subscriber: negotiate ack: ", Error(ackRes)], ""))
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return 4
+    let negotiateMs = mediaMoqSubscriberNowMs() - negotiateStartMs
+
+    # --- Phase 2b: Without --object-id, learn the object identity over the
+    # network from the publisher's "moq-announce" segment on this connection. ---
+    if !hasObjectId:
+        let netAnnStartMs = mediaMoqSubscriberNowMs()
+        var annRequest: moqstream.Libp2pMoqSegmentStreamRequest
+        annRequest.streamId = "subscriber-announce-1"
+        annRequest.segmentKey = "moq-announce"
+        annRequest.offsetBytes = 0
+        annRequest.lengthBytes = 1024
+        annRequest.readChunkBytes = 1024
+        var annReader: moqstream.Libp2pMoqSegmentStreamReader
+        let annOpenRes = moqstream.Libp2pMoqSegmentStreamClientOpen(annReader, qconn.ConnDup(conn), annRequest)
+        if IsErr(annOpenRes):
+            mediaMoqSubscriberLog(strutil.Join([" media_moq_subscriber: announce open: ", Error(annOpenRes)], ""))
+            qconn.ConnClose(conn)
+            qtransport.Stop(client)
+            return 6
+        var annBytes = rawbytes.EmptyBytes()
+        while !annReader.closed:
+            let annChunkRes = moqstream.Libp2pMoqSegmentStreamRead(annReader, 1024)
+            if IsErr(annChunkRes):
+                mediaMoqSubscriberLog(strutil.Join([" media_moq_subscriber: announce read: ", Error(annChunkRes)], ""))
+                qconn.ConnClose(conn)
+                qtransport.Stop(client)
+                return 6
+            let annChunk = Value(annChunkRes)
+            if rawbytes.BytesLen(annChunk) <= 0:
+                break
+            annBytes = moqstream.Libp2pMoqSegmentStreamAppendBytes(annBytes, annChunk)
+        let annText = rawbytes.BytesToString(annBytes)
+        objectId = mediaMoqSubscriberAnnounceField(annText, "object_id")
+        let annOffsetRaw = mediaMoqSubscriberAnnounceField(annText, "object_offset")
+        let annLengthRaw = mediaMoqSubscriberAnnounceField(annText, "object_length")
+        expectedHash = mediaMoqSubscriberAnnounceField(annText, "object_hash")
+        let _ao = cmdline.ParseInt32(annOffsetRaw, objectOffset)
+        let _al = cmdline.ParseInt32(annLengthRaw, objectLength)
+        if len(objectId) <= 0 || objectLength <= 0:
+            mediaMoqSubscriberLog(" media_moq_subscriber: announce parse failed")
+            qconn.ConnClose(conn)
+            qtransport.Stop(client)
+            return 6
+        announceMs = announceMs + (mediaMoqSubscriberNowMs() - netAnnStartMs)
+
+    # --- Phase 3: Send object-range fetch request ---
+    # Default to fetching from object-0 covering a reasonable range.
+    # If object-length is 0, request a 64KB window from offset.
+    var fetchLength: int32 = objectLength
+    if fetchLength <= 0:
+        fetchLength = 65536
+
+    var request: moqstream.Libp2pMoqSegmentStreamRequest
+    request.streamId = "subscriber-bravo-stream-1"
+    request.segmentKey = objectId
+    request.offsetBytes = objectOffset
+    request.lengthBytes = fetchLength
+    request.readChunkBytes = chunkBytes
+
+    let fetchStartMs = mediaMoqSubscriberNowMs()
+    var reader: moqstream.Libp2pMoqSegmentStreamReader
+    let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(conn), request)
+    if IsErr(openRes):
+        mediaMoqSubscriberLog(strutil.Join([" media_moq_subscriber: open: ", Error(openRes)], ""))
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return 5
+
+    # --- Phase 4: Read first byte (first chunk) ---
+    let firstChunkRes = moqstream.Libp2pMoqSegmentStreamRead(reader, chunkBytes)
+    if IsErr(firstChunkRes):
+        mediaMoqSubscriberLog(strutil.Join([" media_moq_subscriber: first chunk: ", Error(firstChunkRes)], ""))
+        moqstream.Libp2pMoqSegmentStreamClose(reader)
+        qtransport.Stop(client)
+        return 5
+    let firstChunk = Value(firstChunkRes)
+    let fetchFirstByteMs = mediaMoqSubscriberNowMs() - fetchStartMs
+
+    # --- Phase 5: Read remaining chunks ---
+    var received = moqstream.Libp2pMoqSegmentStreamAppendBytes(rawbytes.EmptyBytes(), firstChunk)
+    while !reader.closed:
+        let chunkRes = moqstream.Libp2pMoqSegmentStreamRead(reader, chunkBytes)
+        if IsErr(chunkRes):
+            mediaMoqSubscriberLog(strutil.Join([" media_moq_subscriber: read: ", Error(chunkRes)], ""))
+            moqstream.Libp2pMoqSegmentStreamClose(reader)
+            qtransport.Stop(client)
+            return 5
+        let chunk = Value(chunkRes)
+        if rawbytes.BytesLen(chunk) <= 0:
+            break
+        received = moqstream.Libp2pMoqSegmentStreamAppendBytes(received, chunk)
+
+    let fetchCompleteMs = mediaMoqSubscriberNowMs() - fetchStartMs
+
+    moqstream.Libp2pMoqSegmentStreamClose(reader)
+    qtransport.Stop(client)
+
+    # --- Phase 6: Hash check ---
+    let receivedHash = media.MediaAssetSha256Hex(received)
+    if len(expectedHash) > 0:
+        if receivedHash != expectedHash:
+            mediaMoqSubscriberLog(strutil.Join([" media_moq_subscriber: hash mismatch got=", receivedHash,
+                                                " expected=", expectedHash], ""))
+            return 6
+
+    # --- Phase 7: Print timing line ---
+    var line: str = "media_moq_subscriber"
+    line = strutil.Join([line, " announce_ms=", Int64ToStr(announceMs)], "")
+    line = strutil.Join([line, " negotiate_ms=", Int64ToStr(negotiateMs)], "")
+    line = strutil.Join([line, " connect_init_ms=", Int64ToStr(initDoneMs - negotiateStartMs)], "")
+    line = strutil.Join([line, " connect_dial_ms=", Int64ToStr(dialDoneMs - initDoneMs)], "")
+    line = strutil.Join([line, " negotiate_rtt_ms=", Int64ToStr(negotiateMs - (dialDoneMs - negotiateStartMs))], "")
+    line = strutil.Join([line, " fetch_first_byte_ms=", Int64ToStr(fetchFirstByteMs)], "")
+    line = strutil.Join([line, " fetch_complete_ms=", Int64ToStr(fetchCompleteMs)], "")
+    line = strutil.Join([line, " bytes=", IntToStr(rawbytes.BytesLen(received))], "")
+    line = strutil.Join([line, " hash=", receivedHash], "")
+    os.WriteLine(os.Get_stdout(), line)
+    return 0

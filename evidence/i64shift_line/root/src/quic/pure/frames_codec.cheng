@@ -1,0 +1,416 @@
+# QUIC frame codec for the minimal frame set (RFC 9000, Section 19):
+# PADDING, PING, ACK (with optional ECN counts), CRYPTO, STREAM (OFF/LEN/FIN
+# bit combinations), MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS (bidi+uni),
+# NEW_CONNECTION_ID, CONNECTION_CLOSE (transport 0x1c + application 0x1d).
+#
+# Frames are decoded into a plain-scalar record; payload-shaped fields
+# (STREAM/CRYPTO data, connection IDs, reset token, close reason, ACK ranges)
+# are (offset,len) views into the source buffer rather than copies. Encoding
+# writes the frame back out from the record plus its source view, so
+# decode->encode is byte-identical to the input. A 0x00 octet is one PADDING
+# frame; runs decode to one frame per octet and re-encode identically.
+#
+# Decode error codes (negative return of QuicFrameDecodeAt):
+#   -1 truncated buffer            -2 unknown frame type (FRAME_ENCODING_ERROR)
+#   -3 non-minimal Frame Type      -4 field out of range (CID length)
+#   -5 frame structurally invalid (retire>seq, length bounds)
+
+import std/rawbytes
+import cheng/quic/pure/frames_varint as quicvarint
+
+const
+    QuicFramePadding: int32 = 0x00
+    QuicFramePing: int32 = 0x01
+    QuicFrameAck: int32 = 0x02
+    QuicFrameAckEcn: int32 = 0x03
+    QuicFrameCrypto: int32 = 0x06
+    QuicFrameStreamBase: int32 = 0x08
+    QuicFrameStreamMask: int32 = 0x0f
+    QuicStreamBitFin: int32 = 0x01
+    QuicStreamBitLen: int32 = 0x02
+    QuicStreamBitOff: int32 = 0x04
+    QuicFrameMaxData: int32 = 0x10
+    QuicFrameMaxStreamData: int32 = 0x11
+    QuicFrameMaxStreamsBidi: int32 = 0x12
+    QuicFrameMaxStreamsUni: int32 = 0x13
+    QuicFrameNewConnectionId: int32 = 0x18
+    QuicFrameConnectionClose: int32 = 0x1c
+    QuicFrameConnectionCloseApp: int32 = 0x1d
+    QuicCidMaxLen: int32 = 20
+    QuicStatelessResetTokenLen: int32 = 16
+
+# Plain-scalar frame record. View fields are -1 when absent.
+type
+    QuicFrame =
+        ftype: int32           # raw type octet (STREAM keeps 0x08..0x0f bits)
+        streamId: int64        # STREAM / MAX_STREAM_DATA
+        offset: int64          # STREAM / CRYPTO offset field
+        length: int64          # CRYPTO length; STREAM Length field when LEN bit
+        hasOffset: bool        # STREAM OFF bit
+        hasLength: bool        # STREAM LEN bit
+        fin: bool              # STREAM FIN bit
+        largestAck: int64      # ACK
+        ackDelay: int64        # ACK
+        ackRangeCount: int64   # ACK
+        firstAckRange: int64   # ACK
+        ect0: int64            # ACK ECN
+        ect1: int64            # ACK ECN
+        ceCount: int64         # ACK ECN
+        rangesOff: int32       # ACK: offset of additional (Gap,Range) pairs
+        maximum: int64         # MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS
+        seqNum: int64          # NEW_CONNECTION_ID
+        retirePriorTo: int64   # NEW_CONNECTION_ID
+        cidOff: int32
+        cidLen: int32
+        tokenOff: int32        # NEW_CONNECTION_ID stateless reset token
+        errorCode: int64       # CONNECTION_CLOSE
+        closeFrameType: int64  # CONNECTION_CLOSE (transport 0x1c only)
+        reasonLen: int32       # CONNECTION_CLOSE
+        dataOff: int32         # STREAM/CRYPTO data or close reason view
+        dataLen: int32
+
+fn QuicFrameZero(): QuicFrame =
+    var out: QuicFrame
+    out.ftype = 0
+    out.streamId = 0
+    out.offset = 0
+    out.length = 0
+    out.hasOffset = false
+    out.hasLength = false
+    out.fin = false
+    out.largestAck = 0
+    out.ackDelay = 0
+    out.ackRangeCount = 0
+    out.firstAckRange = 0
+    out.ect0 = 0
+    out.ect1 = 0
+    out.ceCount = 0
+    out.rangesOff = -1
+    out.maximum = 0
+    out.seqNum = 0
+    out.retirePriorTo = 0
+    out.cidOff = -1
+    out.cidLen = 0
+    out.tokenOff = -1
+    out.errorCode = 0
+    out.closeFrameType = 0
+    out.reasonLen = 0
+    out.dataOff = -1
+    out.dataLen = 0
+    return out
+
+# True when the type octet is in the supported set.
+fn QuicFrameTypeSupported(t: int32): bool =
+    if t == QuicFramePadding: return true
+    if t == QuicFramePing: return true
+    if t == QuicFrameAck: return true
+    if t == QuicFrameAckEcn: return true
+    if t == QuicFrameCrypto: return true
+    if t >= QuicFrameStreamBase && t <= QuicFrameStreamMask: return true
+    if t == QuicFrameMaxData: return true
+    if t == QuicFrameMaxStreamData: return true
+    if t == QuicFrameMaxStreamsBidi: return true
+    if t == QuicFrameMaxStreamsUni: return true
+    if t == QuicFrameNewConnectionId: return true
+    if t == QuicFrameConnectionClose: return true
+    if t == QuicFrameConnectionCloseApp: return true
+    return false
+
+# Walk `count` additional ACK Range (Gap, Range Length) varint pairs starting
+# at pos. ACK Range Count in the frame counts exactly these additional pairs;
+# the First ACK Range is a separate mandatory field (RFC 9000 Section 19.3.1).
+# Returns the end offset, or -1 on truncation.
+@borrows
+fn quicAckScanRanges(buf: Bytes, pos: int32, count: int64): int32 =
+    var p: int32 = pos
+    var i: int64
+    while i < count:
+        let gap: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !gap.ok:
+            return -1
+        p = p + gap.size
+        let rl: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !rl.ok:
+            return -1
+        p = p + rl.size
+        i = i + 1
+    return p
+
+# Decode one frame at pos. Returns the offset just past the frame, or a
+# negative error code. f is overwritten only on success.
+@borrows
+fn QuicFrameDecodeAt(buf: Bytes, pos: int32, f: var QuicFrame): int32 =
+    var cand: QuicFrame = QuicFrameZero()
+    if pos < 0 || pos >= buf.len:
+        return -1
+    let tr: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadMinimalAt(buf, pos)
+    if !tr.ok:
+        if tr.size < 0:
+            return -3
+        return -1
+    let t: int32 = int32(tr.value)
+    if !QuicFrameTypeSupported(t):
+        return -2
+    var p: int32 = pos + tr.size
+    if t == QuicFramePadding:
+        cand.ftype = t
+        f = cand
+        return p
+    if t == QuicFramePing:
+        cand.ftype = t
+        f = cand
+        return p
+    if t == QuicFrameAck || t == QuicFrameAckEcn:
+        cand.ftype = t
+        let largest: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !largest.ok: return -1
+        cand.largestAck = largest.value
+        p = p + largest.size
+        let delay: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !delay.ok: return -1
+        cand.ackDelay = delay.value
+        p = p + delay.size
+        let count: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !count.ok: return -1
+        cand.ackRangeCount = count.value
+        p = p + count.size
+        let firstR: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !firstR.ok: return -1
+        cand.firstAckRange = firstR.value
+        p = p + firstR.size
+        cand.rangesOff = p
+        let after: int32 = quicAckScanRanges(buf, p, cand.ackRangeCount)
+        if after < 0:
+            return -1
+        p = after
+        if t == QuicFrameAckEcn:
+            let e0: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+            if !e0.ok: return -1
+            cand.ect0 = e0.value
+            p = p + e0.size
+            let e1: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+            if !e1.ok: return -1
+            cand.ect1 = e1.value
+            p = p + e1.size
+            let ce: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+            if !ce.ok: return -1
+            cand.ceCount = ce.value
+            p = p + ce.size
+        f = cand
+        return p
+    if t == QuicFrameCrypto:
+        cand.ftype = t
+        let off: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !off.ok: return -1
+        cand.offset = off.value
+        p = p + off.size
+        let ln: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !ln.ok: return -1
+        cand.length = ln.value
+        p = p + ln.size
+        if cand.length > int64(buf.len - p):
+            return -5
+        cand.dataOff = p
+        cand.dataLen = int32(cand.length)
+        f = cand
+        return p + cand.dataLen
+    if t >= QuicFrameStreamBase && t <= QuicFrameStreamMask:
+        cand.ftype = t
+        cand.hasOffset = (t & QuicStreamBitOff) != 0
+        cand.hasLength = (t & QuicStreamBitLen) != 0
+        cand.fin = (t & QuicStreamBitFin) != 0
+        let sid: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !sid.ok: return -1
+        cand.streamId = sid.value
+        p = p + sid.size
+        if cand.hasOffset:
+            let off: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+            if !off.ok: return -1
+            cand.offset = off.value
+            p = p + off.size
+        if cand.hasLength:
+            let ln: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+            if !ln.ok: return -1
+            cand.length = ln.value
+            p = p + ln.size
+            if cand.length > int64(buf.len - p):
+                return -5
+            cand.dataOff = p
+            cand.dataLen = int32(cand.length)
+            f = cand
+            return p + cand.dataLen
+        # No LEN bit: Stream Data consumes the rest of the packet.
+        cand.dataOff = p
+        cand.dataLen = buf.len - p
+        f = cand
+        return buf.len
+    if t == QuicFrameMaxData:
+        cand.ftype = t
+        let m: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !m.ok: return -1
+        cand.maximum = m.value
+        f = cand
+        return p + m.size
+    if t == QuicFrameMaxStreamData:
+        cand.ftype = t
+        let sid: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !sid.ok: return -1
+        cand.streamId = sid.value
+        p = p + sid.size
+        let m: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !m.ok: return -1
+        cand.maximum = m.value
+        f = cand
+        return p + m.size
+    if t == QuicFrameMaxStreamsBidi || t == QuicFrameMaxStreamsUni:
+        cand.ftype = t
+        let m: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !m.ok: return -1
+        cand.maximum = m.value
+        f = cand
+        return p + m.size
+    if t == QuicFrameNewConnectionId:
+        cand.ftype = t
+        let seq: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !seq.ok: return -1
+        cand.seqNum = seq.value
+        p = p + seq.size
+        let ret: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !ret.ok: return -1
+        cand.retirePriorTo = ret.value
+        p = p + ret.size
+        if cand.retirePriorTo > cand.seqNum:
+            return -5
+        if p >= buf.len:
+            return -1
+        let cl: int32 = BytesGet(buf, p) & 255
+        p = p + 1
+        if cl < 1 || cl > QuicCidMaxLen:
+            return -4
+        if cl > buf.len - p:
+            return -1
+        cand.cidOff = p
+        cand.cidLen = cl
+        p = p + cl
+        if QuicStatelessResetTokenLen > buf.len - p:
+            return -1
+        cand.tokenOff = p
+        f = cand
+        return p + QuicStatelessResetTokenLen
+    # CONNECTION_CLOSE transport (0x1c) / application (0x1d)
+    cand.ftype = t
+    let ec: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+    if !ec.ok: return -1
+    cand.errorCode = ec.value
+    p = p + ec.size
+    if t == QuicFrameConnectionClose:
+        let cft: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+        if !cft.ok: return -1
+        cand.closeFrameType = cft.value
+        p = p + cft.size
+    let rl: quicvarint.QuicVarintRead = quicvarint.QuicVarintReadAt(buf, p)
+    if !rl.ok: return -1
+    if rl.value > int64(buf.len - p - rl.size):
+        return -5
+    cand.reasonLen = int32(rl.value)
+    p = p + rl.size
+    cand.dataOff = p
+    cand.dataLen = cand.reasonLen
+    f = cand
+    return p + cand.reasonLen
+
+# Encode one frame into b. Data-shaped fields are taken from buf at the view
+# offsets recorded by decode, so a decoded frame re-encodes byte-identically.
+# For a fresh frame the caller sets the view offsets into its own buffer
+# (CRYPTO/STREAM data, close reason). ACK additional ranges are re-scanned
+# from buf at rangesOff; fresh ACK generation appends ranges via varint
+# primitives, see module header. Returns bytes appended or -1.
+@borrows
+fn QuicFrameAppend(b: var BytesBuilder, buf: Bytes, f: QuicFrame): int32 =
+    if !QuicFrameTypeSupported(f.ftype):
+        return -2
+    let before: int32 = BytesBuilderLen(b)
+    let tr: int32 = quicvarint.QuicVarintAppend(b, int64(f.ftype))
+    if tr < 0:
+        return -1
+    if f.ftype == QuicFramePadding || f.ftype == QuicFramePing:
+        return 1
+    if f.ftype == QuicFrameAck || f.ftype == QuicFrameAckEcn:
+        if quicvarint.QuicVarintAppend(b, f.largestAck) < 0: return -1
+        if quicvarint.QuicVarintAppend(b, f.ackDelay) < 0: return -1
+        if quicvarint.QuicVarintAppend(b, f.ackRangeCount) < 0: return -1
+        if quicvarint.QuicVarintAppend(b, f.firstAckRange) < 0: return -1
+        if f.ackRangeCount > 0:
+            if f.rangesOff < 0:
+                return -5
+            let endp: int32 = quicAckScanRanges(buf, f.rangesOff, f.ackRangeCount)
+            if endp < 0:
+                return -1
+            let view: Bytes = BytesSliceView(buf, f.rangesOff, endp - f.rangesOff)
+            BytesBuilderAppend(b, view)
+        if f.ftype == QuicFrameAckEcn:
+            if quicvarint.QuicVarintAppend(b, f.ect0) < 0: return -1
+            if quicvarint.QuicVarintAppend(b, f.ect1) < 0: return -1
+            if quicvarint.QuicVarintAppend(b, f.ceCount) < 0: return -1
+        return BytesBuilderLen(b) - before
+    if f.ftype == QuicFrameCrypto:
+        if quicvarint.QuicVarintAppend(b, f.offset) < 0: return -1
+        if quicvarint.QuicVarintAppend(b, f.length) < 0: return -1
+        if f.dataLen > 0:
+            let view: Bytes = BytesSliceView(buf, f.dataOff, f.dataLen)
+            BytesBuilderAppend(b, view)
+        return BytesBuilderLen(b) - before
+    if f.ftype >= QuicFrameStreamBase && f.ftype <= QuicFrameStreamMask:
+        if quicvarint.QuicVarintAppend(b, f.streamId) < 0: return -1
+        if f.hasOffset:
+            if quicvarint.QuicVarintAppend(b, f.offset) < 0: return -1
+        if f.hasLength:
+            if quicvarint.QuicVarintAppend(b, f.length) < 0: return -1
+        if f.dataLen > 0:
+            let view: Bytes = BytesSliceView(buf, f.dataOff, f.dataLen)
+            BytesBuilderAppend(b, view)
+        return BytesBuilderLen(b) - before
+    if f.ftype == QuicFrameMaxData:
+        if quicvarint.QuicVarintAppend(b, f.maximum) < 0: return -1
+        return BytesBuilderLen(b) - before
+    if f.ftype == QuicFrameMaxStreamData:
+        if quicvarint.QuicVarintAppend(b, f.streamId) < 0: return -1
+        if quicvarint.QuicVarintAppend(b, f.maximum) < 0: return -1
+        return BytesBuilderLen(b) - before
+    if f.ftype == QuicFrameMaxStreamsBidi || f.ftype == QuicFrameMaxStreamsUni:
+        if quicvarint.QuicVarintAppend(b, f.maximum) < 0: return -1
+        return BytesBuilderLen(b) - before
+    if f.ftype == QuicFrameNewConnectionId:
+        if quicvarint.QuicVarintAppend(b, f.seqNum) < 0: return -1
+        if quicvarint.QuicVarintAppend(b, f.retirePriorTo) < 0: return -1
+        if f.cidLen < 1 || f.cidLen > QuicCidMaxLen:
+            return -4
+        BytesBuilderAppendByte(b, f.cidLen)
+        let view: Bytes = BytesSliceView(buf, f.cidOff, f.cidLen)
+        BytesBuilderAppend(b, view)
+        if f.tokenOff >= 0:
+            let tok: Bytes = BytesSliceView(buf, f.tokenOff, QuicStatelessResetTokenLen)
+            BytesBuilderAppend(b, tok)
+        else:
+            var i: int32
+            while i < QuicStatelessResetTokenLen:
+                BytesBuilderAppendByte(b, 0)
+                i = i + 1
+        return BytesBuilderLen(b) - before
+    # CONNECTION_CLOSE
+    if quicvarint.QuicVarintAppend(b, f.errorCode) < 0: return -1
+    if f.ftype == QuicFrameConnectionClose:
+        if quicvarint.QuicVarintAppend(b, f.closeFrameType) < 0: return -1
+    if quicvarint.QuicVarintAppend(b, int64(f.reasonLen)) < 0: return -1
+    if f.reasonLen > 0:
+        let view: Bytes = BytesSliceView(buf, f.dataOff, f.reasonLen)
+        BytesBuilderAppend(b, view)
+    return BytesBuilderLen(b) - before
+
+# Append n PADDING octets (a run of PADDING frames). n >= 0.
+fn QuicPaddingAppend(b: var BytesBuilder, n: int32): int32 =
+    var i: int32
+    while i < n:
+        BytesBuilderAppendByte(b, QuicFramePadding)
+        i = i + 1
+    return n

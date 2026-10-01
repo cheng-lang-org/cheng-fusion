@@ -1,0 +1,569 @@
+# src/inference/tokenizer.cheng - byte-level BPE tokenizer runtime (Qwen2.5
+# family, GPT2-style). Loads a compact binary fixture built at build time by
+# ts-csg/scripts/tokenizer-fixture-build.mjs from a real HF tokenizer.json;
+# the Cheng runtime never parses JSON and never sees the GPT2 "visible
+# unicode" byte encoding -- vocab and merges are raw bytes end to end.
+#
+# Pipeline: literal special-token scan (longest match) over raw UTF-8 bytes,
+# NFC-normalize each non-special run (std/unicode), split the normalized
+# codepoints with the GPT2 pre-tokenizer regex
+#   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|
+#   ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+# hand-ported to an explicit longest-alternative-first scanner (no regex
+# engine in the runtime), then run byte-level BPE merges (strict rank order)
+# per piece via a doubly-linked-list + binary min-heap, O(n log n).
+#
+# Binary format (little-endian), all integers int32 unless noted:
+#   header: magic, version, vocabCount, mergeCount, specialCount, int64 contentHash
+#   vocab: int32[vocabCount] byte lengths, then raw bytes concatenated in id order
+#   merges (rank = array index): int32[mergeCount] leftId, rightId, resultId
+#   specials: specialCount * (int32 id, int32 contentByteLen, u8[contentByteLen])
+
+import std/result
+import std/os
+import std/rawbytes
+import std/system
+import std/hashmaps
+import std/unicode as uni
+
+const
+    TokenizerMagic: int32 = 0x314b4f54
+    TokenizerVersion: int32 = 1
+
+type
+    Tokenizer =
+        vocabOffset: int32[]     # length vocabCount+1, prefix sums into vocabBlob
+        vocabBlob: rawbytes.Bytes
+        byteToId: int32[]        # length 256, direct base-alphabet lookup
+        mergeRank: hashmaps.HashMapPtrInt  # key=pack(leftId,rightId) -> rank
+        mergeResult: int32[]     # indexed by rank
+        specialId: int32[]
+        specialBytes: rawbytes.Bytes[]
+
+    TokenizerHeapEntry =
+        rank: int32
+        node: int32
+        genI: int32
+        genJ: int32
+
+@borrows
+fn tokenizerReadI32LE(buf: rawbytes.Bytes, offset: int32): int32 =
+    let b0: int64 = int64(rawbytes.BytesGet(buf, offset) & 255)
+    let b1: int64 = int64(rawbytes.BytesGet(buf, offset + 1) & 255)
+    let b2: int64 = int64(rawbytes.BytesGet(buf, offset + 2) & 255)
+    let b3: int64 = int64(rawbytes.BytesGet(buf, offset + 3) & 255)
+    return int32(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+
+@borrows
+fn tokenizerReadI64LE(buf: rawbytes.Bytes, offset: int32): int64 =
+    let b0: int64 = int64(rawbytes.BytesGet(buf, offset) & 255)
+    let b1: int64 = int64(rawbytes.BytesGet(buf, offset + 1) & 255)
+    let b2: int64 = int64(rawbytes.BytesGet(buf, offset + 2) & 255)
+    let b3: int64 = int64(rawbytes.BytesGet(buf, offset + 3) & 255)
+    let b4: int64 = int64(rawbytes.BytesGet(buf, offset + 4) & 255)
+    let b5: int64 = int64(rawbytes.BytesGet(buf, offset + 5) & 255)
+    let b6: int64 = int64(rawbytes.BytesGet(buf, offset + 6) & 255)
+    let b7: int64 = int64(rawbytes.BytesGet(buf, offset + 7) & 255)
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+
+# Mirrors WeightTensorHashStep in src/inference/weight_store.cheng exactly.
+fn tokenizerHashStep(hash: int64, value: int64): int64 =
+    let mixed = hash * int64(524287) + value + int64(113)
+    if mixed < int64(0):
+        return int64(0) - mixed
+    return mixed
+
+fn TokenizerLoad(path: str): Result[Tokenizer] =
+    let bytesRes = os.ReadFileBytesResult(path)
+    if IsErr(bytesRes):
+        return Err[Tokenizer](Error(bytesRes))
+    let buf: rawbytes.Bytes = Value(bytesRes)
+    if rawbytes.BytesLen(buf) < 28:
+        return Err[Tokenizer]("tokenizer: truncated header")
+    var offset: int32 = 0
+    let magic = tokenizerReadI32LE(buf, offset)
+    offset = offset + 4
+    if magic != TokenizerMagic:
+        return Err[Tokenizer]("tokenizer: bad magic")
+    let version = tokenizerReadI32LE(buf, offset)
+    offset = offset + 4
+    if version != TokenizerVersion:
+        return Err[Tokenizer]("tokenizer: bad version")
+    let vocabCount = tokenizerReadI32LE(buf, offset)
+    offset = offset + 4
+    let mergeCount = tokenizerReadI32LE(buf, offset)
+    offset = offset + 4
+    let specialCount = tokenizerReadI32LE(buf, offset)
+    offset = offset + 4
+    let contentHash = tokenizerReadI64LE(buf, offset)
+    offset = offset + 8
+    if vocabCount <= 0 || mergeCount < 0 || specialCount < 0:
+        return Err[Tokenizer]("tokenizer: bad counts")
+
+    var h: int64 = int64(113)
+    h = tokenizerHashStep(h, int64(magic))
+    h = tokenizerHashStep(h, int64(version))
+    h = tokenizerHashStep(h, int64(vocabCount))
+    h = tokenizerHashStep(h, int64(mergeCount))
+    h = tokenizerHashStep(h, int64(specialCount))
+
+    var vocabLens: int32[]
+    setLen(vocabLens, vocabCount)
+    for i in 0..<vocabCount:
+        vocabLens[i] = tokenizerReadI32LE(buf, offset)
+        offset = offset + 4
+        h = tokenizerHashStep(h, int64(vocabLens[i]))
+
+    var vocabOffset: int32[]
+    setLen(vocabOffset, vocabCount + 1)
+    vocabOffset[0] = 0
+    for i in 0..<vocabCount:
+        vocabOffset[i + 1] = vocabOffset[i] + vocabLens[i]
+
+    let blobLen: int32 = vocabOffset[vocabCount]
+    let blobStart: int32 = offset
+    for i in 0..<blobLen:
+        h = tokenizerHashStep(h, int64(rawbytes.BytesGet(buf, blobStart + i) & 255))
+    let vocabBlob: rawbytes.Bytes = rawbytes.BytesSliceView(buf, blobStart, blobLen)
+    offset = offset + blobLen
+
+    var leftIds: int32[]
+    var rightIds: int32[]
+    var mergeResult: int32[]
+    setLen(leftIds, mergeCount)
+    setLen(rightIds, mergeCount)
+    setLen(mergeResult, mergeCount)
+    for i in 0..<mergeCount:
+        leftIds[i] = tokenizerReadI32LE(buf, offset)
+        offset = offset + 4
+        h = tokenizerHashStep(h, int64(leftIds[i]))
+    for i in 0..<mergeCount:
+        rightIds[i] = tokenizerReadI32LE(buf, offset)
+        offset = offset + 4
+        h = tokenizerHashStep(h, int64(rightIds[i]))
+    for i in 0..<mergeCount:
+        mergeResult[i] = tokenizerReadI32LE(buf, offset)
+        offset = offset + 4
+        h = tokenizerHashStep(h, int64(mergeResult[i]))
+
+    var mergeRank: hashmaps.HashMapPtrInt = hashmaps.HashMapPtrIntInit(hashmaps.HashMapNextPow2(mergeCount * 2, 1024))
+    for i in 0..<mergeCount:
+        let key: int64 = ((int64(leftIds[i]) + int64(1)) << 32) | (int64(rightIds[i]) + int64(1))
+        hashmaps.HashMapPtrIntPut(mergeRank, key, i)
+
+    var specialId: int32[]
+    var specialBytes: rawbytes.Bytes[]
+    setLen(specialId, specialCount)
+    setLen(specialBytes, specialCount)
+    for i in 0..<specialCount:
+        let sid = tokenizerReadI32LE(buf, offset)
+        offset = offset + 4
+        let slen = tokenizerReadI32LE(buf, offset)
+        offset = offset + 4
+        h = tokenizerHashStep(h, int64(sid))
+        h = tokenizerHashStep(h, int64(slen))
+        for k in 0..<slen:
+            h = tokenizerHashStep(h, int64(rawbytes.BytesGet(buf, offset + k) & 255))
+        specialId[i] = sid
+        specialBytes[i] = rawbytes.BytesSliceView(buf, offset, slen)
+        offset = offset + slen
+
+    if h != contentHash:
+        return Err[Tokenizer]("tokenizer: content hash mismatch")
+
+    var byteToId: int32[]
+    var byteToIdSet: int32[]
+    setLen(byteToId, 256)
+    setLen(byteToIdSet, 256)
+    for i in 0..<256:
+        byteToIdSet[i] = 0
+    for id in 0..<vocabCount:
+        if vocabLens[id] == 1:
+            let bval: int32 = rawbytes.BytesGet(vocabBlob, vocabOffset[id]) & 255
+            byteToId[bval] = id
+            byteToIdSet[bval] = 1
+    for i in 0..<256:
+        if byteToIdSet[i] == 0:
+            return Err[Tokenizer]("tokenizer: byte-level base alphabet incomplete")
+
+    var t: Tokenizer
+    t.vocabOffset = vocabOffset
+    t.vocabBlob = vocabBlob
+    t.byteToId = byteToId
+    t.mergeRank = mergeRank
+    t.mergeResult = mergeResult
+    t.specialId = specialId
+    t.specialBytes = specialBytes
+    return Ok[Tokenizer](t)
+
+@borrows
+fn TokenizerVocabBytes(t: Tokenizer, id: int32): rawbytes.Bytes =
+    let startOff: int32 = t.vocabOffset[id]
+    let endOff: int32 = t.vocabOffset[id + 1]
+    return rawbytes.BytesSliceView(t.vocabBlob, startOff, endOff - startOff)
+
+# --- GPT2 pre-tokenizer regex, ported to an explicit longest-alternative-first
+# scanner over Unicode codepoints (table-driven L/N classification, no regex
+# engine). Alternatives tried in the exact source order of the HF pattern:
+#   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+#   | [^\r\n\p{L}\p{N}]?\p{L}+
+#   | \p{N}
+#   | ' '?[^\s\p{L}\p{N}]+[\r\n]*
+#   | \s*[\r\n]+
+#   | \s+(?!\S)
+#   | \s+
+fn tokenizerIsWhitespace(cp: int32): bool =
+    if cp == 0x09 || cp == 0x0a || cp == 0x0b || cp == 0x0c || cp == 0x0d || cp == 0x20:
+        return true
+    if cp == 0x85 || cp == 0xa0 || cp == 0x1680:
+        return true
+    if cp >= 0x2000 && cp <= 0x200a:
+        return true
+    if cp == 0x2028 || cp == 0x2029 || cp == 0x202f || cp == 0x205f || cp == 0x3000:
+        return true
+    return false
+
+fn tokenizerIsCrLf(cp: int32): bool =
+    return cp == 0x0d || cp == 0x0a
+
+fn tokenizerAsciiLower(cp: int32): int32 =
+    if cp >= 0x41 && cp <= 0x5a:
+        return cp + 32
+    return cp
+
+@borrows
+fn tokenizerContractionMatchLen(cps: int32[], i: int32): int32 =
+    let n: int32 = cps.len
+    if cps[i] != 0x27:
+        return 0
+    if i + 2 <= n:
+        let c1: int32 = tokenizerAsciiLower(cps[i + 1])
+        if c1 == Int32('s') || c1 == Int32('t') || c1 == Int32('m') || c1 == Int32('d'):
+            return 2
+    if i + 3 <= n:
+        let c1: int32 = tokenizerAsciiLower(cps[i + 1])
+        let c2: int32 = tokenizerAsciiLower(cps[i + 2])
+        if c1 == Int32('r') && c2 == Int32('e'):
+            return 3
+        if c1 == Int32('v') && c2 == Int32('e'):
+            return 3
+        if c1 == Int32('l') && c2 == Int32('l'):
+            return 3
+    return 0
+
+@borrows
+fn tokenizerLetterRunMatchLen(uniTables: uni.UnicodeTables, cps: int32[], i: int32): int32 =
+    let n: int32 = cps.len
+    var prefixLen: int32 = 0
+    if !tokenizerIsCrLf(cps[i]) && !uni.UnicodeIsLetter(uniTables, cps[i]) && !uni.UnicodeIsNumber(uniTables, cps[i]):
+        prefixLen = 1
+    var k: int32 = i + prefixLen
+    let letterStart: int32 = k
+    while k < n && uni.UnicodeIsLetter(uniTables, cps[k]):
+        k = k + 1
+    if k > letterStart:
+        return k - i
+    return 0
+
+@borrows
+fn tokenizerNumberMatchLen(uniTables: uni.UnicodeTables, cps: int32[], i: int32): int32 =
+    if uni.UnicodeIsNumber(uniTables, cps[i]):
+        return 1
+    return 0
+
+@borrows
+fn tokenizerSymbolRunMatchLen(uniTables: uni.UnicodeTables, cps: int32[], i: int32): int32 =
+    let n: int32 = cps.len
+    var prefixLen: int32 = 0
+    if cps[i] == 0x20:
+        prefixLen = 1
+    var k: int32 = i + prefixLen
+    let symStart: int32 = k
+    while k < n && !tokenizerIsWhitespace(cps[k]) && !uni.UnicodeIsLetter(uniTables, cps[k]) && !uni.UnicodeIsNumber(uniTables, cps[k]):
+        k = k + 1
+    if k > symStart:
+        while k < n && tokenizerIsCrLf(cps[k]):
+            k = k + 1
+        return k - i
+    return 0
+
+@borrows
+fn tokenizerWsCrlfMatchLen(cps: int32[], i: int32): int32 =
+    let n: int32 = cps.len
+    var k: int32 = i
+    while k < n && tokenizerIsWhitespace(cps[k]) && !tokenizerIsCrLf(cps[k]):
+        k = k + 1
+    let crlfStart: int32 = k
+    while k < n && tokenizerIsCrLf(cps[k]):
+        k = k + 1
+    if k > crlfStart:
+        return k - i
+    return 0
+
+# \s+(?!\S): greedy over the maximal whitespace run, but the negative
+# lookahead only succeeds by backing off exactly one char when the run does
+# not reach end-of-input (that one char is reserved as the next piece's
+# leading-space prefix). See ts-csg/scripts + scratch verification notes.
+@borrows
+fn tokenizerWsNoTrailMatchLen(cps: int32[], i: int32): int32 =
+    let n: int32 = cps.len
+    var k: int32 = i
+    while k < n && tokenizerIsWhitespace(cps[k]):
+        k = k + 1
+    if k > i:
+        var endPos: int32 = k
+        if endPos < n:
+            endPos = endPos - 1
+        if endPos > i:
+            return endPos - i
+    return 0
+
+@borrows
+fn tokenizerWsMatchLen(cps: int32[], i: int32): int32 =
+    let n: int32 = cps.len
+    var k: int32 = i
+    while k < n && tokenizerIsWhitespace(cps[k]):
+        k = k + 1
+    return k - i
+
+@borrows
+fn tokenizerGpt2MatchAt(uniTables: uni.UnicodeTables, cps: int32[], i: int32): int32 =
+    var m: int32 = tokenizerContractionMatchLen(cps, i)
+    if m > 0:
+        return m
+    m = tokenizerLetterRunMatchLen(uniTables, cps, i)
+    if m > 0:
+        return m
+    m = tokenizerNumberMatchLen(uniTables, cps, i)
+    if m > 0:
+        return m
+    m = tokenizerSymbolRunMatchLen(uniTables, cps, i)
+    if m > 0:
+        return m
+    m = tokenizerWsCrlfMatchLen(cps, i)
+    if m > 0:
+        return m
+    m = tokenizerWsNoTrailMatchLen(cps, i)
+    if m > 0:
+        return m
+    m = tokenizerWsMatchLen(cps, i)
+    if m > 0:
+        return m
+    panic("tokenizerGpt2MatchAt: no alternative matched (unreachable for valid Unicode text)")
+    return 0
+
+# --- byte-level BPE merge: doubly linked list (prev/next flat arrays) +
+# binary min-heap keyed by rank, lazy-deletion validated via per-node
+# generation counters (heap entries captured at push time; popped entries
+# whose node is dead or whose generation changed are silently skipped).
+fn tokenizerHeapPush(heap: var TokenizerHeapEntry[], e: TokenizerHeapEntry) =
+    add(heap, e)
+    var i: int32 = heap.len - 1
+    while i > 0:
+        let p: int32 = (i - 1) / 2
+        if heap[p].rank <= heap[i].rank:
+            break
+        let tmp: TokenizerHeapEntry = heap[p]
+        heap[p] = heap[i]
+        heap[i] = tmp
+        i = p
+
+fn tokenizerHeapPop(heap: var TokenizerHeapEntry[]): TokenizerHeapEntry =
+    let top: TokenizerHeapEntry = heap[0]
+    let lastIdx: int32 = heap.len - 1
+    heap[0] = heap[lastIdx]
+    setLen(heap, lastIdx)
+    var i: int32 = 0
+    while true:
+        let l: int32 = 2 * i + 1
+        let r: int32 = 2 * i + 2
+        var smallest: int32 = i
+        if l < heap.len && heap[l].rank < heap[smallest].rank:
+            smallest = l
+        if r < heap.len && heap[r].rank < heap[smallest].rank:
+            smallest = r
+        if smallest == i:
+            break
+        let tmp: TokenizerHeapEntry = heap[smallest]
+        heap[smallest] = heap[i]
+        heap[i] = tmp
+        i = smallest
+    return top
+
+@borrows
+fn tokenizerHeapTryPush(mergeRank: hashmaps.HashMapPtrInt, val: int32[], next: int32[], alive: int32[], gen: int32[], i: int32, heap: var TokenizerHeapEntry[]) =
+    if i < 0:
+        return
+    if next[i] < 0:
+        return
+    if alive[i] == 0:
+        return
+    let j: int32 = next[i]
+    let key: int64 = ((int64(val[i]) + int64(1)) << 32) | (int64(val[j]) + int64(1))
+    var found: bool
+    let rank: int32 = hashmaps.HashMapPtrIntGetEx(mergeRank, key, found)
+    if !found:
+        return
+    var e: TokenizerHeapEntry
+    e.rank = rank
+    e.node = i
+    e.genI = gen[i]
+    e.genJ = gen[j]
+    tokenizerHeapPush(heap, e)
+
+@borrows
+fn tokenizerBpeMerge(mergeRank: hashmaps.HashMapPtrInt, mergeResult: int32[], ids: int32[]): int32[] =
+    let n: int32 = ids.len
+    if n <= 0:
+        return []
+    var val: int32[]
+    var prev: int32[]
+    var next: int32[]
+    var alive: int32[]
+    var gen: int32[]
+    setLen(val, n)
+    setLen(prev, n)
+    setLen(next, n)
+    setLen(alive, n)
+    setLen(gen, n)
+    for i in 0..<n:
+        val[i] = ids[i]
+        prev[i] = i - 1
+        if i + 1 >= n:
+            next[i] = -1
+        else:
+            next[i] = i + 1
+        alive[i] = 1
+        gen[i] = 0
+
+    var heap: TokenizerHeapEntry[]
+    for i in 0..<n:
+        tokenizerHeapTryPush(mergeRank, val, next, alive, gen, i, heap)
+
+    while heap.len > 0:
+        let e: TokenizerHeapEntry = tokenizerHeapPop(heap)
+        let i: int32 = e.node
+        if alive[i] == 0 || gen[i] != e.genI:
+            continue
+        let j: int32 = next[i]
+        if j < 0 || alive[j] == 0 || gen[j] != e.genJ:
+            continue
+        val[i] = mergeResult[e.rank]
+        gen[i] = gen[i] + 1
+        alive[j] = 0
+        let jn: int32 = next[j]
+        next[i] = jn
+        if jn >= 0:
+            prev[jn] = i
+        tokenizerHeapTryPush(mergeRank, val, next, alive, gen, prev[i], heap)
+        tokenizerHeapTryPush(mergeRank, val, next, alive, gen, i, heap)
+
+    var out: int32[]
+    var walk: int32 = 0
+    while walk != -1:
+        if alive[walk] == 1:
+            add(out, val[walk])
+        walk = next[walk]
+    return out
+
+@borrows
+fn tokenizerEncodePieceRange(t: Tokenizer, cps: int32[], fromIdx: int32, toIdx: int32, out: var int32[]) =
+    if toIdx <= fromIdx:
+        return
+    var pieceCps: int32[]
+    setLen(pieceCps, toIdx - fromIdx)
+    for k in 0..<(toIdx - fromIdx):
+        pieceCps[k] = cps[fromIdx + k]
+    let pieceBytes: rawbytes.Bytes = uni.Utf8Encode(pieceCps)
+    let bn: int32 = rawbytes.BytesLen(pieceBytes)
+    var byteIds: int32[]
+    setLen(byteIds, bn)
+    for bi in 0..<bn:
+        let bval: int32 = rawbytes.BytesGet(pieceBytes, bi) & 255
+        byteIds[bi] = t.byteToId[bval]
+    let merged: int32[] = tokenizerBpeMerge(t.mergeRank, t.mergeResult, byteIds)
+    for k in 0..<merged.len:
+        add(out, merged[k])
+
+@borrows
+fn tokenizerGpt2SplitEncode(t: Tokenizer, uniTables: uni.UnicodeTables, cps: int32[], out: var int32[]) =
+    var i: int32 = 0
+    let n: int32 = cps.len
+    while i < n:
+        let m: int32 = tokenizerGpt2MatchAt(uniTables, cps, i)
+        tokenizerEncodePieceRange(t, cps, i, i + m, out)
+        i = i + m
+
+@borrows
+fn tokenizerBytesStartsWithAt(hay: rawbytes.Bytes, i: int32, needle: rawbytes.Bytes): bool =
+    let m: int32 = rawbytes.BytesLen(needle)
+    if i + m > rawbytes.BytesLen(hay):
+        return false
+    for k in 0..<m:
+        if rawbytes.BytesGet(hay, i + k) != rawbytes.BytesGet(needle, k):
+            return false
+    return true
+
+# Literal added-token match at position i, raw (pre-normalization) UTF-8
+# bytes -- matches HF AddedVocabulary semantics (specials are matched before
+# normalization/pre-tokenization run on the surrounding plain text).
+@borrows
+fn tokenizerFindSpecialAt(t: Tokenizer, hay: rawbytes.Bytes, i: int32): int32 =
+    var bestIdx: int32 = -1
+    var bestLen: int32 = -1
+    for s in 0..<t.specialId.len:
+        let needle: rawbytes.Bytes = t.specialBytes[s]
+        if tokenizerBytesStartsWithAt(hay, i, needle):
+            let m: int32 = rawbytes.BytesLen(needle)
+            if m > bestLen:
+                bestLen = m
+                bestIdx = s
+    return bestIdx
+
+@borrows
+fn tokenizerFlushPlain(t: Tokenizer, uniTables: uni.UnicodeTables, raw: rawbytes.Bytes, start: int32, endPos: int32, out: var int32[]) =
+    if endPos <= start:
+        return
+    let span: rawbytes.Bytes = rawbytes.BytesSliceView(raw, start, endPos - start)
+    let cps: int32[] = uni.Utf8Decode(span)
+    let normalized: int32[] = uni.UnicodeNfc(uniTables, cps)
+    tokenizerGpt2SplitEncode(t, uniTables, normalized, out)
+
+@borrows
+fn TokenizerEncode(t: Tokenizer, uniTables: uni.UnicodeTables, text: str): int32[] =
+    let raw: rawbytes.Bytes = rawbytes.BytesFromString(text)
+    let n: int32 = rawbytes.BytesLen(raw)
+    var out: int32[]
+    var i: int32 = 0
+    var plainStart: int32 = 0
+    while i < n:
+        let specialIdx: int32 = tokenizerFindSpecialAt(t, raw, i)
+        if specialIdx >= 0:
+            tokenizerFlushPlain(t, uniTables, raw, plainStart, i, out)
+            add(out, t.specialId[specialIdx])
+            i = i + rawbytes.BytesLen(t.specialBytes[specialIdx])
+            plainStart = i
+        else:
+            i = i + 1
+    tokenizerFlushPlain(t, uniTables, raw, plainStart, n, out)
+    return out
+
+@borrows
+fn tokenizerFindSpecialById(t: Tokenizer, id: int32): int32 =
+    for s in 0..<t.specialId.len:
+        if t.specialId[s] == id:
+            return s
+    return -1
+
+@borrows
+fn TokenizerDecode(t: Tokenizer, ids: int32[]): str =
+    var b: rawbytes.BytesBuilder = rawbytes.BytesBuilderNew(ids.len * 3)
+    for i in 0..<ids.len:
+        let id: int32 = ids[i]
+        let specialIdx: int32 = tokenizerFindSpecialById(t, id)
+        if specialIdx >= 0:
+            rawbytes.BytesBuilderAppend(b, t.specialBytes[specialIdx])
+        else:
+            rawbytes.BytesBuilderAppend(b, TokenizerVocabBytes(t, id))
+    let outBytes: rawbytes.Bytes = rawbytes.BytesBuilderFinish(b)
+    return rawbytes.BytesToString(outBytes)

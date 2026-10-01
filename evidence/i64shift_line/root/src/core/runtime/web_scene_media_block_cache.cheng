@@ -1,0 +1,484 @@
+# web_scene_media_block_cache — S4: 内容寻址块缓存, GOP 粒度磁盘持久化。
+#
+# 蓝图 docs/video-seek-scrub-blueprint.md §S4。不复用/不改造
+# web_scene_media_network_bridge.cheng:127-199 那套已判定废弃的 1MB 内存窗口缓存（单槽替换、
+# 非按内容寻址、非持久化，语义完全不同）——本模块是独立的新文件。
+#
+# 缓存键 = (assetCid, gopStartFrameIdx)。assetCid 是 announce 里的 SHA256 十六进制字符串
+# （web_scene_media_network_bridge.cheng:251 注释确认），文件系统安全，落盘路径：
+#   rootDir/<assetCid>/<gopStartFrameIdx>.blk
+# GOP 起点由 S1 的关键帧表定义，一个块 = 一个 GOP，不是任意字节窗口。
+#
+# rootDir 由调用方在 WebSceneMediaBlockCacheInit 显式传入，库内不硬编码/猜测平台缓存路径
+# （本仓当前没有任何"系统缓存目录"约定可查证）。rootDir 必须与 cheng-publish 暂存目录物理
+# 隔离——本模块从不派生/猜测该目录，隔离由调用方在两处各自传入不同的 rootDir 保证。
+#
+# 生产接线（S4 宿主初始化，video-seek-scrub-blueprint.md §S4）：cheng_scene_media_block_cache_init
+# 导出为 C-ABI 入口，宿主在 ES/媒体会话首次可用时调用，传入平台真实可写目录——Android 侧
+# 镜像 mobile_shell_codegen.cheng 里 nativeStartMoqServe 的既有惯用法
+# （File(filesDir, "moq_publish")：filesDir 是 app 私有持久目录，非系统可清空的 cacheDir），
+# 用 File(filesDir, "media_block_cache") 同级兄弟目录，与 moq_publish（cheng-publish 暂存,
+# 方向相反）物理隔离；鸿蒙侧镜像 platform/harmony/.../ets/pages/Index.ets 里
+# getContext(this).cacheDir 的既有取址惯用法，取 cacheDir + "/media_block_cache" 子目录。
+#
+# 淘汰策略（容量切片，落地蓝图 §7 开放问题）：镜像 PWA 蓝本 p2pMedia.ts
+# planManifestEviction(:716-747)——按最后访问 LRU（Get 命中/Put 都刷新 lastAccess），
+# 默认 512MB 上限 / 384MB 目标水位，pinned 豁免。蓝本的 ownedByPublisher 豁免在此无
+# 对应物：发布暂存目录与本缓存 rootDir 物理隔离（见上文），发布者副本从不进入本缓存，
+# 豁免集 = pinned。LRU 元数据持久化在 rootDir/block_cache_manifest.v1（tmp+rename
+# 原子写），磁盘文件永远是真相源：Init 时对账（清单有盘无→删条目，盘有清单无→按文件
+# mtime 收养孤儿块，两边都在→以磁盘实际大小刷新记账），随后越限立即淘汰。
+#
+# 写入用 tmp+rename 原子写（镜像 compile_skip_cache.cheng 的既有模式），避免并发/中断写出
+# 半截文件被 Get 读到损坏内容。
+
+import std/result
+import std/os
+import std/rawbytes
+import std/strings as strs
+import std/strutils as strutil
+import std/system
+
+# host_runtime.c 提供（web_console_runtime.cheng:7 同型先例）；LRU lastAccess 用 epoch 毫秒，
+# 与蓝本 updatedAt（Date.now()）同粒度。
+importc fn cheng_epoch_time_ms(): int64
+
+var webSceneMediaBlockCacheRootDir: str
+
+# 调用方显式传入缓存根目录；库内绝不硬编码/猜测平台缓存路径。
+@borrows
+fn WebSceneMediaBlockCacheInit(rootDir: str): bool =
+    webSceneMediaBlockCacheRootDir = strs.CloneStr(rootDir)
+    os.MkdirAll(rootDir, 493)
+    if !os.DirExists(rootDir):
+        return false
+    # 重建条目状态：先载清单（LRU 元数据），再以磁盘为真相源对账，越限立即淘汰。
+    webSceneMediaBlockCacheKeys = []
+    webSceneMediaBlockCacheSizes = []
+    webSceneMediaBlockCacheAccessMs = []
+    webSceneMediaBlockCachePinned = []
+    webSceneMediaBlockCacheTotalBytes = 0
+    webSceneMediaBlockCacheManifestLoad()
+    webSceneMediaBlockCacheReconcile()
+    webSceneMediaBlockCacheEvictIfNeeded()
+    webSceneMediaBlockCacheManifestPersist()
+    return true
+
+# C-ABI seam (S4 宿主接线): cheng_scene_media_block_cache_init 只由 scene runtime(SR)
+# 生成的薄包装导出(cstring 经 __chengCstrBorrowFix); 本文件曾有的同名 @exportc 副本
+# 与 SR 撞符号(cold duplicate-symbol 硬失败), 已删除。宿主经 SR 符号调到下面的
+# WebSceneMediaBlockCacheInit。
+
+@borrows
+fn webSceneMediaBlockCacheAssetDir(assetCid: str): str =
+    return strings.ConcatStr(strings.ConcatStr(webSceneMediaBlockCacheRootDir, "/"), strs.CloneStr(assetCid))
+
+@borrows
+fn webSceneMediaBlockCachePath(assetCid: str, gopStartFrameIdx: int32): str =
+    return strings.ConcatStr(strings.ConcatStr(webSceneMediaBlockCacheAssetDir(assetCid), "/"), strings.ConcatStr(strs.IntToStr(gopStartFrameIdx), ".blk"))
+
+# 命中读取。冷 miss（未 Put 过的键）必须返回 Err，不静默返回空/垃圾数据。
+fn WebSceneMediaBlockCacheGet(assetCid: str, gopStartFrameIdx: int32): Result[Bytes] =
+    let path = webSceneMediaBlockCachePath(assetCid, gopStartFrameIdx)
+    if !os.FileExists(path):
+        return Err[Bytes]("block cache miss assetCid=" + assetCid + " gopStartFrameIdx=" + strs.IntToStr(gopStartFrameIdx))
+    let res: Result[Bytes] = os.ReadFileBytesResult(path)
+    if IsOk(res):
+        webSceneMediaBlockCacheTouch(assetCid, gopStartFrameIdx, false, path)
+    return res
+
+# 写入：GOP 一个块。tmp+rename 原子写，落盘后立即可被 Get 命中（含跨进程）。
+fn WebSceneMediaBlockCachePut(assetCid: str, gopStartFrameIdx: int32, data: Bytes): bool =
+    if assetCid.len == 0:
+        return false
+    os.MkdirAll(webSceneMediaBlockCacheAssetDir(assetCid), 493)
+    let finalPath = webSceneMediaBlockCachePath(assetCid, gopStartFrameIdx)
+    let tmpPath = finalPath + ".tmp"
+    if os.FileExists(tmpPath):
+        os.RemoveFile(tmpPath)
+    var writeData: Bytes = data
+    var writeRes: Result[bool] = os.WriteFileBytesResult(tmpPath, writeData)
+    if IsErr(writeRes):
+        os.RemoveFile(tmpPath)
+        return false
+    if !os.FileExists(tmpPath):
+        return false
+    if os.RenameFile(tmpPath, finalPath):
+        webSceneMediaBlockCacheAfterPut(assetCid, gopStartFrameIdx, false, BytesLen(data))
+        return true
+    if os.FileExists(finalPath):
+        os.RemoveFile(tmpPath)
+        webSceneMediaBlockCacheAfterPut(assetCid, gopStartFrameIdx, false, BytesLen(data))
+        return true
+    os.RemoveFile(tmpPath)
+    return false
+
+# --- S7 slice1: audio-parallel key (video-seek-scrub-blueprint.md §7.1 选项 A) ------
+# Audio ES (AAC/ADTS) has no GOP/keyframe structure (every AU decodes independently —
+# see web_scene_media_network_bridge.cheng's WebSceneMediaAudioEsSeekToVideoFrame doc
+# comment), so an audio block is a fixed-size run of ADTS AUs, not a GOP; its start
+# index lives in the SAME small-non-negative-integer space as a video gopStartFrameIdx
+# (both are "frame N of an independently-numbered track"), so reusing
+# WebSceneMediaBlockCachePut/Get's key verbatim risks a numeric collision (e.g. video
+# GOP start 96 and an audio block start 96 would both resolve to
+# "<assetCid>/96.blk" under the same assetCid). A parallel key — same (assetCid,
+# startFrameIdx) pair, distinct on-disk filename prefix — keeps the two tracks'
+# keyspaces disjoint by construction rather than by coincidence, while reusing this
+# module's Init/mkdir/tmp+rename machinery unchanged.
+@borrows
+fn webSceneMediaBlockCacheAudioPath(assetCid: str, audioBlockStartFrameIdx: int32): str =
+    return strings.ConcatStr(strings.ConcatStr(webSceneMediaBlockCacheAssetDir(assetCid), "/a-"), strings.ConcatStr(strs.IntToStr(audioBlockStartFrameIdx), ".blk"))
+
+# 命中读取（音频块）。冷 miss 必须返回 Err，不静默返回空/垃圾数据。
+fn WebSceneMediaBlockCacheGetAudio(assetCid: str, audioBlockStartFrameIdx: int32): Result[Bytes] =
+    let path = webSceneMediaBlockCacheAudioPath(assetCid, audioBlockStartFrameIdx)
+    if !os.FileExists(path):
+        return Err[Bytes]("audio block cache miss assetCid=" + assetCid + " audioBlockStartFrameIdx=" + strs.IntToStr(audioBlockStartFrameIdx))
+    let res: Result[Bytes] = os.ReadFileBytesResult(path)
+    if IsOk(res):
+        webSceneMediaBlockCacheTouch(assetCid, audioBlockStartFrameIdx, true, path)
+    return res
+
+# 写入（音频块）：tmp+rename 原子写，同 WebSceneMediaBlockCachePut 的落盘语义。
+fn WebSceneMediaBlockCachePutAudio(assetCid: str, audioBlockStartFrameIdx: int32, data: Bytes): bool =
+    if assetCid.len == 0:
+        return false
+    os.MkdirAll(webSceneMediaBlockCacheAssetDir(assetCid), 493)
+    let finalPath = webSceneMediaBlockCacheAudioPath(assetCid, audioBlockStartFrameIdx)
+    let tmpPath = finalPath + ".tmp"
+    if os.FileExists(tmpPath):
+        os.RemoveFile(tmpPath)
+    var writeData: Bytes = data
+    var writeRes: Result[bool] = os.WriteFileBytesResult(tmpPath, writeData)
+    if IsErr(writeRes):
+        os.RemoveFile(tmpPath)
+        return false
+    if !os.FileExists(tmpPath):
+        return false
+    if os.RenameFile(tmpPath, finalPath):
+        webSceneMediaBlockCacheAfterPut(assetCid, audioBlockStartFrameIdx, true, BytesLen(data))
+        return true
+    if os.FileExists(finalPath):
+        os.RemoveFile(tmpPath)
+        webSceneMediaBlockCacheAfterPut(assetCid, audioBlockStartFrameIdx, true, BytesLen(data))
+        return true
+    os.RemoveFile(tmpPath)
+    return false
+
+# --- 容量淘汰：LRU(按最后访问) + 上限/目标水位 + pinned 豁免 -----------------------------
+# 镜像 PWA 蓝本 p2pMedia.ts planManifestEviction(:716-747)。蓝本三键排序 (updatedAt 升,
+# sizeBytes 降, key 升) 的第三键在此省略：插入排序稳定，同 (access,size) 保持清单序，同样
+# 确定。线程模型：生产接线（鸿蒙 cheng_gui_host_gen.c 拉取线程闭环 / Android 同型）里
+# Get/Put/GetAudio/PutAudio 全部运行在单一拉取线程，Init 由 ArkTS 启动期一次性调用且先于
+# 任何流建立——模块内可变状态无跨线程并发，与既有 rootDir 全局同一假设，不引入锁。
+
+const
+    WebSceneMediaBlockCacheDefaultMaxBytes: int64 = 536870912
+    WebSceneMediaBlockCacheDefaultTargetBytes: int64 = 402653184
+
+var webSceneMediaBlockCacheMaxBytes: int64 = WebSceneMediaBlockCacheDefaultMaxBytes
+var webSceneMediaBlockCacheTargetBytes: int64 = WebSceneMediaBlockCacheDefaultTargetBytes
+# 条目 = (键, 字节数, 最后访问 epoch ms, pinned)。键 = "v:<assetCid>:<gopStartFrameIdx>" /
+# "a:<assetCid>:<audioBlockStartFrameIdx>"，与磁盘文件名一一对应（assetCid 是十六进制串，
+# 不含 ':'/' '）。pinned 是会话级运行态，不写清单——蓝本 pinnedKeys 同为运行时参数。
+var webSceneMediaBlockCacheKeys: str[]
+var webSceneMediaBlockCacheSizes: int64[]
+var webSceneMediaBlockCacheAccessMs: int64[]
+var webSceneMediaBlockCachePinned: bool[]
+var webSceneMediaBlockCacheTotalBytes: int64
+
+@borrows
+fn webSceneMediaBlockCacheKey(assetCid: str, startFrameIdx: int32, isAudio: bool): str =
+    if isAudio:
+        return "a:" + assetCid + ":" + strs.IntToStr(startFrameIdx)
+    return "v:" + assetCid + ":" + strs.IntToStr(startFrameIdx)
+
+@borrows
+fn webSceneMediaBlockCacheFindKey(key: str): int32 =
+    var i: int32
+    while i < webSceneMediaBlockCacheKeys.len:
+        if webSceneMediaBlockCacheKeys[i] == key:
+            return i
+        i = i + 1
+    return -1
+
+# 解析非负十进制整数：空串/含非数字/超界返回 false。乘加前拦（上限 1e17，块大小与
+# epoch ms 都远低于此），保证 value*10+digit 永不溢出 int64。
+@borrows
+fn webSceneMediaBlockCacheParseU64(s: str, out: var int64): bool =
+    out = 0
+    if s.len <= 0:
+        return false
+    var value: int64
+    var i: int32
+    while i < s.len:
+        let ch: char = s[i]
+        if ch < '0' || ch > '9':
+            return false
+        if value > int64(100000000000000000):
+            return false
+        value = value * int64(10) + int64(int32(ch) - int32('0'))
+        i = i + 1
+    out = value
+    return true
+
+fn webSceneMediaBlockCacheUpsert(key: str, sizeBytes: int64, accessMs: int64): int32 =
+    let found: int32 = webSceneMediaBlockCacheFindKey(key)
+    if found >= 0:
+        webSceneMediaBlockCacheTotalBytes = webSceneMediaBlockCacheTotalBytes - webSceneMediaBlockCacheSizes[found] + sizeBytes
+        webSceneMediaBlockCacheSizes[found] = sizeBytes
+        webSceneMediaBlockCacheAccessMs[found] = accessMs
+        return found
+    add(webSceneMediaBlockCacheKeys, key)
+    add(webSceneMediaBlockCacheSizes, sizeBytes)
+    add(webSceneMediaBlockCacheAccessMs, accessMs)
+    add(webSceneMediaBlockCachePinned, false)
+    webSceneMediaBlockCacheTotalBytes = webSceneMediaBlockCacheTotalBytes + sizeBytes
+    return webSceneMediaBlockCacheKeys.len - 1
+
+# 键 → 磁盘路径（v → <idx>.blk，a → a-<idx>.blk），与 Put/Get 的路径构造互为逆运算。
+@borrows
+fn webSceneMediaBlockCachePathForKey(key: str): str =
+    let parts: str[] = strutil.Split(key, ':')
+    if parts.len != 3:
+        return strings.CloneStr(webSceneMediaBlockCacheRootDir)
+    if parts[0] == "a":
+        return strings.ConcatStr(strings.ConcatStr(webSceneMediaBlockCacheAssetDir(parts[1]), "/a-"), strings.ConcatStr(parts[2], ".blk"))
+    return strings.ConcatStr(strings.ConcatStr(webSceneMediaBlockCacheAssetDir(parts[1]), "/"), strings.ConcatStr(parts[2], ".blk"))
+
+# 清单持久化：tmp+rename 原子写（同块写入模式）。清单只是 LRU 元数据载体，磁盘文件才是
+# 真相源——写失败不使 Put/Get 失败：进程内条目记账是权威，下次 Init 的 reconcile 会以文件
+# mtime 为 lastAccess 重新收养清单遗漏的块，退化的仅是跨进程 LRU 精度，不是数据正确性。
+fn webSceneMediaBlockCacheManifestPath(): str =
+    return strings.ConcatStr(strings.CloneStr(webSceneMediaBlockCacheRootDir), "/block_cache_manifest.v1")
+
+fn webSceneMediaBlockCacheManifestPersist(): bool =
+    if webSceneMediaBlockCacheRootDir.len == 0:
+        return false
+    var text: str = "MBC1\n"
+    var i: int32
+    while i < webSceneMediaBlockCacheKeys.len:
+        text = text + webSceneMediaBlockCacheKeys[i] + " " + strs.Int64ToStr(webSceneMediaBlockCacheSizes[i]) + " " + strs.Int64ToStr(webSceneMediaBlockCacheAccessMs[i]) + "\n"
+        i = i + 1
+    let manifestPath = webSceneMediaBlockCacheManifestPath()
+    let tmpPath = manifestPath + ".tmp"
+    if os.FileExists(tmpPath):
+        os.RemoveFile(tmpPath)
+    var writeRes: Result[bool] = os.WriteFileResult(tmpPath, text)
+    if IsErr(writeRes):
+        os.RemoveFile(tmpPath)
+        return false
+    if !os.FileExists(tmpPath):
+        return false
+    if os.RenameFile(tmpPath, manifestPath):
+        return true
+    if os.FileExists(manifestPath):
+        os.RemoveFile(tmpPath)
+        return true
+    os.RemoveFile(tmpPath)
+    return false
+
+# 清单行 = "<key> <sizeBytes> <lastAccessMs>"。无法解析的行直接跳过：该行对应块会退化为
+# reconcile 阶段的孤儿收养（lastAccess=文件 mtime），不是数据丢失。
+@borrows
+fn webSceneMediaBlockCacheManifestLoadLine(line: str) =
+    if line.len <= 0:
+        return
+    let fields: str[] = strutil.Split(line, ' ')
+    if fields.len != 3:
+        return
+    let keyParts: str[] = strutil.Split(fields[0], ':')
+    if keyParts.len != 3:
+        return
+    if keyParts[0] != "v" && keyParts[0] != "a":
+        return
+    if keyParts[1].len <= 0:
+        return
+    var idxV: int64
+    var sizeV: int64
+    var accV: int64
+    if !webSceneMediaBlockCacheParseU64(keyParts[2], idxV):
+        return
+    if idxV > int64(2147483647):
+        return
+    if !webSceneMediaBlockCacheParseU64(fields[1], sizeV):
+        return
+    if !webSceneMediaBlockCacheParseU64(fields[2], accV):
+        return
+    # 以解析后的规范形重建键（拒绝 "0240" 式非规范 idx 与 reconcile 重建键失配成双重条目）。
+    webSceneMediaBlockCacheUpsert(webSceneMediaBlockCacheKey(keyParts[1], int32(idxV), keyParts[0] == "a"), sizeV, accV)
+
+fn webSceneMediaBlockCacheManifestLoad() =
+    let path = webSceneMediaBlockCacheManifestPath()
+    if !os.FileExists(path):
+        return
+    let res: Result[str] = os.ReadFileResult(path)
+    if IsErr(res):
+        return
+    let lines: str[] = strutil.Split(Value(res), '\n')
+    if lines.len <= 0 || lines[0] != "MBC1":
+        return
+    var i: int32 = 1
+    while i < lines.len:
+        webSceneMediaBlockCacheManifestLoadLine(lines[i])
+        i = i + 1
+
+# 磁盘对账：清单有盘无→删条目；盘有清单无→按文件 mtime 收养；两边都在→以磁盘大小刷新记账。
+@borrows
+fn webSceneMediaBlockCacheReconcileFile(path: str) =
+    if !strs.HasSuffix(path, ".blk"):
+        return
+    let rootDir = strings.CloneStr(webSceneMediaBlockCacheRootDir)
+    if !strs.HasPrefix(path, rootDir + "/"):
+        return
+    let rel: str = strings.CloneStrRange(path, rootDir.len + 1, path.len - rootDir.len - 1)
+    let parts: str[] = strutil.Split(rel, '/')
+    if parts.len != 2 || parts[0].len <= 0:
+        return
+    var isAudio: bool
+    var stem: str = strings.CloneStr(parts[1])
+    if strs.HasPrefix(stem, "a-"):
+        isAudio = true
+        stem = strings.CloneStrRange(stem, 2, stem.len - 2)
+    stem = strings.CloneStrRange(stem, 0, stem.len - 4)
+    var idxV: int64
+    if !webSceneMediaBlockCacheParseU64(stem, idxV):
+        return
+    if idxV > int64(2147483647):
+        return
+    let key: str = webSceneMediaBlockCacheKey(parts[0], int32(idxV), isAudio)
+    let size: int64 = os.FileSize(path)
+    let found: int32 = webSceneMediaBlockCacheFindKey(key)
+    if found >= 0:
+        if webSceneMediaBlockCacheSizes[found] != size:
+            webSceneMediaBlockCacheTotalBytes = webSceneMediaBlockCacheTotalBytes - webSceneMediaBlockCacheSizes[found] + size
+            webSceneMediaBlockCacheSizes[found] = size
+        return
+    webSceneMediaBlockCacheUpsert(key, size, os.FileMtime(path) * int64(1000))
+
+fn webSceneMediaBlockCacheReconcile() =
+    var dropFlags: bool[]
+    var i: int32
+    while i < webSceneMediaBlockCacheKeys.len:
+        add(dropFlags, !os.FileExists(webSceneMediaBlockCachePathForKey(webSceneMediaBlockCacheKeys[i])))
+        i = i + 1
+    webSceneMediaBlockCacheCompact(dropFlags)
+    let rootDir = strings.CloneStr(webSceneMediaBlockCacheRootDir)
+    let files: str[] = os.WalkDirRec(strings.CloneStr(rootDir))
+    var f: int32
+    while f < files.len:
+        webSceneMediaBlockCacheReconcileFile(files[f])
+        f = f + 1
+
+fn webSceneMediaBlockCacheCompact(dropFlags: bool[]) =
+    var keepKeys: str[]
+    var keepSizes: int64[]
+    var keepAccessMs: int64[]
+    var keepPinned: bool[]
+    var i: int32
+    while i < webSceneMediaBlockCacheKeys.len:
+        if !dropFlags[i]:
+            add(keepKeys, strs.CloneStr(webSceneMediaBlockCacheKeys[i]))
+            add(keepSizes, webSceneMediaBlockCacheSizes[i])
+            add(keepAccessMs, webSceneMediaBlockCacheAccessMs[i])
+            add(keepPinned, webSceneMediaBlockCachePinned[i])
+        i = i + 1
+    webSceneMediaBlockCacheKeys = keepKeys
+    webSceneMediaBlockCacheSizes = keepSizes
+    webSceneMediaBlockCacheAccessMs = keepAccessMs
+    webSceneMediaBlockCachePinned = keepPinned
+
+# 淘汰候选排序键：a 排在 b 后 ⇔ a 访问更晚，或同时刻 a 更小（大文件先淘汰，蓝本 sizeBytes desc）。
+fn webSceneMediaBlockCacheEvictLater(a: int32, b: int32): bool =
+    if webSceneMediaBlockCacheAccessMs[a] != webSceneMediaBlockCacheAccessMs[b]:
+        return webSceneMediaBlockCacheAccessMs[a] > webSceneMediaBlockCacheAccessMs[b]
+    return webSceneMediaBlockCacheSizes[a] < webSceneMediaBlockCacheSizes[b]
+
+# 容量淘汰，镜像蓝本：总量 ≤ 上限不动；超上限 → 非 pinned 候选按 (lastAccess 升, size 降)
+# 排序逐个删除直到总量 ≤ 目标水位；候选耗尽仍超目标（几乎全 pinned）就停（蓝本 break 同形）。
+# 删除失败且文件仍在的条目保留记账，不假装淘汰成功。条目规模为块级（数百~数千）且仅越限
+# 触发，插入排序 O(n^2) 与蓝本同位置的一次全量 sort 等价可接受。
+fn webSceneMediaBlockCacheEvictIfNeeded() =
+    if webSceneMediaBlockCacheTotalBytes <= webSceneMediaBlockCacheMaxBytes:
+        return
+    var order: int32[]
+    var dropFlags: bool[]
+    var i: int32
+    while i < webSceneMediaBlockCacheKeys.len:
+        add(dropFlags, false)
+        if !webSceneMediaBlockCachePinned[i]:
+            add(order, i)
+        i = i + 1
+    var s: int32 = 1
+    while s < order.len:
+        let v: int32 = order[s]
+        var j: int32 = s - 1
+        while j >= 0 && webSceneMediaBlockCacheEvictLater(order[j], v):
+            order[j + 1] = order[j]
+            j = j - 1
+        order[j + 1] = v
+        s = s + 1
+    var evictedAny: bool
+    var k: int32
+    while k < order.len:
+        if webSceneMediaBlockCacheTotalBytes <= webSceneMediaBlockCacheTargetBytes:
+            break
+        let idx: int32 = order[k]
+        let path: str = webSceneMediaBlockCachePathForKey(webSceneMediaBlockCacheKeys[idx])
+        os.RemoveFile(path)
+        if !os.FileExists(path):
+            webSceneMediaBlockCacheTotalBytes = webSceneMediaBlockCacheTotalBytes - webSceneMediaBlockCacheSizes[idx]
+            dropFlags[idx] = true
+            evictedAny = true
+        k = k + 1
+    if evictedAny:
+        webSceneMediaBlockCacheCompact(dropFlags)
+        webSceneMediaBlockCacheManifestPersist()
+
+# Get 命中刷新 lastAccess（LRU 的"按最后访问"）。磁盘有块但条目缺失（清单丢失/旧版本
+# 写入）时读命中即真实访问，收养入账——容量记账必须覆盖磁盘真相。
+fn webSceneMediaBlockCacheTouch(assetCid: str, startFrameIdx: int32, isAudio: bool, path: str) =
+    let nowMs: int64 = cheng_epoch_time_ms()
+    let key: str = webSceneMediaBlockCacheKey(assetCid, startFrameIdx, isAudio)
+    let idx: int32 = webSceneMediaBlockCacheFindKey(key)
+    if idx >= 0:
+        if webSceneMediaBlockCacheAccessMs[idx] != nowMs:
+            webSceneMediaBlockCacheAccessMs[idx] = nowMs
+            webSceneMediaBlockCacheManifestPersist()
+        return
+    webSceneMediaBlockCacheUpsert(key, os.FileSize(path), nowMs)
+    webSceneMediaBlockCacheManifestPersist()
+
+fn webSceneMediaBlockCacheAfterPut(assetCid: str, startFrameIdx: int32, isAudio: bool, sizeBytes: int64) =
+    webSceneMediaBlockCacheUpsert(webSceneMediaBlockCacheKey(assetCid, startFrameIdx, isAudio), sizeBytes, cheng_epoch_time_ms())
+    webSceneMediaBlockCacheEvictIfNeeded()
+    webSceneMediaBlockCacheManifestPersist()
+
+# pinned 豁免（蓝本 pinnedKeys）：宿主在播放/预取窗口内 pin 住正在消费的块，防止淘汰删掉
+# 服务中的块，换窗后 unpin。键不存在返回 false（诚实失败，不静默 no-op）。
+fn WebSceneMediaBlockCacheSetPinned(assetCid: str, startFrameIdx: int32, isAudio: bool, pinned: bool): bool =
+    let idx: int32 = webSceneMediaBlockCacheFindKey(webSceneMediaBlockCacheKey(assetCid, startFrameIdx, isAudio))
+    if idx < 0:
+        return false
+    webSceneMediaBlockCachePinned[idx] = pinned
+    return true
+
+# 容量参数覆盖（默认 512MB 上限/384MB 目标水位）：运行侧兼容扩展——宿主现有
+# cheng_scene_media_block_cache_init 一参接线不变，需要自定义水位时 Init 后调用本函数。
+# 参数非法（非正/目标>上限）返回 false 不生效；合法立即按新水位淘汰。
+fn WebSceneMediaBlockCacheSetCapacity(maxBytes: int64, targetBytes: int64): bool =
+    if maxBytes <= 0 || targetBytes <= 0 || targetBytes > maxBytes:
+        return false
+    webSceneMediaBlockCacheMaxBytes = maxBytes
+    webSceneMediaBlockCacheTargetBytes = targetBytes
+    webSceneMediaBlockCacheEvictIfNeeded()
+    return true
+
+@exportc("cheng_scene_media_block_cache_set_capacity")
+fn chengSceneMediaBlockCacheSetCapacityExport(maxBytes: int64, targetBytes: int64): int32 =
+    if WebSceneMediaBlockCacheSetCapacity(maxBytes, targetBytes):
+        return 1
+    return 0
+
+# cheng_scene_media_block_cache_set_pinned 的 C-ABI seam 同样只由 SR 薄包装导出,
+# 桥侧副本已删(cold duplicate-symbol 硬失败); set_capacity 无 SR 副本, 保留本文件导出。

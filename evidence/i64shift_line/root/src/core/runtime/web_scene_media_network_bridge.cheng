@@ -1,0 +1,2772 @@
+# Pure-Cheng media network bridge (对端秒开 integration layer).
+#
+# The base scene graph (web_scene_runtime) cannot fetch over the network: the
+# MoQ segment-stream + QUIC transport and the media orchestrator all sit ABOVE
+# it (they import the scene runtime, not the other way round). This module is
+# that upper integration layer — it imports the transport + orchestrator and
+# exposes a single fetch entry the GUI media pipeline calls when an OpenAsset
+# targets a moq-transport fountain asset, so the native GPU GUI itself drives
+# "对端秒开" over real UDP/QUIC with no Kotlin/ArkTS layer.
+#
+# The dial → negotiate → open → drain sequence mirrors the device-verified
+# media_moq_subscriber fetch path exactly; the drain reuses the orchestrator's
+# proven WebSceneMediaOrchestrateFetchAll primitive.
+
+import std/result
+import std/rawbytes
+import std/system
+import std/os
+import std/strutils as strutil
+import std/strings as strs
+import std/cmdline
+import cheng/quic/connection as qconn
+import cheng/quic/msquictransport_native as qtransport
+import cheng/libp2p/transports/quic_transport
+import cheng/libp2p/protocols/media/moq_segment_stream as moqstream
+import cheng/core/runtime/web_scene_media_orchestrator as orchestrator
+import cheng/core/runtime/web_scene_media_block_cache as blockcache
+import std/net/transports/tcp_syscall as tcp
+
+# Fetch one MoQ fountain object (or the announce block) over real QUIC.
+# dialHost/port address the publisher; streamId/segmentKey/offset/length select
+# the object range; readChunkBytes bounds each segment-stream read. Returns the
+# assembled object bytes for the platform decode/texture path. Mirrors the
+# device-verified subscriber client; closes the connection + transport on every
+# exit path (success or error) so no fd/datapath leaks across opens.
+# Diagnostic: last failing step of WebSceneMediaFetchRemoteObject (int-only, no
+# string/file ops). 1=dial 2=negotiate 3=ack 4=open 5=drain 6=ok.
+var webSceneMediaFetchStep: int32
+
+fn WebSceneMediaFetchRemoteObject(dialHost: str,
+                                  port: int32,
+                                  streamId: str,
+                                  segmentKey: str,
+                                  offsetBytes: int32,
+                                  lengthBytes: int32,
+                                  readChunkBytes: int32): Result[rawbytes.Bytes] =
+    webSceneMediaFetchStep = 1
+    var client = qtransport.InitMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn, strs.CloneStr(dialHost), port, "localhost")
+    if IsErr(dialRes):
+        qtransport.Stop(client)
+        return Err[rawbytes.Bytes](Error(dialRes))
+    # Production MoQ serve uses a SYMMETRIC per-media QUIC stream (send==recv==streamId);
+    # the publisher's probe-and-derive serve loop replies on the SAME stream the client
+    # wrote on. The legacy default dial pair is asymmetric (send=0/recv=1), so the
+    # publisher's symmetric ack lands on the wrong stream (deterministic failure on a
+    # fast/loopback peer; masked only by network latency). Derive onto symmetric video
+    # stream 4 to match the serve loop, exactly like the av-prefetch path (vConn=4).
+    conn = qconn.ConnDeriveStream(conn, 4, 4)
+    webSceneMediaFetchStep = 2
+    let negotiateRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, conn)
+    if IsErr(negotiateRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return Err[rawbytes.Bytes](Error(negotiateRes))
+    webSceneMediaFetchStep = 3
+    let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, conn)
+    if IsErr(ackRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return Err[rawbytes.Bytes](Error(ackRes))
+    webSceneMediaFetchStep = 4
+    var request: moqstream.Libp2pMoqSegmentStreamRequest
+    request.streamId = streamId
+    request.segmentKey = segmentKey
+    request.offsetBytes = offsetBytes
+    request.lengthBytes = lengthBytes
+    request.readChunkBytes = readChunkBytes
+    var reader: moqstream.Libp2pMoqSegmentStreamReader
+    let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(conn), request)
+    if IsErr(openRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return Err[rawbytes.Bytes](Error(openRes))
+    let drainRes = orchestrator.WebSceneMediaOrchestrateFetchAll(reader, readChunkBytes)
+    moqstream.Libp2pMoqSegmentStreamClose(reader)
+    qconn.ConnClose(conn)
+    qtransport.Stop(client)
+    if IsErr(drainRes):
+        return Err[rawbytes.Bytes](Error(drainRes))
+    return Ok[rawbytes.Bytes](Value(drainRes))
+
+# --- Read-ahead byte-range fetcher for MoQ progressive media streaming ----------
+# The OHOS media data-source readAt pulls arbitrary byte ranges of the asset on
+# demand (moov parse + per-sample). To bound QUIC round-trips, a cache miss fetches
+# a 1MB-aligned chunk via the existing one-shot range fetch (the publisher's
+# "moq-asset" range serve) and subsequent reads hit the cache. The MsQuicTransport
+# struct is large (632B) and the cold backend cannot store it in a module global,
+# so we re-dial per chunk (a handful for the whole clip) rather than hold a
+# persistent connection — only the cached Bytes + small scalars live in globals.
+# Copy a Bytes slice into the host's raw output buffer (outBuf, sized for `want`). Uses the
+# production rawbytes copy primitive (RawmemCopy under the hood) via a zero-copy view over the
+# raw pointer — NO @importc memcpy here. A bridge-local @importc("memcpy") in the SAME module
+# as the other @importc seams (es_sink_frame / es_diag) desyncs the cold backend's @importc
+# body-index resolution at production reach scale (the first @importc loses its external slot
+# and codegen reports "reachable function body missing"), so the bridge avoids declaring it.
+fn copyBytesIntoPtr(outBuf: ptr, src: Bytes, want: int32) =
+    if outBuf == nil || want <= 0:
+        return
+    rawbytes.BytesCopyInto(rawbytes.BytesView(outBuf, want), 0, src)
+
+# C sink for the persistent-connection ES stream loop: push one access unit (a slice
+# [inRunOff, inRunOff+frameSize) of runData) into the host's input FIFO with backpressure.
+# Returns 1 to continue, 0 to stop (teardown). Defined in cheng_gui_host.c.
+# Host sink for ES access units. The host implementation is non-blocking: returns
+# 1 = pushed (continue), 2 = FIFO full (stop this run, resume at the same cursor next
+# tick), 0 = teardown. The persistent-connection pump runs on the render/present thread
+# so the sink MUST NOT block — it stops on 2 and resumes next tick. (Adding a second
+# @importc here desyncs the cold @importc body indexing for the preceding decl, so the
+# pump reuses THIS existing import rather than declaring a new one.)
+@importc("cheng_scene_media_es_sink_frame")
+fn esSinkFrame(frameIdx: int32, runData: ptr, inRunOff: int32, frameSize: int32, key: int32): int32
+
+@importc("cheng_host_es_diag")
+fn esDiag(step: int32, a: int32, b: int32): void
+
+const WebSceneMediaChunkBytes = 1048576
+
+var webSceneMediaDialHost: str
+var webSceneMediaDialPort: int32
+var webSceneMediaStreamId: str
+var webSceneMediaAssetTotal: int32
+var webSceneMediaSessionOpen: bool
+var webSceneMediaCacheData: Bytes
+var webSceneMediaCacheStart: int32
+var webSceneMediaCacheLen: int32
+
+fn WebSceneMediaSessionOpen(dialHost: str, port: int32): bool =
+    # Fetch the announce once to learn the asset total (data-source size) + the
+    # stream id, so the host need only supply host:port. Range fetches reuse them.
+    let annRes = WebSceneMediaFetchRemoteObject(strs.CloneStr(dialHost), port, "gui-session-ann", "moq-announce", 0, 1024, 1024)
+    if IsErr(annRes):
+        return false
+    let announce: str = rawbytes.BytesToString(Value(annRes))
+    let totalStr: str = webSceneMediaAnnounceField(announce, "asset_bytes")
+    if totalStr.len == 0:
+        return false
+    var total: int32
+    if !cmdline.ParseInt32(totalStr, total) || total <= 0:
+        return false
+    var streamId: str = webSceneMediaAnnounceField(announce, "asset_stream_id")
+    if streamId.len == 0:
+        streamId = "moq-asset-1"
+    webSceneMediaDialHost = strs.CloneStr(dialHost)
+    webSceneMediaDialPort = port
+    webSceneMediaStreamId = strs.CloneStr(streamId)
+    webSceneMediaAssetTotal = total
+    webSceneMediaCacheStart = 0
+    webSceneMediaCacheLen = 0
+    webSceneMediaSessionOpen = true
+    return true
+
+# Read [offset, offset+length) of the asset into outBuf; serve from the read-ahead
+# cache, fetching a 1MB-aligned chunk over QUIC on a miss. Returns bytes copied
+# (<= length; 0 on error/EOF for the demuxer).
+fn WebSceneMediaSessionReadAt(offsetBytes: int32, lengthBytes: int32, outBuf: ptr): int32 =
+    if !webSceneMediaSessionOpen || outBuf == nil || lengthBytes <= 0:
+        return 0
+    if webSceneMediaAssetTotal > 0 && offsetBytes >= webSceneMediaAssetTotal:
+        return 0
+    var want: int32 = lengthBytes
+    if webSceneMediaAssetTotal > 0 && offsetBytes + want > webSceneMediaAssetTotal:
+        want = webSceneMediaAssetTotal - offsetBytes
+    if want <= 0:
+        return 0
+    let haveCache: bool = webSceneMediaCacheLen > 0 &&
+                          offsetBytes >= webSceneMediaCacheStart &&
+                          offsetBytes + want <= webSceneMediaCacheStart + webSceneMediaCacheLen
+    if !haveCache:
+        var chunkStart: int32 = (offsetBytes / WebSceneMediaChunkBytes) * WebSceneMediaChunkBytes
+        var chunkLen: int32 = WebSceneMediaChunkBytes
+        if chunkStart + chunkLen < offsetBytes + want:
+            chunkLen = (offsetBytes + want) - chunkStart
+        if webSceneMediaAssetTotal > 0 && chunkStart + chunkLen > webSceneMediaAssetTotal:
+            chunkLen = webSceneMediaAssetTotal - chunkStart
+        let fetchRes = WebSceneMediaFetchRemoteObject(strs.CloneStr(webSceneMediaDialHost), webSceneMediaDialPort,
+                                                      strs.CloneStr(webSceneMediaStreamId), "moq-asset",
+                                                      chunkStart, chunkLen, 65536)
+        if IsErr(fetchRes):
+            return 0
+        webSceneMediaCacheData = Value(fetchRes)
+        webSceneMediaCacheStart = chunkStart
+        webSceneMediaCacheLen = rawbytes.BytesLen(webSceneMediaCacheData)
+    if !(offsetBytes >= webSceneMediaCacheStart &&
+         offsetBytes + want <= webSceneMediaCacheStart + webSceneMediaCacheLen):
+        return 0
+    let inCacheOff: int32 = offsetBytes - webSceneMediaCacheStart
+    var src = rawbytes.BytesSlice(webSceneMediaCacheData, inCacheOff, want)
+    copyBytesIntoPtr(outBuf, src, want)
+    return want
+
+fn WebSceneMediaSessionClose() =
+    webSceneMediaSessionOpen = false
+    webSceneMediaCacheLen = 0
+
+# Asset total (data-source size) learned from the announce at open.
+fn WebSceneMediaSessionTotal(): int32 =
+    return webSceneMediaAssetTotal
+
+# --- C-ABI seam for the host AMediaDataSource (progressive 秒开 streaming) --------
+# The Android host wires an AMediaDataSource whose getSize/readAt/close call these,
+# so AMediaExtractor demuxes the asset by pulling byte ranges over QUIC on demand
+# (moov faststart at offset 0 → first frame decodes the moment the first ~1MB chunk
+# lands = 秒开, no whole-file download). Same approach as the OHOS GUI data source.
+# NOTE: cheng_scene_media_session_{open,read_at,total,close} 的 C-ABI seam 只由
+# scene runtime(SR) 生成的薄包装导出(见 scene-runtime-smoke-source)——本文件曾有的
+# 桥侧 @exportc 副本与 SR 包装同名撞符号, cold 编译器对 duplicate object symbol
+# 硬失败, 已删除; open 的 cstring 入参本就需要 SR 的 __chengCstrBorrowFix
+# (跨模块 StrFromCStringBorrow 会把 c_strlen 折成 0)。
+
+# --- MoQ per-frame ES streaming (production-correct) ----------------------------
+# es_open fetches the announce + the compact frame index; es_fetch_frame pulls ONE
+# access unit (small range, ~8KB) the player feeds straight to the decoder. No
+# large random-access transfers (those stall on the loss-recovery-less Cheng QUIC).
+var webSceneMediaEsDialHost: str
+var webSceneMediaEsDialPort: int32
+var webSceneMediaEsStreamId: str
+var webSceneMediaEsFrames: int32
+var webSceneMediaEsVidW: int32
+var webSceneMediaEsVidH: int32
+var webSceneMediaEsFpsVal: int32
+var webSceneMediaEsRotationVal: int32
+const webSceneMediaEsFormatCurrent: int32 = 2
+const webSceneMediaEsHeaderBytesCurrent: int32 = 36
+const webSceneMediaEsEntryBytes: int32 = 12
+const webSceneMediaEsFlagKeyframe: int32 = 1
+var webSceneMediaEsHeaderBytes: int32 = 36
+var webSceneMediaEsIndexData: Bytes
+var webSceneMediaEsOpenFlag: bool
+# Content identity of the last-opened ES stream, read straight off the wire (the
+# publisher's announce carries asset_cid = SHA256 of the exact asset bytes it is
+# serving — see media_moq_publisher_main.cheng). Lets a caller that already knows
+# the expected assetCid (the feed card identity) verify the fetch actually landed
+# on the right content before consuming it, instead of trusting host:port alone —
+# real content-addressing, not a guess based on which server slot answered.
+var webSceneMediaEsAssetCid: str
+
+# Batch fetch: dial ONE connection and pull a contiguous run of frames on it via
+# multiple sequential requests (multi-request-per-conn — verified working), then cache
+# them. This amortizes the dial over many frames AND keeps the connection on the STACK
+# (a held-GLOBAL Connection reused across calls corrupts/segfaults — verified). The
+# cached batch bytes live in a Bytes global (that is safe). Each frame is a separate
+# small request (≤ the loss-tolerant single-transfer size), so no large-range stall.
+const webSceneMediaEsBatchFrames = 96
+# Per-request byte budget: each request fetches a CONTIGUOUS RUN of as many frames as
+# fit under this size (1 round-trip per run, not per frame) — cuts the per-frame RTT
+# churn that capped cross-device playback at ~10fps. Well under the QUIC flow window.
+const webSceneMediaEsRunByteBudget = 131072
+var webSceneMediaEsBatchData: Bytes
+var webSceneMediaEsBatchStart: int32 = -1
+var webSceneMediaEsBatchEnd: int32
+var webSceneMediaEsBatchByteBase: int32
+var webSceneMediaEsLastErr: str
+# Diagnostic: how many times the persistent ES connection was torn down because a new
+# es_open requested a DIFFERENT peer (card switch) — torn down and redialed on the plain
+# path, torn down and REPLACED by an adopted warm pool connection when the per-slot pool
+# has the target peer prewarmed (see WebSceneMediaEsOpen's adoption prologue). Stays 0
+# across same-peer re-opens (prewarm/pool metric + the peer-match verification signal).
+var webSceneMediaEsPumpRedialCount: int32
+var webSceneMediaEsPumpEnded: bool
+# Pause backpressure (video-seek-scrub-blueprint.md §7.4/§S8 "暂停不停流"): while true,
+# WebSceneMediaEsStreamLoop and WebSceneMediaEsPrefetchTick both no-op on entry — no dial,
+# no range-fetch, no cache write. Sits beside webSceneMediaEsPumpEnded (same "gate the pump
+# loop with a flag it checks on entry" shape) rather than tearing the connection down: an
+# unpause must resume from the SAME pump cursor with the SAME persistent connection, not
+# redial. Host wiring (set this from the Play/Pause control) is a later slice — this is the
+# gate the wiring will call into.
+var webSceneMediaEsPaused: bool
+
+fn WebSceneMediaEsLastError(): str =
+    return strs.CloneStr(webSceneMediaEsLastErr)
+# Current peer (host:port) the persistent ES connection is dialed to, and the count of
+# peer-switch redials — exposed for the prewarm/pool layer and localhost verification.
+fn WebSceneMediaEsDialedPort(): int32 =
+    return webSceneMediaEsPumpDialedPort
+
+fn WebSceneMediaEsRedialCount(): int32 =
+    return webSceneMediaEsPumpRedialCount
+
+# Read a little-endian uint32 (values fit in int32 here) from the index blob.
+fn webSceneMediaEsReadLeU32(b: var Bytes, off: int32): int32 =
+    let b0: int32 = rawbytes.BytesGet(b, off) & 255
+    let b1: int32 = rawbytes.BytesGet(b, off + 1) & 255
+    let b2: int32 = rawbytes.BytesGet(b, off + 2) & 255
+    let b3: int32 = rawbytes.BytesGet(b, off + 3) & 255
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+fn webSceneMediaEsRotationCurrentValid(rotation: int32): bool =
+    return rotation == 0 || rotation == 90 || rotation == -90 ||
+           rotation == 180 || rotation == -180 ||
+           rotation == 270 || rotation == -270
+
+# One validator owns the current MQES wire contract consumed by both the primary
+# reader and the prewarm-pool reader. It accepts exactly the current 36-byte header,
+# validates the exact int64 file length before indexing, and proves that the table is
+# a continuous partition of es_total_bytes with only the declared keyframe flag.
+fn WebSceneMediaEsIndexCurrentValid(idxData: var Bytes): bool =
+    let byteLen: int32 = rawbytes.BytesLen(idxData)
+    if byteLen < webSceneMediaEsHeaderBytesCurrent:
+        return false
+    if rawbytes.BytesGet(idxData, 0) != 77 || rawbytes.BytesGet(idxData, 1) != 81 ||
+       rawbytes.BytesGet(idxData, 2) != 69 || rawbytes.BytesGet(idxData, 3) != 83:
+        return false
+    let format: int32 = webSceneMediaEsReadLeU32(idxData, 4)
+    let width: int32 = webSceneMediaEsReadLeU32(idxData, 8)
+    let height: int32 = webSceneMediaEsReadLeU32(idxData, 12)
+    let fpsNum: int32 = webSceneMediaEsReadLeU32(idxData, 16)
+    let fpsDen: int32 = webSceneMediaEsReadLeU32(idxData, 20)
+    let frameCount: int32 = webSceneMediaEsReadLeU32(idxData, 24)
+    let esTotal: int32 = webSceneMediaEsReadLeU32(idxData, 28)
+    let rotation: int32 = webSceneMediaEsReadLeU32(idxData, 32)
+    if format != webSceneMediaEsFormatCurrent ||
+       width <= 0 || height <= 0 ||
+       fpsNum <= 0 || fpsDen <= 0 || fpsNum / fpsDen <= 0 ||
+       frameCount <= 0 || esTotal <= 0 ||
+       !webSceneMediaEsRotationCurrentValid(rotation):
+        return false
+    let expectedLength: int64 =
+        int64(webSceneMediaEsHeaderBytesCurrent) +
+        int64(frameCount) * int64(webSceneMediaEsEntryBytes)
+    if int64(byteLen) != expectedLength:
+        return false
+    var expectedOffset: int64
+    for frameIdx in 0..<frameCount:
+        let entryOffset: int32 =
+            webSceneMediaEsHeaderBytesCurrent +
+            frameIdx * webSceneMediaEsEntryBytes
+        let frameOffset: int32 = webSceneMediaEsReadLeU32(idxData, entryOffset)
+        let frameSize: int32 = webSceneMediaEsReadLeU32(idxData, entryOffset + 4)
+        let flags: int32 = webSceneMediaEsReadLeU32(idxData, entryOffset + 8)
+        if frameOffset < 0 || frameSize <= 0 ||
+           int64(frameOffset) != expectedOffset ||
+           (flags != 0 && flags != webSceneMediaEsFlagKeyframe):
+            return false
+        if frameIdx == 0 && flags != webSceneMediaEsFlagKeyframe:
+            return false
+        expectedOffset = expectedOffset + int64(frameSize)
+        if expectedOffset > int64(esTotal):
+            return false
+    return expectedOffset == int64(esTotal)
+
+# Open an ES session: fetch the announce (es_index_bytes/es_stream_id), then the
+# frame index blob (moq-esindex), parse its header (MQES + w/h/fps/count) + cache
+# the per-frame offset/size table. Returns false on any failure (no silent default).
+# Dial (or reuse) the ONE persistent QUIC connection for the whole ES session. announce,
+# esindex AND every frame run ride this single connection: the publisher pins all server
+# connection state to one shared slot, so separate connections (the old announce/esindex
+# OneShot dials + a third stream-loop dial) collide on that slot — the persistent
+# connection's congestion window never opens, its writes pile up past one packet, and the
+# serve fails ("packet too small"). One connection avoids the collision entirely.
+fn webSceneMediaEsEnsureDialed(dialHost: str, port: int32): bool =
+    if webSceneMediaEsPumpDialed:
+        # Same peer → the persistent connection is still valid for this asset; reuse it.
+        if webSceneMediaEsPumpDialedHost == dialHost && webSceneMediaEsPumpDialedPort == port:
+            return true
+        # Different peer (card switch to another publisher) → the stale connection points at
+        # the WRONG server slot/asset. Tear the persistent native session down (ConnClose on a
+        # conn rebuilt from the stored pipeIdx = pipeClose(pipeIdx)) and redial the new peer.
+        # Same-peer single-connection semantics are preserved by the reuse branch above.
+        esDiag(20, port, webSceneMediaEsPumpDialedPort)   # peer switch → close old + redial
+        var oldConn = qconn.ConnFromPipeIdx(webSceneMediaEsPumpPipeIdx, webSceneMediaEsPumpPipeSide,
+                                            webSceneMediaEsPumpSendStreamId, webSceneMediaEsPumpRecvStreamId)
+        qconn.ConnClose(oldConn)
+        webSceneMediaEsPumpDialed = false
+        webSceneMediaEsPumpCursor = 0
+        webSceneMediaEsArmVideoEosForNewRun()
+        webSceneMediaEsPumpRedialCount = webSceneMediaEsPumpRedialCount + 1
+    var client = qtransport.InitMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn, strs.CloneStr(dialHost), port, "localhost")
+    if IsErr(dialRes):
+        webSceneMediaEsLastErr = ErrorText(dialRes)
+        qtransport.Stop(client)
+        return false
+    conn = qconn.ConnDeriveStream(conn, 4, 4)
+    let negRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, conn)
+    if IsErr(negRes):
+        webSceneMediaEsLastErr = ErrorText(negRes)
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, conn)
+    if IsErr(ackRes):
+        webSceneMediaEsLastErr = ErrorText(ackRes)
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    # Persist ONLY the small token state; the native session stays alive in the runtime
+    # globals (keyed by pipeIdx), so the stack-local client/conn going out of scope is fine.
+    webSceneMediaEsPumpPipeIdx = conn.pipeIdx
+    webSceneMediaEsPumpPipeSide = conn.pipeSide
+    webSceneMediaEsPumpSendStreamId = conn.sendStreamId
+    webSceneMediaEsPumpRecvStreamId = conn.recvStreamId
+    webSceneMediaEsPumpDialed = true
+    webSceneMediaEsPumpDialedHost = strs.CloneStr(dialHost)
+    webSceneMediaEsPumpDialedPort = port
+    # No cursor reset here: EsOpen resets the cursor itself on success, the peer-switch
+    # path above resets it before redialing, and a mid-play heal redial driven by the
+    # audio open (see WebSceneMediaAudioEsOpen's dead-session retry) MUST keep the pump
+    # cursor at the first undelivered frame so video resumes instead of rewinding.
+    webSceneMediaEsArmVideoEosForNewRun()
+    return true
+
+# Fetch one object range over the already-dialed persistent connection (no dial/negotiate/
+# close): a request on the same stream the stream-loop frames use.
+fn webSceneMediaFetchOnPersistent(segmentKey: str, mstreamId: str, offset: int32, length: int32, chunk: int32): Result[rawbytes.Bytes] =
+    var pconn = qconn.ConnFromPipeIdx(webSceneMediaEsPumpPipeIdx, webSceneMediaEsPumpPipeSide,
+                                      webSceneMediaEsPumpSendStreamId, webSceneMediaEsPumpRecvStreamId)
+    var request: moqstream.Libp2pMoqSegmentStreamRequest
+    request.streamId = mstreamId
+    request.segmentKey = segmentKey
+    request.offsetBytes = offset
+    request.lengthBytes = length
+    request.readChunkBytes = chunk
+    var reader: moqstream.Libp2pMoqSegmentStreamReader
+    let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(pconn), request)
+    if IsErr(openRes):
+        return Err[rawbytes.Bytes](Error(openRes))
+    # Drain stops at expectedBytes (publisher uses WriteRange / no FIN); do NOT close the
+    # reader — Libp2pMoqSegmentStreamClose calls ConnClose(reader.conn)=pipeClose(pipeIdx),
+    # which tears down the WHOLE persistent native session (keyed by pipeIdx, not stream),
+    # killing the connection that announce/esindex/frames all share. A fresh reader per call
+    # already resets expectedBytes/bytesRead/closed, so requests ride the same stream cleanly.
+    let drainRes = orchestrator.WebSceneMediaOrchestrateFetchAll(reader, chunk)
+    if IsErr(drainRes):
+        return Err[rawbytes.Bytes](Error(drainRes))
+    return Ok[rawbytes.Bytes](Value(drainRes))
+
+fn WebSceneMediaEsOpen(dialHost: str, port: int32): bool =
+    # #139: a new session re-arms the fetch path — clear any teardown-cancel latch the
+    # previous session's host teardown set (see the flag's header in the orchestrator).
+    orchestrator.WebSceneMediaFetchCancelClear()
+    webSceneMediaEsDialHost = strs.CloneStr(dialHost)
+    webSceneMediaEsDialPort = port
+    esDiag(1, port, 0)
+    # Per-slot pool adoption (秒开): if a pool slot already holds an OPEN, fully indexed
+    # ES session to this exact peer (a feed card prewarmed ahead of the tap), move its
+    # warm persistent connection into the primary session instead of paying a cold
+    # dial+TLS here. Only the connection token moves: the announce + esindex below are
+    # still fetched over that connection by the untouched normal flow, so content is
+    # re-validated from the wire on every open exactly as before (and a pool connection
+    # that silently died while parked hits the same dead-pipe invalidate + redial-on-
+    # next-open recovery a same-peer reuse failure already had). Skipped entirely when
+    # the primary session is already dialed to this peer (plain same-peer reuse) or when
+    # no pool slot matches (every existing no-pool caller takes that path unchanged).
+    var pumpPeerMatches = false
+    if webSceneMediaEsPumpDialed:
+        pumpPeerMatches = webSceneMediaEsPumpDialedHost == dialHost && webSceneMediaEsPumpDialedPort == port
+    if !pumpPeerMatches:
+        let adoptIdx: int32 = WebSceneMediaEsPoolSlotFindPeer(dialHost, port)
+        if adoptIdx >= 0:
+            # Switching the primary session to a different peer tears its stale connection
+            # down first — the same peer-switch teardown webSceneMediaEsEnsureDialed
+            # performs; the adopted connection then replaces it (no redial happens, which
+            # is the whole point of prewarm).
+            if webSceneMediaEsPumpDialed:
+                var oldConn = qconn.ConnFromPipeIdx(webSceneMediaEsPumpPipeIdx, webSceneMediaEsPumpPipeSide,
+                                                    webSceneMediaEsPumpSendStreamId, webSceneMediaEsPumpRecvStreamId)
+                qconn.ConnClose(oldConn)
+                webSceneMediaEsPumpDialed = false
+                webSceneMediaEsPumpRedialCount = webSceneMediaEsPumpRedialCount + 1
+            webSceneMediaEsPumpPipeIdx = webSceneMediaEsPoolPipeIdx[adoptIdx]
+            webSceneMediaEsPumpPipeSide = webSceneMediaEsPoolPipeSide[adoptIdx]
+            webSceneMediaEsPumpSendStreamId = webSceneMediaEsPoolSendStreamId[adoptIdx]
+            webSceneMediaEsPumpRecvStreamId = webSceneMediaEsPoolRecvStreamId[adoptIdx]
+            webSceneMediaEsPumpDialed = true
+            webSceneMediaEsPumpDialedHost = strs.CloneStr(dialHost)
+            webSceneMediaEsPumpDialedPort = port
+            webSceneMediaEsPumpCursor = 0
+            webSceneMediaEsArmVideoEosForNewRun()
+            # Release the slot WITHOUT closing the moved connection: mark its columns
+            # not-dialed first so the slot table no longer references the pipe the
+            # primary session now owns (a later release of this slot must not close it).
+            webSceneMediaEsPoolDialed[adoptIdx] = false
+            webSceneMediaEsPoolPipeIdx[adoptIdx] = -1
+            webSceneMediaEsPoolClearSlot(adoptIdx)
+            # Byte-evidence receipt: the warm connection's ownership physically moved
+            # into the primary session (same event as host diag step 21).
+            webSceneMediaEsPoolAdoptMoveCount = webSceneMediaEsPoolAdoptMoveCount + 1
+            esDiag(21, port, adoptIdx)   # pool adopt: warm connection moved to primary session
+    if !webSceneMediaEsEnsureDialed(strs.CloneStr(dialHost), port):
+        esDiag(2, 0, 0)        # persistent dial/negotiate failed
+        return false
+    let annRes = webSceneMediaFetchOnPersistent("moq-announce", "gui-es-ann", 0, 1024, 1024)
+    if IsErr(annRes):
+        esDiag(2, 0, 0)        # announce fetch failed
+        # A reused persistent connection that fails the very first fetch is a dead pipe
+        # (the peer restarted between opens — reproduced on-device 2026-07-11: Android
+        # serve reinstall left webSceneMediaEsPumpDialed=true pointing at a torn-down
+        # session; every subsequent open failed in ~1ms until app restart). Tear it down
+        # so the NEXT open performs a genuine redial. First-dial failures (not reuse)
+        # carry dialed=false and skip this, so a genuinely unreachable peer stays loud.
+        WebSceneMediaEsInvalidate()
+        return false
+    let announce: str = rawbytes.BytesToString(Value(annRes))
+    esDiag(3, announce.len, 0) # announce fetched
+    # Content identity straight off the wire (see WebSceneMediaEsAssetCid's declaration
+    # comment). Recorded even if the rest of this open later fails, so a caller can see
+    # what content answered a partially-failed dial.
+    webSceneMediaEsAssetCid = webSceneMediaAnnounceField(announce, "asset_cid")
+    let idxBytesStr: str = webSceneMediaAnnounceField(announce, "es_index_bytes")
+    if idxBytesStr.len == 0:
+        esDiag(4, announce.len, 0)  # es_index_bytes field missing from announce
+        return false
+    var idxLen: int32
+    if !cmdline.ParseInt32(idxBytesStr, idxLen) || idxLen <= 0:
+        esDiag(5, idxBytesStr.len, 0)  # es_index_bytes parse failed
+        return false
+    let esBytesStr: str = webSceneMediaAnnounceField(announce, "es_bytes")
+    var announcedEsTotal: int32
+    if !cmdline.ParseInt32(esBytesStr, announcedEsTotal) || announcedEsTotal <= 0:
+        esDiag(5, esBytesStr.len, 1)  # es_bytes missing or invalid
+        return false
+    var streamId: str = webSceneMediaAnnounceField(announce, "es_stream_id")
+    if streamId.len == 0:
+        esDiag(5, 0, 2)  # current announce requires an explicit stream identity
+        return false
+    webSceneMediaEsStreamId = strs.CloneStr(streamId)
+    esDiag(6, idxLen, 0)       # about to fetch moq-esindex
+    let idxRes = webSceneMediaFetchOnPersistent("moq-esindex", streamId, 0, idxLen, idxLen)
+    if IsErr(idxRes):
+        esDiag(7, idxLen, 0)   # moq-esindex fetch failed
+        return false
+    var idxData = Value(idxRes)
+    esDiag(8, rawbytes.BytesLen(idxData), 0)  # esindex fetched
+    if rawbytes.BytesLen(idxData) != idxLen ||
+       !WebSceneMediaEsIndexCurrentValid(idxData):
+        esDiag(9, rawbytes.BytesLen(idxData), 0)
+        rawbytes.BytesFree(idxData)
+        return false
+    let esTotal: int32 = webSceneMediaEsReadLeU32(idxData, 28)
+    if esTotal != announcedEsTotal:
+        esDiag(9, esTotal, announcedEsTotal)
+        rawbytes.BytesFree(idxData)
+        return false
+    let width: int32 = webSceneMediaEsReadLeU32(idxData, 8)
+    let height: int32 = webSceneMediaEsReadLeU32(idxData, 12)
+    let fpsNum: int32 = webSceneMediaEsReadLeU32(idxData, 16)
+    let fpsDen: int32 = webSceneMediaEsReadLeU32(idxData, 20)
+    let count: int32 = webSceneMediaEsReadLeU32(idxData, 24)
+    let rotation: int32 = webSceneMediaEsReadLeU32(idxData, 32)
+    let fps: int32 = fpsNum / fpsDen
+    webSceneMediaEsVidW = width
+    webSceneMediaEsVidH = height
+    webSceneMediaEsFpsVal = fps
+    webSceneMediaEsRotationVal = rotation
+    webSceneMediaEsHeaderBytes = webSceneMediaEsHeaderBytesCurrent
+    webSceneMediaEsFrames = count
+    webSceneMediaEsIndexData = idxData
+    webSceneMediaEsPumpCursor = 0
+    webSceneMediaEsArmVideoEosForNewRun()
+    webSceneMediaEsPumpDeadStreak = 0
+    # Connection already dialed at the top; everything came over it.
+    webSceneMediaEsOpenFlag = true
+    return true
+
+fn WebSceneMediaEsFrameCount(): int32 =
+    if !webSceneMediaEsOpenFlag:
+        return 0
+    return webSceneMediaEsFrames
+
+# Read-only GOP signal query: is frameIdx a decoder-independent sync point? Reads the
+# flags word already written into the index by tools/gen_moq_es_index.mjs (bit0=keyframe,
+# see webSceneMediaEsReadLeU32's offset/size neighbors in WebSceneMediaEsStreamLoop) —
+# same read pattern, just the +8 word nobody consumed before this. No precomputed table:
+# the per-frame index is already an O(1)-indexable array on disk/in-memory, so a query
+# is one bounds check + one 4-byte read, cheaper than maintaining a second structure.
+fn WebSceneMediaEsIsKeyFrame(frameIdx: int32): bool =
+    if !webSceneMediaEsOpenFlag:
+        return false
+    if frameIdx < 0 || frameIdx >= webSceneMediaEsFrames:
+        return false
+    let flags: int32 = webSceneMediaEsReadLeU32(webSceneMediaEsIndexData, webSceneMediaEsHeaderBytes + frameIdx * 12 + 8)
+    return flags != 0
+
+# Snap an arbitrary (possibly out-of-range) target frame index to the nearest keyframe
+# at or before it — the answer to "which frame can a seek to targetFrameIdx actually
+# start decoding from". Clamps into [0, frames-1] first, then scans backward; frame 0
+# is a keyframe by format convention (the encoder always opens the stream on an IDR),
+# so the backward scan is guaranteed to terminate there even without an explicit check.
+fn WebSceneMediaEsSnapToKeyFrame(targetFrameIdx: int32): int32 =
+    if !webSceneMediaEsOpenFlag:
+        return 0
+    var clamped: int32 = targetFrameIdx
+    if clamped < 0:
+        clamped = 0
+    if clamped > webSceneMediaEsFrames - 1:
+        clamped = webSceneMediaEsFrames - 1
+    var i: int32 = clamped
+    while i > 0:
+        if WebSceneMediaEsIsKeyFrame(i):
+            return i
+        i = i - 1
+    return 0
+
+fn WebSceneMediaEsWidth(): int32 =
+    if !webSceneMediaEsOpenFlag:
+        return 0
+    return webSceneMediaEsVidW
+
+fn WebSceneMediaEsHeight(): int32 =
+    if !webSceneMediaEsOpenFlag:
+        return 0
+    return webSceneMediaEsVidH
+
+fn WebSceneMediaEsFps(): int32 =
+    if !webSceneMediaEsOpenFlag:
+        return 0
+    return webSceneMediaEsFpsVal
+
+# Raw display-matrix rotation from the current esindex header (e.g. -90).
+# The host normalizes it through the same path as the whole-file KEY_ROTATION so ES
+# playback is oriented identically (fixes the upside-down/sideways ES picture).
+fn WebSceneMediaEsRotation(): int32 =
+    if !webSceneMediaEsOpenFlag:
+        return 0
+    return webSceneMediaEsRotationVal
+
+# Content hash (SHA256) of the asset the last-opened ES stream is actually serving,
+# read from the announce's asset_cid field (see webSceneMediaEsAssetCid's declaration
+# comment). Empty if no open has completed (matches the other getters' !open guard).
+fn WebSceneMediaEsAssetCid(): str =
+    if !webSceneMediaEsOpenFlag:
+        return ""
+    return strs.CloneStr(webSceneMediaEsAssetCid)
+
+# Pure content-addressing check: does the ES stream this open just landed on actually
+# serve the expected content? A prefetch armed ahead of tap (see mobile_shell_codegen's
+# cheng_android_es_arm_prefetch) is keyed by host:port, not by content — if a publisher
+# slot is reused for different content between the prefetch and the tap (peer/content
+# rotation), host:port alone would silently hand the caller the WRONG video. Compares
+# against the real on-wire hash instead of trusting the slot. Case-sensitive exact match
+# (assetCid is a lowercase hex SHA256 by construction on both the publisher and this
+# call's caller); empty expectedAssetCid never matches (an unknown expectation must not
+# rubber-stamp whatever answered — no guessing).
+fn WebSceneMediaEsContentMatches(expectedAssetCid: str): bool =
+    if !webSceneMediaEsOpenFlag:
+        return false
+    if expectedAssetCid.len == 0 || webSceneMediaEsAssetCid.len == 0:
+        return false
+    return webSceneMediaEsAssetCid == expectedAssetCid
+
+# Invalidate a mismatched prefetch/open (a content-addressing check failed): tear down
+# the persistent connection exactly like webSceneMediaEsEnsureDialed's peer-switch path
+# does, and clear the open flag + cached content id, so the NEXT WebSceneMediaEsOpen call
+# performs a genuine fresh dial+announce+esindex fetch instead of reusing (and re-serving)
+# the same wrong content. This is the "失效必须验真" half of the prefetch primitive: a
+# mismatch is never served, and is never a dead end either — it forces a real redial.
+fn WebSceneMediaEsInvalidate() =
+    if webSceneMediaEsPumpDialed:
+        var oldConn = qconn.ConnFromPipeIdx(webSceneMediaEsPumpPipeIdx, webSceneMediaEsPumpPipeSide,
+                                            webSceneMediaEsPumpSendStreamId, webSceneMediaEsPumpRecvStreamId)
+        qconn.ConnClose(oldConn)
+        webSceneMediaEsPumpDialed = false
+        webSceneMediaEsPumpCursor = 0
+        webSceneMediaEsArmVideoEosForNewRun()
+        webSceneMediaEsPumpRedialCount = webSceneMediaEsPumpRedialCount + 1
+    webSceneMediaEsOpenFlag = false
+    webSceneMediaEsAssetCid = ""
+
+# Nearest real GOP keyframe at-or-before targetFrameIdx, read straight off the esindex's
+# own per-frame flags (bit0 of the u32 at record offset +8 — see webSceneMediaEsReadLeU32
+# call sites elsewhere in this file for the same record layout; record stride is 12B:
+# offset,size,flags). frame 0 is always a keyframe for content produced by
+# tools/gen_moq_es_index.mjs (ffmpeg stream-copy preserves the encoder's own GOP start),
+# so a target before the first flagged keyframe correctly snaps to 0 without needing a
+# sentinel. targetFrameIdx is clamped into [0, webSceneMediaEsFrames) first so a caller
+# passing an out-of-range value still gets a real, in-bounds keyframe rather than reading
+# past the index.
+fn webSceneMediaEsSnapToKeyFrame(targetFrameIdx: int32): int32 =
+    var clamped: int32 = targetFrameIdx
+    if clamped < 0:
+        clamped = 0
+    if clamped >= webSceneMediaEsFrames:
+        clamped = webSceneMediaEsFrames - 1
+    var snapped: int32
+    var f: int32
+    while f <= clamped:
+        let flags: int32 = webSceneMediaEsReadLeU32(webSceneMediaEsIndexData, webSceneMediaEsHeaderBytes + f * 12 + 8)
+        if (flags & 1) == 1:
+            snapped = f
+        f = f + 1
+    return snapped
+
+# Jump the persistent-connection ES pump's cursor to the real keyframe at-or-before
+# targetFrameIdx (transport layer only — no decoder involved here). WebSceneMediaEsStreamLoop
+# recomputes its contiguous fetch run from webSceneMediaEsPumpCursor on every call (below),
+# so overwriting the cursor here is the whole seek: the next pump tick starts a brand-new
+# range request from the snapped frame instead of continuing the old sequential run.
+# webSceneMediaEsPumpEnded is cleared so a seek back into the stream after EOS resumes
+# fetching instead of staying latched at "ended".
+fn WebSceneMediaEsSeekToFrame(targetFrameIdx: int32): bool =
+    if !webSceneMediaEsOpenFlag:
+        return false
+    if targetFrameIdx < 0 || targetFrameIdx >= webSceneMediaEsFrames:
+        return false
+    webSceneMediaEsPumpCursor = webSceneMediaEsSnapToKeyFrame(targetFrameIdx)
+    webSceneMediaEsArmVideoEosForNewRun()
+    return true
+
+# Test-only read of the pump cursor (no production caller — the module has no other
+# public getter for it). Needed so desktop assertions can observe SeekToFrame's effect
+# without reaching into the private var directly from outside the module.
+fn WebSceneMediaEsPumpCursor(): int32 =
+    return webSceneMediaEsPumpCursor
+
+# S3 (video-seek-scrub-blueprint.md §S6): total clip length in milliseconds, derived from
+# frame count + fps already in memory (no new state) — the UI-side progress bar's "max"
+# bound and the ms<->frame conversions below share this one source of truth.
+fn WebSceneMediaEsDurationMs(): int32 =
+    if !webSceneMediaEsOpenFlag || webSceneMediaEsFpsVal <= 0:
+        return 0
+    return int32((int64(webSceneMediaEsFrames) * int64(1000)) / int64(webSceneMediaEsFpsVal))
+
+# Position(ms) -> frameIdx, clamped into [0, frames-1]. Pure arithmetic (constant fps is
+# the same assumption WebSceneMediaEsOpen already makes reading fpsNum/fpsDen — see its
+# header parse — §7.2 of the blueprint notes variable-frame-rate would need a format
+# version bump, not relevant here). Does not itself touch the pump cursor or snap to a
+# keyframe — WebSceneMediaEsSeekToPositionMs below composes this with the existing
+# SeekToFrame (which already snaps) so callers never see an unsnapped frame take effect.
+fn WebSceneMediaEsFrameForPositionMs(positionMs: int32): int32 =
+    if !webSceneMediaEsOpenFlag || webSceneMediaEsFpsVal <= 0 || webSceneMediaEsFrames <= 0:
+        return 0
+    var clampedMs: int32 = positionMs
+    if clampedMs < 0:
+        clampedMs = 0
+    var frame: int32 = int32((int64(clampedMs) * int64(webSceneMediaEsFpsVal)) / int64(1000))
+    if frame < 0:
+        frame = 0
+    if frame > webSceneMediaEsFrames - 1:
+        frame = webSceneMediaEsFrames - 1
+    return frame
+
+# Inverse of the above: frameIdx -> position(ms), clamped into [0, frames-1] first. Used
+# to bind the drag handle's displayed position back to the real pump cursor (the UI reads
+# this after every seek/pump tick instead of tracking its own separate clock).
+fn WebSceneMediaEsPositionMsForFrame(frameIdx: int32): int32 =
+    if !webSceneMediaEsOpenFlag || webSceneMediaEsFpsVal <= 0:
+        return 0
+    var clamped: int32 = frameIdx
+    if clamped < 0:
+        clamped = 0
+    if clamped > webSceneMediaEsFrames - 1:
+        clamped = webSceneMediaEsFrames - 1
+    return int32((int64(clamped) * int64(1000)) / int64(webSceneMediaEsFpsVal))
+
+# One-stop UI entry point: drag/click position(ms) -> frame -> WebSceneMediaEsSeekToFrame
+# (which already snaps to the nearest real keyframe at-or-before the target and resets
+# pumpEnded — see that function's own doc comment). Whether the resulting GOP is served
+# from the S4 block cache or falls back to a real network range-fetch is decided by the
+# EXISTING WebSceneMediaEsStreamLoop logic on its next tick (cache-hit direct read at
+# this file's cursorFlags/blockcache.Get check, miss falls through to the untouched
+# range-fetch path below it) — this function does not duplicate that decision, it only
+# repositions the cursor the same way any other seek does.
+fn WebSceneMediaEsSeekToPositionMs(positionMs: int32): bool =
+    return WebSceneMediaEsSeekToFrame(WebSceneMediaEsFrameForPositionMs(positionMs))
+
+# Pause/resume the ES pump (video-seek-scrub-blueprint.md §7.4 "暂停不停流" / §S8). Setting
+# paused=true stops WebSceneMediaEsStreamLoop and WebSceneMediaEsPrefetchTick from doing any
+# further network or cache work from their NEXT call onward — the connection, pump cursor
+# and batch/cache state are all left exactly as they are (no teardown), so paused=false lets
+# both resume from the same position with no redial. A frame already in flight when pause is
+# set completes normally (the flag is only checked on entry, matching webSceneMediaEsPumpEnded's
+# own shape) — this stops the NEXT tick's dial/fetch, not an in-progress one.
+fn WebSceneMediaEsSetPaused(paused: bool) =
+    webSceneMediaEsPaused = paused
+
+fn WebSceneMediaEsPaused(): bool =
+    return webSceneMediaEsPaused
+
+# #139 teardown-cancel gateway (thin delegate so the scene wrapper can call
+# media_bridge.* uniformly; the flag itself lives in the orchestrator — the bridge
+# imports it, never the reverse). Unlike EsSetPaused above this one IS safe to call
+# from a non-pump thread (the Harmony render thread at teardown): the flag is a plain
+# int32 with no QUIC/session state behind it, and the fetch loop's cumulative deadline
+# backstops any visibility delay. Cleared on the next EsOpen/AudioEsOpen, not here.
+fn WebSceneMediaFetchCancelSet(v: int32) =
+    orchestrator.WebSceneMediaFetchCancelSet(v)
+
+# Transport-death teardown (the transport half of WebSceneMediaEsInvalidate, WITHOUT its
+# content invalidation): the publisher-side session is already gone ("negotiate: msquic:
+# pipe closed" — e.g. emulator slirp UDP drops the path mid-stream), so the stored pipeIdx
+# only ever yields rc=5/6. Close the dead pipe and clear dialed so the loop's own dial-once
+# block redials on the next call. Deliberately untouched: openFlag, the frame index, the
+# pump cursor (the decoder/FIFO state is continuous — the refetch resumes at the exact
+# next-undelivered frame, no keyframe rewind, no from-zero replay), and assetCid. Audio
+# frame fetches read the same token globals per call, so audio recovers on the same redial.
+fn webSceneMediaEsPumpDeadSessionTeardown() =
+    esDiag(34, webSceneMediaEsPumpDeadStreak, webSceneMediaEsPumpCursor)   # pumpdiag: dead pipe → teardown, loop redials
+    var deadConn = qconn.ConnFromPipeIdx(webSceneMediaEsPumpPipeIdx, webSceneMediaEsPumpPipeSide,
+                                        webSceneMediaEsPumpSendStreamId, webSceneMediaEsPumpRecvStreamId)
+    qconn.ConnClose(deadConn)
+    webSceneMediaEsPumpDialed = false
+    webSceneMediaEsArmVideoEosForNewRun()
+    webSceneMediaEsPumpRedialCount = webSceneMediaEsPumpRedialCount + 1
+    webSceneMediaEsPumpDeadStreak = 0
+
+# Persistent-connection ES pump (the 卡顿 fix), called ONCE PER RENDER-THREAD TICK.
+# The render thread is the only thread that drives the Cheng QUIC pump AND present; the
+# old batch path re-dialed a fresh QUIC connection (~hundreds of ms of dial+TLS) at every
+# 96-frame batch boundary on this thread, so present stalled periodically (the long frames
+# landed exactly on batch boundaries). This pump dials EXACTLY ONCE for the whole stream
+# (multi-request reuse — verified 500 sequential requests on one conn) and persists only
+# SMALL scalars (pipeIdx/pipeSide/streamIds + a frame cursor) in globals — the large
+# MsQuicTransport never leaves the dial stack frame (it can't be a module global). Every
+# tick rebuilds a stack-local Connection from the stored pipeIdx (ConnFromPipeIdx) — which
+# references the still-alive native session/socket — pulls ONE contiguous frame run, hands
+# each access unit to the host FIFO non-blocking (the host sink returns 2 on a full FIFO,
+# so the pump stops at that cursor and resumes next tick — present is NEVER blocked), and
+# returns immediately. NO re-dial, NO re-negotiate, NO ConnClose of the persistent session.
+# Kept under the original name/export so the host drives it per-tick with no new symbol.
+fn WebSceneMediaEsStreamLoop(): int32 =
+    # Read the two peer-identity globals once on the unconditional path: a
+    # global's address shadow emitted inside a conditional branch cannot reach
+    # the downstream CFG merge.
+    let esStreamId = strs.CloneStr(webSceneMediaEsStreamId)
+    let esDialHost = strs.CloneStr(webSceneMediaEsDialHost)
+    let esAssetCid = strs.CloneStr(webSceneMediaEsAssetCid)
+    var esIndexData: rawbytes.Bytes
+    esIndexData = webSceneMediaEsIndexData
+    if !webSceneMediaEsOpenFlag:
+        esDiag(30, 1, webSceneMediaEsPumpCursor)   # pumpdiag: not open
+        return 1
+    if webSceneMediaEsPumpEnded:
+        esDiag(30, 7, webSceneMediaEsPumpCursor)   # pumpdiag: ended latch
+        return 7
+    # Pause backpressure gate (see WebSceneMediaEsSetPaused's doc comment): checked BEFORE
+    # the dial-once block below, so a pause set before the pump has ever dialed also stops
+    # the FIRST dial from happening — not just later range-fetches.
+    if webSceneMediaEsPaused:
+        esDiag(30, 8, webSceneMediaEsPumpCursor)   # pumpdiag: paused
+        return 8
+    if !webSceneMediaEsPumpDialed:
+        esDiag(30, 9, webSceneMediaEsPumpCursor)   # pumpdiag: loop-side redial entered
+        var client = qtransport.InitMsQuicTransport()
+        var conn: qconn.Connection
+        let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn,
+                                                                      esDialHost, webSceneMediaEsDialPort, "localhost")
+        if IsErr(dialRes):
+            webSceneMediaEsLastErr = ErrorText(dialRes)
+            qtransport.Stop(client)
+            esDiag(31, 2, 0)   # pumpdiag: loop dial failed
+            return 2
+        # Symmetric per-media QUIC stream (send==recv==video stream 4) to match the
+        # publisher's probe-and-derive serve loop — the legacy asymmetric default
+        # (send=0/recv=1) makes the server's ack land on the wrong stream (rc=4 ack fail).
+        conn = qconn.ConnDeriveStream(conn, 4, 4)
+        let negRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, conn)
+        if IsErr(negRes):
+            webSceneMediaEsLastErr = ErrorText(negRes)
+            qconn.ConnClose(conn)
+            qtransport.Stop(client)
+            esDiag(31, 3, 0)   # pumpdiag: loop negotiate failed
+            return 3
+        let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, conn)
+        if IsErr(ackRes):
+            webSceneMediaEsLastErr = ErrorText(ackRes)
+            qconn.ConnClose(conn)
+            qtransport.Stop(client)
+            esDiag(31, 4, 0)   # pumpdiag: loop ack failed
+            return 4
+        # Setup succeeded — persist ONLY the small token state and DO NOT Stop/ConnClose:
+        # the native session+socket stay alive in native_runtime globals (keyed by pipeIdx),
+        # so the stack-local client/conn going out of scope keeps the session live.
+        webSceneMediaEsPumpPipeIdx = conn.pipeIdx
+        webSceneMediaEsPumpPipeSide = conn.pipeSide
+        webSceneMediaEsPumpSendStreamId = conn.sendStreamId
+        webSceneMediaEsPumpRecvStreamId = conn.recvStreamId
+        webSceneMediaEsPumpDialed = true
+        webSceneMediaEsPumpDialedHost = webSceneMediaEsDialHost
+        webSceneMediaEsPumpDialedPort = webSceneMediaEsDialPort
+        # No cursor reset here: every path that can land in this block already leaves the
+        # cursor at its correct value — a first-ever dial has cursor 0 by init; EsInvalidate,
+        # ensureDialed's fresh-dial and peer-switch paths, and the pool-adoption prologue
+        # each set cursor 0 themselves; and a dead-session heal redial (see
+        # webSceneMediaEsPumpDeadSessionTeardown) MUST keep the cursor at the first
+        # undelivered frame so the refetched run resumes the decoder's continuous state
+        # instead of replaying from frame 0.
+    # Per-call pump: pull ONE bounded unit of contiguous frames (one cached GOP, or one
+    # network-fetch run under the byte budget) over the SAME persistent connection, deliver
+    # each into the host FIFO, then return — never loop internally over multiple units.
+    # This is the S5-B backpressure contract (video-seek-scrub-blueprint.md §7.4 "让位点"): every unit
+    # boundary is a safe yield point where the CALLER regains control before the next
+    # dial-free unit starts, instead of this function silently marching through the whole
+    # remaining stream in one call. Two callers rely on this today: the Android/desktop
+    # per-render-tick loop (mobile_shell_codegen.cheng), which already re-invokes this once
+    # per tick expecting a small bounded slice of work each time (this fixes a latent
+    # violation of that contract — a non-full FIFO previously let one call march through
+    # many units uninterrupted); and the Harmony fetch thread's pump loop
+    # (cheng_stream_fetch_worker in cheng_gui_host_gen.c), whose sink BLOCKS on a full FIFO
+    # instead of returning "full" — so it is the ONLY caller for which this bound is the
+    # sole source of any yield point at all (its sink never signals "full" to stop the old
+    # unbounded internal loop). rc=0 keeps its existing meaning ("no error, caller may call
+    # again immediately") for all three exits below: FIFO-full-mid-unit, sink-requested-stop,
+    # and now also "one bounded unit finished cleanly" (the trailing `return 0`) — callers
+    # already treat plain rc=0 as "keep pumping", so no caller-side contract changes.
+    # Pause (rc=8) is re-checked by every fresh call via the entry gate above (line 664),
+    # so a pause set mid-stream now takes effect at the very next unit boundary instead of
+    # only before the pump's very first dial — no separate mid-loop pause check is needed
+    # once the loop itself is bounded to one unit per call.
+    # Rebuild a stack-local conn referencing the persistent session (no dial/negotiate).
+    var pconn = qconn.ConnFromPipeIdx(webSceneMediaEsPumpPipeIdx, webSceneMediaEsPumpPipeSide,
+                                      webSceneMediaEsPumpSendStreamId, webSceneMediaEsPumpRecvStreamId)
+    var frameIdx: int32 = webSceneMediaEsPumpCursor
+    if frameIdx < 0:
+        frameIdx = 0
+    if frameIdx >= webSceneMediaEsFrames:
+        webSceneMediaEsLatchVideoEos()
+        return 7
+    # S5 read-path: the cursor landing exactly on a GOP start (bit0 of the frame's
+    # flags word — same field WebSceneMediaEsIsKeyFrame reads) is the one place a
+    # whole GOP can be served from the S4 block cache instead of the network: this
+    # happens naturally at the first frame, right after a seek snap, and right after
+    # S5's own background prefetch has filled a GOP ahead of the cursor. A cache hit
+    # here delivers every frame of that GOP straight from disk — zero QUIC requests —
+    # and advances the cursor past it; a miss falls straight back to the untouched
+    # existing range-fetch logic below (no behavior change on the miss path).
+    let cursorFlags: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + frameIdx * 12 + 8)
+    var servedFromCache: bool
+    if (cursorFlags & 1) == 1 && esAssetCid.len > 0:
+        let cacheRes: Result[Bytes] = blockcache.WebSceneMediaBlockCacheGet(strs.CloneStr(webSceneMediaEsAssetCid), frameIdx)
+        if IsOk(cacheRes):
+            var cachedBytes: Bytes = Value(cacheRes)
+            let gopStartOff: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + frameIdx * 12)
+            var gopEnd: int32 = frameIdx + 1
+            while gopEnd < webSceneMediaEsFrames:
+                let endFlags: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + gopEnd * 12 + 8)
+                if (endFlags & 1) == 1:
+                    break
+                gopEnd = gopEnd + 1
+            var cf: int32 = frameIdx
+            while cf < gopEnd:
+                let cfOff: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + cf * 12)
+                let cfSize: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + cf * 12 + 4)
+                let cfFlags: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + cf * 12 + 8)
+                var cont: int32 = esSinkFrame(cf, cachedBytes.data, cfOff - gopStartOff, cfSize, cfFlags & 1)
+                if cont == 2:
+                    webSceneMediaEsPumpCursor = cf
+                    rawbytes.BytesFree(cachedBytes)
+                    return 0
+                if cont == 0:
+                    rawbytes.BytesFree(cachedBytes)
+                    return 0
+                cf = cf + 1
+            rawbytes.BytesFree(cachedBytes)
+            if gopEnd >= webSceneMediaEsFrames:
+                webSceneMediaEsPumpCursor = webSceneMediaEsFrames
+                webSceneMediaEsLatchVideoEos()
+                return 7
+            webSceneMediaEsPumpCursor = gopEnd
+            servedFromCache = true
+    if !servedFromCache:
+        # Grow ONE contiguous run [frameIdx, j) under the byte budget — one request per run.
+        let runOff: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + frameIdx * 12)
+        var j: int32 = frameIdx + 1
+        while j < webSceneMediaEsFrames:
+            let jOff: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + j * 12)
+            let jSize: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + j * 12 + 4)
+            if (jOff + jSize) - runOff > webSceneMediaEsRunByteBudget:
+                break
+            j = j + 1
+        let lastOff: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + (j - 1) * 12)
+        let lastSize: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + (j - 1) * 12 + 4)
+        let runLen: int32 = (lastOff + lastSize) - runOff
+        var req: moqstream.Libp2pMoqSegmentStreamRequest
+        req.streamId = esStreamId
+        req.segmentKey = "moq-frame"
+        req.offsetBytes = runOff
+        req.lengthBytes = runLen
+        req.readChunkBytes = 262144
+        esDiag(32, frameIdx, runLen)   # pumpdiag: issuing moq-frame run request
+        var reader: moqstream.Libp2pMoqSegmentStreamReader
+        let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(pconn), req)
+        if IsErr(openRes):
+            webSceneMediaEsLastErr = ErrorText(openRes)
+            esDiag(31, 5, runLen)   # pumpdiag: run open failed
+            webSceneMediaEsPumpDeadStreak = webSceneMediaEsPumpDeadStreak + 1
+            if webSceneMediaEsPumpDeadStreak >= webSceneMediaEsPumpDeadStreakMax:
+                webSceneMediaEsPumpDeadSessionTeardown()
+            return 5
+        let drainRes = orchestrator.WebSceneMediaOrchestrateFetchAll(reader, 262144)
+        if IsErr(drainRes):
+            webSceneMediaEsLastErr = ErrorText(drainRes)
+            esDiag(31, 6, runLen)   # pumpdiag: run drain failed
+            webSceneMediaEsPumpDeadStreak = webSceneMediaEsPumpDeadStreak + 1
+            if webSceneMediaEsPumpDeadStreak >= webSceneMediaEsPumpDeadStreakMax:
+                webSceneMediaEsPumpDeadSessionTeardown()
+            return 6
+        webSceneMediaEsPumpDeadStreak = 0
+        var runBytes = Value(drainRes)
+        var f: int32 = frameIdx
+        while f < j:
+            let fOff: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + f * 12)
+            let fSize: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + f * 12 + 4)
+            let fFlags: int32 = webSceneMediaEsReadLeU32(esIndexData, webSceneMediaEsHeaderBytes + f * 12 + 8)
+            var cont: int32 = esSinkFrame(f, runBytes.data, fOff - runOff, fSize, fFlags & 1)
+            if cont == 2:
+                webSceneMediaEsPumpCursor = f
+                rawbytes.BytesFree(runBytes)
+                return 0
+            if cont == 0:
+                rawbytes.BytesFree(runBytes)
+                return 0
+            f = f + 1
+        # This run's bytes have been copied into the host FIFO by esSinkFrame above
+        # (memcpy per access unit) — free the run buffer itself (see
+        # WebSceneMediaOrchestrateFetchAll doc: was previously never freed here, the
+        # confirmed root cause of the unbounded RSS growth during network playback).
+        rawbytes.BytesFree(runBytes)
+        var nextCursor: int32 = j
+        if nextCursor >= webSceneMediaEsFrames:
+            webSceneMediaEsPumpCursor = webSceneMediaEsFrames
+            webSceneMediaEsLatchVideoEos()
+            return 7
+        webSceneMediaEsPumpCursor = nextCursor
+    # One bounded unit finished with no error/full/stop/end — same rc as FIFO-full above:
+    # callers already treat plain 0 as "keep pumping", so this asks for exactly one more call.
+    return 0
+
+# Dial ONE stack-local connection and pull frames [startIdx, startIdx+BatchFrames)
+# via multiple sequential requests on it (multi-request-per-conn), concatenating them
+# into the batch cache. The conn never leaves this frame (no global-conn corruption).
+fn webSceneMediaEsFetchBatch(startIdx: int32): bool =
+    var fetchVIdxData: rawbytes.Bytes
+    fetchVIdxData = webSceneMediaEsIndexData
+    var endIdx: int32 = startIdx + webSceneMediaEsBatchFrames
+    if endIdx > webSceneMediaEsFrames:
+        endIdx = webSceneMediaEsFrames
+    if startIdx < 0 || startIdx >= endIdx:
+        return false
+    let baseOff: int32 = webSceneMediaEsReadLeU32(fetchVIdxData, webSceneMediaEsHeaderBytes + startIdx * 12)
+    # One dial per batch (the conn never leaves this stack frame). The dial handshake
+    # is intermittently flaky ("handshake ! ready"); on failure return false and the
+    # caller (render-thread prefetch) re-attempts this batch on the next tick.
+    var client = qtransport.InitMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn,
+                                                                  strs.CloneStr(webSceneMediaEsDialHost), webSceneMediaEsDialPort, "localhost")
+    if IsErr(dialRes):
+        webSceneMediaEsLastErr = ErrorText(dialRes)
+        qtransport.Stop(client)
+        return false
+    let negRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, conn)
+    if IsErr(negRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, conn)
+    if IsErr(ackRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    # Pre-allocate the whole batch (frames are contiguous in the ES, so the batch byte
+    # size is known from the index) and copy each fetched frame into place — no repeated
+    # BytesConcat (which churns allocations and crashed the client).
+    var endOff: int32 = webSceneMediaEsReadLeU32(fetchVIdxData, webSceneMediaEsHeaderBytes + (endIdx - 1) * 12)
+    let endSize: int32 = webSceneMediaEsReadLeU32(fetchVIdxData, webSceneMediaEsHeaderBytes + (endIdx - 1) * 12 + 4)
+    let batchBytes: int32 = (endOff + endSize) - baseOff
+    if batchBytes <= 0:
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    var batch = rawbytes.BytesAlloc(batchBytes)
+    var ok: bool = true
+    var i: int32 = startIdx
+    while i < endIdx:
+        # Grow a CONTIGUOUS run [i, j) while it stays under the byte budget — ONE request
+        # per run (not per frame). Always include >=1 frame even if it alone exceeds the
+        # budget. Frames are contiguous, so the run is the ES range [runOff, runOff+runLen).
+        let runOff: int32 = webSceneMediaEsReadLeU32(fetchVIdxData, webSceneMediaEsHeaderBytes + i * 12)
+        var j: int32 = i + 1
+        while j < endIdx:
+            let jOff: int32 = webSceneMediaEsReadLeU32(fetchVIdxData, webSceneMediaEsHeaderBytes + j * 12)
+            let jSize: int32 = webSceneMediaEsReadLeU32(fetchVIdxData, webSceneMediaEsHeaderBytes + j * 12 + 4)
+            if (jOff + jSize) - runOff > webSceneMediaEsRunByteBudget:
+                break
+            j = j + 1
+        let lastOff: int32 = webSceneMediaEsReadLeU32(fetchVIdxData, webSceneMediaEsHeaderBytes + (j - 1) * 12)
+        let lastSize: int32 = webSceneMediaEsReadLeU32(fetchVIdxData, webSceneMediaEsHeaderBytes + (j - 1) * 12 + 4)
+        let runLen: int32 = (lastOff + lastSize) - runOff
+        var req: moqstream.Libp2pMoqSegmentStreamRequest
+        req.streamId = strs.CloneStr(webSceneMediaEsStreamId)
+        req.segmentKey = "moq-frame"
+        req.offsetBytes = runOff
+        req.lengthBytes = runLen
+        req.readChunkBytes = 262144
+        var reader: moqstream.Libp2pMoqSegmentStreamReader
+        let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(conn), req)
+        if IsErr(openRes):
+            webSceneMediaEsLastErr = ErrorText(openRes)
+            ok = false
+            break
+        let drainRes = orchestrator.WebSceneMediaOrchestrateFetchAll(reader, 262144)
+        if IsErr(drainRes):
+            webSceneMediaEsLastErr = ErrorText(drainRes)
+            ok = false
+            break
+        # The whole run lands at its ES offset in the prealloc batch; per-frame reads
+        # (frameOffset - baseOff) still index correctly since the run bytes are contiguous.
+        var runBytes = Value(drainRes)
+        rawbytes.BytesCopyInto(batch, runOff - baseOff, runBytes)
+        rawbytes.BytesFree(runBytes)
+        i = j
+    qconn.ConnClose(conn)
+    qtransport.Stop(client)
+    if !ok:
+        return false
+    rawbytes.BytesFree(webSceneMediaEsBatchData)
+    webSceneMediaEsBatchData = batch
+    webSceneMediaEsBatchStart = startIdx
+    webSceneMediaEsBatchEnd = endIdx
+    webSceneMediaEsBatchByteBase = baseOff
+    return true
+
+# Fetch access unit [frameIdx] into outBuf (bounded by outCap). Served from the batch
+# cache; a cache miss dials once and pulls the next BatchFrames on one connection.
+fn WebSceneMediaEsFrameFetch(frameIdx: int32, outBuf: ptr, outCap: int32): int32 =
+    var frameVIdxData: rawbytes.Bytes
+    frameVIdxData = webSceneMediaEsIndexData
+    if !webSceneMediaEsOpenFlag || outBuf == nil || outCap <= 0:
+        return 0
+    if frameIdx < 0 || frameIdx >= webSceneMediaEsFrames:
+        return 0
+    let entryOff: int32 = webSceneMediaEsHeaderBytes + frameIdx * 12
+    let frameOffset: int32 = webSceneMediaEsReadLeU32(frameVIdxData, entryOff)
+    let frameSize: int32 = webSceneMediaEsReadLeU32(frameVIdxData, entryOff + 4)
+    if frameSize <= 0:
+        return 0
+    if frameIdx < webSceneMediaEsBatchStart || frameIdx >= webSceneMediaEsBatchEnd:
+        if !webSceneMediaEsFetchBatch(frameIdx):
+            return 0
+    let inBatchOff: int32 = frameOffset - webSceneMediaEsBatchByteBase
+    var want: int32 = frameSize
+    if want > outCap:
+        want = outCap
+    if inBatchOff < 0 || inBatchOff + want > rawbytes.BytesLen(webSceneMediaEsBatchData):
+        return 0
+    var src = rawbytes.BytesSlice(webSceneMediaEsBatchData, inBatchOff, want)
+    copyBytesIntoPtr(outBuf, src, want)
+    rawbytes.BytesFree(src)
+    return want
+
+# End the ES session: clear the batch cache (each batch dials/closes its own conn).
+fn WebSceneMediaEsClose() =
+    webSceneMediaEsOpenFlag = false
+    rawbytes.BytesFree(webSceneMediaEsBatchData)
+    webSceneMediaEsBatchStart = -1
+    webSceneMediaEsBatchEnd = 0
+    webSceneMediaEsArmVideoEosForNewRun()
+
+# --- S5: background sequential prefetch into the S4 block cache -----------------
+# Runs a BOUNDED unit of work per call — at most ONE cache-miss GOP fetched, and
+# ALWAYS over the SAME persistent connection webSceneMediaEsEnsureDialed already
+# holds open for announce/esindex/frame-run traffic (webSceneMediaFetchOnPersistent,
+# the exact call the persistent pump itself uses). This is not optional: the
+# reference/production publisher (mediaMoqPublisherRun) runs a single-threaded serial
+# accept loop — it services ONE connection fully before calling accept() again — so a
+# SEPARATE one-shot dial issued while the persistent connection is still open would
+# never even be accepted (verified: it hangs to "read timeout", not a fast failure).
+# Sharing the one connection the session already has open is therefore the only
+# working design here, not a convenience.
+#
+# Since prefetch now rides the same connection AND the same single render thread the
+# persistent pump runs on (see the pump's own header comment), the backpressure is
+# NOT physical connection isolation — it is doing at most one GOP of real work per
+# call. The caller's own tick cadence (e.g. "call this once every K StreamLoop
+# ticks", a caller-side policy this function does not impose) is what bounds how much
+# prefetch bandwidth/render-thread time gets spent; this function never loops
+# internally to pull more than one GOP, so it can never race ahead unboundedly on
+# its own.
+#
+# Scans the aheadGops keyframe-aligned GOPs strictly AFTER the GOP the pump cursor is
+# currently sitting in, skips ones already cached (a Get hit), and fetches + Puts the
+# FIRST miss found in that window. Returns: 0 = no ES session open; 1 = one GOP
+# fetched and cached this call; 2 = nothing to do (every GOP in the window is already
+# cached, or the stream ends before the window is filled, or aheadGops/frame count is
+# non-positive); 3 = the target GOP's fetch or cache write failed (see
+# WebSceneMediaEsLastError() for the reason — the caller may retry on a later tick;
+# never silently drops the miss or falls back to serving stale/partial data); 4 = paused
+# (see WebSceneMediaEsSetPaused — background prefetch must not keep spending bandwidth
+# while the user has paused playback, video-seek-scrub-blueprint.md §7.4).
+fn WebSceneMediaEsPrefetchTick(aheadGops: int32): int32 =
+    var prefVIdxData: rawbytes.Bytes
+    prefVIdxData = webSceneMediaEsIndexData
+    if !webSceneMediaEsOpenFlag:
+        return 0
+    if webSceneMediaEsPaused:
+        return 4
+    if aheadGops <= 0 || webSceneMediaEsFrames <= 0:
+        return 2
+    if webSceneMediaEsAssetCid.len == 0:
+        return 2
+    let currentGopStart: int32 = webSceneMediaEsSnapToKeyFrame(webSceneMediaEsPumpCursor)
+    var scanFrame: int32 = currentGopStart + 1
+    var gopsSeen: int32
+    while scanFrame < webSceneMediaEsFrames && gopsSeen < aheadGops:
+        let scanFlags: int32 = webSceneMediaEsReadLeU32(prefVIdxData, webSceneMediaEsHeaderBytes + scanFrame * 12 + 8)
+        if (scanFlags & 1) == 1:
+            gopsSeen = gopsSeen + 1
+            let cacheRes: Result[Bytes] = blockcache.WebSceneMediaBlockCacheGet(strs.CloneStr(webSceneMediaEsAssetCid), scanFrame)
+            if IsErr(cacheRes):
+                var gopEndFrame: int32 = scanFrame + 1
+                while gopEndFrame < webSceneMediaEsFrames:
+                    let endFlags: int32 = webSceneMediaEsReadLeU32(prefVIdxData, webSceneMediaEsHeaderBytes + gopEndFrame * 12 + 8)
+                    if (endFlags & 1) == 1:
+                        break
+                    gopEndFrame = gopEndFrame + 1
+                let gopStartOff: int32 = webSceneMediaEsReadLeU32(prefVIdxData, webSceneMediaEsHeaderBytes + scanFrame * 12)
+                let lastFrameOff: int32 = webSceneMediaEsReadLeU32(prefVIdxData, webSceneMediaEsHeaderBytes + (gopEndFrame - 1) * 12)
+                let lastFrameSize: int32 = webSceneMediaEsReadLeU32(prefVIdxData, webSceneMediaEsHeaderBytes + (gopEndFrame - 1) * 12 + 4)
+                let gopLen: int32 = (lastFrameOff + lastFrameSize) - gopStartOff
+                if gopLen <= 0:
+                    webSceneMediaEsLastErr = "prefetch: computed non-positive gop byte length"
+                    return 3
+                let fetchRes = webSceneMediaFetchOnPersistent("moq-frame", strs.CloneStr(webSceneMediaEsStreamId),
+                                                              gopStartOff, gopLen, 262144)
+                if IsErr(fetchRes):
+                    webSceneMediaEsLastErr = ErrorText(fetchRes)
+                    return 3
+                var fetched: Bytes = Value(fetchRes)
+                let putOk: bool = blockcache.WebSceneMediaBlockCachePut(strs.CloneStr(webSceneMediaEsAssetCid), scanFrame, fetched)
+                rawbytes.BytesFree(fetched)
+                if !putOk:
+                    webSceneMediaEsLastErr = "prefetch: block cache put failed"
+                    return 3
+                return 1
+        scanFrame = scanFrame + 1
+    return 2
+
+# ===== Per-slot ES connection pool (秒开 feed 卡级预暖) ===========================
+# The primary playback session above is intentionally a SINGLE global session: exactly
+# one video streams into the one host FIFO at any moment. Feed-level prewarm needs MORE
+# than that one session: the cards visible around the playing one each hold their own
+# dialed+indexed ES session so a tap lands on a warm connection (秒开) instead of a cold
+# dial, and prewarming one card must NEVER tear down the playback session or another
+# card's session (不互踢). This pool is that per-slot session table.
+#
+# DOD/SoA layout: one parallel growable column per piece of per-session state, addressed
+# by an int32 slot index — the slot index IS the session identity (no pointers, no
+# name+arity keys; the cold backend has no fixed-size global arrays, so columns are
+# growable arrays pinned to webSceneMediaEsPoolMaxSlots entries by the one-time init).
+# A slot's whole lifecycle: Acquire (reserve, keyed by host:port) -> SlotOpen (dial +
+# announce + esindex on the slot's OWN persistent connection) -> SlotPrefetchTick
+# (bounded one-GOP-per-call prewarm into the content-addressed S4 block cache) ->
+# either adoption (WebSceneMediaEsOpen moves the slot's warm connection into the primary
+# session when the tapped card matches) or SlotRelease (滚出即拆: ConnClose the slot's
+# native session via its stored pipeIdx, free the index blob, clear every column).
+#
+# Two structural constraints this design honours, both verified elsewhere in this file:
+#  - The large MsQuicTransport cannot be a module global: each slot persists ONLY the
+#    small pipe token scalars (pipeIdx/pipeSide/streamIds), exactly like the primary
+#    pump; every fetch rebuilds a stack-local Connection via ConnFromPipeIdx.
+#  - The reference publisher (mediaMoqPublisherRun) services ONE connection at a time
+#    with a serial accept loop, so two slots dialed to the SAME peer make progress only
+#    one-at-a-time (serve-side constraint, unchanged by this pool). Prewarm therefore
+#    targets DISTINCT peers (one publisher per feed card), and adoption MOVES a slot's
+#    connection into the primary session instead of holding two connections to one peer.
+# Pool slots deliberately expose no StreamLoop-to-host-FIFO entry: the host sink
+# (esSinkFrame) is a single global FIFO, so only the primary session may pump frames into
+# it; pool slots prefetch into the content-addressed block cache, which the primary
+# pump's existing cache-hit branch later serves with zero network.
+# Pause backpressure applies pool-wide: WebSceneMediaEsPoolSlotPrefetchTick gates on the
+# SAME webSceneMediaEsPaused flag as the primary pump/prefetch (暂停不停流 §7.4 — a pause
+# stops ALL background network spend, not just the playing session's).
+const webSceneMediaEsPoolMaxSlots = 3
+
+var webSceneMediaEsPoolUsed: bool[]
+var webSceneMediaEsPoolOpen: bool[]
+var webSceneMediaEsPoolDialed: bool[]
+var webSceneMediaEsPoolPipeIdx: int32[]
+var webSceneMediaEsPoolPipeSide: int32[]
+var webSceneMediaEsPoolSendStreamId: int64[]
+var webSceneMediaEsPoolRecvStreamId: int64[]
+var webSceneMediaEsPoolDialHost: str[]
+var webSceneMediaEsPoolDialPort: int32[]
+var webSceneMediaEsPoolStreamId: str[]
+var webSceneMediaEsPoolAssetCid: str[]
+var webSceneMediaEsPoolFrames: int32[]
+var webSceneMediaEsPoolHeaderBytes: int32[]
+var webSceneMediaEsPoolIndexData: Bytes[]
+var webSceneMediaEsPoolLastErr: str[]
+var webSceneMediaEsPoolReady: bool
+# Reason of the most recent pool open failure (any slot) — mirrors webSceneMediaEsLastErr
+# for the pool surface; a failed OpenPeer auto-releases its slot, so the per-slot lastErr
+# column cannot outlive the failure that filled it.
+var webSceneMediaEsPoolLastOpenErr: str
+# S3 全链真实字节证据 receipts (S3 whole-chain byte-evidence receipts). Each counter is
+# incremented at the EXACT production point where the named thing physically happened:
+#  - ConnDialedReceipt: a slot's own dial+negotiate+ack completed over a real socket
+#    (the same three round-trips the primary session pays; this is the "建立" evidence).
+#  - ConnCloseReceipt: ConnClose actually ran on a DIALED slot connection (release or
+#    dead-slot teardown of real bytes — never counted for a slot that was never dialed,
+#    so "released without a connection" cannot masquerade as a closed one).
+#  - ReleaseReceipt: SlotRelease performed its full closure (conn torn down if any +
+#    esindex blob freed + every column cleared); the "释放必须闭合 receipt" number.
+#  - AdoptMoveReceipt: warm-connection adoptions into the primary session (the same
+#    event the host diag step 21 records, now also countable from inside the module).
+# The 池负例 mutations assert against these: a failed-dial OpenPeer must move Release
+# but NOT ConnClose (nothing physical existed to close).
+var webSceneMediaEsPoolConnDialedCount: int32
+var webSceneMediaEsPoolConnCloseCount: int32
+var webSceneMediaEsPoolReleaseCount: int32
+var webSceneMediaEsPoolAdoptMoveCount: int32
+
+fn webSceneMediaEsPoolEnsureInit() =
+    if webSceneMediaEsPoolReady:
+        return
+    var i: int32
+    while i < webSceneMediaEsPoolMaxSlots:
+        add(webSceneMediaEsPoolUsed, false)
+        add(webSceneMediaEsPoolOpen, false)
+        add(webSceneMediaEsPoolDialed, false)
+        add(webSceneMediaEsPoolPipeIdx, -1)
+        add(webSceneMediaEsPoolPipeSide, 0)
+        add(webSceneMediaEsPoolSendStreamId, int64(0))
+        add(webSceneMediaEsPoolRecvStreamId, int64(0))
+        add(webSceneMediaEsPoolDialHost, "")
+        add(webSceneMediaEsPoolDialPort, 0)
+        add(webSceneMediaEsPoolStreamId, "")
+        add(webSceneMediaEsPoolAssetCid, "")
+        add(webSceneMediaEsPoolFrames, 0)
+        add(webSceneMediaEsPoolHeaderBytes, webSceneMediaEsHeaderBytesCurrent)
+        var emptyIndex: Bytes
+        add(webSceneMediaEsPoolIndexData, emptyIndex)
+        add(webSceneMediaEsPoolLastErr, "")
+        i = i + 1
+    webSceneMediaEsPoolReady = true
+
+fn webSceneMediaEsPoolSlotValid(slotIdx: int32): bool =
+    webSceneMediaEsPoolEnsureInit()
+    return slotIdx >= 0 && slotIdx < webSceneMediaEsPoolMaxSlots
+
+# Tear down ONLY the slot's persistent native session (ConnClose on a conn rebuilt from
+# the stored pipeIdx = pipeClose(pipeIdx), the exact teardown the primary session's
+# peer-switch path uses). Leaves the slot reserved (used stays true) so an open retry
+# redials fresh. Idempotent: a non-dialed slot is a no-op.
+fn webSceneMediaEsPoolCloseConn(slotIdx: int32) =
+    if webSceneMediaEsPoolDialed[slotIdx]:
+        var oldConn = qconn.ConnFromPipeIdx(webSceneMediaEsPoolPipeIdx[slotIdx],
+                                            webSceneMediaEsPoolPipeSide[slotIdx],
+                                            webSceneMediaEsPoolSendStreamId[slotIdx],
+                                            webSceneMediaEsPoolRecvStreamId[slotIdx])
+        qconn.ConnClose(oldConn)
+        # Byte-evidence receipt: a REAL dialed connection was just closed. Only this
+        # branch counts — a never-dialed slot closing nothing must not inflate it.
+        webSceneMediaEsPoolConnCloseCount = webSceneMediaEsPoolConnCloseCount + 1
+        webSceneMediaEsPoolDialed[slotIdx] = false
+        webSceneMediaEsPoolPipeIdx[slotIdx] = -1
+
+# Clear every per-slot column EXCEPT the connection (whose ownership the caller has
+# either closed already or moved out — adoption). Frees the fetched esindex blob (the
+# one large per-slot allocation) and resets scalars to their init values, so a re-acquire
+# of this slot starts from a genuinely empty session, never stale state.
+fn webSceneMediaEsPoolClearSlot(slotIdx: int32) =
+    if webSceneMediaEsPoolOpen[slotIdx]:
+        rawbytes.BytesFree(webSceneMediaEsPoolIndexData[slotIdx])
+        var emptyIndex: Bytes
+        webSceneMediaEsPoolIndexData[slotIdx] = emptyIndex
+    webSceneMediaEsPoolOpen[slotIdx] = false
+    webSceneMediaEsPoolStreamId[slotIdx] = ""
+    webSceneMediaEsPoolAssetCid[slotIdx] = ""
+    webSceneMediaEsPoolFrames[slotIdx] = 0
+    webSceneMediaEsPoolHeaderBytes[slotIdx] = webSceneMediaEsHeaderBytesCurrent
+    webSceneMediaEsPoolLastErr[slotIdx] = ""
+    webSceneMediaEsPoolDialHost[slotIdx] = ""
+    webSceneMediaEsPoolDialPort[slotIdx] = 0
+    webSceneMediaEsPoolUsed[slotIdx] = false
+
+# Reserve a pool slot for host:port (pure bookkeeping, no network). Idempotent per peer:
+# a slot already reserved for this exact host:port is returned again (re-warm calls never
+# duplicate a session). Returns the slot index, or -1 when every slot is in use (loud —
+# the caller evicts another slot via WebSceneMediaEsPoolSlotRelease first; the pool never
+# silently evicts a live session on its own).
+fn WebSceneMediaEsPoolAcquire(dialHost: str, port: int32): int32 =
+    webSceneMediaEsPoolEnsureInit()
+    var i: int32
+    while i < webSceneMediaEsPoolMaxSlots:
+        if webSceneMediaEsPoolUsed[i] && webSceneMediaEsPoolDialHost[i] == dialHost &&
+           webSceneMediaEsPoolDialPort[i] == port:
+            return i
+        i = i + 1
+    i = 0
+    while i < webSceneMediaEsPoolMaxSlots:
+        if !webSceneMediaEsPoolUsed[i]:
+            webSceneMediaEsPoolUsed[i] = true
+            webSceneMediaEsPoolDialHost[i] = dialHost
+            webSceneMediaEsPoolDialPort[i] = port
+            return i
+        i = i + 1
+    return -1
+
+# Dial (or reuse) the slot's OWN persistent QUIC connection. A slot's peer is fixed at
+# acquire time, so there is no peer-switch branch here (that whole problem class — the
+# primary session's close+redial on card switch — is what the pool exists to avoid).
+fn webSceneMediaEsPoolEnsureDialed(slotIdx: int32): bool =
+    if webSceneMediaEsPoolDialed[slotIdx]:
+        return true
+    var client = qtransport.InitMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn,
+                                                                  webSceneMediaEsPoolDialHost[slotIdx],
+                                                                  webSceneMediaEsPoolDialPort[slotIdx], "localhost")
+    if IsErr(dialRes):
+        webSceneMediaEsPoolLastErr[slotIdx] = Error(dialRes)
+        qtransport.Stop(client)
+        return false
+    # Symmetric per-media QUIC stream (send==recv==video stream 4), same as the primary
+    # session — the publisher's probe-and-derive serve loop replies on the same stream.
+    conn = qconn.ConnDeriveStream(conn, 4, 4)
+    let negRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, conn)
+    if IsErr(negRes):
+        webSceneMediaEsPoolLastErr[slotIdx] = Error(negRes)
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, conn)
+    if IsErr(ackRes):
+        webSceneMediaEsPoolLastErr[slotIdx] = Error(ackRes)
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    # Persist ONLY the small token state; the native session stays alive keyed by pipeIdx.
+    webSceneMediaEsPoolPipeIdx[slotIdx] = conn.pipeIdx
+    webSceneMediaEsPoolPipeSide[slotIdx] = conn.pipeSide
+    webSceneMediaEsPoolSendStreamId[slotIdx] = conn.sendStreamId
+    webSceneMediaEsPoolRecvStreamId[slotIdx] = conn.recvStreamId
+    webSceneMediaEsPoolDialed[slotIdx] = true
+    # Byte-evidence receipt: this slot's own dial+negotiate+ack just completed for real.
+    webSceneMediaEsPoolConnDialedCount = webSceneMediaEsPoolConnDialedCount + 1
+    return true
+
+# Fetch one object range over the slot's already-dialed persistent connection. Mirrors
+# webSceneMediaFetchOnPersistent exactly (fresh reader per call, never Close the reader —
+# Close would ConnClose the whole shared native session).
+fn webSceneMediaEsPoolFetchOnPersistent(slotIdx: int32, segmentKey: str, mstreamId: str, offset: int32, length: int32, chunk: int32): Result[rawbytes.Bytes] =
+    var pconn = qconn.ConnFromPipeIdx(webSceneMediaEsPoolPipeIdx[slotIdx],
+                                      webSceneMediaEsPoolPipeSide[slotIdx],
+                                      webSceneMediaEsPoolSendStreamId[slotIdx],
+                                      webSceneMediaEsPoolRecvStreamId[slotIdx])
+    var request: moqstream.Libp2pMoqSegmentStreamRequest
+    request.streamId = mstreamId
+    request.segmentKey = segmentKey
+    request.offsetBytes = offset
+    request.lengthBytes = length
+    request.readChunkBytes = chunk
+    var reader: moqstream.Libp2pMoqSegmentStreamReader
+    let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(pconn), request)
+    if IsErr(openRes):
+        return Err[rawbytes.Bytes](Error(openRes))
+    let drainRes = orchestrator.WebSceneMediaOrchestrateFetchAll(reader, chunk)
+    if IsErr(drainRes):
+        return Err[rawbytes.Bytes](Error(drainRes))
+    return Ok[rawbytes.Bytes](Value(drainRes))
+
+# Open the ES session on an acquired slot: dial (or reuse) the slot's connection, fetch
+# the announce + esindex over it, validate the MQES header, and cache the per-frame
+# table in the slot's columns. Same wire sequence and same validation as the primary
+# WebSceneMediaEsOpen; returns false loudly on any failure (no silent partial open —
+# though the slot stays reserved with webSceneMediaEsPoolLastErr set, so the caller can
+# read the reason and either retry SlotOpen or SlotRelease the slot).
+fn WebSceneMediaEsPoolSlotOpen(slotIdx: int32): bool =
+    if !webSceneMediaEsPoolSlotValid(slotIdx) || !webSceneMediaEsPoolUsed[slotIdx]:
+        return false
+    if webSceneMediaEsPoolOpen[slotIdx]:
+        return true
+    if !webSceneMediaEsPoolEnsureDialed(slotIdx):
+        return false
+    let annRes = webSceneMediaEsPoolFetchOnPersistent(slotIdx, "moq-announce", "gui-es-ann", 0, 1024, 1024)
+    if IsErr(annRes):
+        webSceneMediaEsPoolLastErr[slotIdx] = Error(annRes)
+        # Same dead-pipe recovery as the primary session's open: tear the connection down
+        # so the NEXT open performs a genuine redial instead of reusing a torn-down pipe.
+        webSceneMediaEsPoolCloseConn(slotIdx)
+        return false
+    let announce: str = rawbytes.BytesToString(Value(annRes))
+    # Content identity straight off the wire, recorded even if the rest of the open fails
+    # (same contract as the primary session's webSceneMediaEsAssetCid).
+    webSceneMediaEsPoolAssetCid[slotIdx] = webSceneMediaAnnounceField(announce, "asset_cid")
+    let idxBytesStr: str = webSceneMediaAnnounceField(announce, "es_index_bytes")
+    if idxBytesStr.len == 0:
+        webSceneMediaEsPoolLastErr[slotIdx] = "pool open: es_index_bytes field missing from announce"
+        return false
+    var idxLen: int32
+    if !cmdline.ParseInt32(idxBytesStr, idxLen) || idxLen <= 0:
+        webSceneMediaEsPoolLastErr[slotIdx] = "pool open: es_index_bytes parse failed"
+        return false
+    let esBytesStr: str = webSceneMediaAnnounceField(announce, "es_bytes")
+    var announcedEsTotal: int32
+    if !cmdline.ParseInt32(esBytesStr, announcedEsTotal) || announcedEsTotal <= 0:
+        webSceneMediaEsPoolLastErr[slotIdx] = "pool open: es_bytes missing or invalid"
+        return false
+    var streamId: str = webSceneMediaAnnounceField(announce, "es_stream_id")
+    if streamId.len == 0:
+        webSceneMediaEsPoolLastErr[slotIdx] = "pool open: es_stream_id missing"
+        return false
+    webSceneMediaEsPoolStreamId[slotIdx] = streamId
+    let idxRes = webSceneMediaEsPoolFetchOnPersistent(slotIdx, "moq-esindex", streamId, 0, idxLen, idxLen)
+    if IsErr(idxRes):
+        webSceneMediaEsPoolLastErr[slotIdx] = Error(idxRes)
+        return false
+    var idxData = Value(idxRes)
+    if rawbytes.BytesLen(idxData) != idxLen ||
+       !WebSceneMediaEsIndexCurrentValid(idxData):
+        webSceneMediaEsPoolLastErr[slotIdx] = "pool open: current MQES contract rejected"
+        rawbytes.BytesFree(idxData)
+        return false
+    let esTotal: int32 = webSceneMediaEsReadLeU32(idxData, 28)
+    if esTotal != announcedEsTotal:
+        webSceneMediaEsPoolLastErr[slotIdx] = "pool open: es_total_bytes mismatch"
+        rawbytes.BytesFree(idxData)
+        return false
+    let count: int32 = webSceneMediaEsReadLeU32(idxData, 24)
+    webSceneMediaEsPoolFrames[slotIdx] = count
+    webSceneMediaEsPoolHeaderBytes[slotIdx] = webSceneMediaEsHeaderBytesCurrent
+    webSceneMediaEsPoolIndexData[slotIdx] = idxData
+    webSceneMediaEsPoolOpen[slotIdx] = true
+    return true
+
+# One-call prewarm entry: acquire a slot for host:port and open its ES session. Returns
+# the slot index (>= 0) on success — including the already-warm case (idempotent re-warm
+# costs no dial); -1 when the pool is full; -2 when the open failed (the slot is
+# auto-released back to the pool and WebSceneMediaEsPoolLastError carries the reason).
+fn WebSceneMediaEsPoolSlotOpenPeer(dialHost: str, port: int32): int32 =
+    let slotIdx: int32 = WebSceneMediaEsPoolAcquire(dialHost, port)
+    if slotIdx < 0:
+        webSceneMediaEsPoolLastOpenErr = "pool full"
+        return -1
+    if webSceneMediaEsPoolOpen[slotIdx]:
+        return slotIdx
+    if WebSceneMediaEsPoolSlotOpen(slotIdx):
+        return slotIdx
+    webSceneMediaEsPoolLastOpenErr = webSceneMediaEsPoolLastErr[slotIdx]
+    let released = WebSceneMediaEsPoolSlotRelease(slotIdx)
+    released
+    return -2
+
+# 滚出即拆: evict a pool slot — ConnClose its persistent native session, free the esindex
+# blob, clear every column. Returns false loudly for an out-of-range index or a slot that
+# is not currently reserved (a double-release is a caller bug, not a no-op to hide).
+fn WebSceneMediaEsPoolSlotRelease(slotIdx: int32): bool =
+    if !webSceneMediaEsPoolSlotValid(slotIdx):
+        return false
+    if !webSceneMediaEsPoolUsed[slotIdx]:
+        return false
+    webSceneMediaEsPoolCloseConn(slotIdx)
+    webSceneMediaEsPoolClearSlot(slotIdx)
+    # Closure receipt: the full release (conn + index blob + every column) completed.
+    webSceneMediaEsPoolReleaseCount = webSceneMediaEsPoolReleaseCount + 1
+    return true
+
+# Bounded prewarm tick for a pool slot: fetch+cache AT MOST ONE GOP per call, always over
+# the slot's own persistent connection, into the SAME content-addressed S4 block cache
+# the primary pump's cache-hit branch reads. Unlike WebSceneMediaEsPrefetchTick (which
+# scans the window strictly AFTER the playback cursor's GOP — the GOP about to be played
+# is never a prefetch target there), a prewarm slot has no playback cursor, so the scan
+# starts at frame 0 and GOP0 IS a target: the first keyframe's GOP is exactly what 秒开
+# needs already on disk when the tap lands. Successive calls make progress one GOP at a
+# time (cached GOPs are skipped), so the caller's tick cadence bounds prewarm bandwidth
+# exactly like the primary prefetch's caller-cadence contract. Returns: 0 = invalid slot
+# or no open session; 1 = one GOP fetched and cached; 2 = nothing to do (every GOP
+# cached, or non-positive frame state, or no asset cid); 3 = fetch/cache failure (see
+# WebSceneMediaEsPoolSlotLastError — cursor-less, the next call retries the same GOP);
+# 4 = paused (the SAME module pause flag the primary pump/prefetch gate on).
+fn WebSceneMediaEsPoolSlotPrefetchTick(slotIdx: int32): int32 =
+    if !webSceneMediaEsPoolSlotValid(slotIdx) || !webSceneMediaEsPoolUsed[slotIdx]:
+        return 0
+    if !webSceneMediaEsPoolOpen[slotIdx]:
+        return 0
+    if webSceneMediaEsPaused:
+        return 4
+    if webSceneMediaEsPoolFrames[slotIdx] <= 0:
+        return 2
+    if webSceneMediaEsPoolAssetCid[slotIdx].len == 0:
+        return 2
+    var scanFrame: int32
+    while scanFrame < webSceneMediaEsPoolFrames[slotIdx]:
+        let scanFlags: int32 = webSceneMediaEsReadLeU32(webSceneMediaEsPoolIndexData[slotIdx],
+                                                        webSceneMediaEsPoolHeaderBytes[slotIdx] + scanFrame * 12 + 8)
+        if (scanFlags & 1) == 1:
+            let cacheRes: Result[Bytes] = blockcache.WebSceneMediaBlockCacheGet(strs.CloneStr(webSceneMediaEsPoolAssetCid[slotIdx]), scanFrame)
+            if IsErr(cacheRes):
+                var gopEndFrame: int32 = scanFrame + 1
+                while gopEndFrame < webSceneMediaEsPoolFrames[slotIdx]:
+                    let endFlags: int32 = webSceneMediaEsReadLeU32(webSceneMediaEsPoolIndexData[slotIdx],
+                                                                   webSceneMediaEsPoolHeaderBytes[slotIdx] + gopEndFrame * 12 + 8)
+                    if (endFlags & 1) == 1:
+                        break
+                    gopEndFrame = gopEndFrame + 1
+                let gopStartOff: int32 = webSceneMediaEsReadLeU32(webSceneMediaEsPoolIndexData[slotIdx],
+                                                                  webSceneMediaEsPoolHeaderBytes[slotIdx] + scanFrame * 12)
+                let lastFrameOff: int32 = webSceneMediaEsReadLeU32(webSceneMediaEsPoolIndexData[slotIdx],
+                                                                   webSceneMediaEsPoolHeaderBytes[slotIdx] + (gopEndFrame - 1) * 12)
+                let lastFrameSize: int32 = webSceneMediaEsReadLeU32(webSceneMediaEsPoolIndexData[slotIdx],
+                                                                    webSceneMediaEsPoolHeaderBytes[slotIdx] + (gopEndFrame - 1) * 12 + 4)
+                let gopLen: int32 = (lastFrameOff + lastFrameSize) - gopStartOff
+                if gopLen <= 0:
+                    webSceneMediaEsPoolLastErr[slotIdx] = "pool prefetch: computed non-positive gop byte length"
+                    return 3
+                let fetchRes = webSceneMediaEsPoolFetchOnPersistent(slotIdx, "moq-frame", webSceneMediaEsPoolStreamId[slotIdx],
+                                                                    gopStartOff, gopLen, 262144)
+                if IsErr(fetchRes):
+                    webSceneMediaEsPoolLastErr[slotIdx] = Error(fetchRes)
+                    return 3
+                var fetched: Bytes = Value(fetchRes)
+                let putOk: bool = blockcache.WebSceneMediaBlockCachePut(strs.CloneStr(webSceneMediaEsPoolAssetCid[slotIdx]), scanFrame, fetched)
+                rawbytes.BytesFree(fetched)
+                if !putOk:
+                    webSceneMediaEsPoolLastErr[slotIdx] = "pool prefetch: block cache put failed"
+                    return 3
+                return 1
+        scanFrame = scanFrame + 1
+    return 2
+
+# Read-only pool surface for the feed/eviction layer and for verification. Every getter
+# guards an invalid or unopened slot with the same zero-value contract the primary
+# session's getters use (!open -> 0/""/false).
+fn WebSceneMediaEsPoolSlotCount(): int32 =
+    webSceneMediaEsPoolEnsureInit()
+    return webSceneMediaEsPoolMaxSlots
+
+fn WebSceneMediaEsPoolSlotIsUsed(slotIdx: int32): bool =
+    if !webSceneMediaEsPoolSlotValid(slotIdx):
+        return false
+    return webSceneMediaEsPoolUsed[slotIdx]
+
+fn WebSceneMediaEsPoolSlotIsOpen(slotIdx: int32): bool =
+    if !webSceneMediaEsPoolSlotValid(slotIdx):
+        return false
+    return webSceneMediaEsPoolOpen[slotIdx]
+
+fn WebSceneMediaEsPoolSlotFrameCount(slotIdx: int32): int32 =
+    if !webSceneMediaEsPoolSlotValid(slotIdx) || !webSceneMediaEsPoolOpen[slotIdx]:
+        return 0
+    return webSceneMediaEsPoolFrames[slotIdx]
+
+fn WebSceneMediaEsPoolSlotAssetCid(slotIdx: int32): str =
+    if !webSceneMediaEsPoolSlotValid(slotIdx) || !webSceneMediaEsPoolOpen[slotIdx]:
+        return ""
+    return webSceneMediaEsPoolAssetCid[slotIdx]
+
+# Pure content-addressing check on a pool slot — the exact mirror of
+# WebSceneMediaEsContentMatches (same exact-match, same empty-never-matches rule), so a
+# tap can verify the prewarmed slot serves the card's expected content before relying on it.
+# Expected-cid is a pure read (borrowed): callers compare the same local against
+# several slots/slots' own cid without losing it to a by-value consume.
+@borrows
+fn WebSceneMediaEsPoolSlotContentMatches(slotIdx: int32, expectedAssetCid: str): bool =
+    if !webSceneMediaEsPoolSlotValid(slotIdx) || !webSceneMediaEsPoolOpen[slotIdx]:
+        return false
+    if expectedAssetCid.len == 0 || webSceneMediaEsPoolAssetCid[slotIdx].len == 0:
+        return false
+    return webSceneMediaEsPoolAssetCid[slotIdx] == expectedAssetCid
+
+# Locate the OPEN slot serving host:port, or -1. Used by WebSceneMediaEsOpen's adoption
+# prologue and by feed-side bookkeeping; open-only by construction (a reserved-but-not-
+# opened slot has no session to adopt).
+@borrows
+fn WebSceneMediaEsPoolSlotFindPeer(dialHost: str, port: int32): int32 =
+    webSceneMediaEsPoolEnsureInit()
+    var i: int32
+    while i < webSceneMediaEsPoolMaxSlots:
+        if webSceneMediaEsPoolUsed[i] && webSceneMediaEsPoolOpen[i] &&
+           webSceneMediaEsPoolDialHost[i] == dialHost && webSceneMediaEsPoolDialPort[i] == port:
+            return i
+        i = i + 1
+    return -1
+
+fn WebSceneMediaEsPoolSlotLastError(slotIdx: int32): str =
+    if !webSceneMediaEsPoolSlotValid(slotIdx):
+        return ""
+    return webSceneMediaEsPoolLastErr[slotIdx]
+
+fn WebSceneMediaEsPoolLastError(): str =
+    return strs.CloneStr(webSceneMediaEsPoolLastOpenErr)
+# S3 byte-evidence receipt readout (see the counter block's header for exact semantics).
+fn WebSceneMediaEsPoolConnDialedReceipt(): int32 =
+    return webSceneMediaEsPoolConnDialedCount
+fn WebSceneMediaEsPoolConnCloseReceipt(): int32 =
+    return webSceneMediaEsPoolConnCloseCount
+fn WebSceneMediaEsPoolReleaseReceipt(): int32 =
+    return webSceneMediaEsPoolReleaseCount
+fn WebSceneMediaEsPoolAdoptMoveReceipt(): int32 =
+    return webSceneMediaEsPoolAdoptMoveCount
+
+# ===== S4 EOS 完整播放语义 (docs/cheng-video-e2e-miaofa-miaokai-plan.md §S4) ======
+# Dual-track EOS state machine, single source of truth: every latch is written at
+# the EXACT production line where the thing physically happened (video pump cursor
+# ran past the last frame; audio cursor asked past the last ADTS AU). The state
+# projection below only READS those latches — it never infers, never guesses.
+#
+# Three terminations are strictly distinguishable (the S4 receipt contract):
+#   EOF   — video pump returns rc=7 with webSceneMediaEsPumpEnded latched; complete
+#           playback exists ONLY in the WebSceneMediaEsEosState()==3 corner.
+#   ERROR — pump rc=2..6 left a live dead-streak behind (webSceneMediaEsPumpDeadStreak>0):
+#           supply stopped mid-stream, EOF not reached. Redial heals it.
+#   STALL — backpressure is NOT a state here: a FIFO-full tick (rc=0, cursor unmoved)
+#           is the documented 让位点 design behavior, so only the two real stops above
+#           plus "still playing" appear in the projection.
+#
+# Audio-first race verdict (音频时钟裁决的传输层形态): when the audio track drains
+# before the video track, audioEosLatches alone and the state stays 1 (race window)
+# — the video pump keeps pulling at its own cursor and NOTHING may claim complete
+# until webSceneMediaEsPumpEnded joins. Conversely video-first stays 2 while the
+# audio clock still has AUs to play. Complete = every OPEN track drained:
+# an unopened audio track must never block video completion (and vice versa — but
+# webSceneMediaEsPumpEnded can only ever latch through the video pump itself).
+var webSceneMediaAudioEsEosLatched: bool
+var webSceneMediaEsEosCompleteLatched: bool
+var webSceneMediaEsEosCompleteCount: int32
+
+fn webSceneMediaEsRecomputeEosComplete() =
+    if webSceneMediaEsEosCompleteLatched:
+        return
+    let vDone: bool = webSceneMediaEsPumpEnded
+    let aDone: bool = !webSceneMediaAudioEsOpenFlag || webSceneMediaAudioEsEosLatched
+    if vDone && aDone:
+        webSceneMediaEsEosCompleteLatched = true
+        webSceneMediaEsEosCompleteCount = webSceneMediaEsEosCompleteCount + 1
+    return
+
+# Video EOF production points call this instead of touching webSceneMediaEsPumpEnded
+# directly, so the complete-edge receipt advances exactly once per reached-EOF run.
+fn webSceneMediaEsLatchVideoEos() =
+    if !webSceneMediaEsPumpEnded:
+        webSceneMediaEsPumpEnded = true
+        webSceneMediaEsRecomputeEosComplete()
+    return
+
+# Audio drain production point (WebSceneMediaAudioEsAdvanceCursor's exhaustion branch).
+fn webSceneMediaEsLatchAudioEos() =
+    if !webSceneMediaAudioEsEosLatched:
+        webSceneMediaAudioEsEosLatched = true
+        webSceneMediaEsRecomputeEosComplete()
+    return
+
+# Re-arm for a NEW playback run: every path that rewinds/reopens the video stream
+# clears the ended latch here too, so replaying to the tail receipts another complete
+# edge instead of staying silent after the first one.
+fn webSceneMediaEsArmVideoEosForNewRun() =
+    if webSceneMediaEsPumpEnded && webSceneMediaEsEosCompleteLatched:
+        webSceneMediaEsEosCompleteLatched = false
+    webSceneMediaEsPumpEnded = false
+    return
+
+# The audio mirror: a seek back into the audio stream un-latches its EOS and re-arms
+# the complete edge for the next full pass (a seek keeps the count already earned).
+fn webSceneMediaEsUnlatchAudioEos() =
+    if webSceneMediaAudioEsEosLatched:
+        webSceneMediaAudioEsEosLatched = false
+        if webSceneMediaEsEosCompleteLatched:
+            webSceneMediaEsEosCompleteLatched = false
+    return
+
+# State projection (all inputs are production latches; see block header):
+#   0 = in-progress (no track drained yet, no error streak live)
+#   1 = audio-eos-only — the race window; feeding continues by contract
+#   2 = video-eos-only — audio clock still has AUs to play
+#   3 = eof-complete — the ONLY state allowed to claim 丝滑完整/整片播到尾
+#   4 = transport-error stop (dead streak active, EOF not reached)
+@borrows
+fn WebSceneMediaEsEosState(): int32 =
+    let vDone: bool = webSceneMediaEsPumpEnded
+    let audioOpen: bool = webSceneMediaAudioEsOpenFlag
+    if vDone && (!audioOpen || webSceneMediaAudioEsEosLatched):
+        return 3
+    if !vDone && webSceneMediaEsPumpDeadStreak > 0:
+        return 4
+    if vDone && audioOpen:
+        return 2
+    if !vDone && audioOpen && webSceneMediaAudioEsEosLatched:
+        return 1
+    return 0
+
+# Receipts (S4 齐全判据): complete counts EOF-converged passes; the boolean reads are
+# direct projections of the production latches (EOF vs error vs stall stay
+# distinguishable via EosState + LastError + DeadStreak getters that already exist).
+fn WebSceneMediaEsEosCompleteReceipt(): int32 =
+    return webSceneMediaEsEosCompleteCount
+fn WebSceneMediaEsVideoEosLatched(): bool =
+    return webSceneMediaEsPumpEnded
+fn WebSceneMediaEsAudioEosLatched(): bool =
+    return webSceneMediaAudioEsEosLatched
+# ===== Persistent-connection ES pump (the 卡顿 fix) ==============================
+# The render thread is the ONLY thread that drives the Cheng QUIC pump AND present.
+# The old batch path re-dialed a fresh QUIC connection at every 96-frame batch boundary
+# (~hundreds of ms of dial+TLS handshake) ON the render thread, so present stalled
+# periodically — the long frames landed exactly on batch boundaries. This pump dials
+# EXACTLY ONCE and keeps the native session alive for the whole stream, then streams
+# frame runs across ticks with a non-blocking sink so present is never blocked.
+#
+# Only SMALL scalars live in globals (pipeIdx/pipeSide/streamIds + a frame cursor) — the
+# large MsQuicTransport never leaves the dial stack frame (it can't be a module global).
+# Each tick rebuilds a stack-local Connection from the stored pipeIdx (ConnFromPipeIdx),
+# which references the still-alive native session/socket. No re-dial, no re-negotiate.
+var webSceneMediaEsPumpPipeIdx: int32 = -1
+var webSceneMediaEsPumpPipeSide: int32
+var webSceneMediaEsPumpSendStreamId: int64
+var webSceneMediaEsPumpRecvStreamId: int64
+var webSceneMediaEsPumpDialed: bool
+var webSceneMediaEsPumpCursor: int32
+# The peer (host:port) the persistent connection above is currently dialed to. EnsureDialed
+# reuses the connection ONLY when the requested peer matches; a different peer (card switch)
+# forces a safe close + redial, because the publisher pins server state to one slot per peer
+# and the stale connection would otherwise serve the WRONG asset.
+var webSceneMediaEsPumpDialedHost: str
+var webSceneMediaEsPumpDialedPort: int32
+# Consecutive dead-pipe failures (rc=5 open / rc=6 drain) on the persistent connection.
+# The stream loop has no host reopen driving it between plays, so it must retire a dead
+# session itself: at the streak threshold the transport token is torn down (see the loop's
+# failure paths) and the loop's own dial-once block redials on the next call. Reset on any
+# successful run fetch and on every successful EsOpen.
+var webSceneMediaEsPumpDeadStreak: int32
+const webSceneMediaEsPumpDeadStreakMax = 3
+
+# --- MoQ per-frame AUDIO ES streaming (AAC/ADTS) --------------------------------
+# Exact mirror of the video ES surface above: audio_es_open fetches the announce +
+# the ADTS frame index (moq-aindex), then audio_es_fetch_frame pulls ONE ADTS access
+# unit (small range) the host feeds straight to the AAC decoder (IS_ADTS=1, no csd).
+# Frames stream over moq-aframe ranges. Same batch-fetch-on-one-conn design (conn never
+# leaves the stack frame; only cached Bytes + scalars live in globals).
+var webSceneMediaAudioEsStreamId: str
+var webSceneMediaAudioEsFrames: int32
+var webSceneMediaAudioSampleRate: int32
+var webSceneMediaAudioChannels: int32
+var webSceneMediaAudioProfile: int32
+var webSceneMediaAudioEsIndexData: Bytes
+var webSceneMediaAudioEsOpenFlag: bool
+# ADTS index frame table = 8B/entry (offset u32, size u32), header = 32B.
+const webSceneMediaAudioEsHeaderBytes = 32
+const webSceneMediaAudioEsEntryBytes = 8
+var webSceneMediaAudioEsBatchData: Bytes
+var webSceneMediaAudioEsBatchStart: int32 = -1
+var webSceneMediaAudioEsBatchEnd: int32
+var webSceneMediaAudioEsBatchByteBase: int32
+var webSceneMediaAudioEsDialHost: str
+var webSceneMediaAudioEsDialPort: int32
+var webSceneMediaAudioEsLastErr: str
+# S7 slice1 (video-seek-scrub-blueprint.md §7.1 选项 A, 音频 ES 化): the audio-side mirror
+# of webSceneMediaEsPumpCursor — which ADTS access unit the audio pump is positioned at.
+# Only bookkeeping lives here; the persistent-connection pump loop that CONSUMES the
+# cursor (mirroring WebSceneMediaEsStreamLoop) is host-wiring work left to the next slice.
+var webSceneMediaAudioEsPumpCursor: int32
+
+fn WebSceneMediaAudioEsLastError(): str =
+    return strs.CloneStr(webSceneMediaAudioEsLastErr)
+# --- aidx (MQAS) index parsing — pure over an in-memory blob, no transport involved ---
+# Factored out of WebSceneMediaAudioEsOpen so the same header-validate/field-read logic
+# serves both the network path (fetch bytes, then adopt) and any caller that already has
+# the raw index bytes (e.g. WebSceneMediaAudioEsAdoptIndexBytes below, or a test reading
+# a local .aidx fixture straight off disk — no network transport needed to exercise the
+# index format itself). Field readers assume the caller already checked MagicValid (same
+# invariant the original inline parse relied on: the len<32 bound before any u32 read).
+fn WebSceneMediaAudioEsIndexMagicValid(idxData: Bytes): bool =
+    if rawbytes.BytesLen(idxData) < webSceneMediaAudioEsHeaderBytes:
+        return false
+    return rawbytes.BytesGet(idxData, 0) == 77 && rawbytes.BytesGet(idxData, 1) == 81 &&
+           rawbytes.BytesGet(idxData, 2) == 65 && rawbytes.BytesGet(idxData, 3) == 83
+
+fn WebSceneMediaAudioEsIndexSampleRate(idxData: Bytes): int32 =
+    return webSceneMediaEsReadLeU32(idxData, 8)
+
+fn WebSceneMediaAudioEsIndexChannels(idxData: Bytes): int32 =
+    return webSceneMediaEsReadLeU32(idxData, 12)
+
+fn WebSceneMediaAudioEsIndexProfile(idxData: Bytes): int32 =
+    return webSceneMediaEsReadLeU32(idxData, 16)
+
+fn WebSceneMediaAudioEsIndexFrameCount(idxData: Bytes): int32 =
+    return webSceneMediaEsReadLeU32(idxData, 20)
+
+# Adopt already-fetched aidx bytes as the open audio ES state: validates the MQAS header
+# + per-frame table bounds, then sets the module globals (sample rate/channels/profile/
+# frame count/index data), resets the pump cursor to 0, and raises the open flag. Returns
+# false on any validation failure (no silent partial-open, no default). This is the whole
+# body of WebSceneMediaAudioEsOpen AFTER its network fetch — kept separate so the same
+# adopt logic is reachable without a live QUIC dial.
+fn WebSceneMediaAudioEsAdoptIndexBytes(idxData: Bytes): bool =
+    if !WebSceneMediaAudioEsIndexMagicValid(idxData):
+        return false
+    let sampleRate: int32 = WebSceneMediaAudioEsIndexSampleRate(idxData)
+    let channels: int32 = WebSceneMediaAudioEsIndexChannels(idxData)
+    let profile: int32 = WebSceneMediaAudioEsIndexProfile(idxData)
+    let count: int32 = WebSceneMediaAudioEsIndexFrameCount(idxData)
+    if sampleRate <= 0 || channels <= 0 || profile <= 0 || count <= 0:
+        return false
+    if rawbytes.BytesLen(idxData) < webSceneMediaAudioEsHeaderBytes + count * webSceneMediaAudioEsEntryBytes:
+        return false
+    webSceneMediaAudioSampleRate = sampleRate
+    webSceneMediaAudioChannels = channels
+    webSceneMediaAudioProfile = profile
+    webSceneMediaAudioEsFrames = count
+    webSceneMediaAudioEsIndexData = idxData
+    webSceneMediaAudioEsPumpCursor = 0
+    # New session (fresh index bytes): a stale EOS latch from the previous run must
+    # not leak into this one — same re-arm discipline as the video side's adopt path.
+    webSceneMediaEsUnlatchAudioEos()
+    webSceneMediaAudioEsOpenFlag = true
+    return true
+
+# Open an audio ES session: announce (audio_es_index_bytes/audio_es_stream_id), then the
+# ADTS frame index (moq-aindex), parse MQAS header (sample_rate/channels/profile/count) +
+# cache the per-frame offset/size table. Returns false on any failure (no silent default).
+fn WebSceneMediaAudioEsOpen(dialHost: str, port: int32): bool =
+    # #139: a new session re-arms the fetch path — clear any teardown-cancel latch the
+    # previous session's host teardown set (see the flag's header in the orchestrator).
+    orchestrator.WebSceneMediaFetchCancelClear()
+    webSceneMediaAudioEsDialHost = strs.CloneStr(dialHost)
+    webSceneMediaAudioEsDialPort = port
+    # Single-slot publisher discipline (the same one webSceneMediaEsEnsureDialed's header
+    # documents): the production publisher pins all server state to ONE shared connection
+    # slot, so ANY second dial — including these two one-shot announce/aindex fetches —
+    # replaces that slot and silently kills the video session's persistent connection
+    # server-side (reproduced on Android 2026-07-24: aes open ok, then every moq-frame
+    # request fails rc=5 with zero arrivals in the pub log — media_frame stays 0 forever).
+    # When the video ES session already holds its persistent connection to this exact
+    # peer, ride it (webSceneMediaFetchOnPersistent, the exact call the video open and
+    # both PrefetchTicks already use for announce/esindex/moq-frame/moq-aframe). The
+    # one-shot path stays for a standalone audio open with no video session (or a
+    # different peer), where no persistent connection exists to protect.
+    let ridePersistent: bool = webSceneMediaEsPumpDialed &&
+                               webSceneMediaEsPumpDialedHost == dialHost &&
+                               webSceneMediaEsPumpDialedPort == port
+    var announce: str
+    if ridePersistent:
+        let annRes = webSceneMediaFetchOnPersistent("moq-announce", "gui-aes-ann", 0, 1024, 1024)
+        if IsErr(annRes):
+            # Dead session (pub idle read-timeout or a dropped path killed the shared
+            # connection while it sat idle between es_open and this audio open — the
+            # emulator/slirp case): retire the dead token, re-establish the session
+            # through the SAME ensure mechanism EsOpen uses (cursor untouched), retry once.
+            webSceneMediaEsPumpDeadSessionTeardown()
+            if !webSceneMediaEsEnsureDialed(strs.CloneStr(dialHost), port):
+                return false
+            let annRetry = webSceneMediaFetchOnPersistent("moq-announce", "gui-aes-ann", 0, 1024, 1024)
+            if IsErr(annRetry):
+                return false
+            announce = rawbytes.BytesToString(Value(annRetry))
+        else:
+            announce = rawbytes.BytesToString(Value(annRes))
+    else:
+        let annRes = WebSceneMediaFetchRemoteObject(strs.CloneStr(dialHost), port, "gui-aes-ann", "moq-announce", 0, 1024, 1024)
+        if IsErr(annRes):
+            return false
+        announce = rawbytes.BytesToString(Value(annRes))
+    let idxBytesStr: str = webSceneMediaAnnounceField(announce, "audio_es_index_bytes")
+    if idxBytesStr.len == 0:
+        return false
+    var idxLen: int32
+    if !cmdline.ParseInt32(idxBytesStr, idxLen) || idxLen <= 0:
+        return false
+    var streamId: str = webSceneMediaAnnounceField(announce, "audio_es_stream_id")
+    if streamId.len == 0:
+        streamId = "moq-aes-1"
+    webSceneMediaAudioEsStreamId = strs.CloneStr(streamId)
+    if ridePersistent:
+        let idxRes = webSceneMediaFetchOnPersistent("moq-aindex", strs.CloneStr(streamId), 0, idxLen, idxLen)
+        if IsErr(idxRes):
+            # Same dead-session heal as the announce fetch above (the connection may have
+            # died between the two fetches on a flapping path).
+            webSceneMediaEsPumpDeadSessionTeardown()
+            if !webSceneMediaEsEnsureDialed(strs.CloneStr(dialHost), port):
+                return false
+            let idxRetry = webSceneMediaFetchOnPersistent("moq-aindex", strs.CloneStr(streamId), 0, idxLen, idxLen)
+            if IsErr(idxRetry):
+                return false
+            return WebSceneMediaAudioEsAdoptIndexBytes(Value(idxRetry))
+        return WebSceneMediaAudioEsAdoptIndexBytes(Value(idxRes))
+    let idxRes = WebSceneMediaFetchRemoteObject(strs.CloneStr(dialHost), port, strs.CloneStr(streamId), "moq-aindex", 0, idxLen, idxLen)
+    if IsErr(idxRes):
+        return false
+    return WebSceneMediaAudioEsAdoptIndexBytes(Value(idxRes))
+
+fn WebSceneMediaAudioEsFrameCount(): int32 =
+    if !webSceneMediaAudioEsOpenFlag:
+        return 0
+    return webSceneMediaAudioEsFrames
+
+fn WebSceneMediaAudioSampleRate(): int32 =
+    if !webSceneMediaAudioEsOpenFlag:
+        return 0
+    return webSceneMediaAudioSampleRate
+
+fn WebSceneMediaAudioChannels(): int32 =
+    if !webSceneMediaAudioEsOpenFlag:
+        return 0
+    return webSceneMediaAudioChannels
+
+fn WebSceneMediaAudioProfile(): int32 =
+    if !webSceneMediaAudioEsOpenFlag:
+        return 0
+    return webSceneMediaAudioProfile
+
+# --- Audio pump cursor + seek alignment (S7 slice1) -----------------------------
+# Test-only-shaped read of the pump cursor (mirrors WebSceneMediaEsPumpCursor's own
+# doc comment) — no production caller yet; the persistent-connection pump loop that
+# advances it during ordinary forward playback is host-wiring work for the next slice.
+fn WebSceneMediaAudioEsPumpCursor(): int32 =
+    return webSceneMediaAudioEsPumpCursor
+
+# Advance the pump cursor by exactly one ADTS access unit (ordinary forward playback,
+# no seek) — the cursor-bookkeeping half of what WebSceneMediaEsStreamLoop does for
+# video on every tick, without any network/decoder work attached. Returns the NEW
+# cursor value, or -1 once the stream is exhausted (cursor already at the last frame)
+# so a caller can detect end-of-stream instead of walking the cursor past the index.
+fn WebSceneMediaAudioEsAdvanceCursor(): int32 =
+    if !webSceneMediaAudioEsOpenFlag:
+        return -1
+    if webSceneMediaAudioEsPumpCursor >= webSceneMediaAudioEsFrames - 1:
+        # S4: the cursor asking past the LAST AU is the audio track's physical drain
+        # moment — latch it here so the dual-track state machine sees this EOF even
+        # when the video pump finishes first (audio-first race, verdict per the
+        # state machine's header: keep feeding video, complete waits for both).
+        webSceneMediaEsLatchAudioEos()
+        return -1
+    webSceneMediaAudioEsPumpCursor = webSceneMediaAudioEsPumpCursor + 1
+    return webSceneMediaAudioEsPumpCursor
+
+# One AAC-LC ADTS access unit always spans this many raw samples (ISO/IEC 14496-3) —
+# the fixed frame size gen_moq_audio_index.mjs's ADTS walk relies on implicitly (it
+# never encodes samples-per-frame in the .aidx; every AU it indexes is a standard LC
+# frame). Audio ES only ever serves AAC-LC (profile==2, checked by the caller via
+# WebSceneMediaAudioProfile — a non-LC profile is a format this slice does not claim
+# to align, not a silently-wrong answer).
+const webSceneMediaAudioSamplesPerFrame = 1024
+
+# Pure seek-alignment math: which audio sample instant corresponds to videoFrameIdx at
+# videoFps, played into a stream sampled at audioSampleRate. Both frame rates are taken
+# as constant (the same assumption WebSceneMediaEsSnapToKeyFrame's frame_index/fps
+# reverse mapping already makes for video — blueprint §7.2). int64 throughout: at
+# realistic sample rates (≥192kHz) and clip lengths (≥3.1 hours at 60fps) the int32
+# product videoFrameIdx*audioSampleRate would overflow before the divide by fps could
+# bring it back in range, so the multiply must not be done in int32.
+fn WebSceneMediaAudioSampleIndexForVideoFrameEx(videoFrameIdx: int32, videoFps: int32, audioSampleRate: int32): int64 =
+    if videoFps <= 0 || audioSampleRate <= 0:
+        return 0
+    var frame: int32 = videoFrameIdx
+    if frame < 0:
+        frame = 0
+    return (int64(frame) * int64(audioSampleRate)) / int64(videoFps)
+
+# Which audio ES frame (ADTS AU index) covers the sample instant seeking to
+# videoFrameIdx lands on, clamped into [0, audioFrameCount). Pure function (no module
+# state) so the alignment math is testable against a real fixture's real fps/sample
+# rate/frame count without opening any network session — WebSceneMediaAudioFrameIndex-
+# ForVideoFrame below is the thin production wrapper over this.
+fn WebSceneMediaAudioFrameIndexForVideoFrameEx(videoFrameIdx: int32, videoFps: int32, audioSampleRate: int32, audioFrameCount: int32): int32 =
+    if audioFrameCount <= 0:
+        return 0
+    let sampleIdx: int64 = WebSceneMediaAudioSampleIndexForVideoFrameEx(videoFrameIdx, videoFps, audioSampleRate)
+    var audioFrame: int32 = int32(sampleIdx / int64(webSceneMediaAudioSamplesPerFrame))
+    if audioFrame < 0:
+        audioFrame = 0
+    if audioFrame >= audioFrameCount:
+        audioFrame = audioFrameCount - 1
+    return audioFrame
+
+# Production wrapper: reads the video fps off the ALREADY-OPEN video ES state (S1's
+# webSceneMediaEsFpsVal — audio seek alignment is meaningless without a video cursor to
+# align to) and this module's own open audio state, then delegates to the pure Ex form.
+fn WebSceneMediaAudioFrameIndexForVideoFrame(videoFrameIdx: int32): int32 =
+    if !webSceneMediaAudioEsOpenFlag || !webSceneMediaEsOpenFlag:
+        return 0
+    return WebSceneMediaAudioFrameIndexForVideoFrameEx(videoFrameIdx, webSceneMediaEsFpsVal,
+                                                        webSceneMediaAudioSampleRate, webSceneMediaAudioEsFrames)
+
+# Jump the audio pump cursor to the AU that aligns with a video-side SeekToFrame target
+# (video-seek-scrub-blueprint.md §7.1 选项 A) — the audio mirror of
+# WebSceneMediaEsSeekToFrame, except audio ES has no GOP/keyframe structure to snap to
+# (every AAC-LC AU decodes independently, see gen_moq_audio_index.mjs's header comment),
+# so the aligned AU index is used directly with no snap step. Transport-layer cursor
+# move only, same as the video seek — no decoder involved here.
+fn WebSceneMediaAudioEsSeekToVideoFrame(videoFrameIdx: int32): bool =
+    if !webSceneMediaAudioEsOpenFlag:
+        return false
+    webSceneMediaAudioEsPumpCursor = WebSceneMediaAudioFrameIndexForVideoFrame(videoFrameIdx)
+    # A seek back into the audio stream un-latches its EOS and re-arms the complete
+    # edge (the mirror of SeekToFrame's ArmVideoEosForNewRun on the video side).
+    webSceneMediaEsUnlatchAudioEos()
+    return true
+
+# #14-eos (block cache migration, patch2): serves the webSceneMediaEsBatchFrames-aligned
+# block [blockStart, blockEnd) containing startIdx — SAME block boundary
+# WebSceneMediaAudioEsPrefetchTick uses (floor(idx/blockSize)*blockSize, see that
+# function's own doc comment) so a key this function reads and one PrefetchTick already
+# wrote into the S4 disk block cache always land on the identical (assetCid, blockStart)
+# key: a block PrefetchTick filled ahead of the cursor is a guaranteed cache hit here,
+# zero network. On a miss, fetches the block over the SAME persistent connection
+# WebSceneMediaAudioEsPrefetchTick already uses (webSceneMediaFetchOnPersistent) and Puts
+# it into the S4 cache before serving it, so a later PrefetchTick/FetchBatch call over the
+# same block also hits.
+#
+# This function used to dial an INDEPENDENT one-shot QUIC connection here
+# (qtransport.InitMsQuicTransport + Libp2pQuicDialOneShotClientNamed) even while the video
+# pump's persistent connection was already open against the SAME single-threaded reference
+# publisher (mediaMoqPublisherRun, which services one connection fully before accept()ing
+# the next) — media_moq_audio_es_prefetch_tick_check_main.cheng's own header comment
+# documents that this exact "persistent conn open + independent dial" pattern hangs to a
+# read timeout, not a fast failure. That whole dial (InitMsQuicTransport/
+# Libp2pQuicDialOneShotClientNamed/ConnClose/Stop) is gone: this path cannot hang on a
+# second dial because there is no longer a second dial, structurally, not "less likely".
+#
+# WebSceneMediaAudioEsFrameFetch's own call site/contract is unchanged: same
+# webSceneMediaAudioEsBatchStart/End/Data/ByteBase fields, same bool return.
+fn webSceneMediaAudioEsFetchBatch(startIdx: int32): bool =
+    var fetchAIdxData: rawbytes.Bytes
+    fetchAIdxData = webSceneMediaAudioEsIndexData
+    let blockSize: int32 = webSceneMediaEsBatchFrames
+    let blockStart: int32 = (startIdx / blockSize) * blockSize
+    var blockEnd: int32 = blockStart + blockSize
+    if blockEnd > webSceneMediaAudioEsFrames:
+        blockEnd = webSceneMediaAudioEsFrames
+    if blockStart < 0 || blockStart >= blockEnd:
+        return false
+    let blockStartOff: int32 = webSceneMediaEsReadLeU32(fetchAIdxData, webSceneMediaAudioEsHeaderBytes + blockStart * webSceneMediaAudioEsEntryBytes)
+    var blockBytes: Bytes
+    let cacheRes: Result[Bytes] = blockcache.WebSceneMediaBlockCacheGetAudio(strs.CloneStr(webSceneMediaEsAssetCid), blockStart)
+    if IsOk(cacheRes):
+        blockBytes = Value(cacheRes)
+    else:
+        let lastOff: int32 = webSceneMediaEsReadLeU32(fetchAIdxData, webSceneMediaAudioEsHeaderBytes + (blockEnd - 1) * webSceneMediaAudioEsEntryBytes)
+        let lastSize: int32 = webSceneMediaEsReadLeU32(fetchAIdxData, webSceneMediaAudioEsHeaderBytes + (blockEnd - 1) * webSceneMediaAudioEsEntryBytes + 4)
+        let blockLen: int32 = (lastOff + lastSize) - blockStartOff
+        if blockLen <= 0:
+            webSceneMediaAudioEsLastErr = "fetch_batch: computed non-positive block byte length"
+            return false
+        let fetchRes = webSceneMediaFetchOnPersistent("moq-aframe", strs.CloneStr(webSceneMediaAudioEsStreamId),
+                                                       blockStartOff, blockLen, 262144)
+        if IsErr(fetchRes):
+            webSceneMediaAudioEsLastErr = Error(fetchRes)
+            return false
+        blockBytes = Value(fetchRes)
+        let putOk: bool = blockcache.WebSceneMediaBlockCachePutAudio(strs.CloneStr(webSceneMediaEsAssetCid), blockStart, blockBytes)
+        if !putOk:
+            webSceneMediaAudioEsLastErr = "fetch_batch: audio block cache put failed"
+            rawbytes.BytesFree(blockBytes)
+            return false
+    rawbytes.BytesFree(webSceneMediaAudioEsBatchData)
+    webSceneMediaAudioEsBatchData = blockBytes
+    webSceneMediaAudioEsBatchStart = blockStart
+    webSceneMediaAudioEsBatchEnd = blockEnd
+    webSceneMediaAudioEsBatchByteBase = blockStartOff
+    return true
+
+# Single-connection interleaved video+audio prefetch: ONE dial pulls a video batch
+# (moq-frame, 12B index entries) AND an audio batch (moq-aframe, 8B entries) on the
+# SAME connection, demuxed by segmentKey — VPN-style stream multiplexing over one
+# connection, no second QUIC connection. The conn never leaves this stack frame (the
+# large MsQuicTransport can't live in a module global); only cached Bytes survive.
+fn webSceneMediaAvFetchBatch(videoStart: int32, audioStart: int32): bool =
+    if !webSceneMediaEsOpenFlag || !webSceneMediaAudioEsOpenFlag:
+        return false
+    var avVideoIndexData: rawbytes.Bytes
+    avVideoIndexData = webSceneMediaEsIndexData
+    var avAudioIndexData: rawbytes.Bytes
+    avAudioIndexData = webSceneMediaAudioEsIndexData
+    var vEnd: int32 = videoStart + webSceneMediaEsBatchFrames
+    if vEnd > webSceneMediaEsFrames:
+        vEnd = webSceneMediaEsFrames
+    var aEnd: int32 = audioStart + webSceneMediaEsBatchFrames
+    if aEnd > webSceneMediaAudioEsFrames:
+        aEnd = webSceneMediaAudioEsFrames
+    let vOk0: bool = videoStart >= 0 && videoStart < vEnd
+    let aOk0: bool = audioStart >= 0 && audioStart < aEnd
+    if !vOk0 && !aOk0:
+        return false
+    var client = qtransport.InitMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn,
+                                                                  strs.CloneStr(webSceneMediaEsDialHost), webSceneMediaEsDialPort, "localhost")
+    if IsErr(dialRes):
+        webSceneMediaEsLastErr = ErrorText(dialRes)
+        qtransport.Stop(client)
+        return false
+    # Two independent QUIC streams on the ONE dialed connection: video=stream4,
+    # audio=stream8. ConnDeriveStream reuses conn.pipeIdx (same native session) and
+    # conn.pipeSide (client), only swapping the streamId — the ONLY way to ride the
+    # dialed session on a second stream (*ForStreams would open another session). Each
+    # stream runs its OWN MoQ multistream-select negotiate, because select bytes travel
+    # on the stream's QUIC stream; the publisher answers per stream. NEVER ConnClose the
+    # derived handles (they share conn.pipeIdx) — close conn once after both drains.
+    var vConn = qconn.ConnDeriveStream(conn, 4, 4)
+    var aConn = qconn.ConnDeriveStream(conn, 8, 8)
+    let vNegRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, vConn)
+    if IsErr(vNegRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    let vAckRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, vConn)
+    if IsErr(vAckRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    let aNegRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, aConn)
+    if IsErr(aNegRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    let aAckRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, aConn)
+    if IsErr(aAckRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return false
+    var ok: bool = true
+    # --- video batch on stream4 (moq-frame) ---
+    var vBatch: Bytes = rawbytes.BytesAlloc(0)
+    var vBase: int32
+    if vOk0:
+        vBase = webSceneMediaEsReadLeU32(avVideoIndexData, webSceneMediaEsHeaderBytes + videoStart * 12)
+        let vEndOff: int32 = webSceneMediaEsReadLeU32(avVideoIndexData, webSceneMediaEsHeaderBytes + (vEnd - 1) * 12)
+        let vEndSize: int32 = webSceneMediaEsReadLeU32(avVideoIndexData, webSceneMediaEsHeaderBytes + (vEnd - 1) * 12 + 4)
+        let vBytes: int32 = (vEndOff + vEndSize) - vBase
+        if vBytes <= 0:
+            ok = false
+        else:
+            vBatch = rawbytes.BytesAlloc(vBytes)
+            var i: int32 = videoStart
+            while i < vEnd:
+                let runOff: int32 = webSceneMediaEsReadLeU32(avVideoIndexData, webSceneMediaEsHeaderBytes + i * 12)
+                var j: int32 = i + 1
+                while j < vEnd:
+                    let jOff: int32 = webSceneMediaEsReadLeU32(avVideoIndexData, webSceneMediaEsHeaderBytes + j * 12)
+                    let jSize: int32 = webSceneMediaEsReadLeU32(avVideoIndexData, webSceneMediaEsHeaderBytes + j * 12 + 4)
+                    if (jOff + jSize) - runOff > webSceneMediaEsRunByteBudget:
+                        break
+                    j = j + 1
+                let lastOff: int32 = webSceneMediaEsReadLeU32(avVideoIndexData, webSceneMediaEsHeaderBytes + (j - 1) * 12)
+                let lastSize: int32 = webSceneMediaEsReadLeU32(avVideoIndexData, webSceneMediaEsHeaderBytes + (j - 1) * 12 + 4)
+                let runLen: int32 = (lastOff + lastSize) - runOff
+                var req: moqstream.Libp2pMoqSegmentStreamRequest
+                req.streamId = strs.CloneStr(webSceneMediaEsStreamId)
+                req.segmentKey = "moq-frame"
+                req.offsetBytes = runOff
+                req.lengthBytes = runLen
+                req.readChunkBytes = 262144
+                var reader: moqstream.Libp2pMoqSegmentStreamReader
+                let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(vConn), req)
+                if IsErr(openRes):
+                    webSceneMediaEsLastErr = ErrorText(openRes)
+                    ok = false
+                    break
+                let drainRes = orchestrator.WebSceneMediaOrchestrateFetchAll(reader, 262144)
+                if IsErr(drainRes):
+                    webSceneMediaEsLastErr = ErrorText(drainRes)
+                    ok = false
+                    break
+                var runBytes = Value(drainRes)
+                rawbytes.BytesCopyInto(vBatch, runOff - vBase, runBytes)
+                rawbytes.BytesFree(runBytes)
+                i = j
+    # --- audio batch on stream8 of the SAME conn (moq-aframe) ---
+    var aBatch: Bytes = rawbytes.BytesAlloc(0)
+    var aBase: int32
+    if aOk0 && ok:
+        aBase = webSceneMediaEsReadLeU32(avAudioIndexData, webSceneMediaAudioEsHeaderBytes + audioStart * webSceneMediaAudioEsEntryBytes)
+        let aEndOff: int32 = webSceneMediaEsReadLeU32(avAudioIndexData, webSceneMediaAudioEsHeaderBytes + (aEnd - 1) * webSceneMediaAudioEsEntryBytes)
+        let aEndSize: int32 = webSceneMediaEsReadLeU32(avAudioIndexData, webSceneMediaAudioEsHeaderBytes + (aEnd - 1) * webSceneMediaAudioEsEntryBytes + 4)
+        let aBytes: int32 = (aEndOff + aEndSize) - aBase
+        if aBytes <= 0:
+            ok = false
+        else:
+            aBatch = rawbytes.BytesAlloc(aBytes)
+            var i: int32 = audioStart
+            while i < aEnd:
+                let runOff: int32 = webSceneMediaEsReadLeU32(avAudioIndexData, webSceneMediaAudioEsHeaderBytes + i * webSceneMediaAudioEsEntryBytes)
+                var j: int32 = i + 1
+                while j < aEnd:
+                    let jOff: int32 = webSceneMediaEsReadLeU32(avAudioIndexData, webSceneMediaAudioEsHeaderBytes + j * webSceneMediaAudioEsEntryBytes)
+                    let jSize: int32 = webSceneMediaEsReadLeU32(avAudioIndexData, webSceneMediaAudioEsHeaderBytes + j * webSceneMediaAudioEsEntryBytes + 4)
+                    if (jOff + jSize) - runOff > webSceneMediaEsRunByteBudget:
+                        break
+                    j = j + 1
+                let lastOff: int32 = webSceneMediaEsReadLeU32(avAudioIndexData, webSceneMediaAudioEsHeaderBytes + (j - 1) * webSceneMediaAudioEsEntryBytes)
+                let lastSize: int32 = webSceneMediaEsReadLeU32(avAudioIndexData, webSceneMediaAudioEsHeaderBytes + (j - 1) * webSceneMediaAudioEsEntryBytes + 4)
+                let runLen: int32 = (lastOff + lastSize) - runOff
+                var req: moqstream.Libp2pMoqSegmentStreamRequest
+                req.streamId = webSceneMediaAudioEsStreamId
+                req.segmentKey = "moq-aframe"
+                req.offsetBytes = runOff
+                req.lengthBytes = runLen
+                req.readChunkBytes = 262144
+                var reader: moqstream.Libp2pMoqSegmentStreamReader
+                let openRes = moqstream.Libp2pMoqSegmentStreamClientOpen(reader, qconn.ConnDup(aConn), req)
+                if IsErr(openRes):
+                    webSceneMediaAudioEsLastErr = Error(openRes)
+                    ok = false
+                    break
+                let drainRes = orchestrator.WebSceneMediaOrchestrateFetchAll(reader, 262144)
+                if IsErr(drainRes):
+                    webSceneMediaAudioEsLastErr = Error(drainRes)
+                    ok = false
+                    break
+                var runBytes = Value(drainRes)
+                rawbytes.BytesCopyInto(aBatch, runOff - aBase, runBytes)
+                rawbytes.BytesFree(runBytes)
+                i = j
+    qconn.ConnClose(conn)
+    qtransport.Stop(client)
+    if !ok:
+        return false
+    if vOk0:
+        rawbytes.BytesFree(webSceneMediaEsBatchData)
+        webSceneMediaEsBatchData = vBatch
+        webSceneMediaEsBatchStart = videoStart
+        webSceneMediaEsBatchEnd = vEnd
+        webSceneMediaEsBatchByteBase = vBase
+    if aOk0:
+        rawbytes.BytesFree(webSceneMediaAudioEsBatchData)
+        webSceneMediaAudioEsBatchData = aBatch
+        webSceneMediaAudioEsBatchStart = audioStart
+        webSceneMediaAudioEsBatchEnd = aEnd
+        webSceneMediaAudioEsBatchByteBase = aBase
+    return true
+
+# Host-driven single-connection AV prefetch entry: pull a video batch around videoIdx
+# and an audio batch around audioIdx on ONE connection. Returns 1 on success, 0 on
+# failure (caller re-attempts next tick). After this, EsFrameFetch/AudioEsFrameFetch
+# serve from cache without re-dialing — both media ride one interleaved connection.
+@exportc("cheng_scene_media_av_prefetch")
+fn WebSceneMediaAvPrefetch(videoIdx: int32, audioIdx: int32): int32 =
+    # Pause backpressure gate (see WebSceneMediaEsSetPaused's doc comment): checked
+    # BEFORE any batch dial, same shape as WebSceneMediaEsStreamLoop/PrefetchTick's own
+    # pause checks — a pause set before this session has ever prefetched anything also
+    # stops the FIRST dial, not just later re-fetches.
+    if webSceneMediaEsPaused:
+        return 0
+    if !webSceneMediaEsOpenFlag || !webSceneMediaAudioEsOpenFlag:
+        return 0
+    let vCached: bool = videoIdx >= webSceneMediaEsBatchStart && videoIdx < webSceneMediaEsBatchEnd
+    let aCached: bool = audioIdx >= webSceneMediaAudioEsBatchStart && audioIdx < webSceneMediaAudioEsBatchEnd
+    if vCached && aCached:
+        return 1
+    if webSceneMediaAvFetchBatch(videoIdx, audioIdx):
+        return 1
+    return 0
+
+# Fetch ADTS access unit [frameIdx] into outBuf (bounded by outCap). Served from the
+# batch cache; a cache miss dials once and pulls the next BatchFrames on one connection.
+fn WebSceneMediaAudioEsFrameFetch(frameIdx: int32, outBuf: ptr, outCap: int32): int32 =
+    var frameAIdxData: rawbytes.Bytes
+    frameAIdxData = webSceneMediaAudioEsIndexData
+    if !webSceneMediaAudioEsOpenFlag || outBuf == nil || outCap <= 0:
+        return 0
+    if frameIdx < 0 || frameIdx >= webSceneMediaAudioEsFrames:
+        return 0
+    let entryOff: int32 = webSceneMediaAudioEsHeaderBytes + frameIdx * webSceneMediaAudioEsEntryBytes
+    let frameOffset: int32 = webSceneMediaEsReadLeU32(frameAIdxData, entryOff)
+    let frameSize: int32 = webSceneMediaEsReadLeU32(frameAIdxData, entryOff + 4)
+    if frameSize <= 0:
+        return 0
+    if frameIdx < webSceneMediaAudioEsBatchStart || frameIdx >= webSceneMediaAudioEsBatchEnd:
+        if !webSceneMediaAudioEsFetchBatch(frameIdx):
+            return 0
+    let inBatchOff: int32 = frameOffset - webSceneMediaAudioEsBatchByteBase
+    var want: int32 = frameSize
+    if want > outCap:
+        want = outCap
+    if inBatchOff < 0 || inBatchOff + want > rawbytes.BytesLen(webSceneMediaAudioEsBatchData):
+        return 0
+    var src = rawbytes.BytesSlice(webSceneMediaAudioEsBatchData, inBatchOff, want)
+    copyBytesIntoPtr(outBuf, src, want)
+    rawbytes.BytesFree(src)
+    return want
+
+# --- S7b: sequential prefetch of AUDIO ES access units into the S4 audio block cache
+# (blockcache.WebSceneMediaBlockCache{Get,Put}Audio — the audio-parallel key added by
+# S7a, see web_scene_media_block_cache.cheng:73-86). Mirrors WebSceneMediaEsPrefetchTick's
+# write-into-S4-then-let-a-read-path-hit-it shape, but audio ES has NO GOP/keyframe
+# structure (every ADTS AU decodes independently — WebSceneMediaAudioEsSeekToVideoFrame's
+# own doc comment), so a "block" here is a FIXED webSceneMediaEsBatchFrames-frame run
+# starting at a multiple of webSceneMediaEsBatchFrames, not a keyframe-aligned GOP — no
+# keyframe-flag scan is performed (block_cache.cheng:74-80's own reasoning for why the
+# audio key doesn't need one).
+#
+# Each call scans the aheadBlocks fixed blocks starting at the block containing the
+# CURRENT pump cursor (webSceneMediaAudioEsPumpCursor), fetching+caching every miss in
+# that window over the SAME persistent connection the video pump already holds open
+# (webSceneMediaFetchOnPersistent — the exact call video's own PrefetchTick uses, just
+# with the audio streamId/segmentKey — see that function's own doc comment for why a
+# separate one-shot dial cannot be issued while the persistent connection is open
+# against the single-threaded reference publisher), then advances the pump cursor —
+# via repeated calls to the EXISTING WebSceneMediaAudioEsAdvanceCursor(), never
+# reimplementing its own clamp/end-of-stream logic — to the start of the block just
+# past the scanned window. This makes the pump cursor double as "how far ahead has
+# been prefetched" (there is no separate audio consumption pump yet — that is S7c)
+# as well as a strictly sequential advance, never an arbitrary seek.
+#
+# Returns: 0 = no audio ES session open; 4 = paused (WebSceneMediaEsSetPaused — the
+# SAME pause flag video's pump/PrefetchTick already gate on, video-seek-scrub-
+# blueprint.md §7.4); 2 = nothing to do (aheadBlocks/frame count non-positive, no
+# asset cid yet, or the cursor's block is already at/past the end of the stream); 3 =
+# a block's fetch or cache write failed (see WebSceneMediaAudioEsLastError() — the
+# cursor is left unmoved so the caller retries the SAME window on a later tick, never
+# advancing past an unconfirmed write); 1 = the whole window was processed (a mix of
+# cache hits and/or fresh fetches, all now cached) and the cursor advanced.
+fn WebSceneMediaAudioEsPrefetchTick(aheadBlocks: int32): int32 =
+    var prefAIdxData: rawbytes.Bytes
+    prefAIdxData = webSceneMediaAudioEsIndexData
+    if !webSceneMediaAudioEsOpenFlag:
+        return 0
+    if webSceneMediaEsPaused:
+        return 4
+    if aheadBlocks <= 0 || webSceneMediaAudioEsFrames <= 0:
+        return 2
+    if webSceneMediaEsAssetCid.len == 0:
+        return 2
+    let blockSize: int32 = webSceneMediaEsBatchFrames
+    let currentBlockStart: int32 = (webSceneMediaAudioEsPumpCursor / blockSize) * blockSize
+    if currentBlockStart >= webSceneMediaAudioEsFrames:
+        return 2
+    var windowEnd: int32 = currentBlockStart + aheadBlocks * blockSize
+    if windowEnd > webSceneMediaAudioEsFrames:
+        windowEnd = webSceneMediaAudioEsFrames
+    var blockStart: int32 = currentBlockStart
+    while blockStart < windowEnd:
+        var blockEnd: int32 = blockStart + blockSize
+        if blockEnd > webSceneMediaAudioEsFrames:
+            blockEnd = webSceneMediaAudioEsFrames
+        let cacheRes: Result[Bytes] = blockcache.WebSceneMediaBlockCacheGetAudio(strs.CloneStr(webSceneMediaEsAssetCid), blockStart)
+        if IsErr(cacheRes):
+            let blockStartOff: int32 = webSceneMediaEsReadLeU32(prefAIdxData, webSceneMediaAudioEsHeaderBytes + blockStart * webSceneMediaAudioEsEntryBytes)
+            let lastOff: int32 = webSceneMediaEsReadLeU32(prefAIdxData, webSceneMediaAudioEsHeaderBytes + (blockEnd - 1) * webSceneMediaAudioEsEntryBytes)
+            let lastSize: int32 = webSceneMediaEsReadLeU32(prefAIdxData, webSceneMediaAudioEsHeaderBytes + (blockEnd - 1) * webSceneMediaAudioEsEntryBytes + 4)
+            let blockLen: int32 = (lastOff + lastSize) - blockStartOff
+            if blockLen <= 0:
+                webSceneMediaAudioEsLastErr = "prefetch: computed non-positive block byte length"
+                return 3
+            let fetchRes = webSceneMediaFetchOnPersistent("moq-aframe", strs.CloneStr(webSceneMediaAudioEsStreamId),
+                                                           blockStartOff, blockLen, 262144)
+            if IsErr(fetchRes):
+                webSceneMediaAudioEsLastErr = Error(fetchRes)
+                return 3
+            var fetched: Bytes = Value(fetchRes)
+            let putOk: bool = blockcache.WebSceneMediaBlockCachePutAudio(strs.CloneStr(webSceneMediaEsAssetCid), blockStart, fetched)
+            rawbytes.BytesFree(fetched)
+            if !putOk:
+                webSceneMediaAudioEsLastErr = "prefetch: audio block cache put failed"
+                return 3
+        blockStart = blockStart + blockSize
+    while webSceneMediaAudioEsPumpCursor < windowEnd:
+        if WebSceneMediaAudioEsAdvanceCursor() < 0:
+            break
+    return 1
+
+fn WebSceneMediaAudioEsClose() =
+    webSceneMediaAudioEsOpenFlag = false
+    rawbytes.BytesFree(webSceneMediaAudioEsBatchData)
+    webSceneMediaAudioEsBatchStart = -1
+    webSceneMediaAudioEsBatchEnd = 0
+
+# NOTE: cheng_scene_media_session_{open,read_at,total,close} are @exportc'd by the
+# scene runtime (SR) as thin wrappers over these plain functions — the bridge-side
+# @exportc copies were removed (cold duplicate-symbol hard-fail); open's cstring
+# arg needs the SR's __chengCstrBorrowFix (cross-module StrFromCStringBorrow folds
+# c_strlen→0).
+
+# C-ABI seam for the platform host: fetch the object over QUIC and write the raw
+# bytes to outPath, so the host's decode path can MediaCodec/AMediaExtractor it
+# from a file the same way it would a bundled asset. Returns the byte count on
+# success, or a negative status (-1 fetch failed, -2 write failed). This is the
+# single call the generated Android/Harmony host makes for a moq-transport asset
+# instead of reading the bundled blob.
+@exportc("cheng_scene_media_fetch_remote_to_file")
+fn chengSceneMediaFetchRemoteToFileExport(dialHostC: cstring,
+                                          port: int32,
+                                          streamIdC: cstring,
+                                          segmentKeyC: cstring,
+                                          offsetBytes: int32,
+                                          lengthBytes: int32,
+                                          readChunkBytes: int32,
+                                          outPathC: cstring): int32 =
+    let dialHost: str = system.strFromCStringCopy(dialHostC)
+    let streamId: str = system.strFromCStringCopy(streamIdC)
+    let segmentKey: str = system.strFromCStringCopy(segmentKeyC)
+    let outPath: str = system.strFromCStringCopy(outPathC)
+    let fetchRes = WebSceneMediaFetchRemoteObject(dialHost, port, streamId, segmentKey,
+                                                  offsetBytes, lengthBytes, readChunkBytes)
+    if IsErr(fetchRes):
+        return -1
+    var bytes = Value(fetchRes)
+    let writeRes = os.WriteFileBytesResult(outPath, bytes)
+    if IsErr(writeRes):
+        return -2
+    return rawbytes.BytesLen(bytes)
+
+# Parse one "key=value" field out of the publisher announce block.
+@borrows
+fn webSceneMediaAnnounceField(text: str, key: str): str =
+    let parts = strutil.Split(strs.CloneStr(text), ' ')
+    var i: int32
+    while i < parts.len:
+        let kv = strutil.Split(parts[i], '=')
+        if kv.len == 2 && kv[0] == key:
+            return strs.ConcatStr(kv[1], "")
+        i = i + 1
+    return ""
+
+# High-level 对端秒开 entry the host calls for a moq-transport asset: fetch the
+# publisher's announce block, learn the object identity it serves, fetch that
+# object in full, and drop it at outPath for the host decoder. One call from the
+# generated host replaces the bundled-asset read. Returns the object byte count,
+# or a negative status (-1 announce fetch, -3 announce parse, -4/-5 bad length,
+# -6 object fetch, -2 write). objectTargetBytes at publish time must cover the
+# whole media file so the single announced object is the complete asset.
+# Classify an in-app moq/dial error by keyword into the host's "fetch failed n=<code>"
+# log (pure string match, no file/alloc ops). Base 2000; +webSceneMediaFetchStep in the
+# ones place. recv=2200 send=2300 timeout=2400 handshake=2500 active=2600 ready=2700
+# settings=2800 tls=2900 refused=3100 bind=3300 ... else=last-4-chars encoded at 1000000+.
+fn webSceneMediaClassifyMoqErr(etext: str): int32 =
+    if strutil.Contains(etext, "recv"):
+        return 0 - (2200 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "send"):
+        return 0 - (2300 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "timeout"):
+        return 0 - (2400 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "handshake"):
+        return 0 - (2500 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "active"):
+        return 0 - (2600 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "ready"):
+        return 0 - (2700 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "settings"):
+        return 0 - (2800 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "tls"):
+        return 0 - (2900 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "refused"):
+        return 0 - (3100 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "bind"):
+        return 0 - (3300 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "lost"):
+        return 0 - (3310 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "datapath"):
+        return 0 - (3320 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "socket"):
+        return 0 - (3330 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "session"):
+        return 0 - (3340 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "pipe"):
+        return 0 - (3350 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "memory") || strutil.Contains(etext, "alloc") || strutil.Contains(etext, "slab"):
+        return 0 - (3360 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "full"):
+        return 0 - (3370 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "init"):
+        return 0 - (3380 + webSceneMediaFetchStep)
+    if strutil.Contains(etext, "side"):
+        return 0 - (3390 + webSceneMediaFetchStep)
+    var e4: int32
+    var eidx: int32 = etext.len - 4
+    if eidx < 0:
+        eidx = 0
+    while eidx < etext.len:
+        e4 = e4 * 128 + int32(etext[eidx])
+        eidx = eidx + 1
+    return 0 - (1000000 + e4)
+
+# Single-connection announce+object fetch. The publisher's serial accept loop parks in a
+# blocking read on the announce connection (its moq-announce branch serves WITHOUT FIN, by
+# design, so the SAME conn carries the follow-up object request — the subscriber/ES-loop
+# pattern). A second dial for the object is therefore never accepted, stranding the read.
+# So negotiate once and issue announce THEN object on one connection.
+fn WebSceneMediaFetchRemoteAnnouncedToFile(dialHost: str, port: int32, outPath: str): int32 =
+    # MoQ segment 协议 = 同一条连接上"写请求帧→读 expectedBytes 原始字节→写下一个请求帧"。
+    # publisher 的 moq-announce/moq-asset 分支都不 connDone、不 shutdown,正是为在一条连接上
+    # 顺序服务多个 range 请求而设计。所以:dial+negotiate+ack 一次,announce 与所有块共用这条
+    # 连接,**绝不 per-reader Close**(Libp2pMoqSegmentStreamClose 会 ConnClose 整条连接 → 下一块
+    # open 写到已关连接 = -6),只在全部块取完后 ConnClose 一次。
+    webSceneMediaFetchStep = 1
+    var client = qtransport.InitMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = quic_transport.Libp2pQuicDialOneShotClientNamed(client, conn, strs.CloneStr(dialHost), port, "localhost")
+    if IsErr(dialRes):
+        qtransport.Stop(client)
+        return webSceneMediaClassifyMoqErr(Error(dialRes))
+    webSceneMediaFetchStep = 2
+    let negRes = moqstream.Libp2pMoqSegmentStreamClientSendNegotiate(client, conn)
+    if IsErr(negRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return webSceneMediaClassifyMoqErr(Error(negRes))
+    webSceneMediaFetchStep = 3
+    let ackRes = moqstream.Libp2pMoqSegmentStreamClientReadNegotiateAck(client, conn)
+    if IsErr(ackRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return webSceneMediaClassifyMoqErr(Error(ackRes))
+    # announce → asset_bytes(同一条连接,不 Close annReader)
+    webSceneMediaFetchStep = 4
+    var annReq: moqstream.Libp2pMoqSegmentStreamRequest
+    annReq.streamId = "gui-announce-1"
+    annReq.segmentKey = "moq-announce"
+    annReq.offsetBytes = 0
+    annReq.lengthBytes = 1024
+    annReq.readChunkBytes = 1024
+    var annReader: moqstream.Libp2pMoqSegmentStreamReader
+    let annOpenRes = moqstream.Libp2pMoqSegmentStreamClientOpen(annReader, qconn.ConnDup(conn), annReq)
+    if IsErr(annOpenRes):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return webSceneMediaClassifyMoqErr(Error(annOpenRes))
+    let annDrain = orchestrator.WebSceneMediaOrchestrateFetchAll(annReader, 1024)
+    if IsErr(annDrain):
+        qconn.ConnClose(conn)
+        qtransport.Stop(client)
+        return webSceneMediaClassifyMoqErr(Error(annDrain))
+    let announce: str = rawbytes.BytesToString(Value(annDrain))
+    # 连续播放需要完整 mp4:AMediaExtractor 以固定 fd 长度打开,需要 moov + 全部 mdat
+    # 才能逐帧推进。拉整个 asset(moov faststart 在头部,首帧依旧能立即解出=秒开)。
+    # 解析不到 asset_bytes 时退回首帧前缀大小(仅够 moov + 第一个 IDR)。
+    var fetchLen: int32 = 262144
+    let assetBytesStr: str = webSceneMediaAnnounceField(announce, "asset_bytes")
+    var assetBytesTotal: int32
+    if cmdline.ParseInt32(assetBytesStr, assetBytesTotal):
+        if assetBytesTotal > 0:
+            fetchLen = assetBytesTotal
+    # 渐进式分块取 mp4:每块 ≤256KB(loss-recovery-less Cheng QUIC 单次可靠传输的单元),
+    # 在同一条连接上顺序请求 [offset:chunk],BytesConcat 拼成完整文件。
+    webSceneMediaFetchStep = 5
+    let chunkSize: int32 = 262144
+    var assembled: rawbytes.Bytes = rawbytes.BytesAlloc(0)
+    var offset: int32
+    while offset < fetchLen:
+        var thisLen: int32 = chunkSize
+        if fetchLen - offset < thisLen:
+            thisLen = fetchLen - offset
+        var partReq: moqstream.Libp2pMoqSegmentStreamRequest
+        partReq.streamId = strutil.Join(["gui-asset-", strs.IntToStr(offset)], "")
+        partReq.segmentKey = "moq-asset"
+        partReq.offsetBytes = offset
+        partReq.lengthBytes = thisLen
+        partReq.readChunkBytes = 65536
+        var partReader: moqstream.Libp2pMoqSegmentStreamReader
+        let partOpenRes = moqstream.Libp2pMoqSegmentStreamClientOpen(partReader, qconn.ConnDup(conn), partReq)
+        if IsErr(partOpenRes):
+            rawbytes.BytesFree(assembled)
+            qconn.ConnClose(conn)
+            qtransport.Stop(client)
+            return webSceneMediaClassifyMoqErr(Error(partOpenRes))
+        let partDrain = orchestrator.WebSceneMediaOrchestrateFetchAll(partReader, thisLen)
+        if IsErr(partDrain):
+            rawbytes.BytesFree(assembled)
+            qconn.ConnClose(conn)
+            qtransport.Stop(client)
+            return webSceneMediaClassifyMoqErr(Error(partDrain))
+        let merged = rawbytes.BytesConcat(assembled, Value(partDrain))
+        rawbytes.BytesFree(assembled)
+        assembled = merged
+        offset = offset + thisLen
+    qconn.ConnClose(conn)
+    qtransport.Stop(client)
+    let writeRes = os.WriteFileBytesResult(outPath, assembled)
+    if IsErr(writeRes):
+        rawbytes.BytesFree(assembled)
+        return -2
+    let total = rawbytes.BytesLen(assembled)
+    rawbytes.BytesFree(assembled)
+    return total
+
+# cheng_scene_media_fetch_remote_announced_to_file 的 C-ABI seam 同样只由 SR 薄包装导出,
+# 桥侧副本已删(cold duplicate-symbol 硬失败)。
+
+# 对端秒开 for the poster still image: fetch the announce to learn poster_length,
+# then fetch the publisher's "moq-poster" fixed segment (a complete PNG/JPEG) and
+# drop it at outPath for the host's OH_ImageSourceNative decode. Mirrors the video
+# announced fetch. Returns the poster byte count, or negative (-1 announce, -3
+# missing field, -4 parse, -5 bad length, -6 poster fetch, -2 write).
+fn WebSceneMediaFetchRemotePosterToFile(dialHost: str, port: int32, outPath: str): int32 =
+    let annRes = WebSceneMediaFetchRemoteObject(strs.CloneStr(dialHost), port, "gui-announce-p", "moq-announce", 0, 1024, 1024)
+    if IsErr(annRes):
+        return -1
+    let announce: str = rawbytes.BytesToString(Value(annRes))
+    let posterLenStr: str = webSceneMediaAnnounceField(announce, "poster_length")
+    if posterLenStr.len == 0:
+        return -3
+    var posterLen: int32
+    if !cmdline.ParseInt32(posterLenStr, posterLen):
+        return -4
+    if posterLen <= 0:
+        return -5
+    let posterRes = WebSceneMediaFetchRemoteObject(dialHost, port, "gui-poster-1", "moq-poster", 0, posterLen, 4096)
+    if IsErr(posterRes):
+        # Encode the LAST 4 chars of the poster-fetch error (decode: e=(-code)-7000000)
+        # so we can read the exact failure without string/file ops on this path.
+        let etext: str = Error(posterRes)
+        var e4: int32
+        var eidx: int32 = etext.len - 4
+        if eidx < 0:
+            eidx = 0
+        while eidx < etext.len:
+            e4 = e4 * 128 + int32(etext[eidx])
+            eidx = eidx + 1
+        return 0 - (7000000 + e4)
+    var posterBytes = Value(posterRes)
+    let writeRes = os.WriteFileBytesResult(outPath, posterBytes)
+    if IsErr(writeRes):
+        return -2
+    return rawbytes.BytesLen(posterBytes)
+
+# Drain a TCP connection to EOF, accumulating into one Bytes (cap-bounded). The
+# poster TCP server FINs after [4-byte length][poster], so EOF marks completion.
+fn webSceneMediaTcpDrainToEof(conn: var tcp.TcpConnectionHandle, cap: int32): Result[Bytes] =
+    var acc: Bytes = rawbytes.BytesAlloc(0)
+    while true:
+        let chunkRes = tcp.TcpRecv(conn, 65536)
+        if IsErr(chunkRes):
+            return Err[Bytes](ErrorText(chunkRes))
+        let chunk = Value(chunkRes)
+        if rawbytes.BytesLen(chunk) == 0:
+            return Ok[Bytes](acc)
+        acc = rawbytes.BytesConcat(acc, chunk)
+        if rawbytes.BytesLen(acc) > cap:
+            return Err[Bytes]("tcp poster: oversize")
+
+# 对端秒开 poster over the kernel-TCP side channel (see media_moq_publisher_main):
+# the pure-Cheng QUIC lacks STREAM-data loss recovery, so a ~460KB still image
+# stalls on it; the OS kernel TCP stack delivers it reliably. Connects to the
+# SAME host:port as the QUIC dial, sends "moq-poster\n", reads
+# [4-byte big-endian length][poster], validates the length, writes the file.
+# Returns the poster byte count, or negative (-11 connect, -12 request,
+# -13 read, -14 short, -15 length mismatch, -2 write).
+fn webSceneMediaFetchBlobViaTcpToFile(dialHost: str, port: int32, requestKey: str, capBytes: int32, outPath: str): int32 =
+    # Unprotected connect: the GUI is not a VPN, so there is no socket-protect
+    # callback to honour, and the protected/timeout path drags in the mobile
+    # connect bridge that the OHOS runtime providers do not define.
+    let connRes = tcp.TcpConnect4Unprotected(dialHost, port)
+    if IsErr(connRes):
+        return -11
+    var conn = Value(connRes)
+    var req: Bytes = rawbytes.BytesFromString(requestKey)
+    let sendRes = tcp.TcpSend(conn, req)
+    if IsErr(sendRes):
+        tcp.TcpClose(conn)
+        return -12
+    let drainRes = webSceneMediaTcpDrainToEof(conn, capBytes)
+    tcp.TcpClose(conn)
+    if IsErr(drainRes):
+        return -13
+    var frame = Value(drainRes)
+    let total: int32 = rawbytes.BytesLen(frame)
+    if total < 4:
+        return -14
+    let declaredLen: int32 = (rawbytes.BytesGet(frame, 0) << 24) |
+                             (rawbytes.BytesGet(frame, 1) << 16) |
+                             (rawbytes.BytesGet(frame, 2) << 8) |
+                             rawbytes.BytesGet(frame, 3)
+    if declaredLen <= 0 || total != declaredLen + 4:
+        return -15
+    var blob = rawbytes.BytesSlice(frame, 4, declaredLen)
+    let writeRes = os.WriteFileBytesResult(outPath, blob)
+    if IsErr(writeRes):
+        return -2
+    return declaredLen
+
+# 对端秒开 poster (single large still-image blob) over kernel TCP — see header.
+fn WebSceneMediaFetchRemotePosterViaTcpToFile(dialHost: str, port: int32, outPath: str): int32 =
+    return webSceneMediaFetchBlobViaTcpToFile(dialHost, port, "moq-poster\n", 8388608, outPath)
+
+# Land the full video clip for complete frame-paced playback. Production transport
+# is MoQ-over-QUIC (bounded per-GOP segments, size-independent); this kernel-TCP
+# path is the reachable bench transport. 64MB cap covers real short clips.
+fn WebSceneMediaFetchRemoteVideoViaTcpToFile(dialHost: str, port: int32, outPath: str): int32 =
+    return webSceneMediaFetchBlobViaTcpToFile(dialHost, port, "moq-video\n", 67108864, outPath)

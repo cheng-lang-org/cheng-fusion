@@ -1,0 +1,166 @@
+import std/result
+import std/os
+import std/strings
+import std/strutils as strutil
+import std/cmdline
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/hf_model_graph as hfgraph
+import cheng/inference/weight_store as ws
+import cheng/inference/weight_binding as wb
+import cheng/inference/model_executor as mexec
+import cheng/inference/distributed_engine as engine
+
+# 小优 S5 冒烟: WeightSafetensorsLoadGraphFilePath (整文件读入) vs
+# WeightSafetensorsLoadGraphFilePathStreaming (逐张量精确区间读) 双路等价性 +
+# 峰值内存对比。
+#
+# 用法 (由 tools/inference_planner_cli_weights_path_streaming_smoke.sh 驱动,
+# 对同一份磁盘 safetensors 夹具跑两次独立进程, 各自套 /usr/bin/time -l 采集
+# 峰值 RSS):
+#   --config <config.json> --weights <model.safetensors> --loader streaming|nonstreaming
+#
+# stdout 只含与所选 loader 无关的确定性结果 (graph 结构 + 逐张量 payloadHash +
+# 生成 token id), 不打印 loader 名字, 让两次运行的 stdout 可以逐字节 diff。
+
+type
+    DualLoadResult =
+        graph: mg.ModelGraph
+        bindings: wb.WeightBindingSet
+        store: ws.WeightTensorStore
+
+fn dualPeerIds(count: int32): str[] =
+    var peers: str[]
+    for i in 0..<count:
+        add(peers, strutil.Join(["peer:xiaoyou-planner-dual:", strings.IntToStr(i)], ""))
+    return peers
+
+fn dualLoadFromPaths(configPath: str,
+                     weightsPath: str,
+                     modelCid: str,
+                     tensorScale: int32,
+                     useStreaming: bool): Result[DualLoadResult] =
+    if configPath == "":
+        return Err[DualLoadResult]("streaming dual smoke: missing --config")
+    if weightsPath == "":
+        return Err[DualLoadResult]("streaming dual smoke: missing --weights")
+    if !os.FileExists(configPath):
+        return Err[DualLoadResult](strutil.Join(
+            ["streaming dual smoke: config not found: ", configPath], ""))
+    if !os.FileExists(weightsPath):
+        return Err[DualLoadResult](strutil.Join(
+            ["streaming dual smoke: weights not found: ", weightsPath], ""))
+
+    let configRes = os.ReadFileResult(configPath)
+    if IsErr(configRes):
+        return Err[DualLoadResult](Error(configRes))
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        Value(configRes),
+        modelCid,
+        kir.KernelDtypeFp16,
+        mg.ModelQuantSchemeNone
+    )
+    if IsErr(graphRes):
+        return Err[DualLoadResult](Error(graphRes))
+    let graph = Value(graphRes)
+    let graphOk = mg.ModelGraphValidate(graph)
+    if IsErr(graphOk):
+        return Err[DualLoadResult](Error(graphOk))
+    if graph.weights.len <= 0:
+        return Err[DualLoadResult]("streaming dual smoke: empty weight inventory")
+
+    let peerIds = dualPeerIds(graph.weights.len)
+    var loaded: Result[ws.WeightSafetensorsLoadResult]
+    if useStreaming:
+        loaded = ws.WeightSafetensorsLoadGraphFilePathStreaming(weightsPath, graph, peerIds, tensorScale)
+    else:
+        loaded = ws.WeightSafetensorsLoadGraphFilePath(weightsPath, graph, peerIds, tensorScale)
+    if IsErr(loaded):
+        return Err[DualLoadResult](Error(loaded))
+    let loadResult = Value(loaded)
+    if loadResult.store.payloads.len != graph.weights.len:
+        return Err[DualLoadResult]("streaming dual smoke: payload count mismatch")
+
+    var hashes: int64[]
+    for i in 0..<loadResult.store.payloads.len:
+        if loadResult.store.payloads[i].tensorName != graph.weights[i].tensorName:
+            return Err[DualLoadResult]("streaming dual smoke: payload order mismatch")
+        add(hashes, loadResult.store.payloads[i].payloadHash)
+    let boundGraphRes = mg.ModelGraphBindExpectedWeightPayloadHashes(graph, hashes)
+    if IsErr(boundGraphRes):
+        return Err[DualLoadResult](Error(boundGraphRes))
+    let boundGraph = Value(boundGraphRes)
+    let bindOk = wb.WeightBindingValidate(loadResult.bindings, boundGraph)
+    if IsErr(bindOk):
+        return Err[DualLoadResult](Error(bindOk))
+    let storeOk = ws.WeightTensorValidateStore(loadResult.store, loadResult.bindings, boundGraph)
+    if IsErr(storeOk):
+        return Err[DualLoadResult](Error(storeOk))
+    let gateRes = mexec.ModelExecutorValidateDenseTransformerGraph(
+        boundGraph, loadResult.bindings, loadResult.store)
+    if IsErr(gateRes):
+        return Err[DualLoadResult](Error(gateRes))
+    if !Value(gateRes):
+        return Err[DualLoadResult]("streaming dual smoke: graph gate false")
+    return Ok[DualLoadResult](DualLoadResult(
+        graph: boundGraph,
+        bindings: loadResult.bindings,
+        store: loadResult.store
+    ))
+
+fn dualHashesToString(hashes: int64[]): str =
+    var parts: str[]
+    for i in 0..<hashes.len:
+        add(parts, strings.Int64ToStr(hashes[i]))
+    return strutil.Join(parts, ",")
+
+fn dualTokenIdsToString(ids: int32[]): str =
+    var parts: str[]
+    for i in 0..<ids.len:
+        add(parts, strings.IntToStr(ids[i]))
+    return strutil.Join(parts, ",")
+
+fn main(): int32 =
+    let configPath = cmdline.ReadFlagOrDefault("--config", "")
+    let weightsPath = cmdline.ReadFlagOrDefault("--weights", "")
+    let loaderFlag = cmdline.ReadFlagOrDefault("--loader", "")
+    if configPath == "" || weightsPath == "":
+        echo("streaming_dual_smoke: hard-fail missing --config/--weights")
+        return 2
+    if loaderFlag != "streaming" && loaderFlag != "nonstreaming":
+        echo("streaming_dual_smoke: hard-fail --loader must be streaming|nonstreaming")
+        return 2
+    let useStreaming = loaderFlag == "streaming"
+    let modelCid = "cid:model:xiaoyou-planner-cli-weights-path-streaming-dual-smoke"
+    let tensorScale = int32(1000)
+
+    let loadedRes = dualLoadFromPaths(configPath, weightsPath, modelCid, tensorScale, useStreaming)
+    if IsErr(loadedRes):
+        echo(strutil.Join(["load_error=", Error(loadedRes)], ""))
+        return 1
+    let loaded = Value(loadedRes)
+
+    echo(strutil.Join(["graph_weights: ", strings.IntToStr(loaded.graph.weights.len)], ""))
+    echo(strutil.Join(["graph_ops: ", strings.IntToStr(loaded.graph.ops.len)], ""))
+
+    var hashes: int64[]
+    for i in 0..<loaded.store.payloads.len:
+        add(hashes, loaded.store.payloads[i].payloadHash)
+    echo(strutil.Join(["store_payload_hashes: ", dualHashesToString(hashes)], ""))
+
+    var promptTokenIds: infer.TensorQ
+    let promptOk = infer.TensorFromDataFill(promptTokenIds, [3], 1, [2, 1, 0])
+    if IsErr(promptOk):
+        echo(strutil.Join(["prompt_tensor_error=", Error(promptOk)], ""))
+        return 1
+
+    let generatedRes = engine.DistributedGenerateGreedyDenseTransformerTokens(
+        loaded.graph, loaded.bindings, loaded.store, promptTokenIds, 3, -1)
+    if IsErr(generatedRes):
+        echo(strutil.Join(["generate_error=", Error(generatedRes)], ""))
+        return 1
+    let generated = Value(generatedRes)
+    echo(strutil.Join(["generated_token_ids: ", dualTokenIdsToString(generated.data)], ""))
+    echo("inference_planner_cli_weights_path_streaming_dual_smoke ok")
+    return 0

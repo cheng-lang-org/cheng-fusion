@@ -1,0 +1,164 @@
+# Standalone real WebTransport/QUIC listener process.
+#
+# Binds a real UDP/QUIC listener on 127.0.0.1:<port>, presents a freshly
+# issued ECDSA P-256 self-signed leaf certificate (std/tls/x509_issue.cheng,
+# validity <= 14 days -- the shape browsers require for the
+# `serverCertificateHashes` pinning mode), negotiates ALPN "h3", performs the
+# real HTTP/3 SETTINGS preamble + Extended CONNECT (RFC 9220) handshake
+# (cheng/libp2p/transports/webtransport_h3_session.cheng), then accepts one
+# bidirectional WebTransport data stream and echoes back whatever bytes it
+# receives. Prints the bound port and the certificate's SHA-256 fingerprint
+# (hex) to stdout for an external client to dial with.
+#
+# This is a NEW standalone entry point -- it does not touch host.cheng or
+# any existing libp2p Transport registration (out of scope for this slice).
+
+import std/result
+import std/system
+import std/os
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
+import std/cmdline as cmdline
+import std/tls/x509 as x509
+import std/tls/x509_issue as x509issue
+import cheng/quic/connection as qconn
+import cheng/quic/multiaddress as qaddr
+import cheng/quic/msquictransport_native as qtransport
+import cheng/quic/tls/policy as qpolicy
+import cheng/libp2p/transports/quic_transport as quic_transport
+import cheng/libp2p/transports/webtransport_common as wtcommon
+import cheng/libp2p/transports/webtransport_wire as wtwire
+import cheng/libp2p/transports/webtransport_h3_session as wth3
+
+const
+    wtListenerAcceptWaitMs = 20000
+    wtListenerBidiWaitAttempts = 500
+    wtListenerBidiWaitPollMs = 10
+    wtListenerEchoMaxBytes = 65536
+    wtListenerEchoFirstByteWaitMs = 5000
+    wtListenerEchoQuietGapMs = 200
+
+fn wtListenerLog(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn wtListenerBuildServerPolicy(sanHost: str, validityDays: int32): Result[qpolicy.MsQuicTlsPolicy] =
+    let issuedRes: Result[x509issue.X509IssuedCert] = x509issue.X509IssueSelfSignedLeaf(strings.CloneStr(sanHost), validityDays)
+    if IsErr(issuedRes):
+        return Err[qpolicy.MsQuicTlsPolicy]("cert issue: " + ErrorText(issuedRes))
+    let cert: x509issue.X509IssuedCert = Value(issuedRes)
+    var policy: qpolicy.MsQuicTlsPolicy
+    policy.serverName = sanHost
+    policy.allowInsecure = false
+    policy.certChainCount = 1
+    policy.certChain0 = rawbytes.BytesSlice(cert.der, 0, rawbytes.BytesLen(cert.der))
+    policy.certPrivateKey = rawbytes.BytesSlice(cert.privateKeyRaw, 0, rawbytes.BytesLen(cert.privateKeyRaw))
+    policy.certLeafKeyKind = x509.X509KeyEcdsaP256
+    policy.trustRootsCount = 1
+    policy.trustRoot0 = rawbytes.BytesSlice(cert.der, 0, rawbytes.BytesLen(cert.der))
+    let alpnRes: Result[bool] = qpolicy.msquicTlsPolicyAddAlpn(policy, "h3")
+    if IsErr(alpnRes):
+        return Err[qpolicy.MsQuicTlsPolicy]("alpn: " + ErrorText(alpnRes))
+    os.WriteLine(os.Get_stdout(), "WT_LISTENER_CERTHASH=" + BytesToHex(cert.certHash))
+    os.WriteLine(os.Get_stdout(), "WT_LISTENER_CERTDER_HEX=" + BytesToHex(cert.der))
+    return Ok[qpolicy.MsQuicTlsPolicy](policy)
+
+fn wtListenerServeOneSession(listener: var qtransport.MsQuicTransport, expectedPath: str, withH3SettingsPreamble: bool): int32 =
+    let acceptRes: Result[qconn.Connection] = qtransport.AcceptTimed(listener, wtListenerAcceptWaitMs)
+    if IsErr(acceptRes):
+        wtListenerLog("wt_listener: accept: " + ErrorText(acceptRes))
+        return 5
+    var base: qconn.Connection = Value(acceptRes)
+    let handleRes: Result[bool] = wth3.Wth3ServerHandleConnection(listener, base, expectedPath, withH3SettingsPreamble)
+    if IsErr(handleRes):
+        wtListenerLog("wt_listener: session rejected: " + ErrorText(handleRes))
+        os.WriteLine(os.Get_stdout(), "WT_LISTENER_SESSION_REJECTED=" + ErrorText(handleRes))
+        qconn.ConnClose(base)
+        return 6
+    os.WriteLine(os.Get_stdout(), "WT_LISTENER_SESSION_ESTABLISHED=1")
+    let bidiRes: Result[int64] = wth3.Wth3AwaitBidiStream(listener, base, int64(4), wtListenerBidiWaitAttempts, wtListenerBidiWaitPollMs)
+    if IsErr(bidiRes):
+        wtListenerLog("wt_listener: bidi stream: " + ErrorText(bidiRes))
+        qconn.ConnClose(base)
+        return 7
+    let streamId: int64 = Value(bidiRes)
+    var dataConn: qconn.Connection = qconn.ConnDeriveStream(base, streamId, streamId)
+    let sigRes: Result[int64] = wtwire.Wth3ReadVarint(listener, dataConn)
+    if IsErr(sigRes):
+        wtListenerLog("wt_listener: read WT_STREAM signal: " + ErrorText(sigRes))
+        qconn.ConnClose(base)
+        return 8
+    let sessionIdRes: Result[int64] = wtwire.Wth3ReadVarint(listener, dataConn)
+    if IsErr(sessionIdRes):
+        wtListenerLog("wt_listener: read WT_STREAM session id: " + ErrorText(sessionIdRes))
+        qconn.ConnClose(base)
+        return 8
+    os.WriteLine(os.Get_stdout(), "WT_LISTENER_BIDI_STREAM_ID=" + strutil.Join([IntToStr(int32(streamId))], ""))
+    let payloadRes: Result[Bytes] = wtwire.Wth3ReadAvailable(listener, dataConn, wtListenerEchoMaxBytes, wtListenerEchoFirstByteWaitMs, wtListenerEchoQuietGapMs)
+    if IsErr(payloadRes):
+        wtListenerLog("wt_listener: read app payload: " + ErrorText(payloadRes))
+        qconn.ConnClose(base)
+        return 9
+    let payload: Bytes = Value(payloadRes)
+    os.WriteLine(os.Get_stdout(), "WT_LISTENER_RECEIVED_BYTES=" + IntToStr(BytesLen(payload)))
+    os.WriteLine(os.Get_stdout(), "WT_LISTENER_RECEIVED_HEX=" + BytesToHex(payload))
+    let echoRes: Result[bool] = quic_transport.Libp2pQuicWriteExact(listener, dataConn, payload)
+    if IsErr(echoRes):
+        wtListenerLog("wt_listener: echo write: " + ErrorText(echoRes))
+        qconn.ConnClose(base)
+        return 10
+    os.WriteLine(os.Get_stdout(), "WT_LISTENER_ECHOED_BYTES=" + IntToStr(BytesLen(payload)))
+    qconn.ConnClose(base)
+    return 0
+
+fn main(): int32 =
+    let port: int32 = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    var sanHostRaw: str
+    let hasSanHost: bool = cmdline.ReadFirstFlagValue("--san-host", sanHostRaw)
+    let sanHost: str = if hasSanHost: sanHostRaw else: "127.0.0.1"
+    let validityDays: int32 = cmdline.ReadInt32FlagOrDefault("--cert-days", 1)
+    if validityDays <= 0 || validityDays > 14:
+        wtListenerLog("wt_listener: --cert-days must be in 1..14")
+        return 2
+    var pathRaw: str
+    let hasPath: bool = cmdline.ReadFirstFlagValue("--path", pathRaw)
+    let expectedPath: str = if hasPath: pathRaw else: "/wt"
+    let maxSessions: int32 = cmdline.ReadInt32FlagOrDefault("--max-sessions", 1)
+    # Off by default: see webtransport_h3_session.cheng's VERIFIED TRANSPORT
+    # GAP note -- turning this on makes every session fail encoding the
+    # preamble's own SETTINGS frame, the F07 hard flaw's still-open
+    # same-file const sub-case in quic_varint.cheng, unrelated to this file
+    # (bounded, explicit failure, not a hang). Pass --h3-settings-preamble
+    # to reproduce that.
+    let withH3SettingsPreamble: bool = cmdline.HasFlag("--h3-settings-preamble")
+
+    let policyRes: Result[qpolicy.MsQuicTlsPolicy] = wtListenerBuildServerPolicy(strings.CloneStr(sanHost), validityDays)
+    if IsErr(policyRes):
+        wtListenerLog("wt_listener: " + ErrorText(policyRes))
+        return 3
+    let policy: qpolicy.MsQuicTlsPolicy = Value(policyRes)
+
+    var listener = qtransport.InitMsQuicTransport()
+    let tlsRes: Result[bool] = qtransport.setMsQuicTransportTlsPolicy(listener, policy)
+    if IsErr(tlsRes):
+        wtListenerLog("wt_listener: tls policy: " + ErrorText(tlsRes))
+        return 4
+    let addrText = "/ip4/127.0.0.1/udp/" + IntToStr(port) + "/quic-v1"
+    let addrData = BytesSlice(BytesFromString(addrText), 0, len(addrText))
+    var addr: qaddr.MultiAddress
+    addr.raw = addrText
+    addr.data = addrData
+    qtransport.start(listener, addr)
+    if ! listener.running:
+        wtListenerLog("wt_listener: listener start: " + listener.lastError)
+        return 4
+    let boundPort: int32 = quic_transport.Libp2pQuicBoundPort(listener.listenAddr)
+    os.WriteLine(os.Get_stdout(), "WT_LISTENER_READY port=" + IntToStr(boundPort) + " san_host=" + strings.CloneStr(sanHost) + " path=" + strings.CloneStr(expectedPath))
+
+    var served: int32
+    var lastRc: int32
+    while served < maxSessions:
+        lastRc = wtListenerServeOneSession(listener, strings.CloneStr(expectedPath), withH3SettingsPreamble)
+        served = served + 1
+    qtransport.Stop(listener)
+    return lastRc

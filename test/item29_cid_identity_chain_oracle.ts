@@ -17,7 +17,7 @@ import {
   sourceToCsgBindingSeal,
   verifyMigrationProofBindings,
 } from "../src/cheng_cid_identity_chain_oracle.ts";
-import {CID_CGROUP_ARTIFACT_ROLES, CID_CURRENT_DRIVER_CONTAINER_PATH, CID_CURRENT_DRIVER_RUN_CASE_COMMAND, CID_OFFICIAL_ENTRY_SPECS, CID_REQUIRED_IDENTITY_TOOLS, assertCanonicalUstarFilesEqual, assertCidExecutionImageLineage, assertCidRequiredIdentityTools, assertCidSourcePhaseContract, assertMutationReplayRecipe, canonicalCaseImageLayerMembers, canonicalJson, canonicalUstarFiles, cidCaseTargetArgv, parseCompileReceipt, parseEvidenceManifest, requiredCidEvidenceRoles, verifyCidCaseControllerBinding, verifyCidEvidence, verifyCidExecutionImageEvidence, verifyLinuxMemoryReceipt, verifyNativeDescriptorReceiptBinding} from "../src/cheng_cid_identity_chain_evidence.ts";
+import {CID_CGROUP_ARTIFACT_ROLES, CID_CURRENT_DRIVER_CONTAINER_PATH, CID_CURRENT_DRIVER_RUN_CASE_COMMAND, CID_OFFICIAL_ENTRY_SPECS, CID_REQUIRED_IDENTITY_TOOLS, NATIVE_LINUX_DESCRIPTOR_KEYS, assertCanonicalUstarFilesEqual, assertCidExecutionImageLineage, assertCidRequiredIdentityTools, assertCidSourcePhaseContract, assertMutationReplayRecipe, canonicalCaseImageLayerMembers, canonicalJson, canonicalUstarFiles, cidCaseTargetArgv, parseCompileReceipt, parseEvidenceManifest, requiredCidEvidenceRoles, verifyCidCaseControllerBinding, verifyCidEvidence, verifyCidExecutionImageEvidence, verifyLinuxMemoryReceipt, verifyNativeDescriptorReceiptBinding} from "../src/cheng_cid_identity_chain_evidence.ts";
 
 function canonicalUstar(entries: readonly (readonly [string, Buffer])[]): Buffer {
   const chunks: Buffer[] = [];
@@ -1551,73 +1551,103 @@ assert.deepEqual(controllerArgv, [
   controllerCaseId,
   controllerCandidateSha,
 ]);
-const descriptor = new Map<string, string>([
-  ["schema", "cheng.backend2.current_source_native_executor"],
-  ["status", "CONFIGURED"],
-  ["host_os", "linux"],
-  ["execution_environment", "controlled_cgroup_v2"],
-  ["target", "x86_64-unknown-linux-gnu"],
-  ["machine", "x86_64"],
-  ["image_id", `sha256:${"cd".repeat(32)}`],
-  ["worker_path_in_image_fshex",
-    Buffer.from(CID_CURRENT_DRIVER_CONTAINER_PATH).toString("hex")],
-  ["worker_sha256", controllerCandidateSha],
-  ["source_closure_cid", "12".repeat(32)],
-  ["source_closure_capture_sha256", "34".repeat(32)],
-  ["candidate_build_receipt_path_fshex",
-    Buffer.from("/cheng-current/build.receipt").toString("hex")],
-  ["candidate_build_receipt_sha256", "56".repeat(32)],
-  ["candidate_entry_path", officialEntryPath],
-  ["candidate_entry_module_path", officialEntryModulePath],
-  ["candidate_entry_sha256", officialEntrySha256],
-  ["controller_host_os", "darwin"],
-  ["controller_host_machine", "x86_64"],
-  ["controller_host_translated", "false"],
-  ["native_execution_proof",
-    "controller_guest_same_isa_and_guest_cpuinfo_no_qemu_tcg"],
-  ["native_execution", "true"],
-  ["emulation", "false"],
-  ["target_argv_encoding", "be64_length_utf8_sequence"],
-  ["target_argv_count", String(controllerArgv.length)],
-  ["target_argv_sha256", framedStringsSha256(controllerArgv)],
-  ["target_env_encoding", "be64_length_utf8_sequence"],
-  ["target_env_count", "5"],
-  ["target_env_sha256", "78".repeat(32)],
-  ["cgroup_producer_sha256", "9a".repeat(32)],
-  ["cgroup_validator_sha256", "bc".repeat(32)],
-  ["cgroup_version", "2"],
-  ["cgroup_mount_type", "cgroup2"],
-  ["memory_enforcement_scope", "container_and_all_descendants"],
-  ["memory_max_bytes", "1073741824"],
-  ["memory_swap_max_bytes", "0"],
-  ["memory_and_swap_total_limit_bytes", "1073741824"],
-  ["backend_count", "2"],
-  ["backend.0.name", "primary"],
-  ["backend.1.name", "backend2"],
-  ["descriptor_payload_sha256", "de".repeat(32)],
-]);
-const descriptorReceipt = new Map<string, string>();
-for (const [key, value] of descriptor) {
-  descriptorReceipt.set(
-    key === "descriptor_payload_sha256"
-      ? "native_descriptor_payload_sha256"
-      : `native_descriptor_${key}`,
-    value,
-  );
-}
-descriptorReceipt.set("current_source_binding_status", "bound_unique_current");
-descriptorReceipt.set(
-  "current_driver_container_path",
+const descriptorArgv = [
   CID_CURRENT_DRIVER_CONTAINER_PATH,
+  "system-link-exec",
+  "--require-pure-system-link-exec",
+  "--root:/cheng-current-source/repo",
+  `--in:${officialEntryPath}`,
+  "--emit:exe",
+  "--backend:primary",
+  "--link-providers",
+  "--target:x86_64-unknown-linux-gnu",
+  "--out:/cheng-hardcap-work/current-driver.next",
+  "--report-out:/cheng-hardcap-work/current-driver.report",
+];
+const descriptorEnv = [
+  "HOME=/nonexistent", "LANG=C", "LC_ALL=C", "PATH=/usr/bin:/bin", "TZ=UTC",
+];
+const descriptorValues: Record<string, string> = Object.fromEntries(
+  NATIVE_LINUX_DESCRIPTOR_KEYS.map((key) => [key, "12".repeat(32)]),
 );
+Object.assign(descriptorValues, {
+  schema: "cheng.backend2.current_source_native_executor",
+  status: "CONFIGURED",
+  workload_kind: "current_driver",
+  target: "x86_64-unknown-linux-gnu",
+  host_os: "linux",
+  machine: "x86_64",
+  execution_environment: "native_linux_delegated_cgroup_v2",
+  native_execution: "true",
+  emulation: "false",
+  controller_host_os: "linux",
+  controller_host_machine: "x86_64",
+  controller_host_translated: "false",
+  native_execution_proof: "native_linux_same_machine_live_elf_and_cgroup2",
+  cgroup_version: "2",
+  cgroup_mount_type: "cgroup2",
+  memory_enforcement_scope: "rootless_oci_process_and_all_descendants",
+  memory_max_bytes: "1073741824",
+  memory_swap_max_bytes: "0",
+  memory_and_swap_total_limit_bytes: "1073741824",
+  backend_count: "2",
+  "backend.0.name": "primary",
+  "backend.1.name": "backend2",
+  target_argv_encoding: "be64_length_utf8_sequence",
+  target_env_encoding: "be64_length_utf8_sequence",
+  candidate_build_receipt_path_fshex:
+    Buffer.from("/cheng-current/build.receipt").toString("hex"),
+  candidate_entry_path: officialEntryPath,
+  candidate_entry_module_path: officialEntryModulePath,
+  candidate_entry_sha256: officialEntrySha256,
+  image_id: `sha256:${"cd".repeat(32)}`,
+  worker_path_in_image_fshex:
+    Buffer.from(CID_CURRENT_DRIVER_CONTAINER_PATH).toString("hex"),
+  worker_sha256: controllerCandidateSha,
+  official_driver_sha256: controllerCandidateSha,
+  target_argv_count: String(descriptorArgv.length),
+  target_argv_sha256: framedStringsSha256(descriptorArgv),
+  target_env_count: String(descriptorEnv.length),
+  target_env_sha256: framedStringsSha256(descriptorEnv),
+});
+const descriptorPrefix = NATIVE_LINUX_DESCRIPTOR_KEYS.slice(0, -1)
+  .map((key) => `${key}=${descriptorValues[key]}\n`)
+  .join("");
+descriptorValues.descriptor_payload_sha256 = sha256(descriptorPrefix);
+const descriptor = new Map<string, string>(
+  NATIVE_LINUX_DESCRIPTOR_KEYS.map((key) => [key, descriptorValues[key]]),
+);
+const resealDescriptor = (value: Map<string, string>): Map<string, string> => {
+  value.set(
+    "descriptor_payload_sha256",
+    sha256(NATIVE_LINUX_DESCRIPTOR_KEYS.slice(0, -1)
+      .map((key) => `${key}=${value.get(key)}\n`)
+      .join("")),
+  );
+  return value;
+};
+const descriptorReceipt = new Map<string, string>([
+  ["workload_kind", "current_driver"],
+  ["native_descriptor_payload_sha256",
+    descriptor.get("descriptor_payload_sha256")!],
+  ["native_descriptor_target", descriptor.get("target")!],
+  ["native_descriptor_machine", descriptor.get("machine")!],
+  ["native_descriptor_candidate_entry_path", officialEntryPath],
+  ["native_descriptor_candidate_entry_module_path", officialEntryModulePath],
+  ["native_descriptor_candidate_entry_sha256", officialEntrySha256],
+  ["native_descriptor_worker_sha256", controllerCandidateSha],
+  ["native_descriptor_snapshot_manifest_sha256",
+    descriptor.get("snapshot_manifest_sha256")!],
+]);
+descriptorReceipt.set("current_source_binding_status", "bound_unique_current");
 descriptorReceipt.set("current_driver_sha256", controllerCandidateSha);
 descriptorReceipt.set("current_entry_path", officialEntryPath);
 descriptorReceipt.set("current_entry_module_path", officialEntryModulePath);
 descriptorReceipt.set("current_entry_sha256", officialEntrySha256);
-descriptorReceipt.set("target_argv_count", String(controllerArgv.length));
+descriptorReceipt.set("target_argv_count", String(descriptorArgv.length));
 descriptorReceipt.set(
   "target_argv_sha256",
-  framedStringsSha256(controllerArgv),
+  framedStringsSha256(descriptorArgv),
 );
 descriptorReceipt.set("target_env_count", descriptor.get("target_env_count")!);
 descriptorReceipt.set(
@@ -1639,7 +1669,57 @@ descriptorReceipt.set(
 );
 assert.doesNotThrow(() =>
   verifyNativeDescriptorReceiptBinding(descriptor, descriptorReceipt));
-assert.doesNotThrow(() =>
+const descriptorOldEnvironment = new Map(descriptor);
+descriptorOldEnvironment.set("execution_environment", "controlled_cgroup_v2");
+resealDescriptor(descriptorOldEnvironment);
+assert.throws(
+  () => verifyNativeDescriptorReceiptBinding(
+    descriptorOldEnvironment,
+    descriptorReceipt,
+  ),
+  /fixed field execution_environment/,
+);
+const descriptorOldController = new Map(descriptor);
+descriptorOldController.set("controller_host_os", "darwin");
+resealDescriptor(descriptorOldController);
+assert.throws(
+  () => verifyNativeDescriptorReceiptBinding(
+    descriptorOldController,
+    descriptorReceipt,
+  ),
+  /fixed field controller_host_os/,
+);
+const descriptorOldScope = new Map(descriptor);
+descriptorOldScope.set(
+  "memory_enforcement_scope",
+  "container_and_all_descendants",
+);
+resealDescriptor(descriptorOldScope);
+assert.throws(
+  () => verifyNativeDescriptorReceiptBinding(
+    descriptorOldScope,
+    descriptorReceipt,
+  ),
+  /fixed field memory_enforcement_scope/,
+);
+const descriptorOrderDrift = new Map([...descriptor].reverse());
+assert.throws(
+  () => verifyNativeDescriptorReceiptBinding(
+    descriptorOrderDrift,
+    descriptorReceipt,
+  ),
+  /字段顺序\/集合/,
+);
+const descriptorPayloadDrift = new Map(descriptor);
+descriptorPayloadDrift.set("descriptor_payload_sha256", "ef".repeat(32));
+assert.throws(
+  () => verifyNativeDescriptorReceiptBinding(
+    descriptorPayloadDrift,
+    descriptorReceipt,
+  ),
+  /payload\/order identity/,
+);
+assert.throws(() =>
   verifyCidCaseControllerBinding(
     descriptorReceipt,
     controllerCaseId,
@@ -1647,7 +1727,7 @@ assert.doesNotThrow(() =>
     officialEntryPath,
     officialEntryModulePath,
     officialEntrySha256,
-  ));
+  ), /producer_missing/);
 const oldControllerReceipt = new Map(descriptorReceipt);
 oldControllerReceipt.set(
   "target_argv_sha256",
@@ -1669,7 +1749,7 @@ assert.throws(
     officialEntryModulePath,
     officialEntrySha256,
   ),
-  /driver-owned run-case/,
+  /producer_missing/,
 );
 const controllerEntryDrift = new Map(descriptorReceipt);
 controllerEntryDrift.set("current_entry_sha256", "f1".repeat(32));
@@ -1682,7 +1762,7 @@ assert.throws(
     officialEntryModulePath,
     officialEntrySha256,
   ),
-  /driver-owned run-case/,
+  /producer_missing/,
 );
 const descriptorEntryDrift = new Map(descriptorReceipt);
 descriptorEntryDrift.set(
@@ -1698,23 +1778,16 @@ assert.throws(
 );
 const descriptorHashDrift = new Map(descriptorReceipt);
 descriptorHashDrift.set(
-  "native_descriptor_target_argv_sha256",
+  "target_argv_sha256",
   "ef".repeat(32),
 );
 assert.throws(
-  () => verifyCidCaseControllerBinding(
-    descriptorHashDrift,
-    controllerCaseId,
-    controllerCandidateSha,
-    officialEntryPath,
-    officialEntryModulePath,
-    officialEntrySha256,
-  ),
-  /driver-owned run-case/,
+  () => verifyNativeDescriptorReceiptBinding(descriptor, descriptorHashDrift),
+  /target_argv_sha256/,
 );
 const descriptorReceiptDrift = new Map(descriptorReceipt);
 descriptorReceiptDrift.set(
-  "native_descriptor_candidate_build_receipt_sha256",
+  "current_build_receipt_sha256",
   "f0".repeat(32),
 );
 assert.throws(

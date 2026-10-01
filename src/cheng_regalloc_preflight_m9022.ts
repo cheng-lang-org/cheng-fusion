@@ -39,9 +39,9 @@ const PRODUCTION_GATE_DEPENDENCY_FILES = Object.freeze({
   lockValidator: "tools/regalloc_external_lock_validator.py",
 });
 const PRODUCTION_GATE_DEPENDENCY_EXPECTED_SHA256 = Object.freeze({
-  "tools/regalloc_production_gate.sh": "d4c3092af0a0be3a618e3d42922d0ca160fd751682bc4be717bbf7a39e538940",
-  "tools/beat_c_process_group_guard.sh": "1a2456ed271bcc5e36f19d2497519d75ede6ac2c204fad74207aa23ad7312532",
-  "tools/regalloc_production_evidence.sh": "eba70942df1c1488a524bdf9a8659d0ea4bf29d4d97a136a2013a2a49dc68741",
+  "tools/regalloc_production_gate.sh": "9c8ffa60b29aa4246123ca720f5a0517cac6b1d9117ff09f46b53f1801ca31ae",
+  "tools/beat_c_process_group_guard.sh": "017aff546b4d8c0e43a7e0ae6d11c7663b7287c54b211b00476ec5ff05c7b183",
+  "tools/regalloc_production_evidence.sh": "cff4d865fc96a348d2f37cdafa41f07d749d724cca71485f1a47ea2dcc74eff1",
   "tools/regalloc_external_lock_validator.py": "b4266c000cbde7590ef7cb3b7801ba6367b668ff36f5a28a7c4319177c01ae44",
 });
 const RELEASE_EVIDENCE_INPUTS = Object.freeze([
@@ -74,7 +74,7 @@ const AARCH64_F64_RUNTIME_GATE_GUARD_STAGES = Object.freeze([
 ]);
 const AARCH64_F64_RUNTIME_GATE_EXPECTED_SHA256 = Object.freeze({
   "tools/regalloc_aarch64_f64_runtime_gate.sh": "3467f9604ce81c1051d584fed60c2832a70880c6945565b8fea7824bf887d9dd",
-  "tools/beat_c_process_group_guard.sh": "1a2456ed271bcc5e36f19d2497519d75ede6ac2c204fad74207aa23ad7312532",
+  "tools/beat_c_process_group_guard.sh": "017aff546b4d8c0e43a7e0ae6d11c7663b7287c54b211b00476ec5ff05c7b183",
   "src/tests/regalloc_aarch64_f64_contract_smoke.cheng": "aa4efe675edbb9474497733d6e2af915c466522152786a55bfb2216f43b50d41",
   "src/tests/regalloc_aarch64_f64_runtime_image.cheng": "3a6b2b624d94a3c505035526058a80a6fbe194339667a705eacedc7f546b2214",
   "src/tests/regalloc_aarch64_f64_runtime_harness.c": "0694520d7bf6cdc2d5d9133be902bad0d07a6b465eef7fbf67fdd1da42c4084d",
@@ -98,7 +98,7 @@ const X86_64_F64_RUNTIME_GATE_GUARD_STAGES = Object.freeze([
 ]);
 const X86_64_F64_RUNTIME_GATE_EXPECTED_SHA256 = Object.freeze({
   "tools/regalloc_x86_64_f64_runtime_gate.sh": "6f780002fe0400cdbdc3a586bdacbac80d4d6e60969aeffe6a9de0bc92f710df",
-  "tools/beat_c_process_group_guard.sh": "1a2456ed271bcc5e36f19d2497519d75ede6ac2c204fad74207aa23ad7312532",
+  "tools/beat_c_process_group_guard.sh": "017aff546b4d8c0e43a7e0ae6d11c7663b7287c54b211b00476ec5ff05c7b183",
   "src/tests/regalloc_x86_64_f64_runtime_image.cheng": "7e979e51f13734d47c1c6bb12fcd8aaa8e62c8d068f69fcef539cc7219dbbc28",
   "src/tests/regalloc_x86_64_f64_runtime_harness.c": "2c9d5305ff533a20a97eaa179929449dde12131f5abd481f32f35dd7edb0bad2",
   "src/tests/regalloc_x86_64_f64_runtime_bridge.S": "73e2f3adcadd15be8f143b773c8e884cbb6cab7c3950e7bfa484a9b3ef85d9b7",
@@ -1231,6 +1231,8 @@ function validateGeneratedEbnfParserMapBinding(
           !parserOwnedStructuredWitnessAccepted(
             row.span_model,
             projection.parser_node_kind,
+            row.name,
+            row.node_kinds,
           ) ||
           !/^[0-9a-f]{64}$/.test(
             projection.parser_node_identity_sha256 ?? "") ||
@@ -4730,15 +4732,15 @@ function validateBackend2VersionManifest(root, snapshot) {
   const {rows} = parseUniqueUnhashedKv(snapshot.raw, "backend2 version manifest");
   const count = Number(uintValue(rows.get("source_count"), "backend2 version manifest source_count", 100000n));
   if (count <= 0) throw new Error("backend2 version manifest source_count must be positive");
-  const exact = ["schema", "version", "sources_sha256", "framing", "source_count"];
+  const exact = ["schema", "semantic_epoch_sha256", "source_closure_sha256", "framing", "source_count"];
   for (let index = 0; index < count; index++) exact.push(`source_${String(index).padStart(4, "0")}`);
   exactKeys(rows, exact, "backend2 version manifest");
   if (rows.get("schema") !== "backend2_version_manifest" ||
-      rows.get("framing") !== "backend2_codegen_semantic_closure.framed" ||
-      !/^backend2-slice[1-9]\d*$/.test(String(rows.get("version") || ""))) {
-    throw new Error("backend2 version manifest schema/framing/version mismatch");
+      rows.get("framing") !== "backend2_codegen_semantic_closure.framed") {
+    throw new Error("backend2 version manifest schema/framing mismatch");
   }
-  const sourcesSha256 = requireSha256(rows.get("sources_sha256"), "backend2 version manifest sources SHA-256");
+  const semanticEpochSha256 = requireSha256(rows.get("semantic_epoch_sha256"), "backend2 version manifest semantic epoch SHA-256");
+  const sourceClosureSha256 = requireSha256(rows.get("source_closure_sha256"), "backend2 version manifest source closure SHA-256");
   const sources = [];
   const seen = new Set();
   for (let index = 0; index < count; index++) {
@@ -4755,17 +4757,18 @@ function validateBackend2VersionManifest(root, snapshot) {
   for (const required of ["src/core/backend2/backend2_pipeline.cheng", "src/core/backend/regalloc_single_pass.cheng", "src/core/lang/parser.cheng", "src/core/lang/typed_expr.cheng"]) {
     if (!seen.has(required)) throw new Error(`backend2 version manifest omits release-critical source: ${required}`);
   }
-  return {schema: rows.get("schema"), version: rows.get("version"), sourcesSha256, framing: rows.get("framing"), sourceCount: count, sources, manifestPath: snapshot.path, manifestSha256: snapshot.sha256};
+  return {schema: rows.get("schema"), semanticEpochSha256, sourceClosureSha256, framing: rows.get("framing"), sourceCount: count, sources, manifestPath: snapshot.path, manifestSha256: snapshot.sha256};
 }
 
 function validateBackend2VersionSentinelReport(snapshot, backend2VersionManifest) {
   const {rows} = parseUniqueUnhashedKv(snapshot.raw, "backend2 version sentinel report");
-  const exact = ["schema", "status", "rc", "version", "sources_sha256", "manifest_sha256", "framing", "source_count"];
+  const exact = ["schema", "status", "rc", "semantic_epoch_sha256", "source_closure_sha256", "manifest_sha256", "framing", "source_count"];
   for (let index = 0; index < backend2VersionManifest.sourceCount; index++) exact.push(`source_${String(index).padStart(4, "0")}`);
   exactKeys(rows, exact, "backend2 version sentinel report");
   const expected = new Map([
     ["schema", "backend2_version_sentinel"], ["status", "PASS"], ["rc", "0"],
-    ["version", backend2VersionManifest.version], ["sources_sha256", backend2VersionManifest.sourcesSha256],
+    ["semantic_epoch_sha256", backend2VersionManifest.semanticEpochSha256],
+    ["source_closure_sha256", backend2VersionManifest.sourceClosureSha256],
     ["manifest_sha256", backend2VersionManifest.manifestSha256], ["framing", backend2VersionManifest.framing],
     ["source_count", String(backend2VersionManifest.sourceCount)],
   ]);
@@ -4775,7 +4778,14 @@ function validateBackend2VersionSentinelReport(snapshot, backend2VersionManifest
       throw new Error(`backend2 version sentinel source closure mismatch: ${index}`);
     }
   }
-  return {schema: rows.get("schema"), status: rows.get("status"), version: rows.get("version"), sourcesSha256: rows.get("sources_sha256"), manifestSha256: rows.get("manifest_sha256"), sourceCount: backend2VersionManifest.sourceCount};
+  return {
+    schema: rows.get("schema"),
+    status: rows.get("status"),
+    semanticEpochSha256: rows.get("semantic_epoch_sha256"),
+    sourceClosureSha256: rows.get("source_closure_sha256"),
+    manifestSha256: rows.get("manifest_sha256"),
+    sourceCount: backend2VersionManifest.sourceCount,
+  };
 }
 
 function validateCurrentWorkspaceSourceHashManifest(root, directory, expectedSha256) {
@@ -9405,7 +9415,9 @@ async function revalidateFinalizerReleaseEvidence(context, stageOneReport, cross
     ["execution_identity_sha256", releaseInputs.executionStageReceipt.executionRaw32],
     ["execution_stage_root_sha256", releaseInputs.executionStageReceipt.sevenStageRootRaw32],
     ["backend2_sentinel_guard_sha256", sentinelGuard.sha256], ["backend2_sentinel_stdout_sha256", sentinelStdout.sha256],
-    ["backend2_sentinel_stderr_sha256", sentinelStderr.sha256], ["backend2_sources_sha256", sentinelEvidence.sourcesSha256],
+    ["backend2_sentinel_stderr_sha256", sentinelStderr.sha256],
+    ["backend2_semantic_epoch_sha256", sentinelEvidence.semanticEpochSha256],
+    ["backend2_source_closure_sha256", sentinelEvidence.sourceClosureSha256],
     ["report_count", reports.length],
   ];
   for (let index = 0; index < reports.length; index++) {

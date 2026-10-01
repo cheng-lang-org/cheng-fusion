@@ -1,0 +1,383 @@
+# STUN protocol (RFC 5389/8489) — minimal binding closed loop.
+#
+# Encodes/decodes Binding Request/Response/Error Response with XOR-MAPPED-ADDRESS,
+# USERNAME/REALM/NONCE, MESSAGE-INTEGRITY (HMAC-SHA1), FINGERPRINT (CRC32),
+# ERROR-CODE and SOFTWARE. Long-term credential key construction uses MD5.
+#
+# Design: every routine is a small single-purpose function (<= ~30 lines) to keep
+# the BodyIR/CFG small and avoid large-composite-return codegen pressure. IPv4
+# is the primary path; IPv6 XOR-MAPPED-ADDRESS is decoded/encoded too.
+
+import std/rawbytes
+import std/system
+import std/crypto/hkdf
+import std/crypto/md5
+import std/crypto/crc32
+
+const
+    stunMagicCookie = 0x2112A442
+    stunBindingRequest = 0x0001
+    stunBindingResponse = 0x0101
+    stunBindingErrorResponse = 0x0111
+    stunHeaderLen = 20
+    stunAttrUsername = 0x0006
+    stunAttrMessageIntegrity = 0x0008
+    stunAttrErrorCode = 0x0009
+    stunAttrRealm = 0x0014
+    stunAttrNonce = 0x0015
+    stunAttrXorMappedAddress = 0x0020
+    stunAttrSoftware = 0x8022
+    stunAttrFingerprint = 0x8028
+    stunFingerprintXor = 0x5354554E
+
+type
+    StunHeader =
+        msgType: int32
+        msgLen: int32
+        magic: int64
+        txid: Bytes
+    StunXorMappedAddress =
+        family: int32
+        port: int32
+        ip: Bytes
+    StunAttributes =
+        xorMapped: StunXorMappedAddress
+        hasXorMapped: bool
+        username: Bytes
+        realm: Bytes
+        nonce: Bytes
+        messageIntegrity: Bytes
+        hasMessageIntegrity: bool
+        fingerprint: int64
+        hasFingerprint: bool
+        errorCode: int32
+        errorReason: Bytes
+        hasErrorCode: bool
+        software: Bytes
+
+fn stunU16BE(data: Bytes, offset: int32): int32 =
+    let hi: int64 = int64(BytesGet(data, offset))
+    let lo: int64 = int64(BytesGet(data, offset + 1))
+    return int32((hi << 8) | lo)
+
+fn stunSetU16BE(data: Bytes, offset: int32, value: int32) =
+    BytesSet(data, offset, (value >> 8) & 255)
+    BytesSet(data, offset + 1, value & 255)
+
+fn stunU32BE(data: Bytes, offset: int32): int64 =
+    let b0: int64 = int64(BytesGet(data, offset))
+    let b1: int64 = int64(BytesGet(data, offset + 1))
+    let b2: int64 = int64(BytesGet(data, offset + 2))
+    let b3: int64 = int64(BytesGet(data, offset + 3))
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+fn stunSetU32BE(data: Bytes, offset: int32, value: int64) =
+    let v: int64 = value & int64(0xffffffff)
+    BytesSet(data, offset, int32((v >> 24) & 255))
+    BytesSet(data, offset + 1, int32((v >> 16) & 255))
+    BytesSet(data, offset + 2, int32((v >> 8) & 255))
+    BytesSet(data, offset + 3, int32(v & 255))
+
+fn stunNewHeader(msgType: int32, txid: Bytes): Bytes =
+    let out: Bytes = BytesAlloc(stunHeaderLen)
+    stunSetU16BE(out, 0, msgType)
+    stunSetU16BE(out, 2, 0)
+    stunSetU32BE(out, 4, int64(stunMagicCookie))
+    var i: int32
+    for i in i..<12:
+        BytesSet(out, 8 + i, BytesGet(txid, i))
+    return out
+
+fn stunXorKeyV6(magic: int64, txid: Bytes): Bytes =
+    let out: Bytes = BytesAlloc(16)
+    stunSetU32BE(out, 0, magic)
+    var i: int32
+    for i in i..<12:
+        BytesSet(out, 4 + i, BytesGet(txid, i))
+    return out
+
+fn stunPad4(n: int32): int32 =
+    return ((n + 3) / 4) * 4
+
+fn stunAppendAttr(msg: Bytes, attrType: int32, value: Bytes): Bytes =
+    let msgLen: int32 = BytesLen(msg)
+    let valLen: int32 = BytesLen(value)
+    let padded: int32 = stunPad4(valLen)
+    let out: Bytes = BytesAlloc(msgLen + 4 + padded)
+    BytesCopyInto(out, 0, msg)
+    stunSetU16BE(out, msgLen, attrType)
+    stunSetU16BE(out, msgLen + 2, valLen)
+    if valLen > 0:
+        BytesCopyInto(out, msgLen + 4, value)
+    return out
+
+fn stunMaybeAppendSoftware(msg: Bytes, software: Bytes): Bytes =
+    if BytesLen(software) <= 0:
+        return msg
+    return stunAppendAttr(msg, stunAttrSoftware, software)
+
+fn stunFindAttrOffset(msg: Bytes, attrType: int32): int32 =
+    let total: int32 = BytesLen(msg)
+    var off: int32 = stunHeaderLen
+    while off + 4 <= total:
+        let t: int32 = stunU16BE(msg, off)
+        let l: int32 = stunU16BE(msg, off + 2)
+        if t == attrType:
+            return off
+        off = off + 4 + stunPad4(l)
+    return -1
+
+fn stunEncodeErrorCode(code: int32, reason: str): Bytes =
+    let reasonBytes: Bytes = BytesFromString(reason)
+    let reasonLen: int32 = BytesLen(reasonBytes)
+    let out: Bytes = BytesAlloc(4 + reasonLen)
+    BytesSet(out, 0, 0)
+    BytesSet(out, 1, 0)
+    BytesSet(out, 2, code / 100)
+    BytesSet(out, 3, code % 100)
+    if reasonLen > 0:
+        BytesCopyInto(out, 4, reasonBytes)
+    return out
+
+fn StunDecodeHeader(msg: Bytes): StunHeader =
+    var h: StunHeader
+    h.msgType = stunU16BE(msg, 0)
+    h.msgLen = stunU16BE(msg, 2)
+    h.magic = stunU32BE(msg, 4)
+    h.txid = BytesSlice(msg, 8, 12)
+    return h
+
+fn StunEncodeBindingRequest(txid: Bytes): Bytes =
+    return stunNewHeader(stunBindingRequest, txid)
+
+fn StunEncodeXorMappedAddress(ip: Bytes, port: int32, magic: int64, txid: Bytes): Bytes =
+    let ipLen: int32 = BytesLen(ip)
+    let cookieHi: int32 = int32((magic >> 16) & 0xffff)
+    if ipLen == 4:
+        let out: Bytes = BytesAlloc(8)
+        BytesSet(out, 0, 0)
+        BytesSet(out, 1, 0x01)
+        stunSetU16BE(out, 2, port ^ cookieHi)
+        BytesSet(out, 4, BytesGet(ip, 0) ^ int32((magic >> 24) & 255))
+        BytesSet(out, 5, BytesGet(ip, 1) ^ int32((magic >> 16) & 255))
+        BytesSet(out, 6, BytesGet(ip, 2) ^ int32((magic >> 8) & 255))
+        BytesSet(out, 7, BytesGet(ip, 3) ^ int32(magic & 255))
+        return out
+    let out: Bytes = BytesAlloc(20)
+    BytesSet(out, 0, 0)
+    BytesSet(out, 1, 0x02)
+    stunSetU16BE(out, 2, port ^ cookieHi)
+    let key: Bytes = stunXorKeyV6(magic, txid)
+    var i: int32
+    for i in i..<16:
+        BytesSet(out, 4 + i, BytesGet(ip, i) ^ BytesGet(key, i))
+    return out
+
+fn StunDecodeXorMappedAddress(attrValue: Bytes, magic: int64, txid: Bytes): StunXorMappedAddress =
+    var addr: StunXorMappedAddress
+    let family: int32 = BytesGet(attrValue, 1)
+    addr.family = family
+    let cookieHi: int32 = int32((magic >> 16) & 0xffff)
+    addr.port = stunU16BE(attrValue, 2) ^ cookieHi
+    if family == 0x01:
+        let ip: Bytes = BytesAlloc(4)
+        BytesSet(ip, 0, BytesGet(attrValue, 4) ^ int32((magic >> 24) & 255))
+        BytesSet(ip, 1, BytesGet(attrValue, 5) ^ int32((magic >> 16) & 255))
+        BytesSet(ip, 2, BytesGet(attrValue, 6) ^ int32((magic >> 8) & 255))
+        BytesSet(ip, 3, BytesGet(attrValue, 7) ^ int32(magic & 255))
+        addr.ip = ip
+        return addr
+    let key: Bytes = stunXorKeyV6(magic, txid)
+    let ip: Bytes = BytesAlloc(16)
+    var i: int32
+    for i in i..<16:
+        BytesSet(ip, i, BytesGet(attrValue, 4 + i) ^ BytesGet(key, i))
+    addr.ip = ip
+    return addr
+
+fn StunFindAttribute(msg: Bytes, attrType: int32): Bytes =
+    let off: int32 = stunFindAttrOffset(msg, attrType)
+    if off < 0:
+        return EmptyBytes()
+    let l: int32 = stunU16BE(msg, off + 2)
+    return BytesSlice(msg, off + 4, l)
+
+fn stunDecodeOneAttribute(attrs: var StunAttributes, msg: Bytes, off: int32, t: int32, l: int32, magic: int64, txid: Bytes) =
+    if t == stunAttrXorMappedAddress:
+        attrs.xorMapped = StunDecodeXorMappedAddress(BytesSlice(msg, off + 4, l), magic, txid)
+        attrs.hasXorMapped = true
+    elif t == stunAttrUsername:
+        attrs.username = BytesSlice(msg, off + 4, l)
+    elif t == stunAttrRealm:
+        attrs.realm = BytesSlice(msg, off + 4, l)
+    elif t == stunAttrNonce:
+        attrs.nonce = BytesSlice(msg, off + 4, l)
+    elif t == stunAttrMessageIntegrity:
+        attrs.messageIntegrity = BytesSlice(msg, off + 4, 20)
+        attrs.hasMessageIntegrity = true
+    elif t == stunAttrFingerprint:
+        attrs.fingerprint = stunU32BE(msg, off + 4)
+        attrs.hasFingerprint = true
+    elif t == stunAttrErrorCode:
+        attrs.errorCode = BytesGet(msg, off + 4 + 2) * 100 + BytesGet(msg, off + 4 + 3)
+        attrs.errorReason = BytesSlice(msg, off + 4 + 4, l - 4)
+        attrs.hasErrorCode = true
+    elif t == stunAttrSoftware:
+        attrs.software = BytesSlice(msg, off + 4, l)
+
+fn StunDecodeAttributes(msg: Bytes, magic: int64, txid: Bytes): StunAttributes =
+    var attrs: StunAttributes
+    let total: int32 = BytesLen(msg)
+    var off: int32 = stunHeaderLen
+    while off + 4 <= total:
+        let t: int32 = stunU16BE(msg, off)
+        let l: int32 = stunU16BE(msg, off + 2)
+        if off + 4 + l > total:
+            return attrs
+        stunDecodeOneAttribute(attrs, msg, off, t, l, magic, txid)
+        off = off + 4 + stunPad4(l)
+    return attrs
+
+fn StunAppendMessageIntegrity(msg: Bytes, key: Bytes): Bytes =
+    let currentLen: int32 = BytesLen(msg)
+    let bodyLen: int32 = currentLen - stunHeaderLen
+    let newBodyLen: int32 = bodyLen + 24
+    let prefix: Bytes = BytesAlloc(currentLen)
+    BytesCopyInto(prefix, 0, msg)
+    stunSetU16BE(prefix, 2, newBodyLen)
+    let mac: Bytes = hkdf.hmacDigestSha1(key, prefix)
+    let out: Bytes = BytesAlloc(currentLen + 24)
+    BytesCopyInto(out, 0, prefix)
+    stunSetU16BE(out, currentLen, stunAttrMessageIntegrity)
+    stunSetU16BE(out, currentLen + 2, 20)
+    BytesCopyInto(out, currentLen + 4, mac)
+    return out
+
+fn StunAppendFingerprint(msg: Bytes): Bytes =
+    let currentLen: int32 = BytesLen(msg)
+    let bodyLen: int32 = currentLen - stunHeaderLen
+    let newBodyLen: int32 = bodyLen + 8
+    let prefix: Bytes = BytesAlloc(currentLen)
+    BytesCopyInto(prefix, 0, msg)
+    stunSetU16BE(prefix, 2, newBodyLen)
+    let crc: int64 = crc32.Crc32(prefix)
+    let fp: int64 = crc ^ int64(stunFingerprintXor)
+    let out: Bytes = BytesAlloc(currentLen + 8)
+    BytesCopyInto(out, 0, prefix)
+    stunSetU16BE(out, currentLen, stunAttrFingerprint)
+    stunSetU16BE(out, currentLen + 2, 4)
+    stunSetU32BE(out, currentLen + 4, fp)
+    return out
+
+fn StunVerifyMessageIntegrity(msg: Bytes, key: Bytes): bool =
+    let miOff: int32 = stunFindAttrOffset(msg, stunAttrMessageIntegrity)
+    if miOff < 0:
+        return false
+    let bodyUpTo: int32 = miOff - stunHeaderLen
+    let newBodyLen: int32 = bodyUpTo + 24
+    let prefix: Bytes = BytesAlloc(miOff)
+    BytesCopyInto(prefix, 0, BytesSlice(msg, 0, miOff))
+    stunSetU16BE(prefix, 2, newBodyLen)
+    let mac: Bytes = hkdf.hmacDigestSha1(key, prefix)
+    let existing: Bytes = BytesSlice(msg, miOff + 4, 20)
+    return BytesEqual(mac, existing)
+
+fn StunVerifyFingerprint(msg: Bytes): bool =
+    let fpOff: int32 = stunFindAttrOffset(msg, stunAttrFingerprint)
+    if fpOff < 0:
+        return false
+    let bodyUpTo: int32 = fpOff - stunHeaderLen
+    let newBodyLen: int32 = bodyUpTo + 8
+    let prefix: Bytes = BytesAlloc(fpOff)
+    BytesCopyInto(prefix, 0, BytesSlice(msg, 0, fpOff))
+    stunSetU16BE(prefix, 2, newBodyLen)
+    let crc: int64 = crc32.Crc32(prefix)
+    let fp: int64 = crc ^ int64(stunFingerprintXor)
+    let existing: int64 = stunU32BE(msg, fpOff + 4)
+    return fp == existing
+
+fn StunEncodeBindingResponse(txid: Bytes, ip: Bytes, port: int32, key: Bytes, software: Bytes): Bytes =
+    let base: Bytes = stunNewHeader(stunBindingResponse, txid)
+    let withSw: Bytes = stunMaybeAppendSoftware(base, software)
+    let xmaValue: Bytes = StunEncodeXorMappedAddress(ip, port, int64(stunMagicCookie), txid)
+    let withXma: Bytes = stunAppendAttr(withSw, stunAttrXorMappedAddress, xmaValue)
+    let withMi: Bytes = StunAppendMessageIntegrity(withXma, key)
+    let withFp: Bytes = StunAppendFingerprint(withMi)
+    return withFp
+
+fn StunEncodeBindingErrorResponse(txid: Bytes, code: int32, reason: str, key: Bytes, software: Bytes): Bytes =
+    let base: Bytes = stunNewHeader(stunBindingErrorResponse, txid)
+    let ecValue: Bytes = stunEncodeErrorCode(code, reason)
+    let withEc: Bytes = stunAppendAttr(base, stunAttrErrorCode, ecValue)
+    let withSw: Bytes = stunMaybeAppendSoftware(withEc, software)
+    let withMi: Bytes = StunAppendMessageIntegrity(withSw, key)
+    let withFp: Bytes = StunAppendFingerprint(withMi)
+    return withFp
+
+fn StunLongTermKey(username: str, realm: str, password: str): Bytes =
+    let u: Bytes = BytesFromString(username)
+    let r: Bytes = BytesFromString(realm)
+    let p: Bytes = BytesFromString(password)
+    let colon: Bytes = BytesFromString(":")
+    let ur: Bytes = BytesConcat3(u, colon, r)
+    let urc: Bytes = BytesConcat(ur, colon)
+    let full: Bytes = BytesConcat(urc, p)
+    return md5.Md5Digest(full)
+
+# Exported framework helpers for reuse by TURN (RFC 5766) modules. These are
+# thin pass-through wrappers over the private STUN building blocks above; they
+# add no new behavior so stage-0 STUN tests are unaffected.
+
+fn StunNewHeader(msgType: int32, txid: Bytes): Bytes =
+    return stunNewHeader(msgType, txid)
+
+fn StunAppendAttr(msg: Bytes, attrType: int32, value: Bytes): Bytes =
+    return stunAppendAttr(msg, attrType, value)
+
+fn StunPad4(n: int32): int32 =
+    return stunPad4(n)
+
+fn StunU16BE(data: Bytes, offset: int32): int32 =
+    return stunU16BE(data, offset)
+
+fn StunSetU16BE(data: Bytes, offset: int32, value: int32) =
+    stunSetU16BE(data, offset, value)
+
+fn StunU32BE(data: Bytes, offset: int32): int64 =
+    return stunU32BE(data, offset)
+
+fn StunSetU32BE(data: Bytes, offset: int32, value: int64) =
+    stunSetU32BE(data, offset, value)
+
+fn StunFindAttrOffset(msg: Bytes, attrType: int32): int32 =
+    return stunFindAttrOffset(msg, attrType)
+
+fn StunEncodeErrorCode(code: int32, reason: str): Bytes =
+    return stunEncodeErrorCode(code, reason)
+
+fn StunMagicCookie(): int64 =
+    return int64(stunMagicCookie)
+
+fn StunHeaderLen(): int32 =
+    return stunHeaderLen
+
+fn StunAttrSoftware(): int32 =
+    return stunAttrSoftware
+
+fn StunAttrMessageIntegrity(): int32 =
+    return stunAttrMessageIntegrity
+
+fn StunAttrFingerprint(): int32 =
+    return stunAttrFingerprint
+
+fn StunAttrErrorCode(): int32 =
+    return stunAttrErrorCode
+
+fn StunAttrUsername(): int32 =
+    return stunAttrUsername
+
+fn StunAttrRealm(): int32 =
+    return stunAttrRealm
+
+fn StunAttrNonce(): int32 =
+    return stunAttrNonce

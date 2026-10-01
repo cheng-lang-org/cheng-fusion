@@ -1,0 +1,146 @@
+import std/result
+import std/strings
+import std/strutils as strutil
+import cheng/inference/kernel as infer
+import cheng/inference/kernel_ir as kir
+import cheng/inference/model_graph as mg
+import cheng/inference/hf_model_graph as hfgraph
+import cheng/inference/weight_store as ws
+import cheng/inference/model_executor as mexec
+
+const BiasScale: int32 = 1000
+
+fn configJson(): str =
+    return strutil.Join([
+        "{",
+        "\"architectures\":[\"Qwen2ForCausalLM\"],",
+        "\"model_type\":\"qwen2\",",
+        "\"vocab_size\":6,",
+        "\"hidden_size\":8,",
+        "\"num_hidden_layers\":2,",
+        "\"num_attention_heads\":4,",
+        "\"num_key_value_heads\":2,",
+        "\"intermediate_size\":6,",
+        "\"tie_word_embeddings\":false,",
+        "\"rope_theta\":10000.0",
+        "}"
+    ], "")
+
+fn cycleAt(ordinal: int32): int32 =
+    let slot = ordinal % 6
+    if slot == 0:
+        return 1000
+    if slot == 1:
+        return -500
+    if slot == 2:
+        return 250
+    if slot == 3:
+        return 4000
+    if slot == 4:
+        return -2000
+    return 125
+
+fn takeStream(ordinal: var int32, count: int32): int32[] =
+    var out: int32[]
+    for _ in 0..<count:
+        add(out, cycleAt(ordinal))
+        ordinal = ordinal + 1
+    return out
+
+fn mk(shape: int32[], scale: int32, data: int32[]): infer.TensorQ =
+    var o: infer.TensorQ
+    assert(IsOk(infer.TensorFromDataFill(o, shape, scale, data)), " bias smoke: mk")
+    return o
+
+fn main(): int32 =
+    # --- step 3a: ModelExecutorAddBiasRows direct math ---
+    var q = mk([2, 2], BiasScale, [100, 200, 300, 400])
+    let addOk = mexec.ModelExecutorAddBiasRows(q, mk([2], BiasScale, [5, -7]))
+    assert(IsOk(addOk), " bias smoke: add bias rows")
+    assert(q.data[0] == 105 && q.data[1] == 193 && q.data[2] == 305 && q.data[3] == 393,
+           " bias smoke: add bias rows value")
+    echo(strutil.Join(["addbias: [", strings.IntToStr(q.data[0]), ",", strings.IntToStr(q.data[1]), ",",
+                       strings.IntToStr(q.data[2]), ",", strings.IntToStr(q.data[3]), "]"], ""))
+
+    # scale-mismatch must hard-fail (invariant guard, no silent add)
+    var q2 = mk([1, 2], BiasScale, [10, 20])
+    assert(IsErr(mexec.ModelExecutorAddBiasRows(q2, mk([2], 100, [1, 1]))),
+           " bias smoke: bias scale mismatch must fail")
+
+    # --- step 3b: graph inventory (218-style: dense HF graph gains 3 bias/layer) ---
+    let graphRes = hfgraph.HfModelGraphBuildDenseTransformerFromConfig(
+        configJson(), "cid:model:num-core-153-bias", kir.KernelDtypeFp16, mg.ModelQuantSchemeNone)
+    assert(IsOk(graphRes), " bias smoke: build graph")
+    let graph = Value(graphRes)
+    assert(IsOk(mg.ModelGraphValidate(graph)), " bias smoke: graph valid")
+    echo(strutil.Join(["weights.len: ", strings.IntToStr(graph.weights.len)], ""))
+    assert(graph.weights.len == 27, " bias smoke: weights.len == 21 + 3*2")
+    # locate layer0 qkv op, assert 7 weightNames with bias at 4/5/6
+    var qkvIdx: int32
+    qkvIdx = -1
+    for i in 0..<graph.ops.len:
+        if graph.ops[i].opKind == mg.InferenceModelOpQkv && graph.ops[i].outputName == "layer0.qkv":
+            qkvIdx = i
+    assert(qkvIdx >= 0, " bias smoke: find layer0 qkv op")
+    let qkvOp = graph.ops[qkvIdx]
+    assert(qkvOp.weightNames.len == 7, " bias smoke: qkv weightNames == 7")
+    assert(qkvOp.weightNames[4] == "model.layers.0.self_attn.q_proj.bias" &&
+           qkvOp.weightNames[5] == "model.layers.0.self_attn.k_proj.bias" &&
+           qkvOp.weightNames[6] == "model.layers.0.self_attn.v_proj.bias",
+           " bias smoke: qkv bias names")
+
+    # --- step 3c: QKV op adds bias end-to-end (executor wiring) ---
+    var ordinal: int32
+    var payloads: ws.WeightTensorPayload[]
+    for i in 0..<graph.weights.len:
+        let countRes = mg.ModelGraphTensorElementCount(graph.weights[i].shape)
+        assert(IsOk(countRes), " bias smoke: weight count")
+        let data = takeStream(ordinal, int32(Value(countRes)))
+        let tensor = mk(graph.weights[i].shape, BiasScale, data)
+        let peerId = strutil.Join(["peer:num153bias:", strings.IntToStr(i)], "")
+        let payloadRes = ws.WeightTensorPayloadBuild(
+            graph.weights[i].modelCid, graph.weights[i].tensorName, graph.weights[i].shardCid,
+            graph.weights[i].dtype, graph.weights[i].quantScheme, peerId, tensor)
+        assert(IsOk(payloadRes), " bias smoke: payload build")
+        add(payloads, Value(payloadRes))
+    let store = ws.WeightTensorStoreBuild(graph.modelCid, payloads)
+
+    var slots: mexec.ModelExecutorTensorSlot[]
+    let putToken = mexec.ModelExecutorPutTensor(slots, "token_ids", mk([2], 1, [1, 2]))
+    assert(IsOk(putToken), " bias smoke: put token")
+    var executionHash: int64
+    # replay embedding + input_norm + qkv (ops 0,1,2)
+    for i in 0..<3:
+        let opOk = mexec.ModelExecutorExecuteDenseTransformerOp(graph, store, graph.ops[i], slots, executionHash)
+        assert(IsOk(opOk), strutil.Join([" bias smoke: op replay ", strings.IntToStr(i)], ""))
+
+    let inputNorm = mexec.ModelExecutorFindTensor(slots, "layer0.input_norm")
+    assert(IsOk(inputNorm), " bias smoke: find input_norm")
+    let qSlot = mexec.ModelExecutorFindTensor(slots, "layer0.qkv")
+    assert(IsOk(qSlot), " bias smoke: find qkv out")
+    let qOut = Value(qSlot)
+
+    # independent reference: q proj (no bias) then + bias, from same payloads
+    let qWeight = mexec.ModelExecutorFindWeightPayload(store, "model.layers.0.self_attn.q_proj.weight")
+    assert(IsOk(qWeight), " bias smoke: find q weight")
+    let qBias = mexec.ModelExecutorFindWeightPayload(store, "model.layers.0.self_attn.q_proj.bias")
+    assert(IsOk(qBias), " bias smoke: find q bias")
+    var refProj: infer.TensorQ
+    assert(IsOk(mexec.ModelExecutorLinearOutInWeightFill(refProj, Value(inputNorm), Value(qWeight).tensor, "ref_q")),
+           " bias smoke: ref q proj")
+    var refNoBias: infer.TensorQ
+    assert(IsOk(infer.TensorFromDataFill(refNoBias, refProj.shape, refProj.scale, refProj.data)), " bias smoke: copy")
+    assert(IsOk(mexec.ModelExecutorAddBiasRows(refProj, Value(qBias).tensor)), " bias smoke: ref add bias")
+
+    assert(qOut.data.len == refProj.data.len, " bias smoke: q len")
+    var sawBiasEffect: bool
+    sawBiasEffect = false
+    for i in 0..<qOut.data.len:
+        assert(qOut.data[i] == refProj.data[i], " bias smoke: q == proj+bias")
+        if refProj.data[i] != refNoBias.data[i]:
+            sawBiasEffect = true
+    assert(sawBiasEffect, " bias smoke: bias actually changed q (not a no-op)")
+    echo(strutil.Join(["q[0] proj+bias=", strings.IntToStr(qOut.data[0]), " nobias=", strings.IntToStr(refNoBias.data[0])], ""))
+
+    echo(" num_core_153_bias_smoke ok")
+    return 0

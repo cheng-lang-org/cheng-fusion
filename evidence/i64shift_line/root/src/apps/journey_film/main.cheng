@@ -1,0 +1,406 @@
+# journey_film (JOURNEY): the 60-second single-world continuous take.
+# Pass 1 runs the 14400-tick journey physics serially (stand -> walk to
+# the rope -> rope transition -> five climb cycles -> tall finish) and
+# dumps one render-state file plus one six-shot camera/caption parameter
+# file per 24 fps frame; pass 2 renders all 1440 frames fully in
+# parallel (each worker loads its own state and parameter files, makes
+# its own raster and writes its own PPM — no shared memory crosses a
+# thread boundary, the parallel_render_probe zero-sharing pattern); pass
+# 3 streams the PPM frames through the VideoToolbox bridge and assembles
+# journey.mp4, then asserts the journey displacement contract:
+#   - zero rejected physics steps
+#   - walk segment: pelvis advances >= 0.5 m along +x
+#   - climb segment: pelvis rises >= 1.5 m
+#   - final pelvis height >= 2.5 m, chest above pelvis (upright)
+import cheng/game/csg/schema
+import cheng/game/csg/validation
+import cheng/game/csg/producer
+import cheng/game/csg/materializer
+import cheng/game/csg/execution
+import cheng/game/world3d
+import cheng/game/physics3d
+import cheng/game/cinema/camera
+import cheng/game/cinema/shot_plan
+import cheng/game/cinema/vtbr
+import cheng/game/cinema/mp4
+import cheng/game/cinema/aac
+import cheng/game/cinema/score
+import cheng/game/render/cpu_raster as raster
+import cheng/game/render/character
+import cheng/game/render/text
+import cheng/game/render/render_state
+import std/os
+import std/strings as strings
+import std/rawbytes
+import std/thread
+
+const
+    JourneySchema = "cheng.apps.journey_film.v1"
+    JourneyWidth = 1280
+    JourneyHeight = 720
+    JourneyDir = "artifacts/csg_world_video/journey"
+    JourneyTotalTicks = 14400
+    JourneyFrameStep = 10
+    JourneyFrames = 1440
+    WalkStartTick = 1800
+    WalkEndTick = 2880
+    ClimbStartTick = 4300
+    # PPM spot-check frames kept on disk for inspection (standing, walk,
+    # rope transition, mid-climb, final hang)
+    KeepFrame0 = 0
+    KeepFrame1 = 210
+    KeepFrame2 = 330
+    KeepFrame3 = 800
+    KeepFrame4 = 1439
+
+fn framePath(frame: int32): str =
+    return JourneyDir + "/j_f" + strings.IntToStr(frame) + ".ppm"
+
+fn QuantMm(v: float64): int64 =
+    let mm: int32 = int32(v * 1000.0)
+    let wide: int64 = mm
+    return wide
+
+fn IsKeepFrame(frame: int32): bool =
+    if frame == KeepFrame0:
+        return true
+    if frame == KeepFrame1:
+        return true
+    if frame == KeepFrame2:
+        return true
+    if frame == KeepFrame3:
+        return true
+    if frame == KeepFrame4:
+        return true
+    return false
+
+# The six-shot edit: one 2400-tick window each across the 14400-tick
+# journey. The figure stands beside the wall at x=0 (pelvis z ~0.7),
+# walks eight steps along +x to the rope anchor at x=1.2, transitions
+# onto the rope and climbs five cycles to the tall finish (pelvis z
+# >= 2.5). Every camera keeps the whole window's figure travel inside
+# its frustum.
+fn JourneyPlan(): shot_plan.ShotPlan =
+    var p: shot_plan.ShotPlan
+    shot_plan.ShotPlanReset(p)
+    shot_plan.ShotPlanAddShot(p, -2.4, 3.2, 1.1, 0.5, 0.85, 0.9, 900.0, int64(0), int64(2399), "SHOT 1: THE WALL")
+    shot_plan.ShotPlanAddShot(p, -2.2, 3.0, 0.9, 1.15, 0.87, 1.05, 950.0, int64(2400), int64(4799), "SHOT 2: THE WALK")
+    shot_plan.ShotPlanAddShot(p, -2.4, 3.3, 1.3, 1.2, 0.9, 1.55, 1000.0, int64(4800), int64(7199), "SHOT 3: THE GRAB")
+    shot_plan.ShotPlanAddShot(p, 4.1, 3.3, 2.1, 1.2, 0.9, 2.4, 950.0, int64(7200), int64(9599), "SHOT 4: THE CLIMB")
+    shot_plan.ShotPlanAddShot(p, -2.6, 3.2, 2.9, 1.2, 0.9, 3.05, 950.0, int64(9600), int64(11999), "SHOT 5: THE HEIGHTS")
+    shot_plan.ShotPlanAddShot(p, -3.4, 4.4, 1.6, 1.2, 0.9, 3.0, 850.0, int64(12000), int64(14399), "SHOT 6: THE SUMMIT")
+    # narrative subtitles (non-overlapping windows)
+    shot_plan.ShotPlanAddSubtitle(p, int64(100), int64(1700), "THE JOURNEY BEGINS")
+    shot_plan.ShotPlanAddSubtitle(p, int64(1900), int64(3500), "EIGHT STEPS TOWARD THE ROPE")
+    shot_plan.ShotPlanAddSubtitle(p, int64(3700), int64(5200), "HANDS FIND THE ROPE")
+    shot_plan.ShotPlanAddSubtitle(p, int64(5400), int64(9100), "PULL BY PULL UP THE ROPE")
+    shot_plan.ShotPlanAddSubtitle(p, int64(9300), int64(11800), "HIGHER THAN THE WALL TOP")
+    shot_plan.ShotPlanAddSubtitle(p, int64(12100), int64(14200), "THE SUMMIT OF THE ROPE")
+    return p
+
+# The shot plan (with its seq fields) never crosses a thread boundary:
+# pass 1 freezes each frame's camera scalars and subtitle choice into a
+# per-frame text file. Camera scalars travel as micro-metre integers so
+# the worker's hand parse round-trips the plan's decimal literals
+# exactly; the label and subtitle ride the following lines verbatim.
+#   line 1: pxU pyU pzU txU tyU tzU focalU subOn
+#   line 2: shot label
+#   line 3: subtitle text (empty line when subOn = 0)
+fn ParamFramePath(dir: str, frame: int32): str =
+    return dir + "/param_f" + strings.IntToStr(frame) + ".txt"
+
+fn MicronOf(v: float64): int64 =
+    if v >= 0.0:
+        return int64(v * 1000000.0 + 0.5)
+    return int64(v * 1000000.0 - 0.5)
+
+fn MicronToFloat(m: int64): float64 =
+    return float64(m) / 1000000.0
+
+# Pass 2 worker: load this frame's state file plus its frozen camera/
+# subtitle parameter file, render and write the frame PPM. Every input
+# comes from this frame's own files — no shared state across threads.
+fn journeyRenderWorker(raw: ptr, index: int32, worker: int32): int32 =
+    let _raw = raw
+    let _worker = worker
+    let ptext: str = os.ReadFile(ParamFramePath(JourneyDir, index))
+    var camv: int64[]
+    setLen(camv, 0)
+    var subOn: int32
+    var pos: int32 = 0
+    var fi: int32 = 0
+    while fi < 8:
+        var v: int64 = 0
+        var neg: bool = false
+        var seen: bool = false
+        while pos < ptext.len:
+            let c: int32 = int32(ptext[pos])
+            if c == 45:
+                neg = true
+                seen = true
+                pos = pos + 1
+            else:
+                if c == 32 || c == 10:
+                    if seen:
+                        pos = pos + 1
+                        break
+                    pos = pos + 1
+                else:
+                    v = v * 10 + int64(c - 48)
+                    seen = true
+                    pos = pos + 1
+        if neg:
+            v = 0 - v
+        if fi < 7:
+            add(camv, v)
+        else:
+            subOn = int32(v)
+        fi = fi + 1
+    # line 2: shot label (frozen for the manifest trail, skipped here)
+    while pos < ptext.len:
+        if int32(ptext[pos]) == 10:
+            break
+        pos = pos + 1
+    pos = pos + 1
+    # line 3: subtitle text (may be empty)
+    var ss: int32 = pos
+    while pos < ptext.len:
+        if int32(ptext[pos]) == 10:
+            break
+        pos = pos + 1
+    let subText: str = strings.sliceBytes(ptext, ss, pos - ss)
+    var cam = camera.CinemaCameraLookAt(
+        MicronToFloat(camv[0]), MicronToFloat(camv[1]), MicronToFloat(camv[2]),
+        MicronToFloat(camv[3]), MicronToFloat(camv[4]), MicronToFloat(camv[5]),
+        MicronToFloat(camv[6]), JourneyWidth, JourneyHeight)
+    let state = render_state.RenderStateLoad(render_state.RenderStateFramePath(JourneyDir, index))
+    if state == nil:
+        return 1
+    var t: raster.RasterTarget
+    t = raster.RasterMake(JourneyWidth, JourneyHeight)
+    raster.RasterGround(t, cam)
+    raster.RasterWallFace(t, cam, 0.5, -2.0, 2.0, 0.0, 4.0)
+    character.RenderRopeState(t, cam, state)
+    character.RenderCharacterState(t, cam, state)
+    # narrative subtitle when the plan says this frame carries one
+    if subOn >= 1:
+        text.RasterText(t, 40, 640, 3, subText, 255, 240, 200)
+    raster.RasterWritePpm(t, framePath(index))
+    return 0
+
+fn main(): int32 =
+    os.MkdirAll(JourneyDir, 493)
+    var plan = JourneyPlan()
+    if !shot_plan.ShotPlanValid(plan):
+        echo("FAIL shot plan invalid")
+        return 1
+    var facts: schema.CsgWorldFacts = producer.CsgProducerBuildJourneyScene()
+    var verdict = validation.CsgValidateFacts(facts)
+    if verdict.statusCode != validation.CsgValidOk:
+        echo("FAIL facts validation")
+        echo("status=" + strings.IntToStr(verdict.statusCode))
+        echo("detail=" + strings.IntToStr(verdict.detailIndex))
+        return 1
+    var w: world3d.World3d
+    var mp: materializer.CsgMaterializerMapping
+    var err: str = ""
+    if !materializer.CsgMaterialize(facts, w, mp, err):
+        echo("FAIL materialize: " + err)
+        return 1
+    var st: execution.CsgExecutionState
+    execution.CsgExecutionInit(st, facts, w, mp.partSlot, mp.ropeNodeSlot)
+    let pelvisSlot = mp.partSlot[0]
+    let chestSlot = mp.partSlot[1]
+    var partRoles: int32[]
+    setLen(partRoles, 0)
+    var ri: int32 = 0
+    while ri < facts.partRole.len:
+        add(partRoles, facts.partRole[ri])
+        ri = ri + 1
+    # ---- pass 1: serial physics + per-frame state dump ----
+    var walkStartX: float64 = 0.0
+    var walkEndX: float64 = 0.0
+    var climbStartZ: float64 = 0.0
+    var frame: int32 = 0
+    var tick: int32 = 0
+    while tick < JourneyTotalTicks:
+        if tick == WalkStartTick:
+            walkStartX = st.w.bodyPx[pelvisSlot]
+        if tick == WalkEndTick:
+            walkEndX = st.w.bodyPx[pelvisSlot]
+        if tick == ClimbStartTick:
+            climbStartZ = st.w.bodyPz[pelvisSlot]
+        if tick % JourneyFrameStep == 0:
+            let shotIdx = shot_plan.ShotPlanShotAt(plan, int64(tick))
+            let subIdx = shot_plan.ShotPlanSubtitleAt(plan, int64(tick))
+            var ptext: str = ""
+            ptext = ptext + strings.Int64ToStr(MicronOf(plan.camPx[shotIdx]))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(plan.camPy[shotIdx]))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(plan.camPz[shotIdx]))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(plan.camTx[shotIdx]))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(plan.camTy[shotIdx]))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(plan.camTz[shotIdx]))
+            ptext = ptext + " " + strings.Int64ToStr(MicronOf(plan.camFocal[shotIdx]))
+            if subIdx >= 0:
+                ptext = ptext + " 1\n"
+            else:
+                ptext = ptext + " 0\n"
+            ptext = ptext + plan.label[shotIdx] + "\n"
+            if subIdx >= 0:
+                ptext = ptext + plan.subText[subIdx] + "\n"
+            else:
+                ptext = ptext + "\n"
+            os.WriteFile(ParamFramePath(JourneyDir, frame), ptext)
+            render_state.RenderStateSave(st.w, partRoles, render_state.RenderStateFramePath(JourneyDir, frame))
+            frame = frame + 1
+        var receipt = execution.CsgExecutionTick(st, facts)
+        if receipt.statusCode != physics3d.Physics3dStatusOk:
+            echo("FAIL step rejected")
+            echo("tick=" + strings.Int64ToStr(receipt.tick))
+            echo("status=" + strings.IntToStr(receipt.statusCode))
+            return 1
+        tick = tick + 1
+    let endZ: float64 = st.w.bodyPz[pelvisSlot]
+    let endX: float64 = st.w.bodyPx[pelvisSlot]
+    if frame != JourneyFrames:
+        echo("FAIL frame count")
+        echo("frames=" + strings.IntToStr(frame))
+        return 1
+    if st.rejectedCount != 0:
+        echo("FAIL rejections")
+        echo("n=" + strings.IntToStr(st.rejectedCount))
+        return 1
+    # ---- journey displacement contract ----
+    let walkAdvance: float64 = walkEndX - walkStartX
+    let walkAdvMm: int64 = QuantMm(walkAdvance)
+    if walkAdvance < 0.5:
+        echo("FAIL walk advance")
+        echo("mm=" + strings.Int64ToStr(walkAdvMm))
+        return 1
+    let climbRise: float64 = endZ - climbStartZ
+    let climbRiseMm: int64 = QuantMm(climbRise)
+    if climbRise < 1.5:
+        echo("FAIL climb rise")
+        echo("mm=" + strings.Int64ToStr(climbRiseMm))
+        return 1
+    let endZMm: int64 = QuantMm(endZ)
+    if endZ < 2.5:
+        echo("FAIL final height")
+        echo("mm=" + strings.Int64ToStr(endZMm))
+        return 1
+    if st.w.bodyPz[chestSlot] < st.w.bodyPz[pelvisSlot]:
+        echo("FAIL upright chest below pelvis")
+        return 1
+    # ---- pass 2: frame-parallel render from the state stream ----
+    var pool = thread.PoolNew(0)
+    thread.ParallelFor(pool, JourneyFrames, &journeyRenderWorker, nil)
+    # ---- pass 3: stream PPM frames -> VideoToolbox -> journey.mp4 ----
+    let vctx: ptr = vtbr.VtbrVideoSessionCreate(JourneyWidth, JourneyHeight)
+    if vctx == nil:
+        echo("FAIL vt session")
+        return 1
+    var encodeFail: int32 = 0
+    var pixTotal: int32 = JourneyWidth * JourneyHeight
+    var f: int32 = 0
+    while f < JourneyFrames:
+        let ppm: str = os.ReadFile(framePath(f))
+        if ppm.len < 16 + pixTotal * 3:
+            echo("FAIL ppm short")
+            echo("frame=" + strings.IntToStr(f))
+            return 1
+        var b: rawbytes.Bytes = rawbytes.BytesAlloc(pixTotal * 4)
+        var pi: int32 = 0
+        while pi < pixTotal:
+            rawbytes.BytesSet(b, pi * 4, int32(ppm[16 + pi * 3 + 2]) & 255)
+            rawbytes.BytesSet(b, pi * 4 + 1, int32(ppm[16 + pi * 3 + 1]) & 255)
+            rawbytes.BytesSet(b, pi * 4 + 2, int32(ppm[16 + pi * 3]) & 255)
+            rawbytes.BytesSet(b, pi * 4 + 3, int32(255))
+            pi = pi + 1
+        let erc = vtbr.VtbrVideoEncodeBgra(vctx, rawbytes.BytesDataPtr(b), JourneyWidth * 4, JourneyWidth, JourneyHeight, f * 1000)
+        rawbytes.BytesFree(b)
+        if erc != 0:
+            encodeFail = encodeFail + 1
+        if !IsKeepFrame(f):
+            let _removed = os.RemoveFile(framePath(f))
+        f = f + 1
+    if encodeFail > 0:
+        echo("FAIL encode frames")
+        echo("n=" + strings.IntToStr(encodeFail))
+        return 1
+    if vtbr.VtbrVideoFinish(vctx) != 0:
+        echo("FAIL video finish")
+        return 1
+    let _drained = vtbr.VtbrVideoDrain(vctx)
+    var videoPayload: uint8[]
+    setLen(videoPayload, 0)
+    vtbr.VtbrVideoCopyPayload(vctx, videoPayload)
+    var videoSizes: int32[]
+    setLen(videoSizes, 0)
+    vtbr.VtbrVideoCopySizes(vctx, videoSizes)
+    var videoKf: int32[]
+    setLen(videoKf, 0)
+    vtbr.VtbrVideoCopyKeyframes(vctx, videoKf)
+    var sps: uint8[]
+    setLen(sps, 0)
+    var pps: uint8[]
+    setLen(pps, 0)
+    vtbr.VtbrVideoCopyParamSets(vctx, sps, pps)
+    if sps.len == 0 || pps.len == 0:
+        echo("FAIL paramsets empty")
+        return 1
+    if videoSizes.len != JourneyFrames:
+        echo("FAIL video sample count")
+        echo("n=" + strings.IntToStr(videoSizes.len))
+        return 1
+    var inp: mp4.Mp4Input
+    inp.videoSizes = videoSizes
+    inp.videoKf = videoKf
+    inp.videoPayload = videoPayload
+    inp.sps = sps
+    inp.pps = pps
+    var scorePcm: uint8[]
+    setLen(scorePcm, 0)
+    let scoreSamples: int32 = score.ScorePcm48k(scorePcm, 60)
+    var audioPayload: uint8[]
+    setLen(audioPayload, 0)
+    var audioSizes: int32[]
+    setLen(audioSizes, 0)
+    let arc = aac.AacEncodePcm16(scorePcm, scorePcm.len, audioPayload, audioSizes)
+    if arc != 0:
+        echo("FAIL audio encode rc=" + strings.IntToStr(arc))
+        return 1
+    var packetBytes: int32 = 0
+    var asi: int32 = 0
+    while asi < audioSizes.len:
+        packetBytes = packetBytes + audioSizes[asi]
+        asi = asi + 1
+    if packetBytes != audioPayload.len:
+        echo("FAIL audio payload mismatch")
+        return 1
+    inp.audioPayload = audioPayload
+    inp.audioSizes = audioSizes
+    inp.audioSamples = scoreSamples
+    mp4.Mp4Assemble(inp, JourneyDir + "/journey.mp4")
+    var man: str = ""
+    man = man + "schema=" + JourneySchema + "\n"
+    man = man + "shots=" + strings.IntToStr(plan.shotCount) + "\n"
+    man = man + "ticks=" + strings.IntToStr(JourneyTotalTicks) + "\n"
+    man = man + "frames=" + strings.IntToStr(frame) + "\n"
+    man = man + "audioPackets=" + strings.IntToStr(audioSizes.len) + "\n"
+    man = man + "audioSamples=" + strings.IntToStr(scoreSamples) + "\n"
+    man = man + "walkAdvanceMm=" + strings.Int64ToStr(walkAdvMm) + "\n"
+    man = man + "climbRiseMm=" + strings.Int64ToStr(climbRiseMm) + "\n"
+    man = man + "endPelvisZMm=" + strings.Int64ToStr(endZMm) + "\n"
+    man = man + "walkStartXmm=" + strings.Int64ToStr(QuantMm(walkStartX)) + "\n"
+    man = man + "climbStartZmm=" + strings.Int64ToStr(QuantMm(climbStartZ)) + "\n"
+    man = man + "factsCid=" + Fmt"{schema.CsgWorldFactsCid(facts)}" + "\n"
+    man = man + "chainCid=" + Fmt"{st.chainCid}" + "\n"
+    os.WriteFile(JourneyDir + "/manifest.txt", man)
+    echo("walkAdvanceMm=" + strings.Int64ToStr(walkAdvMm))
+    echo("climbRiseMm=" + strings.Int64ToStr(climbRiseMm))
+    echo("endPelvisZMm=" + strings.Int64ToStr(endZMm))
+    echo("frames=" + strings.IntToStr(frame))
+    echo("samples=" + strings.IntToStr(videoSizes.len))
+    echo("chainCid=" + Fmt"{st.chainCid}")
+    echo("PASS journey film")
+    return 0

@@ -1,0 +1,460 @@
+import cheng/core/ir/core_types as ir
+import cheng/core/ir/body_ir_access as access
+import cheng/core/ir/body_ir_cfg as cfg
+import cheng/core/backend/regalloc_single_pass as alloc
+import cheng/core/backend/regalloc_aarch64_adapter as adapter
+import cheng/core/backend/aarch64_encode as a64
+import cheng/core/backend/regalloc_production_emitter as emitter
+import cheng/core/backend/regalloc_production_artifacts as artifacts
+
+fn makeScalarSlot(id: int32,
+                  typeKind: int32,
+                  stackOffset: int32): ir.LocalSlot =
+    var slot: ir.LocalSlot
+    slot.id = id
+    slot.name = "stack_home_value"
+    slot.typeKind = typeKind
+    slot.stackOffset = stackOffset
+    slot.sizeBytes = 4
+    slot.alignBytes = 4
+    if typeKind == ir.LocalI64Tag || typeKind == ir.LocalPtrTag:
+        slot.sizeBytes = 8
+        slot.alignBytes = 8
+    ir.BodyIRApplyLocalSlotDefaultProof(slot)
+    return slot
+
+fn makeBorrowI32Slot(id: int32,
+                     ownerSlot: int32,
+                     stackOffset: int32): ir.LocalSlot =
+    var slot = makeScalarSlot(id, ir.LocalI32Tag, stackOffset)
+    slot.placeKind = ir.BodyPlaceBorrowAddressTag
+    slot.auxValue = ownerSlot
+    slot.noAlias = false
+    slot.aliasClass = ir.AliasUnknown
+    return slot
+
+fn appendConst(body: var ir.BodyIR,
+               target: int32,
+               typeKind: int32,
+               value: int32) =
+    var op: ir.BodyOp
+    op.kind = ir.BodyOpLoadConstTag
+    op.target = target
+    add(op.operands, typeKind)
+    add(op.operands, value)
+    add(body.ops, op)
+
+fn appendCopy(body: var ir.BodyIR,
+              target: int32,
+              source: int32) =
+    var op: ir.BodyOp
+    op.kind = ir.BodyOpCopyLocalTag
+    op.target = target
+    add(op.operands, source)
+    add(body.ops, op)
+
+fn appendAddressCall(body: var ir.BodyIR,
+                     targetSymbol: str,
+                     addressSlots: var int32[]) =
+    var call: ir.CallOp
+    call.targetSymbol = targetSymbol
+    call.resultSlot = -1
+    call.resultPassKind = ir.BodyCallPassStackValueTag
+    call.relocWordOffset = -1
+    for argIndex in 0..<addressSlots.len:
+        add(call.argSlots, ir.CallArgSlotAddress(addressSlots[argIndex]))
+        add(call.argPassKinds, ir.BodyCallPassParamAddressTag)
+        add(call.argAbiSizes, 8)
+    add(body.callSequence, call)
+    var op: ir.BodyOp
+    op.kind = ir.BodyOpCallTag
+    op.target = -1
+    add(op.operands, body.callSequence.len - 1)
+    add(body.ops, op)
+
+fn appendNoArgCall(body: var ir.BodyIR, targetSymbol: str) =
+    var addressSlots: int32[]
+    appendAddressCall(body, targetSymbol, addressSlots)
+
+fn appendI32ValueCall(body: var ir.BodyIR,
+                      targetSymbol: str,
+                      slotIndex: int32) =
+    var call: ir.CallOp
+    call.targetSymbol = targetSymbol
+    call.resultSlot = -1
+    call.resultPassKind = ir.BodyCallPassStackValueTag
+    call.relocWordOffset = -1
+    add(call.argSlots, slotIndex)
+    add(call.argPassKinds, ir.BodyCallPassStackValueTag)
+    add(call.argAbiSizes, 4)
+    add(body.callSequence, call)
+    var op: ir.BodyOp
+    op.kind = ir.BodyOpCallTag
+    op.target = -1
+    add(op.operands, body.callSequence.len - 1)
+    add(body.ops, op)
+
+fn appendReturn(body: var ir.BodyIR,
+                slotIndex: int32,
+                typeKind: int32): int32 =
+    var term: ir.BodyTerm
+    term.kind = ir.BodyTermReturnTag
+    term.resultSlot = slotIndex
+    add(term.operands, typeKind)
+    return ir.BodyIRAppendTerm(body, term)
+
+fn appendVoidReturn(body: var ir.BodyIR): int32 =
+    var term: ir.BodyTerm
+    term.kind = ir.BodyTermReturnTag
+    term.resultSlot = -1
+    return ir.BodyIRAppendTerm(body, term)
+
+fn forbiddenPersistentAction(kind: int32): bool =
+    return kind == alloc.RegallocValueActionEntryReload ||
+           kind == alloc.RegallocValueActionBindDef ||
+           kind == alloc.RegallocValueActionReloadCall ||
+           kind == alloc.RegallocValueActionBindFixedResult
+
+fn callFactsAreReadWrite(table: var access.BodyIrAccessTable): bool =
+    for callOrdinal in 0..<table.callFactStarts.len:
+        let start = table.callFactStarts[callOrdinal]
+        let count = table.callFactCounts[callOrdinal]
+        var memoryCount: int32
+        for factIndex in start..<(start + count):
+            let fact = table.facts[factIndex]
+            if fact.kind == access.BodyIrAccessFactMemory:
+                if fact.memoryEffect !=
+                   access.BodyIrAccessMemoryCallReadWrite:
+                    return false
+                memoryCount = memoryCount + 1
+        if memoryCount != 1:
+            return false
+    return true
+
+fn valueForSlot(plan: var alloc.RegallocSinglePassValuePlan,
+                slotIndex: int32): int32 =
+    for valueId in 0..<plan.valueSlotIndices.len:
+        if plan.valueSlotIndices[valueId] == slotIndex &&
+           plan.valueDefPositions[valueId] >= 0:
+            return valueId
+    return -1
+
+fn planHasHomeUseAndDef(plan: var alloc.RegallocSinglePassValuePlan,
+                        valueId: int32): bool =
+    var sawStore: bool
+    var sawReload: bool
+    var sawFixedLoad: bool
+    for actionIndex in 0..<plan.actions.len:
+        let action = plan.actions[actionIndex]
+        if action.valueId != valueId:
+            continue
+        if forbiddenPersistentAction(action.kind):
+            return false
+        if action.kind == alloc.RegallocValueActionStoreHome &&
+           action.sourceLocation == alloc.RegallocValueLocationNone &&
+           action.sourceReg < 0 && action.targetMemoryHome:
+            sawStore = true
+        if action.kind == alloc.RegallocValueActionReloadOperand &&
+           action.sourceLocation == alloc.RegallocValueLocationStack &&
+           action.targetLocation == alloc.RegallocValueLocationRegister &&
+           action.targetReg >= 0:
+            sawReload = true
+        if action.kind == alloc.RegallocValueActionLoadFixed &&
+           action.sourceLocation == alloc.RegallocValueLocationStack:
+            sawFixedLoad = true
+    return sawStore && sawReload && sawFixedLoad
+
+fn buildMutateBody(): ir.BodyIR =
+    var body = ir.BodyIRNew()
+    add(body.localSlots, makeScalarSlot(0, ir.LocalI32Tag, 16))
+    add(body.localSlots, makeScalarSlot(1, ir.LocalI32Tag, 24))
+    appendConst(body, 0, ir.LocalI32Tag, 1)
+    var addressSlots: int32[]
+    add(addressSlots, 0)
+    appendAddressCall(body, "mutate", addressSlots)
+    appendNoArgCall(body, "looks_read_only_but_is_not")
+    appendCopy(body, 1, 0)
+    appendI32ValueCall(body, "observe_copy", 1)
+    let returnTerm = appendReturn(body, 0, ir.LocalI32Tag)
+    let _ = ir.BodyIRAppendBlock(body, 0, 5, returnTerm)
+    return body
+
+fn testMutateAndWorstCaseCalls(): int32 =
+    var body = buildMutateBody()
+    var table = access.BodyIrAccessDecode(body)
+    if !table.valid || !callFactsAreReadWrite(table):
+        return 11
+    var constraints = alloc.RegallocTargetConstraintsA64Darwin()
+    var first = alloc.RegallocSinglePassValuePlanBuildDecoded(
+        body, constraints)
+    var second = alloc.RegallocSinglePassValuePlanBuildDecoded(
+        body, constraints)
+    if !first.valid || !first.frozen ||
+       !alloc.RegallocSinglePassValuePlanValidate(first) ||
+       !alloc.RegallocSinglePassValuePlanEquivalent(first, second):
+        return 12
+    let xValue = valueForSlot(first, 0)
+    if xValue < 0 || !first.valueMemoryHomes[xValue] ||
+       first.valueClasses[xValue] != alloc.RegallocValueClassAddressHome ||
+       first.valueAssignedRegs[xValue] != -1 ||
+       !planHasHomeUseAndDef(first, xValue):
+        return 13
+    var sawAddress: bool
+    for actionIndex in 0..<first.actions.len:
+        let action = first.actions[actionIndex]
+        if action.kind == alloc.RegallocValueActionAddressFixed &&
+           action.encodedValue == 0:
+            sawAddress = true
+    if !sawAddress:
+        return 14
+    var coalescedIndex: int32 = -1
+    var reloadIndex: int32 = -1
+    for actionIndex in 0..<first.actions.len:
+        let action = first.actions[actionIndex]
+        if action.kind == alloc.RegallocValueActionCoalescedCopy &&
+           action.opIndex == 3:
+            if coalescedIndex >= 0:
+                return 15
+            coalescedIndex = actionIndex
+        if action.kind == alloc.RegallocValueActionReloadOperand &&
+           action.opIndex == 3 && action.valueId == xValue:
+            if reloadIndex >= 0:
+                return 15
+            reloadIndex = actionIndex
+    if coalescedIndex < 0 || reloadIndex < 0:
+        return 15
+    let coalesced = first.actions[coalescedIndex]
+    let reload = first.actions[reloadIndex]
+    if coalesced.otherValueId != xValue ||
+       coalesced.relatedActionOrdinal != reloadIndex ||
+       reloadIndex >= coalescedIndex ||
+       coalesced.sourceReg < 0 ||
+       coalesced.sourceReg != coalesced.targetReg ||
+       reload.targetReg != coalesced.sourceReg ||
+       reload.factIndex < 0 || reload.factIndex >= table.facts.len ||
+       table.facts[reload.factIndex].kind != access.BodyIrAccessFactUse ||
+       table.facts[reload.factIndex].siteKind != access.BodyIrAccessSiteOp ||
+       table.facts[reload.factIndex].siteIndex != 3 ||
+       table.facts[reload.factIndex].slotIndex != 0 ||
+       reload.placement != alloc.RegallocValuePlacementBeforeOp ||
+       coalesced.placement != alloc.RegallocValuePlacementAfterOp:
+        return 16
+    var prepared = adapter.RegallocA64PrepareFunctionActionRecipes(
+        body, first)
+    if !prepared.valid || coalescedIndex >= prepared.recipes.len ||
+       reloadIndex >= prepared.recipes.len ||
+       coalescedIndex >= prepared.actionWordCounts.len ||
+       reloadIndex >= prepared.actionWordCounts.len:
+        return 17
+    let coalescedRecipe = prepared.recipes[coalescedIndex]
+    let reloadRecipe = prepared.recipes[reloadIndex]
+    if coalescedRecipe.bindingKind !=
+           alloc.RegallocValueBindingStructural ||
+       coalescedRecipe.words.len != 0 ||
+       coalescedRecipe.effectMask != 0 ||
+       prepared.actionWordCounts[coalescedIndex] != 0 ||
+       reloadRecipe.bindingKind != alloc.RegallocValueBindingMachine ||
+       reloadRecipe.words.len != 1 ||
+       prepared.actionWordCounts[reloadIndex] != 1 ||
+       prepared.localStackOffsets.len <= 0 ||
+       reloadRecipe.words[0] != Value(a64.A64EncLdrImm(
+           false, reload.targetReg, a64.A64SP,
+           int64(prepared.localStackOffsets[0]))):
+        return 18
+    var coalescedFragmentCount: int32
+    var reloadFragmentCount: int32
+    for fragmentIndex in 0..<prepared.machineFragments.len:
+        let fragment = prepared.machineFragments[fragmentIndex]
+        if fragment.actionConsumerOrdinal == coalescedIndex:
+            coalescedFragmentCount = coalescedFragmentCount + 1
+        if fragment.actionConsumerOrdinal == reloadIndex:
+            reloadFragmentCount = reloadFragmentCount + 1
+            if fragment.wordCount != 1:
+                return 19
+    if coalescedFragmentCount != 0 || reloadFragmentCount != 1:
+        return 19
+    var resolvedCallTargets: str[]
+    add(resolvedCallTargets, "_mutate")
+    add(resolvedCallTargets, "_looks_read_only_but_is_not")
+    add(resolvedCallTargets, "_observe_copy")
+    var resolvedDataTargets: str[]
+    var emission = emitter.RegallocProductionEmitFunction(
+        "arm64-apple-darwin",
+        body, "_regalloc_address_home", 0,
+        resolvedCallTargets, resolvedDataTargets,
+        0, artifacts.RegallocProductionFunctionKindNormal)
+    if !emission.valid || !emission.receipt.valid ||
+       coalescedIndex >= emission.receipt.actionEmissions.len ||
+       reloadIndex >= emission.receipt.actionEmissions.len ||
+       emission.receipt.actionEmissions[coalescedIndex].bindingKind !=
+           alloc.RegallocValueBindingStructural ||
+       emission.receipt.actionEmissions[coalescedIndex].emittedByteLength != 0 ||
+       emission.receipt.actionEmissions[coalescedIndex].emittedBytesSha256 !=
+           alloc.RegallocValueEmptySha256 ||
+       emission.receipt.actionEmissions[reloadIndex].bindingKind !=
+           alloc.RegallocValueBindingMachine ||
+       emission.receipt.actionEmissions[reloadIndex].emittedByteLength != 4:
+        return 20
+    var forged = alloc.RegallocSinglePassValuePlanBuildDecoded(
+        body, constraints)
+    if !forged.valid || coalescedIndex >= forged.actions.len:
+        return 20
+    forged.actions[coalescedIndex].relatedActionOrdinal = -1
+    if alloc.RegallocSinglePassValuePlanValidate(forged) || forged.valid:
+        return 20
+    return 0
+
+fn buildAliasBody(): ir.BodyIR =
+    var body = ir.BodyIRNew()
+    add(body.localSlots, makeScalarSlot(0, ir.LocalI64Tag, 16))
+    add(body.localSlots, makeBorrowI32Slot(1, 0, 16))
+    add(body.localSlots, makeBorrowI32Slot(2, 0, 20))
+    appendConst(body, 0, ir.LocalI64Tag, 9)
+    appendConst(body, 1, ir.LocalI32Tag, 1)
+    appendConst(body, 2, ir.LocalI32Tag, 2)
+    var addressSlots: int32[]
+    add(addressSlots, 1)
+    add(addressSlots, 2)
+    appendAddressCall(body, "mutate_two_aliases", addressSlots)
+    let returnTerm = appendReturn(body, 0, ir.LocalI64Tag)
+    let _ = ir.BodyIRAppendBlock(body, 0, 4, returnTerm)
+    return body
+
+fn testAliasOwnerPropagation(): int32 =
+    var body = buildAliasBody()
+    var table = access.BodyIrAccessDecode(body)
+    var analysis = cfg.BodyIrCfgAnalyze(body, table)
+    if !table.valid || !analysis.valid:
+        return 21
+    var addressCount: int32
+    for factIndex in 0..<table.facts.len:
+        let fact = table.facts[factIndex]
+        if fact.kind != access.BodyIrAccessFactAddress:
+            continue
+        if !access.BodyIrAccessAddressFactIsValid(body, fact) ||
+           fact.addressOwnerSlot != 0 ||
+           fact.addressByteLength != 4 ||
+           (fact.slotIndex == 1 && fact.addressByteOffset != 0) ||
+           (fact.slotIndex == 2 && fact.addressByteOffset != 4):
+            return 22
+        addressCount = addressCount + 1
+    if addressCount != 2:
+        return 23
+    var constraints = alloc.RegallocTargetConstraintsA64Darwin()
+    var first = alloc.RegallocSinglePassValuePlanBuild(
+        body, table, analysis, constraints)
+    var second = alloc.RegallocSinglePassValuePlanBuildDecoded(
+        body, constraints)
+    if !first.valid ||
+       !alloc.RegallocSinglePassValuePlanEquivalent(first, second):
+        return 24
+    for valueId in 0..<first.valueSlotIndices.len:
+        let slotIndex = first.valueSlotIndices[valueId]
+        if slotIndex >= 0 && slotIndex <= 2 &&
+           first.valueDefPositions[valueId] >= 0 &&
+           (!first.valueMemoryHomes[valueId] ||
+            first.valueAssignedRegs[valueId] != -1):
+            return 25
+    var forgedOwnerTable = access.BodyIrAccessDecode(body)
+    for factIndex in 0..<forgedOwnerTable.facts.len:
+        if forgedOwnerTable.facts[factIndex].kind ==
+           access.BodyIrAccessFactAddress:
+            forgedOwnerTable.facts[factIndex].addressOwnerSlot = 2
+            break
+    var forgedOwnerPlan = alloc.RegallocSinglePassValuePlanBuild(
+        body, forgedOwnerTable, analysis, constraints)
+    if forgedOwnerPlan.valid ||
+       forgedOwnerPlan.errorCode != alloc.RegallocValuePlanErrorFactShape:
+        return 26
+    var forgedRangeTable = access.BodyIrAccessDecode(body)
+    for factIndex in 0..<forgedRangeTable.facts.len:
+        if forgedRangeTable.facts[factIndex].kind ==
+           access.BodyIrAccessFactAddress:
+            forgedRangeTable.facts[factIndex].addressByteLength = 8
+            break
+    var forgedRangePlan = alloc.RegallocSinglePassValuePlanBuild(
+        body, forgedRangeTable, analysis, constraints)
+    if forgedRangePlan.valid ||
+       forgedRangePlan.errorCode != alloc.RegallocValuePlanErrorFactShape:
+        return 27
+    return 0
+
+fn buildInvalidBorrow(ownerSlot: int32,
+                      projectionOffset: int32): ir.BodyIR =
+    var body = ir.BodyIRNew()
+    add(body.localSlots, makeScalarSlot(0, ir.LocalI64Tag, 16))
+    add(body.localSlots,
+        makeBorrowI32Slot(1, ownerSlot, projectionOffset))
+    appendConst(body, 0, ir.LocalI64Tag, 1)
+    appendConst(body, 1, ir.LocalI32Tag, 2)
+    var addressSlots: int32[]
+    add(addressSlots, 1)
+    appendAddressCall(body, "mutate_invalid", addressSlots)
+    let returnTerm = appendVoidReturn(body)
+    let _ = ir.BodyIRAppendBlock(body, 0, 3, returnTerm)
+    return body
+
+fn testInvalidOwnerAndRange(): int32 =
+    var badOwner = buildInvalidBorrow(9, 16)
+    var ownerTable = access.BodyIrAccessDecode(badOwner)
+    if ownerTable.valid ||
+       ownerTable.errorCode != access.BodyIrAccessErrorAddressOwner:
+        return 31
+    var badRange = buildInvalidBorrow(0, 24)
+    var rangeTable = access.BodyIrAccessDecode(badRange)
+    if rangeTable.valid ||
+       rangeTable.errorCode != access.BodyIrAccessErrorAddressRange:
+        return 32
+    return 0
+
+fn testNoAliasAndNonStackHomes(): int32 =
+    var body = ir.BodyIRNew()
+    var mayAlias = makeScalarSlot(0, ir.LocalI32Tag, 16)
+    mayAlias.noAlias = false
+    add(body.localSlots, mayAlias)
+    appendConst(body, 0, ir.LocalI32Tag, 7)
+    let returnTerm = appendReturn(body, 0, ir.LocalI32Tag)
+    let _ = ir.BodyIRAppendBlock(body, 0, 1, returnTerm)
+    var constraints = alloc.RegallocTargetConstraintsA64Darwin()
+    var plan = alloc.RegallocSinglePassValuePlanBuildDecoded(body, constraints)
+    let valueId = valueForSlot(plan, 0)
+    if !plan.valid || valueId < 0 ||
+       !plan.valueMemoryHomes[valueId] ||
+       plan.valueAssignedRegs[valueId] != -1:
+        return 41
+
+    var addressBody = ir.BodyIRNew()
+    var incoming = makeScalarSlot(0, ir.LocalPtrTag, -1)
+    incoming.placeKind = ir.BodyPlaceParamAddressTag
+    incoming.noAlias = true
+    add(addressBody.localSlots, incoming)
+    let addressReturn = appendReturn(addressBody, 0, ir.LocalPtrTag)
+    let _ = ir.BodyIRAppendBlock(addressBody, 0, 0, addressReturn)
+    var addressPlan = alloc.RegallocSinglePassValuePlanBuildDecoded(
+        addressBody, constraints)
+    let addressValue = valueForSlot(addressPlan, 0)
+    if !addressPlan.valid || addressValue < 0 ||
+       !addressPlan.valueMemoryHomes[addressValue] ||
+       addressPlan.valueAssignedRegs[addressValue] != -1:
+        return 42
+    for actionIndex in 0..<addressPlan.actions.len:
+        let action = addressPlan.actions[actionIndex]
+        if action.valueId == addressValue &&
+           forbiddenPersistentAction(action.kind):
+            return 43
+    return 0
+
+fn main(): int32 =
+    # B1: codegen unit composition root (dispatch fails closed without registration)
+    if !adapter.RegallocA64CodegenUnitRegister():
+        return 90
+    let mutateCode = testMutateAndWorstCaseCalls()
+    if mutateCode != 0:
+        return mutateCode
+    let aliasCode = testAliasOwnerPropagation()
+    if aliasCode != 0:
+        return aliasCode
+    let invalidCode = testInvalidOwnerAndRange()
+    if invalidCode != 0:
+        return invalidCode
+    return testNoAliasAndNonStackHomes()

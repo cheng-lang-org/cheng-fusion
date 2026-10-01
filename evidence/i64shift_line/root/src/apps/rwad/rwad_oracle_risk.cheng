@@ -1,0 +1,261 @@
+# rwad_oracle_risk.cheng - oracle feed aggregation, rewards/penalties,
+# risk flags and governance parameter writes on the settlement economy.
+#
+# Migrated from RWAD-blockchain rwad_oracle / rwad_risk:
+#   maybeRewardOracle  -> EcoMaybeReward   (window dedup; empty pool no-ops)
+#   applyOraclePenalty -> EcoApplyPenalty  (charge = min(penalty, balance))
+#   calcAggregatePrice -> EcoTrimmedMean   (count>=3 drops min+max; the
+#                           original used floating Ratio, the kernel uses
+#                           fixed-point int64 - same ordering semantics)
+#   updateAggregate    -> EcoUpdateAggregate (stale window resets the set)
+#   isPaused/getLimit/applyRiskPause/applyRiskLimit/isBlacklisted
+#
+# Governance: the original repo has no standalone module; parameter writes
+# land as EcoGovSetBp with a whitelist and a <=10000 bp bound. Signer-role
+# authorization hooks in at the transaction layer.
+
+import std/system
+import std/rawbytes
+import std/result
+import cheng/std/bytes_layout as layout
+import cheng/chain/lsmr_types as lt
+import cheng/apps/rwad/rwad_settlement as ssm
+
+const
+    EcoOracleWindowMsDefault: int64 = 60000
+    EcoGovMaxBp: int32 = 10000
+
+type
+    EcoOracleFeed =
+        pairCid: layout.FixedBytes32
+        sumPrice: int64
+        count: int32
+        minPrice: int64
+        maxPrice: int64
+        lastUpdateMs: int64
+
+    EcoRiskFlags =
+        scope: layout.FixedBytes32
+        paused: bool
+        limit: int64
+
+    EcoOracleRiskState =
+        feeds: EcoOracleFeed[]
+        riskFlags: EcoRiskFlags[]
+        blacklist: layout.FixedBytes32[]
+        oracleWindowMs: int64
+        oracleRewardAmount: int64
+        oraclePenaltyAmount: int64
+        lastRewardTs: int64
+
+fn EcoInit(): EcoOracleRiskState =
+    var s: EcoOracleRiskState
+    s.oracleWindowMs = EcoOracleWindowMsDefault
+    return s
+
+# --- aggregate ---
+
+# Stale-window or first-tick resets the aggregate; otherwise accumulate.
+fn EcoUpdateAggregate(st: var EcoOracleRiskState, pairCid: layout.FixedBytes32,
+                      price: int64, nowMs: int64): Result[bool] =
+    if price < 0:
+        return Err[bool]("eco: negative price")
+    var i: int32
+    while i < st.feeds.len:
+        if layout.FixedBytes32Equal(st.feeds[i].pairCid, pairCid):
+            var reset: bool = false
+            if st.feeds[i].count == 0:
+                reset = true
+            else:
+                if st.oracleWindowMs > 0 and nowMs - st.feeds[i].lastUpdateMs > st.oracleWindowMs:
+                    reset = true
+            if reset:
+                st.feeds[i].sumPrice = price
+                st.feeds[i].count = 1
+                st.feeds[i].minPrice = price
+                st.feeds[i].maxPrice = price
+            else:
+                st.feeds[i].sumPrice = st.feeds[i].sumPrice + price
+                st.feeds[i].count = st.feeds[i].count + 1
+                if price < st.feeds[i].minPrice:
+                    st.feeds[i].minPrice = price
+                if price > st.feeds[i].maxPrice:
+                    st.feeds[i].maxPrice = price
+            st.feeds[i].lastUpdateMs = nowMs
+            return Ok[bool](true)
+        i = i + 1
+    var f: EcoOracleFeed
+    f.pairCid = pairCid
+    f.sumPrice = price
+    f.count = 1
+    f.minPrice = price
+    f.maxPrice = price
+    f.lastUpdateMs = nowMs
+    add(st.feeds, f)
+    return Ok[bool](true)
+
+# Trimmed mean at fixed point: count>=3 drops one min and one max then
+# divides by count-2; below 3 it is the plain mean. Integer division
+# truncates toward zero exactly like the original Ratio arithmetic rounds
+# at the same decimal place for the scaled representation.
+@borrows
+fn EcoTrimmedMean(st: EcoOracleRiskState, pairCid: layout.FixedBytes32): Result[int64] =
+    var i: int32
+    while i < st.feeds.len:
+        if layout.FixedBytes32Equal(st.feeds[i].pairCid, pairCid):
+            if st.feeds[i].count == 0:
+                return Err[int64]("eco: empty aggregate")
+            if st.feeds[i].count >= 3:
+                let trimmed: int64 = st.feeds[i].sumPrice - st.feeds[i].minPrice - st.feeds[i].maxPrice
+                return Ok[int64](trimmed / Int64(st.feeds[i].count - 2))
+            return Ok[int64](st.feeds[i].sumPrice / Int64(st.feeds[i].count))
+        i = i + 1
+    return Err[int64]("eco: unknown pair")
+
+# --- rewards and penalties (operate on the settlement economy state) ---
+
+@borrows
+fn EcoMaybeReward(st: var ssm.SsmState, eco: EcoOracleRiskState,
+                  signer: layout.FixedBytes32, prevTsMs: int64,
+                  nowMs: int64): Result[bool] =
+    let reward: int64 = eco.oracleRewardAmount
+    if reward == 0:
+        return Ok[bool](true)
+    if st.pools.rewardPool < reward:
+        # original semantics: an empty reward pool silently skips the bonus
+        return Ok[bool](true)
+    if prevTsMs != 0 and eco.oracleWindowMs > 0:
+        if nowMs - prevTsMs < eco.oracleWindowMs:
+            return Ok[bool](true)
+    let cRes = ssm.SsmCredit(st, signer, reward)
+    if !cRes.ok:
+        return Err[bool](cRes.err.msg)
+    st.pools.rewardPool = st.pools.rewardPool - reward
+    return Ok[bool](true)
+
+@borrows
+fn EcoApplyPenalty(st: var ssm.SsmState, eco: EcoOracleRiskState,
+                   signer: layout.FixedBytes32): Result[bool] =
+    let penalty: int64 = eco.oraclePenaltyAmount
+    if penalty == 0:
+        return Ok[bool](true)
+    let bal: int64 = ssm.SsmBalanceOf(st, signer)
+    if bal == 0:
+        return Ok[bool](true)
+    var charged: int64 = penalty
+    if charged > bal:
+        charged = bal
+    let dRes = ssm.SsmDebit(st, signer, charged)
+    if !dRes.ok:
+        return Err[bool](dRes.err.msg)
+    st.pools.safetyFund = st.pools.safetyFund + charged
+    return Ok[bool](true)
+
+# --- risk ---
+
+@borrows
+fn EcoRiskIndexOf(st: EcoOracleRiskState, scope: layout.FixedBytes32): int32 =
+    var i: int32
+    while i < st.riskFlags.len:
+        if layout.FixedBytes32Equal(st.riskFlags[i].scope, scope):
+            return i
+        i = i + 1
+    return -1
+
+# Global pause dominates; then the scope flag.
+@borrows
+fn EcoIsPaused(st: EcoOracleRiskState, globalScope: layout.FixedBytes32,
+               scope: layout.FixedBytes32): bool =
+    let gi: int32 = EcoRiskIndexOf(st, globalScope)
+    if gi >= 0:
+        if st.riskFlags[gi].paused:
+            return true
+    let si: int32 = EcoRiskIndexOf(st, scope)
+    if si >= 0:
+        if st.riskFlags[si].paused:
+            return true
+    return false
+
+@borrows
+fn EcoGetLimit(st: EcoOracleRiskState, scope: layout.FixedBytes32): int64 =
+    let si: int32 = EcoRiskIndexOf(st, scope)
+    if si >= 0:
+        return st.riskFlags[si].limit
+    return 0
+
+# Pause update preserves the scope limit; empty scope rejected.
+fn EcoApplyRiskPause(st: var EcoOracleRiskState, scope: layout.FixedBytes32,
+                     paused: bool, emptyScope: layout.FixedBytes32): Result[bool] =
+    if layout.FixedBytes32Equal(scope, emptyScope):
+        return Err[bool]("eco: empty risk scope")
+    let idx: int32 = EcoRiskIndexOf(st, scope)
+    if idx >= 0:
+        st.riskFlags[idx].paused = paused
+        return Ok[bool](true)
+    var f: EcoRiskFlags
+    f.scope = scope
+    f.paused = paused
+    f.limit = 0
+    add(st.riskFlags, f)
+    return Ok[bool](true)
+
+# Limit update preserves the pause flag.
+fn EcoApplyRiskLimit(st: var EcoOracleRiskState, scope: layout.FixedBytes32,
+                     limit: int64, emptyScope: layout.FixedBytes32): Result[bool] =
+    if layout.FixedBytes32Equal(scope, emptyScope):
+        return Err[bool]("eco: empty risk scope")
+    if limit < 0:
+        return Err[bool]("eco: negative limit")
+    let idx: int32 = EcoRiskIndexOf(st, scope)
+    if idx >= 0:
+        st.riskFlags[idx].limit = limit
+        return Ok[bool](true)
+    var f: EcoRiskFlags
+    f.scope = scope
+    f.paused = false
+    f.limit = limit
+    add(st.riskFlags, f)
+    return Ok[bool](true)
+
+@borrows
+fn EcoIsBlacklisted(st: EcoOracleRiskState, account: layout.FixedBytes32): bool =
+    var i: int32
+    while i < st.blacklist.len:
+        if layout.FixedBytes32Equal(st.blacklist[i], account):
+            return true
+        i = i + 1
+    return false
+
+fn EcoBlacklist(st: var EcoOracleRiskState, account: layout.FixedBytes32,
+                blocked: bool): Result[bool] =
+    if blocked:
+        if EcoIsBlacklisted(st, account):
+            return Ok[bool](true)
+        add(st.blacklist, account)
+        return Ok[bool](true)
+    var i: int32
+    while i < st.blacklist.len:
+        if layout.FixedBytes32Equal(st.blacklist[i], account):
+            st.blacklist[i] = st.blacklist[st.blacklist.len - 1]
+            var shrunk: layout.FixedBytes32[]
+            var j: int32
+            while j < st.blacklist.len - 1:
+                add(shrunk, st.blacklist[j])
+                j = j + 1
+            st.blacklist = shrunk
+            return Ok[bool](true)
+        i = i + 1
+    return Ok[bool](true)
+
+# --- governance ---
+
+fn EcoGovSetBp(st: var ssm.SsmState, which: int32, value: int32): Result[bool] =
+    if value < 0 or value > EcoGovMaxBp:
+        return Err[bool]("eco: bp out of range")
+    if which == 1:
+        st.params.challengeRewardBp = value
+        return Ok[bool](true)
+    if which == 2:
+        st.params.burnBp = value
+        return Ok[bool](true)
+    return Err[bool]("eco: unknown param key")

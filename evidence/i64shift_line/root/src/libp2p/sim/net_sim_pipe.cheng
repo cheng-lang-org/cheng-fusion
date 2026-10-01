@@ -1,0 +1,336 @@
+# qconn pipe shim over the deterministic network simulator (Wave 0 batch 2).
+#
+# Mirrors the qconn pipe contract (src/quic/connection.cheng): pipeIdx values
+# live in a discriminated segment so SimPipeIsIdx can dispatch alongside
+# msquicNativeIsPipeIdx (which owns 1000001); this shim owns 2000001+slot.
+# Side 0 is the aNode endpoint, side 1 the bNode endpoint: write(side) sends
+# toward the peer, read(side) consumes bytes addressed to that endpoint.
+#
+# Frame format: streamId as base-128 varint (LEB128) + payload. One sim link
+# carries every stream of a pipe; the kernel's (time, seq) total order keeps
+# per-stream FIFO on zero-jitter links. Lossy/jittery/partitioned links may
+# drop or reorder frames; a blocking read that can never be satisfied returns
+# Err("pipe: underrun") once the event heap is empty (let it crash).
+#
+# Cold backend constraints honored (findings 2026-06-12): every mutable table
+# is a seq of pure-scalar structs updated by whole-element stores with local
+# indices; payload bytes live in an append-only Bytes[] log consumed through
+# (offset, cursor) scalars; no scalar global-seq element stores; varint codec
+# uses */% 128 instead of shifts (shift/large-literal miscompile family).
+# Additionally (defect found in this batch): a function that both scans seq
+# elements (`let p: T = s[i]`) and `add`s to the same seq crashes or silently
+# drops the add when the seq is empty at run time, so every `add` lives in a
+# leaf append helper and scans live in find-only helpers.
+
+import std/system
+import std/seqs
+import cheng/libp2p/utils/result
+import cheng/libp2p/utils/bytes
+import cheng/libp2p/sim/net_sim
+
+type
+    SimPipeRec =
+        aNode: int32
+        bNode: int32
+        open: int32
+
+    SimPipeStream =
+        pipeSlot: int32
+        side: int32
+        streamId: int64
+        chunkCursor: int32
+        pendingBytes: int64
+
+    SimPipeChunkRec =
+        streamSlot: int32
+        dataIdx: int32
+        offset: int32
+        length: int32
+
+const
+    simPipeIdxBase = 2000001
+
+var
+    simPipes: SimPipeRec[]
+    simPipeStreams: SimPipeStream[]
+    simPipeChunkRecs: SimPipeChunkRec[]
+    simPipeChunkData: Bytes[]
+
+# Clears all pipe state; call right after SimNew when reusing the process.
+fn SimPipeReset() =
+    setLen(simPipes, 0)
+    setLen(simPipeStreams, 0)
+    setLen(simPipeChunkRecs, 0)
+    setLen(simPipeChunkData, 0)
+
+fn SimPipeIsIdx(idx: int32): bool =
+    if idx < simPipeIdxBase:
+        return false
+    return idx - simPipeIdxBase < simPipes.len
+
+fn simPipeSlotFor(idx: int32): int32 =
+    return idx - simPipeIdxBase
+
+fn simPipeVarintLen(value: int64): int32 =
+    var v: int64 = value
+    var n: int32 = 1
+    while v >= 128:
+        v = v / 128
+        n = n + 1
+    return n
+
+fn simPipeFrameBuild(streamId: int64, data: Bytes): Bytes =
+    let dlen: int32 = BytesLen(data)
+    let vlen: int32 = simPipeVarintLen(streamId)
+    var frame: Bytes = BytesAlloc(vlen + dlen)
+    var v: int64 = streamId
+    for i in 0..<vlen:
+        # & 127 not % 128: int64 % truncates dividends >= 2^32 (miscompile #6).
+        var b: int32 = int32(v & 127)
+        v = v / 128
+        if i + 1 < vlen:
+            b = b | 128
+        BytesSet(frame, i, b)
+    if dlen > 0:
+        BytesCopyRangeInto(frame, vlen, data, 0, dlen)
+    return frame
+
+fn simPipeDecodeStreamId(frame: Bytes, outPos: var int32): int64 =
+    var v: int64
+    var mul: int64 = 1
+    var pos: int32
+    var done: bool
+    while ! done:
+        if pos >= BytesLen(frame):
+            panic("sim pipe: truncated frame varint")
+        let b: int32 = BytesGet(frame, pos)
+        v = v + int64(b & 127) * mul
+        pos = pos + 1
+        if (b & 128) == 0:
+            done = true
+        else:
+            mul = mul * 128
+    outPos = pos
+    return v
+
+fn simPipeStreamFind(pipeSlot: int32, side: int32, streamId: int64): int32 =
+    let total: int32 = simPipeStreams.len
+    for i in 0..<total:
+        let s: SimPipeStream = simPipeStreams[i]
+        if s.pipeSlot == pipeSlot && s.side == side && s.streamId == streamId:
+            return i
+    return -1
+
+fn simPipeStreamAppend(pipeSlot: int32, side: int32, streamId: int64): int32 =
+    var ns: SimPipeStream
+    ns.pipeSlot = pipeSlot
+    ns.side = side
+    ns.streamId = streamId
+    ns.chunkCursor = simPipeChunkRecs.len
+    add(simPipeStreams, ns)
+    return simPipeStreams.len - 1
+
+fn simPipeStreamSlot(pipeSlot: int32, side: int32, streamId: int64): int32 =
+    let found: int32 = simPipeStreamFind(pipeSlot, side, streamId)
+    if found >= 0:
+        return found
+    return simPipeStreamAppend(pipeSlot, side, streamId)
+
+fn simPipeStreamPending(streamSlot: int32): int64 =
+    let s: SimPipeStream = simPipeStreams[streamSlot]
+    return s.pendingBytes
+
+fn simPipeChunkDataAppend(frame: Bytes): int32 =
+    add(simPipeChunkData, frame)
+    return simPipeChunkData.len - 1
+
+fn simPipeChunkRecAppend(streamSlot: int32, dataIdx: int32, offset: int32, length: int32) =
+    var rec: SimPipeChunkRec
+    rec.streamSlot = streamSlot
+    rec.dataIdx = dataIdx
+    rec.offset = offset
+    rec.length = length
+    add(simPipeChunkRecs, rec)
+
+fn simPipeStreamAddPending(streamSlot: int32, delta: int64) =
+    var s: SimPipeStream = simPipeStreams[streamSlot]
+    s.pendingBytes = s.pendingBytes + delta
+    simPipeStreams[streamSlot] = s
+
+fn simPipeIngestFrame(pipeSlot: int32, recvSide: int32, frame: Bytes) =
+    var pos: int32
+    let sid: int64 = simPipeDecodeStreamId(frame, pos)
+    let streamSlot: int32 = simPipeStreamSlot(pipeSlot, recvSide, sid)
+    let dataIdx: int32 = simPipeChunkDataAppend(frame)
+    simPipeChunkRecAppend(streamSlot, dataIdx, pos, BytesLen(frame))
+    simPipeStreamAddPending(streamSlot, int64(BytesLen(frame) - pos))
+
+# First open pipe whose endpoints match the delivery's (src, dst) pair.
+fn simPipeMatchSlot(srcNode: int32, dstNode: int32): int32 =
+    let total: int32 = simPipes.len
+    for i in 0..<total:
+        let p: SimPipeRec = simPipes[i]
+        if p.open != 0:
+            if p.aNode == srcNode && p.bNode == dstNode:
+                return i
+            if p.bNode == srcNode && p.aNode == dstNode:
+                return i
+    return -1
+
+# Drains already-delivered packets addressed to node into stream queues.
+# Pure cursor walk over the kernel delivery log; never advances virtual time.
+fn simPipePumpNode(node: int32) =
+    var d: net_sim.SimDelivery
+    var more: bool = SimNextDelivery(node, d)
+    while more:
+        let pipeSlot: int32 = simPipeMatchSlot(d.src, node)
+        if pipeSlot < 0:
+            panic("sim pipe: delivery without matching pipe")
+        let p: SimPipeRec = simPipes[pipeSlot]
+        var recvSide: int32 = 1
+        if node == p.aNode:
+            recvSide = 0
+        simPipeIngestFrame(pipeSlot, recvSide, d.payload)
+        more = SimNextDelivery(node, d)
+
+# Copies count pending bytes out of the stream's chunk queue in FIFO order.
+# Caller must have verified pendingBytes >= count.
+fn simPipeConsume(streamSlot: int32, count: int32): Bytes =
+    var out: Bytes = BytesAlloc(count)
+    var filled: int32
+    let st: SimPipeStream = simPipeStreams[streamSlot]
+    var cur: int32 = st.chunkCursor
+    while filled < count:
+        let rec: SimPipeChunkRec = simPipeChunkRecs[cur]
+        var exhausted: bool = true
+        if rec.streamSlot == streamSlot:
+            if rec.offset < rec.length:
+                exhausted = false
+        if exhausted:
+            cur = cur + 1
+        else:
+            var take: int32 = rec.length - rec.offset
+            if take > count - filled:
+                take = count - filled
+            let src: Bytes = simPipeChunkData[rec.dataIdx]
+            BytesCopyRangeInto(out, filled, src, rec.offset, take)
+            filled = filled + take
+            var upd: SimPipeChunkRec = rec
+            upd.offset = rec.offset + take
+            simPipeChunkRecs[cur] = upd
+            if upd.offset >= upd.length:
+                cur = cur + 1
+    var s: SimPipeStream = simPipeStreams[streamSlot]
+    s.chunkCursor = cur
+    s.pendingBytes = s.pendingBytes - int64(count)
+    simPipeStreams[streamSlot] = s
+    return out
+
+fn simPipePairAppend(aNode: int32, bNode: int32): int32 =
+    var rec: SimPipeRec
+    rec.aNode = aNode
+    rec.bNode = bNode
+    rec.open = 1
+    add(simPipes, rec)
+    return simPipes.len - 1
+
+fn SimPipeOpen(aNode: int32, bNode: int32): Result[int32] =
+    if aNode < 0 || bNode < 0 || aNode == bNode:
+        return Err[int32]("pipe: invalid nodes")
+    if simPipeMatchSlot(aNode, bNode) >= 0:
+        return Err[int32]("pipe: duplicate pair")
+    let slot: int32 = simPipePairAppend(aNode, bNode)
+    return Ok[int32](simPipeIdxBase + slot)
+
+fn simPipeCheckOp(idx: int32, side: int32, streamId: int64): str =
+    if ! SimPipeIsIdx(idx):
+        return "pipe: invalid"
+    let p: SimPipeRec = simPipes[simPipeSlotFor(idx)]
+    if p.open == 0:
+        return "pipe: closed"
+    if side != 0 && side != 1:
+        return "pipe: invalid side"
+    if streamId < 0:
+        return "pipe: invalid stream"
+    return ""
+
+fn simPipeRecvNode(p: SimPipeRec, side: int32): int32 =
+    if side == 0:
+        return p.aNode
+    return p.bNode
+
+# Writes one frame onto the sim link. Returns the accepted byte count; loss
+# or partition dropping the frame is wire behavior and surfaces at read time.
+fn SimPipeWrite(idx: int32, side: int32, streamId: int64, data: Bytes): Result[int32] =
+    let bad: str = simPipeCheckOp(idx, side, streamId)
+    if bad != "":
+        return Err[int32](bad)
+    let p: SimPipeRec = simPipes[simPipeSlotFor(idx)]
+    var src: int32 = p.aNode
+    var dst: int32 = p.bNode
+    if side == 1:
+        src = p.bNode
+        dst = p.aNode
+    let frame: Bytes = simPipeFrameBuild(streamId, data)
+    let sendRes: Result[bool] = SimSend(src, dst, frame)
+    if IsErr(sendRes):
+        return Err[int32](ErrorText(sendRes))
+    return Ok[int32](BytesLen(data))
+
+# Deterministic blocking read: steps the simulator until the (idx, side,
+# streamId) reassembly queue holds count bytes. Empty event heap with the
+# queue still short -> Err("pipe: underrun").
+fn SimPipeRead(idx: int32, side: int32, streamId: int64, count: int32): Result[Bytes] =
+    let bad: str = simPipeCheckOp(idx, side, streamId)
+    if bad != "":
+        return Err[Bytes](bad)
+    if count <= 0:
+        return Ok[Bytes](EmptyBytes())
+    let p: SimPipeRec = simPipes[simPipeSlotFor(idx)]
+    let node: int32 = simPipeRecvNode(p, side)
+    simPipePumpNode(node)
+    let streamSlot: int32 = simPipeStreamSlot(simPipeSlotFor(idx), side, streamId)
+    var ready: bool = simPipeStreamPending(streamSlot) >= int64(count)
+    while ! ready:
+        if ! SimStep():
+            return Err[Bytes]("pipe: underrun")
+        simPipePumpNode(node)
+        ready = simPipeStreamPending(streamSlot) >= int64(count)
+    return Ok[Bytes](simPipeConsume(streamSlot, count))
+
+# Never advances virtual time. Empty queue -> Err("pipe: empty"); otherwise
+# returns up to count bytes (partial reads allowed, qconn contract).
+fn SimPipeReadNonblocking(idx: int32, side: int32, streamId: int64, count: int32): Result[Bytes] =
+    let bad: str = simPipeCheckOp(idx, side, streamId)
+    if bad != "":
+        return Err[Bytes](bad)
+    if count <= 0:
+        return Ok[Bytes](EmptyBytes())
+    let p: SimPipeRec = simPipes[simPipeSlotFor(idx)]
+    simPipePumpNode(simPipeRecvNode(p, side))
+    let streamSlot: int32 = simPipeStreamSlot(simPipeSlotFor(idx), side, streamId)
+    let pending: int64 = simPipeStreamPending(streamSlot)
+    if pending <= 0:
+        return Err[Bytes]("pipe: empty")
+    var take: int32 = count
+    if int64(take) > pending:
+        take = int32(pending)
+    return Ok[Bytes](simPipeConsume(streamSlot, take))
+
+# Mirrors msquicNativePipeIsClosed for the qconn pipeIsClosed dispatch chain.
+fn SimPipeIsClosed(idx: int32): bool =
+    if ! SimPipeIsIdx(idx):
+        return true
+    let p: SimPipeRec = simPipes[simPipeSlotFor(idx)]
+    return p.open == 0
+
+fn SimPipeClose(idx: int32) =
+    if ! SimPipeIsIdx(idx):
+        return
+    let slot: int32 = simPipeSlotFor(idx)
+    let p: SimPipeRec = simPipes[slot]
+    if p.open == 0:
+        return
+    var upd: SimPipeRec = p
+    upd.open = 0
+    simPipes[slot] = upd

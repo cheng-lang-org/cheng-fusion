@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""Python source to CSG-Core extractor.
+
+The complete subset is a closed int32 function graph: module-level pure
+`def helper(int...) -> int` functions plus top-level int assignments, print
+of string literals, and final `raise SystemExit(0..255)`.
+Other CPython semantics are recorded as unsupported facts and cannot lower to
+Cheng.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import dis
+import importlib.machinery
+import importlib.util
+import types
+import sys
+import symtable
+from pathlib import Path
+from typing import Any
+
+_COMMON_PATH = Path(__file__).with_name("lang_csg_common")
+_LOADER = importlib.machinery.SourceFileLoader("lang_csg_common", str(_COMMON_PATH))
+_SPEC = importlib.util.spec_from_loader(_LOADER.name, _LOADER)
+if _SPEC is None:
+    raise SystemExit("error: failed to load lang_csg_common")
+_COMMON = importlib.util.module_from_spec(_SPEC)
+_LOADER.exec_module(_COMMON)
+
+complete_report = _COMMON.complete_report
+die = _COMMON.die
+make_module_fact = _COMMON.make_module_fact
+make_schema_fact = _COMMON.make_schema_fact
+make_unsupported_fact = _COMMON.make_unsupported_fact
+rel_display = _COMMON.rel_display
+safe_id = _COMMON.safe_id
+write_facts = _COMMON.write_facts
+write_json = _COMMON.write_json
+
+INT32_MIN = -(2**31)
+INT32_MAX = 2**31 - 1
+
+
+class UnsupportedSemantic(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def ensure_int32(value: int) -> int:
+    if value < INT32_MIN or value > INT32_MAX:
+        raise UnsupportedSemantic("python.frontend.int32_overflow_not_closed")
+    return value
+
+
+def valid_identifier(name: str) -> bool:
+    if not name:
+        return False
+    if not (name[0].isalpha() or name[0] == "_"):
+        return False
+    return all(ch.isalnum() or ch == "_" for ch in name)
+
+
+def module_path(root: Path, entry: str) -> Path:
+    candidate = root / (entry.replace(".", "/") + ".py")
+    if candidate.exists():
+        return candidate.resolve()
+    package_init = root / entry.replace(".", "/") / "__init__.py"
+    if package_init.exists():
+        return package_init.resolve()
+    die(f"missing Python entry module: {entry}")
+    return candidate
+
+
+def scan_binary_extensions(root: Path) -> list[Path]:
+    out: list[Path] = []
+    for suffix in ("*.so", "*.pyd"):
+        out.extend(sorted(root.rglob(suffix)))
+    return out
+
+
+def scan_extra_python_modules(root: Path, entry_source: Path) -> list[Path]:
+    entry_resolved = entry_source.resolve()
+    out: list[Path] = []
+    for path in sorted(root.rglob("*.py")):
+        if path.resolve() != entry_resolved:
+            out.append(path)
+    return out
+
+
+def stable_instruction_argrepr(instruction: dis.Instruction) -> str:
+    if isinstance(instruction.argval, types.CodeType):
+        return f"<code object {instruction.argval.co_name} line {instruction.argval.co_firstlineno}>"
+    return instruction.argrepr
+
+
+def py_expr(
+    node: ast.expr,
+    locals_i32: dict[str, int],
+    functions: dict[str, ast.FunctionDef],
+    stack: list[str],
+) -> tuple[str, int]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+        value = ensure_int32(int(node.value))
+        return str(value), value
+    if isinstance(node, ast.Name):
+        if not valid_identifier(node.id) or node.id not in locals_i32:
+            raise UnsupportedSemantic("python.frontend.only_local_i32_names_are_closed")
+        return node.id, locals_i32[node.id]
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in functions:
+            raise UnsupportedSemantic("python.frontend.only_closed_helper_calls_are_closed")
+        if node.keywords:
+            raise UnsupportedSemantic("python.frontend.helper_call_keywords_not_closed")
+        arg_exprs: list[str] = []
+        arg_values: list[int] = []
+        for arg in node.args:
+            arg_expr, arg_value = py_expr(arg, locals_i32, functions, stack)
+            arg_exprs.append(arg_expr)
+            arg_values.append(arg_value)
+        result = eval_py_function(node.func.id, arg_values, functions, stack)
+        return f"{node.func.id}({', '.join(arg_exprs)})", result["returnValue"]
+    if isinstance(node, ast.BinOp):
+        if not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+            raise UnsupportedSemantic("python.frontend.only_add_sub_mul_i32_are_closed")
+        left_expr, left_value = py_expr(node.left, locals_i32, functions, stack)
+        right_expr, right_value = py_expr(node.right, locals_i32, functions, stack)
+        if isinstance(node.op, ast.Add):
+            op = "+"
+            value = left_value + right_value
+        elif isinstance(node.op, ast.Sub):
+            op = "-"
+            value = left_value - right_value
+        else:
+            op = "*"
+            value = left_value * right_value
+        value = ensure_int32(value)
+        return f"({left_expr} {op} {right_expr})", value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        inner_expr, inner_value = py_expr(node.operand, locals_i32, functions, stack)
+        value = ensure_int32(0 - inner_value)
+        return f"(0 - {inner_expr})", value
+    raise UnsupportedSemantic("python.frontend.expression_not_closed")
+
+
+def system_exit_expr(
+    stmt: ast.stmt,
+    locals_i32: dict[str, int],
+    functions: dict[str, ast.FunctionDef],
+) -> tuple[str, int] | None:
+    if not isinstance(stmt, ast.Raise):
+        return None
+    call = stmt.exc
+    if not isinstance(call, ast.Call):
+        return None
+    if not isinstance(call.func, ast.Name) or call.func.id != "SystemExit":
+        return None
+    if len(call.args) != 1 or call.keywords:
+        return None
+    try:
+        expr_text, value = py_expr(call.args[0], locals_i32, functions, [])
+    except UnsupportedSemantic:
+        return None
+    if value < 0 or value > 255:
+        return None
+    return expr_text, value
+
+
+def print_line(stmt: ast.stmt) -> str | None:
+    if not isinstance(stmt, ast.Expr):
+        return None
+    call = stmt.value
+    if not isinstance(call, ast.Call):
+        return None
+    if not isinstance(call.func, ast.Name) or call.func.id != "print":
+        return None
+    if len(call.args) != 1 or call.keywords:
+        return None
+    value = call.args[0]
+    if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+        return None
+    return value.value
+
+
+def assignment_stmt(
+    stmt: ast.stmt,
+    locals_i32: dict[str, int],
+    functions: dict[str, ast.FunctionDef],
+    stack: list[str],
+) -> tuple[str, str, int]:
+    if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+        raise UnsupportedSemantic("python.frontend.only_single_name_assignment_is_closed")
+    name = stmt.targets[0].id
+    if not valid_identifier(name) or name in locals_i32:
+        raise UnsupportedSemantic("python.frontend.local_name_not_closed")
+    expr_text, value = py_expr(stmt.value, locals_i32, functions, stack)
+    locals_i32[name] = value
+    return name, expr_text, value
+
+
+def py_function_params(fn: ast.FunctionDef) -> list[str]:
+    if fn.decorator_list or fn.args.vararg is not None or fn.args.kwarg is not None:
+        raise UnsupportedSemantic("python.frontend.helper_signature_not_closed")
+    if fn.args.defaults or fn.args.kw_defaults or fn.args.posonlyargs or fn.args.kwonlyargs:
+        raise UnsupportedSemantic("python.frontend.helper_signature_not_closed")
+    params: list[str] = []
+    for arg in fn.args.args:
+        if not valid_identifier(arg.arg) or arg.arg in params:
+            raise UnsupportedSemantic("python.frontend.helper_param_not_closed")
+        params.append(arg.arg)
+    if len(params) > 8:
+        raise UnsupportedSemantic("python.frontend.helper_arity_not_closed")
+    return params
+
+
+def collect_py_functions(tree: ast.Module) -> tuple[dict[str, ast.FunctionDef], list[str]]:
+    functions: dict[str, ast.FunctionDef] = {}
+    reasons: list[str] = []
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.FunctionDef):
+            continue
+        if not valid_identifier(stmt.name) or stmt.name in functions or stmt.name == "main":
+            reasons.append("python.frontend.helper_name_not_closed")
+            continue
+        try:
+            py_function_params(stmt)
+        except UnsupportedSemantic as exc:
+            reasons.append(exc.code)
+            continue
+        functions[stmt.name] = stmt
+    return functions, reasons
+
+
+def eval_py_function(
+    name: str,
+    arg_values: list[int],
+    functions: dict[str, ast.FunctionDef],
+    stack: list[str],
+) -> dict[str, Any]:
+    if name in stack:
+        raise UnsupportedSemantic("python.frontend.recursive_function_graph_not_closed")
+    fn = functions.get(name)
+    if fn is None:
+        raise UnsupportedSemantic("python.frontend.function_not_found")
+    params = py_function_params(fn)
+    if len(params) != len(arg_values):
+        raise UnsupportedSemantic("python.frontend.function_call_arity_not_closed")
+    locals_i32 = dict(zip(params, arg_values, strict=True))
+    statements: list[dict[str, Any]] = []
+    if not fn.body or not isinstance(fn.body[-1], ast.Return) or fn.body[-1].value is None:
+        raise UnsupportedSemantic("python.frontend.helper_must_return_i32_expression")
+    stack.append(name)
+    try:
+        for stmt in fn.body[:-1]:
+            if not isinstance(stmt, ast.Assign):
+                raise UnsupportedSemantic("python.frontend.helper_must_be_pure_int_return")
+            local_name, expr_text, value = assignment_stmt(stmt, locals_i32, functions, stack)
+            statements.append({"kind": "local_i32", "name": local_name, "expr": expr_text, "value": value})
+        return_expr, return_value = py_expr(fn.body[-1].value, locals_i32, functions, stack)
+    finally:
+        stack.pop()
+    return {
+        "name": name,
+        "parameters": params,
+        "statements": statements,
+        "returnExpr": return_expr,
+        "returnValue": return_value,
+    }
+
+
+def extract_closed_entry(tree: ast.Module) -> tuple[bool, str | None, int | None, list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    statements: list[dict[str, Any]] = []
+    locals_i32: dict[str, int] = {}
+    functions, reasons = collect_py_functions(tree)
+    closed_functions: list[dict[str, Any]] = []
+    main_body = [stmt for stmt in tree.body if not isinstance(stmt, ast.FunctionDef)]
+    if reasons:
+        return False, None, None, reasons, statements, []
+    if not main_body:
+        return False, None, None, ["python.frontend.empty_module_not_closed"], statements, []
+    if not isinstance(main_body[-1], ast.Raise):
+        return False, None, None, ["python.frontend.closed_module_must_end_with_system_exit"], statements, []
+    try:
+        for name in sorted(functions):
+            args = [0 for _ in py_function_params(functions[name])]
+            closed_functions.append(eval_py_function(name, args, functions, []))
+    except UnsupportedSemantic as exc:
+        return False, None, None, [exc.code], statements, []
+    for stmt in main_body[:-1]:
+        try:
+            if isinstance(stmt, ast.Assign):
+                name, expr_text, value = assignment_stmt(stmt, locals_i32, functions, [])
+                statements.append({"kind": "local_i32", "name": name, "expr": expr_text, "value": value})
+            else:
+                line = print_line(stmt)
+                if line is None:
+                    raise UnsupportedSemantic("python.frontend.only_assignment_or_print_before_system_exit_is_closed")
+                statements.append({"kind": "stdout_line", "text": line})
+        except UnsupportedSemantic as exc:
+            return False, None, None, [exc.code], statements, []
+    exit_expr = system_exit_expr(main_body[-1], locals_i32, functions)
+    if exit_expr is None:
+        return False, None, None, ["python.frontend.entry_must_raise_system_exit_i32_expression"], statements, []
+    return_expr, value = exit_expr
+    closed_functions.append({"name": "main", "parameters": [], "statements": statements, "returnExpr": return_expr, "returnValue": value})
+    return True, return_expr, value, [], statements, closed_functions
+
+
+def append_closed_function_facts(facts: list[dict[str, Any]], closed_functions: list[dict[str, Any]]) -> None:
+    for item in sorted(closed_functions, key=lambda value: (value["name"] == "main", value["name"])):
+        name = item["name"]
+        function_id = f"function:{name}"
+        facts.extend(
+            [
+                {"id": f"symbol:{name}", "kind": "csg.symbol", "name": name, "symbolKind": "function"},
+                {
+                    "id": function_id,
+                    "kind": "csg.function",
+                    "name": name,
+                    "parameters": [{"name": param, "type": "i32"} for param in item["parameters"]],
+                    "returnType": "i32",
+                    "symbol": f"symbol:{name}",
+                },
+                {"blockKind": "entry", "function": function_id, "id": f"block:{name}:entry", "kind": "csg.block"},
+            ]
+        )
+        for param_idx, param in enumerate(item["parameters"]):
+            facts.append(
+                {
+                    "function": function_id,
+                    "id": f"param:{name}:{param_idx}:{param}",
+                    "kind": "csg_dialect::native::param_i32",
+                    "name": param,
+                    "order": param_idx,
+                }
+            )
+        for idx, statement in enumerate(item["statements"]):
+            if statement["kind"] == "stdout_line":
+                facts.append(
+                    {
+                        "id": f"stmt:{name}:{idx}:stdout",
+                        "kind": "csg_dialect::native::stdout_line",
+                        "function": function_id,
+                        "order": idx,
+                        "text": statement["text"],
+                    }
+                )
+            elif statement["kind"] == "local_i32":
+                facts.append(
+                    {
+                        "expr": statement["expr"],
+                        "function": function_id,
+                        "id": f"stmt:{name}:{idx}:local:{statement['name']}",
+                        "kind": "csg_dialect::native::local_i32",
+                        "name": statement["name"],
+                        "order": idx,
+                        "value": statement["value"],
+                    }
+                )
+            else:
+                raise AssertionError(f"unknown closed statement kind: {statement['kind']}")
+        facts.append(
+            {
+                "block": f"block:{name}:entry",
+                "function": function_id,
+                "id": f"term:{name}:return",
+                "kind": "csg.term",
+                "termKind": "return",
+                "value": item["returnValue"],
+                "valueExpr": item["returnExpr"],
+            }
+        )
+
+
+def build_facts(root: Path, entry: str, version: str) -> tuple[list[dict[str, Any]], bool, list[str], int | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    source = module_path(root, entry)
+    source_text = source.read_text(encoding="utf-8")
+    try:
+        tree = ast.parse(source_text, filename=str(source))
+        code = compile(tree, str(source), "exec")
+        symbols = symtable.symtable(source_text, str(source), "exec")
+    except SyntaxError as exc:
+        die(f"CPython rejected {source}: {exc}")
+
+    facts: list[dict[str, Any]] = [make_schema_fact("python", "csg_dialect::python")]
+    module_id = f"module:python:{safe_id(entry)}"
+    facts.append(make_module_fact(module_id, source, rel_display(root, source)))
+    instructions = [
+        {
+            "opname": ins.opname,
+            "argrepr": stable_instruction_argrepr(ins),
+            "offset": ins.offset,
+        }
+        for ins in dis.get_instructions(code)
+    ]
+    facts.append(
+        {
+            "id": f"python-dialect:module:{safe_id(entry)}",
+            "kind": "csg_dialect::python::module",
+            "module": module_id,
+            "entry": entry,
+            "pythonVersion": version,
+            "symbolCount": len(symbols.get_identifiers()),
+            "bytecode": instructions,
+        }
+    )
+
+    unsupported: list[str] = []
+    binary_extensions = scan_binary_extensions(root)
+    for path in binary_extensions:
+        code_id = "python.frontend.binary_extension_not_translatable"
+        unsupported.append(code_id)
+        facts.append(make_unsupported_fact("python", code_id, f"binary extension has no pure Cheng source: {rel_display(root, path)}"))
+    extra_python_modules = scan_extra_python_modules(root, source)
+    for path in extra_python_modules:
+        code_id = "python.frontend.multi_module_project_not_closed"
+        if code_id not in unsupported:
+            unsupported.append(code_id)
+            facts.append(make_unsupported_fact("python", code_id, f"Python project has modules outside the closed entry script: {rel_display(root, path)}"))
+
+    closed, return_expr, value, reasons, statements, closed_functions = extract_closed_entry(tree)
+    if closed and not binary_extensions and not extra_python_modules and value is not None:
+        append_closed_function_facts(facts, closed_functions)
+        return facts, True, unsupported, value, statements, closed_functions
+
+    for code_id in reasons:
+        unsupported.append(code_id)
+        facts.append(make_unsupported_fact("python", code_id, f"Python semantic not closed: {code_id}"))
+    return facts, False, unsupported, None, [], []
+
+
+def cmd_emit(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="py-csg emit")
+    parser.add_argument("--root", required=True)
+    parser.add_argument("--python-version", required=True)
+    parser.add_argument("--entry", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--report-out", required=True)
+    args = parser.parse_args(argv)
+
+    current = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if args.python_version != current:
+        die(f"requested CPython {args.python_version}, but extractor is running {current}")
+
+    root = Path(args.root).resolve()
+    if not root.is_dir():
+        die(f"Python root is not a directory: {root}")
+    facts, complete, unsupported, closed_return, closed_statements, closed_functions = build_facts(root, args.entry, args.python_version)
+    lines = write_facts(Path(args.out), facts)
+    report = complete_report(
+        dialect="csg_dialect::python",
+        facts_lines=lines,
+        facts=facts,
+        entry_roots=["function:main"] if complete else [],
+        complete=complete,
+        extra={
+            "toolImplementation": "python-bootstrap",
+            "extractorImplementation": "python-bootstrap-cpython-ast-symtable-bytecode",
+            "closedWorldKind": "single-entry-script-executable",
+            "completionScope": "closed-subset-only",
+            "fullProjectTranspilationComplete": False,
+            "pythonVersion": args.python_version,
+            "closedSubset": "python.function-graph-local-arith-print-system-exit.v1" if complete else "",
+            "closedReturn": closed_return,
+            "closedStatements": closed_statements,
+            "closedFunctions": closed_functions,
+            "unsupportedCodes": unsupported,
+        },
+    )
+    write_json(Path(args.report_out), report)
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="py-csg")
+    parser.add_argument("command")
+    args, rest = parser.parse_known_args()
+    if args.command == "emit":
+        return cmd_emit(rest)
+    parser.error("expected command: emit")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

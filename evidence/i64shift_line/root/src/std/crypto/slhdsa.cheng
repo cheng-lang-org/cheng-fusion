@@ -1,0 +1,696 @@
+# SLH-DSA (FIPS 205, SPHINCS+) stateless hash-based signatures, SHAKE
+# instantiation (Section 11.1: H_msg/PRF/PRF_msg/F/H/T_l are all plain
+# SHAKE256 concatenations). Components:
+#   - ADRS 32-byte structure with the seven type constants
+#   - WOTS+ chain/pkGen/sign/pkFromSig        (Algorithms 5-8, w = 16)
+#   - XMSS node/sign/pkFromSig                (Algorithms 9-11; node uses
+#     the standard iterative treehash, byte-identical to the recursion)
+#   - HT hypertree sign/verify                (Algorithms 12/13)
+#   - FORS skGen/node/sign/pkFromSig          (Algorithms 14-17)
+#   - KeyGen/Sign/Verify internal             (Algorithms 18/19/20)
+#   - public API with context strings         (Algorithms 21/22/24; hedged
+#     addrnd by default, caller-injected addrnd via SlhSignWithAddrnd,
+#     deterministic variant addrnd = PK.seed via SlhSignDeterministic)
+# Parameter sets: SLH-DSA-SHAKE-128s (fully validated against NIST ACVP)
+# and SLH-DSA-SHAKE-128f (table provided). SHA2 variants are not provided.
+#
+# Compiler red lines respected throughout: no int64 %, no literals >= 2^31
+# (masks are built with int64(1) << k), no global state at all (every
+# intermediate lives in local Bytes), cross-module calls are alias
+# qualified.
+
+import std/result
+import std/system
+import std/rawbytes
+import std/crypto/sha3
+import std/crypto/rand
+
+type
+    SlhParams =
+        n: int32
+        h: int32
+        d: int32
+        hPrime: int32
+        a: int32
+        k: int32
+        lgW: int32
+        m: int32
+
+    SlhKeyPair =
+        pk: Bytes
+        sk: Bytes
+
+# FIPS 205 Table 2 ADRS type constants.
+const
+    slhAdrsWotsHash: int32 = 0
+    slhAdrsWotsPk: int32 = 1
+    slhAdrsTree: int32 = 2
+    slhAdrsForsTree: int32 = 3
+    slhAdrsForsRoots: int32 = 4
+    slhAdrsWotsPrf: int32 = 5
+    slhAdrsForsPrf: int32 = 6
+
+# FIPS 205 Table 2 parameter sets (SHAKE instantiation).
+fn SlhParamsShake128s(): SlhParams =
+    var p: SlhParams
+    p.n = 16
+    p.h = 63
+    p.d = 7
+    p.hPrime = 9
+    p.a = 12
+    p.k = 14
+    p.lgW = 4
+    p.m = 30
+    return p
+
+fn SlhParamsShake128f(): SlhParams =
+    var p: SlhParams
+    p.n = 16
+    p.h = 66
+    p.d = 22
+    p.hPrime = 3
+    p.a = 6
+    p.k = 33
+    p.lgW = 4
+    p.m = 34
+    return p
+
+fn slhW(p: SlhParams): int32 =
+    return 1 << p.lgW
+
+# len1 = ceil(8n / lg_w)
+fn slhLen1(p: SlhParams): int32 =
+    return (8 * p.n + p.lgW - 1) / p.lgW
+
+# FIPS 205 Algorithm 1 (gen_len2): floor(log2(len1*(w-1)) / lg_w) + 1.
+fn slhLen2(p: SlhParams): int32 =
+    let cap: int32 = slhLen1(p) * (slhW(p) - 1)
+    var bits: int32
+    for t in 0..<31:
+        if (cap >> t) != 0:
+            bits = t + 1
+    return (bits - 1) / p.lgW + 1
+
+fn slhLen(p: SlhParams): int32 =
+    return slhLen1(p) + slhLen2(p)
+
+# FIPS 205 Table 2 sizes.
+fn SlhPkLen(p: SlhParams): int32 =
+    return 2 * p.n
+
+fn SlhSkLen(p: SlhParams): int32 =
+    return 4 * p.n
+
+fn SlhSigLen(p: SlhParams): int32 =
+    return (1 + p.k * (1 + p.a) + p.h + p.d * slhLen(p)) * p.n
+
+# ---- ADRS: 32-byte address (FIPS 205 Section 4.2, big-endian fields) ----
+# layer  [0,4)   tree [4,16)   type [16,20)
+# word1  [20,24) = key pair address (WOTS_HASH/WOTS_PK/WOTS_PRF/FORS_*)
+# word2  [24,28) = chain address (WOTS) / tree height (TREE/FORS_TREE)
+# word3  [28,32) = hash address (WOTS) / tree index (TREE/FORS_*)
+
+fn slhAdrsNew(): Bytes =
+    return BytesAlloc(32)
+
+fn slhAdrsCopy(adrs: Bytes): Bytes =
+    return BytesSlice(adrs, 0, 32)
+
+fn slhAdrsSetU32(adrs: Bytes, off: int32, v: int32) =
+    BytesSet(adrs, off, (v >> 24) & 255)
+    BytesSet(adrs, off + 1, (v >> 16) & 255)
+    BytesSet(adrs, off + 2, (v >> 8) & 255)
+    BytesSet(adrs, off + 3, v & 255)
+
+fn slhAdrsGetU32(adrs: Bytes, off: int32): int32 =
+    return (BytesGet(adrs, off) << 24) | (BytesGet(adrs, off + 1) << 16) |
+           (BytesGet(adrs, off + 2) << 8) | BytesGet(adrs, off + 3)
+
+# tree address: 12 bytes big-endian at [4,16) (tree index < 2^(h - h/d),
+# so the top 4 bytes are always zero). Shift counts must stay below 64:
+# the backend reduces shift counts mod 64 (findings.md 2026-06-12).
+fn slhAdrsSetTree(adrs: Bytes, tree: int64) =
+    for t in 0..<4:
+        BytesSet(adrs, 4 + t, 0)
+    for t in 0..<8:
+        BytesSet(adrs, 8 + t, int32((tree >> (8 * (7 - t))) & 255))
+
+# setTypeAndClear: type word, then zero the three type-specific words.
+fn slhAdrsSetTypeAndClear(adrs: Bytes, typeId: int32) =
+    slhAdrsSetU32(adrs, 16, typeId)
+    for t in 0..<12:
+        BytesSet(adrs, 20 + t, 0)
+
+# ---- Hash functions (FIPS 205 Section 11.1, SHAKE instantiation) ----
+
+# F(PK.seed, ADRS, M1) = SHAKE256(PK.seed || ADRS || M1, 8n); H and T_l
+# have the same shape with longer message inputs. The concatenation
+# temporaries are freed immediately: there is no GC and F runs millions of
+# times per signature, so leaking them costs gigabytes of peak RSS.
+fn slhF(p: SlhParams, pkSeed: Bytes, adrs: Bytes, m1: Bytes): Bytes =
+    var input: Bytes = BytesConcat3(pkSeed, adrs, m1)
+    let out: Bytes = sha3.Shake256Xof(input, p.n)
+    BytesFree(input)
+    return out
+
+# PRF(PK.seed, SK.seed, ADRS) = SHAKE256(PK.seed || ADRS || SK.seed, 8n).
+fn slhPrf(p: SlhParams, pkSeed: Bytes, skSeed: Bytes, adrs: Bytes): Bytes =
+    var input: Bytes = BytesConcat3(pkSeed, adrs, skSeed)
+    let out: Bytes = sha3.Shake256Xof(input, p.n)
+    BytesFree(input)
+    return out
+
+# PRF_msg(SK.prf, opt_rand, M) = SHAKE256(SK.prf || opt_rand || M, 8n).
+fn slhPrfMsg(p: SlhParams, skPrf: Bytes, optRand: Bytes, msg: Bytes): Bytes =
+    var input: Bytes = BytesConcat3(skPrf, optRand, msg)
+    let out: Bytes = sha3.Shake256Xof(input, p.n)
+    BytesFree(input)
+    return out
+
+# H_msg(R, PK.seed, PK.root, M) = SHAKE256(R || PK.seed || PK.root || M, 8m).
+fn slhHmsg(p: SlhParams, r: Bytes, pkSeed: Bytes, pkRoot: Bytes, msg: Bytes): Bytes =
+    var head: Bytes = BytesConcat3(r, pkSeed, pkRoot)
+    var input: Bytes = BytesConcat(head, msg)
+    BytesFree(head)
+    let out: Bytes = sha3.Shake256Xof(input, p.m)
+    BytesFree(input)
+    return out
+
+# ---- Integer/byte conversions ----
+
+# FIPS 205 Algorithm 3 (toByte), big-endian.
+fn slhToByte(x: int32, outLen: int32): Bytes =
+    let out: Bytes = BytesAlloc(outLen)
+    for i in 0..<outLen:
+        BytesSet(out, i, (x >> (8 * (outLen - 1 - i))) & 255)
+    return out
+
+# FIPS 205 Algorithm 2 (toInt) combined with the mod 2^modBits reduction of
+# Algorithms 19/20. The surplus bits (always < 8 for valid parameter sets)
+# are dropped from the leading byte before accumulating, so the result
+# stays below 2^63 and no int64 % is ever needed.
+fn slhToIntMod(b: Bytes, modBits: int32): int64 =
+    let nb: int32 = BytesLen(b)
+    let drop: int32 = nb * 8 - modBits
+    Assert(drop >= 0 && drop < 8, "slhToIntMod: byte length does not match modBits")
+    var ret: int64 = int64(BytesGet(b, 0) & (255 >> drop))
+    for i in 1..<nb:
+        ret = (ret << 8) | int64(BytesGet(b, i))
+    return ret
+
+# FIPS 205 Algorithm 4 (base_2b): split bit string into b-bit big-endian
+# values. total is re-masked after every extraction so it stays < 2^19.
+fn slhBase2b(x: Bytes, b: int32, outLen: int32): int32[] =
+    Assert(b >= 1 && b <= 16, "slhBase2b: b out of range")
+    Assert(BytesLen(x) * 8 >= outLen * b, "slhBase2b: input too short")
+    var out: int32[]
+    setLen(out, outLen)
+    var inIdx: int32
+    var bits: int32
+    var total: int32
+    for o in 0..<outLen:
+        while bits < b:
+            total = (total << 8) | BytesGet(x, inIdx)
+            inIdx = inIdx + 1
+            bits = bits + 8
+        bits = bits - b
+        out[o] = (total >> bits) & ((1 << b) - 1)
+        total = total & ((1 << bits) - 1)
+    return out
+
+# ---- WOTS+ (FIPS 205 Section 5) ----
+
+# Algorithm 5 (chain): iterate F s times starting from index i. Always
+# returns a fresh buffer (never x itself) and frees every intermediate.
+fn slhChain(p: SlhParams, x: Bytes, i: int32, s: int32, pkSeed: Bytes, adrs: Bytes): Bytes =
+    var tmp: Bytes = BytesSlice(x, 0, BytesLen(x))
+    for j in 0..<s:
+        slhAdrsSetU32(adrs, 28, i + j)
+        var next: Bytes = slhF(p, pkSeed, adrs, tmp)
+        BytesFree(tmp)
+        tmp = next
+    return tmp
+
+# Message digits for sign/pkFromSig: base_2b(M) plus the checksum digits
+# (csum left-shifted so it sits in the top bits of ceil(len2*lg_w/8) bytes).
+fn slhWotsDigits(p: SlhParams, m: Bytes): int32[] =
+    let len1: int32 = slhLen1(p)
+    let len2: int32 = slhLen2(p)
+    let w: int32 = slhW(p)
+    let msg: int32[] = slhBase2b(m, p.lgW, len1)
+    var csum: int32
+    for i in 0..<len1:
+        csum = csum + w - 1 - msg[i]
+    let shift: int32 = (8 - ((len2 * p.lgW) % 8)) % 8
+    csum = csum << shift
+    let csumDigits: int32[] = slhBase2b(slhToByte(csum, (len2 * p.lgW + 7) / 8), p.lgW, len2)
+    var digits: int32[]
+    setLen(digits, len1 + len2)
+    for i in 0..<len1:
+        digits[i] = msg[i]
+    for i in 0..<len2:
+        digits[len1 + i] = csumDigits[i]
+    return digits
+
+# Algorithm 6 (wots_pkGen). ADRS arrives as WOTS_HASH with the key pair
+# address set; the secret chain seeds come from PRF with a WOTS_PRF copy.
+fn slhWotsPkGen(p: SlhParams, skSeed: Bytes, pkSeed: Bytes, adrs: Bytes): Bytes =
+    let len: int32 = slhLen(p)
+    let kpAddr: int32 = slhAdrsGetU32(adrs, 20)
+    var skAdrs: Bytes = slhAdrsCopy(adrs)
+    slhAdrsSetTypeAndClear(skAdrs, slhAdrsWotsPrf)
+    slhAdrsSetU32(skAdrs, 20, kpAddr)
+    var tmp: Bytes = BytesAlloc(len * p.n)
+    for i in 0..<len:
+        slhAdrsSetU32(skAdrs, 24, i)
+        var sk: Bytes = slhPrf(p, pkSeed, skSeed, skAdrs)
+        slhAdrsSetU32(adrs, 24, i)
+        var ck: Bytes = slhChain(p, sk, 0, slhW(p) - 1, pkSeed, adrs)
+        BytesCopyInto(tmp, i * p.n, ck)
+        BytesFree(ck)
+        BytesFree(sk)
+    BytesFree(skAdrs)
+    var pkAdrs: Bytes = slhAdrsCopy(adrs)
+    slhAdrsSetTypeAndClear(pkAdrs, slhAdrsWotsPk)
+    slhAdrsSetU32(pkAdrs, 20, kpAddr)
+    let out: Bytes = slhF(p, pkSeed, pkAdrs, tmp)
+    BytesFree(pkAdrs)
+    BytesFree(tmp)
+    return out
+
+# Algorithm 7 (wots_sign): chain each digit d_i for d_i steps.
+fn slhWotsSign(p: SlhParams, m: Bytes, skSeed: Bytes, pkSeed: Bytes, adrs: Bytes): Bytes =
+    let len: int32 = slhLen(p)
+    let digits: int32[] = slhWotsDigits(p, m)
+    let kpAddr: int32 = slhAdrsGetU32(adrs, 20)
+    var skAdrs: Bytes = slhAdrsCopy(adrs)
+    slhAdrsSetTypeAndClear(skAdrs, slhAdrsWotsPrf)
+    slhAdrsSetU32(skAdrs, 20, kpAddr)
+    let sig: Bytes = BytesAlloc(len * p.n)
+    for i in 0..<len:
+        slhAdrsSetU32(skAdrs, 24, i)
+        var sk: Bytes = slhPrf(p, pkSeed, skSeed, skAdrs)
+        slhAdrsSetU32(adrs, 24, i)
+        var ck: Bytes = slhChain(p, sk, 0, digits[i], pkSeed, adrs)
+        BytesCopyInto(sig, i * p.n, ck)
+        BytesFree(ck)
+        BytesFree(sk)
+    BytesFree(skAdrs)
+    return sig
+
+# Algorithm 8 (wots_pkFromSig): finish every chain and compress with T_len.
+fn slhWotsPkFromSig(p: SlhParams, sig: Bytes, m: Bytes, pkSeed: Bytes, adrs: Bytes): Bytes =
+    let len: int32 = slhLen(p)
+    let w: int32 = slhW(p)
+    let digits: int32[] = slhWotsDigits(p, m)
+    let kpAddr: int32 = slhAdrsGetU32(adrs, 20)
+    var tmp: Bytes = BytesAlloc(len * p.n)
+    for i in 0..<len:
+        slhAdrsSetU32(adrs, 24, i)
+        var seg: Bytes = BytesSlice(sig, i * p.n, p.n)
+        var ck: Bytes = slhChain(p, seg, digits[i], w - 1 - digits[i], pkSeed, adrs)
+        BytesCopyInto(tmp, i * p.n, ck)
+        BytesFree(ck)
+        BytesFree(seg)
+    var pkAdrs: Bytes = slhAdrsCopy(adrs)
+    slhAdrsSetTypeAndClear(pkAdrs, slhAdrsWotsPk)
+    slhAdrsSetU32(pkAdrs, 20, kpAddr)
+    let out: Bytes = slhF(p, pkSeed, pkAdrs, tmp)
+    BytesFree(pkAdrs)
+    BytesFree(tmp)
+    return out
+
+# ---- XMSS (FIPS 205 Section 6) ----
+
+# Algorithm 9 (xmss_node) as the standard iterative treehash: the subtree
+# of height z whose leaves are WOTS+ public keys i*2^z .. (i+1)*2^z - 1.
+# Same H calls with the same ADRS values as the recursion, in stack order.
+fn slhXmssNode(p: SlhParams, skSeed: Bytes, i: int32, z: int32, pkSeed: Bytes, adrs: Bytes): Bytes =
+    let count: int32 = 1 << z
+    var stack: Bytes = BytesAlloc((z + 1) * p.n)
+    var heights: int32[]
+    setLen(heights, z + 1)
+    var top: int32
+    for leaf in 0..<count:
+        let leafIdx: int32 = i * count + leaf
+        slhAdrsSetTypeAndClear(adrs, slhAdrsWotsHash)
+        slhAdrsSetU32(adrs, 20, leafIdx)
+        var node: Bytes = slhWotsPkGen(p, skSeed, pkSeed, adrs)
+        var height: int32
+        while top > 0 && heights[top - 1] == height:
+            slhAdrsSetTypeAndClear(adrs, slhAdrsTree)
+            slhAdrsSetU32(adrs, 24, height + 1)
+            slhAdrsSetU32(adrs, 28, leafIdx >> (height + 1))
+            var left: Bytes = BytesSlice(stack, (top - 1) * p.n, p.n)
+            var combined: Bytes = BytesConcat(left, node)
+            BytesFree(left)
+            var parent: Bytes = slhF(p, pkSeed, adrs, combined)
+            BytesFree(combined)
+            BytesFree(node)
+            node = parent
+            top = top - 1
+            height = height + 1
+        BytesCopyInto(stack, top * p.n, node)
+        BytesFree(node)
+        heights[top] = height
+        top = top + 1
+    Assert(top == 1, "slhXmssNode: treehash did not reduce to a single node")
+    let root: Bytes = BytesSlice(stack, 0, p.n)
+    BytesFree(stack)
+    return root
+
+# Algorithm 10 (xmss_sign): WOTS sig on M plus the authentication path of
+# leaf idx. Layout: WOTS sig (len*n) || AUTH (h'*n).
+fn slhXmssSign(p: SlhParams, m: Bytes, skSeed: Bytes, idx: int32, pkSeed: Bytes, adrs: Bytes): Bytes =
+    let len: int32 = slhLen(p)
+    let out: Bytes = BytesAlloc((len + p.hPrime) * p.n)
+    for j in 0..<p.hPrime:
+        let sib: int32 = (idx >> j) ^ 1
+        var auth: Bytes = slhXmssNode(p, skSeed, sib, j, pkSeed, adrs)
+        BytesCopyInto(out, (len + j) * p.n, auth)
+        BytesFree(auth)
+    slhAdrsSetTypeAndClear(adrs, slhAdrsWotsHash)
+    slhAdrsSetU32(adrs, 20, idx)
+    var ws: Bytes = slhWotsSign(p, m, skSeed, pkSeed, adrs)
+    BytesCopyInto(out, 0, ws)
+    BytesFree(ws)
+    return out
+
+# Algorithm 11 (xmss_pkFromSig): walk the auth path back to the root.
+fn slhXmssPkFromSig(p: SlhParams, idx: int32, sigXmss: Bytes, m: Bytes, pkSeed: Bytes, adrs: Bytes): Bytes =
+    let len: int32 = slhLen(p)
+    slhAdrsSetTypeAndClear(adrs, slhAdrsWotsHash)
+    slhAdrsSetU32(adrs, 20, idx)
+    var wotsSig: Bytes = BytesSlice(sigXmss, 0, len * p.n)
+    var node: Bytes = slhWotsPkFromSig(p, wotsSig, m, pkSeed, adrs)
+    BytesFree(wotsSig)
+    slhAdrsSetTypeAndClear(adrs, slhAdrsTree)
+    var treeIdx: int32 = idx
+    for k in 0..<p.hPrime:
+        slhAdrsSetU32(adrs, 24, k + 1)
+        var auth: Bytes = BytesSlice(sigXmss, (len + k) * p.n, p.n)
+        var combined: Bytes
+        if ((idx >> k) & 1) == 0:
+            treeIdx = treeIdx >> 1
+            slhAdrsSetU32(adrs, 28, treeIdx)
+            combined = BytesConcat(node, auth)
+        else:
+            treeIdx = (treeIdx - 1) >> 1
+            slhAdrsSetU32(adrs, 28, treeIdx)
+            combined = BytesConcat(auth, node)
+        BytesFree(auth)
+        BytesFree(node)
+        node = slhF(p, pkSeed, adrs, combined)
+        BytesFree(combined)
+    return node
+
+# ---- HT hypertree (FIPS 205 Section 7) ----
+
+# Algorithm 12 (ht_sign): d XMSS signatures, layer j signs the root of
+# layer j-1. Layout: d consecutive XMSS signatures.
+fn slhHtSign(p: SlhParams, m: Bytes, skSeed: Bytes, pkSeed: Bytes, idxTree: int64, idxLeaf: int32): Bytes =
+    let xmssLen: int32 = (slhLen(p) + p.hPrime) * p.n
+    let out: Bytes = BytesAlloc(p.d * xmssLen)
+    let leafMask: int64 = (int64(1) << p.hPrime) - 1
+    var tree: int64 = idxTree
+    var leaf: int32 = idxLeaf
+    var adrs: Bytes = slhAdrsNew()
+    slhAdrsSetTree(adrs, tree)
+    var sigTmp: Bytes = slhXmssSign(p, m, skSeed, leaf, pkSeed, adrs)
+    BytesCopyInto(out, 0, sigTmp)
+    var root: Bytes = slhXmssPkFromSig(p, leaf, sigTmp, m, pkSeed, adrs)
+    BytesFree(sigTmp)
+    for j in 1..<p.d:
+        leaf = int32(tree & leafMask)
+        tree = tree >> p.hPrime
+        slhAdrsSetU32(adrs, 0, j)
+        slhAdrsSetTree(adrs, tree)
+        sigTmp = slhXmssSign(p, root, skSeed, leaf, pkSeed, adrs)
+        BytesCopyInto(out, j * xmssLen, sigTmp)
+        if j < p.d - 1:
+            var nextRoot: Bytes = slhXmssPkFromSig(p, leaf, sigTmp, root, pkSeed, adrs)
+            BytesFree(root)
+            root = nextRoot
+        BytesFree(sigTmp)
+    BytesFree(root)
+    BytesFree(adrs)
+    return out
+
+# Algorithm 13 (ht_verify).
+fn slhHtVerify(p: SlhParams, m: Bytes, sigHt: Bytes, pkSeed: Bytes, idxTree: int64,
+               idxLeaf: int32, pkRoot: Bytes): bool =
+    let xmssLen: int32 = (slhLen(p) + p.hPrime) * p.n
+    let leafMask: int64 = (int64(1) << p.hPrime) - 1
+    var tree: int64 = idxTree
+    var leaf: int32 = idxLeaf
+    var adrs: Bytes = slhAdrsNew()
+    slhAdrsSetTree(adrs, tree)
+    var sigSeg: Bytes = BytesSlice(sigHt, 0, xmssLen)
+    var node: Bytes = slhXmssPkFromSig(p, leaf, sigSeg, m, pkSeed, adrs)
+    BytesFree(sigSeg)
+    for j in 1..<p.d:
+        leaf = int32(tree & leafMask)
+        tree = tree >> p.hPrime
+        slhAdrsSetU32(adrs, 0, j)
+        slhAdrsSetTree(adrs, tree)
+        sigSeg = BytesSlice(sigHt, j * xmssLen, xmssLen)
+        var nextNode: Bytes = slhXmssPkFromSig(p, leaf, sigSeg, node, pkSeed, adrs)
+        BytesFree(sigSeg)
+        BytesFree(node)
+        node = nextNode
+    let ok: bool = BytesEqual(node, pkRoot)
+    BytesFree(node)
+    BytesFree(adrs)
+    return ok
+
+# ---- FORS (FIPS 205 Section 8) ----
+
+# Algorithm 14 (fors_skGen): PRF with a FORS_PRF copy of ADRS.
+fn slhForsSkGen(p: SlhParams, skSeed: Bytes, pkSeed: Bytes, adrs: Bytes, idx: int32): Bytes =
+    var skAdrs: Bytes = slhAdrsCopy(adrs)
+    slhAdrsSetTypeAndClear(skAdrs, slhAdrsForsPrf)
+    slhAdrsSetU32(skAdrs, 20, slhAdrsGetU32(adrs, 20))
+    slhAdrsSetU32(skAdrs, 28, idx)
+    let out: Bytes = slhPrf(p, pkSeed, skSeed, skAdrs)
+    BytesFree(skAdrs)
+    return out
+
+# Algorithm 15 (fors_node), iterative treehash. ADRS keeps the FORS_TREE
+# type and key pair address; only tree height/index words mutate.
+fn slhForsNode(p: SlhParams, skSeed: Bytes, i: int32, z: int32, pkSeed: Bytes, adrs: Bytes): Bytes =
+    let count: int32 = 1 << z
+    var stack: Bytes = BytesAlloc((z + 1) * p.n)
+    var heights: int32[]
+    setLen(heights, z + 1)
+    var top: int32
+    for leaf in 0..<count:
+        let leafIdx: int32 = i * count + leaf
+        var sk: Bytes = slhForsSkGen(p, skSeed, pkSeed, adrs, leafIdx)
+        slhAdrsSetU32(adrs, 24, 0)
+        slhAdrsSetU32(adrs, 28, leafIdx)
+        var node: Bytes = slhF(p, pkSeed, adrs, sk)
+        BytesFree(sk)
+        var height: int32
+        while top > 0 && heights[top - 1] == height:
+            slhAdrsSetU32(adrs, 24, height + 1)
+            slhAdrsSetU32(adrs, 28, leafIdx >> (height + 1))
+            var left: Bytes = BytesSlice(stack, (top - 1) * p.n, p.n)
+            var combined: Bytes = BytesConcat(left, node)
+            BytesFree(left)
+            var parent: Bytes = slhF(p, pkSeed, adrs, combined)
+            BytesFree(combined)
+            BytesFree(node)
+            node = parent
+            top = top - 1
+            height = height + 1
+        BytesCopyInto(stack, top * p.n, node)
+        BytesFree(node)
+        heights[top] = height
+        top = top + 1
+    Assert(top == 1, "slhForsNode: treehash did not reduce to a single node")
+    let root: Bytes = BytesSlice(stack, 0, p.n)
+    BytesFree(stack)
+    return root
+
+# Algorithm 16 (fors_sign): per tree i, the secret leaf value plus its
+# authentication path. Layout: k blocks of (1 + a)*n bytes.
+fn slhForsSign(p: SlhParams, md: Bytes, skSeed: Bytes, pkSeed: Bytes, adrs: Bytes): Bytes =
+    let indices: int32[] = slhBase2b(md, p.a, p.k)
+    let unit: int32 = (1 + p.a) * p.n
+    let out: Bytes = BytesAlloc(p.k * unit)
+    for i in 0..<p.k:
+        var sk: Bytes = slhForsSkGen(p, skSeed, pkSeed, adrs, (i << p.a) + indices[i])
+        BytesCopyInto(out, i * unit, sk)
+        BytesFree(sk)
+        for j in 0..<p.a:
+            let sib: int32 = (indices[i] >> j) ^ 1
+            var auth: Bytes = slhForsNode(p, skSeed, (i << (p.a - j)) + sib, j, pkSeed, adrs)
+            BytesCopyInto(out, i * unit + (1 + j) * p.n, auth)
+            BytesFree(auth)
+    return out
+
+# Algorithm 17 (fors_pkFromSig): recover the k roots and compress with T_k
+# under a FORS_ROOTS copy of ADRS.
+fn slhForsPkFromSig(p: SlhParams, sigFors: Bytes, md: Bytes, pkSeed: Bytes, adrs: Bytes): Bytes =
+    let indices: int32[] = slhBase2b(md, p.a, p.k)
+    let unit: int32 = (1 + p.a) * p.n
+    var roots: Bytes = BytesAlloc(p.k * p.n)
+    for i in 0..<p.k:
+        let leafIdx: int32 = (i << p.a) + indices[i]
+        slhAdrsSetU32(adrs, 24, 0)
+        slhAdrsSetU32(adrs, 28, leafIdx)
+        var leafSk: Bytes = BytesSlice(sigFors, i * unit, p.n)
+        var node: Bytes = slhF(p, pkSeed, adrs, leafSk)
+        BytesFree(leafSk)
+        var treeIdx: int32 = leafIdx
+        for j in 0..<p.a:
+            slhAdrsSetU32(adrs, 24, j + 1)
+            var auth: Bytes = BytesSlice(sigFors, i * unit + (1 + j) * p.n, p.n)
+            var combined: Bytes
+            if ((indices[i] >> j) & 1) == 0:
+                treeIdx = treeIdx >> 1
+                slhAdrsSetU32(adrs, 28, treeIdx)
+                combined = BytesConcat(node, auth)
+            else:
+                treeIdx = (treeIdx - 1) >> 1
+                slhAdrsSetU32(adrs, 28, treeIdx)
+                combined = BytesConcat(auth, node)
+            BytesFree(auth)
+            BytesFree(node)
+            node = slhF(p, pkSeed, adrs, combined)
+            BytesFree(combined)
+        BytesCopyInto(roots, i * p.n, node)
+        BytesFree(node)
+    var pkAdrs: Bytes = slhAdrsCopy(adrs)
+    slhAdrsSetTypeAndClear(pkAdrs, slhAdrsForsRoots)
+    slhAdrsSetU32(pkAdrs, 20, slhAdrsGetU32(adrs, 20))
+    let out: Bytes = slhF(p, pkSeed, pkAdrs, roots)
+    BytesFree(pkAdrs)
+    BytesFree(roots)
+    return out
+
+# ---- SLH-DSA internal functions (FIPS 205 Section 9) ----
+
+# Algorithm 18: slh_keygen_internal(SK.seed, SK.prf, PK.seed).
+fn SlhKeyGenInternal(p: SlhParams, skSeed: Bytes, skPrf: Bytes, pkSeed: Bytes): SlhKeyPair =
+    Assert(BytesLen(skSeed) == p.n, "SlhKeyGenInternal: SK.seed must be n bytes")
+    Assert(BytesLen(skPrf) == p.n, "SlhKeyGenInternal: SK.prf must be n bytes")
+    Assert(BytesLen(pkSeed) == p.n, "SlhKeyGenInternal: PK.seed must be n bytes")
+    let adrs: Bytes = slhAdrsNew()
+    slhAdrsSetU32(adrs, 0, p.d - 1)
+    let root: Bytes = slhXmssNode(p, skSeed, 0, p.hPrime, pkSeed, adrs)
+    var out: SlhKeyPair
+    out.pk = BytesConcat(pkSeed, root)
+    out.sk = BytesConcat(BytesConcat3(skSeed, skPrf, pkSeed), root)
+    return out
+
+# Message digest split shared by sign/verify (Algorithms 19/20):
+# digest = md || tmp_idx_tree || tmp_idx_leaf.
+fn slhMdLen(p: SlhParams): int32 =
+    return (p.k * p.a + 7) / 8
+
+fn slhTreeBytes(p: SlhParams): int32 =
+    return (p.h - p.h / p.d + 7) / 8
+
+fn slhLeafBytes(p: SlhParams): int32 =
+    return (p.h + 8 * p.d - 1) / (8 * p.d)
+
+# Algorithm 19: slh_sign_internal(M', SK, addrnd). The deterministic
+# variant passes addrnd = PK.seed.
+fn SlhSignInternal(p: SlhParams, sk: Bytes, mPrime: Bytes, addrnd: Bytes): Bytes =
+    Assert(BytesLen(sk) == 4 * p.n, "SlhSignInternal: sk length wrong")
+    Assert(BytesLen(addrnd) == p.n, "SlhSignInternal: addrnd must be n bytes")
+    let skSeed: Bytes = BytesSlice(sk, 0, p.n)
+    let skPrf: Bytes = BytesSlice(sk, p.n, p.n)
+    let pkSeed: Bytes = BytesSlice(sk, 2 * p.n, p.n)
+    let pkRoot: Bytes = BytesSlice(sk, 3 * p.n, p.n)
+    let r: Bytes = slhPrfMsg(p, skPrf, addrnd, mPrime)
+    let digest: Bytes = slhHmsg(p, r, pkSeed, pkRoot, mPrime)
+    let mdLen: int32 = slhMdLen(p)
+    let treeBytes: int32 = slhTreeBytes(p)
+    let md: Bytes = BytesSlice(digest, 0, mdLen)
+    let idxTree: int64 = slhToIntMod(BytesSlice(digest, mdLen, treeBytes), p.h - p.h / p.d)
+    let idxLeaf: int32 = int32(slhToIntMod(BytesSlice(digest, mdLen + treeBytes, slhLeafBytes(p)), p.h / p.d))
+    let adrs: Bytes = slhAdrsNew()
+    slhAdrsSetTree(adrs, idxTree)
+    slhAdrsSetTypeAndClear(adrs, slhAdrsForsTree)
+    slhAdrsSetU32(adrs, 20, idxLeaf)
+    let sigFors: Bytes = slhForsSign(p, md, skSeed, pkSeed, adrs)
+    let pkFors: Bytes = slhForsPkFromSig(p, sigFors, md, pkSeed, adrs)
+    let sigHt: Bytes = slhHtSign(p, pkFors, skSeed, pkSeed, idxTree, idxLeaf)
+    return BytesConcat3(r, sigFors, sigHt)
+
+# Algorithm 20: slh_verify_internal(M', SIG, PK). Malformed lengths return
+# false without crashing.
+fn SlhVerifyInternal(p: SlhParams, pk: Bytes, mPrime: Bytes, sig: Bytes): bool =
+    if BytesLen(pk) != 2 * p.n:
+        return false
+    if BytesLen(sig) != SlhSigLen(p):
+        return false
+    let pkSeed: Bytes = BytesSlice(pk, 0, p.n)
+    let pkRoot: Bytes = BytesSlice(pk, p.n, p.n)
+    let r: Bytes = BytesSlice(sig, 0, p.n)
+    let forsLen: int32 = p.k * (1 + p.a) * p.n
+    let sigFors: Bytes = BytesSlice(sig, p.n, forsLen)
+    let sigHt: Bytes = BytesSlice(sig, p.n + forsLen, (p.h + p.d * slhLen(p)) * p.n)
+    let digest: Bytes = slhHmsg(p, r, pkSeed, pkRoot, mPrime)
+    let mdLen: int32 = slhMdLen(p)
+    let treeBytes: int32 = slhTreeBytes(p)
+    let md: Bytes = BytesSlice(digest, 0, mdLen)
+    let idxTree: int64 = slhToIntMod(BytesSlice(digest, mdLen, treeBytes), p.h - p.h / p.d)
+    let idxLeaf: int32 = int32(slhToIntMod(BytesSlice(digest, mdLen + treeBytes, slhLeafBytes(p)), p.h / p.d))
+    let adrs: Bytes = slhAdrsNew()
+    slhAdrsSetTree(adrs, idxTree)
+    slhAdrsSetTypeAndClear(adrs, slhAdrsForsTree)
+    slhAdrsSetU32(adrs, 20, idxLeaf)
+    let pkFors: Bytes = slhForsPkFromSig(p, sigFors, md, pkSeed, adrs)
+    return slhHtVerify(p, pkFors, sigHt, pkSeed, idxTree, idxLeaf, pkRoot)
+
+# ---- Public API (FIPS 205 Section 10, pure variants only) ----
+
+# M' = toByte(0, 1) || toByte(|ctx|, 1) || ctx || M (Algorithms 22/24).
+fn slhFormatMessage(ctx: Bytes, msg: Bytes): Bytes =
+    Assert(BytesLen(ctx) <= 255, "slhFormatMessage: context must be at most 255 bytes")
+    let head: Bytes = BytesAlloc(2)
+    BytesSet(head, 0, 0)
+    BytesSet(head, 1, BytesLen(ctx))
+    return BytesConcat3(head, ctx, msg)
+
+# Algorithm 21: slh_keygen() with fresh randomness.
+fn SlhKeyGen(p: SlhParams): Result[SlhKeyPair] =
+    let seedRes: Result[Bytes] = rand.randomBytes(3 * p.n)
+    if IsErr(seedRes):
+        return Err[SlhKeyPair](Error(seedRes))
+    let seeds: Bytes = Value(seedRes)
+    return Ok[SlhKeyPair](SlhKeyGenInternal(p,
+        BytesSlice(seeds, 0, p.n), BytesSlice(seeds, p.n, p.n), BytesSlice(seeds, 2 * p.n, p.n)))
+
+# Algorithm 22 with caller-provided addrnd (n bytes): hedged signing with
+# injected randomness for tests.
+fn SlhSignWithAddrnd(p: SlhParams, sk: Bytes, msg: Bytes, ctx: Bytes, addrnd: Bytes): Result[Bytes] =
+    if BytesLen(ctx) > 255:
+        return Err[Bytes]("slhdsa: context longer than 255 bytes")
+    return Ok[Bytes](SlhSignInternal(p, sk, slhFormatMessage(ctx, msg), addrnd))
+
+# Algorithm 22: hedged signing with fresh randomness.
+fn SlhSign(p: SlhParams, sk: Bytes, msg: Bytes, ctx: Bytes): Result[Bytes] =
+    if BytesLen(ctx) > 255:
+        return Err[Bytes]("slhdsa: context longer than 255 bytes")
+    let rndRes: Result[Bytes] = rand.randomBytes(p.n)
+    if IsErr(rndRes):
+        return Err[Bytes](Error(rndRes))
+    return Ok[Bytes](SlhSignInternal(p, sk, slhFormatMessage(ctx, msg), Value(rndRes)))
+
+# Algorithm 22, deterministic variant: addrnd = PK.seed.
+fn SlhSignDeterministic(p: SlhParams, sk: Bytes, msg: Bytes, ctx: Bytes): Result[Bytes] =
+    if BytesLen(ctx) > 255:
+        return Err[Bytes]("slhdsa: context longer than 255 bytes")
+    if BytesLen(sk) != 4 * p.n:
+        return Err[Bytes]("slhdsa: secret key length wrong")
+    return Ok[Bytes](SlhSignInternal(p, sk, slhFormatMessage(ctx, msg), BytesSlice(sk, 2 * p.n, p.n)))
+
+# Algorithm 24: verification with context string.
+fn SlhVerify(p: SlhParams, pk: Bytes, msg: Bytes, sig: Bytes, ctx: Bytes): bool =
+    if BytesLen(ctx) > 255:
+        return false
+    return SlhVerifyInternal(p, pk, slhFormatMessage(ctx, msg), sig)

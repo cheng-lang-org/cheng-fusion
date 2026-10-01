@@ -5,6 +5,7 @@ import {
   lstatSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   type BigIntStats,
@@ -85,6 +86,76 @@ const REQUIRED_SNAPSHOT_ROWS = [
 const SHA256 = /^[0-9a-f]{64}$/;
 const CANONICAL_UINT = /^(?:0|[1-9][0-9]*)$/;
 const LOWER_HEX = /^(?:[0-9a-f][0-9a-f])*$/;
+const COLD_SCRATCH_MEMORY_LIMIT_BYTES = "1073741824";
+const COLD_SCRATCH_STDOUT = Buffer.from(
+  "cold_codegen_scratch_static_mutations_rejected=16\n" +
+  "cold_codegen_scratch_lifetime_gate_status=PASS\n" +
+  "cold_codegen_scratch_begin_count=4\n" +
+  "cold_codegen_scratch_release_count=4\n" +
+  "cold_codegen_scratch_failure_release_count=3\n" +
+  "cold_codegen_scratch_live_count=0\n" +
+  "cold_codegen_scratch_signal_recovery=PROVED\n" +
+  "cold_codegen_scratch_carrier_restore=PROVED\n" +
+  "cold_codegen_scratch_release_internal_failure=HARD_FAIL\n" +
+  "cold_codegen_scratch_lifetime_gate_status=PASS\n",
+  "utf8",
+);
+const COLD_SCRATCH_STDERR = Buffer.from(
+  "cheng_cold: focused codegen scratch failure (recovery=1 depth=1)\n" +
+  "cheng_cold: codegen scratch release failed with live owner\n",
+  "utf8",
+);
+const COLD_SCRATCH_BOUND_FILE_ROLES = [
+  "guard_report",
+  "stdout",
+  "stderr",
+  "resource_trace",
+  "argv_manifest",
+  "env_manifest",
+  "execution_manifest",
+  "execution_evidence",
+] as const;
+const COLD_SCRATCH_BOUND_FILE_SUFFIXES = [
+  "path_fshex",
+  "sha256",
+  "device",
+  "inode",
+  "mode",
+  "nlink",
+  "uid",
+  "gid",
+  "size",
+  "mtime_ns",
+  "ctime_ns",
+] as const;
+const COLD_SCRATCH_RECEIPT_KEY_ORDER: readonly string[] = [
+  "schema",
+  "status",
+  ...COLD_SCRATCH_BOUND_FILE_ROLES.flatMap((role) =>
+    COLD_SCRATCH_BOUND_FILE_SUFFIXES.map((suffix) => `${role}_${suffix}`)),
+  "process_guard_path_fshex",
+  "process_guard_sha256",
+  "monitor_runtime_path_fshex",
+  "monitor_runtime_sha256",
+  "monitor_python_path_fshex",
+  "monitor_python_sha256",
+  "command_path_fshex",
+  "command_sha256",
+  "source_snapshot_root_fshex",
+  "source_manifest_path_fshex",
+  "source_manifest_sha256",
+  "scratch_gate_path_fshex",
+  "scratch_gate_sha256",
+  "scratch_harness_path_fshex",
+  "scratch_harness_sha256",
+  "cold_source_path_fshex",
+  "cold_source_sha256",
+  "command_argv_sha256",
+  "target_env_requested_sha256",
+  "memory_limit_bytes",
+  "formal_command_identity_status",
+  "receipt_payload_sha256",
+];
 const OFFICIAL_BINDING_KEYS = new Set([
   "schema",
   "status",
@@ -100,7 +171,7 @@ const OFFICIAL_BINDING_KEYS = new Set([
   "final_receipt_source_manifest_sha256",
   "receipt_payload_sha256",
 ]);
-const OFFICIAL_BUILD_RECEIPT_KEYS = new Set([
+const OFFICIAL_BUILD_RECEIPT_KEY_ORDER = [
   "schema",
   "status",
   "driver_role",
@@ -108,6 +179,8 @@ const OFFICIAL_BUILD_RECEIPT_KEYS = new Set([
   "source_manifest_before_path_fshex",
   "source_manifest_after_path_fshex",
   "official_sha256",
+  "cold_scratch_execution_receipt_path_fshex",
+  "cold_scratch_execution_receipt_sha256",
   "install_receipt_path_fshex",
   "install_receipt_sha256",
   "publisher_receipt_path_fshex",
@@ -115,7 +188,10 @@ const OFFICIAL_BUILD_RECEIPT_KEYS = new Set([
   "source_postflight_status",
   "raw_bytes_fixed_point",
   "receipt_payload_sha256",
-]);
+] as const;
+const OFFICIAL_BUILD_RECEIPT_KEYS = new Set(
+  OFFICIAL_BUILD_RECEIPT_KEY_ORDER,
+);
 const OFFICIAL_INSTALL_RECEIPT_KEYS = new Set([
   "schema",
   "status",
@@ -149,7 +225,26 @@ interface StableFileIdentity {
   readonly byteLength: number;
   readonly device: string;
   readonly inode: string;
+  readonly rawMode: string;
   readonly mode: number;
+  readonly linkCount: string;
+  readonly uid: string;
+  readonly gid: string;
+  readonly modifiedNs: string;
+  readonly changedNs: string;
+}
+
+interface StableFileSeal {
+  readonly path: string;
+  readonly sha256: string;
+  readonly byteLength: number;
+  readonly device: string;
+  readonly inode: string;
+  readonly rawMode: string;
+  readonly mode: number;
+  readonly linkCount: string;
+  readonly uid: string;
+  readonly gid: string;
   readonly modifiedNs: string;
   readonly changedNs: string;
 }
@@ -262,7 +357,11 @@ function stableRegularFile(
       byteLength: bytes.length,
       device: before.dev.toString(),
       inode: before.ino.toString(),
+      rawMode: before.mode.toString(8),
       mode: Number(before.mode & 0o7777n),
+      linkCount: before.nlink.toString(),
+      uid: before.uid.toString(),
+      gid: before.gid.toString(),
       modifiedNs: before.mtimeNs.toString(),
       changedNs: before.ctimeNs.toString(),
     };
@@ -280,10 +379,87 @@ function sameFileIdentity(
     left.byteLength === right.byteLength &&
     left.device === right.device &&
     left.inode === right.inode &&
+    left.rawMode === right.rawMode &&
     left.mode === right.mode &&
+    left.linkCount === right.linkCount &&
+    left.uid === right.uid &&
+    left.gid === right.gid &&
     left.modifiedNs === right.modifiedNs &&
     left.changedNs === right.changedNs &&
     left.bytes.equals(right.bytes);
+}
+
+function stableRegularFileSeal(
+  pathRaw: string,
+  label: string,
+  requireSingleLink = false,
+): StableFileSeal {
+  const path = resolve(pathRaw);
+  if (realpathSync(path) !== path) {
+    throw new Error(`${label}_path_not_canonical`);
+  }
+  const flags = constants.O_RDONLY |
+    ((constants as typeof constants & {O_CLOEXEC?: number}).O_CLOEXEC ?? 0) |
+    (constants.O_NOFOLLOW ?? 0);
+  const fd = openSync(path, flags);
+  try {
+    const before = fstatSync(fd, {bigint: true});
+    if (!before.isFile() ||
+        (requireSingleLink && before.nlink !== 1n) ||
+        before.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error(`${label}_identity_invalid`);
+    }
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let observed = 0;
+    for (;;) {
+      const count = readSync(fd, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      digest.update(buffer.subarray(0, count));
+      observed += count;
+    }
+    const after = fstatSync(fd, {bigint: true});
+    const pathStat = lstatSync(path, {bigint: true});
+    if (!sameStableStat(before, after) ||
+        !sameStableStat(before, pathStat) ||
+        observed !== Number(before.size)) {
+      throw new Error(`${label}_drift`);
+    }
+    return {
+      path,
+      sha256: digest.digest("hex"),
+      byteLength: observed,
+      device: before.dev.toString(),
+      inode: before.ino.toString(),
+      rawMode: before.mode.toString(8),
+      mode: Number(before.mode & 0o7777n),
+      linkCount: before.nlink.toString(),
+      uid: before.uid.toString(),
+      gid: before.gid.toString(),
+      modifiedNs: before.mtimeNs.toString(),
+      changedNs: before.ctimeNs.toString(),
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function sameFileSeal(
+  left: StableFileSeal,
+  right: StableFileSeal,
+): boolean {
+  return left.path === right.path &&
+    left.sha256 === right.sha256 &&
+    left.byteLength === right.byteLength &&
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.rawMode === right.rawMode &&
+    left.mode === right.mode &&
+    left.linkCount === right.linkCount &&
+    left.uid === right.uid &&
+    left.gid === right.gid &&
+    left.modifiedNs === right.modifiedNs &&
+    left.changedNs === right.changedNs;
 }
 
 function requireExactKeys(
@@ -294,6 +470,16 @@ function requireExactKeys(
   if (rows.size !== expected.size ||
       [...rows.keys()].some((key) => !expected.has(key))) {
     throw new Error(`${label}_key_set_invalid`);
+  }
+}
+
+function requireExactKeyOrder(
+  rows: ReadonlyMap<string, string>,
+  expected: readonly string[],
+  label: string,
+): void {
+  if ([...rows.keys()].join("\0") !== expected.join("\0")) {
+    throw new Error(`${label}_key_order_invalid`);
   }
 }
 
@@ -328,6 +514,27 @@ function parseHashedKv(
   }
   if (expectedKeys !== undefined) {
     requireExactKeys(rows, expectedKeys, label);
+  }
+  return rows;
+}
+
+function parseUniqueKv(
+  file: StableFileIdentity,
+  label: string,
+): Map<string, string> {
+  const text = file.bytes.toString("utf8");
+  if (!text.endsWith("\n") || text.includes("\r") || text.includes("\0") ||
+      Buffer.from(text, "utf8").length !== file.bytes.length) {
+    throw new Error(`${label}_encoding_invalid`);
+  }
+  const rows = new Map<string, string>();
+  for (const line of text.slice(0, -1).split("\n")) {
+    const separator = line.indexOf("=");
+    const key = line.slice(0, separator);
+    if (separator <= 0 || rows.has(key)) {
+      throw new Error(`${label}_row_invalid`);
+    }
+    rows.set(key, line.slice(separator + 1));
   }
   return rows;
 }
@@ -397,6 +604,1029 @@ function requireFileHash(
   }
 }
 
+function requireSealedScratchArtifact(
+  file: StableFileIdentity,
+  label: string,
+): void {
+  if (file.mode !== 0o400 || file.linkCount !== "1" ||
+      file.uid !== String(process.geteuid?.() ?? -1) ||
+      file.gid !== String(process.getegid?.() ?? -1)) {
+    throw new Error(`${label}_seal_invalid`);
+  }
+}
+
+function scratchFrame(bytes: Buffer): Buffer {
+  if (bytes.length >= 2 ** 32) {
+    throw new Error("cold_scratch_frame_too_large");
+  }
+  const size = Buffer.allocUnsafe(4);
+  size.writeUInt32BE(bytes.length);
+  return Buffer.concat([size, bytes]);
+}
+
+function scratchArgvSha256(values: readonly string[]): string {
+  const count = Buffer.allocUnsafe(4);
+  count.writeUInt32BE(values.length);
+  return sha256(Buffer.concat([
+    scratchFrame(Buffer.from("cheng.guard.command_argv", "utf8")),
+    count,
+    ...values.map((value) => scratchFrame(Buffer.from(value, "utf8"))),
+  ]));
+}
+
+function scratchEnvSha256(values: ReadonlyMap<string, string>): string {
+  const keys = [...values.keys()].sort((left, right) =>
+    Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+  const count = Buffer.allocUnsafe(4);
+  count.writeUInt32BE(keys.length);
+  return sha256(Buffer.concat([
+    scratchFrame(Buffer.from("cheng.guard.target_env", "utf8")),
+    count,
+    ...keys.flatMap((key) => [
+      scratchFrame(Buffer.from(key, "utf8")),
+      scratchFrame(Buffer.from(values.get(key) ?? "", "utf8")),
+    ]),
+  ]));
+}
+
+function decodeFsHexText(
+  rows: ReadonlyMap<string, string>,
+  key: string,
+  label: string,
+): string {
+  const raw = requiredRow(rows, key, label);
+  if (!LOWER_HEX.test(raw)) {
+    throw new Error(`${label}_fshex_invalid:${key}`);
+  }
+  const bytes = Buffer.from(raw, "hex");
+  const decoded = bytes.toString("utf8");
+  if (decoded.includes("\0") ||
+      !Buffer.from(decoded, "utf8").equals(bytes)) {
+    throw new Error(`${label}_text_invalid:${key}`);
+  }
+  return decoded;
+}
+
+function requireCanonicalOctal(value: string, label: string): string {
+  if (!/^(?:0|[1-7][0-7]*)$/.test(value)) {
+    throw new Error(`${label}_octal_invalid`);
+  }
+  return value;
+}
+
+function requirePhysicalFileRows(
+  rows: ReadonlyMap<string, string>,
+  prefix: string,
+  file: StableFileIdentity,
+  label: string,
+): void {
+  const declaredPath = decodeFsHexPath(
+    rows,
+    `${prefix}path_fshex`,
+    label,
+  );
+  const declaredSha = requiredSha(rows, `${prefix}sha256`, label);
+  const declaredMode = requireCanonicalOctal(
+    requiredRow(rows, `${prefix}mode`, label),
+    `${label}_mode`,
+  );
+  const expected = new Map<string, string>([
+    ["path_fshex", file.path],
+    ["sha256", file.sha256],
+    ["device", file.device],
+    ["inode", file.inode],
+    ["mode", file.rawMode],
+    ["nlink", file.linkCount],
+    ["uid", file.uid],
+    ["gid", file.gid],
+    ["size", String(file.byteLength)],
+    ["mtime_ns", file.modifiedNs],
+    ["ctime_ns", file.changedNs],
+  ]);
+  if (declaredPath !== expected.get("path_fshex") ||
+      declaredSha !== expected.get("sha256") ||
+      declaredMode !== expected.get("mode")) {
+    throw new Error(`${label}_physical_identity_invalid`);
+  }
+  for (const suffix of [
+    "device",
+    "inode",
+    "nlink",
+    "uid",
+    "gid",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+  ] as const) {
+    const declared = exactCanonicalUint(
+      requiredRow(rows, `${prefix}${suffix}`, label),
+      `${label}_${suffix}`,
+    ).toString();
+    if (declared !== expected.get(suffix)) {
+      throw new Error(`${label}_physical_identity_invalid:${suffix}`);
+    }
+  }
+}
+
+function validateScratchArgvManifest(
+  file: StableFileIdentity,
+  expectedValues: readonly string[],
+): void {
+  const label = "cold_scratch_argv_manifest";
+  const rows = parseUniqueKv(file, label);
+  const count = Number(exactCanonicalUint(
+    requiredRow(rows, "count", label),
+    `${label}_count`,
+  ));
+  const expectedOrder = [
+    "schema",
+    "count",
+    "sha256",
+    ...expectedValues.map((_value, index) => `arg.${index}.fshex`),
+  ];
+  if (count !== expectedValues.length) {
+    throw new Error(`${label}_count_invalid`);
+  }
+  requireExactKeyOrder(rows, expectedOrder, label);
+  if (rows.get("schema") !== "cheng.guard.argv_manifest") {
+    throw new Error(`${label}_schema_invalid`);
+  }
+  const values = expectedValues.map((_expected, index) =>
+    decodeFsHexText(rows, `arg.${index}.fshex`, label));
+  if (values.some((value, index) => value !== expectedValues[index])) {
+    throw new Error(`${label}_value_invalid`);
+  }
+  const digest = scratchArgvSha256(values);
+  if (requiredSha(rows, "sha256", label) !== digest) {
+    throw new Error(`${label}_digest_invalid`);
+  }
+}
+
+function validateScratchEnvManifest(
+  file: StableFileIdentity,
+  expectedValues: ReadonlyMap<string, string>,
+): void {
+  const label = "cold_scratch_env_manifest";
+  const rows = parseUniqueKv(file, label);
+  const expectedKeys = [...expectedValues.keys()].sort((left, right) =>
+    Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+  const count = Number(exactCanonicalUint(
+    requiredRow(rows, "count", label),
+    `${label}_count`,
+  ));
+  const expectedOrder = ["schema", "count", "sha256"];
+  for (let index = 0; index < expectedKeys.length; index += 1) {
+    expectedOrder.push(
+      `entry.${index}.key_fshex`,
+      `entry.${index}.value_fshex`,
+    );
+  }
+  if (count !== expectedKeys.length) {
+    throw new Error(`${label}_count_invalid`);
+  }
+  requireExactKeyOrder(rows, expectedOrder, label);
+  if (rows.get("schema") !== "cheng.guard.env_manifest") {
+    throw new Error(`${label}_schema_invalid`);
+  }
+  const observed = new Map<string, string>();
+  for (let index = 0; index < count; index += 1) {
+    const key = decodeFsHexText(
+      rows,
+      `entry.${index}.key_fshex`,
+      label,
+    );
+    const value = decodeFsHexText(
+      rows,
+      `entry.${index}.value_fshex`,
+      label,
+    );
+    if (observed.has(key) || key !== expectedKeys[index] ||
+        value !== expectedValues.get(key)) {
+      throw new Error(`${label}_value_invalid`);
+    }
+    observed.set(key, value);
+  }
+  if (requiredSha(rows, "sha256", label) !== scratchEnvSha256(observed)) {
+    throw new Error(`${label}_digest_invalid`);
+  }
+}
+
+function validateScratchExecutionManifest(
+  file: StableFileIdentity,
+  inputs: ReadonlyMap<string, StableFileIdentity>,
+  outputs: ReadonlyMap<string, StableFileIdentity>,
+): void {
+  const label = "cold_scratch_execution_manifest";
+  const rows = parseUniqueKv(file, label);
+  const inputRoles = ["command", "monitor_runtime", "monitor_python"] as const;
+  const outputRoles = [
+    "report",
+    "stdout",
+    "stderr",
+    "resource_trace",
+  ] as const;
+  const expectedOrder = ["schema"];
+  for (const role of inputRoles) {
+    for (const suffix of COLD_SCRATCH_BOUND_FILE_SUFFIXES) {
+      expectedOrder.push(`input.${role}.${suffix}`);
+    }
+  }
+  expectedOrder.push("output_count");
+  for (let index = 0; index < outputRoles.length; index += 1) {
+    expectedOrder.push(
+      `output.${index}.role`,
+      `output.${index}.path_fshex`,
+      `output.${index}.expected_kind`,
+      `output.${index}.expected_mode`,
+      `output.${index}.expected_nlink`,
+      `output.${index}.expected_uid`,
+      `output.${index}.expected_gid`,
+      `output.${index}.pre_run_status`,
+    );
+  }
+  expectedOrder.push("manifest_payload_sha256");
+  requireExactKeyOrder(rows, expectedOrder, label);
+  if (rows.get("schema") !== "cheng.guard.execution_manifest" ||
+      exactCanonicalUint(
+        requiredRow(rows, "output_count", label),
+        `${label}_output_count`,
+      ) !== BigInt(outputRoles.length)) {
+    throw new Error(`${label}_header_invalid`);
+  }
+  const lines = file.bytes.toString("utf8").slice(0, -1).split("\n");
+  const payload = Buffer.from(`${lines.slice(0, -1).join("\n")}\n`, "utf8");
+  if (requiredSha(rows, "manifest_payload_sha256", label) !==
+      sha256(payload)) {
+    throw new Error(`${label}_payload_sha_invalid`);
+  }
+  for (const role of inputRoles) {
+    const input = inputs.get(role);
+    if (input === undefined) {
+      throw new Error(`${label}_input_missing:${role}`);
+    }
+    requirePhysicalFileRows(
+      rows,
+      `input.${role}.`,
+      input,
+      `${label}_input_${role}`,
+    );
+  }
+  const expectedUid = String(process.geteuid?.() ?? -1);
+  const expectedGid = String(process.getegid?.() ?? -1);
+  for (let index = 0; index < outputRoles.length; index += 1) {
+    const role = outputRoles[index]!;
+    const output = outputs.get(role);
+    if (output === undefined) {
+      throw new Error(`${label}_output_missing:${role}`);
+    }
+    const prefix = `output.${index}.`;
+    if (rows.get(`${prefix}role`) !== role ||
+        decodeFsHexPath(rows, `${prefix}path_fshex`, label) !== output.path ||
+        rows.get(`${prefix}expected_kind`) !== "regular" ||
+        rows.get(`${prefix}expected_mode`) !== "100400" ||
+        rows.get(`${prefix}expected_nlink`) !== "1" ||
+        rows.get(`${prefix}expected_uid`) !== expectedUid ||
+        rows.get(`${prefix}expected_gid`) !== expectedGid ||
+        rows.get(`${prefix}pre_run_status`) !== "absent") {
+      throw new Error(`${label}_output_invalid:${role}`);
+    }
+  }
+}
+
+const CURRENT_SOURCE_MANIFEST_SCHEMA =
+  "cheng.current_source_closure_manifest";
+const CURRENT_SOURCE_CONTENT_CID_DOMAIN =
+  Buffer.from("cheng.current_source_closure.content.cid", "utf8");
+const CURRENT_SOURCE_MAX_PATH_COUNT = 1_000_000;
+const CURRENT_SOURCE_MAX_PATH_BYTES = 64 * 1024 * 1024;
+const CURRENT_SOURCE_MAX_FILE_BYTES = 8 * 1024 * 1024 * 1024;
+const SNAPSHOT_DIRECTORY_MODE = 0o500;
+const SNAPSHOT_REGULAR_MODE = 0o400;
+const SNAPSHOT_EXECUTABLE_MODE = 0o500;
+
+interface CurrentSourceManifestMember {
+  readonly relativePath: string;
+  readonly relativeBytes: Buffer;
+  readonly state: "tracked" | "untracked" | "tracked_deleted";
+  readonly sha256: string;
+  readonly mode: bigint;
+  readonly size: number;
+}
+
+interface CurrentSourceManifestIdentity {
+  readonly file: StableFileIdentity;
+  readonly members: readonly CurrentSourceManifestMember[];
+}
+
+interface StableDirectoryIdentity {
+  readonly path: string;
+  readonly device: string;
+  readonly inode: string;
+  readonly mode: number;
+  readonly linkCount: string;
+  readonly uid: string;
+  readonly gid: string;
+  readonly modifiedNs: string;
+  readonly changedNs: string;
+}
+
+function exactCanonicalUint(raw: string, label: string): bigint {
+  if (!CANONICAL_UINT.test(raw)) {
+    throw new Error(`${label}_uint_invalid`);
+  }
+  return BigInt(raw);
+}
+
+function exactUtf8Path(raw: Buffer, label: string): string {
+  const decoded = raw.toString("utf8");
+  if (!Buffer.from(decoded, "utf8").equals(raw)) {
+    throw new Error(`${label}_utf8_invalid`);
+  }
+  return decoded;
+}
+
+function requireCanonicalRelativePath(
+  path: string,
+  label: string,
+): void {
+  const components = path.split("/");
+  if (path === "" || path.startsWith("/") ||
+      components.some((component) =>
+        component === "" || component === "." || component === ".."
+      )) {
+    throw new Error(`${label}_relative_path_invalid`);
+  }
+}
+
+function scratchFrame64(bytes: Buffer): Buffer {
+  const size = Buffer.allocUnsafe(8);
+  size.writeBigUInt64BE(BigInt(bytes.length));
+  return Buffer.concat([size, bytes]);
+}
+
+function scratchCount64(value: number): Buffer {
+  const bytes = Buffer.allocUnsafe(8);
+  bytes.writeBigUInt64BE(BigInt(value));
+  return bytes;
+}
+
+function currentSourceContentCid(
+  head: Buffer,
+  scopes: readonly Buffer[],
+  members: readonly CurrentSourceManifestMember[],
+): string {
+  const digest = createHash("sha256");
+  digest.update(scratchFrame64(CURRENT_SOURCE_CONTENT_CID_DOMAIN));
+  digest.update(scratchFrame64(head));
+  digest.update(scratchCount64(scopes.length));
+  for (const scope of scopes) {
+    digest.update(scratchFrame64(scope));
+  }
+  digest.update(scratchCount64(members.length));
+  for (const member of members) {
+    digest.update(scratchFrame64(member.relativeBytes));
+    digest.update(scratchFrame64(Buffer.from(member.state, "utf8")));
+    if (member.state === "tracked_deleted") {
+      continue;
+    }
+    digest.update(Buffer.from(member.sha256, "hex"));
+    digest.update(Buffer.from([(member.mode & 0o111n) === 0n ? 0 : 1]));
+    const size = Buffer.allocUnsafe(8);
+    size.writeBigUInt64BE(BigInt(member.size));
+    digest.update(size);
+  }
+  return digest.digest("hex");
+}
+
+function parseCurrentSourceManifest(
+  file: StableFileIdentity,
+): CurrentSourceManifestIdentity {
+  const label = "cold_scratch_source_manifest";
+  if (file.byteLength > CURRENT_SOURCE_MAX_PATH_BYTES * 4) {
+    throw new Error(`${label}_size_invalid`);
+  }
+  const text = file.bytes.toString("utf8");
+  if (!text.endsWith("\n") || text.includes("\r") || text.includes("\0") ||
+      !Buffer.from(text, "utf8").equals(file.bytes)) {
+    throw new Error(`${label}_encoding_invalid`);
+  }
+  const lines = text.slice(0, -1).split("\n");
+  let cursor = 0;
+  const take = (prefix: string): string => {
+    const line = lines[cursor++];
+    if (line === undefined || !line.startsWith(prefix)) {
+      throw new Error(`${label}_field_missing:${prefix}`);
+    }
+    return line.slice(prefix.length);
+  };
+  if (take("schema=") !== CURRENT_SOURCE_MANIFEST_SCHEMA) {
+    throw new Error(`${label}_schema_invalid`);
+  }
+  const headRaw = take("head=");
+  if (!/^[0-9a-f]{40}$/.test(headRaw)) {
+    throw new Error(`${label}_head_invalid`);
+  }
+  const scopeCount = Number(exactCanonicalUint(
+    take("scope_count="),
+    `${label}_scope_count`,
+  ));
+  if (scopeCount <= 0 || scopeCount > CURRENT_SOURCE_MAX_PATH_COUNT) {
+    throw new Error(`${label}_scope_count_invalid`);
+  }
+  const scopes: Buffer[] = [];
+  const scopePaths: string[] = [];
+  for (let index = 0; index < scopeCount; index += 1) {
+    const raw = take("scope=");
+    if (!LOWER_HEX.test(raw)) {
+      throw new Error(`${label}_scope_hex_invalid`);
+    }
+    const bytes = Buffer.from(raw, "hex");
+    const path = exactUtf8Path(bytes, `${label}_scope`);
+    requireCanonicalRelativePath(path, `${label}_scope`);
+    scopes.push(bytes);
+    scopePaths.push(path);
+  }
+  for (let index = 1; index < scopes.length; index += 1) {
+    if (Buffer.compare(scopes[index - 1]!, scopes[index]!) >= 0) {
+      throw new Error(`${label}_scope_order_invalid`);
+    }
+  }
+  const pathCount = Number(exactCanonicalUint(
+    take("path_count="),
+    `${label}_path_count`,
+  ));
+  if (pathCount > CURRENT_SOURCE_MAX_PATH_COUNT) {
+    throw new Error(`${label}_path_count_invalid`);
+  }
+  const claimedContentCid = take("content_cid=");
+  if (!SHA256.test(claimedContentCid)) {
+    throw new Error(`${label}_content_cid_invalid`);
+  }
+  const members: CurrentSourceManifestMember[] = [];
+  let pathBytes = 0;
+  for (let index = 0; index < pathCount; index += 1) {
+    const line = lines[cursor++];
+    if (line === undefined) {
+      throw new Error(`${label}_path_row_missing`);
+    }
+    const columns = line.split("\t");
+    if (!LOWER_HEX.test(columns[0] ?? "")) {
+      throw new Error(`${label}_path_hex_invalid`);
+    }
+    const relativeBytes = Buffer.from(columns[0]!, "hex");
+    pathBytes += relativeBytes.length;
+    if (pathBytes > CURRENT_SOURCE_MAX_PATH_BYTES) {
+      throw new Error(`${label}_path_bytes_invalid`);
+    }
+    const relativePath = exactUtf8Path(
+      relativeBytes,
+      `${label}_member_path`,
+    );
+    requireCanonicalRelativePath(relativePath, `${label}_member_path`);
+    if (!scopePaths.some((scope) =>
+      relativePath === scope || relativePath.startsWith(`${scope}/`)
+    )) {
+      throw new Error(`${label}_member_outside_scope`);
+    }
+    if (columns.length === 2 && columns[1] === "tracked_deleted") {
+      members.push({
+        relativePath,
+        relativeBytes,
+        state: "tracked_deleted",
+        sha256: "",
+        mode: 0n,
+        size: 0,
+      });
+      continue;
+    }
+    if (columns.length !== 9 ||
+        (columns[1] !== "tracked" && columns[1] !== "untracked") ||
+        !SHA256.test(columns[2] ?? "")) {
+      throw new Error(`${label}_path_row_invalid`);
+    }
+    for (const [columnIndex, field] of [
+      [3, "device"],
+      [4, "inode"],
+      [5, "mode"],
+      [6, "size"],
+      [7, "mtime_ns"],
+      [8, "ctime_ns"],
+    ] as const) {
+      exactCanonicalUint(
+        columns[columnIndex]!,
+        `${label}_${field}`,
+      );
+    }
+    const mode = BigInt(columns[5]!);
+    const sizeBig = BigInt(columns[6]!);
+    if ((mode & 0o170000n) !== 0o100000n ||
+        sizeBig > BigInt(CURRENT_SOURCE_MAX_FILE_BYTES) ||
+        sizeBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error(`${label}_member_identity_invalid`);
+    }
+    members.push({
+      relativePath,
+      relativeBytes,
+      state: columns[1],
+      sha256: columns[2]!,
+      mode,
+      size: Number(sizeBig),
+    });
+  }
+  if (cursor !== lines.length) {
+    throw new Error(`${label}_trailing_rows`);
+  }
+  for (let index = 1; index < members.length; index += 1) {
+    if (Buffer.compare(
+      members[index - 1]!.relativeBytes,
+      members[index]!.relativeBytes,
+    ) >= 0) {
+      throw new Error(`${label}_member_order_invalid`);
+    }
+  }
+  const contentCid = currentSourceContentCid(
+    Buffer.from(headRaw, "utf8"),
+    scopes,
+    members,
+  );
+  if (contentCid !== claimedContentCid) {
+    throw new Error(`${label}_content_cid_mismatch`);
+  }
+  return {file, members};
+}
+
+function stableSnapshotDirectory(
+  pathRaw: string,
+  expectedOwner?: readonly [string, string],
+): StableDirectoryIdentity {
+  const path = resolve(pathRaw);
+  if (realpathSync(path) !== path) {
+    throw new Error("cold_scratch_snapshot_directory_not_canonical");
+  }
+  const stat = lstatSync(path, {bigint: true});
+  if (!stat.isDirectory() || stat.isSymbolicLink() ||
+      Number(stat.mode & 0o7777n) !== SNAPSHOT_DIRECTORY_MODE ||
+      (expectedOwner !== undefined &&
+        (stat.uid.toString() !== expectedOwner[0] ||
+          stat.gid.toString() !== expectedOwner[1]))) {
+    throw new Error("cold_scratch_snapshot_directory_invalid");
+  }
+  return {
+    path,
+    device: stat.dev.toString(),
+    inode: stat.ino.toString(),
+    mode: Number(stat.mode & 0o7777n),
+    linkCount: stat.nlink.toString(),
+    uid: stat.uid.toString(),
+    gid: stat.gid.toString(),
+    modifiedNs: stat.mtimeNs.toString(),
+    changedNs: stat.ctimeNs.toString(),
+  };
+}
+
+function sameDirectoryIdentity(
+  left: StableDirectoryIdentity,
+  right: StableDirectoryIdentity,
+): boolean {
+  return left.path === right.path &&
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.mode === right.mode &&
+    left.linkCount === right.linkCount &&
+    left.uid === right.uid &&
+    left.gid === right.gid &&
+    left.modifiedNs === right.modifiedNs &&
+    left.changedNs === right.changedNs;
+}
+
+function validateColdScratchSourceSnapshot(
+  rootRaw: string,
+  manifest: CurrentSourceManifestIdentity,
+): {
+  readonly files: readonly StableFileSeal[];
+  readonly directories: readonly StableDirectoryIdentity[];
+} {
+  const root = resolve(rootRaw);
+  const rootIdentity = stableSnapshotDirectory(root);
+  const owner = [rootIdentity.uid, rootIdentity.gid] as const;
+  const expected = new Map(
+    manifest.members
+      .filter((member) => member.state !== "tracked_deleted")
+      .map((member) => [member.relativePath, member] as const),
+  );
+  const files: StableFileSeal[] = [];
+  const directories: StableDirectoryIdentity[] = [];
+  const actual: string[] = [];
+  const visit = (directoryPath: string): void => {
+    const directory = stableSnapshotDirectory(directoryPath, owner);
+    directories.push(directory);
+    const names = readdirSync(directoryPath).sort((left, right) =>
+      Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+    for (const name of names) {
+      const path = join(directoryPath, name);
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink()) {
+        throw new Error("cold_scratch_snapshot_symlink");
+      }
+      if (stat.isDirectory()) {
+        visit(path);
+        continue;
+      }
+      if (!stat.isFile()) {
+        throw new Error("cold_scratch_snapshot_nonregular");
+      }
+      const relativePath = relative(root, path);
+      requireCanonicalRelativePath(
+        relativePath,
+        "cold_scratch_snapshot_member",
+      );
+      const member = expected.get(relativePath);
+      if (member === undefined) {
+        throw new Error(
+          `cold_scratch_snapshot_unmanifested:${relativePath}`,
+        );
+      }
+      const file = stableRegularFileSeal(
+        path,
+        `cold_scratch_snapshot_member:${relativePath}`,
+        true,
+      );
+      const expectedMode = (member.mode & 0o111n) === 0n
+        ? SNAPSHOT_REGULAR_MODE
+        : SNAPSHOT_EXECUTABLE_MODE;
+      if (file.uid !== owner[0] || file.gid !== owner[1] ||
+          file.mode !== expectedMode ||
+          file.byteLength !== member.size ||
+          file.sha256 !== member.sha256) {
+        throw new Error(
+          `cold_scratch_snapshot_member_drift:${relativePath}`,
+        );
+      }
+      files.push(file);
+      actual.push(relativePath);
+    }
+  };
+  visit(root);
+  const expectedPaths = [...expected.keys()].sort((left, right) =>
+    Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+  actual.sort((left, right) =>
+    Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+  if (actual.join("\0") !== expectedPaths.join("\0")) {
+    throw new Error("cold_scratch_snapshot_path_set_mismatch");
+  }
+  return {files, directories};
+}
+
+interface ColdScratchExecutionIdentity {
+  readonly receipt: StableFileIdentity;
+  readonly files: readonly StableFileIdentity[];
+  readonly multiLinkFiles: readonly StableFileIdentity[];
+  readonly snapshotFiles: readonly StableFileSeal[];
+  readonly snapshotDirectories: readonly StableDirectoryIdentity[];
+}
+
+function validateColdScratchExecutionReceipt(
+  receiptPath: string,
+  expectedSha256: string,
+  workspaceRoot: string,
+  expectedSourceManifest: StableFileIdentity,
+): ColdScratchExecutionIdentity {
+  const receiptRoot = dirname(receiptPath);
+  if (receiptPath !== join(receiptRoot, "receipt.kv") ||
+      basename(receiptRoot) !== "cold-scratch-execution" ||
+      receiptRoot !== join(
+        dirname(expectedSourceManifest.path),
+        "cold-scratch-execution",
+      )) {
+    throw new Error("cold_scratch_execution_receipt_layout_invalid");
+  }
+  const receipt = stableRegularFile(
+    receiptPath,
+    "cold_scratch_execution_receipt",
+    true,
+  );
+  requireSealedScratchArtifact(receipt, "cold_scratch_execution_receipt");
+  requireFileHash(
+    receipt,
+    expectedSha256,
+    "cold_scratch_execution_receipt",
+  );
+  const rows = parseHashedKv(
+    receipt,
+    "cold_scratch_execution_receipt",
+    new Set(COLD_SCRATCH_RECEIPT_KEY_ORDER),
+  );
+  requireExactKeyOrder(
+    rows,
+    COLD_SCRATCH_RECEIPT_KEY_ORDER,
+    "cold_scratch_execution_receipt",
+  );
+  if (rows.get("schema") !==
+        "cheng.backend2.current_source_cold_scratch_execution_receipt" ||
+      rows.get("status") !== "PASS") {
+    throw new Error("cold_scratch_execution_receipt_header_invalid");
+  }
+
+  const sourceSnapshotRoot = decodeFsHexPath(
+    rows,
+    "source_snapshot_root_fshex",
+    "cold_scratch_execution_receipt",
+  );
+  const sourceManifestPath = decodeFsHexPath(
+    rows,
+    "source_manifest_path_fshex",
+    "cold_scratch_execution_receipt",
+  );
+  if (sourceSnapshotRoot !== join(dirname(receiptRoot), "source-snapshot") ||
+      sourceManifestPath !== expectedSourceManifest.path ||
+      requiredSha(
+        rows,
+        "source_manifest_sha256",
+        "cold_scratch_execution_receipt",
+      ) !== expectedSourceManifest.sha256) {
+    throw new Error("cold_scratch_source_manifest_binding_invalid");
+  }
+  const sourceManifest = parseCurrentSourceManifest(expectedSourceManifest);
+  const sourceSnapshot = validateColdScratchSourceSnapshot(
+    sourceSnapshotRoot,
+    sourceManifest,
+  );
+  const expectedPaths = new Map<string, string>([
+    ["guard_report", join(receiptRoot, "guard-report.kv")],
+    ["stdout", join(receiptRoot, "stdout.txt")],
+    ["stderr", join(receiptRoot, "stderr.txt")],
+    ["resource_trace", join(receiptRoot, "resource-trace.tsv")],
+    ["argv_manifest", join(receiptRoot, "argv-manifest.kv")],
+    ["env_manifest", join(receiptRoot, "env-manifest.kv")],
+    ["execution_manifest", join(receiptRoot, "execution-manifest.kv")],
+    [
+      "execution_evidence",
+      join(workspaceRoot, "tools/backend2_current_source_official_evidence"),
+    ],
+    ["process_guard", join(workspaceRoot, "tools/beat_c_process_group_guard.sh")],
+    [
+      "monitor_runtime",
+      join(workspaceRoot, "tools/beat_c_process_group_guard_runtime.py"),
+    ],
+    [
+      "scratch_gate",
+      join(sourceSnapshotRoot, "tools/cold_codegen_scratch_lifetime_gate.sh"),
+    ],
+    [
+      "scratch_harness",
+      join(sourceSnapshotRoot, "tools/cold_codegen_scratch_lifetime_gate.c"),
+    ],
+    ["cold_source", join(sourceSnapshotRoot, "bootstrap/cheng_cold.c")],
+  ]);
+  const states = new Map<string, StableFileIdentity>();
+  for (const [label, expectedPath] of expectedPaths) {
+    const path = decodeFsHexPath(
+      rows,
+      `${label}_path_fshex`,
+      "cold_scratch_execution_receipt",
+    );
+    if (path !== expectedPath) {
+      throw new Error(`cold_scratch_execution_${label}_path_invalid`);
+    }
+    const state = stableRegularFile(
+      path,
+      `cold_scratch_execution_${label}`,
+      !COLD_SCRATCH_BOUND_FILE_ROLES.includes(
+        label as typeof COLD_SCRATCH_BOUND_FILE_ROLES[number],
+      ),
+    );
+    requireFileHash(
+      state,
+      requiredSha(
+        rows,
+        `${label}_sha256`,
+        "cold_scratch_execution_receipt",
+      ),
+      `cold_scratch_execution_${label}`,
+    );
+    states.set(label, state);
+  }
+  for (const role of COLD_SCRATCH_BOUND_FILE_ROLES) {
+    requirePhysicalFileRows(
+      rows,
+      `${role}_`,
+      states.get(role)!,
+      `cold_scratch_execution_${role}`,
+    );
+  }
+  const monitorPythonPath = decodeFsHexPath(
+    rows,
+    "monitor_python_path_fshex",
+    "cold_scratch_execution_receipt",
+  );
+  const monitorPython = stableRegularFile(
+    monitorPythonPath,
+    "cold_scratch_execution_monitor_python",
+  );
+  requireFileHash(
+    monitorPython,
+    requiredSha(
+      rows,
+      "monitor_python_sha256",
+      "cold_scratch_execution_receipt",
+    ),
+    "cold_scratch_execution_monitor_python",
+  );
+  const commandPath = decodeFsHexPath(
+    rows,
+    "command_path_fshex",
+    "cold_scratch_execution_receipt",
+  );
+  const scratchGate = states.get("scratch_gate")!;
+  if (commandPath !==
+        join(workspaceRoot, "tools/cold_codegen_scratch_lifetime_gate.sh")) {
+    throw new Error("cold_scratch_execution_command_path_invalid");
+  }
+  const command = stableRegularFile(
+    commandPath,
+    "cold_scratch_execution_command",
+    true,
+  );
+  requireFileHash(
+    command,
+    requiredSha(
+      rows,
+      "command_sha256",
+      "cold_scratch_execution_receipt",
+    ),
+    "cold_scratch_execution_command",
+  );
+  if (command.sha256 !== scratchGate.sha256 ||
+      (command.mode & 0o111) === 0 ||
+      (states.get("process_guard")!.mode & 0o111) === 0 ||
+      (monitorPython.mode & 0o111) === 0 ||
+      (states.get("execution_evidence")!.mode & 0o111) === 0 ||
+      states.get("execution_evidence")!.linkCount !== "1") {
+    throw new Error("cold_scratch_execution_executable_identity_invalid");
+  }
+
+  for (const label of [
+    "guard_report",
+    "stdout",
+    "stderr",
+    "resource_trace",
+    "argv_manifest",
+    "env_manifest",
+    "execution_manifest",
+  ]) {
+    requireSealedScratchArtifact(
+      states.get(label)!,
+      `cold_scratch_execution_${label}`,
+    );
+  }
+  if (!states.get("stdout")!.bytes.equals(COLD_SCRATCH_STDOUT)) {
+    throw new Error("cold_scratch_execution_stdout_invalid");
+  }
+  if (!states.get("stderr")!.bytes.equals(COLD_SCRATCH_STDERR)) {
+    throw new Error("cold_scratch_execution_stderr_invalid");
+  }
+  if (states.get("resource_trace")!.byteLength === 0) {
+    throw new Error("cold_scratch_execution_resource_trace_empty");
+  }
+
+  const expectedEnv = new Map([
+    ["HOME", "/var/empty"],
+    ["LANG", "C"],
+    ["LC_ALL", "C"],
+    ["PATH", `${dirname(monitorPython.path)}:/usr/bin:/bin`],
+    ["TMPDIR", "/private/var/tmp"],
+  ]);
+  const expectedArgvSha256 = scratchArgvSha256([
+    command.path,
+    "--root",
+    sourceSnapshotRoot,
+  ]);
+  const expectedEnvSha256 = scratchEnvSha256(expectedEnv);
+  if (rows.get("command_argv_sha256") !== expectedArgvSha256 ||
+      rows.get("target_env_requested_sha256") !== expectedEnvSha256 ||
+      rows.get("memory_limit_bytes") !== COLD_SCRATCH_MEMORY_LIMIT_BYTES ||
+      rows.get("formal_command_identity_status") !== "required_verified") {
+    throw new Error("cold_scratch_execution_authority_invalid");
+  }
+  validateScratchArgvManifest(
+    states.get("argv_manifest")!,
+    [command.path, "--root", sourceSnapshotRoot],
+  );
+  validateScratchEnvManifest(
+    states.get("env_manifest")!,
+    expectedEnv,
+  );
+  validateScratchExecutionManifest(
+    states.get("execution_manifest")!,
+    new Map([
+      ["command", command],
+      ["monitor_runtime", states.get("monitor_runtime")!],
+      ["monitor_python", monitorPython],
+    ]),
+    new Map([
+      ["report", states.get("guard_report")!],
+      ["stdout", states.get("stdout")!],
+      ["stderr", states.get("stderr")!],
+      ["resource_trace", states.get("resource_trace")!],
+    ]),
+  );
+
+  const guardReport = states.get("guard_report")!;
+  const guardRows = parseUniqueKv(
+    guardReport,
+    "cold_scratch_guard_report",
+  );
+  const enforcedPeak = exactCanonicalUint(
+    requiredRow(
+      guardRows,
+      "process_tree_enforced_peak_bytes",
+      "cold_scratch_guard_report",
+    ),
+    "cold_scratch_guard_report_peak",
+  );
+  if (enforcedPeak > BigInt(COLD_SCRATCH_MEMORY_LIMIT_BYTES) ||
+      guardRows.get("process_tree_escape_pid") !== "0") {
+    throw new Error("cold_scratch_guard_report_memory_invalid");
+  }
+  const expectedGuardRows = new Map<string, string>([
+    ["schema", "beat_c_process_memory_guard"],
+    ["status", "completed"],
+    ["rc", "0"],
+    ["abort_reason", ""],
+    ["expected_exit_code", "0"],
+    ["actual_exit_code", "0"],
+    ["exit_code_contract_status", "verified"],
+    ["memory_guard_mode", "process_tree"],
+    ["memory_limit_bytes", COLD_SCRATCH_MEMORY_LIMIT_BYTES],
+    ["memory_measurement_status", "available"],
+    ["combined_output_limit_status", "within_limit"],
+    ["combined_output_failure_class", ""],
+    ["tracked_output_count", "0"],
+    ["formal_command_identity_status", "required_verified"],
+    ["command_identity_status", "available"],
+    ["command_path", command.path],
+    ["command_sha256", command.sha256],
+    ["command_execution_mode", "private_single_link_snapshot"],
+    ["command_execution_snapshot_sha256", command.sha256],
+    ["command_argv_count", "3"],
+    ["command_argv_sha256", expectedArgvSha256],
+    ["target_env_mode", "exact"],
+    ["target_env_requested_count", String(expectedEnv.size)],
+    ["target_env_requested_sha256", expectedEnvSha256],
+    ["monitor_python_path", monitorPython.path],
+    ["monitor_python_sha256", monitorPython.sha256],
+    ["monitor_runtime_script_path", states.get("monitor_runtime")!.path],
+    ["monitor_runtime_script_sha256", states.get("monitor_runtime")!.sha256],
+    [
+      "monitor_runtime_script_invocation_status",
+      "verified_o_nofollow_loader_fd9",
+    ],
+    ["monitor_runtime_script_expected_sha_match", "1"],
+    ["output_path_history_status", "verified_clean"],
+    ["report_path", guardReport.path],
+  ]);
+  for (const label of ["stdout", "stderr", "resource_trace"] as const) {
+    const state = states.get(label)!;
+    expectedGuardRows.set(`${label}_status`, "available");
+    expectedGuardRows.set(`${label}_path`, state.path);
+    expectedGuardRows.set(`${label}_sha256`, state.sha256);
+    expectedGuardRows.set(`${label}_size`, String(state.byteLength));
+  }
+  for (const [key, expected] of expectedGuardRows) {
+    if (guardRows.get(key) !== expected) {
+      throw new Error(`cold_scratch_guard_report_binding_invalid:${key}`);
+    }
+  }
+  for (const label of ["report", "stdout", "stderr", "resource_trace"]) {
+    const state = label === "report"
+      ? guardReport
+      : states.get(label)!;
+    for (const [suffix, expected] of [
+      ["device", state.device],
+      ["inode", state.inode],
+    ] as const) {
+      if (guardRows.get(`${label}_${suffix}`) !== expected) {
+        throw new Error(
+          `cold_scratch_guard_report_artifact_identity_invalid:` +
+          `${label}_${suffix}`,
+        );
+      }
+    }
+  }
+
+  return {
+    receipt,
+    files: [
+      receipt,
+      ...states.values(),
+      command,
+    ],
+    multiLinkFiles: [monitorPython],
+    snapshotFiles: sourceSnapshot.files,
+    snapshotDirectories: sourceSnapshot.directories,
+  };
+}
+
 export function validateOfficialCurrentBuildBindingClosure(
   bindingPathRaw: string,
   expectedOfficialBuildReceiptRaw: string,
@@ -448,6 +1678,11 @@ export function validateOfficialCurrentBuildBindingClosure(
     officialBuildReceipt,
     "official_current_build_receipt",
     OFFICIAL_BUILD_RECEIPT_KEYS,
+  );
+  requireExactKeyOrder(
+    officialBuildRows,
+    OFFICIAL_BUILD_RECEIPT_KEY_ORDER,
+    "official_current_build_receipt",
   );
   requireHeader(
     officialBuildRows,
@@ -501,6 +1736,27 @@ export function validateOfficialCurrentBuildBindingClosure(
       !manifestBefore.bytes.equals(manifestAfter.bytes)) {
     throw new Error("official_current_source_manifest_drift");
   }
+
+  const workspaceRoot = dirname(dirname(dirname(expectedOfficialDriver)));
+  if (expectedOfficialDriver !==
+      join(workspaceRoot, "artifacts/backend_driver/cheng")) {
+    throw new Error("official_current_workspace_layout_invalid");
+  }
+  const coldScratchExecutionReceiptPath = decodeFsHexPath(
+    officialBuildRows,
+    "cold_scratch_execution_receipt_path_fshex",
+    "official_current_build_receipt",
+  );
+  const coldScratchExecution = validateColdScratchExecutionReceipt(
+    coldScratchExecutionReceiptPath,
+    requiredSha(
+      officialBuildRows,
+      "cold_scratch_execution_receipt_sha256",
+      "official_current_build_receipt",
+    ),
+    workspaceRoot,
+    manifestBefore,
+  );
 
   const installReceiptPath = decodeFsHexPath(
     officialBuildRows,
@@ -744,6 +2000,9 @@ export function validateOfficialCurrentBuildBindingClosure(
   const finalFiles = [
     [binding, "official_current_build_binding"],
     [officialBuildReceipt, "official_current_build_receipt"],
+    ...coldScratchExecution.files.map((file, index) =>
+      [file, `official_current_cold_scratch_${index}`] as const
+    ),
     [manifestBefore, "official_source_manifest_before"],
     [manifestAfter, "official_source_manifest_after"],
     [installReceipt, "official_current_install_receipt"],
@@ -759,6 +2018,40 @@ export function validateOfficialCurrentBuildBindingClosure(
       stableRegularFile(before.path, label, true),
     )) {
       throw new Error(`${label}_drift`);
+    }
+  }
+  for (const before of coldScratchExecution.multiLinkFiles) {
+    if (!sameFileIdentity(
+      before,
+      stableRegularFile(
+        before.path,
+        "official_current_cold_scratch_multilink",
+      ),
+    )) {
+      throw new Error("official_current_cold_scratch_multilink_drift");
+    }
+  }
+  for (const before of coldScratchExecution.snapshotFiles) {
+    if (!sameFileSeal(
+      before,
+      stableRegularFileSeal(
+        before.path,
+        "official_current_cold_scratch_snapshot_file",
+        true,
+      ),
+    )) {
+      throw new Error("official_current_cold_scratch_snapshot_file_drift");
+    }
+  }
+  for (const before of coldScratchExecution.snapshotDirectories) {
+    if (!sameDirectoryIdentity(
+      before,
+      stableSnapshotDirectory(
+        before.path,
+        [before.uid, before.gid],
+      ),
+    )) {
+      throw new Error("official_current_cold_scratch_snapshot_directory_drift");
     }
   }
   return {

@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Materialize and verify a frozen compiler/source tree from a formal archive."""
+
+import argparse
+import hashlib
+import os
+import pathlib
+import stat
+import struct
+
+
+MAGIC = b"cheng.riscv_isa.source_archive.v1\0"
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit("riscv_isa_formal_source_tree_error=" + message)
+
+
+def canonical_relative(raw: bytes) -> pathlib.PurePosixPath:
+    if not raw or raw.startswith(b"/") or b"\0" in raw:
+        fail("archive_path_invalid")
+    parts = raw.split(b"/")
+    if any(part in (b"", b".", b"..") for part in parts):
+        fail("archive_path_component_invalid")
+    return pathlib.PurePosixPath(os.fsdecode(raw))
+
+
+def stable_bytes(path: pathlib.Path) -> bytes:
+    text = str(path)
+    if (
+        not path.is_absolute()
+        or os.path.normpath(text) != text
+        or os.path.realpath(text) != text
+    ):
+        fail("input_not_canonical")
+    before = path.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_nlink != 1
+    ):
+        fail("input_not_single_regular")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        closed = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = path.lstat()
+    fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+    identities = [tuple(int(getattr(info, field)) for field in fields) for info in (before, opened, closed, after)]
+    if len(set(identities)) != 1:
+        fail("input_identity_drift")
+    raw = b"".join(chunks)
+    if len(raw) != before.st_size:
+        fail("input_short_read")
+    return raw
+
+
+def parse_archive(path: pathlib.Path) -> tuple[bytes, list[tuple[bytes, int, bytes]]]:
+    raw = stable_bytes(path)
+    if len(raw) < len(MAGIC) + 4 + 32 or not raw.startswith(MAGIC):
+        fail("archive_header_invalid")
+    if hashlib.sha256(raw[:-32]).digest() != raw[-32:]:
+        fail("archive_payload_sha256_invalid")
+    offset = len(MAGIC)
+    count = struct.unpack_from(">I", raw, offset)[0]
+    offset += 4
+    entries = []
+    prior = b""
+    for _index in range(count):
+        if offset + 4 > len(raw) - 32:
+            fail("archive_truncated")
+        path_size = struct.unpack_from(">I", raw, offset)[0]
+        offset += 4
+        if offset + path_size + 41 > len(raw) - 32:
+            fail("archive_member_truncated")
+        relative = raw[offset:offset + path_size]
+        offset += path_size
+        canonical_relative(relative)
+        if prior and relative <= prior:
+            fail("archive_member_order_invalid")
+        prior = relative
+        executable, size = struct.unpack_from(">BQ", raw, offset)
+        offset += 9
+        digest = raw[offset:offset + 32]
+        offset += 32
+        if executable not in (0, 1) or offset + size > len(raw) - 32:
+            fail("archive_member_shape_invalid")
+        payload = raw[offset:offset + size]
+        offset += size
+        if hashlib.sha256(payload).digest() != digest:
+            fail("archive_member_sha256_invalid")
+        entries.append((relative, executable, payload))
+    if offset != len(raw) - 32:
+        fail("archive_trailing_bytes")
+    return raw, entries
+
+
+def canonical_new_tree(path_text: str) -> pathlib.Path:
+    path = pathlib.Path(path_text)
+    if (
+        not path.is_absolute()
+        or os.path.normpath(path_text) != path_text
+        or os.path.realpath(str(path.parent)) != str(path.parent)
+        or path.exists()
+        or path.is_symlink()
+    ):
+        fail("tree_output_not_canonical_absent")
+    return path
+
+
+def extract(archive: pathlib.Path, tree_text: str) -> None:
+    _raw, entries = parse_archive(archive)
+    tree = canonical_new_tree(tree_text)
+    tree.mkdir(mode=0o700)
+    directories = {tree}
+    for relative, executable, payload in entries:
+        target = tree / canonical_relative(relative)
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        current = target.parent
+        while current != tree.parent:
+            directories.add(current)
+            if current == tree:
+                break
+            current = current.parent
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    fail("tree_member_short_write")
+                offset += written
+            os.fsync(descriptor)
+            os.fchmod(descriptor, 0o555 if executable else 0o444)
+        finally:
+            os.close(descriptor)
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        os.chmod(directory, 0o555, follow_symlinks=False)
+    print("riscv_isa_formal_source_tree_status=extracted")
+
+
+def command_specs(values: list[str]) -> dict[bytes, str]:
+    commands = {}
+    for value in values:
+        if "=" not in value:
+            fail("command_spec_invalid")
+        relative_text, digest = value.split("=", 1)
+        relative = os.fsencode(relative_text)
+        canonical_relative(relative)
+        if relative in commands or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            fail("command_spec_identity_invalid")
+        commands[relative] = digest
+    return commands
+
+
+def write_fd(path: str, raw: bytes) -> None:
+    if not path.startswith("/dev/fd/") or not path[8:].isdigit():
+        fail("receipt_output_not_fd")
+    descriptor = int(path[8:])
+    if descriptor < 10 or descriptor > 63:
+        fail("receipt_output_fd_invalid")
+    offset = 0
+    while offset < len(raw):
+        written = os.write(descriptor, raw[offset:])
+        if written <= 0:
+            fail("receipt_short_write")
+        offset += written
+    os.fsync(descriptor)
+
+
+def verify(archive: pathlib.Path, tree_text: str, specs: list[str], receipt_output: str) -> None:
+    archive_raw, entries = parse_archive(archive)
+    tree = pathlib.Path(tree_text)
+    if (
+        not tree.is_absolute()
+        or os.path.normpath(tree_text) != tree_text
+        or os.path.realpath(tree_text) != tree_text
+    ):
+        fail("tree_not_canonical")
+    commands = command_specs(specs)
+    expected = {relative: (executable, payload) for relative, executable, payload in entries}
+    if set(expected).intersection(commands):
+        fail("command_source_collision")
+    actual_files = {}
+    actual_directories = set()
+    for directory, directory_names, file_names in os.walk(tree, topdown=True, followlinks=False):
+        directory_names.sort(key=os.fsencode)
+        file_names.sort(key=os.fsencode)
+        directory_path = pathlib.Path(directory)
+        info = directory_path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o555:
+            fail("tree_directory_invalid")
+        if hasattr(os, "listxattr") and os.listxattr(directory_path):
+            fail("tree_directory_xattr")
+        actual_directories.add(os.fsencode(os.path.relpath(directory_path, tree).replace(os.sep, "/")))
+        for name in directory_names:
+            child = directory_path / name
+            if child.is_symlink() or not child.is_dir():
+                fail("tree_child_directory_invalid")
+        for name in file_names:
+            path = directory_path / name
+            relative = os.fsencode(os.path.relpath(path, tree).replace(os.sep, "/"))
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_nlink != 1:
+                fail("tree_file_invalid")
+            if hasattr(os, "listxattr") and os.listxattr(path):
+                fail("tree_file_xattr")
+            actual_files[relative] = (info, stable_bytes(path))
+    if set(actual_files) != set(expected).union(commands):
+        fail("tree_file_set_mismatch")
+    expected_directories = {b"."}
+    for relative in actual_files:
+        parts = relative.split(b"/")[:-1]
+        for count in range(1, len(parts) + 1):
+            expected_directories.add(b"/".join(parts[:count]))
+    if actual_directories != expected_directories:
+        fail("tree_directory_set_mismatch")
+    closure = hashlib.sha256(b"cheng.riscv_isa.verified_source_tree.v1")
+    source_bytes = 0
+    for relative in sorted(actual_files):
+        info, payload = actual_files[relative]
+        if relative in expected:
+            executable, wanted = expected[relative]
+            if payload != wanted or stat.S_IMODE(info.st_mode) != (0o555 if executable else 0o444):
+                fail("tree_source_member_mismatch")
+            source_bytes += len(payload)
+        else:
+            if hashlib.sha256(payload).hexdigest() != commands[relative] or stat.S_IMODE(info.st_mode) != 0o555:
+                fail("tree_command_member_mismatch")
+        closure.update(struct.pack(">I", len(relative)))
+        closure.update(relative)
+        closure.update(struct.pack(">IQ", stat.S_IMODE(info.st_mode), len(payload)))
+        closure.update(hashlib.sha256(payload).digest())
+    rows = [
+        "schema=cheng.riscv_isa.formal_source_tree.v1",
+        "status=VERIFIED",
+        "archive_sha256=" + hashlib.sha256(archive_raw).hexdigest(),
+        "source_file_count=" + str(len(entries)),
+        "source_bytes=" + str(source_bytes),
+        "command_count=" + str(len(commands)),
+        "verified_tree_sha256=" + closure.hexdigest(),
+    ]
+    payload = ("\n".join(rows) + "\n").encode("utf-8")
+    rows.append("receipt_payload_sha256=" + hashlib.sha256(payload).hexdigest())
+    write_fd(receipt_output, ("\n".join(rows) + "\n").encode("utf-8"))
+    print("riscv_isa_formal_source_tree_status=verified")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+    extract_parser = subparsers.add_parser("extract")
+    extract_parser.add_argument("--archive", required=True)
+    extract_parser.add_argument("--tree", required=True)
+    verify_parser = subparsers.add_parser("verify")
+    verify_parser.add_argument("--archive", required=True)
+    verify_parser.add_argument("--tree", required=True)
+    verify_parser.add_argument("--command", action="append", default=[])
+    verify_parser.add_argument("--receipt-output", required=True)
+    args = parser.parse_args()
+    if args.operation == "extract":
+        extract(pathlib.Path(args.archive), args.tree)
+    else:
+        verify(pathlib.Path(args.archive), args.tree, args.command, args.receipt_output)
+
+
+if __name__ == "__main__":
+    main()

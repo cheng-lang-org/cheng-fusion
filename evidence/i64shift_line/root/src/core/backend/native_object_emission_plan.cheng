@@ -1,0 +1,456 @@
+import std/rawbytes
+import std/result
+import std/strings
+import std/crypto/hash256
+import cheng/std/bytes_layout as layout
+import cheng/core/backend/coff_object_writer
+import cheng/core/backend/codegen_contract as contract
+import cheng/core/backend/codegen_writer_units as wunits
+import cheng/core/backend/direct_object_debug_sections as debugsections
+import cheng/core/backend/elf_object_writer
+import cheng/core/backend/target_matrix as tmat
+import cheng/core/backend/macho_object_writer
+import cheng/core/backend/macho_debug_section_evidence as debugevidence
+import cheng/core/backend/object_relocs as orel
+import cheng/core/backend/object_symbols as osym
+
+type
+    NativeObjectEmissionPlan =
+        targetTriple: str
+        objectFormat: str
+        actualBackendKind: str
+        entrySymbol: str
+        entryFunctionSymbol: str
+        text: rawbytes.Bytes
+        data: rawbytes.Bytes
+        symbols: osym.ObjectSymbolTable
+        relocs: orel.ObjectRelocTable
+        debug: debugsections.DirectObjectDebugSections
+
+    NativeObjectEmissionReceipt =
+        ok: bool
+        objectBytes: rawbytes.Bytes
+        objectSha256: str
+        objectByteCount: int32
+        relocCount: int32
+        error: str
+
+@borrows
+fn nativeObjectEmissionTargetSupported(
+        targetTriple: str,
+        objectFormat: str): bool =
+    if targetTriple == "arm64-apple-darwin" &&
+       objectFormat == "macho":
+        return true
+    if targetTriple == "x86_64-unknown-linux-gnu" &&
+       objectFormat == "elf":
+        return true
+    if (targetTriple == "aarch64-unknown-linux-gnu" ||
+        targetTriple == "arm64-unknown-linux-gnu" ||
+        targetTriple == "aarch64-linux-android" ||
+        targetTriple == "aarch64-linux-ohos" ||
+        targetTriple == "aarch64-unknown-linux-ohos") &&
+       objectFormat == "elf":
+        return true
+    if targetTriple == "x86_64-pc-windows-msvc" &&
+       objectFormat == "coff":
+        return true
+    if tmat.TargetIsRiscvCodegen(targetTriple) &&
+       objectFormat == "elf":
+        return true
+    return false
+
+fn nativeObjectEmissionAlign(value: int64,
+                             alignment: int64): int64 =
+    let remainder = value % alignment
+    if remainder == int64(0):
+        return value
+    return value + alignment - remainder
+
+fn nativeObjectEmissionRelocWidth(
+        kind: orel.ObjectRelocKind): int64 =
+    if kind == orel.ObjectRelocAbs64:
+        return int64(8)
+    if kind == orel.ObjectRelocAbs32 ||
+       kind == orel.ObjectRelocBranch26 ||
+       kind == orel.ObjectRelocPage21 ||
+       kind == orel.ObjectRelocPageOff12 ||
+       kind == orel.ObjectRelocPcRel32 ||
+       kind == orel.ObjectRelocJump26 ||
+       kind == orel.ObjectRelocRiscvCall:
+        return int64(4)
+    return int64(0)
+
+fn nativeObjectEmissionRelocPcRelative(
+        kind: orel.ObjectRelocKind): bool =
+    return kind == orel.ObjectRelocBranch26 ||
+        kind == orel.ObjectRelocPage21 ||
+        kind == orel.ObjectRelocPcRel32 ||
+        kind == orel.ObjectRelocJump26 ||
+        kind == orel.ObjectRelocRiscvCall
+
+fn nativeObjectEmissionRelocRequiresInstructionAlignment(
+        kind: orel.ObjectRelocKind): bool =
+    return kind == orel.ObjectRelocBranch26 ||
+        kind == orel.ObjectRelocPage21 ||
+        kind == orel.ObjectRelocPageOff12 ||
+        kind == orel.ObjectRelocJump26 ||
+        kind == orel.ObjectRelocRiscvCall
+
+fn NativeObjectEmissionByteOffsetBitsetInit(
+        byteLength: int32,
+        seen: var int32[]): bool =
+    setLen(seen, 0)
+    if byteLength < 0:
+        return false
+    var bucketCount = byteLength / 31
+    if byteLength % 31 != 0:
+        bucketCount = bucketCount + 1
+    setLen(seen, bucketCount)
+    for bucketIndex in 0..<seen.len:
+        seen[bucketIndex] = 0
+    return seen.len == bucketCount
+
+fn NativeObjectEmissionByteOffsetBitsetMark(
+        seen: var int32[],
+        byteLength: int32,
+        byteOffset: int64): bool =
+    if byteLength < 0 || byteOffset < int64(0) ||
+       byteOffset >= int64(byteLength):
+        return false
+    let offset = int32(byteOffset)
+    let bucketIndex = offset / 31
+    let bitIndex = offset % 31
+    if bucketIndex < 0 || bucketIndex >= seen.len:
+        return false
+    let mask = 1 << bitIndex
+    if (seen[bucketIndex] & mask) != 0:
+        return false
+    seen[bucketIndex] = seen[bucketIndex] | mask
+    return true
+
+@borrows
+fn nativeObjectEmissionRelocSupported(
+        plan: var NativeObjectEmissionPlan,
+        kind: orel.ObjectRelocKind): bool =
+    if plan.objectFormat == "macho":
+        return kind == orel.ObjectRelocAbs64 ||
+            kind == orel.ObjectRelocBranch26 ||
+            kind == orel.ObjectRelocPage21 ||
+            kind == orel.ObjectRelocPageOff12
+    if plan.objectFormat == "elf" &&
+       plan.targetTriple == "x86_64-unknown-linux-gnu":
+        return kind == orel.ObjectRelocAbs32 ||
+            kind == orel.ObjectRelocAbs64 ||
+            kind == orel.ObjectRelocBranch26 ||
+            kind == orel.ObjectRelocPcRel32
+    if plan.objectFormat == "elf" &&
+       (tmat.TargetIsLinuxRv64(plan.targetTriple) ||
+        tmat.TargetIsRv64Bare(plan.targetTriple)):
+        return kind == orel.ObjectRelocAbs32 ||
+            kind == orel.ObjectRelocAbs64 ||
+            kind == orel.ObjectRelocRiscvCall ||
+            kind == orel.ObjectRelocPage21 ||
+            kind == orel.ObjectRelocPageOff12
+    if plan.objectFormat == "elf" &&
+       tmat.TargetIsRv32(plan.targetTriple):
+        return kind == orel.ObjectRelocAbs32 ||
+            kind == orel.ObjectRelocRiscvCall ||
+            kind == orel.ObjectRelocPage21 ||
+            kind == orel.ObjectRelocPageOff12
+    if plan.objectFormat == "elf":
+        return kind == orel.ObjectRelocAbs32 ||
+            kind == orel.ObjectRelocAbs64 ||
+            kind == orel.ObjectRelocBranch26 ||
+            kind == orel.ObjectRelocPage21 ||
+            kind == orel.ObjectRelocPageOff12 ||
+            kind == orel.ObjectRelocJump26
+    if plan.objectFormat == "coff":
+        return kind == orel.ObjectRelocAbs32 ||
+            kind == orel.ObjectRelocAbs64 ||
+            kind == orel.ObjectRelocBranch26
+    return false
+
+@borrows
+fn nativeObjectEmissionSymbolRangeValid(
+        plan: var NativeObjectEmissionPlan,
+        symbol: osym.ObjectSymbol): bool =
+    if symbol.undefined:
+        return symbol.sectionIndex == -1 &&
+            symbol.global &&
+            symbol.offset == int64(0) &&
+            symbol.size == int64(0)
+    if symbol.offset < int64(0) || symbol.size < int64(0):
+        return false
+    if symbol.sectionIndex == 0:
+        return symbol.offset <= int64(rawbytes.BytesLen(plan.text)) &&
+            symbol.size <=
+                int64(rawbytes.BytesLen(plan.text)) - symbol.offset
+    if symbol.sectionIndex != 1:
+        return false
+    if rawbytes.BytesLen(plan.data) <= 0:
+        return false
+    var dataBase =
+        nativeObjectEmissionAlign(
+            int64(rawbytes.BytesLen(plan.text)), int64(8))
+    if plan.objectFormat == "coff":
+        dataBase = int64(0)
+    if symbol.offset < dataBase:
+        return false
+    let relativeOffset = symbol.offset - dataBase
+    return relativeOffset <= int64(rawbytes.BytesLen(plan.data)) &&
+        symbol.size <=
+            int64(rawbytes.BytesLen(plan.data)) - relativeOffset
+
+@borrows
+fn NativeObjectEmissionPlanValidateInto(
+        plan: var NativeObjectEmissionPlan,
+        outErr: var str): bool =
+    outErr = ""
+    if !nativeObjectEmissionTargetSupported(
+           plan.targetTriple, plan.objectFormat):
+        outErr = "native object emission plan: unsupported target"
+        return false
+    if plan.actualBackendKind != "primary" &&
+       plan.actualBackendKind != "backend2":
+        outErr = "native object emission plan: backend kind invalid"
+        return false
+    if len(plan.entrySymbol) <= 0:
+        outErr = "native object emission plan: entry symbol empty"
+        return false
+    if len(plan.entryFunctionSymbol) <= 0:
+        outErr = "native object emission plan: entry function symbol empty"
+        return false
+    if rawbytes.BytesLen(plan.text) <= 0:
+        outErr = "native object emission plan: text empty"
+        return false
+    if plan.symbols.items.len <= 0:
+        outErr = "native object emission plan: symbols empty"
+        return false
+    var entryFunctionSeen = false
+    for symbolIndex in 0..<plan.symbols.items.len:
+        let symbol = plan.symbols.items[symbolIndex]
+        if len(symbol.name) <= 0 ||
+           !nativeObjectEmissionSymbolRangeValid(plan, symbol):
+            outErr = "native object emission plan: symbol invalid"
+            return false
+        for previousIndex in 0..<symbolIndex:
+            if plan.symbols.items[previousIndex].name == symbol.name:
+                outErr = "native object emission plan: duplicate symbol"
+                return false
+        if symbol.name == plan.entryFunctionSymbol &&
+           !symbol.undefined && symbol.sectionIndex == 0 &&
+           symbol.global:
+            entryFunctionSeen = true
+    if !entryFunctionSeen:
+        outErr = "native object emission plan: entry function missing"
+        return false
+    var relocOffsetsSeen: int32[]
+    if !NativeObjectEmissionByteOffsetBitsetInit(
+           rawbytes.BytesLen(plan.text), relocOffsetsSeen):
+        outErr = "native object emission plan: relocation index invalid"
+        return false
+    for relocIndex in 0..<plan.relocs.items.len:
+        let reloc = plan.relocs.items[relocIndex]
+        let width = nativeObjectEmissionRelocWidth(reloc.kind)
+        let sectionLength = int64(rawbytes.BytesLen(plan.text))
+        if reloc.sectionIndex != 0:
+            outErr = "native object emission plan: relocation section invalid"
+            return false
+        if !nativeObjectEmissionRelocSupported(plan, reloc.kind) ||
+           width <= int64(0) || reloc.offset < int64(0) ||
+           reloc.offset > sectionLength - width ||
+           reloc.symbolIndex < 0 ||
+           reloc.symbolIndex >= plan.symbols.items.len ||
+           reloc.pcRelative !=
+               nativeObjectEmissionRelocPcRelative(reloc.kind) ||
+           (nativeObjectEmissionRelocRequiresInstructionAlignment(
+                reloc.kind) &&
+            reloc.offset % int64(4) != int64(0)) ||
+           ((plan.objectFormat == "macho" ||
+             plan.objectFormat == "coff") &&
+            reloc.addend != int64(0)):
+            outErr = "native object emission plan: relocation invalid"
+            return false
+        if !NativeObjectEmissionByteOffsetBitsetMark(
+               relocOffsetsSeen,
+               rawbytes.BytesLen(plan.text), reloc.offset):
+            outErr =
+                "native object emission plan: duplicate relocation"
+            return false
+    if !plan.debug.valid:
+        if rawbytes.BytesLen(plan.debug.debugLine) != 0 ||
+           rawbytes.BytesLen(plan.debug.debugInfo) != 0 ||
+           rawbytes.BytesLen(plan.debug.debugAbbrev) != 0 ||
+           plan.debug.relocations.len != 0 ||
+           layout.FixedBytes32Hex(plan.debug.sourceReceiptCid) !=
+               "0000000000000000000000000000000000000000000000000000000000000000":
+            outErr = "native object emission plan: disabled debug payload present"
+            return false
+        return true
+    if plan.objectFormat != "macho" ||
+       rawbytes.BytesLen(plan.debug.debugLine) <= 0 ||
+       rawbytes.BytesLen(plan.debug.debugInfo) <= 0 ||
+       rawbytes.BytesLen(plan.debug.debugAbbrev) <= 0 ||
+       layout.FixedBytes32Hex(plan.debug.sourceReceiptCid) ==
+           "0000000000000000000000000000000000000000000000000000000000000000":
+        outErr = "native object emission plan: debug payload invalid"
+        return false
+    var debugLineOffsetsSeen: int32[]
+    var debugInfoOffsetsSeen: int32[]
+    if !NativeObjectEmissionByteOffsetBitsetInit(
+           rawbytes.BytesLen(plan.debug.debugLine),
+           debugLineOffsetsSeen) ||
+       !NativeObjectEmissionByteOffsetBitsetInit(
+           rawbytes.BytesLen(plan.debug.debugInfo),
+           debugInfoOffsetsSeen):
+        outErr =
+            "native object emission plan: debug relocation index invalid"
+        return false
+    for debugRelocIndex in 0..<plan.debug.relocations.len:
+        let debugReloc = plan.debug.relocations[debugRelocIndex]
+        var debugSectionLength: int32
+        if debugReloc.sectionKind == 1:
+            debugSectionLength = rawbytes.BytesLen(plan.debug.debugLine)
+        elif debugReloc.sectionKind == 2:
+            debugSectionLength = rawbytes.BytesLen(plan.debug.debugInfo)
+        else:
+            outErr = "native object emission plan: debug relocation section invalid"
+            return false
+        if debugReloc.sectionByteOffset < 0 ||
+           debugReloc.sectionByteOffset > debugSectionLength - 8 ||
+           debugReloc.targetSymbolIndex < 0 ||
+           debugReloc.targetSymbolIndex >= plan.symbols.items.len ||
+           debugReloc.targetAddend < 0:
+            outErr = "native object emission plan: debug relocation invalid"
+            return false
+        var debugOffsetUnique: bool
+        if debugReloc.sectionKind == 1:
+            debugOffsetUnique =
+                NativeObjectEmissionByteOffsetBitsetMark(
+                    debugLineOffsetsSeen,
+                    rawbytes.BytesLen(plan.debug.debugLine),
+                    int64(debugReloc.sectionByteOffset))
+        else:
+            debugOffsetUnique =
+                NativeObjectEmissionByteOffsetBitsetMark(
+                    debugInfoOffsetsSeen,
+                    rawbytes.BytesLen(plan.debug.debugInfo),
+                    int64(debugReloc.sectionByteOffset))
+        if !debugOffsetUnique:
+            outErr =
+                "native object emission plan: duplicate debug relocation"
+            return false
+        let target =
+            plan.symbols.items[debugReloc.targetSymbolIndex]
+        if target.undefined || target.sectionIndex != 0 ||
+           target.name != debugReloc.targetSymbolName ||
+           target.offset > int64(2147483647) ||
+           target.size > int64(2147483647) ||
+           debugReloc.targetAddend > int32(target.size) ||
+           debugReloc.targetTextByteStart !=
+               int32(target.offset) + debugReloc.targetAddend:
+            outErr = "native object emission plan: debug target mismatch"
+            return false
+    return true
+
+@borrows
+fn NativeObjectEmissionPlanEmitInto(
+        plan: var NativeObjectEmissionPlan,
+        out: var NativeObjectEmissionReceipt): bool =
+    NativeObjectEmissionReceiptRelease(out)
+    out = NativeObjectEmissionReceipt()
+    var validateErr: str
+    if !NativeObjectEmissionPlanValidateInto(plan, validateErr):
+        out.error = validateErr
+        return false
+    var bytesResult: Result[rawbytes.Bytes]
+    if plan.objectFormat == "macho":
+        if plan.debug.valid:
+            bytesResult =
+                macho_object_writer.MachOTextDataDebugObjectBytes(
+                    plan.text,
+                    plan.data,
+                    plan.symbols,
+                    plan.relocs,
+                    plan.debug)
+        else:
+            bytesResult =
+                macho_object_writer.MachOTextDataObjectBytes(
+                    plan.text,
+                    plan.data,
+                    plan.symbols,
+                    plan.relocs)
+    elif plan.objectFormat == "elf":
+        let tripleOwned = strings.CloneStr(plan.targetTriple)
+        let writerUnit = contract.CodegenElfTextDataWriterUnit(tripleOwned)
+        if writerUnit != contract.CodegenUnitInvalid:
+            bytesResult =
+                wunits.CodegenWriterUnitTextDataObjectBytes(
+                    writerUnit,
+                    plan.text,
+                    plan.data,
+                    plan.symbols,
+                    plan.relocs)
+        else:
+            bytesResult =
+                elf_object_writer.ElfTextDataObjectBytes(
+                    plan.text,
+                    plan.data,
+                    plan.symbols,
+                    plan.relocs)
+    elif plan.objectFormat == "coff":
+        bytesResult =
+            coff_object_writer.CoffTextDataObjectBytes(
+                plan.text,
+                plan.data,
+                plan.symbols,
+                plan.relocs)
+    else:
+        out.error = "native object emission plan: writer unavailable"
+        return false
+    if !bytesResult.ok:
+        out.error = bytesResult.err.msg
+        return false
+    out.objectBytes = bytesResult.value
+    if plan.debug.valid:
+        var parsed: debugevidence.MachODebugSectionEvidence
+        var debugErr: str
+        if !debugevidence.MachODebugSectionEvidenceBuildInto(
+               out.objectBytes,
+               plan.debug,
+               plan.symbols,
+               parsed,
+               debugErr):
+            rawbytes.BytesFree(out.objectBytes)
+            out.objectBytes = rawbytes.Bytes()
+            out.error = debugErr
+            return false
+    out.objectByteCount = rawbytes.BytesLen(out.objectBytes)
+    if out.objectByteCount <= 0:
+        rawbytes.BytesFree(out.objectBytes)
+        out.objectBytes = rawbytes.Bytes()
+        out.error = "native object emission plan: writer returned empty object"
+        return false
+    out.objectSha256 =
+        strings.ConcatStr(
+            "sha256:",
+            layout.FixedBytes32Hex(
+                hash256.Sha256Fixed(
+                    layout.ByteSpanFromBytes(out.objectBytes))))
+    out.relocCount =
+        plan.relocs.items.len + plan.debug.relocations.len
+    out.ok = true
+    return true
+
+fn NativeObjectEmissionPlanRelease(
+        plan: var NativeObjectEmissionPlan) =
+    rawbytes.BytesFree(plan.text)
+    rawbytes.BytesFree(plan.data)
+    debugsections.DirectObjectDebugSectionsRelease(plan.debug)
+    plan = NativeObjectEmissionPlan()
+
+fn NativeObjectEmissionReceiptRelease(
+        receipt: var NativeObjectEmissionReceipt) =
+    rawbytes.BytesFree(receipt.objectBytes)
+    receipt = NativeObjectEmissionReceipt()

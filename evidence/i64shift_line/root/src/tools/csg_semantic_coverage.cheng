@@ -1,0 +1,568 @@
+# csg_semantic_coverage.cheng - M8 探针: 胡广生深度域纯 Cheng RANSAC
+# 仿射平面拟合, 量化「语义覆盖率」(背景可被 N 个平面解释的像素占比)。
+#
+# 方法定调 (task_m8_semantic_coverage.md):
+# - MiDaS 深度是相对深度 (无绝对尺度/内参), 3D 反投影不可行; 但图像域的物理
+#   平面在相对深度域仍是仿射函数 d = a*x + b*y + c (3 参数), RANSAC 拟合此
+#   模型即可, 无需内参。内点 = 支持该平面的像素。
+# - 输入: v2 深度产线 f4 npy (256x128 C-order, header 128B), 按 manifest
+#   量化公式 u8 = round((d - min) / (max - min) * 255) 折到 u8 域后在 u8
+#   域做 RANSAC (阈值单位 = u8 级, 默认 12, LSB = 4.674 深度单位)。
+# - 流程: LCG(固定种子) 采样 3 像素 -> 解 d=a*x+b*y+c -> 全图内点计数 ->
+#   最优模型剥离内点, K 上限 16, 覆盖率增量 < 0.5% 提前停。
+# - 对拍环 (M8a): ffmpeg 已将原视频按 10fps + scale=128:256 抽成 raw rgb24
+#   (与深度帧逐像素同构)。背景 (高置信平面内点) 重建 = 常数平面深度 + 原帧
+#   像素纹理 (构造上背景像素与原帧逐位一致, RGB 域 MAD 恒为 0); 真正的判别
+#   度量是前景剩余占比及空间连通性 + 背景深度域残差 MAD。分割叠原帧
+#   (背景标绿/前景标红) 落 BMP, sips 转 PNG 人工可检。
+#
+# 用法: csg_semantic_coverage.exe [threshU8] [iters] [depthDir] [refRgbPath]
+#              [outDir] [mode]   (默认 12 256 <胡广生缺省> <缺省> <缺省> npy)
+# mode: npy = DepthDir/depth_XXXXXX.npy (f4 npy, manifest 量化公式, 胡广生路径)
+#       raw = DepthDir/depth_XXXXXX.raw (32768B 裸 u8 平面帧, BITEXACT, journey
+#             路径: ffmpeg qp0 解码, 无量化公式)
+# 运行 cwd 必须是仓库根 (相对路径读 artifacts/)。
+import std/os
+import std/bytes
+import std/rawbytes
+import std/strings
+import std/cmdline
+import std/result
+
+const
+    FrameW = 128
+    FrameH = 256
+    Npx = 32768
+    NpyBytes = 131200
+    MaxPlanes = 16
+    DefThresh = 12
+    DefIters = 256
+    DefDepthDir = "artifacts/csg_asset_pipeline/huguangsheng/v2/run10fps"
+    DefOutDir = "artifacts/csg_asset_pipeline/huguangsheng/semcov"
+    DefRefRgbPath = "artifacts/csg_asset_pipeline/huguangsheng/semcov/ref_frames/ref_10fps.rgb"
+    QuantMin = 30.90658950805664
+    QuantMax = 1222.69677734375
+
+# 评估帧: npy 模式 (胡广生 225 帧) 取 0/75/150/224; raw 模式 (journey 600 帧)
+# 取 0/150/300/599。
+fn frameAt(fi: int32, rawMode: bool): int32 =
+    if rawMode:
+        if fi == 0:
+            return 0
+        if fi == 1:
+            return 150
+        if fi == 2:
+            return 300
+        return 599
+    if fi == 0:
+        return 0
+    if fi == 1:
+        return 75
+    if fi == 2:
+        return 150
+    return 224
+
+fn padNum(v: int32): str =
+    if v < 10:
+        return "00000" + strings.IntToStr(v)
+    if v < 100:
+        return "0000" + strings.IntToStr(v)
+    return "000" + strings.IntToStr(v)
+
+fn clampU8(v: int32): int32 =
+    if v < 0:
+        return 0
+    if v > 255:
+        return 255
+    return v
+
+fn fabsF(v: float64): float64 =
+    if v < 0.0:
+        return 0.0 - v
+    return v
+
+# f32 位模式 -> float64, 纯整数位运算实现。
+# 注意: std/system.BitsToF32 在本树是恒返 0 的 stub, 不可用; 资产深度域
+# (30..1223) 不含 Inf/NaN/非规格化, e==255 显式拒绝, e==0 按非规格化处理。
+# 2^e 用 ±1 步进循环 (|e| <= 149)。
+fn f32bitsToF64(bits: int32, outV: var float64): bool =
+    let s: int32 = (bits >> 31) & 1
+    let e: int32 = (bits >> 23) & 255
+    let m: int32 = bits & 8388607
+    if e == 255:
+        return false
+    var mant: float64 = 1.0
+    var expo: int32 = e - 127
+    if e == 0:
+        mant = float64(m) / 8388608.0
+        expo = -126
+    else:
+        mant = 1.0 + float64(m) / 8388608.0
+    var p: float64 = 1.0
+    var k: int32 = expo
+    while k > 0:
+        p = p * 2.0
+        k = k - 1
+    while k < 0:
+        p = p / 2.0
+        k = k + 1
+    var v: float64 = mant * p
+    if s == 1:
+        v = 0.0 - v
+    outV = v
+    return true
+
+# LCG: x = (x * 1664525 + 1013904223) mod 2^32, 在 int64 域运算后掩码,
+# 乘积 <= 2^32 * 1664525 < 2^63 不溢出。返回 0..32767 像素索引。
+fn lcgNext15(state: var int64): int32 =
+    state = (state * int64(1664525) + int64(1013904223)) & int64(4294967295)
+    return int32((state >> 8) & int64(32767))
+
+# 定点格式化: v*1000 四舍五入 -> "-12.345"。
+fn fmtFixed(v: float64): str =
+    var scaled: int64 = 0
+    if v >= 0.0:
+        scaled = int64(v * 1000.0 + 0.5)
+    else:
+        scaled = int64(0.0 - v * 1000.0 + 0.5)
+    var sign: str = ""
+    if v < 0.0:
+        sign = "-"
+    let intPart: int32 = int32(scaled / int64(1000))
+    let frac: int32 = int32(scaled % int64(1000))
+    var fracStr: str = strings.IntToStr(frac)
+    if frac < 10:
+        fracStr = "00" + fracStr
+    elif frac < 100:
+        fracStr = "0" + fracStr
+    return sign + strings.IntToStr(intPart) + "." + fracStr
+
+# frac (0..1) -> "12.34"
+fn fmtPct(frac: float64): str =
+    return fmtFixed(frac * 100.0)
+
+# 严格十进制解析 (防呆, 不静默截断)。
+fn parseStrict(s: str, outV: var int32): bool =
+    outV = 0
+    let n: int32 = strings.Len(s)
+    if n <= 0 || n > 9:
+        return false
+    var i: int32 = 0
+    while i < n:
+        let c: char = s[i]
+        if c < '0' || c > '9':
+            return false
+        outV = outV * 10 + (int32(c) - int32('0'))
+        i = i + 1
+    return outV > 0
+
+# 读单帧 f4 npy -> 校验头 -> manifest 公式量化到 u8 (存 int32)。
+@borrows
+fn loadFrameU8(path: str, d8: var int32[]): bool =
+    var buf: bytes.ByteBuffer = bytes.ReadFileBytes(path)
+    defer:
+        bytes.FreeByteBuffer(buf)
+    if buf.len != NpyBytes:
+        return false
+    if bytes.BufByteAt(buf, 0) != 0x93 || bytes.BufByteAt(buf, 1) != int32('N') ||
+       bytes.BufByteAt(buf, 2) != int32('U') || bytes.BufByteAt(buf, 3) != int32('M') ||
+       bytes.BufByteAt(buf, 4) != int32('P') || bytes.BufByteAt(buf, 5) != int32('Y'):
+        return false
+    if bytes.BufByteAt(buf, 6) != 1 || bytes.BufByteAt(buf, 7) != 0:
+        return false
+    if bytes.ReadU16LEAt(buf, 8) != 118:
+        return false
+    let invRange: float64 = 255.0 / (QuantMax - QuantMin)
+    var i: int32 = 0
+    while i < Npx:
+        let bits: int32 = bytes.ReadU32LEAt(buf, 128 + i * 4)
+        var d: float64 = 0.0
+        if !f32bitsToF64(bits, d):
+            return false
+        d8[i] = clampU8(int32((d - QuantMin) * invRange + 0.5))
+        i = i + 1
+    return true
+
+# 读单帧裸 u8 平面 (32KB, ffmpeg qp0 解码, BITEXACT) -> 直接存 int32。
+# journey 帧为横图 256x128 经 transpose=1 预处理成竖向 128x256 排布, 与探针
+# 网格同构 (纯旋转 = 正交变换, 仿射平面拟合/4-连通/覆盖率数学等价)。
+@borrows
+fn loadFrameRaw(path: str, d8: var int32[]): bool =
+    var buf: bytes.ByteBuffer = bytes.ReadFileBytes(path)
+    defer:
+        bytes.FreeByteBuffer(buf)
+    if buf.len != Npx:
+        return false
+    var i: int32 = 0
+    while i < Npx:
+        d8[i] = bytes.BufByteAt(buf, i)
+        i = i + 1
+    return true
+
+# 解 3 点仿射平面 d = a*x + b*y + c。像素网格上 denom 为整数, 非零则
+# |denom| >= 1, < 0.5 即共线退化, 显式拒绝。
+@borrows
+fn solvePlane(x1: int32, y1: int32, d1: int32,
+              x2: int32, y2: int32, d2: int32,
+              x3: int32, y3: int32, d3: int32,
+              oa: var float64, ob: var float64, oc: var float64): bool =
+    let den: float64 = float64((x3 - x1) * (y2 - y1) - (x2 - x1) * (y3 - y1))
+    if fabsF(den) < 0.5:
+        return false
+    let dy21: float64 = float64(d2 - d1)
+    let dy31: float64 = float64(d3 - d1)
+    let dx21: float64 = float64(x2 - x1)
+    let dx31: float64 = float64(x3 - x1)
+    let dy21i: float64 = float64(y2 - y1)
+    let dy31i: float64 = float64(y3 - y1)
+    let a: float64 = (dy31 * dy21i - dy21 * dy31i) / den
+    let b: float64 = (dy21 * dx31 - dy31 * dx21) / den
+    oa = a
+    ob = b
+    oc = float64(d1) - a * float64(x1) - b * float64(y1)
+    return true
+
+# 单帧多平面 RANSAC。planeId 输出 -1(前景) / 0..K-1; pa/pb/pc 为每平面参数;
+# shares 为每平面覆盖率增量; 返回 K。
+@borrows
+fn ransacFrame(d8: int32[], thresh: int32, iters: int32,
+               planeId: var int32[],
+               pa: var float64[], pb: var float64[], pc: var float64[],
+               shares: var float64[], rng: var int64): int32 =
+    var remaining: int32 = Npx
+    var k: int32 = 0
+    var running: bool = true
+    while running && k < MaxPlanes:
+        var bestA: float64 = 0.0
+        var bestB: float64 = 0.0
+        var bestC: float64 = 0.0
+        var bestCnt: int32 = 0
+        var it: int32 = 0
+        while it < iters && remaining >= 3:
+            # rejection 采样 3 个互异未分配像素
+            var s1: int32 = -1
+            var s2: int32 = -1
+            var s3: int32 = -1
+            var tries: int32 = 0
+            while tries < 4096 && s3 < 0:
+                let idx: int32 = lcgNext15(rng)
+                if planeId[idx] < 0 && idx != s1 && idx != s2:
+                    if s1 < 0:
+                        s1 = idx
+                    elif s2 < 0:
+                        s2 = idx
+                    else:
+                        s3 = idx
+                tries = tries + 1
+            if s3 < 0:
+                running = false
+                break
+            var a: float64 = 0.0
+            var b: float64 = 0.0
+            var c: float64 = 0.0
+            if solvePlane(s1 % FrameW, s1 / FrameW, d8[s1],
+                          s2 % FrameW, s2 / FrameW, d8[s2],
+                          s3 % FrameW, s3 / FrameW, d8[s3], a, b, c):
+                let th: float64 = float64(thresh)
+                var cnt: int32 = 0
+                var i: int32 = 0
+                while i < Npx:
+                    if planeId[i] < 0:
+                        let pred: float64 = a * float64(i % FrameW) +
+                            b * float64(i / FrameW) + c
+                        if fabsF(pred - float64(d8[i])) <= th:
+                            cnt = cnt + 1
+                    i = i + 1
+                if cnt > bestCnt:
+                    bestCnt = cnt
+                    bestA = a
+                    bestB = b
+                    bestC = c
+            it = it + 1
+        # 判停: 采样枯竭 / 增量不足 0.5% / 占比不足 1%
+        let gain: float64 = float64(bestCnt) / float64(Npx)
+        if bestCnt < 3 || bestCnt * 100 < Npx || gain * 10000.0 < 50.0:
+            running = false
+        else:
+            pa[k] = bestA
+            pb[k] = bestB
+            pc[k] = bestC
+            shares[k] = gain
+            let th: float64 = float64(thresh)
+            var i: int32 = 0
+            while i < Npx:
+                if planeId[i] < 0:
+                    let pred: float64 = bestA * float64(i % FrameW) +
+                        bestB * float64(i / FrameW) + bestC
+                    if fabsF(pred - float64(d8[i])) <= th:
+                        planeId[i] = k
+                i = i + 1
+            remaining = remaining - bestCnt
+            echo("  plane " + strings.IntToStr(k) + ": a=" + fmtFixed(bestA) +
+                 " b=" + fmtFixed(bestB) + " c=" + fmtFixed(bestC) +
+                 " share=" + fmtPct(gain) + "%")
+            k = k + 1
+    return k
+
+# 前景 (planeId == -1) 4-连通域统计。
+@borrows
+fn fgConnectivity(planeId: int32[], outComps: var int32, outMax: var int32) =
+    var visited: int32[]
+    setLen(visited, Npx)
+    var stack: int32[]
+    setLen(stack, Npx)
+    var i: int32 = 0
+    while i < Npx:
+        visited[i] = 0
+        i = i + 1
+    outComps = 0
+    outMax = 0
+    i = 0
+    while i < Npx:
+        if planeId[i] < 0 && visited[i] == 0:
+            outComps = outComps + 1
+            var sp: int32 = 0
+            stack[sp] = i
+            sp = sp + 1
+            visited[i] = 1
+            var size: int32 = 0
+            while sp > 0:
+                sp = sp - 1
+                let p: int32 = stack[sp]
+                size = size + 1
+                let px: int32 = p % FrameW
+                let py: int32 = p / FrameW
+                if px > 0 && planeId[p - 1] < 0 && visited[p - 1] == 0:
+                    visited[p - 1] = 1
+                    stack[sp] = p - 1
+                    sp = sp + 1
+                if px < FrameW - 1 && planeId[p + 1] < 0 && visited[p + 1] == 0:
+                    visited[p + 1] = 1
+                    stack[sp] = p + 1
+                    sp = sp + 1
+                if py > 0 && planeId[p - FrameW] < 0 && visited[p - FrameW] == 0:
+                    visited[p - FrameW] = 1
+                    stack[sp] = p - FrameW
+                    sp = sp + 1
+                if py < FrameH - 1 && planeId[p + FrameW] < 0 && visited[p + FrameW] == 0:
+                    visited[p + FrameW] = 1
+                    stack[sp] = p + FrameW
+                    sp = sp + 1
+            if size > outMax:
+                outMax = size
+        i = i + 1
+
+# 平面归属伪彩 PGM (P5): 已分配 = (pid * 17) mod 256, 前景 = 255 白。
+@borrows
+fn writePgmMap(planeId: int32[], path: str): bool =
+    let header: str = "P5\n" + strings.IntToStr(FrameW) + " " +
+        strings.IntToStr(FrameH) + "\n255\n"
+    let hlen: int32 = strings.Len(header)
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(hlen + Npx)
+    defer:
+        rawbytes.BytesFree(out)
+    var i: int32 = 0
+    while i < hlen:
+        rawbytes.BytesSet(out, i, int32(header[i]))
+        i = i + 1
+    i = 0
+    while i < Npx:
+        var g: int32 = 255
+        if planeId[i] >= 0:
+            g = (planeId[i] * 17) % 256
+        rawbytes.BytesSet(out, hlen + i, g)
+        i = i + 1
+    var res = os.WriteFileBytesResult(path, out)
+    return !result.IsErr(res)
+
+# 分割叠原帧 BMP (24bpp, bottom-up): 背景 = 原帧 55% + 绿 45%,
+# 前景 = 原帧 55% + 红 45%。同时累计背景像素的平面深度残差 (u8 域)。
+@borrows
+fn writeOverlayBmp(planeId: int32[], ref: bytes.ByteBuffer, frameBase: int32,
+                   d8: int32[], pa: float64[], pb: float64[], pc: float64[],
+                   thresh: int32, path: str,
+                   outBgMad: var float64, outBgFar: var int32): bool =
+    let rowBytes: int32 = FrameW * 3
+    let imgBytes: int32 = rowBytes * FrameH
+    var out: rawbytes.Bytes = rawbytes.BytesAlloc(54 + imgBytes)
+    defer:
+        rawbytes.BytesFree(out)
+    let total: int32 = 54 + imgBytes
+    rawbytes.BytesSet(out, 0, int32('B'))
+    rawbytes.BytesSet(out, 1, int32('M'))
+    rawbytes.BytesSet(out, 2, total & 255)
+    rawbytes.BytesSet(out, 3, (total >> 8) & 255)
+    rawbytes.BytesSet(out, 4, (total >> 16) & 255)
+    rawbytes.BytesSet(out, 5, (total >> 24) & 255)
+    rawbytes.BytesSet(out, 10, 54)
+    rawbytes.BytesSet(out, 14, 40)
+    rawbytes.BytesSet(out, 18, FrameW & 255)
+    rawbytes.BytesSet(out, 19, (FrameW >> 8) & 255)
+    rawbytes.BytesSet(out, 22, FrameH & 255)
+    rawbytes.BytesSet(out, 23, (FrameH >> 8) & 255)
+    rawbytes.BytesSet(out, 26, 1)
+    rawbytes.BytesSet(out, 28, 24)
+    rawbytes.BytesSet(out, 34, imgBytes & 255)
+    rawbytes.BytesSet(out, 35, (imgBytes >> 8) & 255)
+    rawbytes.BytesSet(out, 36, 28)
+    rawbytes.BytesSet(out, 37, 11)
+    rawbytes.BytesSet(out, 38, 28)
+    rawbytes.BytesSet(out, 39, 11)
+    var absSum: float64 = 0.0
+    var bgCount: int32 = 0
+    var bgFar: int32 = 0
+    let th: float64 = float64(thresh)
+    var row: int32 = FrameH - 1
+    while row >= 0:
+        var col: int32 = 0
+        while col < FrameW:
+            let p: int32 = row * FrameW + col
+            let rOff: int32 = frameBase + p * 3
+            let r: int32 = bytes.BufByteAt(ref, rOff)
+            let g: int32 = bytes.BufByteAt(ref, rOff + 1)
+            let b: int32 = bytes.BufByteAt(ref, rOff + 2)
+            var mr: int32 = 255
+            var mg: int32 = 0
+            var mb: int32 = 0
+            if planeId[p] >= 0:
+                mr = 0
+                mg = 255
+                let kk: int32 = planeId[p]
+                let pred: float64 = pa[kk] * float64(col) + pb[kk] * float64(row) + pc[kk]
+                let diff: float64 = fabsF(pred - float64(d8[p]))
+                absSum = absSum + diff
+                bgCount = bgCount + 1
+                if diff > th:
+                    bgFar = bgFar + 1
+            let dst: int32 = 54 + ((FrameH - 1 - row) * rowBytes) + col * 3
+            rawbytes.BytesSet(out, dst, (b * 55 + mb * 45) / 100)
+            rawbytes.BytesSet(out, dst + 1, (g * 55 + mg * 45) / 100)
+            rawbytes.BytesSet(out, dst + 2, (r * 55 + mr * 45) / 100)
+            col = col + 1
+        row = row - 1
+    var res = os.WriteFileBytesResult(path, out)
+    if result.IsErr(res):
+        return false
+    if bgCount > 0:
+        outBgMad = absSum / float64(bgCount)
+    else:
+        outBgMad = 0.0
+    outBgFar = bgFar
+    return true
+
+fn main(): int32 =
+    var thresh: int32 = DefThresh
+    var iters: int32 = DefIters
+    var depthDir: str = DefDepthDir
+    var refRgbPath: str = DefRefRgbPath
+    var outDir: str = DefOutDir
+    var rawMode: bool = false
+    # paramCount() 含程序名 (index 0), 用户参数从 paramStr(1) 起。
+    if cmdline.paramCount() >= 2:
+        if !parseStrict(cmdline.paramStr(1), thresh):
+            echo("ERR argv1 thresh must be positive int")
+            return 2
+    if cmdline.paramCount() >= 3:
+        if !parseStrict(cmdline.paramStr(2), iters):
+            echo("ERR argv2 iters must be positive int")
+            return 2
+    if cmdline.paramCount() >= 4:
+        depthDir = cmdline.paramStr(3)
+    if cmdline.paramCount() >= 5:
+        refRgbPath = cmdline.paramStr(4)
+    if cmdline.paramCount() >= 6:
+        outDir = cmdline.paramStr(5)
+    if cmdline.paramCount() >= 7:
+        if cmdline.paramStr(6) == "raw":
+            rawMode = true
+        elif cmdline.paramStr(6) == "npy":
+            rawMode = false
+        else:
+            echo("ERR argv6 mode must be npy or raw")
+            return 2
+    os.MkdirAll(outDir, 493)
+    var refBuf: bytes.ByteBuffer = bytes.ReadFileBytes(refRgbPath)
+    defer:
+        bytes.FreeByteBuffer(refBuf)
+    # ref 帧数动态校验 (npy 模式 225 帧 / raw 模式 600 帧), 必须覆盖最大评估帧。
+    if refBuf.len <= 0 || (refBuf.len % (Npx * 3)) != 0:
+        echo("ERR ref rgb size not a multiple of frame bytes: " +
+             strings.IntToStr(refBuf.len))
+        return 1
+    let refFrames: int32 = refBuf.len / (Npx * 3)
+    let maxFrame: int32 = frameAt(3, rawMode)
+    if maxFrame >= refFrames:
+        echo("ERR ref rgb has " + strings.IntToStr(refFrames) +
+             " frames, need frame " + strings.IntToStr(maxFrame))
+        return 1
+    var d8: int32[]
+    setLen(d8, Npx)
+    var planeId: int32[]
+    setLen(planeId, Npx)
+    var pa: float64[]
+    setLen(pa, MaxPlanes)
+    var pb: float64[]
+    setLen(pb, MaxPlanes)
+    var pc: float64[]
+    setLen(pc, MaxPlanes)
+    var shares: float64[]
+    setLen(shares, MaxPlanes)
+    var rng: int64 = int64(20260912)
+    var modeName: str = "npy"
+    if rawMode:
+        modeName = "raw"
+    echo("M8 semantic coverage probe: thresh=" + strings.IntToStr(thresh) +
+         " u8 iters=" + strings.IntToStr(iters) + " lcgSeed=20260912" +
+         " mode=" + modeName + " depthDir=" + depthDir)
+    var fi: int32 = 0
+    while fi < 4:
+        let fIdx: int32 = frameAt(fi, rawMode)
+        var framePath: str = depthDir + "/depth_" + padNum(fIdx)
+        if rawMode:
+            framePath = framePath + ".raw"
+        else:
+            framePath = framePath + ".npy"
+        var reset: int32 = 0
+        while reset < Npx:
+            planeId[reset] = -1
+            reset = reset + 1
+        var loadOk: bool = false
+        if rawMode:
+            loadOk = loadFrameRaw(framePath, d8)
+        else:
+            loadOk = loadFrameU8(framePath, d8)
+        if !loadOk:
+            echo("ERR load frame failed: " + framePath)
+            return 1
+        echo("frame " + strings.IntToStr(fIdx) + ": " + framePath)
+        let k: int32 = ransacFrame(d8, thresh, iters, planeId, pa, pb, pc, shares, rng)
+        var cum: float64 = 0.0
+        var s: int32 = 0
+        while s < k:
+            cum = cum + shares[s]
+            s = s + 1
+        let fg: float64 = 1.0 - cum
+        var comps: int32 = 0
+        var maxSize: int32 = 0
+        fgConnectivity(planeId, comps, maxSize)
+        let pgmPath: str = outDir + "/semcov_frame_" + padNum(fIdx) + ".pgm"
+        if !writePgmMap(planeId, pgmPath):
+            echo("ERR write pgm failed: " + pgmPath)
+            return 1
+        var bgMad: float64 = 0.0
+        var bgFar: int32 = 0
+        let bmpPath: str = outDir + "/overlay_frame_" + padNum(fIdx) + ".bmp"
+        let frameBase: int32 = fIdx * Npx * 3
+        if !writeOverlayBmp(planeId, refBuf, frameBase, d8, pa, pb, pc, thresh,
+                            bmpPath, bgMad, bgFar):
+            echo("ERR write bmp failed: " + bmpPath)
+            return 1
+        echo("  RESULT frame=" + strings.IntToStr(fIdx) + " K=" + strings.IntToStr(k) +
+             " cumCoverage=" + fmtPct(cum) + "% foreground=" + fmtPct(fg) + "%" +
+             " fgComponents=" + strings.IntToStr(comps) +
+             " fgMaxComp=" + fmtPct(float64(maxSize) / float64(Npx)) + "%" +
+             " bgDepthMADu8=" + fmtFixed(bgMad) +
+             " bgOverThresh=" + strings.IntToStr(bgFar))
+        fi = fi + 1
+    echo("PASS semantic coverage probe")
+    return 0

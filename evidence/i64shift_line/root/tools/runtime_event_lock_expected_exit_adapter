@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Execute one verified event-lock artifact through its held Linux proc FD."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import platform
+import re
+import signal
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Sequence
+
+
+sys.dont_write_bytecode = True
+
+CASES = {
+    "contention-positive": (
+        0,
+        None,
+        b"",
+    ),
+    "recursive-acquire": (
+        70,
+        b"",
+        b"cheng runtime event lock recursive acquire\n",
+    ),
+    "non-owner-unlock": (
+        70,
+        b"",
+        b"cheng runtime event unlock by non-owner\n",
+    ),
+    "owner-assertion": (
+        70,
+        b"",
+        b"cheng runtime event lock ownership required\n",
+    ),
+    "other-owner-assertion": (
+        70,
+        b"",
+        b"cheng runtime event lock ownership required\n",
+    ),
+}
+MAX_ARTIFACT_BYTES = 4 * 1024 * 1024 * 1024
+MAX_OUTPUT_BYTES = 1024 * 1024
+TIMEOUT_SECONDS = 30
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+PROVIDER_AUDIT_SCHEMA = "cheng.runtime_event_lock_provider_audit"
+PROVIDER_AUDIT_MAGIC = 1163283538
+PROVIDER_AUDIT_TOTAL = 513
+PROVIDER_AUDIT_RAW_RE = re.compile(
+    rb"runtime_event_lock_provider_audit "
+    rb"(0|[1-9][0-9]*) (0|[1-9][0-9]*) (0|[1-9][0-9]*) "
+    rb"(0|[1-9][0-9]*) (0|[1-9][0-9]*) (0|[1-9][0-9]*) "
+    rb"(0|[1-9][0-9]*)\n"
+)
+
+
+class AdapterError(RuntimeError):
+    pass
+
+
+def parse_provider_audit(raw: bytes) -> dict[str, int]:
+    match = PROVIDER_AUDIT_RAW_RE.fullmatch(raw)
+    if match is None:
+        raise AdapterError("provider_audit_stdout_invalid")
+    values = tuple(int(value) for value in match.groups())
+    if any(value > 2_147_483_647 for value in values):
+        raise AdapterError("provider_audit_int32_overflow")
+    (
+        magic,
+        registered_total,
+        current_waiters,
+        wake_call_total,
+        wake_success_total,
+        acquire_total,
+        unlock_total,
+    ) = values
+    if magic != PROVIDER_AUDIT_MAGIC:
+        raise AdapterError("provider_audit_magic_mismatch")
+    if registered_total < 4:
+        raise AdapterError("provider_audit_registered_total_invalid")
+    if current_waiters != 0:
+        raise AdapterError("provider_audit_current_waiters_not_drained")
+    if wake_call_total < 1:
+        raise AdapterError("provider_audit_wake_call_missing")
+    if wake_success_total < 1 or wake_success_total > wake_call_total:
+        raise AdapterError("provider_audit_wake_success_invalid")
+    if acquire_total != PROVIDER_AUDIT_TOTAL:
+        raise AdapterError("provider_audit_acquire_total_invalid")
+    if unlock_total != PROVIDER_AUDIT_TOTAL:
+        raise AdapterError("provider_audit_unlock_total_invalid")
+    return {
+        "magic": magic,
+        "registered_total": registered_total,
+        "current_waiters": current_waiters,
+        "wake_call_total": wake_call_total,
+        "wake_success_total": wake_success_total,
+        "acquire_total": acquire_total,
+        "unlock_total": unlock_total,
+    }
+
+
+def normalized_provider_audit(
+    artifact_sha256: str,
+    artifact_stdout_sha256: str,
+    audit: dict[str, int],
+) -> str:
+    return (
+        "runtime_event_lock_expected_exit=passed"
+        + " case=contention-positive"
+        + " artifact_sha256="
+        + artifact_sha256
+        + " audit_schema="
+        + PROVIDER_AUDIT_SCHEMA
+        + " magic="
+        + str(audit["magic"])
+        + " registered_total="
+        + str(audit["registered_total"])
+        + " current_waiters="
+        + str(audit["current_waiters"])
+        + " wake_call_total="
+        + str(audit["wake_call_total"])
+        + " wake_success_total="
+        + str(audit["wake_success_total"])
+        + " acquire_total="
+        + str(audit["acquire_total"])
+        + " unlock_total="
+        + str(audit["unlock_total"])
+        + " artifact_stdout_sha256="
+        + artifact_stdout_sha256
+    )
+
+
+def identity_tuple(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def require_lexical_absolute(path: Path) -> None:
+    raw = os.fspath(path)
+    if (
+        not path.is_absolute()
+        or "\x00" in raw
+        or "\n" in raw
+        or "\r" in raw
+        or os.path.normpath(raw) != raw
+    ):
+        raise AdapterError("artifact_path_invalid")
+
+
+def open_verified_artifact(path: Path) -> tuple[int, dict[str, Any]]:
+    require_lexical_absolute(path)
+    try:
+        before = os.lstat(path)
+    except OSError as error:
+        raise AdapterError("artifact_path_missing") from error
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size <= 0
+        or before.st_size > MAX_ARTIFACT_BYTES
+        or before.st_mode & 0o111 == 0
+    ):
+        raise AdapterError("artifact_identity_invalid")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if identity_tuple(opened) != identity_tuple(before):
+            raise AdapterError("artifact_open_race")
+        if Path(os.path.realpath(path)) != path:
+            raise AdapterError("artifact_path_not_canonical")
+        digest = hashlib.sha256()
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise AdapterError("artifact_short_read")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise AdapterError("artifact_grew_during_read")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        after = os.lstat(path)
+        if (
+            identity_tuple(os.fstat(descriptor)) != identity_tuple(before)
+            or identity_tuple(after) != identity_tuple(before)
+        ):
+            raise AdapterError("artifact_read_race")
+        return descriptor, {
+            "device": opened.st_dev,
+            "inode": opened.st_ino,
+            "mode": opened.st_mode,
+            "uid": opened.st_uid,
+            "gid": opened.st_gid,
+            "size": opened.st_size,
+            "mtimeNs": opened.st_mtime_ns,
+            "ctimeNs": opened.st_ctime_ns,
+            "sha256": digest.hexdigest(),
+        }
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Require an exact Cheng event-lock process result",
+    )
+    parser.add_argument("--case", required=True, choices=tuple(CASES))
+    parser.add_argument("--artifact", required=True)
+    parser.add_argument("--artifact-sha256", required=True)
+    return parser.parse_args(argv)
+
+
+def run_case(case: str, artifact: Path, expected_sha256: str) -> None:
+    if platform.system() != "Linux" or not Path("/proc/self/fd").is_dir():
+        raise AdapterError("linux_proc_fd_execution_required")
+    if SHA256_RE.fullmatch(expected_sha256) is None:
+        raise AdapterError("artifact_sha256_invalid")
+    expected_exit, expected_stdout, expected_stderr = CASES[case]
+    descriptor, before = open_verified_artifact(artifact)
+    try:
+        if before["sha256"] != expected_sha256:
+            raise AdapterError("artifact_sha256_mismatch")
+        proc_fd_path = "/proc/self/fd/" + str(descriptor)
+        environment = {
+            "HOME": "/nonexistent",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TMPDIR": "/tmp",
+            "TZ": "UTC",
+        }
+        process = subprocess.Popen(
+            [proc_fd_path],
+            cwd="/",
+            env=environment,
+            pass_fds=(descriptor,),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise AdapterError("artifact_timeout") from error
+        try:
+            named_after = os.lstat(artifact)
+        except OSError as error:
+            raise AdapterError("artifact_path_drift") from error
+        if identity_tuple(os.fstat(descriptor)) != identity_tuple(named_after):
+            raise AdapterError("artifact_identity_drift")
+    finally:
+        os.close(descriptor)
+    if len(stdout) > MAX_OUTPUT_BYTES or len(stderr) > MAX_OUTPUT_BYTES:
+        raise AdapterError("artifact_output_too_large")
+    if process.returncode != expected_exit:
+        raise AdapterError("artifact_exit_mismatch")
+    if stderr != expected_stderr:
+        raise AdapterError("artifact_stderr_mismatch")
+    if case == "contention-positive":
+        if expected_stdout is not None:
+            raise AdapterError("positive_case_contract_invalid")
+        audit = parse_provider_audit(stdout)
+        print(
+            normalized_provider_audit(
+                expected_sha256,
+                hashlib.sha256(stdout).hexdigest(),
+                audit,
+            )
+        )
+        return
+    if expected_stdout is None or stdout != expected_stdout:
+        raise AdapterError("artifact_stdout_mismatch")
+    print(
+        "runtime_event_lock_expected_exit=passed"
+        + " case="
+        + case
+        + " artifact_sha256="
+        + expected_sha256
+    )
+
+
+def main(argv: Sequence[str]) -> int:
+    try:
+        args = parse_args(argv)
+        run_case(args.case, Path(args.artifact), args.artifact_sha256)
+        return 0
+    except (AdapterError, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(
+            "runtime_event_lock_expected_exit_error="
+            + str(error).replace("\r", " ").replace("\n", " "),
+            file=sys.stderr,
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

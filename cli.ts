@@ -21,11 +21,16 @@ const INPUT_UTF8_DECODER = new TextDecoder("utf-8", {fatal: true});
 const USAGE = `Usage:
   cheng-fusion list
   cheng-fusion run <tool> --input <JSON|@file|-> [--root <path>] [--cwd <path>]
+  cheng-fusion batch
   cheng-fusion doctor
 
 Commands:
   list    Print the exact MCP tools/list result as JSON.
   run     Execute a registry tool through the same validation/context/execute path as MCP.
+  batch   Read NDJSON lines {"tool","input","root","cwd"} from stdin and execute each through
+          the same tools/call path in ONE process, writing one NDJSON result per line.
+          Removes the per-call bun cold start + registry init (~110-130ms measured) for
+          headless automation issuing several tool calls back to back.
   doctor  Verify the real MCP entry point, tool schemas, Cheng binaries, code signatures,
           and a minimal cheng-lsp initialize handshake.
 `;
@@ -257,6 +262,58 @@ async function runTool(argv) {
   }
   writeJson(process.stdout, result);
   return result?.isError ? 1 : 0;
+}
+
+async function batchTools(argv) {
+  if (argv.length !== 0) throw new CliFailure("UNEXPECTED_ARGUMENT", "batch takes no arguments", {arguments: argv});
+  // 与单发路径 readAllStdin 同一上限: 无界 concat 在误喂大文件时会一次性吃光内存。
+  const inputText = await new Promise((resolve, reject) => {
+    const chunks = [];
+    let byteLength = 0;
+    process.stdin.on("data", (chunk) => {
+      const bytes = Buffer.from(chunk);
+      byteLength += bytes.length;
+      if (byteLength > JSON_RPC_MAX_FRAME_BYTES) {
+        process.stdin.destroy();
+        reject(new CliFailure("INPUT_TOO_LARGE", `stdin JSON exceeds ${JSON_RPC_MAX_FRAME_BYTES} bytes`, {source: "stdin", maxBytes: JSON_RPC_MAX_FRAME_BYTES}));
+        return;
+      }
+      chunks.push(bytes);
+    });
+    process.stdin.on("end", () => resolve(Buffer.concat(chunks, byteLength).toString("utf8")));
+    process.stdin.on("error", reject);
+  });
+  let anyFailure = false;
+  let lineNo = 0;
+  for (const rawLine of inputText.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    lineNo++;
+    const start = performance.now();
+    const entry = {tool: undefined, ok: false, wallMs: 0};
+    try {
+      const request = JSON.parse(line);
+      if (!request || typeof request !== "object") throw new Error("batch entry must be a JSON object");
+      const tool = typeof request.tool === "string" ? request.tool : "";
+      if (!tool) throw new Error("batch entry requires a string tool name");
+      const params = {name: tool, arguments: request.input === undefined ? {} : request.input};
+      if (request.root) params.workspaceRoots = [request.root];
+      if (request.cwd) params.cwd = request.cwd;
+      const result = await handleMcpRequest({jsonrpc: "2.0", id: 1, method: "tools/call", params});
+      entry.tool = tool;
+      entry.wallMs = Math.round((performance.now() - start) * 1000) / 1000;
+      entry.result = result;
+      entry.ok = !result?.isError;
+      if (result?.isError) anyFailure = true;
+    } catch (error) {
+      entry.wallMs = Math.round((performance.now() - start) * 1000) / 1000;
+      entry.error = {code: error?.code || "BATCH_ENTRY_FAILED", message: errorText(error), line: lineNo};
+      anyFailure = true;
+    }
+    // NDJSON 行式输出: 每条结果恰好一行(紧凑 JSON), 解析方按行 split 即可。
+    process.stdout.write(JSON.stringify(entry) + "\n");
+  }
+  return anyFailure ? 1 : 0;
 }
 
 class JsonRpcChild {
@@ -730,6 +787,7 @@ async function runCli(argv = process.argv.slice(2)) {
     return listTools();
   }
   if (command === "run") return runTool(argv.slice(1));
+  if (command === "batch") return batchTools(argv.slice(1));
   if (command === "doctor") {
     if (argv.length !== 1) throw new CliFailure("UNEXPECTED_ARGUMENT", "doctor takes no arguments", {arguments: argv.slice(1)});
     return doctor();
@@ -738,6 +796,12 @@ async function runCli(argv = process.argv.slice(2)) {
 }
 
 if (import.meta.main) {
+  // 管道消费方提前关闭(如 | head)时, 异步 EPIPE 是未捕获异常而非同步 throw;
+  // 惯例按 128+SIGPIPE=141 静默退出, 不打印堆栈。
+  process.stdout?.on?.("error", (error) => {
+    if (error && (error.code === "EPIPE" || error.errno === "EPIPE")) process.exit(141);
+    throw error;
+  });
   runCli().then((exitCode) => {
     process.exitCode = exitCode;
   }).catch((error) => {
@@ -753,4 +817,4 @@ if (import.meta.main) {
   });
 }
 
-export {doctor, listTools, parseInput, runCli, runTool, validateToolSchemas};
+export {batchTools, doctor, listTools, parseInput, runCli, runTool, validateToolSchemas};

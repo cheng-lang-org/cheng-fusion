@@ -1,0 +1,333 @@
+# Slice 2 real-network proof: ECDSA-P256 self-signed leaf issuance
+# (std/tls/x509_issue.cheng) actually driving a real TLS1.3 QUIC handshake
+# (no test_pki fixed certificate), plus a real Extended CONNECT
+# request/response exchange (RFC 9220 pseudo-headers, real QPACK wire bytes)
+# that upgrades the h3 connection to a WebTransport session, plus a second
+# real bidirectional QUIC stream (WT_STREAM 0x41 signal) proving the session
+# can read/write data both directions after establishment.
+#
+# Non-production notes (see design.md for the full slice map):
+#  - Noise-XX identity binding is not exercised here (slice 3).
+#  - Browser-side gossipsub codec is not exercised here (slice 4).
+
+import std/system
+import std/result
+import std/rawbytes
+import std/os
+import std/times as times
+import cheng/quic/multiaddress as qaddr
+import cheng/quic/connection as qconn
+import cheng/quic/msquictransport_native as qtransport
+import cheng/quic/tls/policy as qpolicy
+import cheng/quic/tls/handshake13 as handshake13
+import cheng/libp2p/transports/quic_transport as quic_transport
+import cheng/http3/frame as h3frame
+import cheng/qpack/min as qpack
+import cheng/libp2p/transports/webtransport_common as wtcommon
+import std/tls/x509 as x509
+import std/tls/x509_issue as x509issue
+
+const
+    wtSessionStreamId: int64 = 4
+    wtStreamPollAttempts: int32 = 400
+    wtStreamPollMs: int32 = 10
+
+type
+    ScenarioPair =
+        listener: qtransport.MsQuicTransport
+        client: qtransport.MsQuicTransport
+        outbound: qconn.Connection
+        inbound: qconn.Connection
+
+    IssuedPolicyPair =
+        server: qpolicy.MsQuicTlsPolicy
+        client: qpolicy.MsQuicTlsPolicy
+
+fn makeAddr(port: int32): qaddr.MultiAddress =
+    var out: qaddr.MultiAddress
+    out.raw = "/ip4/127.0.0.1/udp/" + IntToStr(port) + "/quic-v1"
+    out.data = BytesFromString(out.raw)
+    return out
+
+# Builds a "pinned self-signed" MsQuicTlsPolicy pair (server presents the
+# issued leaf as its whole chain; both sides trust that exact leaf DER as
+# their sole root -- the same pattern quic/tls/test_pki.cheng uses for its
+# fixed fixture certs, just with a freshly-issued one).
+fn issuedPolicyPair(cert: x509issue.X509IssuedCert, sanHost: str): Result[IssuedPolicyPair] =
+    var serverPolicy: qpolicy.MsQuicTlsPolicy
+    serverPolicy.serverName = sanHost
+    serverPolicy.allowInsecure = false
+    serverPolicy.certChainCount = 1
+    serverPolicy.certChain0 = cert.der
+    serverPolicy.certPrivateKey = cert.privateKeyRaw
+    serverPolicy.certLeafKeyKind = x509.X509KeyEcdsaP256
+    serverPolicy.trustRootsCount = 1
+    serverPolicy.trustRoot0 = cert.der
+    let serverAlpnRes: Result[bool] = qpolicy.msquicTlsPolicyAddAlpn(serverPolicy, "h3")
+    if IsErr(serverAlpnRes):
+        return Err[IssuedPolicyPair]("issuedPolicyPair: server alpn: " + ErrorText(serverAlpnRes))
+    var clientPolicy: qpolicy.MsQuicTlsPolicy
+    clientPolicy.serverName = sanHost
+    clientPolicy.allowInsecure = false
+    clientPolicy.trustRootsCount = 1
+    clientPolicy.trustRoot0 = cert.der
+    let clientAlpnRes: Result[bool] = qpolicy.msquicTlsPolicyAddAlpn(clientPolicy, "h3")
+    if IsErr(clientAlpnRes):
+        return Err[IssuedPolicyPair]("issuedPolicyPair: client alpn: " + ErrorText(clientAlpnRes))
+    var out: IssuedPolicyPair
+    out.server = serverPolicy
+    out.client = clientPolicy
+    return Ok[IssuedPolicyPair](out)
+
+fn openScenario(out: var ScenarioPair,
+                 clientPolicy: qpolicy.MsQuicTlsPolicy,
+                 serverPolicy: qpolicy.MsQuicTlsPolicy,
+                 port: int32): Result[bool] =
+    out.listener = qtransport.InitMsQuicTransport()
+    out.client = qtransport.InitMsQuicTransport()
+    let listenerTlsRes: Result[bool] = qtransport.setMsQuicTransportTlsPolicy(out.listener, serverPolicy)
+    if IsErr(listenerTlsRes):
+        return Err[bool]("scenario: listener tls: " + ErrorText(listenerTlsRes))
+    let clientTlsRes: Result[bool] = qtransport.setMsQuicTransportTlsPolicy(out.client, clientPolicy)
+    if IsErr(clientTlsRes):
+        return Err[bool]("scenario: client tls: " + ErrorText(clientTlsRes))
+    let addr: qaddr.MultiAddress = makeAddr(port)
+    qtransport.start(out.listener, addr)
+    if ! out.listener.running:
+        return Err[bool]("scenario: listener start: " + out.listener.lastError)
+    let dialRes: Result[qconn.Connection] = qtransport.dial(out.client, out.listener.listenAddr)
+    if IsErr(dialRes):
+        qtransport.Stop(out.listener)
+        return Err[bool]("scenario: dial: " + ErrorText(dialRes))
+    out.outbound = Value(dialRes)
+    let acceptRes: Result[qconn.Connection] = qtransport.accept(out.listener)
+    if IsErr(acceptRes):
+        qconn.ConnClose(out.outbound)
+        qtransport.Stop(out.listener)
+        return Err[bool]("scenario: accept: " + ErrorText(acceptRes))
+    out.inbound = Value(acceptRes)
+    return Ok[bool](true)
+
+fn closeScenario(pair: var ScenarioPair) =
+    qconn.ConnClose(pair.outbound)
+    qconn.ConnClose(pair.inbound)
+    qtransport.Stop(pair.listener)
+
+fn writeHeadersFrame(t: var qtransport.MsQuicTransport, conn: var qconn.Connection, fields: qpack.QpackHeaderField[]): Result[bool] =
+    let frameRes: Result[Bytes] = h3frame.Http3EncodeHeadersFrame(fields)
+    if IsErr(frameRes):
+        return Err[bool]("writeHeadersFrame: encode: " + ErrorText(frameRes))
+    let framed: Bytes = quic_transport.Libp2pQuicEncodeFrame(Value(frameRes))
+    return quic_transport.Libp2pQuicWriteExact(t, conn, framed)
+
+fn readHeadersFields(t: var qtransport.MsQuicTransport, conn: var qconn.Connection): Result[qpack.QpackFieldSection] =
+    let recvRes: Result[Bytes] = quic_transport.Libp2pQuicReadFrame(t, conn)
+    if IsErr(recvRes):
+        return Err[qpack.QpackFieldSection]("readHeadersFields: read: " + ErrorText(recvRes))
+    let decodedRes: Result[h3frame.Http3FrameDecoded] = h3frame.Http3DecodeFrame(Value(recvRes), 0)
+    if IsErr(decodedRes):
+        return Err[qpack.QpackFieldSection]("readHeadersFields: frame decode: " + ErrorText(decodedRes))
+    if Value(decodedRes).frame.kind != h3frame.Http3FrameHeaders:
+        return Err[qpack.QpackFieldSection]("readHeadersFields: frame kind != HEADERS")
+    return h3frame.Http3DecodeHeadersFramePayload(Value(decodedRes).frame.payload)
+
+# ---- x509_issue.cheng cert battery: production ECDSA-P256 issuance,
+# verified with std/tls/x509.cheng's existing (never-modified) verification
+# functions, plus an independent certhash length/shape check. ----
+fn certIssuanceAndVerifyBattery(): x509issue.X509IssuedCert =
+    let issuedRes: Result[x509issue.X509IssuedCert] = x509issue.X509IssueSelfSignedLeaf("localhost", 1)
+    if IsErr(issuedRes):
+        panic(" cert battery: issue: " + ErrorText(issuedRes))
+    let cert: x509issue.X509IssuedCert = Value(issuedRes)
+    assert(BytesLen(cert.privateKeyRaw) == 32, " cert battery: private key raw len")
+    assert(BytesLen(cert.certHash) == 32, " cert battery: certhash len (sha-256)")
+
+    var parsed: x509.X509Certificate = x509.initX509Certificate()
+    let parseRes: Result[bool] = x509.x509ParseCertificateInto(parsed, cert.der)
+    if IsErr(parseRes):
+        panic(" cert battery: parse: " + ErrorText(parseRes))
+    assert(parsed.publicKey.kind == x509.X509KeyEcdsaP256, " cert battery: leaf key kind")
+
+    let selfSignedRes: Result[bool] = x509.x509VerifySelfSigned(parsed)
+    if IsErr(selfSignedRes):
+        panic(" cert battery: self-signed verify: " + ErrorText(selfSignedRes))
+    assert(Value(selfSignedRes), " cert battery: self-signed verify value")
+
+    let now: int64 = times.EpochTimeSeconds()
+    let validityRes: Result[bool] = x509.x509VerifyValidity(parsed, now)
+    if IsErr(validityRes):
+        panic(" cert battery: validity: " + ErrorText(validityRes))
+
+    let leafConstraintRes: Result[bool] = x509.x509VerifyLeafConstraints(parsed)
+    if IsErr(leafConstraintRes):
+        panic(" cert battery: leaf constraints: " + ErrorText(leafConstraintRes))
+
+    assert(x509.x509VerifyHostname(parsed, "localhost"), " cert battery: hostname match")
+    assert(! x509.x509VerifyHostname(parsed, "not-the-host.example"), " cert battery: hostname mismatch must fail")
+
+    let certHashAgain: Bytes = x509issue.X509CertHash(cert.der)
+    assert(BytesEqual(certHashAgain, cert.certHash), " cert battery: certhash deterministic")
+
+    echo(" cert issuance+verify battery ok: der_len=" + IntToStr(BytesLen(cert.der)) + " certhash_len=" + IntToStr(BytesLen(cert.certHash)))
+    return cert
+
+# Real x509 rejection of an expired certificate (both notBefore and notAfter
+# safely in the past) -- exercises the same production x509VerifyValidity
+# used inside the live TLS handshake's chain verification.
+fn expiredCertRejectedAtX509Layer() =
+    let now: int64 = times.EpochTimeSeconds()
+    let notBefore: int64 = now - int64(30) * int64(86400)
+    let notAfter: int64 = now - int64(16) * int64(86400)
+    let issuedRes: Result[x509issue.X509IssuedCert] = x509issue.X509IssueSelfSignedLeafAt("localhost", notBefore, notAfter)
+    if IsErr(issuedRes):
+        panic(" expired cert (x509 layer): issue: " + ErrorText(issuedRes))
+    let cert: x509issue.X509IssuedCert = Value(issuedRes)
+    var parsed: x509.X509Certificate = x509.initX509Certificate()
+    let parseRes: Result[bool] = x509.x509ParseCertificateInto(parsed, cert.der)
+    if IsErr(parseRes):
+        panic(" expired cert (x509 layer): parse: " + ErrorText(parseRes))
+    let validityRes: Result[bool] = x509.x509VerifyValidity(parsed, now)
+    assert(IsErr(validityRes), " expired cert (x509 layer): must be rejected")
+    echo(" expired cert rejected ok (x509 layer): " + ErrorText(validityRes))
+
+# Real live TLS1.3 QUIC handshake rejection of the same expired leaf --
+# state.requireCert defaults true for the client role, so
+# msquicTls13PeerVerifyValidateChain's x509VerifyChain failure (which starts
+# with the same x509VerifyValidity check) must fail dial() outright, not
+# silently accept.
+fn expiredCertRejectedAtHandshakeLayer() =
+    let now: int64 = times.EpochTimeSeconds()
+    let notBefore: int64 = now - int64(30) * int64(86400)
+    let notAfter: int64 = now - int64(16) * int64(86400)
+    let issuedRes: Result[x509issue.X509IssuedCert] = x509issue.X509IssueSelfSignedLeafAt("localhost", notBefore, notAfter)
+    if IsErr(issuedRes):
+        panic(" expired cert (handshake layer): issue: " + ErrorText(issuedRes))
+    let cert: x509issue.X509IssuedCert = Value(issuedRes)
+    let policiesRes: Result[IssuedPolicyPair] = issuedPolicyPair(cert, "localhost")
+    if IsErr(policiesRes):
+        panic(" expired cert (handshake layer): policy: " + ErrorText(policiesRes))
+    let policies: IssuedPolicyPair = Value(policiesRes)
+    handshake13.msquicTls13ResetClientDefault(true)
+    var pair: ScenarioPair
+    let openRes: Result[bool] = openScenario(pair, policies.client, policies.server, 58313)
+    assert(IsErr(openRes), " expired cert (handshake layer): dial must fail")
+    echo(" expired cert rejected ok (handshake layer, real TLS1.3 dial): " + ErrorText(openRes))
+
+fn webtransportConnectAndSession() =
+    let cert: x509issue.X509IssuedCert = certIssuanceAndVerifyBattery()
+    let policiesRes: Result[IssuedPolicyPair] = issuedPolicyPair(cert, "localhost")
+    if IsErr(policiesRes):
+        panic(" webtransport connect: policy: " + ErrorText(policiesRes))
+    let policies: IssuedPolicyPair = Value(policiesRes)
+    handshake13.msquicTls13ResetClientDefault(true)
+    var pair: ScenarioPair
+    let openRes: Result[bool] = openScenario(pair, policies.client, policies.server, 58311)
+    if IsErr(openRes):
+        panic(" webtransport connect: open: " + ErrorText(openRes))
+    let negotiated: str = handshake13.msquicTls13ClientNegotiatedAlpn()
+    assert(negotiated == "h3", " webtransport connect: expected h3, got " + negotiated)
+    echo(" webtransport connect: real issued-cert TLS1.3/h3 handshake ok: negotiated=" + negotiated)
+
+    let authority: str = "127.0.0.1:58311"
+    let path: str = "/.well-known/webtransport"
+
+    # --- negative: missing :protocol pseudo-header, real wire, must reject loudly ---
+    var missingProtocolFields: qpack.QpackHeaderField[]
+    add(missingProtocolFields, qpack.QpackMakeHeaderField(":method", "CONNECT"))
+    add(missingProtocolFields, qpack.QpackMakeHeaderField(":scheme", "https"))
+    add(missingProtocolFields, qpack.QpackMakeHeaderField(":authority", authority))
+    add(missingProtocolFields, qpack.QpackMakeHeaderField(":path", path))
+    let sendMissingRes: Result[bool] = writeHeadersFrame(pair.client, pair.outbound, missingProtocolFields)
+    assert(IsOk(sendMissingRes), " webtransport connect: send missing-protocol request")
+    let recvMissingRes: Result[qpack.QpackFieldSection] = readHeadersFields(pair.listener, pair.inbound)
+    assert(IsOk(recvMissingRes), " webtransport connect: server read missing-protocol request")
+    let parseMissingRes: Result[wtcommon.WebtransportHandshakeInfo] = wtcommon.WebtransportParseConnectRequestFields(Value(recvMissingRes), path)
+    assert(IsErr(parseMissingRes), " webtransport connect: missing :protocol must be rejected")
+    assert(ErrorText(parseMissingRes) == "webtransport: missing :protocol pseudo-header",
+        " webtransport connect: wrong rejection reason: " + ErrorText(parseMissingRes))
+    echo(" webtransport connect (missing :protocol, real wire) rejected ok: " + ErrorText(parseMissingRes))
+
+    # --- negative: wrong :path, real wire, must reject loudly ---
+    let wrongPathFields: qpack.QpackHeaderField[] = wtcommon.WebtransportBuildConnectRequestFields(authority, "/wrong-path")
+    let sendWrongPathRes: Result[bool] = writeHeadersFrame(pair.client, pair.outbound, wrongPathFields)
+    assert(IsOk(sendWrongPathRes), " webtransport connect: send wrong-path request")
+    let recvWrongPathRes: Result[qpack.QpackFieldSection] = readHeadersFields(pair.listener, pair.inbound)
+    assert(IsOk(recvWrongPathRes), " webtransport connect: server read wrong-path request")
+    let parseWrongPathRes: Result[wtcommon.WebtransportHandshakeInfo] = wtcommon.WebtransportParseConnectRequestFields(Value(recvWrongPathRes), path)
+    assert(IsErr(parseWrongPathRes), " webtransport connect: wrong :path must be rejected")
+    assert(ErrorText(parseWrongPathRes) == "webtransport: unexpected :path /wrong-path",
+        " webtransport connect: wrong rejection reason: " + ErrorText(parseWrongPathRes))
+    echo(" webtransport connect (wrong :path, real wire) rejected ok: " + ErrorText(parseWrongPathRes))
+
+    # --- positive: real Extended CONNECT request/response over the real h3 connection ---
+    let requestFields: qpack.QpackHeaderField[] = wtcommon.WebtransportBuildConnectRequestFields(authority, path)
+    let sendReqRes: Result[bool] = writeHeadersFrame(pair.client, pair.outbound, requestFields)
+    assert(IsOk(sendReqRes), " webtransport connect: send valid request")
+    let recvReqRes: Result[qpack.QpackFieldSection] = readHeadersFields(pair.listener, pair.inbound)
+    assert(IsOk(recvReqRes), " webtransport connect: server read valid request")
+    let infoRes: Result[wtcommon.WebtransportHandshakeInfo] = wtcommon.WebtransportParseConnectRequestFields(Value(recvReqRes), path)
+    assert(IsOk(infoRes), " webtransport connect: valid request must parse: " + ErrorText(infoRes))
+    let info: wtcommon.WebtransportHandshakeInfo = Value(infoRes)
+    assert(info.authority == authority, " webtransport connect: authority mismatch")
+    assert(info.path == path, " webtransport connect: path mismatch")
+    echo(" webtransport connect: server parsed real CONNECT request ok: authority=" + info.authority + " path=" + info.path)
+
+    let responseFields: qpack.QpackHeaderField[] = wtcommon.WebtransportConnectResponseFields200()
+    let sendRespRes: Result[bool] = writeHeadersFrame(pair.listener, pair.inbound, responseFields)
+    assert(IsOk(sendRespRes), " webtransport connect: send 200 response")
+    let recvRespRes: Result[qpack.QpackFieldSection] = readHeadersFields(pair.client, pair.outbound)
+    assert(IsOk(recvRespRes), " webtransport connect: client read 200 response")
+    let sessionOkRes: Result[bool] = wtcommon.WebtransportParseConnectResponseFields(Value(recvRespRes))
+    assert(IsOk(sessionOkRes), " webtransport connect: 200 response must validate: " + ErrorText(sessionOkRes))
+    echo(" webtransport connect: session established (client validated 200 response) ok")
+
+    # --- session established: a second real bidirectional QUIC stream,
+    # signaled with WT_STREAM (0x41) + session id (the CONNECT stream's id,
+    # 0), carrying raw bytes both directions. ---
+    let signalRes: Result[Bytes] = wtcommon.WebtransportEncodeBidiStreamSignal(0)
+    assert(IsOk(signalRes), " webtransport session: encode WT_STREAM signal")
+    let clientPayload: Bytes = BytesFromString("hello-from-wt-client")
+    let clientOut: Bytes = BytesConcat(Value(signalRes), clientPayload)
+
+    var clientStream: qconn.Connection = qconn.ConnDeriveStream(pair.outbound, wtSessionStreamId, wtSessionStreamId)
+    let writeSignalRes: Result[bool] = quic_transport.Libp2pQuicWriteExact(pair.client, clientStream, clientOut)
+    assert(IsOk(writeSignalRes), " webtransport session: client write WT_STREAM signal+payload")
+
+    var foundStreamId: int64 = -1
+    for _attempt in 0..<wtStreamPollAttempts:
+        if foundStreamId >= 0:
+            break
+        let readableRes: Result[int64] = qconn.nativeReadableStreamId(pair.inbound, wtSessionStreamId)
+        if IsOk(readableRes):
+            foundStreamId = Value(readableRes)
+        else:
+            os.SleepMs(wtStreamPollMs)
+    assert(foundStreamId == wtSessionStreamId, " webtransport session: server must observe new client-opened stream id=" + IntToStr(wtSessionStreamId))
+    echo(" webtransport session: server observed new bidirectional stream id=" + IntToStr(foundStreamId))
+
+    var serverStream: qconn.Connection = qconn.ConnDeriveStream(pair.inbound, wtSessionStreamId, wtSessionStreamId)
+    let readSignalRes: Result[Bytes] = quic_transport.Libp2pQuicReadExact(pair.listener, serverStream, BytesLen(clientOut))
+    assert(IsOk(readSignalRes), " webtransport session: server read WT_STREAM signal+payload: " + ErrorText(readSignalRes))
+    let decodedSignalRes: Result[wtcommon.WebtransportStreamSignalDecoded] = wtcommon.WebtransportDecodeBidiStreamSignal(Value(readSignalRes), 0)
+    assert(IsOk(decodedSignalRes), " webtransport session: server decode WT_STREAM signal")
+    assert(Value(decodedSignalRes).sessionId == 0, " webtransport session: session id must be the CONNECT stream id (0)")
+    let receivedPayload: Bytes = BytesSlice(Value(readSignalRes), Value(decodedSignalRes).next, BytesLen(Value(readSignalRes)) - Value(decodedSignalRes).next)
+    assert(BytesEqual(receivedPayload, clientPayload), " webtransport session: server payload mismatch")
+    echo(" webtransport session: server decoded WT_STREAM signal ok, session_id=0, payload=\"hello-from-wt-client\"")
+
+    let serverReply: Bytes = BytesFromString("hello-from-wt-server")
+    let writeReplyRes: Result[bool] = quic_transport.Libp2pQuicWriteExact(pair.listener, serverStream, serverReply)
+    assert(IsOk(writeReplyRes), " webtransport session: server write reply")
+    let readReplyRes: Result[Bytes] = quic_transport.Libp2pQuicReadExact(pair.client, clientStream, BytesLen(serverReply))
+    assert(IsOk(readReplyRes), " webtransport session: client read reply: " + ErrorText(readReplyRes))
+    assert(BytesEqual(Value(readReplyRes), serverReply), " webtransport session: client reply mismatch")
+    echo(" webtransport session: bidirectional stream read/write confirmed both directions ok")
+
+    closeScenario(pair)
+
+fn main(): int32 =
+    webtransportConnectAndSession()
+    expiredCertRejectedAtX509Layer()
+    expiredCertRejectedAtHandshakeLayer()
+    echo(" webtransport_connect_slice2_probe ok")
+    return 0

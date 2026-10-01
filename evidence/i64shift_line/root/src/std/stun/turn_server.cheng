@@ -1,0 +1,294 @@
+# TURN UDP server (RFC 5766): listen socket, recvfrom dispatch, REST auth,
+# per-method handlers, and relay pump. Single-threaded event loop: ProcessOne
+# handles one client datagram on the listen socket; PumpAllRelays drains peer
+# datagrams from every allocation's relay socket and forwards them to clients
+# as Data Indications. All forwarding is real UDP.
+
+import std/rawbytes
+import std/system
+import std/result
+import std/atomic
+import std/os
+import std/times
+import std/net/transports/udp_syscall as udp
+import std/stun/protocol as stun
+import std/stun/turn_protocol as turn
+import std/stun/turn_auth as auth
+import std/stun/turn_relay as relay
+import std/stun/turn_metrics as metrics
+import std/stun/turn_log as tlog
+import std/log as slog
+
+const
+    turnListenRecvBuf = 1500
+    turnSolSocket = 65535
+    turnSoRcvTimeo = 4102
+    turnRecvTimeoutSec = 2
+
+var
+    gLogger: slog.Logger
+    gLogOn: bool
+    gUdpStop: atomic.I32
+
+fn TurnServerSetLogger(l: slog.Logger) =
+    gLogger = l
+    gLogOn = true
+
+fn TurnServerRequestStop() =
+    atomic.StoreI32(gUdpStop, 1)
+
+fn TurnServerStopRequested(): bool =
+    if atomic.LoadI32(gUdpStop) != 0:
+        return true
+    return false
+
+fn TurnServerNowSec(): int64 =
+    return times.EpochTimeSeconds()
+
+fn TurnServerAuthSuccess(clientHost: str, clientPort: int32, user: str) =
+    if relay.TurnMetricsEnabled():
+        metrics.TurnMetricsIncAuthSuccess()
+    if gLogOn:
+        tlog.TurnLogAuthSuccess(gLogger, clientHost, clientPort, user)
+
+fn TurnServerAuthFail(clientHost: str, clientPort: int32, reason: str) =
+    if relay.TurnMetricsEnabled():
+        metrics.TurnMetricsIncAuthFail()
+    if gLogOn:
+        tlog.TurnLogAuthFail(gLogger, clientHost, clientPort, reason)
+
+fn TurnServerBind(s: var relay.TurnServer): int32 =
+    gUdpStop = atomic.NewI32(0)
+    let sockRes = udp.UdpSocketOpenDgram(false)
+    if IsErr(sockRes):
+        return 1
+    let sock = Value(sockRes)
+    var addr: udp.UdpSockAddr
+    let addrRes = udp.UdpSockAddrFromHostPort(s.listenHost, s.listenPort, false, sock.family, s.useLenField, addr)
+    if IsErr(addrRes):
+        let _ = os.UdpCloseFd(sock.fd)
+        return 2
+    let bindRes = udp.UdpBindAddr(sock.fd, addr)
+    if IsErr(bindRes):
+        let _ = os.UdpCloseFd(sock.fd)
+        return 3
+    var bound: udp.UdpSockAddr
+    let nameRes = udp.UdpGetSockName(sock.fd, bound)
+    if IsErr(nameRes):
+        let _ = os.UdpCloseFd(sock.fd)
+        return 4
+    s.listenFd = sock.fd
+    s.family = sock.family
+    s.listenPort = bound.port
+    let tv: Bytes = BytesAlloc(16)
+    BytesSet(tv, 0, turnRecvTimeoutSec)
+    let _ = os.UdpSetSockOptIntFd(s.listenFd, turnSolSocket, turnSoRcvTimeo, tv)
+    return 0
+
+fn TurnServerAuthKey(s: relay.TurnServer, msg: Bytes): Bytes =
+    let username: str = rawbytes.BytesToString(turn.TurnDecodeUsername(msg))
+    let realmStr: str = rawbytes.BytesToString(s.realm)
+    # stage 4: prefer a per-user long-term key from the userdb when loaded
+    if relay.TurnUserDbIsLoaded():
+        let ltKey: Bytes = relay.TurnLookupLongTermKey(username, realmStr)
+        if rawbytes.BytesLen(ltKey) > 0:
+            return ltKey
+    let restSecretView: Bytes = s.restSecret
+    return auth.TurnRestLongTermKey(username, realmStr, restSecretView)
+
+fn TurnServerHasMessageIntegrity(msg: Bytes): bool =
+    return stun.StunFindAttrOffset(msg, stun.StunAttrMessageIntegrity()) >= 0
+
+# Fresh nonce for a 401 challenge (time-stamped HMAC when hardening is on).
+fn TurnServerFreshNonce(s: relay.TurnServer): Bytes =
+    let nowSec: int64 = TurnServerNowSec()
+    return relay.TurnServerFreshNonce(s.nonce, nowSec)
+
+# Validate the request nonce when hardening is on. Returns 0 ok; otherwise sends
+# a 438 Stale Nonce error and returns 1. No-op when hardening is off.
+fn TurnServerNonceOk(s: relay.TurnServer, msgType: int32, msg: Bytes, txid: Bytes, clientHost: str, clientPort: int32): int32 =
+    let nowSec: int64 = TurnServerNowSec()
+    let n: Bytes = turn.TurnDecodeNonce(msg)
+    let v: int32 = relay.TurnServerValidateNonce(n, nowSec)
+    if v != 0:
+        let _ = TurnServerSendError(s, msgType, txid, 438, "Stale Nonce", clientHost, clientPort, rawbytes.EmptyBytes())
+        return 1
+    return 0
+
+fn TurnServerSendError(s: relay.TurnServer, msgType: int32, txid: Bytes, code: int32, reason: str, clientHost: str, clientPort: int32, key: Bytes): int32 =
+    let er: Bytes = turn.TurnEncodeErrorResponse(msgType, txid, code, reason, key, s.software)
+    return relay.TurnServerSendToClient(s, clientHost, clientPort, er)
+
+fn TurnHandleAllocate(s: var relay.TurnServer, msg: Bytes, clientHost: str, clientPort: int32): int32 =
+    let txid: Bytes = turn.TurnMessageTxid(msg)
+    if !TurnServerHasMessageIntegrity(msg):
+        let n: Bytes = TurnServerFreshNonce(s)
+        let ch: Bytes = turn.TurnEncodeAllocate401(txid, s.realm, n, s.software, rawbytes.EmptyBytes())
+        return relay.TurnServerSendToClient(s, clientHost, clientPort, ch)
+    if TurnServerNonceOk(s, turn.TurnAllocateErrorType(), msg, txid, clientHost, clientPort) != 0:
+        return 0
+    let key: Bytes = TurnServerAuthKey(s, msg)
+    if !auth.TurnVerifyMessageIntegrity(msg, key):
+        TurnServerAuthFail(clientHost, clientPort, "bad message-integrity")
+        let n: Bytes = TurnServerFreshNonce(s)
+        let ch: Bytes = turn.TurnEncodeAllocate401(txid, s.realm, n, s.software, rawbytes.EmptyBytes())
+        return relay.TurnServerSendToClient(s, clientHost, clientPort, ch)
+    let user: str = rawbytes.BytesToString(turn.TurnDecodeUsername(msg))
+    TurnServerAuthSuccess(clientHost, clientPort, user)
+    let proto: int32 = turn.TurnDecodeRequestedTransport(msg)
+    if proto != turn.TurnProtoUdp():
+        return TurnServerSendError(s, turn.TurnAllocateErrorType(), txid, 442, "Unsupported Transport Protocol", clientHost, clientPort, key)
+    if relay.TurnAllocFind(s, clientHost, clientPort) >= 0:
+        return TurnServerSendError(s, turn.TurnAllocateErrorType(), txid, 437, "Allocation Mismatch", clientHost, clientPort, key)
+    let lifetime: int32 = turn.TurnDecodeLifetime(msg)
+    let idx: int32 = relay.TurnAllocCreate(s, clientHost, clientPort, lifetime)
+    if idx == -2:
+        return TurnServerSendError(s, turn.TurnAllocateErrorType(), txid, 508, "Rate Limited", clientHost, clientPort, key)
+    if idx < 0:
+        return TurnServerSendError(s, turn.TurnAllocateErrorType(), txid, 508, "Insufficient Capacity", clientHost, clientPort, key)
+    let relayIp: Bytes = relay.TurnAllocRelayedIp(s, idx)
+    let relayPort: int32 = s.allocRelayPort[idx]
+    let lt: int32 = s.allocLifetime[idx]
+    if gLogOn:
+        tlog.TurnLogAllocCreate(gLogger, clientHost, clientPort, relayPort)
+    let resp: Bytes = turn.TurnEncodeAllocateResponse(txid, relayIp, relayPort, lt, rawbytes.EmptyBytes(), false, key, s.software)
+    return relay.TurnServerSendToClient(s, clientHost, clientPort, resp)
+
+fn TurnHandleCreatePermission(s: var relay.TurnServer, msg: Bytes, clientHost: str, clientPort: int32): int32 =
+    let txid: Bytes = turn.TurnMessageTxid(msg)
+    let idx: int32 = relay.TurnAllocFind(s, clientHost, clientPort)
+    if idx < 0:
+        return TurnServerSendError(s, turn.TurnCreatePermissionErrorType(), txid, 437, "Allocation Mismatch", clientHost, clientPort, rawbytes.EmptyBytes())
+    if TurnServerNonceOk(s, turn.TurnCreatePermissionErrorType(), msg, txid, clientHost, clientPort) != 0:
+        return 0
+    let key: Bytes = TurnServerAuthKey(s, msg)
+    if !auth.TurnVerifyMessageIntegrity(msg, key):
+        TurnServerAuthFail(clientHost, clientPort, "bad message-integrity")
+        return TurnServerSendError(s, turn.TurnCreatePermissionErrorType(), txid, 441, "Wrong Credentials", clientHost, clientPort, rawbytes.EmptyBytes())
+    let peer: stun.StunXorMappedAddress = turn.TurnDecodeXorPeerAddress(msg, txid)
+    if peer.family == 0:
+        return TurnServerSendError(s, turn.TurnCreatePermissionErrorType(), txid, 400, "Bad Request", clientHost, clientPort, rawbytes.EmptyBytes())
+    let peerHost: str = relay.TurnHostFromIp(peer.ip)
+    relay.TurnPermAdd(s, idx, peerHost, peer.port)
+    let resp: Bytes = turn.TurnEncodeCreatePermissionResponse(txid, key, s.software)
+    return relay.TurnServerSendToClient(s, clientHost, clientPort, resp)
+
+fn TurnHandleSendIndication(s: var relay.TurnServer, msg: Bytes, clientHost: str, clientPort: int32): int32 =
+    let txid: Bytes = turn.TurnMessageTxid(msg)
+    let idx: int32 = relay.TurnAllocFind(s, clientHost, clientPort)
+    if idx < 0:
+        return 1
+    let peer: stun.StunXorMappedAddress = turn.TurnDecodeXorPeerAddress(msg, txid)
+    if peer.family == 0:
+        return 2
+    let peerHost: str = relay.TurnHostFromIp(peer.ip)
+    if !relay.TurnPermHas(s, idx, peerHost, peer.port):
+        return 3
+    let data: Bytes = turn.TurnDecodeData(msg)
+    if rawbytes.BytesLen(data) <= 0:
+        return 4
+    return relay.TurnRelaySendToPeer(s, idx, peerHost, peer.port, data)
+
+fn TurnHandleChannelBind(s: var relay.TurnServer, msg: Bytes, clientHost: str, clientPort: int32): int32 =
+    let txid: Bytes = turn.TurnMessageTxid(msg)
+    let idx: int32 = relay.TurnAllocFind(s, clientHost, clientPort)
+    if idx < 0:
+        return TurnServerSendError(s, turn.TurnChannelBindErrorType(), txid, 437, "Allocation Mismatch", clientHost, clientPort, rawbytes.EmptyBytes())
+    if TurnServerNonceOk(s, turn.TurnChannelBindErrorType(), msg, txid, clientHost, clientPort) != 0:
+        return 0
+    let key: Bytes = TurnServerAuthKey(s, msg)
+    if !auth.TurnVerifyMessageIntegrity(msg, key):
+        TurnServerAuthFail(clientHost, clientPort, "bad message-integrity")
+        return TurnServerSendError(s, turn.TurnChannelBindErrorType(), txid, 441, "Wrong Credentials", clientHost, clientPort, rawbytes.EmptyBytes())
+    let channel: int32 = turn.TurnDecodeChannelNumber(msg)
+    if !turn.TurnIsValidChannel(channel):
+        return TurnServerSendError(s, turn.TurnChannelBindErrorType(), txid, 400, "Bad Request", clientHost, clientPort, rawbytes.EmptyBytes())
+    let peer: stun.StunXorMappedAddress = turn.TurnDecodeXorPeerAddress(msg, txid)
+    if peer.family == 0:
+        return TurnServerSendError(s, turn.TurnChannelBindErrorType(), txid, 400, "Bad Request", clientHost, clientPort, rawbytes.EmptyBytes())
+    let peerHost: str = relay.TurnHostFromIp(peer.ip)
+    let rc: int32 = relay.TurnChannelAdd(s, idx, peerHost, peer.port)
+    if !turn.TurnIsValidChannel(rc):
+        return TurnServerSendError(s, turn.TurnChannelBindErrorType(), txid, 400, "Bad Request", clientHost, clientPort, key)
+    relay.TurnPermAdd(s, idx, peerHost, peer.port)
+    let resp: Bytes = turn.TurnEncodeChannelBindResponse(txid, key, s.software)
+    return relay.TurnServerSendToClient(s, clientHost, clientPort, resp)
+
+fn TurnHandleRefresh(s: var relay.TurnServer, msg: Bytes, clientHost: str, clientPort: int32): int32 =
+    let txid: Bytes = turn.TurnMessageTxid(msg)
+    let idx: int32 = relay.TurnAllocFind(s, clientHost, clientPort)
+    if idx < 0:
+        return TurnServerSendError(s, turn.TurnRefreshErrorType(), txid, 437, "Allocation Mismatch", clientHost, clientPort, rawbytes.EmptyBytes())
+    if TurnServerNonceOk(s, turn.TurnRefreshErrorType(), msg, txid, clientHost, clientPort) != 0:
+        return 0
+    let key: Bytes = TurnServerAuthKey(s, msg)
+    if !auth.TurnVerifyMessageIntegrity(msg, key):
+        TurnServerAuthFail(clientHost, clientPort, "bad message-integrity")
+        return TurnServerSendError(s, turn.TurnRefreshErrorType(), txid, 441, "Wrong Credentials", clientHost, clientPort, rawbytes.EmptyBytes())
+    let requested: int32 = turn.TurnDecodeLifetime(msg)
+    let lt: int32 = if requested > 0 && requested <= relay.TurnMaxLifetime(): requested else: relay.TurnDefaultLifetime()
+    if lt <= 0:
+        relay.TurnAllocRelease(s, idx)
+        if gLogOn:
+            tlog.TurnLogAllocDelete(gLogger, clientHost, clientPort)
+    else:
+        s.allocLifetime[idx] = lt
+        if gLogOn:
+            tlog.TurnLogAllocRefresh(gLogger, clientHost, clientPort, lt)
+    let resp: Bytes = turn.TurnEncodeRefreshResponse(txid, lt, key, s.software)
+    return relay.TurnServerSendToClient(s, clientHost, clientPort, resp)
+
+fn TurnServerDispatch(s: var relay.TurnServer, msg: Bytes, clientHost: str, clientPort: int32): int32 =
+    if turn.TurnIsAllocateRequest(msg):
+        return TurnHandleAllocate(s, msg, clientHost, clientPort)
+    if turn.TurnIsCreatePermissionRequest(msg):
+        return TurnHandleCreatePermission(s, msg, clientHost, clientPort)
+    if turn.TurnIsSendIndication(msg):
+        return TurnHandleSendIndication(s, msg, clientHost, clientPort)
+    if turn.TurnIsChannelBindRequest(msg):
+        return TurnHandleChannelBind(s, msg, clientHost, clientPort)
+    if turn.TurnIsRefreshRequest(msg):
+        return TurnHandleRefresh(s, msg, clientHost, clientPort)
+    return 3
+
+fn TurnServerProcessOne(s: var relay.TurnServer): int32 =
+    let ready: int32 = os.UdpFdWaitReadable(s.listenFd, 2000)
+    if ready <= 0:
+        return 1
+    var recv: udp.UdpRecvResult
+    let recvRes = udp.UdpRecvFromNonblock(s.listenFd, turnListenRecvBuf, recv)
+    if IsErr(recvRes):
+        return 1
+    let msg: Bytes = recv.data
+    if rawbytes.BytesLen(msg) < 20:
+        return 2
+    let clientHost: str = recv.fromAddr.host
+    let clientPort: int32 = recv.fromAddr.port
+    return TurnServerDispatch(s, msg, clientHost, clientPort)
+
+fn TurnServerPumpAllRelays(s: var relay.TurnServer): int32 =
+    return relay.TurnRelayPumpAll(s)
+
+fn TurnServerRun(s: var relay.TurnServer): int32 =
+    let rc: int32 = TurnServerBind(s)
+    if rc != 0:
+        return rc
+    echo(Fmt"turn_server: listening on {s.listenHost}:{s.listenPort}")
+    while true:
+        let _ = TurnServerProcessOne(s)
+        let _ = TurnServerPumpAllRelays(s)
+    return 0
+
+# Run the event loop on an already-bound server (TurnServerBind called by the
+# caller). Used by the dual-protocol standalone entry to bind UDP+TCP up front,
+# fail fast on either bind, then run UDP in a background thread. No listen
+# banner: the caller prints the combined udp+tcp line.
+fn TurnServerRunBound(s: var relay.TurnServer): int32 =
+    if s.listenFd < 0:
+        return 1
+    while true:
+        if TurnServerStopRequested():
+            break
+        let _ = TurnServerProcessOne(s)
+        let _ = TurnServerPumpAllRelays(s)
+    return 0

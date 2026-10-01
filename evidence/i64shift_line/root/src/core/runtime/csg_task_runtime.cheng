@@ -1,0 +1,1256 @@
+# CSG 统一决策执行内核 —— 唯一事件调度器 (任务 06 首切片)。
+#
+# 合同: docs/campaigns/2026-09-21-csg-decision-computer-use/contract.md
+#   §1 (六类节点统一图) + §2 (唯一调度器与提交权威) + §3 (错误与取消合同);
+# 提案 openspec/proposals/csg-semantic-decision-computer-use.md §4
+# 「事件驱动执行与恢复」。
+#
+# 唯一调度入口: 六类节点 (observe/deterministic/learn/action/execute/receipt)
+# 全部由本文件的 CsgTaskRuntime 推进; 学习后端只计算节点结果, 不持执行循环。
+# 单世代内: 显式依赖边 + 就绪集拓扑推进 (Kahn); 确定性节点先于依赖它的
+# 学习节点求值 (依赖边保证 + evalOrder 顺序记录可断言); 循环依赖 = 显式
+# hard-fail (禁止静默跳过或启发式解环)。
+# 跨世代: StateCommit 事件推进新世代, 整快照严格重铸 (contract §4); 旧世代
+# 节点与结果按 (世代, 索引) 双键失效; 结果复用绑定 (节点, 世代, 问题, 候选集)
+# 四键, 世代推进后派发查找永不命中旧键。
+# 事件源: 目标提交/状态提交/授权变化/取消/截止时间为标量事件队列显式注入;
+# 模型完成/执行回执为携带载荷的类型化完成注入 (CompleteLearn/CompleteExecute,
+# 所有权精确移交)。截止时间只按注入时钟判断, 无忙轮询、无固定间隔重问:
+# RunPass 恰好处理当前队列 + 一轮派发扫描, 步数可断言为有限。
+# 取消: 取消后节点不再派发、在途登记清空、完成注入显式拒绝。
+# 首版执行语义: deterministic 节点同步求值 (复用 csg_exact_planner, 输入由
+# 调用方经 AttachDeterministicPlanner 绑定, 展平为 SoA 池); learn/execute
+# 节点为显式 Pending 在途模型, 结果由调用方经事件回填 —— 在途不是假结果。
+# execute 提交权威接线 (任务 08): 绑定 commit authority 的 execute 节点在
+# 派发时依次过 (1) 单副作用在途闸 —— 每任务至多一个 execute 在途, 第二个
+# 派发显式终态拒绝; (2) 同键重发拒绝 —— 已有结局 (含 Unknown 未核实) 的
+# 动作键禁止再次派发; (3) csg_action_authority 权威准入 —— 凭证一次性消费
+# + 快照世代重验 + 授权撤销感知 (AuthorizationChanged 事件同步撤销未消费
+# 凭证, StateCommit 同步推进权威世代, 整快照严格失效)。任一不过 = 显式
+# 终态, 无副作用。回执 UnknownOutcome 落最小核实记录 (节点+动作+凭证+世代),
+# 终态只能经 ResolveExecuteUnknown 新回执事件写入, 禁止盲目重发。
+# learn 回填一律过 decision_validate 校验门 (DecisionValidateLearnResultAt),
+# 门拒绝 = 显式失败终态, 无任何修补。
+#
+# 内存模型项 (活跃会话期存在、跨任务不保留; 全部随 CsgTaskRuntime 值释放):
+# - 任务节点表 N×(4+4+1+4+8)=N×21B; 依赖边 E×8B
+# - 事件队列 Q×(4+8+8)=Q×20B, RunPass 排空即还
+# - 结果复用表 C×(4+8+8+4+4+4)=C×32B, 世代推进后按世代键失效, 行保留至会话释放
+# - 在途表 ≤B×4B (B=派发预算)
+# - execute 提交权威绑定 (08): 每绑定节点 1B 句柄+4B 凭证行 + 3×str
+#   (动作/effectClass/参数, 绑定期存活, 与图行同生命周期); 核实记录
+#   R×(4+4+str+str+8+1+4), R ≤ Unknown 回执数 (每条对应一次真实执行),
+#   追加式保留至会话释放供审计, 不跨任务保留
+# - deterministic 展平池: 谓词 P×40B + 动作 A×53B + 成员/读写/效果/路径/
+#   初始状态池按元素 4-8B; 求值临时结构随规划调用帧释放 (见 csg_exact_planner)
+# - 图容器列: 见 csg_decision_contract.cheng 头注释 (owner=本调度器;
+#   世代推进整快照重铸, 旧行保留至会话释放, 双键不可再引用)
+
+import std/seqs
+import std/result
+import std/strings
+import cheng/core/runtime/csg_decision_contract as dc
+import cheng/core/runtime/csg_action_authority as auth
+import cheng/core/runtime/csg_goal as cgoal
+import cheng/core/runtime/csg_action_model as camodel
+import cheng/core/runtime/csg_exact_planner as planner
+import cheng/inference/decision_validate as dval
+
+# -------------------------------------------------------------------
+# 事件类 (contract §2 事件族; 截止时间为注入定时事件, 不忙轮询)
+# -------------------------------------------------------------------
+const
+    CsgTaskEventGoalCommit: int32 = 1           # 目标提交: 触发一轮派发扫描
+    CsgTaskEventStateCommit: int32 = 2          # 状态提交: 推进新世代 (整快照重铸)
+    CsgTaskEventAuthorizationChanged: int32 = 3 # 授权变化: 计数登记 (重验接线属 05/08)
+    CsgTaskEventCancel: int32 = 4               # 取消: 在途作废, 不再派发
+    CsgTaskEventDeadline: int32 = 5             # 截止时间定时事件 (携带注入时钟读数)
+
+# -------------------------------------------------------------------
+# 任务终态 (显式状态, 不是回退触发器; 对齐 contract §3 错误族)
+# -------------------------------------------------------------------
+const
+    CsgTaskStatusActive: int32 = 0
+    CsgTaskStatusComplete: int32 = 1
+    CsgTaskStatusFailed: int32 = 2
+    CsgTaskStatusCancelled: int32 = 3
+    CsgTaskStatusDeadlinePassed: int32 = 4
+    CsgTaskStatusBudgetExceeded: int32 = 5
+
+# 节点执行状态 (Pending = 在途等待事件回填, 显式非假结果)
+const
+    CsgTaskNodeStateIdle: uint8 = 0
+    CsgTaskNodeStateDone: uint8 = 1
+    CsgTaskNodeStatePending: uint8 = 2
+    CsgTaskNodeStateTerminal: uint8 = 3
+
+# execute 回执事件的三种真实结局 (contract §1/§3; UnknownOutcome 禁止盲目重发)
+const
+    CsgTaskExecOutcomeOk: int32 = 0
+    CsgTaskExecOutcomeUnknown: int32 = 1
+    CsgTaskExecOutcomeFailed: int32 = 2
+
+# -------------------------------------------------------------------
+# 调度器类型 (唯一生产入口; 全列为 DOD + SoA, 跨节点 int32 索引)
+# -------------------------------------------------------------------
+type
+    CsgTaskRuntime =
+        graph: dc.CsgDecisionGraph
+        graphAdopted: bool
+        # 任务节点表: 节点身份 = tnIndex int32; tnRow = 当前世代下图列行号
+        tnClass: int32[]
+        tnRow: int32[]
+        tnState: uint8[]
+        tnRemaining: int32[]        # 未完成依赖计数 (就绪 = idle 且 0)
+        tnProblem: int64[]          # learn 问题语义键 (非名称)
+        # 显式依赖边: to 依赖 from (from 完成后 to 才就绪)
+        edgeFrom: int32[]
+        edgeTo: int32[]
+        # 标量事件队列 (显式注入, FIFO)
+        evKind: int32[]
+        evGeneration: int64[]
+        evTimestampMs: int64[]
+        evHead: int32
+        # 结果复用表: (节点, 世代, 问题, 候选集) 四键绑定 -> learnResults 行
+        cacheNode: int32[]
+        cacheGen: int64[]
+        cacheProblem: int64[]
+        cacheSetStart: int32[]
+        cacheSetCount: int32[]
+        cacheResultRow: int32[]
+        # 在途登记 (Pending 节点; 取消/世代推进即清空)
+        infNode: int32[]
+        # deterministic 节点精确规划器输入 (展平 SoA 池, 全局池 + 每节点段)
+        dpAttached: uint8[]
+        dpUseDijkstra: uint8[]
+        dpGoalRoot: int32[]
+        dpMaxStates: int32[]
+        dpMaxEdges: int64[]
+        dpDegenerate: uint8[]
+        dpPredStart: int32[]
+        dpPredCount: int32[]
+        dpActionStart: int32[]
+        dpActionCount: int32[]
+        dpInitStart: int32[]
+        dpInitCount: int32[]
+        dpPredKind: int32[]
+        dpPredVar: int32[]
+        dpPredRhs: int32[]
+        dpPredConst: int64[]
+        dpMemberStart: int32[]
+        dpMemberCount: int32[]
+        dpChildA: int32[]
+        dpChildB: int32[]
+        dpChild: int32[]
+        dpMembers: int64[]
+        dpReadVars: int32[]
+        dpReadStart: int32[]
+        dpReadCount: int32[]
+        dpWriteVars: int32[]
+        dpWriteStart: int32[]
+        dpWriteCount: int32[]
+        dpPrecond: int32[]
+        dpEffectKind: int32[]
+        dpEffectTarget: int32[]
+        dpEffectConst: int64[]
+        dpEffectSrc: int32[]
+        dpEffectStart: int32[]
+        dpEffectCount: int32[]
+        dpCost: int64[]
+        dpTotal: uint8[]
+        dpInitVals: int64[]
+        dpInitUnk: uint8[]
+        # deterministic 产出 (逐任务节点)
+        detStatus: int32[]
+        detCost: int64[]
+        detExpandedStates: int32[]
+        detExpandedEdges: int64[]
+        detPathStart: int32[]
+        detPathCount: int32[]
+        detPaths: int32[]
+        # execute / receipt 产出 (逐任务节点; -1 = 未定)
+        execOutcome: int32[]
+        rcptOutcome: int32[]
+        # execute 提交权威绑定 (08 接线): 逐 execute 节点, 未绑定 = 06 语义
+        exBound: uint8[]
+        exActionKind: str[]
+        exEffectClass: str[]
+        exPayload: str[]
+        exCredRow: int32[]
+        # UnknownOutcome 核实记录 (追加式审计列; 终态仅经 ResolveExecuteUnknown)
+        vrNode: int32[]
+        vrActionKind: str[]
+        vrPayload: str[]
+        vrCredRow: int32[]
+        vrGeneration: int64[]
+        vrResolved: uint8[]
+        vrFinalOutcome: int32[]
+        # 预算 / 注入时钟 / 终态旗标 / 计数
+        budgetTotal: int32
+        budgetUsed: int32
+        nowMs: int64
+        deadlineMs: int64
+        cancelled: bool
+        deadlinePassed: bool
+        budgetExceeded: bool
+        failureCount: int32
+        stepCount: int32
+        authVersion: int32
+        evalOrder: int32[]          # 每次节点派发的顺序记录 (可断言)
+
+# -------------------------------------------------------------------
+# 构造与图收养 (图行由调用方经 csg_decision_contract 公开 API 构建;
+# 调度器收养后成为图 owner, 世代重铸为调度器内部职责)
+# -------------------------------------------------------------------
+
+fn CsgTaskRuntimeNew(session: int64, generation: int64, dispatchBudget: int32): CsgTaskRuntime =
+    assert(dispatchBudget >= 1, "csg task runtime: dispatch budget must be positive")
+    var rt: CsgTaskRuntime
+    rt.graph = dc.CsgDecisionGraphNew(session, generation)
+    rt.graphAdopted = false
+    rt.budgetTotal = dispatchBudget
+    rt.budgetUsed = 0
+    rt.nowMs = int64(0)
+    rt.deadlineMs = int64(-1)
+    rt.evHead = 0
+    return rt
+
+fn CsgTaskRuntimeAdoptGraph(rt: var CsgTaskRuntime, graph: dc.CsgDecisionGraph): Result[bool] =
+    if rt.graphAdopted:
+        return Err[bool]("InvalidOutput: task runtime graph already adopted")
+    if graph.session != rt.graph.session:
+        return Err[bool]("InvalidOutput: task runtime graph session mismatch")
+    if graph.generation != rt.graph.generation:
+        return Err[bool]("InvalidOutput: task runtime graph generation mismatch")
+    rt.graph = graph
+    rt.graphAdopted = true
+    return Ok[bool](true)
+
+# -------------------------------------------------------------------
+# 只读访问器 (@borrows 只读臂)
+# -------------------------------------------------------------------
+
+@borrows
+fn CsgTaskRuntimeStatus(rt: CsgTaskRuntime): int32 =
+    if rt.cancelled:
+        return CsgTaskStatusCancelled
+    if rt.budgetExceeded:
+        return CsgTaskStatusBudgetExceeded
+    if rt.deadlinePassed:
+        return CsgTaskStatusDeadlinePassed
+    if rt.failureCount > 0:
+        return CsgTaskStatusFailed
+    var allSettled: bool = true
+    for i in 0..<rt.tnState.len:
+        if rt.tnState[i] == CsgTaskNodeStateIdle || rt.tnState[i] == CsgTaskNodeStatePending:
+            allSettled = false
+    if allSettled:
+        return CsgTaskStatusComplete
+    return CsgTaskStatusActive
+
+@borrows
+fn CsgTaskRuntimeNodeState(rt: CsgTaskRuntime, node: int32): int32 =
+    assert(node >= 0 && node < rt.tnState.len, "csg task runtime: node out of bounds")
+    return int32(rt.tnState[node])
+
+@borrows
+fn CsgTaskRuntimeNodeRow(rt: CsgTaskRuntime, node: int32): int32 =
+    assert(node >= 0 && node < rt.tnRow.len, "csg task runtime: node out of bounds")
+    return rt.tnRow[node]
+
+@borrows
+fn CsgTaskRuntimeInflightCount(rt: CsgTaskRuntime): int32 =
+    return rt.infNode.len
+
+@borrows
+fn CsgTaskRuntimeStepCount(rt: CsgTaskRuntime): int32 =
+    return rt.stepCount
+
+@borrows
+fn CsgTaskRuntimeDispatchUsed(rt: CsgTaskRuntime): int32 =
+    return rt.budgetUsed
+
+@borrows
+fn CsgTaskRuntimeFailureCount(rt: CsgTaskRuntime): int32 =
+    return rt.failureCount
+
+@borrows
+fn CsgTaskRuntimeEvalOrderLen(rt: CsgTaskRuntime): int32 =
+    return rt.evalOrder.len
+
+@borrows
+fn CsgTaskRuntimeEvalOrderAt(rt: CsgTaskRuntime, i: int32): int32 =
+    return rt.evalOrder[i]
+
+@borrows
+fn CsgTaskRuntimeSlotCount(rt: CsgTaskRuntime): int32 =
+    return rt.graph.slots.len
+
+@borrows
+fn CsgTaskRuntimeAuthVersion(rt: CsgTaskRuntime): int32 =
+    return rt.authVersion
+
+@borrows
+fn CsgTaskRuntimeDetStatus(rt: CsgTaskRuntime, node: int32): int32 =
+    return rt.detStatus[node]
+
+@borrows
+fn CsgTaskRuntimeDetCost(rt: CsgTaskRuntime, node: int32): int64 =
+    return rt.detCost[node]
+
+@borrows
+fn CsgTaskRuntimeDetExpandedStates(rt: CsgTaskRuntime, node: int32): int32 =
+    return rt.detExpandedStates[node]
+
+@borrows
+fn CsgTaskRuntimeDetExpandedEdges(rt: CsgTaskRuntime, node: int32): int64 =
+    return rt.detExpandedEdges[node]
+
+@borrows
+fn CsgTaskRuntimeDetPathLen(rt: CsgTaskRuntime, node: int32): int32 =
+    return rt.detPathCount[node]
+
+@borrows
+fn CsgTaskRuntimeDetPathAt(rt: CsgTaskRuntime, node: int32, i: int32): int32 =
+    return rt.detPaths[rt.detPathStart[node] + i]
+
+@borrows
+fn CsgTaskRuntimeExecOutcomeAt(rt: CsgTaskRuntime, node: int32): int32 =
+    return rt.execOutcome[node]
+
+@borrows
+fn CsgTaskRuntimeExecCredRowAt(rt: CsgTaskRuntime, node: int32): int32 =
+    return rt.exCredRow[node]
+
+@borrows
+fn CsgTaskRuntimeRcptOutcomeAt(rt: CsgTaskRuntime, node: int32): int32 =
+    return rt.rcptOutcome[node]
+
+# UnknownOutcome 核实记录访问器 (追加式审计列; 下标即记录行)
+@borrows
+fn CsgTaskRuntimeVerifyRecordCount(rt: CsgTaskRuntime): int32 =
+    return rt.vrNode.len
+
+@borrows
+fn CsgTaskRuntimeVerifyRecordNodeAt(rt: CsgTaskRuntime, i: int32): int32 =
+    return rt.vrNode[i]
+
+@borrows
+fn CsgTaskRuntimeVerifyRecordResolvedAt(rt: CsgTaskRuntime, i: int32): int32 =
+    return int32(rt.vrResolved[i])
+
+@borrows
+fn CsgTaskRuntimeVerifyRecordFinalAt(rt: CsgTaskRuntime, i: int32): int32 =
+    return rt.vrFinalOutcome[i]
+
+@borrows
+fn CsgTaskRuntimeVerifyRecordCredRowAt(rt: CsgTaskRuntime, i: int32): int32 =
+    return rt.vrCredRow[i]
+
+@borrows
+fn CsgTaskRuntimeVerifyRecordGenerationAt(rt: CsgTaskRuntime, i: int32): int64 =
+    return rt.vrGeneration[i]
+
+# 结果复用精确绑定探测: 四键 (节点, 世代, 问题, 候选集) 全匹配才命中。
+@borrows
+fn CsgTaskRuntimeLearnCacheProbe(rt: CsgTaskRuntime, node: int32, generation: int64,
+                                 problem: int64, setStart: int32, setCount: int32): bool =
+    for i in 0..<rt.cacheNode.len:
+        if rt.cacheNode[i] == node && rt.cacheGen[i] == generation &&
+           rt.cacheProblem[i] == problem && rt.cacheSetStart[i] == setStart &&
+           rt.cacheSetCount[i] == setCount:
+            return true
+    return false
+
+# -------------------------------------------------------------------
+# 引用校验 (复用 decision_validate 唯一权威; 槽位类 1..13 与节点类 101..108
+# 同一入口)
+# -------------------------------------------------------------------
+
+@borrows
+fn csgTaskRuntimeCheckRef(rt: CsgTaskRuntime, index: int32, kind: int32): Result[bool] =
+    var r: dc.CsgDecisionRef
+    r.session = rt.graph.session
+    r.generation = rt.graph.generation
+    r.index = index
+    r.kind = kind
+    return dval.DecisionValidateRef(share(rt.graph), r)
+
+# -------------------------------------------------------------------
+# 节点注册 (图行由调用方先行构建并保持当前世代; 引用逐个过校验门)
+# -------------------------------------------------------------------
+
+fn CsgTaskRuntimeRegisterNode(rt: var CsgTaskRuntime, class: int32, row: int32,
+                              problemKey: int64): Result[int32] =
+    if !rt.graphAdopted:
+        return Err[int32]("InvalidOutput: task runtime graph not adopted")
+    var rowCount: int32 = 0 - 1
+    if class == dc.CsgDecisionNodeClassObserve:
+        rowCount = rt.graph.observes.len
+    elif class == dc.CsgDecisionNodeClassDeterministic:
+        rowCount = rt.graph.deterministics.len
+    elif class == dc.CsgDecisionNodeClassLearn:
+        rowCount = rt.graph.learns.len
+    elif class == dc.CsgDecisionNodeClassAction:
+        rowCount = rt.graph.actions.len
+    elif class == dc.CsgDecisionNodeClassExecute:
+        rowCount = rt.graph.executes.len
+    elif class == dc.CsgDecisionNodeClassReceipt:
+        rowCount = rt.graph.receipts.len
+    else:
+        return Err[int32]("InvalidOutput: task runtime node class unknown")
+    if row < 0 || row >= rowCount:
+        return Err[int32]("InvalidOutput: task runtime register row out of bounds")
+    if class == dc.CsgDecisionNodeClassObserve:
+        if rt.graph.observes[row].generation != rt.graph.generation:
+            return Err[int32]("InvalidOutput: task runtime register stale generation row")
+    if class == dc.CsgDecisionNodeClassDeterministic:
+        if rt.graph.deterministics[row].generation != rt.graph.generation:
+            return Err[int32]("InvalidOutput: task runtime register stale generation row")
+    if class == dc.CsgDecisionNodeClassLearn:
+        if rt.graph.learns[row].generation != rt.graph.generation:
+            return Err[int32]("InvalidOutput: task runtime register stale generation row")
+    if class == dc.CsgDecisionNodeClassAction:
+        if rt.graph.actions[row].generation != rt.graph.generation:
+            return Err[int32]("InvalidOutput: task runtime register stale generation row")
+    if class == dc.CsgDecisionNodeClassExecute:
+        if rt.graph.executes[row].generation != rt.graph.generation:
+            return Err[int32]("InvalidOutput: task runtime register stale generation row")
+    if class == dc.CsgDecisionNodeClassReceipt:
+        if rt.graph.receipts[row].generation != rt.graph.generation:
+            return Err[int32]("InvalidOutput: task runtime register stale generation row")
+    for i in 0..<rt.tnClass.len:
+        if rt.tnClass[i] == class && rt.tnRow[i] == row:
+            return Err[int32]("InvalidOutput: task runtime duplicate node registration")
+    # 逐类引用校验 (contract §1 载荷表; 门 = decision_validate)
+    if class == dc.CsgDecisionNodeClassObserve:
+        var g1 = csgTaskRuntimeCheckRef(rt, rt.graph.observes[row].snapshotRef, dc.CsgDecisionSlotKindSnapshot)
+        if IsErr(g1):
+            return Err[int32](Error(g1))
+        var g2 = csgTaskRuntimeCheckRef(rt, rt.graph.observes[row].sourceReceiptRef, dc.CsgDecisionSlotKindReceipt)
+        if IsErr(g2):
+            return Err[int32](Error(g2))
+        var g3 = csgTaskRuntimeCheckRef(rt, rt.graph.observes[row].evidenceRef, dc.CsgDecisionSlotKindEvidence)
+        if IsErr(g3):
+            return Err[int32](Error(g3))
+    if class == dc.CsgDecisionNodeClassDeterministic:
+        var g1 = csgTaskRuntimeCheckRef(rt, rt.graph.deterministics[row].predicateRef, dc.CsgDecisionSlotKindPredicate)
+        if IsErr(g1):
+            return Err[int32](Error(g1))
+        var g2 = csgTaskRuntimeCheckRef(rt, rt.graph.deterministics[row].actionModelRef, dc.CsgDecisionSlotKindActionModel)
+        if IsErr(g2):
+            return Err[int32](Error(g2))
+        var g3 = csgTaskRuntimeCheckRef(rt, rt.graph.deterministics[row].budgetRef, dc.CsgDecisionSlotKindBudget)
+        if IsErr(g3):
+            return Err[int32](Error(g3))
+        var g4 = csgTaskRuntimeCheckRef(rt, rt.graph.deterministics[row].evidenceRef, dc.CsgDecisionSlotKindEvidence)
+        if IsErr(g4):
+            return Err[int32](Error(g4))
+    if class == dc.CsgDecisionNodeClassLearn:
+        let headKind = rt.graph.learns[row].headKind
+        if headKind != dc.CsgDecisionHeadChoice && headKind != dc.CsgDecisionHeadNoul && headKind != dc.CsgDecisionHeadScore:
+            return Err[int32]("InvalidOutput: task runtime learn head kind unknown")
+        var g1 = csgTaskRuntimeCheckRef(rt, rt.graph.learns[row].evidenceRef, dc.CsgDecisionSlotKindEvidence)
+        if IsErr(g1):
+            return Err[int32](Error(g1))
+        var g2 = csgTaskRuntimeCheckRef(rt, rt.graph.learns[row].backendRef, dc.CsgDecisionSlotKindBackend)
+        if IsErr(g2):
+            return Err[int32](Error(g2))
+    if class == dc.CsgDecisionNodeClassAction:
+        var g1 = csgTaskRuntimeCheckRef(rt, rt.graph.actions[row].candidateRef, dc.CsgDecisionRefKindCandidate)
+        if IsErr(g1):
+            return Err[int32](Error(g1))
+        var g2 = csgTaskRuntimeCheckRef(rt, rt.graph.actions[row].authorizationRef, dc.CsgDecisionSlotKindAuthorization)
+        if IsErr(g2):
+            return Err[int32](Error(g2))
+        var g3 = csgTaskRuntimeCheckRef(rt, rt.graph.actions[row].preconditionRef, dc.CsgDecisionSlotKindPrecondition)
+        if IsErr(g3):
+            return Err[int32](Error(g3))
+    if class == dc.CsgDecisionNodeClassExecute:
+        var g1 = csgTaskRuntimeCheckRef(rt, rt.graph.executes[row].actionRef, dc.CsgDecisionRefKindAction)
+        if IsErr(g1):
+            return Err[int32](Error(g1))
+        var g2 = csgTaskRuntimeCheckRef(rt, rt.graph.executes[row].commitAuthorityRef, dc.CsgDecisionSlotKindCommitAuthority)
+        if IsErr(g2):
+            return Err[int32](Error(g2))
+    if class == dc.CsgDecisionNodeClassReceipt:
+        var g1 = csgTaskRuntimeCheckRef(rt, rt.graph.receipts[row].executionRef, dc.CsgDecisionRefKindExecute)
+        if IsErr(g1):
+            return Err[int32](Error(g1))
+        var g2 = csgTaskRuntimeCheckRef(rt, rt.graph.receipts[row].goalPredicateRef, dc.CsgDecisionSlotKindPredicate)
+        if IsErr(g2):
+            return Err[int32](Error(g2))
+    add(rt.tnClass, class)
+    add(rt.tnRow, row)
+    add(rt.tnState, CsgTaskNodeStateIdle)
+    add(rt.tnRemaining, 0)
+    add(rt.tnProblem, problemKey)
+    add(rt.dpAttached, uint8(0))
+    add(rt.dpUseDijkstra, uint8(0))
+    add(rt.dpGoalRoot, 0)
+    add(rt.dpMaxStates, 0)
+    add(rt.dpMaxEdges, int64(0))
+    add(rt.dpDegenerate, uint8(0))
+    add(rt.dpPredStart, 0)
+    add(rt.dpPredCount, 0)
+    add(rt.dpActionStart, 0)
+    add(rt.dpActionCount, 0)
+    add(rt.dpInitStart, 0)
+    add(rt.dpInitCount, 0)
+    add(rt.detStatus, 0 - 1)
+    add(rt.detCost, int64(0))
+    add(rt.detExpandedStates, 0)
+    add(rt.detExpandedEdges, int64(0))
+    add(rt.detPathStart, 0)
+    add(rt.detPathCount, 0)
+    add(rt.execOutcome, 0 - 1)
+    add(rt.rcptOutcome, 0 - 1)
+    add(rt.exBound, uint8(0))
+    add(rt.exActionKind, "")
+    add(rt.exEffectClass, "")
+    add(rt.exPayload, "")
+    add(rt.exCredRow, 0 - 1)
+    return Ok[int32](rt.tnClass.len - 1)
+
+# 显式依赖边: toNode 依赖 fromNode。自环/重复边显式拒绝。
+fn CsgTaskRuntimeAddDependency(rt: var CsgTaskRuntime, fromNode: int32, toNode: int32): Result[bool] =
+    if fromNode < 0 || fromNode >= rt.tnClass.len || toNode < 0 || toNode >= rt.tnClass.len:
+        return Err[bool]("InvalidOutput: task runtime dependency node out of bounds")
+    if fromNode == toNode:
+        return Err[bool]("InvalidOutput: task runtime self dependency edge")
+    for e in 0..<rt.edgeFrom.len:
+        if rt.edgeFrom[e] == fromNode && rt.edgeTo[e] == toNode:
+            return Err[bool]("InvalidOutput: task runtime duplicate dependency edge")
+    add(rt.edgeFrom, fromNode)
+    add(rt.edgeTo, toNode)
+    rt.tnRemaining[toNode] = rt.tnRemaining[toNode] + 1
+    return Ok[bool](true)
+
+# -------------------------------------------------------------------
+# deterministic 节点精确规划器绑定 (输入展平为 SoA 池; 调度器在派发时
+# 同步复用 csg_exact_planner 求值 —— 求值时机由调度器唯一决定)
+# -------------------------------------------------------------------
+
+fn CsgTaskRuntimeAttachDeterministicPlanner(rt: var CsgTaskRuntime, node: int32,
+                                            useDijkstra: bool,
+                                            goalRoot: int32,
+                                            maxStates: int32,
+                                            maxEdges: int64,
+                                            degenerateHash: uint8,
+                                            preds: cgoal.CsgGoalPredicateSet,
+                                            actions: camodel.CsgActionModel,
+                                            initVals: int64[],
+                                            initUnk: uint8[]): Result[bool] =
+    if node < 0 || node >= rt.tnClass.len:
+        return Err[bool]("InvalidOutput: task runtime attach node out of bounds")
+    if rt.tnClass[node] != dc.CsgDecisionNodeClassDeterministic:
+        return Err[bool]("InvalidOutput: task runtime attach class mismatch")
+    if rt.dpAttached[node] != uint8(0):
+        return Err[bool]("InvalidOutput: task runtime planner already attached")
+    if initVals.len <= 0 || initVals.len != initUnk.len:
+        return Err[bool]("InvalidOutput: task runtime attach initial state invalid")
+    if goalRoot < 0 || goalRoot >= preds.count:
+        return Err[bool]("InvalidOutput: task runtime attach goal root out of bounds")
+    if maxStates < 1 || maxStates > planner.CsgExactPlannerMaxStateBudget:
+        return Err[bool]("InvalidOutput: task runtime attach state budget invalid")
+    if maxEdges < int64(0):
+        return Err[bool]("InvalidOutput: task runtime attach edge budget invalid")
+    # 谓词行展平 (子谓词下标为集合内相对下标, 原样保留)
+    rt.dpPredStart[node] = rt.dpPredKind.len
+    rt.dpPredCount[node] = preds.count
+    for i in 0..<preds.count:
+        add(rt.dpPredKind, preds.kind[i])
+        add(rt.dpPredVar, preds.varIndex[i])
+        add(rt.dpPredRhs, preds.rhsVar[i])
+        add(rt.dpPredConst, preds.constant[i])
+        let mStart: int32 = rt.dpMembers.len
+        let mCount: int32 = preds.memberCount[i]
+        for j in 0..<mCount:
+            add(rt.dpMembers, preds.members[preds.memberStart[i] + j])
+        add(rt.dpMemberStart, mStart)
+        add(rt.dpMemberCount, mCount)
+        add(rt.dpChildA, preds.childA[i])
+        add(rt.dpChildB, preds.childB[i])
+        add(rt.dpChild, preds.child[i])
+    # 动作行展平 (读/写/效果池为全局池下标, 原样保留)
+    rt.dpActionStart[node] = rt.dpPrecond.len
+    rt.dpActionCount[node] = actions.count
+    for i in 0..<actions.count:
+        let rStart: int32 = rt.dpReadVars.len
+        let rCount: int32 = actions.readCount[i]
+        for j in 0..<rCount:
+            add(rt.dpReadVars, actions.readVars[actions.readStart[i] + j])
+        add(rt.dpReadStart, rStart)
+        add(rt.dpReadCount, rCount)
+        let wStart: int32 = rt.dpWriteVars.len
+        let wCount: int32 = actions.writeCount[i]
+        for j in 0..<wCount:
+            add(rt.dpWriteVars, actions.writeVars[actions.writeStart[i] + j])
+        add(rt.dpWriteStart, wStart)
+        add(rt.dpWriteCount, wCount)
+        add(rt.dpPrecond, actions.precondition[i])
+        let eStart: int32 = rt.dpEffectKind.len
+        let eCount: int32 = actions.effectCount[i]
+        for j in 0..<eCount:
+            add(rt.dpEffectKind, actions.effectKind[actions.effectStart[i] + j])
+            add(rt.dpEffectTarget, actions.effectTarget[actions.effectStart[i] + j])
+            add(rt.dpEffectConst, actions.effectConst[actions.effectStart[i] + j])
+            add(rt.dpEffectSrc, actions.effectSrcVar[actions.effectStart[i] + j])
+        add(rt.dpEffectStart, eStart)
+        add(rt.dpEffectCount, eCount)
+        add(rt.dpCost, actions.cost[i])
+        add(rt.dpTotal, actions.totalUnderTruePrecond[i])
+    # 初始状态展平
+    rt.dpInitStart[node] = rt.dpInitVals.len
+    rt.dpInitCount[node] = initVals.len
+    for j in 0..<initVals.len:
+        add(rt.dpInitVals, initVals[j])
+        add(rt.dpInitUnk, initUnk[j])
+    if useDijkstra:
+        rt.dpUseDijkstra[node] = uint8(1)
+    else:
+        rt.dpUseDijkstra[node] = uint8(0)
+    rt.dpGoalRoot[node] = goalRoot
+    rt.dpMaxStates[node] = maxStates
+    rt.dpMaxEdges[node] = maxEdges
+    rt.dpDegenerate[node] = degenerateHash
+    rt.dpAttached[node] = uint8(1)
+    return Ok[bool](true)
+
+# -------------------------------------------------------------------
+# 事件注入 (标量队列; StateCommit 世代单调性在注入处显式校验)
+# -------------------------------------------------------------------
+
+fn CsgTaskRuntimePostEvent(rt: var CsgTaskRuntime, kind: int32,
+                           newGeneration: int64, timestampMs: int64): Result[bool] =
+    if rt.cancelled:
+        return Err[bool]("Cancelled: task runtime cancelled; events rejected")
+    if rt.budgetExceeded:
+        return Err[bool]("BudgetExceeded: task runtime terminal; events rejected")
+    if rt.deadlinePassed:
+        return Err[bool]("DeadlinePassed: task runtime terminal; events rejected")
+    if kind == CsgTaskEventStateCommit:
+        if newGeneration <= rt.graph.generation:
+            return Err[bool]("InvalidOutput: task runtime generation must be monotonic")
+    elif kind != CsgTaskEventGoalCommit && kind != CsgTaskEventAuthorizationChanged &&
+         kind != CsgTaskEventCancel && kind != CsgTaskEventDeadline:
+        return Err[bool]("InvalidOutput: task runtime event kind unknown")
+    add(rt.evKind, kind)
+    add(rt.evGeneration, newGeneration)
+    add(rt.evTimestampMs, timestampMs)
+    return Ok[bool](true)
+
+# 注入时钟: 调度器不读墙钟, 时间只经此入口与 Deadline 事件进入。
+fn CsgTaskRuntimeInjectClock(rt: var CsgTaskRuntime, nowMs: int64) =
+    rt.nowMs = nowMs
+
+fn CsgTaskRuntimeSetDeadline(rt: var CsgTaskRuntime, deadlineMs: int64) =
+    rt.deadlineMs = deadlineMs
+
+# -------------------------------------------------------------------
+# 派发引擎的窄列辅助 (@borrows 只读 + var 写入共存; 循环内只传字段)
+# -------------------------------------------------------------------
+
+@borrows
+fn csgTaskRuntimeFindReady(rt: CsgTaskRuntime): int32 =
+    for i in 0..<rt.tnState.len:
+        if rt.tnState[i] == CsgTaskNodeStateIdle && rt.tnRemaining[i] == 0:
+            return i
+    return 0 - 1
+
+@borrows
+fn runtimeUnlockDependents(remaining: var int32[], edgeFrom: int32[], edgeTo: int32[], node: int32) =
+    for e in 0..<edgeFrom.len:
+        if edgeFrom[e] == node:
+            let d: int32 = edgeTo[e]
+            remaining[d] = remaining[d] - 1
+
+# 显式失败终态 + 依赖级联 (错误是显式状态; 依赖失败者永不静默跳过)。
+# 失败行落图 failures 列 (kind 必属 contract §3 错误族, 由构造器强制)。
+@borrows
+fn runtimeCascadeTerminal(tnState: var uint8[],
+                          infNode: var int32[],
+                          edgeFrom: int32[],
+                          edgeTo: int32[],
+                          graph: var dc.CsgDecisionGraph,
+                          failureCount: var int32,
+                          seed: int32,
+                          kind: str,
+                          detail: str) =
+    var wl: int32[]
+    add(wl, seed)
+    while wl.len > 0:
+        let cur: int32 = wl[wl.len - 1]
+        setLen(wl, wl.len - 1)
+        if tnState[cur] == CsgTaskNodeStateTerminal:
+            continue
+        tnState[cur] = CsgTaskNodeStateTerminal
+        var at: int32 = 0 - 1
+        for i in 0..<infNode.len:
+            if infNode[i] == cur:
+                at = i
+        if at >= 0:
+            infNode[at] = infNode[infNode.len - 1]
+            setLen(infNode, infNode.len - 1)
+        var frRes = dc.CsgDecisionFailureNew(kind, detail)
+        if IsErr(frRes):
+            assert(false, "csg task runtime: failure kind must be from contract family")
+        else:
+            add(graph.failures, Value(frRes))
+        failureCount = failureCount + 1
+        for e in 0..<edgeFrom.len:
+            if edgeFrom[e] == cur:
+                let d: int32 = edgeTo[e]
+                if tnState[d] != CsgTaskNodeStateTerminal:
+                    add(wl, d)
+
+# 在途登记移除 (swap-pop; 窄列)
+fn runtimeInflightRemove(infNode: var int32[], node: int32) =
+    var at: int32 = 0 - 1
+    for i in 0..<infNode.len:
+        if infNode[i] == node:
+            at = i
+    if at >= 0:
+        infNode[at] = infNode[infNode.len - 1]
+        setLen(infNode, infNode.len - 1)
+
+# 单副作用在途闸 (contract §2): 除自身外是否已有 execute 节点在途。
+@borrows
+fn csgTaskRuntimeSideEffectInflight(rt: CsgTaskRuntime, selfNode: int32): bool =
+    var i: int32 = 0
+    while i < rt.infNode.len:
+        let p: int32 = rt.infNode[i]
+        if p != selfNode && rt.tnClass[p] == dc.CsgDecisionNodeClassExecute:
+            return true
+        i = i + 1
+    return false
+
+# 同键重发拒绝: 绑定键 (动作, 参数) 已有 recorded 结局 (Ok/Unknown/Failed,
+# 含 Unknown 未核实) 的 execute 节点禁止再次派发。
+@borrows
+fn csgTaskRuntimeResendBlocked(rt: CsgTaskRuntime, actionKind: str, payload: str): bool =
+    var i: int32 = 0
+    while i < rt.tnClass.len:
+        if rt.tnClass[i] == dc.CsgDecisionNodeClassExecute && rt.exBound[i] == uint8(1) &&
+           rt.execOutcome[i] != 0 - 1 &&
+           rt.exActionKind[i] == actionKind && rt.exPayload[i] == payload:
+            return true
+        i = i + 1
+    return false
+
+# -------------------------------------------------------------------
+# learn 完成 (模型完成事件, 载荷型注入): 绑定校验 -> 提交 -> 校验门 ->
+# 复用表登记 -> 解锁依赖。门拒绝 = 显式失败终态。
+# -------------------------------------------------------------------
+
+fn CsgTaskRuntimeCompleteLearn(rt: var CsgTaskRuntime, node: int32, problemKey: int64,
+                               res: dc.CsgDecisionLearnResult): Result[bool] =
+    if rt.cancelled:
+        return Err[bool]("Cancelled: task runtime cancelled before completion")
+    if rt.budgetExceeded:
+        return Err[bool]("BudgetExceeded: task runtime terminal before completion")
+    if rt.deadlinePassed:
+        return Err[bool]("DeadlinePassed: task runtime terminal before completion")
+    if node < 0 || node >= rt.tnClass.len:
+        return Err[bool]("InvalidOutput: task runtime completion node out of bounds")
+    if rt.tnClass[node] != dc.CsgDecisionNodeClassLearn:
+        return Err[bool]("InvalidOutput: task runtime completion class mismatch")
+    if rt.tnState[node] != CsgTaskNodeStatePending:
+        return Err[bool]("InvalidOutput: task runtime completion without pending dispatch")
+    if rt.tnProblem[node] != problemKey:
+        return Err[bool]("InvalidOutput: task runtime completion problem binding mismatch")
+    if res.generation != rt.graph.generation:
+        return Err[bool]("InvalidOutput: task runtime completion stale generation")
+    if res.learnRef != rt.tnRow[node]:
+        return Err[bool]("InvalidOutput: task runtime completion learn ref mismatch")
+    if res.headKind != rt.graph.learns[rt.tnRow[node]].headKind:
+        return Err[bool]("InvalidOutput: task runtime completion head kind mismatch")
+    # 提交后过唯一校验门; 门拒绝即任务显式失败 (不修补, 不截断)
+    let rowIdx: int32 = rt.graph.learnResults.len
+    dc.CsgDecisionLearnResultAdd(rt.graph, res)
+    var gate = dval.DecisionValidateLearnResultAt(share(rt.graph), rowIdx)
+    if IsErr(gate):
+        let msg = Error(gate)
+        runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+            rt.graph, rt.failureCount, node, dc.CsgDecisionErrInvalidOutput, msg)
+        return Err[bool](msg)
+    # 结果复用登记: (节点, 世代, 问题, 候选集) 四键绑定
+    let row: int32 = rt.tnRow[node]
+    add(rt.cacheNode, node)
+    add(rt.cacheGen, rt.graph.generation)
+    add(rt.cacheProblem, rt.tnProblem[node])
+    add(rt.cacheSetStart, rt.graph.learns[row].candidateSetRef)
+    add(rt.cacheSetCount, rt.graph.learns[row].candidateCount)
+    add(rt.cacheResultRow, rowIdx)
+    rt.tnState[node] = CsgTaskNodeStateDone
+    runtimeInflightRemove(rt.infNode, node)
+    runtimeUnlockDependents(rt.tnRemaining, rt.edgeFrom, rt.edgeTo, node)
+    return Ok[bool](true)
+
+# -------------------------------------------------------------------
+# execute 提交权威绑定 (08 接线入口): 调用方为 execute 节点提名真实动作
+# (动作/effectClass/参数); 词表合法性在绑定期显式暴露, 消费与世代/撤销
+# 重验在派发时执行 (执行前重验, 绑定不预支)。未绑定节点保持 06 在途语义。
+# -------------------------------------------------------------------
+
+fn CsgTaskRuntimeBindExecuteAuthority(rt: var CsgTaskRuntime, node: int32,
+                                      actionKind: str, effectClass: str,
+                                      payload: str): Result[bool] =
+    if node < 0 || node >= rt.tnClass.len:
+        return Err[bool]("InvalidOutput: task runtime bind node out of bounds")
+    if rt.tnClass[node] != dc.CsgDecisionNodeClassExecute:
+        return Err[bool]("InvalidOutput: task runtime bind class mismatch")
+    if rt.exBound[node] != uint8(0):
+        return Err[bool]("InvalidOutput: task runtime execute already bound")
+    if !auth.CsgActionAuthorityActionRegistered(actionKind):
+        return Err[bool]("InvalidOutput: task runtime bind action kind unknown to authority")
+    if auth.CsgActionAuthorityRowLookup(actionKind, effectClass) < 0:
+        return Err[bool]("InvalidOutput: task runtime bind effect class not registered")
+    rt.exActionKind[node] = strings.CloneStr(actionKind)
+    rt.exEffectClass[node] = strings.CloneStr(effectClass)
+    rt.exPayload[node] = strings.CloneStr(payload)
+    rt.exBound[node] = uint8(1)
+    return Ok[bool](true)
+
+# -------------------------------------------------------------------
+# execute 回执 (执行回执事件, 载荷型注入): Ok/Unknown 完成, Failed 显式
+# 失败终态并级联; UnknownOutcome 记录待核实, 不盲目重发。
+# -------------------------------------------------------------------
+
+fn CsgTaskRuntimeCompleteExecute(rt: var CsgTaskRuntime, node: int32, outcomeKind: int32): Result[bool] =
+    if rt.cancelled:
+        return Err[bool]("Cancelled: task runtime cancelled before completion")
+    if rt.budgetExceeded:
+        return Err[bool]("BudgetExceeded: task runtime terminal before completion")
+    if rt.deadlinePassed:
+        return Err[bool]("DeadlinePassed: task runtime terminal before completion")
+    if node < 0 || node >= rt.tnClass.len:
+        return Err[bool]("InvalidOutput: task runtime completion node out of bounds")
+    if rt.tnClass[node] != dc.CsgDecisionNodeClassExecute:
+        return Err[bool]("InvalidOutput: task runtime completion class mismatch")
+    if rt.tnState[node] != CsgTaskNodeStatePending:
+        return Err[bool]("InvalidOutput: task runtime completion without pending dispatch")
+    if outcomeKind != CsgTaskExecOutcomeOk && outcomeKind != CsgTaskExecOutcomeUnknown &&
+       outcomeKind != CsgTaskExecOutcomeFailed:
+        return Err[bool]("InvalidOutput: task runtime execute outcome kind unknown")
+    rt.execOutcome[node] = outcomeKind
+    if outcomeKind == CsgTaskExecOutcomeUnknown:
+        # 08: 最小核实记录 (节点+动作+凭证+世代绑定); 同键动作在未核实期
+        # (及此后) 禁止再派发, 终态只能经 ResolveExecuteUnknown 回执事件写入
+        if rt.exBound[node] == uint8(1):
+            add(rt.vrNode, node)
+            add(rt.vrActionKind, strings.CloneStr(rt.exActionKind[node]))
+            add(rt.vrPayload, strings.CloneStr(rt.exPayload[node]))
+            add(rt.vrCredRow, rt.exCredRow[node])
+            add(rt.vrGeneration, rt.graph.generation)
+            add(rt.vrResolved, uint8(0))
+            add(rt.vrFinalOutcome, 0 - 1)
+    if outcomeKind == CsgTaskExecOutcomeFailed:
+        runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+            rt.graph, rt.failureCount, node, dc.CsgDecisionErrExecutionFailed,
+            "task runtime: execute node failed")
+        return Err[bool]("ExecutionFailed: task runtime execute node failed")
+    rt.tnState[node] = CsgTaskNodeStateDone
+    runtimeInflightRemove(rt.infNode, node)
+    runtimeUnlockDependents(rt.tnRemaining, rt.edgeFrom, rt.edgeTo, node)
+    return Ok[bool](true)
+
+# UnknownOutcome 核实回执事件 (新回执事件, 唯一终态化通道): 核实结果必须是
+# 真实终局 (Ok/Failed), 再发 Unknown 显式拒绝。只翻核实记录位, 不重派动作。
+fn CsgTaskRuntimeResolveExecuteUnknown(rt: var CsgTaskRuntime, node: int32,
+                                       finalOutcome: int32): Result[bool] =
+    if rt.cancelled:
+        return Err[bool]("Cancelled: task runtime cancelled before verification")
+    if rt.budgetExceeded:
+        return Err[bool]("BudgetExceeded: task runtime terminal before verification")
+    if rt.deadlinePassed:
+        return Err[bool]("DeadlinePassed: task runtime terminal before verification")
+    if node < 0 || node >= rt.tnClass.len:
+        return Err[bool]("InvalidOutput: task runtime verify node out of bounds")
+    if rt.tnClass[node] != dc.CsgDecisionNodeClassExecute:
+        return Err[bool]("InvalidOutput: task runtime verify class mismatch")
+    if finalOutcome != CsgTaskExecOutcomeOk && finalOutcome != CsgTaskExecOutcomeFailed:
+        return Err[bool]("InvalidOutput: task runtime verify outcome must be real terminal")
+    var at: int32 = 0 - 1
+    var i: int32 = 0
+    while i < rt.vrNode.len:
+        if rt.vrNode[i] == node && rt.vrResolved[i] == uint8(0):
+            at = i
+        i = i + 1
+    if at < 0:
+        return Err[bool]("InvalidOutput: task runtime no unresolved unknown record for node")
+    rt.vrResolved[at] = uint8(1)
+    rt.vrFinalOutcome[at] = finalOutcome
+    return Ok[bool](true)
+
+# -------------------------------------------------------------------
+# RunPass: 唯一推进循环。恰好排空当前事件队列 + 一轮派发扫描; 终态守卫
+# 在派发扫描顶部; 队列排空即还。无事件时返回, 绝不自旋等待。
+# -------------------------------------------------------------------
+
+fn CsgTaskRuntimeRunPass(rt: var CsgTaskRuntime): Result[int32] =
+    # ---- 事件排空 ----
+    while rt.evHead < rt.evKind.len:
+        let ev: int32 = rt.evKind[rt.evHead]
+        let evGen: int64 = rt.evGeneration[rt.evHead]
+        let evTs: int64 = rt.evTimestampMs[rt.evHead]
+        rt.evHead = rt.evHead + 1
+        rt.stepCount = rt.stepCount + 1
+        # 目标提交 (GoalCommit) 无事件体: 派发机会在队列排空后统一执行;
+        # goalCommitSeen 是显式空事件体的真实语句位, 不用任何空语句形式
+        var goalCommitSeen: int32 = 0
+        if ev == CsgTaskEventGoalCommit:
+            goalCommitSeen = goalCommitSeen + 1
+        elif ev == CsgTaskEventStateCommit:
+            # 整快照严格重铸: 全列按 (旧行 + 偏移) 重铸为当前世代, 旧行保留
+            # 在列内成为不可引用历史 (世代+索引双键失效)
+            let newGen: int64 = evGen
+            let slotBase: int32 = rt.graph.slots.len
+            let oldSlots: int32 = rt.graph.slots.len
+            for i in 0..<oldSlots:
+                var s = rt.graph.slots[i]
+                s.generation = newGen
+                add(rt.graph.slots, s)
+            let candBase: int32 = rt.graph.candidates.len
+            let oldCands: int32 = rt.graph.candidates.len
+            for i in 0..<oldCands:
+                var c = rt.graph.candidates[i]
+                var ps: int32[]
+                for j in 0..<c.paramSlots.len:
+                    add(ps, c.paramSlots[j] + slotBase)
+                c.paramSlots = ps
+                c.generation = newGen
+                add(rt.graph.candidates, c)
+            let obsBase: int32 = rt.graph.observes.len
+            let oldObs: int32 = rt.graph.observes.len
+            for i in 0..<oldObs:
+                var n = rt.graph.observes[i]
+                n.snapshotRef = n.snapshotRef + slotBase
+                n.sourceReceiptRef = n.sourceReceiptRef + slotBase
+                n.evidenceRef = n.evidenceRef + slotBase
+                n.generation = newGen
+                add(rt.graph.observes, n)
+            let detBase: int32 = rt.graph.deterministics.len
+            let oldDet: int32 = rt.graph.deterministics.len
+            for i in 0..<oldDet:
+                var n = rt.graph.deterministics[i]
+                n.predicateRef = n.predicateRef + slotBase
+                n.actionModelRef = n.actionModelRef + slotBase
+                n.budgetRef = n.budgetRef + slotBase
+                n.evidenceRef = n.evidenceRef + slotBase
+                n.generation = newGen
+                add(rt.graph.deterministics, n)
+            let learnBase: int32 = rt.graph.learns.len
+            let oldLearn: int32 = rt.graph.learns.len
+            for i in 0..<oldLearn:
+                var n = rt.graph.learns[i]
+                n.candidateSetRef = n.candidateSetRef + candBase
+                n.evidenceRef = n.evidenceRef + slotBase
+                n.backendRef = n.backendRef + slotBase
+                n.generation = newGen
+                add(rt.graph.learns, n)
+            let actBase: int32 = rt.graph.actions.len
+            let oldAct: int32 = rt.graph.actions.len
+            for i in 0..<oldAct:
+                var n = rt.graph.actions[i]
+                n.candidateRef = n.candidateRef + candBase
+                n.authorizationRef = n.authorizationRef + slotBase
+                n.preconditionRef = n.preconditionRef + slotBase
+                n.generation = newGen
+                add(rt.graph.actions, n)
+            let execBase: int32 = rt.graph.executes.len
+            let oldExec: int32 = rt.graph.executes.len
+            for i in 0..<oldExec:
+                var n = rt.graph.executes[i]
+                n.actionRef = n.actionRef + actBase
+                n.commitAuthorityRef = n.commitAuthorityRef + slotBase
+                n.generation = newGen
+                add(rt.graph.executes, n)
+            let rcptBase: int32 = rt.graph.receipts.len
+            let oldRcpt: int32 = rt.graph.receipts.len
+            for i in 0..<oldRcpt:
+                var n = rt.graph.receipts[i]
+                n.executionRef = n.executionRef + execBase
+                n.goalPredicateRef = n.goalPredicateRef + slotBase
+                n.generation = newGen
+                add(rt.graph.receipts, n)
+            let oldFacts: int32 = rt.graph.facts.len
+            for i in 0..<oldFacts:
+                var f = rt.graph.facts[i]
+                f.slotRef = f.slotRef + slotBase
+                f.generation = newGen
+                add(rt.graph.facts, f)
+            dc.CsgDecisionGraphAdvanceGeneration(rt.graph, newGen)
+            # 08 接线: 快照世代前进同步到权威准入 —— 旧世代签发的凭证随即
+            # 过期 (整快照严格失效)。返回 false 仅表示权威世代已不落后
+            # (单调 union), 非错误。
+            let authorityGenAdvanced = auth.CsgActionAuthorityAdvanceGeneration(newGen)
+            # 任务节点行重定位 + 全量状态复位 (新世代重新求值; learnResults
+            # 不重铸 —— 旧世代结果是历史, 复用键含世代故永不命中)
+            for i in 0..<rt.tnClass.len:
+                let cls: int32 = rt.tnClass[i]
+                if cls == dc.CsgDecisionNodeClassObserve:
+                    rt.tnRow[i] = rt.tnRow[i] + obsBase
+                elif cls == dc.CsgDecisionNodeClassDeterministic:
+                    rt.tnRow[i] = rt.tnRow[i] + detBase
+                elif cls == dc.CsgDecisionNodeClassLearn:
+                    rt.tnRow[i] = rt.tnRow[i] + learnBase
+                elif cls == dc.CsgDecisionNodeClassAction:
+                    rt.tnRow[i] = rt.tnRow[i] + actBase
+                elif cls == dc.CsgDecisionNodeClassExecute:
+                    rt.tnRow[i] = rt.tnRow[i] + execBase
+                elif cls == dc.CsgDecisionNodeClassReceipt:
+                    rt.tnRow[i] = rt.tnRow[i] + rcptBase
+                rt.tnState[i] = CsgTaskNodeStateIdle
+                rt.tnRemaining[i] = 0
+            for e in 0..<rt.edgeFrom.len:
+                rt.tnRemaining[rt.edgeTo[e]] = rt.tnRemaining[rt.edgeTo[e]] + 1
+            setLen(rt.infNode, 0)
+        elif ev == CsgTaskEventAuthorizationChanged:
+            rt.authVersion = rt.authVersion + 1
+            # 08 接线: 授权变化同步撤销全部未消费凭证 —— 撤销后派发的确认类
+            # 动作经权威准入以可区分判词拒绝 (撤销不影子化撤销后新签发)。
+            auth.CsgActionAuthorityRevokeConfirmations()
+        elif ev == CsgTaskEventCancel:
+            while rt.infNode.len > 0:
+                let victim: int32 = rt.infNode[rt.infNode.len - 1]
+                runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+                    rt.graph, rt.failureCount, victim, dc.CsgDecisionErrCancelled,
+                    "task runtime: cancelled while pending")
+            rt.cancelled = true
+        elif ev == CsgTaskEventDeadline:
+            rt.nowMs = evTs
+            if rt.deadlineMs >= int64(0) && rt.nowMs >= rt.deadlineMs:
+                while rt.infNode.len > 0:
+                    let victim: int32 = rt.infNode[rt.infNode.len - 1]
+                    runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+                        rt.graph, rt.failureCount, victim, dc.CsgDecisionErrDeadlinePassed,
+                        "task runtime: deadline passed while pending")
+                rt.deadlinePassed = true
+        else:
+            assert(false, "csg task runtime: unreachable event kind (post-time validated)")
+    # 队列排空即还
+    setLen(rt.evKind, 0)
+    setLen(rt.evGeneration, 0)
+    setLen(rt.evTimestampMs, 0)
+    rt.evHead = 0
+    # ---- 派发扫描 (唯一推进循环; 就绪集按任务节点下标序确定性推进) ----
+    if !rt.cancelled && !rt.deadlinePassed && !rt.budgetExceeded:
+        while true:
+            let n: int32 = csgTaskRuntimeFindReady(rt)
+            if n < 0:
+                break
+            if rt.budgetUsed >= rt.budgetTotal:
+                rt.budgetExceeded = true
+                var frRes = dc.CsgDecisionFailureNew(dc.CsgDecisionErrBudgetExceeded,
+                    "task runtime: dispatch budget exhausted")
+                if IsErr(frRes):
+                    assert(false, "csg task runtime: budget failure kind must be valid")
+                else:
+                    add(rt.graph.failures, Value(frRes))
+                rt.failureCount = rt.failureCount + 1
+                break
+            rt.budgetUsed = rt.budgetUsed + 1
+            rt.stepCount = rt.stepCount + 1
+            add(rt.evalOrder, n)
+            let cls: int32 = rt.tnClass[n]
+            if cls == dc.CsgDecisionNodeClassObserve:
+                # 观察: 绑定当前世代 (快照行本身即观察产出, 不伪造载荷)
+                rt.tnState[n] = CsgTaskNodeStateDone
+                runtimeUnlockDependents(rt.tnRemaining, rt.edgeFrom, rt.edgeTo, n)
+            elif cls == dc.CsgDecisionNodeClassDeterministic:
+                if rt.dpAttached[n] == uint8(0):
+                    runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+                        rt.graph, rt.failureCount, n, dc.CsgDecisionErrInvalidOutput,
+                        "task runtime: deterministic node without attached planner")
+                    continue
+                # 从 SoA 池重建本节点规划输入 (局部值, 随调用帧释放)
+                var preds: cgoal.CsgGoalPredicateSet
+                var actions: camodel.CsgActionModel
+                var ivals: int64[]
+                var iunk: uint8[]
+                let pStart: int32 = rt.dpPredStart[n]
+                let pCount: int32 = rt.dpPredCount[n]
+                for i in 0..<pCount:
+                    let r: int32 = pStart + i
+                    let k: int32 = rt.dpPredKind[r]
+                    if k == cgoal.CsgGoalPredIdentityEq:
+                        let madeIdx = cgoal.CsgGoalAddIdentityEq(preds, rt.dpPredVar[r], rt.dpPredRhs[r])
+                    elif k == cgoal.CsgGoalPredInSet:
+                        var mem: int64[]
+                        let ms: int32 = rt.dpMemberStart[r]
+                        let mc: int32 = rt.dpMemberCount[r]
+                        for j in 0..<mc:
+                            add(mem, rt.dpMembers[ms + j])
+                        let madeIdx = cgoal.CsgGoalAddInSet(preds, rt.dpPredVar[r], mem)
+                    elif k == cgoal.CsgGoalPredAnd:
+                        let madeIdx = cgoal.CsgGoalAddAnd(preds, rt.dpChildA[r], rt.dpChildB[r])
+                    elif k == cgoal.CsgGoalPredOr:
+                        let madeIdx = cgoal.CsgGoalAddOr(preds, rt.dpChildA[r], rt.dpChildB[r])
+                    elif k == cgoal.CsgGoalPredNot:
+                        let madeIdx = cgoal.CsgGoalAddNot(preds, rt.dpChild[r])
+                    else:
+                        let madeIdx = cgoal.CsgGoalAddScalarCompare(preds, k, rt.dpPredVar[r], rt.dpPredConst[r])
+                let aStart: int32 = rt.dpActionStart[n]
+                let aCount: int32 = rt.dpActionCount[n]
+                for i in 0..<aCount:
+                    let r: int32 = aStart + i
+                    var rd: int32[]
+                    var wr: int32[]
+                    var ek: int32[]
+                    var et: int32[]
+                    var ec: int64[]
+                    var es: int32[]
+                    let rs: int32 = rt.dpReadStart[r]
+                    let rc: int32 = rt.dpReadCount[r]
+                    for j in 0..<rc:
+                        add(rd, rt.dpReadVars[rs + j])
+                    let ws: int32 = rt.dpWriteStart[r]
+                    let wc: int32 = rt.dpWriteCount[r]
+                    for j in 0..<wc:
+                        add(wr, rt.dpWriteVars[ws + j])
+                    let esStart: int32 = rt.dpEffectStart[r]
+                    let esCount: int32 = rt.dpEffectCount[r]
+                    for j in 0..<esCount:
+                        add(ek, rt.dpEffectKind[esStart + j])
+                        add(et, rt.dpEffectTarget[esStart + j])
+                        add(ec, rt.dpEffectConst[esStart + j])
+                        add(es, rt.dpEffectSrc[esStart + j])
+                    camodel.CsgActionAddAction(actions, rt.dpPrecond[r], rt.dpCost[r],
+                        rt.dpTotal[r], rd, wr, ek, et, ec, es)
+                let iStart: int32 = rt.dpInitStart[n]
+                let iCount: int32 = rt.dpInitCount[n]
+                for j in 0..<iCount:
+                    add(ivals, rt.dpInitVals[iStart + j])
+                    add(iunk, rt.dpInitUnk[iStart + j])
+                var opts: planner.CsgExactPlannerOptions
+                opts.degenerateConstantHash = rt.dpDegenerate[n]
+                var outcome: planner.CsgExactPlannerOutcome
+                if rt.dpUseDijkstra[n] != uint8(0):
+                    outcome = planner.CsgExactPlannerPlanDijkstra(preds, rt.dpGoalRoot[n],
+                        actions, ivals, iunk, rt.dpMaxStates[n], rt.dpMaxEdges[n], opts)
+                else:
+                    outcome = planner.CsgExactPlannerPlanBfs(preds, rt.dpGoalRoot[n],
+                        actions, ivals, iunk, rt.dpMaxStates[n], rt.dpMaxEdges[n], opts)
+                rt.detStatus[n] = outcome.status
+                rt.detCost[n] = outcome.totalCost
+                rt.detExpandedStates[n] = outcome.expandedStates
+                rt.detExpandedEdges[n] = outcome.expandedEdges
+                rt.detPathStart[n] = rt.detPaths.len
+                rt.detPathCount[n] = outcome.actions.len
+                for j in 0..<outcome.actions.len:
+                    add(rt.detPaths, outcome.actions[j])
+                if outcome.status == planner.CsgExactPlannerGoalReached:
+                    rt.tnState[n] = CsgTaskNodeStateDone
+                    runtimeUnlockDependents(rt.tnRemaining, rt.edgeFrom, rt.edgeTo, n)
+                else:
+                    # contract §1: deterministic 错误终态逐一对齐错误族
+                    var failKind: str = dc.CsgDecisionErrInvalidOutput
+                    if outcome.status == planner.CsgExactPlannerBudgetExceeded:
+                        failKind = dc.CsgDecisionErrBudgetExceeded
+                    elif outcome.status == planner.CsgExactPlannerUnreachable:
+                        failKind = dc.CsgDecisionErrUnreachable
+                    elif outcome.status == planner.CsgExactPlannerNeedEvidence:
+                        failKind = dc.CsgDecisionErrNeedEvidence
+                    runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+                        rt.graph, rt.failureCount, n, failKind,
+                        "task runtime: deterministic node terminal")
+            elif cls == dc.CsgDecisionNodeClassLearn:
+                # 结果复用: (节点, 世代, 问题, 候选集) 四键全匹配才命中;
+                # 世代推进后旧键永不命中 -> 显式重算 (Pending 在途)
+                let row: int32 = rt.tnRow[n]
+                let setStart: int32 = rt.graph.learns[row].candidateSetRef
+                let setCount: int32 = rt.graph.learns[row].candidateCount
+                let problem: int64 = rt.tnProblem[n]
+                if CsgTaskRuntimeLearnCacheProbe(rt, n, rt.graph.generation, problem, setStart, setCount):
+                    rt.tnState[n] = CsgTaskNodeStateDone
+                    runtimeUnlockDependents(rt.tnRemaining, rt.edgeFrom, rt.edgeTo, n)
+                else:
+                    rt.tnState[n] = CsgTaskNodeStatePending
+                    add(rt.infNode, n)
+            elif cls == dc.CsgDecisionNodeClassAction:
+                # 动作: 执行前重验 (引用逐个过 decision_validate 门)
+                let row: int32 = rt.tnRow[n]
+                var gateFail: bool = false
+                var gateMsg: str = ""
+                var g1 = csgTaskRuntimeCheckRef(rt, rt.graph.actions[row].candidateRef, dc.CsgDecisionRefKindCandidate)
+                if IsErr(g1):
+                    gateFail = true
+                    gateMsg = Error(g1)
+                if !gateFail:
+                    var g2 = csgTaskRuntimeCheckRef(rt, rt.graph.actions[row].authorizationRef, dc.CsgDecisionSlotKindAuthorization)
+                    if IsErr(g2):
+                        gateFail = true
+                        gateMsg = Error(g2)
+                if !gateFail:
+                    var g3 = csgTaskRuntimeCheckRef(rt, rt.graph.actions[row].preconditionRef, dc.CsgDecisionSlotKindPrecondition)
+                    if IsErr(g3):
+                        gateFail = true
+                        gateMsg = Error(g3)
+                if gateFail:
+                    runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+                        rt.graph, rt.failureCount, n, dc.CsgDecisionErrInvalidOutput, gateMsg)
+                else:
+                    rt.tnState[n] = CsgTaskNodeStateDone
+                    runtimeUnlockDependents(rt.tnRemaining, rt.edgeFrom, rt.edgeTo, n)
+            elif cls == dc.CsgDecisionNodeClassExecute:
+                # 08 执行层接线, 依次过三道闸, 任一不过 = 显式终态无副作用:
+                # (1) 单副作用在途闸 (contract §2 首版每任务至多一个副作用在途)
+                # (2) 同键重发拒绝 (已结局动作禁盲目重发, 含 Unknown 未核实态)
+                # (3) 权威准入 (05: 凭证一次性消费+世代重验+撤销感知), 消费后
+                #     记录凭证行句柄供 Unknown 核实记录绑定
+                if csgTaskRuntimeSideEffectInflight(rt, n):
+                    runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+                        rt.graph, rt.failureCount, n, dc.CsgDecisionErrExecutionFailed,
+                        "task runtime: side effect already in flight")
+                    continue
+                if rt.exBound[n] == uint8(1):
+                    if csgTaskRuntimeResendBlocked(rt, rt.exActionKind[n], rt.exPayload[n]):
+                        runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+                            rt.graph, rt.failureCount, n, dc.CsgDecisionErrExecutionFailed,
+                            "task runtime: blind resend of executed action rejected")
+                        continue
+                    var admitErr: str = ""
+                    if !auth.CsgActionAuthorityAdmit(rt.exActionKind[n], rt.exEffectClass[n], rt.exPayload[n], admitErr):
+                        let admitMsg = strings.ConcatStr("task runtime: authority admission rejected: ", admitErr)
+                        runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+                            rt.graph, rt.failureCount, n, dc.CsgDecisionErrExecutionFailed, admitMsg)
+                        continue
+                    rt.exCredRow[n] = auth.CsgActionAuthorityLastConsumedRow()
+                # 执行: 在途模型, 回执经 CompleteExecute 注入 (单副作用在途
+                # 已由上方闸强制; 调度器按在途登记记账)
+                rt.tnState[n] = CsgTaskNodeStatePending
+                add(rt.infNode, n)
+            elif cls == dc.CsgDecisionNodeClassReceipt:
+                # 回执: 记录其唯一 execute 依赖的真实结局绑定, 不伪造验证结论
+                var execDep: int32 = 0 - 1
+                var execDepCount: int32 = 0
+                for e in 0..<rt.edgeFrom.len:
+                    if rt.edgeTo[e] == n && rt.tnClass[rt.edgeFrom[e]] == dc.CsgDecisionNodeClassExecute:
+                        execDep = rt.edgeFrom[e]
+                        execDepCount = execDepCount + 1
+                if execDepCount != 1:
+                    runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+                        rt.graph, rt.failureCount, n, dc.CsgDecisionErrInvalidOutput,
+                        "task runtime: receipt node requires exactly one execute dependency")
+                else:
+                    rt.rcptOutcome[n] = rt.execOutcome[execDep]
+                    rt.tnState[n] = CsgTaskNodeStateDone
+                    runtimeUnlockDependents(rt.tnRemaining, rt.edgeFrom, rt.edgeTo, n)
+            else:
+                assert(false, "csg task runtime: unknown node class")
+    # ---- 循环依赖检测: 无就绪、无在途、仍有未调度节点 -> 显式 hard-fail ----
+    if !rt.cancelled && !rt.deadlinePassed && !rt.budgetExceeded && rt.failureCount == 0:
+        if rt.infNode.len == 0:
+            var idleCount: int32 = 0
+            for i in 0..<rt.tnState.len:
+                if rt.tnState[i] == CsgTaskNodeStateIdle:
+                    idleCount = idleCount + 1
+            if idleCount > 0:
+                for i in 0..<rt.tnState.len:
+                    if rt.tnState[i] == CsgTaskNodeStateIdle:
+                        runtimeCascadeTerminal(rt.tnState, rt.infNode, rt.edgeFrom, rt.edgeTo,
+                            rt.graph, rt.failureCount, i, dc.CsgDecisionErrInvalidOutput,
+                            "task runtime: dependency cycle")
+                return Err[int32]("InvalidOutput: task runtime dependency cycle")
+    return Ok[int32](CsgTaskRuntimeStatus(rt))

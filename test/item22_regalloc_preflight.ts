@@ -5,7 +5,7 @@ import {tmpdir} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {spawnSync} from "node:child_process";
-import {getChengFusionToolManifest, getChengFusionTools, initChengFusionToolRegistryModule} from "../src/cheng_fusion_tool_registry.ts";
+import {getChengFusionToolManifest, loadAllChengFusionTools} from "../src/cheng_fusion_tool_registry.ts";
 import {acquireReleaseWorkClaim, buildPrivateOneShotBundle, closeReleaseWorkClaim, deriveFormalExpressionObligationManifest, evaluateFormalExpressionObligationCoverage, executePreflight, finalizeReleaseWorkClaim, formalChengCompilerProfile, materializeFinalReleaseArtifactManifest, materializePrivateOneShotSourceTree, materializePrivateReleaseToolchain, privateReleaseExecutionEnv, productionRequiredStatuses, rawDriverFixedPoint, sameSourceInputs, snapshotSourceInputs, sourceImports, strictKv, validateAarch64F64RuntimeGateBundle, validateAarch64F64RuntimeGateReport, validateAuthorityProductionClosure, validateBackend2VersionManifest, validateBackend2VersionSentinelReport, validateCanonicalRegallocEvidenceLabels, validateCIncludeClosure, validateFinalReleaseArtifactManifest, validateMemoryManifestBytes, validateOfficialDriverBuildReceipt, validatePrivateOneShotSourceTree, validatePrivateReleaseToolchain, validateProductionGateDependencyBundle, validateProductionGateEvidence, validateProductionGuardReport, validateQualifiedNestedCallDeclarationWitness, validateReleaseEvidenceFieldPresence, validateReleaseWorkClaim, validateRemovedBackend2IndependentEmitterModules, validateSourceManifestPath, validateTypedExprCoverageLedger, validateTypedExprFormalSpecBinding, validateTypedExprFrozenAuthority, validateX86_64F64RuntimeGateBundle, validateX86_64F64RuntimeGateReport} from "../src/cheng_regalloc_preflight_m9022.ts";
 import {assertTrue, startMcp} from "./mcp_client.ts";
 
@@ -728,12 +728,126 @@ fn ${entryName}(): int32 =
 `;
 }
 
+function testBackend2CurrentManifestContract(scratch: string) {
+  const backendEpochRoot = join(scratch, "backend2-epoch");
+  const backendEpochSources = [
+    "src/core/backend2/backend2_pipeline.cheng",
+    "src/core/backend/regalloc_single_pass.cheng",
+    "src/core/lang/parser.cheng",
+    "src/core/lang/typed_expr.cheng",
+  ].sort();
+  for (const relativePath of backendEpochSources) {
+    mkdirSync(dirname(join(backendEpochRoot, relativePath)), {recursive: true});
+    writeFileSync(join(backendEpochRoot, relativePath), `# ${relativePath}\n`);
+  }
+  mkdirSync(join(backendEpochRoot, "tools"), {recursive: true});
+  const backendEpochManifestPath = join(
+    backendEpochRoot, "tools/backend2_version_manifest.rec");
+  const backendEpochSemanticSha256 = hash("semantic-backend2-epoch");
+  const backendEpochSourceClosureSha256 =
+    hash("semantic-backend2-source-closure");
+  const backendEpochManifestRaw = Buffer.from([
+    "schema=backend2_version_manifest",
+    `semantic_epoch_sha256=${backendEpochSemanticSha256}`,
+    `source_closure_sha256=${backendEpochSourceClosureSha256}`,
+    "framing=backend2_codegen_semantic_closure.framed",
+    `source_count=${backendEpochSources.length}`,
+    ...backendEpochSources.map((path, index) =>
+      `source_${String(index).padStart(4, "0")}=${path}`),
+  ].map((line) => `${line}\n`).join(""), "utf8");
+  writeFileSync(backendEpochManifestPath, backendEpochManifestRaw);
+  const backendEpochManifest = validateBackend2VersionManifest(
+    backendEpochRoot, {
+      path: backendEpochManifestPath,
+      raw: backendEpochManifestRaw,
+      sha256: hash(backendEpochManifestRaw),
+      stat: lstatSync(backendEpochManifestPath, {bigint: true}),
+    });
+  assert.equal(
+    backendEpochManifest.semanticEpochSha256,
+    backendEpochSemanticSha256);
+  assert.equal(
+    backendEpochManifest.sourceClosureSha256,
+    backendEpochSourceClosureSha256);
+  const backendEpochSentinelRaw = Buffer.from([
+    "schema=backend2_version_sentinel",
+    "status=PASS",
+    "rc=0",
+    `semantic_epoch_sha256=${backendEpochSemanticSha256}`,
+    `source_closure_sha256=${backendEpochSourceClosureSha256}`,
+    `manifest_sha256=${hash(backendEpochManifestRaw)}`,
+    "framing=backend2_codegen_semantic_closure.framed",
+    `source_count=${backendEpochSources.length}`,
+    ...backendEpochSources.map((path, index) =>
+      `source_${String(index).padStart(4, "0")}=${path}`),
+  ].map((line) => `${line}\n`).join(""), "utf8");
+  const backendEpochSentinel = validateBackend2VersionSentinelReport(
+    {raw: backendEpochSentinelRaw}, backendEpochManifest);
+  assert.equal(backendEpochSentinel.status, "PASS");
+  assert.equal(
+    backendEpochSentinel.semanticEpochSha256,
+    backendEpochSemanticSha256);
+  assert.equal(
+    backendEpochSentinel.sourceClosureSha256,
+    backendEpochSourceClosureSha256);
+  assert.throws(
+    () => validateBackend2VersionSentinelReport({
+      raw: Buffer.from(backendEpochSentinelRaw.toString("utf8").replace(
+        `source_closure_sha256=${backendEpochSourceClosureSha256}`,
+        `source_closure_sha256=${hash("forged-backend2-source-closure")}`,
+      ), "utf8"),
+    }, backendEpochManifest),
+    /source_closure_sha256 mismatch/);
+  assert.throws(
+    () => validateBackend2VersionSentinelReport({
+      raw: Buffer.from(backendEpochSentinelRaw.toString("utf8").replace(
+        `semantic_epoch_sha256=${backendEpochSemanticSha256}`,
+        `semantic_epoch_sha256=${hash("forged-backend2-semantic-epoch")}`,
+      ), "utf8"),
+    }, backendEpochManifest),
+    /semantic_epoch_sha256 mismatch/);
+  const backendEpochLegacyManifestRaw = Buffer.from(
+    backendEpochManifestRaw.toString("utf8")
+      .replace(
+        `semantic_epoch_sha256=${backendEpochSemanticSha256}\n`,
+        "version=backend2-slice7\n")
+      .replace(
+        `source_closure_sha256=${backendEpochSourceClosureSha256}\n`,
+        `sources_sha256=${backendEpochSourceClosureSha256}\n`),
+    "utf8");
+  writeFileSync(backendEpochManifestPath, backendEpochLegacyManifestRaw);
+  assert.throws(() => validateBackend2VersionManifest(backendEpochRoot, {
+    path: backendEpochManifestPath,
+    raw: backendEpochLegacyManifestRaw,
+    sha256: hash(backendEpochLegacyManifestRaw),
+    stat: lstatSync(backendEpochManifestPath, {bigint: true}),
+  }), /backend2 version manifest field set mismatch/);
+  const backendEpochLegacySentinelRaw = Buffer.from(
+    backendEpochSentinelRaw.toString("utf8")
+      .replace(
+        `semantic_epoch_sha256=${backendEpochSemanticSha256}\n`,
+        "version=backend2-slice7\n")
+      .replace(
+        `source_closure_sha256=${backendEpochSourceClosureSha256}\n`,
+        `sources_sha256=${backendEpochSourceClosureSha256}\n`),
+    "utf8");
+  assert.throws(
+    () => validateBackend2VersionSentinelReport(
+      {raw: backendEpochLegacySentinelRaw}, backendEpochManifest),
+    /backend2 version sentinel report field set mismatch/);
+  writeFileSync(backendEpochManifestPath, backendEpochManifestRaw);
+}
+
 async function main() {
   const scratch = realpathSync(mkdtempSync(join(tmpdir(), "fusion-item22-")));
   try {
+    if (process.env.CHENG_ITEM22_FOCUSED_BACKEND2_MANIFEST === "1") {
+      testBackend2CurrentManifestContract(scratch);
+      console.log("item22 focused backend2 current manifest: PASS");
+      return;
+    }
     console.log("[A] one strict registry/CLI/MCP entry");
-    initChengFusionToolRegistryModule();
-    const tools = getChengFusionTools();
+    const tools = await loadAllChengFusionTools();
     const registryManifest = getChengFusionToolManifest();
     assert.equal(tools.length, registryManifest.count);
     const registryNames = tools.map((tool: any) => tool.name).sort();
@@ -2902,39 +3016,7 @@ fn x64BodyFillBlockTermReturn(words: int32[], bodyIR: BodyIR, term: Term, result
     assert.equal(sameSourceInputs({sha256: "same", snapshots: [], absences: [{label: "fusion/bun.lock", path: "/missing"}]}, {sha256: "same", snapshots: [], absences: []}), false);
     assertTrue(true, "payload hashes, exact closures, capacity chains, event sweep and role closure are fail-closed");
 
-    const backendEpochRoot = join(scratch, "backend2-epoch");
-    const backendEpochSources = [
-      "src/core/backend2/backend2_pipeline.cheng", "src/core/backend/regalloc_single_pass.cheng",
-      "src/core/lang/parser.cheng", "src/core/lang/typed_expr.cheng",
-    ].sort();
-    for (const relativePath of backendEpochSources) {
-      mkdirSync(dirname(join(backendEpochRoot, relativePath)), {recursive: true});
-      writeFileSync(join(backendEpochRoot, relativePath), `# ${relativePath}\n`);
-    }
-    mkdirSync(join(backendEpochRoot, "tools"), {recursive: true});
-    const backendEpochManifestPath = join(backendEpochRoot, "tools/backend2_version_manifest.rec");
-    const backendEpochSourcesSha256 = hash("semantic-backend2-source-closure");
-    const backendEpochManifestRaw = Buffer.from([
-      "schema=backend2_version_manifest", "version=backend2-slice7",
-      `sources_sha256=${backendEpochSourcesSha256}`, "framing=backend2_codegen_semantic_closure.framed",
-      `source_count=${backendEpochSources.length}`,
-      ...backendEpochSources.map((path, index) => `source_${String(index).padStart(4, "0")}=${path}`),
-    ].map((line) => `${line}\n`).join(""), "utf8");
-    writeFileSync(backendEpochManifestPath, backendEpochManifestRaw);
-    const backendEpochManifest = validateBackend2VersionManifest(backendEpochRoot, {
-      path: backendEpochManifestPath, raw: backendEpochManifestRaw, sha256: hash(backendEpochManifestRaw),
-      stat: lstatSync(backendEpochManifestPath, {bigint: true}),
-    });
-    const backendEpochSentinelRaw = Buffer.from([
-      "schema=backend2_version_sentinel", "status=PASS", "rc=0", "version=backend2-slice7",
-      `sources_sha256=${backendEpochSourcesSha256}`, `manifest_sha256=${hash(backendEpochManifestRaw)}`,
-      "framing=backend2_codegen_semantic_closure.framed", `source_count=${backendEpochSources.length}`,
-      ...backendEpochSources.map((path, index) => `source_${String(index).padStart(4, "0")}=${path}`),
-    ].map((line) => `${line}\n`).join(""), "utf8");
-    assert.equal(validateBackend2VersionSentinelReport({raw: backendEpochSentinelRaw}, backendEpochManifest).status, "PASS");
-    assert.throws(() => validateBackend2VersionSentinelReport({raw: Buffer.from(backendEpochSentinelRaw.toString("utf8").replace(
-      `sources_sha256=${backendEpochSourcesSha256}`, `sources_sha256=${hash("forged-backend2-source-closure")}`,
-    ), "utf8")}, backendEpochManifest), /sources_sha256 mismatch/);
+    testBackend2CurrentManifestContract(scratch);
 
     const buildRoot = join(scratch, "official-build-receipt");
     const buildDirectory = join(buildRoot, "artifacts/verification/current_source_compiler_main");
