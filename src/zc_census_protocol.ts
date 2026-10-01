@@ -492,7 +492,7 @@ function parseCompletedProtocol(run,expected={}){
   if(fields.zc_rss_guard_mode!=="process_tree"||fields.zc_rss_guard_scope!=="identity_history_union_group_and_descendants")throw new Error("RSS guard mode/scope contract mismatch");
   const requestedLimit=uint(fields.zc_rss_requested_limit_bytes,"zc_rss_requested_limit_bytes",{positive:true});
   const effectiveLimit=uint(fields.zc_rss_limit_bytes,"zc_rss_limit_bytes",{positive:true});
-  if(requestedLimit!==1073741824||effectiveLimit!==requestedLimit)throw new Error("RSS guard production limit contract mismatch");
+  if(requestedLimit!==805306368||effectiveLimit!==requestedLimit)throw new Error("RSS guard production limit contract mismatch");
   if(fields.zc_rss_observed_sample_limit_status!=="proved"||fields.zc_rss_hard_memory_limit_proof_status!=="not_provable_userspace_poll"||fields.zc_rss_poll_seconds!=="0.01"||fields.zc_rss_measurement_status!=="available")throw new Error("RSS guard proof/measurement contract mismatch");
   uint(fields.zc_rss_sample_count,"zc_rss_sample_count",{positive:true});
   const resident=uint(fields.zc_process_tree_resident_peak_bytes,"zc_process_tree_resident_peak_bytes",{positive:true});

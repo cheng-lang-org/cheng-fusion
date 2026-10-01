@@ -403,9 +403,11 @@ var initChengResidualPeelModule = defineModuleInitializer(() => {
         try{
           const run = await runChengDriver(scriptPath, [sourcePath], {
             root,cwd:root,timeoutMs,maxBuffer:ZC_PROCESS_MAX_OUTPUT_BYTES,unsetEnv,
+            // 同 m9014: zc_enumerate.sh 生产闸 768MiB(09-30 加固), 只有 hardRssCapBytes 能真正生效。
+            hardRssCapBytes:805306368,
             env:{
               ZC_DRIVER:driver,ZC_TARGET,ZC_DIAG_DIR:diagDir,ZC_DIAG_PREFIX:diagPrefix,ZC_NO_CACHE:"1",
-              ZC_ENUMERATE_KEEP_WORK:"0",ZC_COMPILER_CSG_STDERR:"0",ZC_PROGRESS:"0",CHENG_PROCESS_MAX_RSS_BYTES:"1073741824",
+              ZC_ENUMERATE_KEEP_WORK:"0",ZC_COMPILER_CSG_STDERR:"0",ZC_PROGRESS:"0",
             },
           });
           if (run.missingDriver) throw new Error(`tools/zc_enumerate.sh not found: ${scriptPath}`);
