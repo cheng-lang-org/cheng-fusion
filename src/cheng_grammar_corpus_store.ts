@@ -75,6 +75,18 @@ export interface ChengGrammarCorpusManifest {
     readonly missingRequiredCount: number;
   };
   readonly hitProductionsByKind: Readonly<Record<string, readonly string[]>>;
+  /** plannedUnimplemented(诚实缺失类): spec 领先 parser 的 production 显式
+   *  列表——计入 missing、永不计 witnessed/MAPPED。scope=production: 整
+   *  production 无实现(当前=regionStmt, 归 core0-parallel 战役), 不得携带任何
+   *  claim; scope=obligations: 仅引用 planned production 的 choice 臂缺失
+   *  (当前=statementCore 的 sequence(regionStmt) 臂), 该 production 其余
+   *  obligation 照常有 claim。 */
+  readonly plannedUnimplemented: readonly {
+    readonly production: string;
+    readonly reason: string;
+    readonly requiredObligations: number;
+    readonly scope: "production" | "obligations";
+  }[];
   readonly entries: readonly ChengGrammarCorpusManifestEntry[];
 }
 
@@ -160,6 +172,7 @@ function assertCanonicalManifest(
     "generated",
     "spec",
     "counts",
+    "plannedUnimplemented",
     "hitProductionsByKind",
     "entries",
   ], "grammar_corpus_manifest");
@@ -316,15 +329,54 @@ function assertCanonicalManifest(
     logicalPaths.add(entry.relativePath);
     claimCount += entry.claims.length;
   }
+  // plannedUnimplemented(诚实缺失类): production+理由+required 数+scope,
+  // 不得重复。scope=production 的行不得与任何 claim 的 production 相交
+  // (claimed ⇒ parser 已声明 ⇒ 非整 production 缺失)。
+  if (!Array.isArray(value.plannedUnimplemented)) {
+    throw new Error("grammar corpus plannedUnimplemented invalid");
+  }
+  const plannedFullProductions = new Set<string>();
+  const allPlannedProductions = new Set<string>();
+  let plannedRequiredCount = 0;
+  for (const planned of value.plannedUnimplemented) {
+    assertExactCurrentObjectKeys(planned, [
+      "production",
+      "reason",
+      "requiredObligations",
+      "scope",
+    ], "grammar_corpus_manifest_planned_unimplemented");
+    if (typeof planned.production !== "string" ||
+        planned.production === "" ||
+        allPlannedProductions.has(planned.production) ||
+        typeof planned.reason !== "string" || planned.reason === "" ||
+        !Number.isSafeInteger(planned.requiredObligations) ||
+        planned.requiredObligations < 0 ||
+        !["production", "obligations"].includes(planned.scope)) {
+      throw new Error("grammar corpus plannedUnimplemented row invalid");
+    }
+    allPlannedProductions.add(planned.production);
+    if (planned.scope === "production") {
+      plannedFullProductions.add(planned.production);
+    }
+    plannedRequiredCount += planned.requiredObligations;
+  }
+  for (const production of plannedFullProductions) {
+    if (claimProductions.has(production)) {
+      throw new Error(
+        `grammar corpus plannedUnimplemented production must not carry claims: ${production}`,
+      );
+    }
+  }
   if (claimCount !== value.counts.claims ||
       value.counts.claims !== value.counts.coveredRequiredObligations ||
-      value.counts.coveredRequiredObligations !==
+      value.counts.coveredRequiredObligations + plannedRequiredCount !==
         value.counts.requiredObligationCount ||
-      value.counts.coveredProductions !== claimProductions.size ||
+      value.counts.coveredProductions !==
+        new Set([...claimProductions, ...allPlannedProductions]).size ||
       value.counts.coveredProductions !== value.spec.productionCount ||
       value.counts.witnessedRequiredCount !== receiptReadyCount ||
       value.counts.missingRequiredCount !==
-        claimCount - receiptReadyCount ||
+        claimCount - receiptReadyCount + plannedRequiredCount ||
       value.counts.requiredObligationCount !==
         value.counts.witnessedRequiredCount +
           value.counts.missingRequiredCount) {

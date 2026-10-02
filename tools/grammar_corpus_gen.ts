@@ -19,6 +19,9 @@
 //     + 按 obligation 类(production/choice/optional/repetition/recursion)的命中 production 集
 // 完备性硬门: PLAN 声明的 source-witness production 的全部 required
 //   obligation 必须各有且仅有一条 claim；不存在人工 BLOCKED/排除清单。
+//   唯一诚实例外 plannedUnimplemented: spec 领先 parser 的 production
+//   (当前=regionStmt, 归 core0-parallel 战役)可入 PLAN 但必须显式标记理由、
+//   计入 missing、永不计 witnessed/MAPPED; corpus.json 记录显式列表。
 //   Source claim 不等于 parser receipt；manifest 原样保留 map 的
 //   witnessedRequiredCount/missingRequiredCount，receiptReady 全由真实 map 决定。
 //
@@ -1306,6 +1309,9 @@ interface ProdPlan {
   optional?: Record<string, {absent: string; present: string}>;
   repetition?: Record<string, {zero: string | undefined; one: string | undefined; max: string | undefined}>;
   recursion?: string;
+  /** plannedUnimplemented(诚实缺失类): spec 领先 parser 的 production 只登记不
+   *  claim——值必须写明归属战役理由; 该 production 不得携带任何其他 PLAN 字段。 */
+  plannedUnimplemented?: string;
 }
 
 const OPT = (absent: string, present: string) => ({absent, present});
@@ -1592,6 +1598,13 @@ const PLAN: Record<string, ProdPlan> = {
   breakStmt: {root: "stmt"},
   continueStmt: {root: "stmt"},
   deferStmt: {root: "stmt", recursion: "rec_stmt"},
+  // plannedUnimplemented(诚实缺失类): spec(9/29 d188abe) 领先 parser——TREE
+  // src/core/lang/parser.cheng 无 region 语句实现(语句关键字分发 0 命中
+  // "region")。regionStmt 归 core0-parallel 战役所有(wave1_region_spec.md
+  // §0.6: RegionId/激活代际/RegionRetired), FUSION 不代实现: 本条目只允许
+  // 空计划, 全部 required obligation 计入 missing; core0-parallel 落地 parser
+  // 实现后补真实 PLAN 并移除本标记。
+  regionStmt: {plannedUnimplemented: "core0-parallel(wave1_region_spec.md §0.6)"},
   ifStmt: {
     root: "stmt",
     repetition: {"repetition(sequence(\"elif\",expression,\":\",suite))": REP("stmt", "stmt", "stmt_rep")},
@@ -2245,9 +2258,30 @@ export function buildCorpus(
   // Therefore PLAN selects claimable productions; the generated claim carries
   // the map's real receiptReady bit and never upgrades PARTIAL to MAPPED.
   const claimProductions = Object.keys(PLAN).sort();
+  // plannedUnimplemented(诚实缺失类): 标记 production 可入 PLAN 但必须显式
+  // 声明理由、绝不产生 claim; 其 required obligation 计入 missing, 永不计
+  // witnessed/MAPPED。UNMAPPED 禁入门对它们豁免, 对其余 production 不变。
+  const plannedUnimplemented = new Map<string, string>();
   for (const name of claimProductions) {
     const row = mapRowByProd.get(name);
     if (row === undefined) throw new Error(`PLAN 引用正式 EBNF 外 production: ${name}`);
+    const plannedReason = PLAN[name]!.plannedUnimplemented;
+    if (plannedReason !== undefined) {
+      if (row.status !== "UNMAPPED") {
+        throw new Error(
+          `plannedUnimplemented production 已被 parser 声明(status=${row.status}), ` +
+          `请移除标记并补真实 source claim 计划: ${name}`,
+        );
+      }
+      const plan = PLAN[name]!;
+      if (plan.root !== undefined || plan.choice !== undefined ||
+          plan.optional !== undefined || plan.repetition !== undefined ||
+          plan.recursion !== undefined) {
+        throw new Error(`plannedUnimplemented production 不得携带 source claim 计划: ${name}`);
+      }
+      plannedUnimplemented.set(name, plannedReason);
+      continue;
+    }
     if (row.status === "UNMAPPED") {
       throw new Error(`PLAN 不得为 UNMAPPED production 生成 source claim: ${name}`);
     }
@@ -2290,7 +2324,16 @@ export function buildCorpus(
   };
 
   const missing = new Map<string, string>(); // obligationId → 描述
+  // 臂级 planned-missing: choice 臂 fragment 引用 plannedUnimplemented
+  // production(如 statementCore 的 sequence(regionStmt) 臂)时, 该 obligation
+  // 的唯一见证形必然依赖缺失的 parser 实现——显式归入 planned-missing, 不算
+  // uncovered 也不产 claim。其余无映射 choice 臂照旧硬红(fail-closed)。
+  const plannedArmMissing = new Map<string, {production: string; fragment: string}>();
+  const armReferencesPlanned = (fragment: string): string | undefined =>
+    [...plannedUnimplemented.keys()].find((n) =>
+      new RegExp(`(?:^|[^A-Za-z0-9_])${n}(?:[^A-Za-z0-9_]|$)`).test(fragment));
   for (const name of claimProductions) {
+    if (plannedUnimplemented.has(name)) continue; // obligations 归入 plannedMissing, 不产 claim
     const plan = PLAN[name];
     const obligations = obsByProd.get(name) ?? [];
     if (plan === undefined) {
@@ -2312,7 +2355,20 @@ export function buildCorpus(
         if (node === undefined) throw new Error(`${name}: choice 节点消失 @ ${o.structuralPath}`);
         const armFragment = node.armFragments[o.bound ?? -1];
         const src = plan.choice?.[armFragment ?? ""] ?? plan.choice?.[`@${o.structuralPath}:${o.bound}`];
-        if (src !== undefined) {addClaim(src, o);} else missing.set(o.obligationId, `${name}/choice/${o.structuralPath}/${o.variant} arm=${armFragment}`);
+        if (src !== undefined) {addClaim(src, o);}
+        else {
+          const plannedRef = armFragment !== undefined
+            ? armReferencesPlanned(armFragment)
+            : undefined;
+          if (plannedRef !== undefined) {
+            plannedArmMissing.set(o.obligationId, {
+              production: name,
+              fragment: `${plannedRef} @ ${armFragment}`,
+            });
+          } else {
+            missing.set(o.obligationId, `${name}/choice/${o.structuralPath}/${o.variant} arm=${armFragment}`);
+          }
+        }
         continue;
       }
       if (o.kind === "optional" || o.kind === "repetition") {
@@ -2382,17 +2438,29 @@ export function buildCorpus(
   for (const list of Object.values(hitSets)) list.sort();
 
   const coveredRequiredObligations = [...obsByProd.entries()]
-    .filter(([name]) => claimProductions.includes(name))
-    .reduce((acc, [, list]) => acc + list.length, 0);
+    .filter(([name]) =>
+      claimProductions.includes(name) && !plannedUnimplemented.has(name))
+    .reduce((acc, [, list]) =>
+      acc + list.filter((o) => !plannedArmMissing.has(o.obligationId)).length, 0);
+  // plannedUnimplemented 的 required obligation 显式计入 missing——coverage
+  // 算术保持 covered + planned == required, witnessed/missing 口径完全沿用
+  // map(本线恒 0/required), 不因 planned 类而升级任何计数。
+  // production 级=整 production 缺失(regionStmt); 臂级=choice 臂缺失
+  // (statementCore 的 sequence(regionStmt) 臂)。
+  const plannedRequiredObligations =
+    [...plannedUnimplemented.keys()]
+      .reduce((acc, name) => acc + (obsByProd.get(name)?.length ?? 0), 0) +
+    plannedArmMissing.size;
   if (claimByObligation.size !== coveredRequiredObligations) {
     throw new Error(
       `source-plan obligation 不守恒: claims=${claimByObligation.size} ` +
       `!= covered=${coveredRequiredObligations}`,
     );
   }
-  if (coveredRequiredObligations !== mapDoc.counts.requiredObligationCount) {
+  if (coveredRequiredObligations + plannedRequiredObligations !==
+        mapDoc.counts.requiredObligationCount) {
     throw new Error(
-      `source-plan 未覆盖全部 required obligation: covered=${coveredRequiredObligations} required=${mapDoc.counts.requiredObligationCount}`,
+      `source-plan 未覆盖全部 required obligation: covered=${coveredRequiredObligations} + plannedUnimplemented=${plannedRequiredObligations} != required=${mapDoc.counts.requiredObligationCount}`,
     );
   }
 
@@ -2414,6 +2482,43 @@ export function buildCorpus(
       witnessedRequiredCount: mapDoc.counts.witnessedRequiredCount,
       missingRequiredCount: mapDoc.counts.missingRequiredCount,
     },
+    // plannedUnimplemented 显式列表(spec 领先 parser 的诚实缺失类):
+    // production 级(scope=production, 整 production 无实现)与臂级
+    // (scope=obligations, 仅引用 planned production 的 choice 臂)分行,
+    // 与 counts 联动可审计。
+    plannedUnimplemented: (() => {
+      const rows = new Map<string, {
+        production: string;
+        reason: string;
+        requiredObligations: number;
+        scope: "production" | "obligations";
+      }>();
+      for (const [name, reason] of plannedUnimplemented) {
+        rows.set(name, {
+          production: name,
+          reason,
+          requiredObligations: obsByProd.get(name)?.length ?? 0,
+          scope: "production",
+        });
+      }
+      for (const {production, fragment} of plannedArmMissing.values()) {
+        const existing = rows.get(production);
+        if (existing === undefined || existing.scope !== "obligations") {
+          rows.set(production, {
+            production,
+            reason: `choice 臂依赖 plannedUnimplemented production(${fragment})`,
+            requiredObligations: 1,
+            scope: "obligations",
+          });
+        } else {
+          existing.requiredObligations += 1;
+          existing.reason = `${existing.reason}; ${fragment}`;
+        }
+      }
+      return [...rows.values()].sort((a, b) =>
+        a.production < b.production ? -1 :
+        a.production > b.production ? 1 : 0);
+    })(),
     hitProductionsByKind: hitSets,
     entries,
   };
@@ -2768,7 +2873,9 @@ function main() {
   const prepareSources = process.argv.includes("--prepare-sources");
   if (checkSources || prepareSources) {
     const {manifest, files} = buildCurrentSourcePlan();
-    if (manifest.counts.claims !==
+    const plannedRequired = manifest.plannedUnimplemented.reduce(
+      (acc, row) => acc + row.requiredObligations, 0);
+    if (manifest.counts.claims + plannedRequired !==
           manifest.counts.requiredObligationCount) {
       throw new Error("current source-plan 未覆盖全部 required obligation");
     }

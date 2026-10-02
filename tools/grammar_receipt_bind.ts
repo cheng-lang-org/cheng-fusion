@@ -4624,7 +4624,7 @@ function buildCtx(
     if (row.kind === 2) return owner.kind === 1;
     if (row.kind === 5) return owner.kind === 4;
     if (row.kind === 3) {
-      return owner.kind === 5 && owner.armIndex === 16;
+      return owner.kind === 5 && owner.armIndex === 17;
     }
     if (row.kind === 6) {
       return owner.kind === 5 &&
@@ -4780,10 +4780,13 @@ function buildCtx(
   ): number => {
     if (row.kind === 6) return 7;
     if (row.kind !== 5) return 0;
-    if ([0, 1, 15, 16, 17, 18, 19, 20].includes(row.armIndex)) {
+    // 臂号按 d188abe 后新序(regionStmt=15 归 core0-parallel, 无权威行):
+    // 声明臂 macro16/template17/concept18/trait19/fn20/iterator21;
+    // 语句臂 expression=22。
+    if ([0, 1, 16, 17, 18, 19, 20, 21].includes(row.armIndex)) {
       return 6;
     }
-    if ([2, 8, 9, 10, 11, 12, 13, 21].includes(row.armIndex)) {
+    if ([2, 8, 9, 10, 11, 12, 13, 22].includes(row.armIndex)) {
       return 3;
     }
     if ([7, 14].includes(row.armIndex)) return 9;
@@ -4805,8 +4808,8 @@ function buildCtx(
       let expectedKind = 3;
       if (row.armIndex === 0) expectedKind = 6;
       else if (row.armIndex === 1) expectedKind = 2;
-      else if (row.armIndex === 17) expectedKind = 7;
-      else if (row.armIndex === 18) expectedKind = 8;
+      else if (row.armIndex === 18) expectedKind = 7;
+      else if (row.armIndex === 19) expectedKind = 8;
       return declaration !== undefined &&
         declaration.kind === expectedKind &&
         declaration.spanStart === row.spanStart &&
@@ -4824,7 +4827,7 @@ function buildCtx(
         expectedRole = "ParserValueExprStatementAssignmentRhs";
       } else if (row.armIndex === 11) {
         expectedRole = "ParserValueExprStatementLoopSource";
-      } else if (row.armIndex === 21) {
+      } else if (row.armIndex === 22) {
         if (![
           "ParserValueExprStatementExpression",
           "ParserValueExprStatementImplicitReturnValue",
@@ -4832,7 +4835,7 @@ function buildCtx(
       } else if (statement.role !== expectedRole) {
         return false;
       }
-      if (row.armIndex !== 21 && statement.role !== expectedRole) {
+      if (row.armIndex !== 22 && statement.role !== expectedRole) {
         return false;
       }
       const authorityAnchor = receipt.tokens[statement.anchorTokenIndex];
@@ -4869,7 +4872,7 @@ function buildCtx(
       }
       return statement.anchorTokenIndex === row.anchorTokenIndex &&
         receipt.statementRoots.filter((candidate) => {
-          const roleMatches = row.armIndex === 21
+          const roleMatches = row.armIndex === 22
             ? [
               "ParserValueExprStatementExpression",
               "ParserValueExprStatementImplicitReturnValue",
@@ -4933,16 +4936,19 @@ function buildCtx(
       const statementCore =
         forwardingProductions[statementChildren[0]!.row];
       if (statementCore?.kind !== 5) return false;
+      // statementCore 臂号按 d188abe 后新序(regionStmt=15, 归
+      // core0-parallel): fnStmt=20/iteratorStmt=21/macroStmt=16/
+      // templateStmt=17/conceptStmt=18/traitStmt=19/expressionStmt=22。
       const topLevelArmByStatementCoreArm = new Map([
         [0, 0],
-        [19, 1],
-        [20, 2],
-        [15, 3],
-        [16, 4],
-        [17, 5],
-        [18, 6],
+        [20, 1],
+        [21, 2],
+        [16, 3],
+        [17, 4],
+        [18, 5],
+        [19, 6],
         [1, 7],
-        [21, 8],
+        [22, 8],
       ]);
       return topLevelArmByStatementCoreArm.get(
         statementCore.armIndex,
@@ -4959,7 +4965,7 @@ function buildCtx(
     if (row.armIndex === 14) {
       return forwarding.length === 1 && childKind === 7;
     }
-    if (row.armIndex === 16) {
+    if (row.armIndex === 17) {
       return forwarding.length === 1 && childKind === 3;
     }
     if ([5, 6].includes(row.armIndex)) return forwarding.length === 0;
@@ -4976,7 +4982,7 @@ function buildCtx(
       (row.kind === 2 && row.armIndex >= 0 && row.armIndex <= 8) ||
       ([3, 7].includes(row.kind) &&
         row.armIndex >= 0 && row.armIndex <= 1) ||
-      (row.kind === 5 && row.armIndex >= 0 && row.armIndex <= 21);
+      (row.kind === 5 && row.armIndex >= 0 && row.armIndex <= 22);
     if (canonicalJson(Object.keys(row).sort()) !== canonicalJson([
       "anchorTokenIndex",
       "annotationCount",
@@ -8676,7 +8682,7 @@ function matchChoice(
   // statementCore / topLevelCore 臂: 首 token 判别(语句行/顶层行)
   if (P === "statementCore" || P === "topLevelCore") {
     const arms = P === "statementCore"
-      ? ["bindingDecl", "typeDecl", "assignStmt", "returnStmt", "yieldStmt", "breakStmt", "continueStmt", "deferStmt", "ifStmt", "matchStmt", "whileStmt", "forStmt", "caseStmt", "whenStmt", "blockStmt", "macroStmt", "templateStmt", "conceptStmt", "traitStmt", "fnStmt", "iteratorStmt", "expressionStmt"]
+      ? ["bindingDecl", "typeDecl", "assignStmt", "returnStmt", "yieldStmt", "breakStmt", "continueStmt", "deferStmt", "ifStmt", "matchStmt", "whileStmt", "forStmt", "caseStmt", "whenStmt", "blockStmt", "regionStmt", "macroStmt", "templateStmt", "conceptStmt", "traitStmt", "fnStmt", "iteratorStmt", "expressionStmt"]
       : ["bindingDecl", "fnDecl", "iteratorDecl", "macroDecl", "templateDecl", "conceptDecl", "traitDecl", "typeDecl", "exprDecl"];
     const armName = arms[armIndex ?? -1];
     if (armName === undefined) return miss(`${P} 臂序号越界`);

@@ -755,28 +755,29 @@ async function main(): Promise<void> {
       registeredAnnotationNames.includes(name)),
     "current annotation corpus 只允许正式注册名",
   );
-  assert.equal(currentGrammar.productionCount, 125);
-  assert.equal(currentGrammar.requiredCount, 971);
-  assert.equal(generatedWithoutReceipts.counts.total, 125);
+  assert.equal(currentGrammar.productionCount, 126);
+  assert.equal(currentGrammar.requiredCount, 976);
+  assert.equal(generatedWithoutReceipts.counts.total, 126);
   assert.equal(
     generatedWithoutReceipts.counts.requiredObligationCount,
-    971,
+    976,
   );
   const currentCoverageAudit =
     auditCurrentFormalParserCoverage(generatedWithoutReceipts);
   assert.equal(currentCoverageAudit.status, "HARD_RED");
-  assert.equal(currentCoverageAudit.productionCount, 125);
+  assert.equal(currentCoverageAudit.productionCount, 126);
+  // regionStmt 为 plannedUnimplemented 诚实空声明, 不计 producerDeclared。
   assert.equal(currentCoverageAudit.producerDeclaredCount, 125);
   assert.equal(currentCoverageAudit.receiptMappedCount, 0);
   assert.equal(
     currentCoverageAudit.recomputedUnmappedProductionCount,
-    0,
-    "历史 36 UNMAPPED 不得作为 current 输入；当前 producer 声明重算为 0",
+    1,
+    "regionStmt plannedUnimplemented 诚实空声明必须保持 UNMAPPED",
   );
-  assert.equal(currentCoverageAudit.unwitnessedProductionCount, 125);
-  assert.equal(currentCoverageAudit.requiredObligationCount, 971);
+  assert.equal(currentCoverageAudit.unwitnessedProductionCount, 126);
+  assert.equal(currentCoverageAudit.requiredObligationCount, 976);
   assert.equal(currentCoverageAudit.witnessedRequiredCount, 0);
-  assert.equal(currentCoverageAudit.missingRequiredCount, 971);
+  assert.equal(currentCoverageAudit.missingRequiredCount, 976);
   assert.deepEqual(
     currentCoverageAudit.focusRows.map((row) => row.name),
     [
@@ -933,8 +934,8 @@ async function main(): Promise<void> {
       Buffer.from(JSON.stringify(missingImplicitClaim)),
       parserBytes,
     ),
-    /producer claim count=124, productions=125/,
-    "旧 124-row claims 必须 hard-fail",
+    /producer claim count=125, productions=126/,
+    "缺行/旧 125-row claims 必须 hard-fail",
   );
   const duplicateImplicitClaim = clone(currentDeclarations);
   duplicateImplicitClaim.rows.push(clone(
@@ -987,7 +988,7 @@ async function main(): Promise<void> {
       sum + generatedWithoutReceipts.rows.find(
         (row) => row.name === name,
       )!.required_obligation_count, 0),
-    57,
+    58,
   );
   for (const name of forwardingProducerNames) {
     const row = generatedWithoutReceipts.rows.find(
@@ -1279,13 +1280,24 @@ async function main(): Promise<void> {
     "当前正式 EBNF 的 29 源 source-plan 必须逐字节确定",
   );
   assert.equal(sourcePlanA.manifest.counts.sources, 29);
+  const sourcePlanPlannedRequired = sourcePlanA.manifest.plannedUnimplemented
+    .reduce((acc, row) => acc + row.requiredObligations, 0);
   assert.equal(
-    sourcePlanA.manifest.counts.claims,
+    sourcePlanA.manifest.counts.claims + sourcePlanPlannedRequired,
     generatedWithoutReceipts.counts.requiredObligationCount,
   );
   assert.equal(
-    sourcePlanA.manifest.counts.coveredRequiredObligations,
+    sourcePlanA.manifest.counts.coveredRequiredObligations +
+      sourcePlanPlannedRequired,
     generatedWithoutReceipts.counts.requiredObligationCount,
+  );
+  assert.ok(
+    sourcePlanA.manifest.plannedUnimplemented.some((row) =>
+      row.production === "regionStmt" &&
+      row.reason.includes("core0-parallel") &&
+      row.requiredObligations > 0 &&
+      row.scope === "production"),
+    "regionStmt 必须以 plannedUnimplemented 诚实缺失类入账(归 core0-parallel)",
   );
   const typeShapesEntry = [...sourcePlanA.files.entries()].find(
     ([name]) => name.endsWith("/type_shapes.cheng") ||
@@ -1704,8 +1716,14 @@ async function main(): Promise<void> {
   assert.equal(generated.receiptEvidence.rejectedCount, 0);
   assert.equal(generated.receiptEvidence.rows.length, 0);
   assert.equal(generated.counts.MAPPED, 0);
-  assert.equal(generated.counts.PARTIAL, generated.counts.total);
-  assert.equal(generated.counts.UNMAPPED, 0);
+  // PARTIAL=producer 已声明(125) + UNMAPPED=plannedUnimplemented 空声明
+  // (regionStmt, 1) = total。
+  assert.equal(
+    generated.counts.PARTIAL + generated.counts.UNMAPPED,
+    generated.counts.total,
+  );
+  assert.equal(generated.counts.PARTIAL, 125);
+  assert.equal(generated.counts.UNMAPPED, 1);
   assert.equal(generated.counts.witnessedRequiredCount, 0);
   assert.equal(
     generated.counts.missingRequiredCount,
@@ -1713,7 +1731,10 @@ async function main(): Promise<void> {
   );
   assert.ok(generated.rows.every(
     (row) =>
-      row.status === "PARTIAL" &&
+      row.status ===
+        (row.parser_fn.length > 0 || row.node_kinds.length > 0
+          ? "PARTIAL"
+          : "UNMAPPED") &&
       !row.receipt_ready &&
       row.witnessed_required_count === 0 &&
       row.missing_required_count === row.required_obligation_count &&
@@ -1866,8 +1887,8 @@ async function main(): Promise<void> {
       (sum, row) => sum + row.required_obligation_count,
       0,
     ),
-    57,
-    "七个 forwarding production 必须精确承载全部 57 个 required obligation",
+    58,
+    "七个 forwarding production 必须精确承载全部 58 个 required obligation",
   );
   assert.deepEqual(
     forwardingRows.map((row) => row.name).sort(),
@@ -1880,7 +1901,7 @@ async function main(): Promise<void> {
       "topLevelCore",
       "topLevelDecl",
     ],
-    "57 个 obligation 只能落到七个 parser-owned forwarding production",
+    "58 个 obligation 只能落到七个 parser-owned forwarding production",
   );
   assert.ok(
     forwardingRows.every((row) =>
@@ -2158,8 +2179,8 @@ async function main(): Promise<void> {
   );
   assert.equal(
     forwardingObligations.length,
-    57,
-    "正式 forwarding obligation 总数必须精确为 57",
+    58,
+    "正式 forwarding obligation 总数必须精确为 58",
   );
   const forwardingKind = new Map([
     ["topLevelDecl", [1, "ParserForwardingProductionTopLevelDecl"]],
@@ -2221,7 +2242,7 @@ async function main(): Promise<void> {
         }],
       };
     }
-    if (armIndex === 16) {
+    if (armIndex === 17) {
       return {
         kind: 5,
         armIndex,
@@ -2245,7 +2266,7 @@ async function main(): Promise<void> {
           depth === 0
             ? terminalCore()
             : directCore(
-              16,
+              17,
               recursiveTarget(kind, armIndex, depth - 1),
             ),
         ),
@@ -2257,7 +2278,7 @@ async function main(): Promise<void> {
         depth === 0
           ? terminalCore()
           : directCore(
-            19,
+            20,
             recursiveTarget(kind, armIndex, depth - 1),
           ),
       );
@@ -2265,7 +2286,7 @@ async function main(): Promise<void> {
     if (kind === 5) {
       if (depth === 0) return terminalCore();
       return directCore(
-        19,
+        20,
         statement(recursiveTarget(kind, armIndex, depth - 1)),
       );
     }
@@ -2299,8 +2320,11 @@ async function main(): Promise<void> {
     }
     throw new Error(`unsupported recursive forwarding kind: ${kind}`);
   };
+  // statementCore 臂号按 d188abe 后新序(0-22, regionStmt=15 归
+  // core0-parallel 不入表): fnStmt=20/iteratorStmt=21/macroStmt=16/
+  // templateStmt=17/conceptStmt=18/traitStmt=19/expressionStmt=22。
   const topLevelStatementCoreArm = (topLevelArm: number): number =>
-    [0, 19, 20, 15, 16, 17, 18, 1, 21][topLevelArm] ?? -1;
+    [0, 20, 21, 16, 17, 18, 19, 1, 22][topLevelArm] ?? -1;
   const wrapForwardingTarget = (
     target: ForwardingSpec,
   ): ForwardingSpec => {
@@ -2309,41 +2333,41 @@ async function main(): Promise<void> {
       return {kind: 1, armIndex: -1, children: [target]};
     }
     const topMappedArm = target.kind === 5
-      ? [0, 19, 20, 15, 16, 17, 18, 1, 21]
+      ? [0, 20, 21, 16, 17, 18, 19, 1, 22]
         .indexOf(target.armIndex)
       : -1;
     let topLevelArm = 1;
     let targetStatement: ForwardingSpec;
     if (target.kind === 3) {
       topLevelArm = 4;
-      targetStatement = statement(directCore(16, target));
+      targetStatement = statement(directCore(17, target));
     } else if (target.kind === 4) {
-      if (target.children[0]?.armIndex === 21) {
+      if (target.children[0]?.armIndex === 22) {
         topLevelArm = 8;
         targetStatement = target;
-      } else if (target.children[0]?.armIndex === 19) {
+      } else if (target.children[0]?.armIndex === 20) {
         topLevelArm = 1;
         targetStatement = target;
       } else {
         topLevelArm = 1;
-        targetStatement = statement(directCore(19, target));
+        targetStatement = statement(directCore(20, target));
       }
     } else if (target.kind === 5 && topMappedArm >= 0) {
       topLevelArm = topMappedArm;
       targetStatement = statement(target);
     } else if (target.kind === 5) {
       targetStatement = statement(directCore(
-        19,
+        20,
         statement(target),
       ));
     } else if (target.kind === 6) {
       targetStatement = statement(directCore(
-        19,
+        20,
         statement(directCore(9, target)),
       ));
     } else {
       targetStatement = statement(directCore(
-        19,
+        20,
         statement(directCore(14, target)),
       ));
     }
@@ -2382,7 +2406,7 @@ async function main(): Promise<void> {
         children: [{
           kind: 2,
           armIndex: 8,
-          children: [statement(directCore(21))],
+          children: [statement(directCore(22))],
         }],
       };
     } else if (positiveKind === 2) {
@@ -2404,7 +2428,7 @@ async function main(): Promise<void> {
     } else if (positiveKind === 3) {
       target = template(undefined, armIndex);
     } else if (positiveKind === 4) {
-      target = statement(directCore(21));
+      target = statement(directCore(22));
     } else if (positiveKind === 6) {
       target = {
         kind: 6,
@@ -2502,10 +2526,10 @@ async function main(): Promise<void> {
       } else if (coreArm === 1) {
         kind = 2;
         kindText = "ParserDeclarationType";
-      } else if (coreArm === 17) {
+      } else if (coreArm === 18) {
         kind = 7;
         kindText = "ParserDeclarationConcept";
-      } else if (coreArm === 18) {
+      } else if (coreArm === 19) {
         kind = 8;
         kindText = "ParserDeclarationTrait";
       }
@@ -2617,7 +2641,7 @@ async function main(): Promise<void> {
         nodeEnd = rhsToken!.index + 1;
       } else if (coreArm === 11) {
         role = "ParserValueExprStatementLoopSource";
-      } else if (coreArm === 21) {
+      } else if (coreArm === 22) {
         role = "ParserValueExprStatementExpression";
       }
       const nodeIndex = candidate.nodes.length;
@@ -2738,7 +2762,7 @@ async function main(): Promise<void> {
           rowSpanEnd,
         );
       } else if (spec.kind === 5) {
-        if ([0, 1, 15, 16, 17, 18, 19, 20]
+        if ([0, 1, 16, 17, 18, 19, 20, 21]
           .includes(spec.armIndex)) {
           authorityKind = 6;
           authorityKindText =
@@ -2748,7 +2772,7 @@ async function main(): Promise<void> {
             rowSpanStart,
             rowSpanEnd,
           );
-        } else if ([2, 8, 9, 10, 11, 12, 13, 21]
+        } else if ([2, 8, 9, 10, 11, 12, 13, 22]
           .includes(spec.armIndex)) {
           authorityKind = 3;
           authorityKindText =
@@ -3119,10 +3143,24 @@ async function main(): Promise<void> {
     mutationValue: number;
     rejectionPoint: string;
   }[] = [];
+  // statementCore choice 臂 alternative_15 = sequence(regionStmt) 是
+  // plannedUnimplemented 臂(corpus.json plannedUnimplemented statementCore
+  // scope=obligations, 归 core0-parallel): parser 无 region 实现, 合成
+  // receipt 无法构造该臂的合法 target——该 obligation 不入 mutation map,
+  // 其余 forwarding obligation 照旧全量 mutation(mutationRows=58-1=57)。
+  const plannedArmObligation = forwardingObligations.find((entry) =>
+    entry.production === "statementCore" &&
+    entry.kind === "choice" &&
+    entry.variant === "alternative_15");
+  assert.ok(
+    plannedArmObligation !== undefined,
+    "statementCore regionStmt 臂 obligation 消失——core0-parallel 落地 parser 后应移除本跳过并补真实 witness",
+  );
   for (let obligationIndex = 0;
        obligationIndex < forwardingObligations.length;
        obligationIndex += 1) {
     const obligation = forwardingObligations[obligationIndex]!;
+    if (obligation === plannedArmObligation) continue;
     const positiveReceipt = forwardingReceiptFor(obligation);
     const positiveBytes = JSON.stringify(positiveReceipt);
     const positive = bindReceiptAgainstObligations(
@@ -3184,6 +3222,8 @@ async function main(): Promise<void> {
       rejectionPoint,
     });
   }
+  // 58 个 forwarding obligation - 1 个 plannedUnimplemented 臂
+  // (statementCore alternative_15 = sequence(regionStmt), 归 core0-parallel)。
   assert.equal(forwardingObligationMutationRows.length, 57);
   assert.equal(
     new Set(forwardingObligationMutationRows.map(

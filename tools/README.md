@@ -304,15 +304,22 @@ touch). The fix is always the unwitnessed regen above -- never hand-editing
 the JSON, which cannot survive the canonical-JSON comparison anyway. After
 regen the same check honestly reports "zero, rejected or malformed
 production receipts" until the witnessed mode runs against a real official
-current build binding; that residual is the actual 971-obligation witness
+current build binding; that residual is the actual 976-obligation witness
 workload, not staleness, and must not be "fixed" by faking receipts.
 spec/parser 变更后必须成对再生：map 之外还要跑
 `bun run generate:grammar-corpus-sources`，否则 `bun run test:item25`
 以 "corpus.json: 内容漂移" 拒绝（2026-07-27 同轮命中）；两项 regen +
-item25 PASS（rows=125 PARTIAL、missingRequiredCount=971 与计划基线一致）
-才算 EBNF artifact 收敛。
+item25 PASS（rows=126=125 PARTIAL+1 plannedUnimplemented UNMAPPED、
+missingRequiredCount=976 与计划基线一致）才算 EBNF artifact 收敛。
 
-### 已知状态(2026-07-27 定位):57 个 statement-root obligation 是 pin 住的故意缺失
+### 已知状态(2026-07-27 定位):58 个 statement-root obligation 是 pin 住的故意缺失
+
+(2026-10-02 更新: TREE spec d188abe 给 statementCore 新增 regionStmt 臂,
+该缺口 57→58; 新增的臂级 obligation 属 plannedUnimplemented 诚实缺失类,
+归 core0-parallel。同因 `test:item22:formal-profile` 的合成全 MAPPED
+基线对空声明行(regionStmt)构造不出来——校验器按诚实规则拒绝给
+span_model=none 的行伪造 witness——该测试在 core0-parallel 落地 parser
+实现并升级 claims 前保持诚实 RED。)
 
 `parserOwnedStructuredWitnessAccepted` 对 `statement_root_span` 要求 role
 kind(`ParserValueExprStatement*`)且 ∈ claims `nodeKinds`;claims 对 7 个
@@ -320,12 +327,12 @@ kind(`ParserValueExprStatement*`)且 ∈ claims `nodeKinds`;claims 对 7 个
 statementCore/matchArm/blockStmt)刻意 `nodeKinds: []`(不复制无意义
 AST)。曾怀疑是两 authority 矛盾并试过放宽 membership 要求——被 item25
 否决:该测试同时 pin 正反两类用例(statementCore 空声明时必须拒绝
-Condition 冒充),且明确断言这 57 个 obligation "必须继续缺失"。结论:这
+Condition 冒充),且明确断言这 58 个 obligation "必须继续缺失"。结论:这
 是 owner 刻意保留的 witness 缺口,闭合需要 owner 决定转发 production 的
 witness role 声明粒度,任何侧不得擅自放宽 acceptance 或伪造 claims 声明。
 同轮修复的真 bug:`cheng_regalloc_preflight_m9022.ts` validator 调用点漏
 传 `production`/`node_kinds` 两参(真实 witness 路径一直传 4 参);
-`item22:formal-profile` 在 57 缺口闭合前保持诚实 RED。
+`item22:formal-profile` 在 58 缺口闭合前保持诚实 RED。
 
 ### 维护例(2026-07-27):跨仓 exact-hash pin 漂移
 
@@ -339,7 +346,7 @@ evidence 脚本一旦提交，item22 即报
 再把 pin 更新为当前字节 sha——昨日 cb0379d 即为同款例行 re-pin，不是
 放宽。注意同一文件可能出现在多个 pin 集(guard 三处)，漏改一处会继续
 红。re-pin 后 item22 从 [B] 段推进到 formal binding 段；其最终 GREEN
-依赖 witnessed map,属 971 witness 生产任务，不是 pin 问题。
+依赖 witnessed map,属 976 witness 生产任务，不是 pin 问题。
 
 ### 维护例(2026-07-27):fusion src 编辑后 MCP 长进程即 stale
 

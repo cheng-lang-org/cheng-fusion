@@ -36,8 +36,13 @@ import {
 
 export const CHENG_CURRENT_PARSER_RECEIPT_INGRESS_SCHEMA =
   "cheng_current_parser_receipt_ingress";
-export const CHENG_CURRENT_PARSER_RECEIPT_PRODUCTION_COUNT = 125;
-export const CHENG_CURRENT_PARSER_RECEIPT_REQUIRED_COUNT = 971;
+// 与绑定的 corpus.json(spec.productionCount/counts.requiredObligationCount)
+// 同步重钉(2026-10-02: 126/976, TREE spec d188abe 新增 regionStmt)。
+// TODO(ingress-derive): 常量还被 HARD_RED 报告与纯报告校验函数在无 corpus
+// 访问时使用, 派生改造牵动面大; 先常量重钉, 后续把 witnessed 链改为与
+// 绑定 corpus.json 的一致性校验。
+export const CHENG_CURRENT_PARSER_RECEIPT_PRODUCTION_COUNT = 126;
+export const CHENG_CURRENT_PARSER_RECEIPT_REQUIRED_COUNT = 976;
 export const CHENG_CURRENT_PARSER_RECEIPT_SOURCE_COUNT = 29;
 export const CHENG_CURRENT_ROOT = "/Users/lbcheng/cheng-lang";
 export const CHENG_CURRENT_OFFICIAL_DRIVER = join(

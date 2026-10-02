@@ -129,13 +129,15 @@ function main() {
     [],
     "current generation 未精确投影当前正式 EBNF/parser producer",
   );
-  assert.equal(mapDoc.counts.total, 125);
-  assert.equal(mapDoc.counts.requiredObligationCount, 971);
+  assert.equal(mapDoc.counts.total, 126);
+  assert.equal(mapDoc.counts.requiredObligationCount, 976);
   assert.equal(mapDoc.counts.witnessedRequiredCount, 0);
-  assert.equal(mapDoc.counts.missingRequiredCount, 971);
+  assert.equal(mapDoc.counts.missingRequiredCount, 976);
   assert.equal(mapDoc.counts.MAPPED, 0);
+  // 126 = 125 PARTIAL(producer 已声明) + 1 UNMAPPED(regionStmt
+  // plannedUnimplemented 诚实空声明, 归 core0-parallel)。
   assert.equal(mapDoc.counts.PARTIAL, 125);
-  assert.equal(mapDoc.counts.UNMAPPED, 0);
+  assert.equal(mapDoc.counts.UNMAPPED, 1);
   assert.deepEqual(mapDoc.receiptEvidence, {
     inputCount: 0,
     acceptedCount: 0,
@@ -151,7 +153,7 @@ function main() {
         row.required_obligation_count &&
       row.witness_projections.length === 0 &&
       row.witness_receipt_sha256s.length === 0),
-    "无真实 parser receipt 时 checked-in map 必须保持 0/971",
+    "无真实 parser receipt 时 checked-in map 必须保持 0/976",
   );
   assert.equal(
     currentUnwitnessedMap.counts.missingRequiredCount,
@@ -330,10 +332,27 @@ function main() {
   assert.equal(claimCount, manifest.counts.claims, "claims 汇总不一致");
   assert.equal(manifest.counts.requiredObligationCount, requiredIds.size,
     "正式 EBNF required obligation 总数与权威合同不一致");
-  assert.equal(manifest.counts.coveredRequiredObligations, manifest.counts.requiredObligationCount,
-    "source-plan 未覆盖全部 required obligation");
-  assert.equal(claimCount, manifest.counts.requiredObligationCount,
-    "每个 required obligation 必须由且仅由一个真实 Cheng source claim 承接");
+  // plannedUnimplemented(诚实缺失类, 当前=regionStmt 归 core0-parallel):
+  // coverage 算术 = covered + planned == required; planned 行绝不产生 claim。
+  const manifestPlannedRequired = manifest.plannedUnimplemented.reduce(
+    (acc, row) => acc + row.requiredObligations, 0);
+  assert.ok(manifest.plannedUnimplemented.length > 0,
+    "plannedUnimplemented 列表不得为空(regionStmt 归 core0-parallel)");
+  for (const planned of manifest.plannedUnimplemented) {
+    assert.ok(planned.reason.length > 0,
+      `plannedUnimplemented 缺理由: ${planned.production}`);
+    if (planned.scope === "production") {
+      assert.equal(rowByProd.get(planned.production)?.status, "UNMAPPED",
+        `plannedUnimplemented(production 级)必须 UNMAPPED: ${planned.production}`);
+    }
+  }
+  assert.equal(
+    manifest.counts.coveredRequiredObligations + manifestPlannedRequired,
+    manifest.counts.requiredObligationCount,
+    "source-plan covered+planned 未覆盖全部 required obligation");
+  assert.equal(claimCount + manifestPlannedRequired,
+    manifest.counts.requiredObligationCount,
+    "每个非 plannedUnimplemented 的 required obligation 必须由且仅由一个真实 Cheng source claim 承接");
   assert.ok(!Object.hasOwn(manifest, "blocked"), "唯一最新版 corpus 禁止保留 blocked 字段");
   assert.ok(!Object.hasOwn(manifest.counts, "blocked"), "唯一最新版 counts 禁止保留 blocked 字段");
   const noPointerSpecLine = "- **禁用指针类型**：`T*`、`void*`、`ref T`、`ptr[T]`。";
@@ -364,7 +383,36 @@ function main() {
     manifest.entries.flatMap((entry) =>
       entry.claims.map((claim) => claim.production)),
   );
-  const coveredRequired = grammar.obligations.filter((o) => o.disposition === "required" && coveredNames.has(o.production));
+  for (const planned of manifest.plannedUnimplemented) {
+    // scope=obligations 的行(statementCore)只缺引用 planned production 的
+    // choice 臂, 其余臂照常有 claim; 仅 scope=production 行必须无 claim。
+    if (planned.scope !== "production") continue;
+    assert.ok(!coveredNames.has(planned.production),
+      `plannedUnimplemented production 不得携带 claim: ${planned.production}`);
+  }
+  // scope=obligations 的 planned 行(statementCore): 其引用 planned
+  // production 的 choice 臂 obligation 无 claim, 其余照常——先按
+  // corpus 记录单列, 再从 covered 集剔除, 算术与 grammar_corpus_gen 一致。
+  const plannedArmProductions = new Set(
+    manifest.plannedUnimplemented
+      .filter((planned) => planned.scope === "obligations")
+      .map((planned) => planned.production),
+  );
+  const plannedArmRequired = grammar.obligations.filter((o) =>
+    o.disposition === "required" &&
+    plannedArmProductions.has(o.production) &&
+    !claimIds.has(o.obligationId));
+  assert.equal(
+    plannedArmRequired.length,
+    manifest.plannedUnimplemented
+      .filter((planned) => planned.scope === "obligations")
+      .reduce((acc, planned) => acc + planned.requiredObligations, 0),
+    "planned 臂 obligation 数与 corpus 记录不一致",
+  );
+  const coveredRequired = grammar.obligations.filter((o) =>
+    o.disposition === "required" &&
+    coveredNames.has(o.production) &&
+    !plannedArmRequired.includes(o));
   assert.equal(coveredRequired.length, manifest.counts.coveredRequiredObligations, "covered required 计数不一致");
   for (const o of coveredRequired) {
     assert.ok(claimIds.has(o.obligationId),

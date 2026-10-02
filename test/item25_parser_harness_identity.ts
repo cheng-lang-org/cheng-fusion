@@ -122,16 +122,16 @@ const seedBuild = harnessSource.indexOf(
 );
 assert.ok(
   productionProfileGate >= 0 && seedBuild > productionProfileGate,
-  "125 productions、971 obligations、29 sources 必须在 seed 构建前 hard-fail",
+  "126 productions、976 obligations、29 sources 必须在 seed 构建前 hard-fail",
 );
 assert.doesNotThrow(
-  () => assertCurrentParserProductionProfile(125, 971, 29),
+  () => assertCurrentParserProductionProfile(126, 976, 29),
 );
 for (const profile of [
-  [124, 971, 29],
-  [125, 970, 29],
-  [125, 971, 28],
-  [125, 971, 30],
+  [125, 976, 29],
+  [126, 975, 29],
+  [126, 976, 28],
+  [126, 976, 30],
 ] as const) {
   assert.throws(
     () => assertCurrentParserProductionProfile(...profile),
