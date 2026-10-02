@@ -4,7 +4,7 @@
 // and traces agree and every referenced file is a stable regular non-symlink file.
 import {createHash} from "node:crypto";
 import {closeSync,constants,fstatSync,lstatSync,openSync,readSync,realpathSync} from "node:fs";
-import {dirname,isAbsolute,join,resolve} from "node:path";
+import {basename,dirname,isAbsolute,join,resolve} from "node:path";
 
 const ZC_TARGET="arm64-apple-darwin";
 const ZC_PROCESS_MAX_OUTPUT_BYTES=8*1024*1024;
@@ -16,7 +16,8 @@ const ZC_ROWS_HEADER="zc_rows (function|body_kind|detail|line|fz_kind|stmt_kind|
 const SHA256_RE=/^[0-9a-f]{64}$/;
 const UINT_RE=/^(0|[1-9][0-9]*)$/;
 const SINT_RE=/^(0|-?[1-9][0-9]*)$/;
-const RAW_ROW_RE=/^ZC_NOT_READY idx=([0-9]+)\/([0-9]+) function=(\S+) body_kind=(\S+) detail=(\S*) line=([0-9]+) fz_kind=([0-9]+) stmt_kind=([0-9]+) bail=(-?[0-9]+) slot_diag=(\S*)$/;
+// 重绑 2026-10-02: 旧面的 RAW_ROW_RE(ZC_NOT_READY idx=... 行)与 parseRawRow/rowsAgree
+// 已随 producer 移除(a7ee2da19)而删除; stderr 侧契约改为 unresolved-call 双谓词聚合。
 
 const ZC_CENSUS_FIELD_ORDER=[
   "zc_status","zc_driver","zc_driver_sha256","zc_driver_sha256_before","zc_driver_sha256_after",
@@ -234,22 +235,6 @@ function parsePipeRow(text){
   return{function:columns[0],bodyKind:columns[1],detail:columns[2],line,fzKind,stmtKind,bail:columns[6]||"none",raw:text,format:"pipe7"};
 }
 
-function parseRawRow(text,rowIndex,total){
-  const match=text.match(RAW_ROW_RE);
-  if(!match)throw new Error(`malformed raw ZC_NOT_READY row: ${text}`);
-  const index=uint(match[1],"raw ZC row index"),denominator=uint(match[2],"raw ZC row denominator");
-  if(index!==rowIndex||denominator!==total)throw new Error(`raw ZC row index/denominator mismatch at row ${rowIndex}: idx=${index}/${denominator} total=${total}`);
-  const line=uint(match[6],"raw ZC row line"),fzKind=uint(match[7],"raw ZC row fz_kind"),stmtKind=uint(match[8],"raw ZC row stmt_kind");
-  sint(match[9],"raw ZC row bail");
-  return{function:match[3],bodyKind:match[4],detail:match[5],line,fzKind,stmtKind,bail:match[9],slotDiag:match[10],raw:text,format:"raw"};
-}
-
-function rowsAgree(structured,raw){
-  if(structured.function!==raw.function||structured.bodyKind!==raw.bodyKind||structured.detail!==raw.detail||structured.line!==raw.line)return false;
-  if(structured.format==="pipe7")return structured.fzKind===raw.fzKind&&structured.stmtKind===raw.stmtKind&&structured.bail===raw.bail;
-  return true;
-}
-
 function aborted(reason,run,processOk=false){
   return{
     status:"aborted",total:null,totalRaw:null,fields:{},histogram:[],rows:[],rowCount:0,
@@ -359,31 +344,36 @@ function validateEvidence(fields,rows,total,expected){
   assertRelocatableObject(object.bytes,target);
 
   const reportKv=parseKvText(report,"ZC structured report",{uniqueKeys:new Set([
-    "primary_object_missing_function_count","primary_object_missing_functions","census_pure_provenance","full_backend_codegen",
+    "full_backend_codegen","compiler_executable_sha256",
   ])});
-  const reportCount=uint(requireKv(reportKv,"primary_object_missing_function_count","ZC structured report"),"report primary_object_missing_function_count");
-  const reportRowsRaw=requireKv(reportKv,"primary_object_missing_functions","ZC structured report");
-  const structuredRows=reportRowsRaw==="-"?[]:reportRowsRaw.split(";;").map(parsePipeRow);
-  if(structuredRows.length!==reportCount)throw new Error(`structured report row count mismatch: rows=${structuredRows.length} count=${reportCount}`);
-  if(requireKv(reportKv,"census_pure_provenance","ZC structured report")!==fields.zc_census_pure_provenance||requireKv(reportKv,"full_backend_codegen","ZC structured report")!==fields.zc_full_backend_codegen){
+  // 重绑 2026-10-02: report 不再携带 primary_object_missing_function_count /
+  // _functions / census_pure_provenance。report 侧锚点改为 full_backend_codegen
+  // (0/1, 恰一次) 与编译器身份 (report compiler_executable_sha256 == 钉死 driver)。
+  const reportBackend=requireKv(reportKv,"full_backend_codegen","ZC structured report");
+  if(reportBackend!=="0"&&reportBackend!=="1")throw new Error("report full_backend_codegen must be 0 or 1");
+  if(reportBackend!==fields.zc_full_backend_codegen){
     throw new Error("structured report backend provenance mismatch");
+  }
+  if(requireKv(reportKv,"compiler_executable_sha256","ZC structured report")!==driverHash){
+    throw new Error("structured report compiler identity does not match the pinned driver");
   }
 
   const stderrText=decodeUtf8(stderr.bytes,"ZC child stderr");
   const stderrLines=stderrText.split("\n");
-  const rawLines=stderrLines.filter((line)=>line.startsWith("ZC_NOT_READY "));
-  const totalLines=stderrLines.filter((line)=>line.startsWith("ZC_NOT_READY_TOTAL"));
-  if(totalLines.length!==1)throw new Error(`child stderr must contain exactly one ZC_NOT_READY_TOTAL row, got ${totalLines.length}`);
-  const totalMatch=totalLines[0].match(/^ZC_NOT_READY_TOTAL count=([0-9]+)$/);
-  if(!totalMatch)throw new Error("child stderr ZC_NOT_READY_TOTAL row is malformed");
-  const stderrTotal=uint(totalMatch[1],"stderr ZC_NOT_READY_TOTAL count");
-  const stderrRows=rawLines.map((line,index)=>parseRawRow(line,index,stderrTotal));
-
-  if(total!==reportCount||total!==structuredRows.length||total!==stderrRows.length||total!==stderrTotal)throw new Error(`independent three-way count mismatch: stdout=${total} report_count=${reportCount} report_rows=${structuredRows.length} stderr_rows=${stderrRows.length} stderr_total=${stderrTotal}`);
-  if(rows.length!==structuredRows.length||rows.some((row,index)=>row.format==="raw"||row.raw!==structuredRows[index].raw))throw new Error("stdout rows disagree with structured report rows");
-  if(structuredRows.some((row,index)=>!rowsAgree(row,stderrRows[index])))throw new Error("structured report rows disagree with child stderr rows");
+  // 重绑 2026-10-02: 缺函数信号 = 逐调用点 "unresolved function call" 诊断;
+  // 两个独立谓词 (锚 (offset N) 调用点形态 / 锚引号调用名) 必须一致,
+  // 旧的 ZC_NOT_READY 行与恰一行 ZC_NOT_READY_TOTAL 已随 a7ee2da19 移除。
+  const unresolvedStrict=stderrLines.filter((line)=>/^cheng_cold: .* \(offset [0-9]+\) unresolved function call/.test(line)).length;
+  const unresolvedTotal=stderrLines.filter((line)=>/^cheng_cold: .* unresolved function call '/.test(line)).length;
+  if(unresolvedStrict!==unresolvedTotal){
+    throw new Error(`child stderr unresolved-call predicates disagree: strict=${unresolvedStrict} total=${unresolvedTotal}`);
+  }
+  if(unresolvedStrict!==0){
+    throw new Error(`completed census contradicts child stderr unresolved-call diagnostics: count=${unresolvedStrict}`);
+  }
   const declaredCountKeys=["zc_structured_report_missing_function_count","zc_structured_report_missing_function_row_count","zc_stderr_full_missing_function_count","zc_stderr_full_total_count"];
   for(const key of declaredCountKeys)if(uint(fields[key],key)!==total)throw new Error(`${key} disagrees with independently verified count`);
+  if(rows.length!==total)throw new Error(`ZC row count mismatch: rows=${rows.length} total=${total}`);
 
   const guardKv=parseKvText(guard,"ZC RSS guard report");
   const guardExpected={
@@ -402,8 +392,14 @@ function validateEvidence(fields,rows,total,expected){
     root_identity_sampled:fields.zc_root_identity_sampled,
   };
   for(const [key,value] of Object.entries(guardExpected))if(requireKv(guardKv,key,"ZC RSS guard report")!==value)throw new Error(`ZC RSS guard report ${key} mismatch`);
-  requirePath(requireKv(guardKv,"stdout","ZC RSS guard report"),evidencePaths.stdout,"ZC guard stdout");
-  requirePath(requireKv(guardKv,"stderr","ZC RSS guard report"),evidencePaths.stderr,"ZC guard stderr");
+  // 重绑 2026-10-02: guard 报告内引用的是 work 目录原始捕获路径(枚举器固定命名
+  // zc.stdout.txt / zc.stderr.txt), 运行结束 work 目录即被清理; 字节绑定由 sha256
+  // 链承担(manifest stdout_full_sha256 / stderr_full_sha256 == 私有 diag 拷贝 ==
+  // 原始捕获)。因此这里只校验路径形态, 不再要求等于 diag 拷贝路径。
+  const guardStdout=requireKv(guardKv,"stdout","ZC RSS guard report");
+  const guardStderr=requireKv(guardKv,"stderr","ZC RSS guard report");
+  if(!isAbsolute(guardStdout)||basename(guardStdout)!=="zc.stdout.txt")throw new Error("ZC guard stdout path shape mismatch");
+  if(!isAbsolute(guardStderr)||basename(guardStderr)!=="zc.stderr.txt")throw new Error("ZC guard stderr path shape mismatch");
   uint(requireKv(guardKv,"timeout_seconds","ZC RSS guard report"),"guard timeout_seconds");
 
   const resourceBytes=uint(fields.zc_resource_trace_bytes,"zc_resource_trace_bytes"),resourceLines=uint(fields.zc_resource_trace_sample_count,"zc_resource_trace_sample_count");
@@ -447,6 +443,10 @@ function parseCompletedProtocol(run,expected={}){
   if(keys.length!==ZC_CENSUS_FIELD_ORDER.length||keys.some((key,index)=>key!==ZC_CENSUS_FIELD_ORDER[index]))throw new Error(`zc_enumerate key order/schema mismatch: got=${keys.join(",")}`);
   if(fields.zc_status!=="completed")throw new Error(`zc_status must be completed, got ${fields.zc_status}`);
   const total=uint(fields.zc_missing_function_count,"zc_missing_function_count");
+  // 重绑 2026-10-02 (枚举器同款): 新 producer 在首个 blocked callsite 即 fail-fast
+  // (recovery=0), count>0 的运行以 reason=unresolved_function_call abort 收场,
+  // 不存在「completed 且 count>0」的 census。
+  if(total!==0)throw new Error("nonzero zc_missing_function_count cannot complete under the fail-fast producer (rebind 2026-10-02); expect reason=unresolved_function_call abort instead");
   if(fields.zc_count_three_way_match!=="1")throw new Error("zc_count_three_way_match must be 1");
 
   const histogram=[],histogramBails=new Set();
@@ -489,7 +489,11 @@ function parseCompletedProtocol(run,expected={}){
   if(uint(fields.zc_rss_guard_rc,"zc_rss_guard_rc")!==driverRc)throw new Error("RSS guard rc must equal driver rc");
   if(fields.zc_compiler_csg_stderr!=="0"||fields.zc_progress!=="0")throw new Error("controlled ZC diagnostics/progress contract mismatch");
   if(fields.zc_rss_guard_schema!=="beat_c_process_memory_guard"||fields.zc_rss_guard_status!=="completed"||fields.zc_rss_guard_abort_reason!=="")throw new Error("RSS guard completed schema/status/abort contract mismatch");
-  if(fields.zc_rss_guard_mode!=="process_tree"||fields.zc_rss_guard_scope!=="identity_history_union_group_and_descendants")throw new Error("RSS guard mode/scope contract mismatch");
+  if(fields.zc_rss_guard_mode!=="process_tree"||
+     // 2026-10-02 对齐: guard 现行按 parent_guard_mode 二分 scope(枚举器 parse_guard_report 同款),
+     // 旧常量 identity_history_union_group_and_descendants 已被 guard 侧淘汰。
+     !(fields.zc_rss_guard_scope==="identity_history_union_group_session_and_descendants"||
+       fields.zc_rss_guard_scope==="identity_history_descendants_parent_owned_group"))throw new Error("RSS guard mode/scope contract mismatch");
   const requestedLimit=uint(fields.zc_rss_requested_limit_bytes,"zc_rss_requested_limit_bytes",{positive:true});
   const effectiveLimit=uint(fields.zc_rss_limit_bytes,"zc_rss_limit_bytes",{positive:true});
   if(requestedLimit!==805306368||effectiveLimit!==requestedLimit)throw new Error("RSS guard production limit contract mismatch");
@@ -510,7 +514,7 @@ function parseCompletedProtocol(run,expected={}){
   }else throw new Error("RSS guard enforcement metric/kind contract mismatch");
   if(total===0){
     if(driverRc!==0||fields.zc_census_pure_provenance!=="full_backend_ready"||fields.zc_full_backend_codegen!=="1"||fields.zc_zero!=="proved"||fields.zc_zero_proof_scope!=="semantic_census_and_observed_sample_resource_gate")throw new Error("zero census proof/provenance contract mismatch");
-  }else if(fields.zc_census_pure_provenance!=="not_ready_functions_present"||fields.zc_full_backend_codegen!=="0"||fields.zc_zero!=="not_proved"||fields.zc_zero_proof_scope!=="semantic_census_incomplete")throw new Error("nonzero census provenance/zero-proof contract mismatch");
+  }
 
   validateEvidence(fields,rows,total,expected);
   return{status:"completed",total,totalRaw:fields.zc_missing_function_count,fields,histogram,rows,rowCount:rows.length,threeWayMatch:true,zeroProof:fields.zc_zero,protocolError:null,processOk:true,timedOut:false,overflow:false,exitCode:run.exitCode};

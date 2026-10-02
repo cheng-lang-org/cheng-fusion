@@ -42,61 +42,59 @@ function makeFixtureRoot(){
   return{root,source,driver,guard,script,objectFixture};
 }
 
-function rawFromStructured(row:string,index:number,total:number){
-  const columns=row.split("|");
-  const [fn,body,detail,line]=columns;
-  const fz=columns.length===7?columns[4]:"0",stmt=columns.length===7?columns[5]:"0",bail=columns.length===7?(columns[6]||"0"):"0";
-  return`ZC_NOT_READY idx=${index}/${total} function=${fn} body_kind=${body} detail=${detail} line=${line} fz_kind=${fz} stmt_kind=${stmt} bail=${bail} slot_diag=none`;
-}
+// 重绑 2026-10-02: 新面 stderr 证据是逐调用点诊断原文(无 ZC_NOT_READY 流)。
+// 调用点诊断行形态(cheng_cold: <path>:<line> (offset N) unresolved function call '<name>')
+// 由夹具直接以字面行注入。
+const UNRESOLVED_CALLSITE="cheng_cold: /fixture/src/core/tooling/backend_driver_dispatch_min.cheng:4 (offset 60) unresolved function call 'undefinedHelper'";
 
 function materializeEvidence(paths:any,options:any={}){
-  const rows=options.rows||["fnA|return||0|3|2|44","fnB|assign|calleeY|20|5|1|631"];
+  const rows=options.rows||[];
   const total=options.total===undefined?rows.length:options.total;
   const diagDir=options.diagDir,prefix=options.prefix;
-  const provenance=total===0?"full_backend_ready":"not_ready_functions_present",fullBackend=total===0?"1":"0";
+  // 重绑 2026-10-02: completed 只有 count==0 一种形态; report 携带 full_backend_codegen
+  // 与编译器身份(compiler_executable_sha256 == driver sha256), provenance 恒 full_backend_ready。
+  const provenance="full_backend_ready",fullBackend=options.fullBackend===undefined?"1":options.fullBackend;
   mkdirSync(diagDir,{recursive:true});
   const evidence={
     manifest:join(diagDir,`${prefix}.manifest.txt`),report:join(diagDir,`${prefix}.report.txt`),stderr:join(diagDir,`${prefix}.stderr_full.txt`),
     stdout:join(diagDir,`${prefix}.stdout_full.txt`),guard:join(diagDir,`${prefix}.guard.txt`),resource:join(diagDir,`${prefix}.resource_trace.tsv`),
     phase:join(diagDir,`${prefix}.phase_trace.tsv`),object:join(diagDir,`${prefix}.object.o`),
   };
-  const reportRows=options.reportRows===undefined?rows:options.reportRows;
-  const reportCount=options.reportCount===undefined?total:options.reportCount;
+  const driverHash=sha256(paths.driver);
+  const compilerSha=options.compilerSha===undefined?driverHash:options.compilerSha;
   writeFileSync(evidence.report,[
-    `primary_object_missing_function_count=${reportCount}`,
-    `primary_object_missing_functions=${reportRows.length===0?"-":reportRows.join(";;")}`,
-    `census_pure_provenance=${provenance}`,`full_backend_codegen=${fullBackend}`,"",
+    `full_backend_codegen=${fullBackend}`,
+    `compiler_executable_sha256=${compilerSha}`,"",
   ].join("\n"));
-  const stderrRows=options.stderrRows===undefined?rows.map((row:string,index:number)=>rawFromStructured(row,index,rows.length)):options.stderrRows;
-  const stderrTotal=options.stderrTotal===undefined?total:options.stderrTotal;
-  writeFileSync(evidence.stderr,[...stderrRows,`ZC_NOT_READY_TOTAL count=${stderrTotal}`,""].join("\n"));
+  const stderrRows=options.stderrRows===undefined?[]:options.stderrRows;
+  writeFileSync(evidence.stderr,[...stderrRows,""].join("\n"));
   writeFileSync(evidence.stdout,"driver stdout\n");
   copyFileSync(paths.objectFixture,evidence.object);
   writeFileSync(evidence.resource,options.resourceText===undefined?"1\t1\n2\t2\n3\t3\n":options.resourceText);
   writeFileSync(evidence.phase,options.phaseText===undefined?"2\t2\tZC phase\n":options.phaseText);
-  const driverRc=total===0?"0":"2";
+  const driverRc="0";
   writeFileSync(evidence.guard,[
     "tool=tools/beat_c_process_group_guard.sh","schema=beat_c_process_memory_guard","platform=darwin","status=completed",`rc=${driverRc}`,"abort_reason=",
-    "memory_guard_mode=process_tree","memory_guard_scope=identity_history_union_group_and_descendants","process_tree_membership_metric=darwin_libproc_identity_history_group_and_descendants",
+    "memory_guard_mode=process_tree","memory_guard_scope=identity_history_union_group_session_and_descendants","process_tree_membership_metric=darwin_libproc_identity_history_group_and_descendants",
     "enforcement_kind=darwin_cooperative_process_tree_poll","observed_sample_limit_status=proved","hard_memory_limit_proof_status=not_provable_userspace_poll",
-    "sampling_blind_spot=inter_sample_transient_peaks_not_provable_by_userspace_polling","memory_limit_bytes=1073741824",
+    "sampling_blind_spot=inter_sample_transient_peaks_not_provable_by_userspace_polling","memory_limit_bytes=805306368",
     "memory_enforcement_metric=max_process_tree_resident_and_phys_footprint","process_tree_resident_metric=current_resident_bytes_sum",
     "process_tree_phys_footprint_metric=darwin_rusage_info_v0_phys_footprint_bytes_sum","process_tree_phys_footprint_status=available",
     "process_tree_resident_peak_bytes=100","process_tree_phys_footprint_peak_bytes=120","process_tree_enforced_peak_bytes=120",
     "process_tree_enforced_sample_peak_bytes=120","process_tree_peak_process_count=1","process_tree_identity_history_peak_count=1","root_identity_sampled=1",
     "process_tree_escape_pid=0","memory_measurement_status=available","memory_measurement_error=","memory_sample_count=3",
     "self_test_global_process_iter_trap_status=not_requested","self_test_global_process_iter_trap_probe_status=not_run","self_test_global_process_iter_trap_call_count=0",
-    "timeout_seconds=0","poll_seconds=0.01",`stdout=${evidence.stdout}`,`stderr=${evidence.stderr}`,"",
+    "timeout_seconds=0","poll_seconds=0.01","stdout=/tmp/zc-fixture-work/zc.stdout.txt","stderr=/tmp/zc-fixture-work/zc.stderr.txt","",
   ].join("\n"));
   const resourceStats=bytesAndLines(evidence.resource),phaseStats=bytesAndLines(evidence.phase);
-  const driverHash=sha256(paths.driver),enumeratorHash=sha256(paths.script),guardHash=sha256(paths.guard),sourceHash=sha256(paths.source),gitHash=sha256Bytes("real worktree state");
+  const enumeratorHash=sha256(paths.script),guardHash=sha256(paths.guard),sourceHash=sha256(paths.source),gitHash=sha256Bytes("real worktree state");
   const manifestRows=[
     "schema=zc_evidence_manifest","status=completed",`zc_enumerator=${paths.script}`,`zc_enumerator_sha256_before=${enumeratorHash}`,`zc_enumerator_sha256_after=${enumeratorHash}`,
     `source=${paths.source}`,`source_sha256=${sourceHash}`,`source_sha256_after=${sourceHash}`,"git_worktree_state_schema=git_worktree_state",
     `git_worktree_state_sha256_before=${gitHash}`,`git_worktree_state_sha256_after=${gitHash}`,`driver=${paths.driver}`,`driver_sha256=${driverHash}`,
     `driver_sha256_before=${driverHash}`,`driver_sha256_after=${driverHash}`,`rss_guard=${paths.guard}`,"rss_guard_schema=beat_c_process_memory_guard",
     `rss_guard_sha256_before=${guardHash}`,`rss_guard_sha256_after=${guardHash}`,`rss_guard_report=${evidence.guard}`,`rss_guard_report_sha256=${sha256(evidence.guard)}`,
-    "rss_guard_limit_bytes=1073741824","rss_guard_enforcement_metric=max_process_tree_resident_and_phys_footprint","rss_guard_enforcement_kind=darwin_cooperative_process_tree_poll",
+    "rss_guard_limit_bytes=805306368","rss_guard_enforcement_metric=max_process_tree_resident_and_phys_footprint","rss_guard_enforcement_kind=darwin_cooperative_process_tree_poll",
     "rss_guard_observed_sample_limit_status=proved","rss_guard_hard_memory_limit_proof_status=not_provable_userspace_poll","rss_guard_poll_seconds=0.01",
     "rss_guard_measurement_status=available","process_tree_resident_peak_bytes=100","process_tree_phys_footprint_peak_bytes=120","process_tree_enforced_peak_bytes=120",
     `target=${ZC_TARGET}`,`structured_report=${evidence.report}`,`structured_report_sha256=${sha256(evidence.report)}`,`stderr_full=${evidence.stderr}`,
@@ -114,7 +112,7 @@ function materializeEvidence(paths:any,options:any={}){
     zc_target:ZC_TARGET,zc_file:paths.source,zc_source_sha256:sourceHash,zc_source_sha256_after:sourceHash,
     zc_git_worktree_state_sha256_before:gitHash,zc_git_worktree_state_sha256_after:gitHash,zc_driver_rc:driverRc,zc_compiler_csg_stderr:"0",zc_progress:"0",
     zc_rss_guard_schema:"beat_c_process_memory_guard",zc_rss_guard_status:"completed",zc_rss_guard_rc:driverRc,zc_rss_guard_abort_reason:"",
-    zc_rss_guard_mode:"process_tree",zc_rss_guard_scope:"identity_history_union_group_and_descendants",zc_rss_requested_limit_bytes:"1073741824",zc_rss_limit_bytes:"1073741824",
+    zc_rss_guard_mode:"process_tree",zc_rss_guard_scope:"identity_history_union_group_session_and_descendants",zc_rss_requested_limit_bytes:"805306368",zc_rss_limit_bytes:"805306368",
     zc_rss_enforcement_metric:"max_process_tree_resident_and_phys_footprint",zc_rss_enforcement_kind:"darwin_cooperative_process_tree_poll",
     zc_rss_observed_sample_limit_status:"proved",zc_rss_hard_memory_limit_proof_status:"not_provable_userspace_poll",zc_rss_poll_seconds:"0.01",zc_rss_measurement_status:"available",
     zc_rss_sample_count:"3",zc_process_tree_resident_peak_bytes:"100",zc_process_tree_phys_footprint_peak_bytes:"120",zc_process_tree_enforced_peak_bytes:"120",
@@ -178,7 +176,7 @@ function installGenerator(paths:any){
     `const ZC_CENSUS_FIELD_ORDER=${JSON.stringify(ZC_CENSUS_FIELD_ORDER)};`,
     `const ZC_PROCESS_MAX_OUTPUT_BYTES=${ZC_PROCESS_MAX_OUTPUT_BYTES};`,
     `const ZC_TARGET=${JSON.stringify(ZC_TARGET)};`,
-    sha256Bytes.toString(),sha256.toString(),bytesAndLines.toString(),rawFromStructured.toString(),materializeEvidence.toString(),render.toString(),
+    sha256Bytes.toString(),sha256.toString(),bytesAndLines.toString(),materializeEvidence.toString(),render.toString(),
     `const root=dirname(fileURLToPath(import.meta.url));const sourcePath=process.argv[2];
 const paths={root,source:sourcePath,driver:process.env.ZC_DRIVER,guard:join(root,"tools/beat_c_process_group_guard.sh"),script:join(root,"tools/zc_enumerate.sh"),objectFixture:join(root,"fixture.o")};
 const mode=readFileSync(join(root,"mode.txt"),"utf8").trim();
@@ -197,10 +195,8 @@ async function main(){
     console.log("[A] canonical 协议必须由真实 evidence set 独立证明");
     const canonical=createDirect(paths);directDirs.push(dirname(canonical.evidence.manifest));
     const ok=parse(paths,canonical);
-    assertTrue(ok.status==="completed"&&ok.total===2&&ok.rows[0].detail===""&&ok.rows[0].line===0,"空 detail/line=0 的正式结构行通过实物三方核验");
-    const four=createDirect(paths,{rows:["fnA|return||0"]});directDirs.push(dirname(four.evidence.manifest));
-    assertTrue(parse(paths,four).status==="completed","4-field 正式结构行与 raw stderr 独立证据一致");
-    const zero=createDirect(paths,{rows:[],resourceText:"",phaseText:""});directDirs.push(dirname(zero.evidence.manifest));
+    assertTrue(ok.status==="completed"&&ok.total===0&&ok.rows.length===0&&ok.zeroProof==="proved","新面 completed 只允许 count==0 且 histogram/rows 空区");
+    const zero=createDirect(paths,{resourceText:"",phaseText:""});directDirs.push(dirname(zero.evidence.manifest));
     const zeroResult=parse(paths,zero);assertTrue(zeroResult.status==="completed"&&zeroResult.total===0&&zeroResult.zeroProof==="proved","零计数要求 full-backend provenance，trace bytes/lines 允许 canonical 0");
     const oldManifest=createDirect(paths);directDirs.push(dirname(oldManifest.evidence.manifest));
     setManifestField(oldManifest,"schema","zc_evidence_manifest.v1");
@@ -223,10 +219,12 @@ async function main(){
     assertAborted(parse(paths,replaced),"trace 链接替换","non-symlink");
     const changed=createDirect(paths);directDirs.push(dirname(changed.evidence.manifest));writeFileSync(changed.evidence.guard,readFileSync(changed.evidence.guard,"utf8")+"tampered=1\n");
     assertAborted(parse(paths,changed),"guard hash 变化","SHA-256");
-    const reportMismatch=createDirect(paths,{reportCount:1});directDirs.push(dirname(reportMismatch.evidence.manifest));
-    assertAborted(parse(paths,reportMismatch),"report 独立 count 冲突","structured report row count mismatch");
-    const stderrMismatch=createDirect(paths,{stderrTotal:1});directDirs.push(dirname(stderrMismatch.evidence.manifest));
-    assertAborted(parse(paths,stderrMismatch),"stderr 独立 total 冲突");
+    const compilerMismatch=createDirect(paths,{compilerSha:"f".repeat(64)});directDirs.push(dirname(compilerMismatch.evidence.manifest));
+    assertAborted(parse(paths,compilerMismatch),"report 编译器身份冲突","compiler identity");
+    const stderrDiag=createDirect(paths,{stderrRows:[UNRESOLVED_CALLSITE]});directDirs.push(dirname(stderrDiag.evidence.manifest));
+    assertAborted(parse(paths,stderrDiag),"completed 与 stderr 诊断冲突","contradicts child stderr");
+    const predicateMismatch=createDirect(paths,{stderrRows:[UNRESOLVED_CALLSITE,"cheng_cold: body=helper unresolved function call 'undefinedHelper'"]});directDirs.push(dirname(predicateMismatch.evidence.manifest));
+    assertAborted(parse(paths,predicateMismatch),"stderr 双谓词不一致","predicates disagree");
 
     const missingStdout=createDirect(paths);directDirs.push(dirname(missingStdout.evidence.manifest));unlinkSync(missingStdout.evidence.stdout);
     assertAborted(parse(paths,missingStdout),"stdout attachment 删除","child stdout");
@@ -263,16 +261,11 @@ async function main(){
     assertAborted(parse(paths,objectOversize),"object attachment 512MiB 上限","exceeds 536870912 bytes");
 
     console.log("[C] target/driver、canonical bounded integers 与协议上限严格失败");
-    const numericCases=[
-      ["line leading zero",["fnA|return||01|3|2|44"]],["fz overflow",[`fnA|return||0|${Number.MAX_SAFE_INTEGER+1}|2|44`]],
-      ["bail negative zero",["fnA|return||0|3|2|-0"]],
-    ];
-    for(const [label,rows] of numericCases as any){const item=createDirect(paths,{rows});directDirs.push(dirname(item.evidence.manifest));assertAborted(parse(paths,item),label)}
     const target=createDirect(paths);directDirs.push(dirname(target.evidence.manifest));assertAborted(parse(paths,target,render(target,{zc_target:"x86_64-apple-darwin"})),"target mismatch","zc_target mismatch");
     const alternateDriver=join(paths.root,"alternate-driver");writeFileSync(alternateDriver,"#!/bin/bash\nexit 0\n");chmodSync(alternateDriver,0o755);
     const driverCase=createDirect(paths);directDirs.push(dirname(driverCase.evidence.manifest));const alternateHash=sha256(alternateDriver);
     assertAborted(parse(paths,driverCase,render(driverCase,{zc_driver:alternateDriver,zc_driver_sha256:alternateHash,zc_driver_sha256_before:alternateHash,zc_driver_sha256_after:alternateHash})),"driver mismatch","zc_driver path mismatch");
-    const count=createDirect(paths,{rows:["fnA|return||0|3|2|44"]});directDirs.push(dirname(count.evidence.manifest));assertAborted(parse(paths,count,render(count,{zc_missing_function_count:"01"})),"count leading zero","canonical uint");
+    const count=createDirect(paths);directDirs.push(dirname(count.evidence.manifest));assertAborted(parse(paths,count,render(count,{zc_missing_function_count:"01"})),"count leading zero","canonical uint");
     const huge=Buffer.alloc(ZC_PROCESS_MAX_OUTPUT_BYTES+1,65);assertAborted(parse(paths,canonical,huge),"stdout parser cap","exceeds");
     assertAborted(parse(paths,canonical,render(canonical),{stdoutBuffer:undefined}),"缺失 stdoutBuffer","stdoutBuffer raw bytes are required");
     assertAborted(parse(paths,canonical,Buffer.from([0xff])),"协议 stdout fatal UTF-8","not valid UTF-8");
@@ -282,14 +275,14 @@ async function main(){
     try{
       await mcp.initialize({rootUri:`file://${paths.root}`,workspaceFolders:[{uri:`file://${paths.root}`,name:"zc-protocol"}]});
       const census=await mcp.callTool("cheng_zc_census",{root:paths.root,source:paths.source,driver:paths.driver},undefined,20000);
-      assertTrue(census.isError!==true&&census.parsed.status==="completed"&&census.parsed.total===2,"zc_census 严格 evidence verdict");
+      assertTrue(census.isError!==true&&census.parsed.status==="completed"&&census.parsed.total===0,"zc_census 严格 evidence verdict");
       assertTrue(census.parsed.schema==="cheng_zc_census","zc_census 使用唯一 canonical schema");
       assert.throws(()=>assertZcCensusReportSchema({...census.parsed,schema:"cheng_zc_census.v1"}),/unsupported ZC census report schema/);
       const censusEnv=JSON.parse(readFileSync(join(paths.root,"env-log.json"),"utf8"));
       assertTrue(censusEnv.zc.ZC_DRIVER===paths.driver&&censusEnv.zc.ZC_TARGET===ZC_TARGET&&censusEnv.zc.ZC_DIAG_PREFIX==="census"&&censusEnv.zc.ZC_NO_CACHE==="1","census 受控 env 固定");
       assertTrue(censusEnv.zc.ZC_AMBIENT_POISON===undefined&&!existsSync(censusEnv.diagDir),"census ambient ZC 清空且私有 diag 已清理");
       const peel=await mcp.callTool("cheng_residual_peel",{root:paths.root,mode:"full",source:paths.source,driver:paths.driver},undefined,20000);
-      assertTrue(peel.isError!==true&&peel.parsed.census.status==="completed"&&peel.parsed.census.total===2,"residual full 共用严格 verdict");
+      assertTrue(peel.isError!==true&&peel.parsed.census.status==="completed"&&peel.parsed.census.total===0,"residual full 共用严格 verdict");
       const peelEnv=JSON.parse(readFileSync(join(paths.root,"env-log.json"),"utf8"));
       assertTrue(peelEnv.zc.ZC_DIAG_PREFIX==="residual"&&peelEnv.zc.ZC_AMBIENT_POISON===undefined&&!existsSync(peelEnv.diagDir),"residual 私有 diag + env 隔离 + cleanup");
       writeFileSync(join(paths.root,"mode.txt"),"oversize\n");
